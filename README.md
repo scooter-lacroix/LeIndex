@@ -25,6 +25,35 @@
 
 ---
 
+## 🚀 One-Click Installation
+
+**The easiest way to get started:**
+
+**Linux/Unix:**
+```bash
+curl -sSL https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/install.sh | bash
+```
+
+**macOS:**
+```bash
+curl -sSL https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/install_macos.sh | bash
+```
+
+**Windows:**
+```powershell
+irm https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/install.ps1 | iex
+```
+
+That's it. The installer will:
+- ✅ Install LeIndex MCP server
+- ✅ Detect your AI tools (Claude Code, Cursor, etc.)
+- ✅ Configure integrations automatically
+- ✅ Install optional skills for enhanced workflows
+
+**Manual installation?** See below ↓
+
+---
+
 ## ✨ What Makes LeIndex Special?
 
 **LeIndex** isn't just another code search tool. It's your intelligent code companion that understands **what** you're looking for, not just **where** it might be typed.
