@@ -1,0 +1,142 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# LeIndex specific files
+.leindex/
+.leindex_data/
+
+# Test and benchmark files
+.benchmarks/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.cover
+.hypothesis/
+
+# Agent and AI tool files
+.gemini/
+.qwen/
+.kiro/
+.roo/
+CLAUDE.md
+
+# Kilocode files (keep memory-bank but ignore temp files)
+.kilocode/*.tmp
+.kilocode/cache/
+
+# Data and cache files
+data/
+faiss_index/
+file_content_cache.json.tmp
+
+# Test files
+test_*.py
+test_*.txt
+debug_*.py
+simple_search_test.py
+mcp_test_file.py
+
+# Backup files
+*.backup
+backups/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Migration and fix scripts (development only)
+apply_migrations.py
+fix_postgresql_schema.py
+
+# Logs
+logs/
+*.log
+
+# Database files
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Model files
+models/
+*.bin
+*.pt
+*.pth
+*.onnx
+
+# Documentation build
+docs/_build/
+docs/.doctrees/
+site/
+
+# Package manager files
+uv.lock
+poetry.lock
+Pipfile.lock
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff
+.ruff_cache/
+
+# Profiling
+*.prof
+*.pstats
+
+# Archive folder
+.archive/
+
+# Hidden folders (folders starting with ".")
+.**/
+.github
+.git
+
+# Legacy architecture folders
+/alembic/
+/benchmarks/
+/conductor/
+/faiss_index/
+/maestro/
+/test_check/
+/tests/
+/logs/

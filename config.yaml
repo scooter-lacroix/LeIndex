@@ -1,0 +1,338 @@
+ignore_patterns:
+  - "**/node_modules/**"
+  - "**/*.tmp"
+  
+size_limits:
+  max_file_size: 1073741824  # 1GB
+  type_specific_limits:
+    ".py": 1073741824  # 1GB for Python files
+
+directory_thresholds:
+  max_files_per_directory: 1000000  # 1M files - Increased for massive codebases (600K+ files)
+  max_subdirectories_per_directory: 50000  # 50K subdirs - Increased for extremely complex project structures
+
+memory_caps:
+  soft_limit_mb: 16384  # 16GB - Increased for massive projects (44GB+, 600K+ files)
+  hard_limit_mb: 32768  # 32GB - Increased for extremely large projects
+
+preferred_search_tool: "ripgrep"
+
+# Data Access Layer (DAL) Configuration
+dal_settings:
+  # Backend type for LeIndex 2.0+
+  # Options: "sqlite_duckdb" (recommended), "sqlite_only", "dual_write_read" (requires PostgreSQL), "postgresql_elasticsearch_only" (requires PostgreSQL)
+  backend_type: "sqlite_duckdb"
+
+  # SQLite database path for transactional metadata
+  db_path: "${SQLITE_DB_PATH:-./data/leindex.db}"
+
+  # DuckDB database path for analytical queries (optional, defaults to sqlite_db_path + .duckdb)
+  duckdb_db_path: "${DUCKDB_DB_PATH:-./data/leindex.db.duckdb}"
+
+  # Enable full-text search in SQLite
+  sqlite_enable_fts: "${SQLITE_ENABLE_FTS:-true}"
+
+  # PostgreSQL connection details (OPTIONAL - only required for dual_write_read or postgresql_elasticsearch_only backends)
+  # Install PostgreSQL dependencies with: pip install leindex[postgresql]
+  # SECURITY: Password must be set via POSTGRES_PASSWORD environment variable - no default fallback
+  postgresql_user: "${POSTGRES_USER:-user}"
+  postgresql_password: "${POSTGRES_PASSWORD}"
+  postgresql_host: "${POSTGRES_HOST:-localhost}"
+  postgresql_port: "${POSTGRES_PORT:-5432}"
+  postgresql_database: "${POSTGRES_DB:-leindex_db}"
+  # PostgreSQL SSL arguments (optional, for client certificate authentication or enforced SSL)
+  # Example: ssl_args: {"sslmode": "require", "sslrootcert": "/path/to/ca.pem", "sslcert": "/path/to/client.crt", "sslkey": "/path/to/client.key"}
+  postgresql_ssl_args: {} # Placeholder for SSL arguments
+
+  # Elasticsearch connection details (OPTIONAL - only required for dual_write_read or postgresql_elasticsearch_only backends)
+  # These should ideally be sourced from a secure secrets management system.
+  elasticsearch_hosts: ["http://localhost:9200"]
+  elasticsearch_index_name: "leindex"
+  # Elasticsearch authentication (choose one: api_key or http_auth)
+  # api_key: ["${ELASTICSEARCH_API_KEY_ID}", "${ELASTICSEARCH_API_KEY}"] # (id, api_key) tuple
+  # http_auth: ["${ELASTICSEARCH_USERNAME}", "${ELASTICSEARCH_PASSWORD}"] # (username, password) tuple
+  elasticsearch_api_key_id: "${ELASTICSEARCH_API_KEY_ID:-}"
+  elasticsearch_api_key: "${ELASTICSEARCH_API_KEY:-}"
+  elasticsearch_username: "${ELASTICSEARCH_USERNAME:-}"
+  elasticsearch_password: "${ELASTICSEARCH_PASSWORD:-}"
+  # Elasticsearch SSL/TLS settings
+  elasticsearch_use_ssl: "${ELASTICSEARCH_USE_SSL:-false}"
+  elasticsearch_verify_certs: "${ELASTICSEARCH_VERIFY_CERTS:-true}"
+  elasticsearch_ca_certs: "${ELASTICSEARCH_CA_CERTS:-}" # Path to CA certificate bundle
+  elasticsearch_client_cert: "${ELASTICSEARCH_CLIENT_CERT:-}" # Path to client certificate
+  elasticsearch_client_key: "${ELASTICSEARCH_CLIENT_KEY:-}" # Path to client key
+
+# Vector Store Configuration for Semantic Search
+vector_store:
+  # Backend type: "leann" (storage-efficient) or "faiss" (legacy)
+  backend_type: "leann"
+
+  # LEANN index path
+  index_path: "${LEANN_INDEX_PATH:-./leann_index}"
+
+  # LEANN backend: "hnsw" (default, good for < 10M vectors) or "diskann" (large datasets)
+  leann_backend: "${LEANN_BACKEND:-hnsw}"
+
+  # Embedding model (CodeRankEmbed is recommended for code search)
+  embedding_model: "${LEANN_MODEL:-nomic-ai/CodeRankEmbed}"
+
+  # Embedding dimension (768 for CodeRankEmbed)
+  embedding_dim: 768
+
+  # HNSW configuration (only used if leann_backend is "hnsw")
+  graph_degree: 32  # Number of connections per node (default: 32)
+  build_complexity: 64  # Build thoroughness (default: 64)
+  search_complexity: 32  # Search thoroughness (default: 32)
+
+  # DiskANN configuration (only used if leann_backend is "diskann")
+  # diskann_graph_degree: 64
+  # diskann_build_complexity: 64
+  # diskann_search_complexity: 32
+
+  # Enhancement Features - Performance optimizations
+  enhancements:
+    # Enable incremental index updates (Issue #5)
+    # When true, only new vectors are added to the index instead of full rebuild
+    # This significantly improves upload performance for large indexes
+    incremental_updates: "${LEANN_INCREMENTAL_UPDATES:-true}"
+
+    # Enable vector deduplication (Recommendation #7)
+    # When true, identical chunks are not stored multiple times
+    # This reduces storage and improves search performance
+    deduplication:
+      enabled: "${LEANN_DEDUPLICATION_ENABLED:-true}"
+      # Deduplication uses SHA-256 content hashing
+      # Reference counting tracks how many times each unique chunk appears
+
+    # Enable search result caching (Recommendation #3)
+    # When true, search results are cached to improve performance
+    cache:
+      enabled: "${LEANN_CACHE_ENABLED:-true}"
+      # Maximum number of cached search results
+      maxsize: "${LEANN_CACHE_MAXSIZE:-1000}"
+      # Cache TTL (time-to-live) in seconds
+      # Default: 300 seconds (5 minutes)
+      ttl: "${LEANN_CACHE_TTL:-300}"
+      # Cache statistics are available via backend.get_cache_stats()
+
+  # Retry configuration for handling rate limits and transient failures
+  retry:
+    # Enable/disable retry logic
+    enabled: "${LEANN_RETRY_ENABLED:-true}"
+
+    # Maximum number of retry attempts
+    max_retries: "${LEANN_MAX_RETRIES:-5}"
+
+    # Initial delay before first retry (in seconds)
+    initial_delay: "${LEANN_INITIAL_DELAY:-1.0}"
+
+    # Maximum delay between retries (in seconds)
+    max_delay: "${LEANN_MAX_DELAY:-60.0}"
+
+    # Add jitter to prevent thundering herd (recommended: true)
+    jitter: "${LEANN_JITTER_ENABLED:-true}"
+
+# Async Processing Configuration for Asynchronous Indexing
+async_processing:
+  # Enable async processing (replaces RabbitMQ)
+  enabled: "${ASYNC_PROCESSING_ENABLED:-true}"
+
+  # Queue configuration
+  max_queue_size: "${ASYNC_MAX_QUEUE_SIZE:-10000}"  # Maximum number of tasks in queue
+  max_per_priority: "${ASYNC_MAX_PER_PRIORITY:-2500}"  # Maximum tasks per priority level
+
+  # Worker pool configuration
+  worker_count: "${ASYNC_WORKER_COUNT:-4}"  # Number of async worker tasks
+  max_task_retries: "${ASYNC_MAX_RETRIES:-3}"  # Maximum retry attempts for failed tasks
+
+  # Batch indexing configuration for improved throughput
+  batching_enabled: "${ASYNC_BATCHING_ENABLED:-true}"
+  batch_size: "${ASYNC_BATCH_SIZE:-50}"  # Number of operations to batch before flushing
+  batch_timeout: "${ASYNC_BATCH_TIMEOUT:-5.0}"  # Seconds to wait before auto-flushing batch
+  max_batch_size: "${ASYNC_MAX_BATCH_SIZE:-500}"  # Maximum batch size
+
+  # Backpressure control settings
+  backpressure_enabled: "${ASYNC_BACKPRESSURE_ENABLED:-true}"
+  queue_threshold: "${ASYNC_QUEUE_THRESHOLD:-1000}"  # Queue depth threshold for backpressure
+  latency_threshold_ms: "${ASYNC_LATENCY_THRESHOLD_MS:-5000}"  # Latency threshold for backpressure
+
+# Existing content
+
+# LeIndex Configuration
+# This file contains configuration for filtering files and directories during indexing
+
+# File size filtering
+file_filtering:
+  # Maximum file size in bytes (default: 1GB)
+  # Files larger than this will be skipped unless explicitly included
+  max_file_size: 1073741824  # 1GB in bytes
+  
+  # Maximum file size for different file types (optional overrides)
+  type_specific_limits:
+    # Text files can be larger
+    ".md": 1073741824   # 1GB
+    ".txt": 1073741824  # 1GB
+    ".rst": 1073741824  # 1GB
+    # Code files - generous limits for large projects
+    ".py": 1073741824    # 1GB
+    ".js": 1073741824    # 1GB
+    ".ts": 1073741824    # 1GB
+    ".jsx": 1073741824   # 1GB
+    ".tsx": 1073741824   # 1GB
+    ".java": 1073741824  # 1GB
+    ".cpp": 1073741824   # 1GB
+    ".c": 1073741824     # 1GB
+    ".h": 1073741824     # 1GB
+    ".hpp": 1073741824   # 1GB
+    ".go": 1073741824    # 1GB
+    ".rs": 1073741824    # 1GB
+    ".php": 1073741824   # 1GB
+    ".rb": 1073741824    # 1GB
+    ".swift": 1073741824 # 1GB
+    ".kt": 1073741824    # 1GB
+    ".scala": 1073741824 # 1GB
+    # Config files - larger limits
+    ".json": 104857600   # 100MB
+    ".yaml": 104857600   # 100MB
+    ".yml": 104857600    # 100MB
+    ".xml": 104857600    # 100MB
+    ".sql": 104857600    # 100MB
+
+# Directory filtering
+directory_filtering:
+  # Maximum number of files per directory (increased for massive codebases)
+  # Directories with more files will be skipped unless explicitly included
+  max_files_per_directory: 1000000  # 1M files - handles massive projects with 600K+ files
+  
+  # Maximum number of subdirectories per directory (increased for extremely complex projects)
+  max_subdirectories_per_directory: 50000  # 50K subdirs - handles complex project structures
+  
+  # Skip directories with these patterns (in addition to standard ignore patterns)
+  skip_large_directories:
+    - "**/node_modules/**"
+    - "**/venv/**"
+    - "**/.venv/**"
+    - "**/env/**"
+    - "**/.env/**"
+    - "**/virtualenv/**"
+    - "**/site-packages/**"
+    - "**/dist/**"
+    - "**/build/**"
+    - "**/target/**"
+    - "**/out/**"
+    - "**/bin/**"
+    - "**/obj/**"
+    - "**/.git/**"
+    - "**/.svn/**"
+    - "**/.hg/**"
+    - "**/coverage/**"
+    - "**/htmlcov/**"
+    - "**/.pytest_cache/**"
+    - "**/.cache/**"
+    - "**/.tox/**"
+    - "**/allure-results/**"
+    - "**/allure-report/**"
+    - "**/logs/**"
+    - "**/log/**"
+    - "**/tmp/**"
+    - "**/temp/**"
+
+# Explicit inclusions (override size/count limits)
+explicit_inclusions:
+  # File patterns to always include regardless of size
+  files: []
+  
+  # Directory patterns to always include regardless of file count
+  directories: []
+  
+  # Specific file extensions to always include
+  extensions: []
+
+# Performance settings
+performance:
+  # Enable parallel processing for large directories
+  parallel_processing: true
+  
+  # Maximum number of worker threads for parallel processing
+  max_workers: 8  # Increased for massive projects with 600K+ files
+  
+  # Enable caching of directory scans
+  cache_directory_scans: true
+  
+  # Log filtering decisions for debugging
+  log_filtering_decisions: false
+
+# Memory management settings
+memory:
+  # Soft memory limit in MB (triggers cleanup)
+  soft_limit_mb: 16384.0  # 16GB - Increased for massive projects
+  
+  # Hard memory limit in MB (triggers aggressive cleanup)
+  hard_limit_mb: 32768.0  # 32GB - Increased for extremely large projects
+  
+  # Maximum number of files to keep loaded in memory
+  max_loaded_files: 2000  # Increased for massive projects
+  
+  # Maximum number of cached search queries
+  max_cached_queries: 1000  # Increased for massive projects
+  
+  # Memory threshold for triggering garbage collection (MB)
+  gc_threshold_mb: 4096.0  # 4GB - Increased for massive projects
+  
+  # Memory threshold for spilling data to disk (MB)
+  spill_threshold_mb: 12288.0  # 12GB - Increased for massive projects
+  
+  # Enable continuous memory monitoring
+  enable_monitoring: true
+  
+  # Memory monitoring interval in seconds
+  monitoring_interval: 30.0
+  
+# Enable memory profiling and export
+  enable_profiling: true
+  
+  # Export memory profile on shutdown
+  export_profile_on_shutdown: true
+
+# Performance monitoring configuration
+performance_monitoring:
+  # Enable performance monitoring and metrics collection
+  enable_monitoring: true
+  
+  # Enable structured logging for operations
+  enable_logging: true
+  
+  # Logging level for performance monitoring (DEBUG, INFO, WARNING, ERROR)
+  log_level: "INFO"
+  
+  # Export metrics in JSON format
+  export_json_metrics: true
+  
+  # Export metrics in Prometheus format
+  export_prometheus_metrics: true
+  
+  # Directory to export metrics files
+  metrics_export_directory: "/tmp/leindex_metrics"
+  
+  # Export metrics interval in seconds (0 = disabled)
+  metrics_export_interval: 300  # 5 minutes
+  
+  # Custom counters to track
+  custom_counters:
+    - name: "files_skipped_total"
+      description: "Total number of files skipped during indexing"
+      labels:
+        reason: "size_limit"
+    - name: "directories_skipped_total"
+      description: "Total number of directories skipped during indexing"
+      labels:
+        reason: "file_count_limit"
+  
+  # Custom histograms for timing measurements
+  custom_histograms:
+    - name: "database_operation_duration_ms"
+      description: "Duration of database operations in milliseconds"
+      buckets: [1.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0]
+    - name: "file_size_processed_bytes"
+      description: "Size of files processed in bytes"
+      buckets: [1024, 10240, 102400, 1048576, 10485760, 104857600, 1073741824]
