@@ -761,17 +761,20 @@ class SQLiteSearch(SearchInterface):
             conn.execute('PRAGMA foreign_keys = ON')
 
             if self.enable_fts:
-                # Create FTS table for file paths
+                # CRITICAL FIX: Create FTS table for file paths using external content
+                # The 'content' option points to the source table for automatic indexing
                 conn.execute('''
                     CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
                         file_path, content='files', content_rowid='id'
                     )
                 ''')
 
-                # Create FTS table for kv_store values (content search)
+                # CRITICAL FIX: Create FTS table for kv_store WITHOUT external content
+                # We cannot use content='kv_store' because kv_fts needs a 'value_text' column
+                # that doesn't exist in kv_store. Instead, we'll manually populate kv_fts.
                 conn.execute('''
                     CREATE VIRTUAL TABLE IF NOT EXISTS kv_fts USING fts5(
-                        key, value_text, content='kv_store', content_rowid='rowid'
+                        key, value_text
                     )
                 ''')
 
@@ -850,12 +853,18 @@ class SQLiteSearch(SearchInterface):
                 # Repair kv_fts from kv_store data
                 try:
                     conn.execute("DELETE FROM kv_fts")
+
+                    # CRITICAL FIX: Properly convert BLOB values to text for FTS indexing
+                    # The kv_store table has: key (TEXT), value (BLOB), value_type (TEXT)
+                    # We need to decode the BLOB and convert it to searchable text
                     conn.execute('''
-                        INSERT OR IGNORE INTO kv_fts (rowid, key, value_text)
-                        SELECT rowid, key, CASE
-                            WHEN value_type = 'text' THEN CAST(value AS TEXT)
-                            ELSE json_extract(CAST(value AS TEXT), '$')
-                        END
+                        INSERT INTO kv_fts (key, value_text)
+                        SELECT
+                            key,
+                            CASE
+                                WHEN value_type = 'text' THEN CAST(value AS TEXT)
+                                ELSE json_extract(CAST(value AS TEXT), '$')
+                            END as searchable_text
                         FROM kv_store
                         WHERE value IS NOT NULL
                     ''')
@@ -869,8 +878,8 @@ class SQLiteSearch(SearchInterface):
                 try:
                     conn.execute("DELETE FROM files_fts")
                     conn.execute('''
-                        INSERT OR IGNORE INTO files_fts (rowid, file_path)
-                        SELECT id, file_path
+                        INSERT INTO files_fts (file_path)
+                        SELECT file_path
                         FROM files
                         WHERE file_path IS NOT NULL
                     ''')
@@ -960,20 +969,21 @@ class SQLiteSearch(SearchInterface):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 if is_regex:
-                    # For regex patterns, use REGEXP operator
+                    # CRITICAL FIX: For regex patterns, use REGEXP operator directly on kv_fts
+                    # Since kv_fts is no longer external content, we query it directly
                     cursor = conn.execute('''
                         SELECT kv_store.key, kv_store.value, kv_store.value_type
                         FROM kv_fts
-                        JOIN kv_store ON kv_fts.rowid = kv_store.rowid
+                        JOIN kv_store ON kv_fts.key = kv_store.key
                         WHERE kv_fts.value_text REGEXP ?
                         ORDER BY rank
                     ''', (search_query,))
                 else:
-                    # Standard FTS search with MATCH
+                    # CRITICAL FIX: Standard FTS search with MATCH on kv_fts directly
                     cursor = conn.execute('''
                         SELECT kv_store.key, kv_store.value, kv_store.value_type
                         FROM kv_fts
-                        JOIN kv_store ON kv_fts.rowid = kv_store.rowid
+                        JOIN kv_store ON kv_fts.key = kv_store.key
                         WHERE kv_fts MATCH ?
                         ORDER BY rank
                     ''', (search_query,))
@@ -1068,11 +1078,11 @@ class SQLiteSearch(SearchInterface):
 
     def index_document(self, doc_id: str, document: Dict[str, Any]) -> bool:
         """Index a document for search in SQLite FTS tables.
-        
+
         Args:
             doc_id: Unique identifier for the document
             document: Document data to index
-            
+
         Returns:
             True if successful, False otherwise
         """
@@ -1081,21 +1091,21 @@ class SQLiteSearch(SearchInterface):
                 # For SQLite, we store the document in the kv_store and update FTS
                 file_path = document.get('path', doc_id)
                 content = document.get('content', '')
-                
+
                 # Store in kv_store
                 conn.execute('''
                     INSERT OR REPLACE INTO kv_store (key, value, value_type)
                     VALUES (?, ?, 'text')
                 ''', (doc_id, content.encode('utf-8')))
-                
-                # Update FTS tables if enabled
+
+                # CRITICAL FIX: Update FTS tables if enabled
+                # Since kv_fts is no longer an external content table, we must manually populate it
                 if self.enable_fts:
-                    # Update content FTS
                     conn.execute('''
                         INSERT OR REPLACE INTO kv_fts (key, value_text)
                         VALUES (?, ?)
                     ''', (doc_id, content))
-                
+
                 conn.commit()
                 return True
         except Exception as e:
@@ -1124,7 +1134,8 @@ class SQLiteSearch(SearchInterface):
                     VALUES (?, ?, 'text')
                 ''', (file_path, content.encode('utf-8')))
 
-                # Update FTS if enabled
+                # CRITICAL FIX: Update FTS if enabled
+                # Since kv_fts is no longer an external content table, we must manually populate it
                 if self.enable_fts:
                     conn.execute('''
                         INSERT OR REPLACE INTO kv_fts (key, value_text)
@@ -1163,9 +1174,11 @@ class SQLiteSearch(SearchInterface):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 if self.enable_fts:
+                    # CRITICAL FIX: Since kv_fts is no longer external content, join with kv_store
                     cursor = conn.execute('''
-                        SELECT key, value
+                        SELECT kv_store.key, kv_store.value
                         FROM kv_fts
+                        JOIN kv_store ON kv_fts.key = kv_store.key
                         WHERE kv_fts MATCH ?
                         LIMIT 100
                     ''', (query,))

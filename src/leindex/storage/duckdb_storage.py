@@ -95,6 +95,7 @@ class DuckDBAnalytics:
         Notes:
             - Connection is closed on initialization failure
             - Analytical views are created only if SQLite is attached
+            - Database attachment is idempotent - checks if already attached
         """
         # Create DuckDB connection
         self.conn = duckdb.connect(self.db_path)
@@ -107,15 +108,24 @@ class DuckDBAnalytics:
             # Attach SQLite database if provided
             if self.sqlite_db_path and os.path.exists(self.sqlite_db_path):
                 try:
-                    # Validate and sanitize the SQLite path to prevent SQL injection
-                    # DuckDB doesn't support parameterized queries for ATTACH
-                    if not self._is_safe_path(self.sqlite_db_path):
-                        raise ValueError(f"Invalid SQLite database path: {self.sqlite_db_path}")
+                    # CRITICAL FIX: Check if database is already attached before attempting
+                    # This prevents "database already exists" errors when multiple
+                    # DuckDBAnalytics instances are created with the same SQLite database
+                    attached_dbs = self.conn.execute("SELECT database_name FROM duckdb_databases()").fetchall()
+                    attached_names = [row[0] for row in attached_dbs]
 
-                    # Escape single quotes in the path to prevent SQL injection
-                    safe_path = self.sqlite_db_path.replace("'", "''")
-                    self.conn.execute(f"ATTACH '{safe_path}' AS sqlite_db (TYPE sqlite)")
-                    logger.info(f"Attached SQLite database: {self.sqlite_db_path}")
+                    if 'sqlite_db' in attached_names:
+                        logger.info(f"SQLite database 'sqlite_db' already attached, skipping attachment")
+                    else:
+                        # Validate and sanitize the SQLite path to prevent SQL injection
+                        # DuckDB doesn't support parameterized queries for ATTACH
+                        if not self._is_safe_path(self.sqlite_db_path):
+                            raise ValueError(f"Invalid SQLite database path: {self.sqlite_db_path}")
+
+                        # Escape single quotes in the path to prevent SQL injection
+                        safe_path = self.sqlite_db_path.replace("'", "''")
+                        self.conn.execute(f"ATTACH '{safe_path}' AS sqlite_db (TYPE sqlite)")
+                        logger.info(f"Attached SQLite database: {self.sqlite_db_path}")
                 except Exception as e:
                     logger.warning(f"Could not attach SQLite database: {e}")
                     # Re-raise to ensure cleanup in outer try/finally
