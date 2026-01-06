@@ -634,10 +634,21 @@ function Merge-JsonConfig {
     $pythonScript = @"
 import json
 import sys
+import os
 
 config_file = r'$ConfigFile'
 server_name = '$ServerName'
 server_command = '$ServerCommand'
+
+# Ensure directory exists
+config_dir = os.path.dirname(config_file)
+if config_dir and not os.path.exists(config_dir):
+    try:
+        os.makedirs(config_dir, exist_ok=True)
+        print(f"Created directory: {config_dir}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error creating directory {config_dir}: {e}", file=sys.stderr)
+        sys.exit(1)
 
 # Validate existing config
 try:
@@ -652,7 +663,11 @@ try:
                 config = {}
         else:
             config = {}
-except (FileNotFoundError, json.JSONDecodeError):
+except FileNotFoundError:
+    config = {}
+    print(f"Config file not found, will create: {config_file}", file=sys.stderr)
+except Exception as e:
+    print(f"Error reading config: {e}", file=sys.stderr)
     config = {}
 
 if 'mcpServers' not in config:
@@ -677,14 +692,25 @@ except (TypeError, ValueError) as e:
     print(f"Error: Invalid configuration structure: {e}", file=sys.stderr)
     sys.exit(1)
 
-with open(config_file, 'w') as f:
-    json.dump(config, f, indent=2)
-    f.write('\n')
+# Write to file with explicit error handling
+try:
+    with open(config_file, 'w') as f:
+        json.dump(config, f, indent=2)
+        f.write('\n')
+    print(f"Successfully wrote: {config_file}", file=sys.stderr)
+except Exception as e:
+    print(f"Error writing config file {config_file}: {e}", file=sys.stderr)
+    sys.exit(1)
 
 print(f"Updated: {config_file}")
 "@
 
     & $PYTHON_CMD -c $pythonScript
+
+    # Check exit code and throw on failure
+    if ($LASTEXITCODE -ne 0) {
+        throw "Python script failed with exit code $LASTEXITCODE"
+    }
 }
 
 # Configure Claude Desktop
@@ -845,11 +871,22 @@ function Merge-VSCodeConfig {
     $pythonScript = @"
 import json
 import sys
+import os
 
 config_file = r'$ConfigFile'
 server_name = '$ServerName'
 server_command = '$ServerCommand'
 extension_key = '$ExtensionKey'
+
+# Ensure directory exists
+config_dir = os.path.dirname(config_file)
+if config_dir and not os.path.exists(config_dir):
+    try:
+        os.makedirs(config_dir, exist_ok=True)
+        print(f"Created directory: {config_dir}", file=sys.stderr)
+    except Exception as e:
+        print(f"Error creating directory {config_dir}: {e}", file=sys.stderr)
+        sys.exit(1)
 
 # Validate existing config
 try:
@@ -864,7 +901,11 @@ try:
                 config = {}
         else:
             config = {}
-except (FileNotFoundError, json.JSONDecodeError):
+except FileNotFoundError:
+    config = {}
+    print(f"Config file not found, will create: {config_file}", file=sys.stderr)
+except Exception as e:
+    print(f"Error reading config: {e}", file=sys.stderr)
     config = {}
 
 # Ensure extension-specific key exists
@@ -890,14 +931,25 @@ except (TypeError, ValueError) as e:
     print(f"Error: Invalid configuration structure: {e}", file=sys.stderr)
     sys.exit(1)
 
-with open(config_file, 'w') as f:
-    json.dump(config, f, indent=2)
-    f.write('\n')
+# Write to file with explicit error handling
+try:
+    with open(config_file, 'w') as f:
+        json.dump(config, f, indent=2)
+        f.write('\n')
+    print(f"Successfully wrote: {config_file}", file=sys.stderr)
+except Exception as e:
+    print(f"Error writing config file {config_file}: {e}", file=sys.stderr)
+    sys.exit(1)
 
 print(f"Updated: {config_file}")
 "@
 
     & $PYTHON_CMD -c $pythonScript
+
+    # Check exit code and throw on failure
+    if ($LASTEXITCODE -ne 0) {
+        throw "Python script failed with exit code $LASTEXITCODE"
+    }
 }
 
 # Configure VS Code

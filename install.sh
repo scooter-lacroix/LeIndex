@@ -647,13 +647,25 @@ merge_json_config() {
     local server_name="$2"
     local server_command="${3:-leindex}"
 
-    $PYTHON_CMD << PYTHON_EOF
+    # Run Python script and capture exit status
+    $PYTHON_CMD -c "
 import json
 import sys
+import os
 
-config_file = "$config_file"
-server_name = "$server_name"
-server_command = "$server_command"
+config_file = \"$config_file\"
+server_name = \"$server_name\"
+server_command = \"$server_command\"
+
+# Ensure directory exists
+config_dir = os.path.dirname(config_file)
+if config_dir and not os.path.exists(config_dir):
+    try:
+        os.makedirs(config_dir, exist_ok=True)
+        print(f\"Created directory: {config_dir}\", file=sys.stderr)
+    except Exception as e:
+        print(f\"Error creating directory {config_dir}: {e}\", file=sys.stderr)
+        sys.exit(1)
 
 # Validate existing config
 try:
@@ -663,12 +675,16 @@ try:
             try:
                 config = json.loads(existing_content)
             except json.JSONDecodeError as e:
-                print(f"Warning: Existing config is invalid JSON: {e}", file=sys.stderr)
-                print(f"Backing up invalid config and creating new one.", file=sys.stderr)
+                print(f\"Warning: Existing config is invalid JSON: {e}\", file=sys.stderr)
+                print(f\"Backing up invalid config and creating new one.\", file=sys.stderr)
                 config = {}
         else:
             config = {}
-except (FileNotFoundError, json.JSONDecodeError):
+except FileNotFoundError:
+    config = {}
+    print(f\"Config file not found, will create: {config_file}\", file=sys.stderr)
+except Exception as e:
+    print(f\"Error reading config: {e}\", file=sys.stderr)
     config = {}
 
 if 'mcpServers' not in config:
@@ -677,8 +693,8 @@ if 'mcpServers' not in config:
 # Check if server already exists
 if server_name in config.get('mcpServers', {}):
     existing_config = config['mcpServers'][server_name]
-    print(f"Notice: Server '{server_name}' already configured.", file=sys.stderr)
-    print(f"Existing config: {existing_config}", file=sys.stderr)
+    print(f\"Notice: Server '{server_name}' already configured.\", file=sys.stderr)
+    print(f\"Existing config: {existing_config}\", file=sys.stderr)
 
 # Claude Desktop/Cursor do NOT support 'disabled' or 'env' fields
 config['mcpServers'][server_name] = {
@@ -690,15 +706,24 @@ config['mcpServers'][server_name] = {
 try:
     json.dumps(config)
 except (TypeError, ValueError) as e:
-    print(f"Error: Invalid configuration structure: {e}", file=sys.stderr)
+    print(f\"Error: Invalid configuration structure: {e}\", file=sys.stderr)
     sys.exit(1)
 
-with open(config_file, 'w') as f:
-    json.dump(config, f, indent=2)
-    f.write('\n')
+# Write to file with explicit error handling
+try:
+    with open(config_file, 'w') as f:
+        json.dump(config, f, indent=2)
+        f.write('\n')
+    print(f\"Successfully wrote: {config_file}\", file=sys.stderr)
+except Exception as e:
+    print(f\"Error writing config file {config_file}: {e}\", file=sys.stderr)
+    sys.exit(1)
 
-print(f"Updated: {config_file}")
-PYTHON_EOF
+print(f\"Updated: {config_file}\")
+"
+
+    # Return Python script's exit status
+    return $?
 }
 
 # Configure Claude Desktop
@@ -862,14 +887,26 @@ merge_vscode_config() {
     local server_command="${3:-leindex}"
     local extension_key="${4:-cline.mcpServers}"  # Default to Cline
 
-    $PYTHON_CMD << PYTHON_EOF
+    # Run Python script and capture exit status
+    $PYTHON_CMD -c "
 import json
 import sys
+import os
 
-config_file = "$config_file"
-server_name = "$server_name"
-server_command = "$server_command"
-extension_key = "$extension_key"
+config_file = \"$config_file\"
+server_name = \"$server_name\"
+server_command = \"$server_command\"
+extension_key = \"$extension_key\"
+
+# Ensure directory exists
+config_dir = os.path.dirname(config_file)
+if config_dir and not os.path.exists(config_dir):
+    try:
+        os.makedirs(config_dir, exist_ok=True)
+        print(f\"Created directory: {config_dir}\", file=sys.stderr)
+    except Exception as e:
+        print(f\"Error creating directory {config_dir}: {e}\", file=sys.stderr)
+        sys.exit(1)
 
 # Validate existing config
 try:
@@ -879,12 +916,16 @@ try:
             try:
                 config = json.loads(existing_content)
             except json.JSONDecodeError as e:
-                print(f"Warning: Existing config is invalid JSON: {e}", file=sys.stderr)
-                print(f"Backing up invalid config and creating new one.", file=sys.stderr)
+                print(f\"Warning: Existing config is invalid JSON: {e}\", file=sys.stderr)
+                print(f\"Backing up invalid config and creating new one.\", file=sys.stderr)
                 config = {}
         else:
             config = {}
-except (FileNotFoundError, json.JSONDecodeError):
+except FileNotFoundError:
+    config = {}
+    print(f\"Config file not found, will create: {config_file}\", file=sys.stderr)
+except Exception as e:
+    print(f\"Error reading config: {e}\", file=sys.stderr)
     config = {}
 
 # Ensure extension-specific key exists
@@ -894,8 +935,8 @@ if extension_key not in config:
 # Check if server already exists
 if extension_key in config and server_name in config[extension_key]:
     existing_config = config[extension_key][server_name]
-    print(f"Notice: Server '{server_name}' already configured in {extension_key}.", file=sys.stderr)
-    print(f"Existing config: {existing_config}", file=sys.stderr)
+    print(f\"Notice: Server '{server_name}' already configured in {extension_key}.\", file=sys.stderr)
+    print(f\"Existing config: {existing_config}\", file=sys.stderr)
 
 # Add server to extension-specific config
 config[extension_key][server_name] = {
@@ -907,15 +948,24 @@ config[extension_key][server_name] = {
 try:
     json.dumps(config)
 except (TypeError, ValueError) as e:
-    print(f"Error: Invalid configuration structure: {e}", file=sys.stderr)
+    print(f\"Error: Invalid configuration structure: {e}\", file=sys.stderr)
     sys.exit(1)
 
-with open(config_file, 'w') as f:
-    json.dump(config, f, indent=2)
-    f.write('\n')
+# Write to file with explicit error handling
+try:
+    with open(config_file, 'w') as f:
+        json.dump(config, f, indent=2)
+        f.write('\n')
+    print(f\"Successfully wrote: {config_file}\", file=sys.stderr)
+except Exception as e:
+    print(f\"Error writing config file {config_file}: {e}\", file=sys.stderr)
+    sys.exit(1)
 
-print(f"Updated: {config_file}")
-PYTHON_EOF
+print(f\"Updated: {config_file}\")
+"
+
+    # Return Python script's exit status
+    return $?
 }
 
 # Configure VS Code / VSCodium
