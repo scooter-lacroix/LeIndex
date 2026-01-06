@@ -29,6 +29,75 @@ $LogDir = "$LEINDEX_HOME\logs"
 # Backup directory
 $BackupDir = "$env:TEMP\leindex-install-backup-$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 
+# ============================================================================
+# LOGGING SYSTEM
+# ============================================================================
+
+# Check for debug mode
+if ($env:DEBUG -eq "1" -or $env:VERBOSE -eq "1") {
+    $DebugPreference = "Continue"
+    Set-PSDebug -Trace 1
+}
+
+# Create log file
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+$InstallLog = "$LogDir\install-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+
+# Initialize log file
+$timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+@"
+=== LeIndex Installation Log ===
+Date: $timestamp
+Script Version: $ScriptVersion
+Platform: Windows PowerShell $($PSVersionTable.PSVersion)
+DEBUG Mode: $($env:DEBUG -eq '1')
+================================
+"@ | Out-File -FilePath $InstallLog -Encoding UTF8
+
+# Logging functions
+function Log-Debug {
+    param([string]$Message)
+    $logMsg = "[DEBUG] $Message"
+    Add-Content -Path $InstallLog -Value $logMsg
+    if ($env:DEBUG -eq "1") {
+        Write-Host $logMsg -ForegroundColor Gray
+    }
+}
+
+function Log-Info {
+    param([string]$Message)
+    $logMsg = "[INFO] $Message"
+    Add-Content -Path $InstallLog -Value $logMsg
+    Write-Host $logMsg -ForegroundColor Cyan
+}
+
+function Log-Error {
+    param([string]$Message)
+    $logMsg = "[ERROR] $Message"
+    Add-Content -Path $InstallLog -Value $logMsg
+    Write-Host $logMsg -ForegroundColor Red
+}
+
+function Log-Warn {
+    param([string]$Message)
+    $logMsg = "[WARN] $Message"
+    Add-Content -Path $InstallLog -Value $logMsg
+    Write-Host $logMsg -ForegroundColor Yellow
+}
+
+function Log-Success {
+    param([string]$Message)
+    $logMsg = "[SUCCESS] $Message"
+    Add-Content -Path $InstallLog -Value $logMsg
+    Write-Host $logMsg -ForegroundColor Green
+}
+
+function Log-Command {
+    param([string]$Command)
+    $logMsg = "[CMD] $Command"
+    Add-Content -Path $InstallLog -Value $logMsg
+}
+
 # Total steps for progress tracking
 $TotalSteps = 7
 
@@ -631,6 +700,9 @@ function Merge-JsonConfig {
         [string]$ServerCommand = "leindex"
     )
 
+    Log-Info "Merge-JsonConfig called with: ConfigFile=$ConfigFile, ServerName=$ServerName, Command=$ServerCommand"
+    Log-Debug "Config file path: $ConfigFile"
+
     $pythonScript = @"
 import json
 import sys
@@ -640,14 +712,18 @@ config_file = r'$ConfigFile'
 server_name = '$ServerName'
 server_command = '$ServerCommand'
 
+print(f"[DEBUG] Config file: {config_file}", file=sys.stderr)
+print(f"[DEBUG] Server name: {server_name}", file=sys.stderr)
+print(f"[DEBUG] Server command: {server_command}", file=sys.stderr)
+
 # Ensure directory exists
 config_dir = os.path.dirname(config_file)
 if config_dir and not os.path.exists(config_dir):
     try:
         os.makedirs(config_dir, exist_ok=True)
-        print(f"Created directory: {config_dir}", file=sys.stderr)
+        print(f"[INFO] Created directory: {config_dir}", file=sys.stderr)
     except Exception as e:
-        print(f"Error creating directory {config_dir}: {e}", file=sys.stderr)
+        print(f"[ERROR] Error creating directory {config_dir}: {e}", file=sys.stderr)
         sys.exit(1)
 
 # Validate existing config
@@ -657,39 +733,47 @@ try:
         if existing_content.strip():
             try:
                 config = json.loads(existing_content)
+                print(f"[INFO] Loaded existing config from {config_file}", file=sys.stderr)
             except json.JSONDecodeError as e:
-                print(f"Warning: Existing config is invalid JSON: {e}", file=sys.stderr)
-                print(f"Backing up invalid config and creating new one.", file=sys.stderr)
+                print(f"[WARN] Existing config is invalid JSON: {e}", file=sys.stderr)
+                print(f"[INFO] Backing up invalid config and creating new one.", file=sys.stderr)
                 config = {}
         else:
+            print(f"[INFO] Config file exists but is empty", file=sys.stderr)
             config = {}
 except FileNotFoundError:
     config = {}
-    print(f"Config file not found, will create: {config_file}", file=sys.stderr)
+    print(f"[INFO] Config file not found, will create: {config_file}", file=sys.stderr)
 except Exception as e:
-    print(f"Error reading config: {e}", file=sys.stderr)
+    print(f"[ERROR] Error reading config: {e}", file=sys.stderr)
+    import traceback
+    traceback.print_exc(file=sys.stderr)
     config = {}
 
 if 'mcpServers' not in config:
+    print(f"[INFO] Creating mcpServers section", file=sys.stderr)
     config['mcpServers'] = {}
 
 # Check if server already exists
 if server_name in config.get('mcpServers', {}):
     existing_config = config['mcpServers'][server_name]
-    print(f"Notice: Server '{server_name}' already configured.", file=sys.stderr)
-    print(f"Existing config: {existing_config}", file=sys.stderr)
+    print(f"[INFO] Server '{server_name}' already configured.", file=sys.stderr)
+    print(f"[DEBUG] Existing config: {existing_config}", file=sys.stderr)
 
 # Claude Desktop/Cursor do NOT support 'disabled' or 'env' fields
-config['mcpServers'][server_name] = {
+new_server_config = {
     'command': server_command,
     'args': ['mcp']
 }
+print(f"[DEBUG] New server config: {new_server_config}", file=sys.stderr)
+config['mcpServers'][server_name] = new_server_config
 
 # Validate config can be serialized
 try:
     json.dumps(config)
+    print(f"[DEBUG] Config is valid JSON", file=sys.stderr)
 except (TypeError, ValueError) as e:
-    print(f"Error: Invalid configuration structure: {e}", file=sys.stderr)
+    print(f"[ERROR] Invalid configuration structure: {e}", file=sys.stderr)
     sys.exit(1)
 
 # Write to file with explicit error handling
@@ -697,25 +781,43 @@ try:
     with open(config_file, 'w') as f:
         json.dump(config, f, indent=2)
         f.write('\n')
-    print(f"Successfully wrote: {config_file}", file=sys.stderr)
+    print(f"[SUCCESS] Successfully wrote: {config_file}", file=sys.stderr)
+    print(f"[DEBUG] Final config: {json.dumps(config, indent=2)}", file=sys.stderr)
 except Exception as e:
-    print(f"Error writing config file {config_file}: {e}", file=sys.stderr)
+    print(f"[ERROR] Error writing config file {config_file}: {e}", file=sys.stderr)
+    import traceback
+    traceback.print_exc(file=sys.stderr)
     sys.exit(1)
 
 print(f"Updated: {config_file}")
 "@
 
-    & $PYTHON_CMD -c $pythonScript
+    Log-Debug "Starting Python script execution..."
+    Log-Command "& `$PYTHON_CMD -c `<JSON merge script>`"
 
-    # Check exit code and throw on failure
-    if ($LASTEXITCODE -ne 0) {
-        throw "Python script failed with exit code $LASTEXITCODE"
+    $output = & $PYTHON_CMD -c $pythonScript 2>&1
+    $exitCode = $LASTEXITCODE
+
+    Log-Debug "Python script exit code: $exitCode"
+    Add-Content -Path $InstallLog -Value $output
+
+    if ($exitCode -ne 0) {
+        Log-Error "Python script failed with exit code $exitCode"
+        Log-Error "Python output:"
+        $output | ForEach-Object { Log-Error "  $_" }
+        throw "Python script failed with exit code $exitCode"
     }
+
+    Log-Debug "Python script output:"
+    $output | ForEach-Object { Log-Debug "  $_" }
+
+    Log-Success "Successfully merged JSON config to $ConfigFile"
 }
 
 # Configure Claude Desktop
 function Configure-ClaudeDesktop {
     Print-Section "Configuring Claude Desktop"
+    Log-Info "Starting Claude Desktop configuration"
 
     # Search for Claude Desktop config (NOT Claude Code CLI!)
     $claudeConfigs = @(
@@ -727,10 +829,13 @@ function Configure-ClaudeDesktop {
     $configFile = $null
     $configDir = $null
 
+    Log-Info "Searching for Claude Desktop config..."
     foreach ($conf in $claudeConfigs) {
+        Log-Debug "Checking for config at: $conf"
         if (Test-Path $conf) {
             $configFile = $conf
             $configDir = Split-Path $conf -Parent
+            Log-Info "Found existing config at: $configFile"
             Print-Bullet "Found config at: $configFile"
             break
         }
@@ -740,17 +845,33 @@ function Configure-ClaudeDesktop {
     if (-not $configFile) {
         $configDir = "$env:APPDATA\Claude"
         $configFile = "$configDir\claude_desktop_config.json"
+        Log-Info "No existing config found. Will create: $configFile"
         Print-Info "No existing config found. Will create: $configFile"
     }
 
+    Log-Debug "Config directory: $configDir"
+    Log-Debug "Config file: $configFile"
+
     try {
+        Log-Debug "Creating config directory if needed..."
         New-Item -ItemType Directory -Path $configDir -Force -ErrorAction Stop | Out-Null
+        Log-Success "Created/confirmed config directory: $configDir"
+
+        Log-Debug "Backing up existing config file..."
         Backup-FileSafe $configFile
+        Log-Debug "Backup completed"
+
+        Log-Info "Calling Merge-JsonConfig for Claude Desktop..."
         Merge-JsonConfig $configFile "leindex" "leindex"
+        Log-Success "Claude Desktop configured successfully"
         Print-Success "Claude Desktop configured"
         Print-Bullet "Config: $configFile"
     } catch {
-        Print-Warning "Failed to configure Claude Desktop: $_"
+        Log-Error "Failed to configure Claude Desktop: $_"
+        Log-Error "Exception: $($_.Exception.Message)"
+        Log-Error "Stack Trace: $($_.ScriptStackTrace)"
+        Print-Error "Failed to configure Claude Desktop: $_"
+        Print-Info "Check log file for details: $InstallLog"
         return 2
     }
 }
@@ -1511,6 +1632,11 @@ function Show-Completion {
     Print-Bullet "Documentation: See README.md"
     Write-Host ""
 
+    Write-ColorText "Installation Log:" -ForegroundColor Yellow
+    Print-Bullet "Log file: $InstallLog"
+    Print-Bullet "To see all debug info, run: `$env:DEBUG = '1'; .\install.ps1"
+    Write-Host ""
+
     Write-ColorText "Troubleshooting:" -ForegroundColor Yellow
     Print-Bullet "Check logs: $LogDir\"
     Print-Bullet "Test MCP: $PYTHON_CMD -m leindex.server"
@@ -1565,6 +1691,10 @@ trap {
         Write-Host ""
         Print-Warning "Some tool configurations failed, but LeIndex is installed"
         Print-Info "You can configure tools manually later"
+        Write-Host ""
+        Print-Warning "Installation log: $InstallLog"
+        Print-Info "Run with DEBUG=1 for detailed output:"
+        Print-Bullet "`$env:DEBUG = '1'; .\install.ps1"
         exit 0  # Don't fail the entire installation
     }
 }

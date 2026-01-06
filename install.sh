@@ -28,6 +28,67 @@ LOG_DIR="${LEINDEX_HOME}/logs"
 BACKUP_DIR="/tmp/leindex-install-backup-$(date +%Y%m%d_%H%M%S)"
 
 # ============================================================================
+# LOGGING SYSTEM
+# ============================================================================
+
+# Check for debug mode
+if [[ "${DEBUG:-}" == "1" ]] || [[ "${VERBOSE:-}" == "1" ]]; then
+    set -x  # Print every command
+fi
+
+# Create log file
+mkdir -p "$LOG_DIR"
+INSTALL_LOG="$LOG_DIR/install-$(date +%Y%m%d-%H%M%S).log"
+
+# Initialize log file
+echo "=== LeIndex Installation Log ===" > "$INSTALL_LOG"
+echo "Date: $(date)" >> "$INSTALL_LOG"
+echo "Script Version: $SCRIPT_VERSION" >> "$INSTALL_LOG"
+echo "DEBUG Mode: ${DEBUG:-0}" >> "$INSTALL_LOG"
+echo "================================" >> "$INSTALL_LOG"
+echo "" >> "$INSTALL_LOG"
+
+# Logging functions
+log_debug() {
+    local msg="$*"
+    echo "[DEBUG] $msg" >> "$INSTALL_LOG"
+    if [[ "${DEBUG:-}" == "1" ]]; then
+        printf "${DIM}[DEBUG]${NC} %s\n" "$msg" >&2
+    fi
+}
+
+log_info() {
+    local msg="$*"
+    echo "[INFO] $msg" >> "$INSTALL_LOG"
+    printf "${CYAN}[INFO]${NC} %s\n" "$msg" >&2
+}
+
+log_error() {
+    local msg="$*"
+    echo "[ERROR] $msg" >> "$INSTALL_LOG"
+    printf "${RED}[ERROR]${NC} %s\n" "$msg" >&2
+}
+
+log_warn() {
+    local msg="$*"
+    echo "[WARN] $msg" >> "$INSTALL_LOG"
+    printf "${YELLOW}[WARN]${NC} %s\n" "$msg" >&2
+}
+
+log_success() {
+    local msg="$*"
+    echo "[SUCCESS] $msg" >> "$INSTALL_LOG"
+    printf "${GREEN}[SUCCESS]${NC} %s\n" "$msg" >&2
+}
+
+# Log command execution
+log_cmd() {
+    local cmd="$*"
+    log_debug "Executing: $cmd"
+    echo "[CMD] $cmd" >> "$INSTALL_LOG"
+}
+
+# ============================================================================
 # COLOR OUTPUT - FIXED with proper escape sequences
 # ============================================================================
 
@@ -296,6 +357,10 @@ handle_error() {
         echo ""
         print_warning "Some tool configurations failed, but LeIndex is installed"
         print_info "You can configure tools manually later"
+        echo ""
+        print_warning "Installation log: $INSTALL_LOG"
+        print_info "Run with DEBUG=1 for detailed output:"
+        print_bullet "DEBUG=1 ./install.sh"
     fi
 }
 
@@ -647,8 +712,17 @@ merge_json_config() {
     local server_name="$2"
     local server_command="${3:-leindex}"
 
-    # Run Python script and capture exit status
-    $PYTHON_CMD -c "
+    log_info "merge_json_config called with: config_file=$config_file, server_name=$server_name, command=$server_command"
+    log_debug "Config file path: $config_file"
+
+    # Run Python script and capture exit status and output
+    local python_output
+    local python_exit_code
+
+    log_debug "Starting Python script execution..."
+    log_cmd "$PYTHON_CMD -c \"<JSON merge script>\""
+
+    python_output=$($PYTHON_CMD -c "
 import json
 import sys
 import os
@@ -657,14 +731,18 @@ config_file = \"$config_file\"
 server_name = \"$server_name\"
 server_command = \"$server_command\"
 
+print(f\"[DEBUG] Config file: {config_file}\", file=sys.stderr)
+print(f\"[DEBUG] Server name: {server_name}\", file=sys.stderr)
+print(f\"[DEBUG] Server command: {server_command}\", file=sys.stderr)
+
 # Ensure directory exists
 config_dir = os.path.dirname(config_file)
 if config_dir and not os.path.exists(config_dir):
     try:
         os.makedirs(config_dir, exist_ok=True)
-        print(f\"Created directory: {config_dir}\", file=sys.stderr)
+        print(f\"[INFO] Created directory: {config_dir}\", file=sys.stderr)
     except Exception as e:
-        print(f\"Error creating directory {config_dir}: {e}\", file=sys.stderr)
+        print(f\"[ERROR] Error creating directory {config_dir}: {e}\", file=sys.stderr)
         sys.exit(1)
 
 # Validate existing config
@@ -674,39 +752,47 @@ try:
         if existing_content.strip():
             try:
                 config = json.loads(existing_content)
+                print(f\"[INFO] Loaded existing config from {config_file}\", file=sys.stderr)
             except json.JSONDecodeError as e:
-                print(f\"Warning: Existing config is invalid JSON: {e}\", file=sys.stderr)
-                print(f\"Backing up invalid config and creating new one.\", file=sys.stderr)
+                print(f\"[WARN] Existing config is invalid JSON: {e}\", file=sys.stderr)
+                print(f\"[INFO] Backing up invalid config and creating new one.\", file=sys.stderr)
                 config = {}
         else:
+            print(f\"[INFO] Config file exists but is empty\", file=sys.stderr)
             config = {}
 except FileNotFoundError:
     config = {}
-    print(f\"Config file not found, will create: {config_file}\", file=sys.stderr)
+    print(f\"[INFO] Config file not found, will create: {config_file}\", file=sys.stderr)
 except Exception as e:
-    print(f\"Error reading config: {e}\", file=sys.stderr)
+    print(f\"[ERROR] Error reading config: {e}\", file=sys.stderr)
+    import traceback
+    traceback.print_exc(file=sys.stderr)
     config = {}
 
 if 'mcpServers' not in config:
+    print(f\"[INFO] Creating mcpServers section\", file=sys.stderr)
     config['mcpServers'] = {}
 
 # Check if server already exists
 if server_name in config.get('mcpServers', {}):
     existing_config = config['mcpServers'][server_name]
-    print(f\"Notice: Server '{server_name}' already configured.\", file=sys.stderr)
-    print(f\"Existing config: {existing_config}\", file=sys.stderr)
+    print(f\"[INFO] Server '{server_name}' already configured.\", file=sys.stderr)
+    print(f\"[DEBUG] Existing config: {existing_config}\", file=sys.stderr)
 
 # Claude Desktop/Cursor do NOT support 'disabled' or 'env' fields
-config['mcpServers'][server_name] = {
+new_server_config = {
     'command': server_command,
     'args': ['mcp']
 }
+print(f\"[DEBUG] New server config: {new_server_config}\", file=sys.stderr)
+config['mcpServers'][server_name] = new_server_config
 
 # Validate config can be serialized
 try:
     json.dumps(config)
+    print(f\"[DEBUG] Config is valid JSON\", file=sys.stderr)
 except (TypeError, ValueError) as e:
-    print(f\"Error: Invalid configuration structure: {e}\", file=sys.stderr)
+    print(f\"[ERROR] Invalid configuration structure: {e}\", file=sys.stderr)
     sys.exit(1)
 
 # Write to file with explicit error handling
@@ -714,21 +800,45 @@ try:
     with open(config_file, 'w') as f:
         json.dump(config, f, indent=2)
         f.write('\n')
-    print(f\"Successfully wrote: {config_file}\", file=sys.stderr)
+    print(f\"[SUCCESS] Successfully wrote: {config_file}\", file=sys.stderr)
+    print(f\"[DEBUG] Final config: {json.dumps(config, indent=2)}\", file=sys.stderr)
 except Exception as e:
-    print(f\"Error writing config file {config_file}: {e}\", file=sys.stderr)
+    print(f\"[ERROR] Error writing config file {config_file}: {e}\", file=sys.stderr)
+    import traceback
+    traceback.print_exc(file=sys.stderr)
     sys.exit(1)
 
 print(f\"Updated: {config_file}\")
-"
+" 2>&1)
+    python_exit_code=$?
+
+    log_debug "Python script exit code: $python_exit_code"
+    echo "$python_output" >> "$INSTALL_LOG"
+
+    if [[ $python_exit_code -ne 0 ]]; then
+        log_error "Python script failed with exit code $python_exit_code"
+        log_error "Python output:"
+        echo "$python_output" | while IFS= read -r line; do
+            log_error "  $line"
+        done
+        return 1
+    fi
+
+    log_debug "Python script output:"
+    echo "$python_output" | while IFS= read -r line; do
+        log_debug "  $line"
+    done
+
+    log_success "Successfully merged JSON config to $config_file"
 
     # Return Python script's exit status
-    return $?
+    return $python_exit_code
 }
 
 # Configure Claude Desktop
 configure_claude_desktop() {
     print_section "Configuring Claude Desktop"
+    log_info "Starting Claude Desktop configuration"
 
     # Search for Claude Desktop config (NOT Claude Code CLI!)
     # Claude Desktop uses claude_desktop_config.json
@@ -740,10 +850,13 @@ configure_claude_desktop() {
     local config_file=""
     local config_dir=""
 
+    log_info "Searching for Claude Desktop config..."
     for conf in "${claude_configs[@]}"; do
+        log_debug "Checking for config at: $conf"
         if [[ -f "$conf" ]]; then
             config_file="$conf"
             config_dir=$(dirname "$conf")
+            log_info "Found existing config at: $config_file"
             print_bullet "Found config at: $config_file"
             break
         fi
@@ -753,17 +866,38 @@ configure_claude_desktop() {
     if [[ -z "$config_file" ]]; then
         config_dir="$HOME/.config/claude"
         config_file="$config_dir/claude_desktop_config.json"
+        log_info "No existing config found. Will create: $config_file"
         print_info "No existing config found. Will create: $config_file"
     fi
 
-    mkdir -p "$config_dir" || { print_warning "Failed to create config directory"; return 2; }
-    backup_file "$config_file" 2>/dev/null || true
+    log_debug "Config directory: $config_dir"
+    log_debug "Config file: $config_file"
 
+    log_debug "Creating config directory if needed..."
+    if mkdir -p "$config_dir" 2>> "$INSTALL_LOG"; then
+        log_success "Created/configirmed config directory: $config_dir"
+    else
+        log_error "Failed to create config directory: $config_dir"
+        print_error "Failed to create config directory"
+        return 2
+    fi
+
+    log_debug "Backing up existing config file..."
+    if backup_file "$config_file" 2>> "$INSTALL_LOG"; then
+        log_debug "Backup completed"
+    else
+        log_debug "No existing file to backup (or backup failed)"
+    fi
+
+    log_info "Calling merge_json_config for Claude Desktop..."
     if merge_json_config "$config_file" "leindex" "leindex"; then
+        log_success "Claude Desktop configured successfully"
         print_success "Claude Desktop configured"
         print_bullet "Config: $config_file"
     else
-        print_warning "Failed to configure Claude Desktop"
+        log_error "Failed to configure Claude Desktop"
+        print_error "Failed to configure Claude Desktop"
+        log_info "Check log file for details: $INSTALL_LOG"
         return 2
     fi
 }
@@ -1504,6 +1638,11 @@ print_completion() {
     printf "${BOLD}${CYAN}Resources:${NC}\n"
     print_bullet "GitHub: $REPO_URL"
     print_bullet "Documentation: See README.md"
+    echo ""
+
+    printf "${BOLD}${YELLOW}Installation Log:${NC}\n"
+    print_bullet "Log file: ${CYAN}$INSTALL_LOG${NC}"
+    print_bullet "To see all debug info, run: ${CYAN}DEBUG=1 ./install.sh${NC}"
     echo ""
 
     printf "${BOLD}${YELLOW}Troubleshooting:${NC}\n"
