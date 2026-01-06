@@ -247,13 +247,7 @@ async def stats_command(args):
     """
     from .stats_dashboard import IndexStatisticsCollector, DashboardCLI
 
-    es_url = args.es_url or os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
-    pg_dsn = args.pg_dsn or os.getenv("DATABASE_URL")
-
-    collector = IndexStatisticsCollector(
-        pg_dsn=pg_dsn,
-        es_url=es_url,
-    )
+    collector = IndexStatisticsCollector()
 
     cli = DashboardCLI(collector)
 
@@ -365,8 +359,6 @@ Examples:
 
     # Stats command
     stats_parser = subparsers.add_parser("stats", help="Show index statistics")
-    stats_parser.add_argument("--es-url", help="Elasticsearch URL")
-    stats_parser.add_argument("--pg-dsn", help="PostgreSQL connection string")
     stats_parser.add_argument(
         "--json", action="store_true", help="Output in JSON format"
     )

@@ -32,23 +32,7 @@ CACHE_FILE = "content_cache.pickle"
 METADATA_FILE = "file_metadata.pickle"
 
 # ============================================================================
-# Elasticsearch Configuration (Legacy)
-# ============================================================================
-
-"""Default Elasticsearch host."""
-ES_HOST = "localhost"
-
-"""Default Elasticsearch port."""
-ES_PORT = 9200
-
-"""Default Elasticsearch index name."""
-ES_INDEX_NAME = "code_index"
-
-"""Default Elasticsearch URL."""
-ES_DEFAULT_URL = "http://localhost:9200"
-
-# ============================================================================
-# Tantivy Configuration (New Primary Full-Text Search Backend)
+# Tantivy Configuration (Primary Full-Text Search Backend)
 # ============================================================================
 
 """Default Tantivy index path."""
@@ -68,25 +52,6 @@ TANTIVY_BM25_K1 = 1.2
 
 """Default BM25 b parameter (length normalization)."""
 TANTIVY_BM25_B = 0.75
-
-# ============================================================================
-# RabbitMQ Configuration
-# ============================================================================
-
-"""Default RabbitMQ host."""
-RABBITMQ_HOST = "localhost"
-
-"""Default RabbitMQ port."""
-RABBITMQ_PORT = 5672
-
-"""Queue name for file indexing operations."""
-RABBITMQ_QUEUE_NAME = "indexing_queue"
-
-"""Exchange name for message routing."""
-RABBITMQ_EXCHANGE_NAME = "indexing_exchange"
-
-"""Routing key for file change messages."""
-RABBITMQ_ROUTING_KEY = "file_changes"
 
 # ============================================================================
 # File Size Limits (in bytes)
@@ -130,12 +95,6 @@ LARGE_MAX_SUBDIRECTORIES_PER_DIRECTORY = 1000
 """Default maximum search results (1000)."""
 DEFAULT_MAX_SEARCH_RESULTS = 1000
 
-"""Maximum search results for Elasticsearch (10000)."""
-ES_MAX_SEARCH_RESULTS = 10000
-
-"""Maximum search results for PostgreSQL (5000)."""
-POSTGRESQL_MAX_SEARCH_RESULTS = 5000
-
 """Default file versions to retrieve (100)."""
 DEFAULT_FILE_VERSIONS_LIMIT = 100
 
@@ -167,23 +126,11 @@ MEDIUM_CONNECTION_TIMEOUT = 10
 """Long connection timeout (30 seconds)."""
 LONG_CONNECTION_TIMEOUT = 30
 
-"""Elasticsearch operation timeout (60 seconds)."""
-ES_OPERATION_TIMEOUT = 60
-
-"""Elasticsearch connection timeout (300 seconds = 5 minutes)."""
-ES_CONNECTION_TIMEOUT = 300
-
 """Zoekt indexing timeout (300 seconds = 5 minutes)."""
 ZOEKT_INDEXING_TIMEOUT = 300
 
 """Zoekt search timeout (30 seconds)."""
 ZOEKT_SEARCH_TIMEOUT = 30
-
-"""Default Elasticsearch client timeout (30 seconds)."""
-ES_CLIENT_TIMEOUT = 30
-
-"""Elasticsearch connection test timeout (2 seconds)."""
-ES_CONNECTION_TEST_TIMEOUT = 2
 
 """Thread join timeout (5 seconds)."""
 THREAD_JOIN_TIMEOUT = 5
@@ -239,37 +186,12 @@ CONFIG_SOFT_LIMIT_MB = 8192
 """Hard memory limit from config (16384MB = 16GB)."""
 CONFIG_HARD_LIMIT_MB = 16384
 
-"""Elasticsearch heap memory limit (4096MB = 4GB)."""
-ES_HEAP_MEMORY_LIMIT_MB = 4096
-
-# ============================================================================
-# Elasticsearch Index Settings
-# ============================================================================
-
-"""Number of shards for Elasticsearch index (3)."""
-ES_INDEX_NUMBER_OF_SHARDS = 3
-
-"""Number of replicas for Elasticsearch index (0 for single-node clusters)."""
-ES_INDEX_NUMBER_OF_REPLICAS = 0
-
-"""Index refresh interval in seconds (1s)."""
-ES_INDEX_REFRESH_INTERVAL = "1s"
-
-"""Minimum n-gram size for code analyzer (2)."""
-ES_CODE_ANALYZER_MIN_NGRAM = 2
-
-"""Maximum n-gram size for code analyzer (3)."""
-ES_CODE_ANALYZER_MAX_NGRAM = 3
-
 # ============================================================================
 # Worker/Thread Settings
 # ============================================================================
 
 """Default maximum workers for parallel processing (4)."""
 DEFAULT_MAX_WORKERS = 4
-
-"""Elasticsearch installer timeout (300 seconds = 5 minutes)."""
-ES_INSTALLER_TIMEOUT = 300
 
 # ============================================================================
 # Retry Settings

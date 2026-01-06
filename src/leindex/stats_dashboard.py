@@ -9,7 +9,7 @@ This module provides comprehensive statistics about:
 - Document count and size
 - Index health status
 - Last update times
-- Backend health (PostgreSQL, Elasticsearch)
+- Backend health (SQLite, DuckDB, Tantivy, LEANN)
 - Usage analytics
 """
 
@@ -102,28 +102,23 @@ class IndexStatisticsCollector:
     "Index Statistics Dashboard: CLI command showing index health metrics"
 
     Collects statistics from:
-    - PostgreSQL storage backend
-    - Elasticsearch search backend
-    - Vector store backend
+    - SQLite storage backend
+    - DuckDB storage backend
+    - Tantivy search backend
+    - LEANN vector store backend
     - Real-time indexer queue
     """
 
     def __init__(
         self,
-        pg_dsn: Optional[str] = None,
-        es_url: Optional[str] = None,
         storage_path: Optional[str] = None
     ):
         """
         Initialize the statistics collector.
 
         Args:
-            pg_dsn: PostgreSQL connection string
-            es_url: Elasticsearch URL
             storage_path: Path for local statistics storage
         """
-        self.pg_dsn = pg_dsn
-        self.es_url = es_url
         self.storage_path = storage_path
         self._start_time = time.time()
         self._cached_stats: Optional[DashboardStats] = None
@@ -151,22 +146,6 @@ class IndexStatisticsCollector:
         stats.last_updated = datetime.now().isoformat()
         stats.uptime_seconds = now - self._start_time
 
-        # Collect Elasticsearch statistics
-        if self.es_url:
-            es_health = await self._check_elasticsearch_health()
-            stats.backends["elasticsearch"] = es_health
-            if es_health.is_healthy:
-                es_stats = await self._collect_elasticsearch_stats()
-                stats.indices.update(es_stats)
-
-        # Collect PostgreSQL statistics
-        if self.pg_dsn:
-            pg_health = await self._check_postgresql_health()
-            stats.backends["postgresql"] = pg_health
-            if pg_health.is_healthy:
-                pg_stats = await self._collect_postgresql_stats()
-                stats.indices.update(pg_stats)
-
         # Determine overall status
         stats.overall_status = self._determine_overall_status(stats)
 
@@ -176,138 +155,10 @@ class IndexStatisticsCollector:
 
         return stats
 
-    async def _check_elasticsearch_health(self) -> BackendHealth:
-        """Check Elasticsearch health."""
-        health = BackendHealth(name="elasticsearch")
-        health.last_checked = datetime.now().isoformat()
-
-        try:
-            from elasticsearch import AsyncElasticsearch
-
-            start = time.time()
-            client = AsyncElasticsearch(self.es_url)
-
-            # Basic health check
-            info = await client.info()
-            health.is_healthy = True
-            health.response_time_ms = (time.time() - start) * 1000
-            health.details = {
-                "version": info.get("version", {}).get("number", "unknown"),
-                "cluster_name": info.get("cluster_name", "unknown"),
-            }
-
-            await client.close()
-
-        except ImportError:
-            health.error_message = "Elasticsearch client not installed"
-        except Exception as e:
-            health.error_message = str(e)
-
-        return health
-
-    async def _collect_elasticsearch_stats(self) -> Dict[str, IndexStats]:
-        """Collect Elasticsearch index statistics."""
-        indices: Dict[str, IndexStats] = {}
-
-        try:
-            from elasticsearch import AsyncElasticsearch
-
-            client = AsyncElasticsearch(self.es_url)
-
-            # Get all indices
-            stats_response = await client.indices.stats(index="*")
-            index_names = list(stats_response["indices"].keys())
-
-            for index_name in index_names:
-                index_data = stats_response["indices"][index_name]
-                stats = IndexStats(name=index_name)
-                stats.document_count = index_data.get("primaries", {}).get("docs", {}).get("count", 0)
-                stats.size_bytes = index_data.get("primaries", {}).get("store", {}).get("size_in_bytes", 0)
-                stats.health_status = "healthy"
-                stats.last_update = datetime.now().isoformat()
-
-                indices[index_name] = stats
-
-            await client.close()
-
-        except Exception as e:
-            logger.error(f"Error collecting Elasticsearch stats: {e}")
-
-        return indices
-
-    async def _check_postgresql_health(self) -> BackendHealth:
-        """Check PostgreSQL health."""
-        health = BackendHealth(name="postgresql")
-        health.last_checked = datetime.now().isoformat()
-
-        try:
-            import asyncpg
-
-            start = time.time()
-            conn = await asyncpg.connect(self.pg_dsn)
-
-            # Simple query to check connection
-            await conn.fetchval("SELECT 1")
-
-            health.is_healthy = True
-            health.response_time_ms = (time.time() - start) * 1000
-
-            await conn.close()
-
-        except ImportError:
-            health.error_message = "asyncpg not installed"
-        except Exception as e:
-            health.error_message = str(e)
-
-        return health
-
-    async def _collect_postgresql_stats(self) -> Dict[str, IndexStats]:
-        """Collect PostgreSQL statistics."""
-        indices: Dict[str, IndexStats] = {}
-
-        try:
-            import asyncpg
-
-            conn = await asyncpg.connect(self.pg_dsn)
-
-            # Get file count
-            file_count = await conn.fetchval("SELECT COUNT(*) FROM files WHERE deleted_at IS NULL")
-
-            # Get index size
-            size_query = """
-                SELECT pg_total_relation_size('files') +
-                       pg_total_relation_size('file_versions') +
-                       pg_total_relation_size('file_diffs') as total_size
-            """
-            size_bytes = await conn.fetchval(size_query)
-
-            stats = IndexStats(name="postgresql_files")
-            stats.document_count = file_count or 0
-            stats.size_bytes = size_bytes or 0
-            stats.health_status = "healthy"
-            stats.last_update = datetime.now().isoformat()
-
-            indices["postgresql_files"] = stats
-
-            await conn.close()
-
-        except Exception as e:
-            logger.error(f"Error collecting PostgreSQL stats: {e}")
-
-        return indices
-
     def _determine_overall_status(self, stats: DashboardStats) -> str:
         """Determine overall system status."""
         if not stats.backends:
             return "unknown"
-
-        # Check if any critical backend is unhealthy
-        critical_backends = ["elasticsearch", "postgresql"]
-        for backend_name in critical_backends:
-            if backend_name in stats.backends:
-                backend = stats.backends[backend_name]
-                if not backend.is_healthy:
-                    return "unhealthy"
 
         return "healthy"
 
@@ -491,10 +342,6 @@ async def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Index Statistics Dashboard")
-    parser.add_argument("--es-url", default=os.getenv("ELASTICSEARCH_URL", "http://localhost:9200"),
-                        help="Elasticsearch URL")
-    parser.add_argument("--pg-dsn", default=os.getenv("DATABASE_URL"),
-                        help="PostgreSQL connection string")
     parser.add_argument("--json", action="store_true", help="Output in JSON format")
     parser.add_argument("--watch", action="store_true", help="Continuously update")
     parser.add_argument("--interval", type=int, default=5, help="Update interval for watch mode")
@@ -502,10 +349,7 @@ async def main():
     args = parser.parse_args()
 
     # Create collector
-    collector = IndexStatisticsCollector(
-        pg_dsn=args.pg_dsn,
-        es_url=args.es_url,
-    )
+    collector = IndexStatisticsCollector()
 
     # Create CLI
     cli = DashboardCLI(collector)

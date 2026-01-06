@@ -1,0 +1,231 @@
+═══════════════════════════════════════════════════════════════════════════════
+                          INSTALLER EXPERIENCE PREVIEW
+═══════════════════════════════════════════════════════════════════════════════
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  🚀 LeIndex Installer v4.0.0                                                ║
+║  ✨ AI-Powered Code Search & MCP Server                                     ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+Welcome to the future of code search!
+
+Let's get you set up with LeIndex in just a few moments.
+This installer will:
+
+  ✓ Detect your Python environment
+  ✓ Find your AI coding tools
+  ✓ Install LeIndex with the best package manager
+  ✓ Configure integrations with your favorite tools
+
+? Ready to begin? [Y/n] _
+
+───────────────────────────────────────────────────────────────────────────────
+
+[1/7] Detecting Python Environment
+✓ Python 3.13 detected
+  • Using: python3.13
+
+[2/7] Detecting Package Manager
+✓ uv detected (⚡ fastest package manager)
+
+[3/7] Detecting AI Coding Tools
+✓ Great news! Found 3 AI tool(s) on your system:
+  • Claude Desktop
+  • Cursor IDE
+  • VS Code
+
+[4/7] Installing LeIndex
+ℹ Upgrading package manager...
+ℹ Installing leindex...
+✓ LeIndex installed successfully
+✓ Installation verified: version 4.0.0
+
+[5/7] Setting up Directories
+✓ Created: /home/user/.leindex/config
+✓ Created: /home/user/.leindex/data
+✓ Created: /home/user/.leindex/logs
+
+[6/7] Tool Integration
+
+Which tools would you like LeIndex to integrate with?
+
+   1) Claude Desktop
+   2) Cursor IDE
+   3) VS Code / VSCodium
+   4) Zed Editor
+   5) JetBrains IDEs
+   6) CLI Tools (PATH setup)
+   7) All tools
+   8) Detected tools only
+   9) Skip integration
+  10) Custom selection
+
+# Enter choice [1-10]: _
+
+───────────────────────────────────────────────────────────────────────────────
+
+┌─ Configuring Claude Desktop ─
+│
+⚠ Backed up: /home/user/.config/claude/claude_desktop_config.json
+✓ Claude Desktop configured
+  • Config: /home/user/.config/claude/claude_desktop_config.json
+
+┌─ Configuring Cursor IDE ─
+│
+✓ Cursor configured
+  • Config: /home/user/.cursor/mcp.json
+
+┌─ Configuring VS Code Family ─
+│
+✓ VS Code configured: /home/user/.config/Code/User/settings.json
+ℹ Note: Install an MCP extension for VS Code:
+  • Cline: https://marketplace.visualstudio.com/items?itemName=saoudrizwan.claude
+  • Continue: https://marketplace.visualstudio.com/items?itemName=Continue.continue
+
+───────────────────────────────────────────────────────────────────────────────
+
+[7/7] Verifying Installation
+✓ Python package installed
+  • Version: 4.0.0
+
+Commands:
+✓ leindex
+✓ leindex-search
+
+Configured tools:
+✓ Claude Desktop
+✓ Cursor
+✓ VS Code
+
+═══════════════════════════════════════════════════════════════════════════════
+║  🎉 Installation Complete! 🎉                                                ║
+═══════════════════════════════════════════════════════════════════════════════
+
+What's next?
+
+1. Restart your AI tool(s) to load LeIndex
+2. Use MCP tools in your AI assistant:
+   • manage_project - Index code repositories
+   • search_content - Search code semantically
+   • get_diagnostics - Get project statistics
+
+3. Or use CLI commands:
+   • leindex mcp - Start MCP server
+   • leindex-search "query" - Search from terminal
+
+Resources:
+  • GitHub: https://github.com/scooter-lacroix/leindex
+  • Documentation: See README.md
+
+Troubleshooting:
+  • Check logs: /home/user/.leindex/logs/
+  • Test MCP: python3.13 -m leindex.server
+  • Debug mode: export LEINDEX_LOG_LEVEL=DEBUG
+
+Thanks for installing LeIndex! Happy coding! 🚀
+
+═══════════════════════════════════════════════════════════════════════════════
+                              COLOR SCHEME
+═══════════════════════════════════════════════════════════════════════════════
+
+The installer uses a vibrant, modern color scheme:
+
+  • Cyan ( Headers, Info )      - Friendly and inviting
+  • Green ( Success )            - Positive confirmation
+  • Yellow ( Warnings )          - Attention-grabbing
+  • Red ( Errors )              - Clear problem indicators
+  • Magenta ( Progress )        - Step indicators
+  • Blue ( Sections )           - Structural elements
+
+All text is properly colored with emoji indicators for visual scanning.
+
+═══════════════════════════════════════════════════════════════════════════════
+                           KEY IMPROVEMENTS
+═══════════════════════════════════════════════════════════════════════════════
+
+BEFORE (Broken):
+  Raw ANSI codes displayed: \033[0;32m\033[0m
+  Unclear interactive menu
+  Poor visual feedback
+  Confusing error messages
+
+AFTER (Fixed):
+  Beautiful colored output throughout
+  Clear numbered menu with validation
+  Progress tracking with step indicators
+  Playful, encouraging dialogue
+  Professional ASCII art headers
+  Emoji indicators for quick scanning
+  Helpful error messages with solutions
+
+═══════════════════════════════════════════════════════════════════════════════
+                      INTERACTIVE MENU EXAMPLE
+═══════════════════════════════════════════════════════════════════════════════
+
+User selects option 7 (All tools):
+
+  Which tools would you like LeIndex to integrate with?
+
+     1) Claude Desktop
+     2) Cursor IDE
+     3) VS Code / VSCodium
+     4) Zed Editor
+     5) JetBrains IDEs
+     6) CLI Tools (PATH setup)
+     7) All tools
+     8) Detected tools only
+     9) Skip integration
+     10) Custom selection
+
+  # Enter choice [1-10]: 7
+
+Installer automatically configures all detected tools, showing progress for each.
+
+User selects option 10 (Custom selection):
+
+  # Enter choice [1-10]: 10
+
+  Enter tools (space-separated, e.g., '1 3 4'): > 1 3 4
+
+Installer configures Claude Desktop, VS Code, and Zed Editor in that order.
+
+═══════════════════════════════════════════════════════════════════════════════
+                      ERROR HANDLING EXAMPLE
+═══════════════════════════════════════════════════════════════════════════════
+
+User enters invalid choice:
+
+  # Enter choice [1-10]: foo
+
+  ✗ Invalid choice. Please enter a number between 1 and 10
+  # Enter choice [1-10]: _
+
+User enters number out of range:
+
+  # Enter choice [1-10]: 15
+
+  ✗ Invalid choice. Please enter a number between 1 and 10
+  # Enter choice [1-10]: _
+
+Clear, helpful error messages guide the user to correct input.
+
+═══════════════════════════════════════════════════════════════════════════════
+                      PLAYFUL DIALOGUE EXAMPLES
+═══════════════════════════════════════════════════════════════════════════════
+
+Welcome:
+  "Welcome to the future of code search!"
+
+AI Tool Detection:
+  "Great news! Found 3 AI tool(s) on your system:"
+  "That's okay! We'll install LeIndex as a standalone MCP server"
+
+Package Manager:
+  "✓ uv detected (⚡ fastest package manager)"
+  "✓ pipx detected (isolated installations)"
+
+Completion:
+  "🎉 Installation Complete! 🎉"
+  "Thanks for installing LeIndex! Happy coding! 🚀"
+
+═══════════════════════════════════════════════════════════════════════════════

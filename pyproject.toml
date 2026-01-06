@@ -45,20 +45,6 @@ dependencies = [
     "msgpack>=1.0.0",
 ]
 
-# Optional dependencies for PostgreSQL backend
-# Install with: pip install leindex[postgresql]
-[project.optional-dependencies]
-postgresql = [
-    "sqlalchemy>=2.0.0",
-    "alembic>=1.16.4",
-    "psycopg2-binary>=2.9.10",
-    "elasticsearch>=8.0.0,<9.0.0",  # Required for dual_write_read and postgresql_elasticsearch_only backends
-    "elastic-transport>=8.17.0",  # Required by elasticsearch client
-]
-all = [
-    "leindex[postgresql]",
-]
-
 # CRITICAL: CPU-only configuration - prevent CUDA/GPU packages
 # This system is CPU/AMD-only and must NOT install NVIDIA packages
 [tool.uv]

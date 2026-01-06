@@ -47,20 +47,7 @@ from .progress_tracker import (
     ProgressTracker,
     LoggingProgressHandler,
 )
-from elasticsearch import Elasticsearch
-from .file_change_tracker import FileChangeTracker  # Import FileChangeTracker
-from .realtime_indexer import (
-    RabbitMQProducer,
-    RabbitMQConsumer,
-    RealtimeIndexer,
-)  # Import RealtimeIndexer and RabbitMQ classes
-from .constants import (
-    RABBITMQ_HOST,
-    RABBITMQ_PORT,
-    RABBITMQ_QUEUE_NAME,
-    RABBITMQ_EXCHANGE_NAME,
-    RABBITMQ_ROUTING_KEY,
-)  # Import Elasticsearch and RabbitMQ constants
+from .file_change_tracker import FileChangeTracker
 from .storage.dal_factory import get_dal_instance
 from .storage.storage_interface import (
     DALInterface,
@@ -72,8 +59,6 @@ from .file_reader import (
     FileSizeCategory,
 )  # Import SmartFileReader and enums
 from .system_utils import detect_system, async_ensure_infrastructure
-from .elasticsearch_installer import ElasticsearchInstaller
-from .elasticsearch_config import elasticsearch_config
 from .search_utils import (
     SearchBackendSelector,
     SearchErrorHandler,
@@ -107,12 +92,6 @@ lazy_content_manager = LazyContentManager(max_loaded_files=100)
 # Global DAL instance
 dal_instance: Optional[DALInterface] = None
 core_engine: Optional[CoreEngine] = None  # Global CoreEngine instance
-
-# Global Elasticsearch client, RabbitMQ producer/consumer, and real-time indexer
-es_client: Optional[Elasticsearch] = None
-rabbitmq_producer: Optional[RabbitMQProducer] = None
-rabbitmq_consumer: Optional[RabbitMQConsumer] = None
-realtime_indexer: Optional[RealtimeIndexer] = None
 
 # Global variable to store the current project path persistently
 _current_project_path: str = ""
@@ -350,10 +329,6 @@ class LeIndexContext:
     file_change_tracker: Optional[FileChangeTracker] = None
     dal: Optional[DALInterface] = None  # Add DAL instance to context
     core_engine: Optional[CoreEngine] = None  # Add CoreEngine to context
-    es_client: Optional[Elasticsearch] = None
-    rabbitmq_producer: Optional[RabbitMQProducer] = None
-    rabbitmq_consumer: Optional[RabbitMQConsumer] = None
-    realtime_indexer: Optional[RealtimeIndexer] = None
     # Phase 7 additions
     result_ranker: Optional[ResultRanker] = None
     api_key_manager: Optional[APIKeyManager] = None
@@ -363,23 +338,18 @@ class LeIndexContext:
 @asynccontextmanager
 async def indexer_lifespan(server: FastMCP) -> AsyncIterator[LeIndexContext]:
     """Manage the lifecycle of the LeIndex MCP server."""
-    global \
-        es_client, \
-        rabbitmq_producer, \
-        rabbitmq_consumer, \
-        realtime_indexer, \
-        dal_instance
+    global dal_instance
     global result_ranker, api_key_manager, stats_collector
 
     # Load base_path from settings if available, otherwise default to empty string
     logger.info("Initializing LeIndex MCP server...")
 
-    # Auto-start required infrastructure services (PostgreSQL, Elasticsearch, RabbitMQ)
+    # Auto-start required infrastructure services (db only)
     # This ensures the MCP server works out-of-the-box without manual service startup
-    logger.info("Checking infrastructure services (db, elasticsearch, rabbitmq)...")
+    logger.info("Checking infrastructure services (db)...")
     try:
         infra_ready = await async_ensure_infrastructure(
-            required_services=["db", "elasticsearch", "rabbitmq"],
+            required_services=["db"],
             timeout=120,  # 2 minutes max wait for services to start
             auto_start=True
         )
@@ -392,10 +362,6 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[LeIndexContext]:
             )
     except Exception as e:
         logger.warning(f"Error ensuring infrastructure services: {e}. Continuing with startup...")
-
-    # Check and potentially install Elasticsearch before initialization
-    logger.info("Checking Elasticsearch availability...")
-    check_and_install_elasticsearch()
 
     # Initialize a temporary settings manager to load the base_path from the default config location
     # This ensures we can retrieve the last saved project path even if the server restarts
@@ -562,64 +528,6 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[LeIndexContext]:
     file_change_tracker = FileChangeTracker(dal_instance.metadata, incremental_indexer)
     logger.info("FileChangeTracker initialized with DAL metadata backend")
 
-    # Initialize Elasticsearch client for RabbitMQ indexing pipeline
-    # NOTE: We connect to ES during startup to enable the RabbitMQ async indexing pipeline
-    es_connected = False
-    es_client = None
-    rabbitmq_producer = None
-    rabbitmq_consumer = None
-    realtime_indexer = None
-
-    try:
-        logger.info("Attempting to connect to Elasticsearch for RabbitMQ indexing pipeline...")
-        es_config_instance = elasticsearch_config  # Get the singleton instance
-        es_client = es_config_instance.create_elasticsearch_client()
-        if es_client and es_config_instance.test_connection(es_client):
-            es_connected = True
-            logger.info("Successfully connected to Elasticsearch")
-        else:
-            logger.warning("Elasticsearch connection test failed")
-            es_client = None
-    except Exception as e:
-        logger.warning(f"Failed to connect to Elasticsearch: {e}. Search functionality will be limited.")
-        es_client = None
-
-    # Initialize RabbitMQ producer and consumer if ES is available
-    if es_connected and es_client:
-        try:
-            # Initialize RabbitMQ producer and consumer only if ES is connected
-            rabbitmq_producer = RabbitMQProducer(
-                host=RABBITMQ_HOST,
-                port=RABBITMQ_PORT,
-                exchange=RABBITMQ_EXCHANGE_NAME,
-                routing_key=RABBITMQ_ROUTING_KEY,
-            )
-            rabbitmq_consumer = RabbitMQConsumer(
-                es_client=es_client,
-                base_path=base_path_from_config,  # Will be updated by set_project_path
-                host=RABBITMQ_HOST,
-                port=RABBITMQ_PORT,
-                queue_name=RABBITMQ_QUEUE_NAME,
-                exchange=RABBITMQ_EXCHANGE_NAME,
-                routing_key=RABBITMQ_ROUTING_KEY,
-            )
-            realtime_indexer = RealtimeIndexer(
-                es_client, base_path_from_config, rabbitmq_producer, rabbitmq_consumer
-            )
-            realtime_indexer.start()  # Start the consumer worker thread
-            logger.info("RealtimeIndexer (RabbitMQ) started.")
-        except Exception as e:
-            logger.error(
-                f"Error initializing RabbitMQ client: {e}. Real-time indexing will be disabled."
-            )
-            rabbitmq_producer = None
-            rabbitmq_consumer = None
-            realtime_indexer = None
-    else:
-        logger.info(
-            "Elasticsearch not available - Real-time indexing will be disabled until Elasticsearch is available."
-        )
-
     # Initialize context with Phase 7 modules
     context = LeIndexContext(
         base_path=base_path_from_config,
@@ -627,10 +535,6 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[LeIndexContext]:
         file_change_tracker=file_change_tracker,
         dal=dal_instance,  # Store DAL instance in context
         core_engine=core_engine,
-        es_client=es_client,
-        rabbitmq_producer=rabbitmq_producer,
-        rabbitmq_consumer=rabbitmq_consumer,
-        realtime_indexer=realtime_indexer,
         # Phase 7 additions
         result_ranker=result_ranker,
         api_key_manager=api_key_manager,
@@ -7635,41 +7539,6 @@ def _add_file_to_index(directory: Dict, file_path: str):
     return False
 
 
-def check_and_install_elasticsearch():
-    """Check if Elasticsearch auto-installation should be triggered."""
-    # Skip Elasticsearch check during MCP startup to avoid blocking
-    # Elasticsearch connection will be established lazily when needed
-
-    # Only proceed with auto-installation if explicitly requested and not in MCP context
-    if os.getenv("LEINDEX_AUTO_INSTALL_ES", "").lower() in ("1", "true", "yes"):
-        system_info = detect_system()
-
-        if system_info.system.lower() == "linux":
-            try:
-                installer = ElasticsearchInstaller(verbose=False)
-
-                # Check if Elasticsearch is already installed and running
-                if installer._check_elasticsearch_installed():
-                    logger.info("Elasticsearch is already installed and running")
-                    return True
-
-                logger.info(
-                    f"Auto-installing Elasticsearch on {system_info.distribution} ({system_info.package_manager})..."
-                )
-                success = installer.install_elasticsearch()
-                if success:
-                    logger.info("Elasticsearch installed successfully")
-                    # Wait a moment for service to start
-                    time.sleep(5)
-                    return True
-                else:
-                    logger.error("Failed to install Elasticsearch")
-            except Exception as e:
-                logger.error(f"Elasticsearch installation failed: {e}")
-
-    return False
-
-
 # ============================================================================
 # PHASE 7 MCP TOOLS: Ranking, API Key Manager, Stats Dashboard
 # ============================================================================
@@ -7687,7 +7556,7 @@ async def get_index_statistics(
 
     Provides statistics about:
     - Document count and size
-    - Backend health (PostgreSQL, Elasticsearch)
+    - Backend health (SQLite, DuckDB, Tantivy, LEANN)
     - Index status and health
     - Overall system status
 

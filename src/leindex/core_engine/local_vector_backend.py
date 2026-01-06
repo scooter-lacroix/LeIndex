@@ -4,7 +4,7 @@ Local Vector Backend - FAISS-based semantic search with local embedding models.
 This module implements a local vector store backend using:
 - FAISS for fast vector similarity search
 - sentence-transformers for embedding generation
-- PostgreSQL for metadata storage
+- SQLite/DuckDB for metadata storage
 
 This replaces the Mixedbread cloud API dependency with a fully local solution.
 
@@ -17,7 +17,7 @@ Features:
 - Adaptive FAISS index (IndexFlatIP -> IndexIVFFlat) based on size
 - Model mismatch detection on startup
 - Index persistence for fast startup
-- Metadata storage in PostgreSQL
+- Metadata storage in SQLite/DuckDB
 
 SECURITY: All inputs are validated and sanitized to prevent:
 - Path traversal attacks
@@ -412,7 +412,7 @@ class LocalVectorBackend:
     - Fast vector search using FAISS
     - Adaptive index (FlatIP -> IVFFlat) based on size
     - Persistent index for fast startup
-    - Metadata storage in PostgreSQL
+    - Metadata storage in SQLite/DuckDB
     - Security: Path validation, resource limits, input sanitization
 
     Usage:
@@ -557,7 +557,7 @@ class LocalVectorBackend:
         # Load model (lazy loading - happens on first search)
         logger.info("Embedding model will be loaded on first search (~2-3 seconds)")
 
-        # Load metadata from PostgreSQL if available
+        # Load metadata from SQLite/DuckDB if available
         await self._load_metadata()
 
         self._initialized = True
@@ -756,12 +756,12 @@ class LocalVectorBackend:
 
     async def _load_metadata(self) -> None:
         """
-        Load metadata from PostgreSQL.
+        Load metadata from SQLite/DuckDB.
 
-        This is a placeholder for future PostgreSQL integration.
+        This is a placeholder for future SQLite/DuckDB integration.
         Currently, metadata is stored alongside the index.
         """
-        # TODO: Implement PostgreSQL metadata loading
+        # TODO: Implement SQLite/DuckDB metadata loading
         # For now, metadata is loaded from JSON file in _load_or_create_index
         pass
 

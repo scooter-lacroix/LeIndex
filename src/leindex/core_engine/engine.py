@@ -31,11 +31,11 @@ The Core Engine implements PRODUCT.MD's dual-mode operation requirement:
 1. STANDALONE POWER MODE (Primary):
    - LocalVectorBackend (FAISS) provides semantic search
    - Zoekt Strategy provides fast code-aware search via regex/symbolic matching
-   - Full functionality without PostgreSQL/Elasticsearch dependencies
+   - Full functionality without external dependencies
    - This is the DEFAULT and PRIMARY mode of operation
 
 2. AUGMENTED INTELLIGENCE MODE (Enhancement):
-   - Legacy Backend (PostgreSQL/Elasticsearch) provides augmentation when:
+   - Legacy Backend (SQLite/DuckDB) provides augmentation when:
      * Metadata queries are needed (file history, versions)
      * Massive scale historical lookups are required
      * Complex joins across metadata are needed
@@ -363,7 +363,7 @@ class CoreEngine:
         STANDALONE POWER MODE (Primary - Default):
             - Uses Core Vector Backend (semantic search with reranking)
             - Falls back to Zoekt for fast symbolic/regex search
-            - Full functionality without PostgreSQL/Elasticsearch
+            - Full functionality without external dependencies
 
         AUGMENTED INTELLIGENCE MODE (When legacy is available):
             - Core engine ALWAYS drives the search
@@ -526,7 +526,7 @@ class CoreEngine:
         -------------------------------------------
         STANDALONE POWER MODE (Primary):
             - Writes to Core Vector Backend for semantic search
-            - No PostgreSQL/Elasticsearch required
+            - No external dependencies required
             - Full searchability immediately available
 
         AUGMENTED INTELLIGENCE MODE (Dual-Write for Metadata):

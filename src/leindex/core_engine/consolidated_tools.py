@@ -435,13 +435,13 @@ def get_diagnostics(
             * Parameters: force_refresh (bool, default: False)
             * Returns: Dict with document counts, sizes, backend health
             * Original tool: get_index_statistics()
-            * Includes: PostgreSQL and Elasticsearch statistics
+            * Includes: SQLite, DuckDB, Tantivy, LEANN statistics
 
         - "backend": Get health status of all backends
             * Parameters: None
             * Returns: Dict with backend names and health status
             * Original tool: get_backend_health()
-            * Includes: PostgreSQL, Elasticsearch connection status
+            * Includes: SQLite, DuckDB, Tantivy, LEANN connection status
 
         - "performance": Get performance monitoring metrics
             * Parameters: None

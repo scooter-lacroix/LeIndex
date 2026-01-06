@@ -54,9 +54,6 @@ def setup_logging():
         # Set specific library log levels if needed
         logging.getLogger('uvicorn').setLevel(logging.INFO)
         logging.getLogger('uvicorn.access').setLevel(logging.INFO)
-        logging.getLogger('elasticsearch').setLevel(logging.DEBUG)
-        logging.getLogger('pika').setLevel(logging.WARNING)
-        logging.getLogger('psycopg2').setLevel(logging.WARNING)
 
     return logger
 

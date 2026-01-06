@@ -124,27 +124,7 @@ class ConfigManager:
                 "backend_type": "sqlite_duckdb",  # Default backend for LeIndex 2.0+
                 "db_path": "./data/leindex.db",  # SQLite database path
                 "duckdb_db_path": "./data/leindex.db.duckdb",  # DuckDB database path
-                "sqlite_enable_fts": True,  # Enable full-text search in SQLite
-                # PostgreSQL settings (OPTIONAL - only for dual_write_read or postgresql_elasticsearch_only backends)
-                "postgresql_connection_string": "postgresql://user:password@localhost:5432/code_index_db",
-                "postgresql_user": "user",
-                "postgresql_password": "password",
-                "postgresql_host": "localhost",
-                "postgresql_port": 5432,
-                "postgresql_database": "code_index_db",
-                "postgresql_ssl_args": {},
-                # Elasticsearch settings (OPTIONAL - only for dual_write_read or postgresql_elasticsearch_only backends)
-                "elasticsearch_hosts": ["http://localhost:9200"],
-                "elasticsearch_index_name": "code_index",
-                "elasticsearch_api_key_id": "",
-                "elasticsearch_api_key": "",
-                "elasticsearch_username": "",
-                "elasticsearch_password": "",
-                "elasticsearch_use_ssl": True,
-                "elasticsearch_verify_certs": True,
-                "elasticsearch_ca_certs": "",
-                "elasticsearch_client_cert": "",
-                "elasticsearch_client_key": ""
+                "sqlite_enable_fts": True  # Enable full-text search in SQLite
             },
             "vector_store": {
                 "backend_type": "leann",  # Options: "leann", "faiss"
@@ -406,27 +386,11 @@ class ConfigManager:
     def get_dal_settings(self) -> Dict[str, Any]:
         """Get DAL settings, prioritizing environment variables and resolving placeholders."""
         dal_settings = self.get_config('dal_settings') or {}
-        
+
         # Resolve environment variables for all DAL settings
         for key, value in dal_settings.items():
             dal_settings[key] = self._resolve_env_var(value)
 
-        # Explicitly handle type conversions after resolution
-        if 'postgresql_port' in dal_settings and isinstance(dal_settings['postgresql_port'], str):
-            try:
-                dal_settings['postgresql_port'] = int(dal_settings['postgresql_port'])
-            except ValueError:
-                pass # Keep as string if conversion fails, let downstream handle it
-
-        if 'elasticsearch_hosts' in dal_settings and isinstance(dal_settings['elasticsearch_hosts'], str):
-            dal_settings['elasticsearch_hosts'] = [h.strip() for h in dal_settings['elasticsearch_hosts'].split(',')]
-        
-        if 'elasticsearch_use_ssl' in dal_settings and isinstance(dal_settings['elasticsearch_use_ssl'], str):
-            dal_settings['elasticsearch_use_ssl'] = dal_settings['elasticsearch_use_ssl'].lower() == 'true'
-        
-        if 'elasticsearch_verify_certs' in dal_settings and isinstance(dal_settings['elasticsearch_verify_certs'], str):
-            dal_settings['elasticsearch_verify_certs'] = dal_settings['elasticsearch_verify_certs'].lower() == 'true'
-            
         return dal_settings
 
     def get_vector_store_settings(self) -> Dict[str, Any]:

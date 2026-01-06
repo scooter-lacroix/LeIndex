@@ -600,7 +600,7 @@ def ensure_infrastructure_running(
     Auto-starts services if they are not running and auto_start is True.
 
     Args:
-        required_services: List of services that must be running (default: ['db', 'elasticsearch', 'rabbitmq'])
+        required_services: List of services that must be running (default: ['db'])
         timeout: Timeout for waiting for services to become healthy (seconds)
         auto_start: Whether to auto-start services if not running
 
@@ -608,7 +608,7 @@ def ensure_infrastructure_running(
         True if all required services are running
     """
     if required_services is None:
-        required_services = ["db", "elasticsearch", "rabbitmq"]
+        required_services = ["db"]
 
     compose_mgr = ComposeManager()
 
