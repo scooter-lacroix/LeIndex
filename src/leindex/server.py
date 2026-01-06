@@ -170,9 +170,7 @@ def ensure_stats_collector() -> IndexStatisticsCollector:
     global stats_collector
     if stats_collector is None:
         try:
-            pg_dsn = os.getenv("DATABASE_URL")
-            es_url = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
-            stats_collector = IndexStatisticsCollector(pg_dsn=pg_dsn, es_url=es_url)
+            stats_collector = IndexStatisticsCollector()
             logger.info("Initialized index statistics collector")
         except Exception as e:
             logger.warning(f"Could not initialize stats collector: {e}")
@@ -473,7 +471,8 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[LeIndexContext]:
 
     # Initialize Vector Backend based on configuration
     # Read vector_store.backend_type from config to choose between LEANN and FAISS
-    vector_store_settings = global_config_manager.get_vector_store_settings()
+    config_manager = ConfigManager()
+    vector_store_settings = config_manager.get_vector_store_settings()
     backend_type = vector_store_settings.get('backend_type', 'leann').lower()
 
     logger.info(f"Initializing vector backend with type: {backend_type}")

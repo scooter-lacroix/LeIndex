@@ -761,19 +761,25 @@ class SQLiteSearch(SearchInterface):
             conn.execute('PRAGMA foreign_keys = ON')
 
             if self.enable_fts:
-                # CRITICAL FIX: Create FTS table for file paths using external content
+                # CRITICAL FIX: Drop old FTS tables that may have incorrect schemas
+                # This handles databases created with older versions that used external content mode
+                # The FTS tables will be repopulated during repair, so dropping is safe
+                conn.execute('DROP TABLE IF EXISTS files_fts')
+                conn.execute('DROP TABLE IF EXISTS kv_fts')
+
+                # Create FTS table for file paths using external content
                 # The 'content' option points to the source table for automatic indexing
                 conn.execute('''
-                    CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+                    CREATE VIRTUAL TABLE files_fts USING fts5(
                         file_path, content='files', content_rowid='id'
                     )
                 ''')
 
-                # CRITICAL FIX: Create FTS table for kv_store WITHOUT external content
+                # Create FTS table for kv_store WITHOUT external content
                 # We cannot use content='kv_store' because kv_fts needs a 'value_text' column
                 # that doesn't exist in kv_store. Instead, we'll manually populate kv_fts.
                 conn.execute('''
-                    CREATE VIRTUAL TABLE IF NOT EXISTS kv_fts USING fts5(
+                    CREATE VIRTUAL TABLE kv_fts USING fts5(
                         key, value_text
                     )
                 ''')
