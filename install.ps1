@@ -198,7 +198,8 @@ function Invoke-Rollback {
 function Find-Python {
     Print-Section "Detecting Python Environment"
 
-    $pythonCmds = @("python", "python3", "py", "python3.11", "python3.12", "python3.13")
+    # Prefer Python 3.13 (leann-backend-hnsw compatibility), then 3.12, 3.11, 3.10
+    $pythonCmds = @("python3.13", "python3.12", "python3.11", "python3.10", "python", "python3", "py")
     $PYTHON_CMD = $null
 
     foreach ($cmd in $pythonCmds) {
@@ -207,6 +208,11 @@ function Find-Python {
             if ($LASTEXITCODE -eq 0 -and $result -match "Python (\d+)\.(\d+)") {
                 $major = [int]$matches[1]
                 $minor = [int]$matches[2]
+
+                # Reject Python 3.14+ (leann-backend-hnsw not compatible)
+                if ($major -eq 3 -and $minor -ge 14) {
+                    continue
+                }
 
                 if ($major -ge $MinPythonMajor -and $minor -ge $MinPythonMinor) {
                     $PYTHON_CMD = $cmd
@@ -220,12 +226,13 @@ function Find-Python {
     }
 
     if (-not $PYTHON_CMD) {
-        Print-Error "Python $MinPythonMajor.$MinPythonMinor+ not found"
+        Print-Error "Python 3.10-3.13 not found"
         Write-Host ""
-        Write-Host "Please install Python 3.10 or higher:"
+        Write-Host "Please install Python 3.10-3.13:"
         Print-Bullet "Download from: https://www.python.org/downloads/"
         Print-Bullet "During installation, check 'Add Python to PATH'"
-        Print-Bullet "Or use: winget install Python.Python.3.12"
+        Print-Bullet "Or use: winget install Python.Python.3.13"
+        Print-Bullet "NOTE: Python 3.14+ is not supported (leann-backend-hnsw compatibility)"
         exit 1
     }
 

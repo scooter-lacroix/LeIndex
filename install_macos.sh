@@ -181,7 +181,8 @@ trap 'rollback $?' EXIT
 detect_python() {
     print_section "Detecting Python Environment"
 
-    local python_cmds=("python3" "python3.11" "python3.12" "python3.13" "python")
+    # Prefer Python 3.13 (leann-backend-hnsw compatibility), then 3.12, 3.11, 3.10
+    local python_cmds=("python3.13" "python3.12" "python3.11" "python3.10" "python3" "python")
     PYTHON_CMD=""
 
     for cmd in "${python_cmds[@]}"; do
@@ -194,10 +195,8 @@ detect_python() {
     if [[ -z "$PYTHON_CMD" ]]; then
         print_error "Python not found"
         echo ""
-        echo "Please install Python 3.10 or higher:"
-        print_bullet "Ubuntu/Debian: sudo apt install python3.11 python3-pip python3-venv"
-        print_bullet "Fedora/RHEL: sudo dnf install python3.11 python3-pip"
-        print_bullet "Arch: sudo pacman -S python python-pip"
+        echo "Please install Python 3.10-3.13:"
+        print_bullet "macOS: brew install python@3.13"
         print_bullet "From source: https://www.python.org/downloads/"
         exit 1
     fi
@@ -207,6 +206,14 @@ detect_python() {
     python_version=$($PYTHON_CMD -c 'import sys; print(".".join(map(str, sys.version_info[:2])))')
     local major=$($PYTHON_CMD -c 'import sys; print(sys.version_info.major)')
     local minor=$($PYTHON_CMD -c 'import sys; print(sys.version_info.minor)')
+
+    # Reject Python 3.14+ (leann-backend-hnsw not compatible)
+    if [[ $major -eq 3 && $minor -ge 14 ]]; then
+        print_error "Python 3.14+ not supported. Please use Python 3.10-3.13"
+        print_bullet "Found: $python_version"
+        print_bullet "Install Python 3.13: brew install python@3.13"
+        exit 1
+    fi
 
     if [[ $major -lt $MIN_PYTHON_MAJOR ]] || [[ $major -eq $MIN_PYTHON_MAJOR && $minor -lt $MIN_PYTHON_MINOR ]]; then
         print_error "Python $MIN_PYTHON_MAJOR.$MIN_PYTHON_MINOR+ required. Found: $python_version"
