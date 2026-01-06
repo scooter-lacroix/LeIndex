@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "leindex"
-version = "1.0.3"
+version = "1.0.4"
 description = "LeIndex: AI-powered code search and indexing system with MCP integration"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"  # Python 3.10-3.13 (3.14 not supported by leann-backend-hnsw)
