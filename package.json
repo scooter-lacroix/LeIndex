@@ -1,0 +1,151 @@
+{
+  "name": "leindex-mcp-server",
+  "version": "2.0.2",
+  "description": "AI-powered code search and indexing system with MCP integration",
+  "type": "module",
+  "main": "src/leindex/server.py",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "code-search",
+    "semantic-search",
+    "code-indexing",
+    "ai",
+    "llm",
+    "claude",
+    "cursor",
+    "code-analysis"
+  ],
+  "author": {
+    "name": "scooter-lacroix",
+    "url": "https://github.com/scooter-lacroix"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/scooter-lacroix/leindex.git"
+  },
+  "bugs": {
+    "url": "https://github.com/scooter-lacroix/leindex/issues"
+  },
+  "homepage": "https://github.com/scooter-lacroix/leindex#readme",
+  "mcp": {
+    "id": "leindex",
+    "displayName": "LeIndex Code Search",
+    "description": "AI-powered semantic code search and indexing system. Understand your codebase by meaning, not just text matching. Supports hybrid search (semantic + full-text), code analysis, and natural language queries.",
+    "icon": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E🔍%3C/text%3E%3C/svg%3E",
+    "command": {
+      "linux": "leindex",
+      "darwin": "leindex",
+      "windows": "leindex.exe"
+    },
+    "args": ["mcp"],
+    "env": {},
+    "categories": [
+      "code-search",
+      "development-tools",
+      "productivity"
+    ],
+    "features": [
+      {
+        "name": "Semantic Search",
+        "description": "Search code by meaning using embeddings, not just text matching"
+      },
+      {
+        "name": "Hybrid Search",
+        "description": "Combined semantic and full-text search for best results"
+      },
+      {
+        "name": "Code Analysis",
+        "description": "Analyze code patterns, dependencies, and structure"
+      },
+      {
+        "name": "Project Management",
+        "description": "Index and manage multiple code projects"
+      }
+    ],
+    "tools": [
+      {
+        "name": "manage_project",
+        "description": "Initialize, index, and manage code projects",
+        "parameters": {
+          "action": {
+            "type": "string",
+            "enum": ["init", "index", "reindex", "remove", "list"],
+            "description": "Action to perform on the project"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Path to the project directory"
+          },
+          "options": {
+            "type": "object",
+            "description": "Additional options for the action"
+          }
+        }
+      },
+      {
+        "name": "search_content",
+        "description": "Search code using semantic and full-text queries",
+        "parameters": {
+          "query": {
+            "type": "string",
+            "description": "Search query (natural language or code)"
+          },
+          "project_path": {
+            "type": "string",
+            "description": "Path to search within"
+          },
+          "max_results": {
+            "type": "number",
+            "default": 10,
+            "description": "Maximum number of results"
+          },
+          "filters": {
+            "type": "object",
+            "description": "Search filters (file patterns, languages, etc.)"
+          }
+        }
+      },
+      {
+        "name": "get_diagnostics",
+        "description": "Get project statistics and health information",
+        "parameters": {
+          "project_path": {
+            "type": "string",
+            "description": "Path to the project"
+          }
+        }
+      }
+    ],
+    "supportedLanguages": [
+      "Python",
+      "JavaScript",
+      "TypeScript",
+      "Java",
+      "C++",
+      "C#",
+      "Go",
+      "Rust",
+      "Ruby",
+      "PHP",
+      "Swift",
+      "Kotlin"
+    ],
+    "installation": {
+      "pip": "pip install leindex",
+      "uv": "uv pip install leindex",
+      "source": "git+https://github.com/scooter-lacroix/leindex.git"
+    },
+    "documentation": {
+      "full": "https://github.com/scooter-lacroix/leindex/blob/master/README.md",
+      "mcp": "https://github.com/scooter-lacroix/leindex/blob/master/MCP_CONFIGURATION.md",
+      "api": "https://github.com/scooter-lacroix/leindex/blob/master/API.md"
+    },
+    "changelog": "https://github.com/scooter-lacroix/leindex/blob/master/CHANGELOG.md"
+  },
+  "scripts": {
+    "install": "pip install leindex",
+    "postinstall": "leindex --version"
+  }
+}

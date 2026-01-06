@@ -25,9 +25,25 @@
 
 ---
 
-## 🚀 One-Click Installation
+## ✨ What Makes LeIndex Special?
+
+**LeIndex** isn't just another code search tool. It's your intelligent code companion that understands **what** you're looking for, not just **where** it might be typed.
+
+Imagine searching for "authentication flow" and finding not just files containing those words, but the actual authentication logic, login handlers, session management, and security patterns - even if they're named completely differently. That's the magic of semantic search! 🎯
+
+---
+
+## 🚀 Quick Start (You'll Be Searching in Under 2 Minutes. It's Easier Than Making Coffee!)
+
+
+## One-Click Installation
 
 **The easiest way to get started:**
+
+### Requirements
+- Python 3.10 or higher
+- 4GB RAM minimum (8GB+ for large codebases)
+- About 1GB disk space
 
 **Linux/Unix:**
 ```bash
@@ -54,16 +70,6 @@ That's it. The installer will:
 
 ---
 
-## ✨ What Makes LeIndex Special?
-
-**LeIndex** isn't just another code search tool. It's your intelligent code companion that understands **what** you're looking for, not just **where** it might be typed.
-
-Imagine searching for "authentication flow" and finding not just files containing those words, but the actual authentication logic, login handlers, session management, and security patterns - even if they're named completely differently. That's the magic of semantic search! 🎯
-
----
-
-## 🚀 Quick Start (You'll Be Searching in Under 2 Minutes!)
-
 ```bash
 # Install LeIndex - seriously, that's it
 pip install leindex
@@ -77,6 +83,31 @@ leindex-search "authentication logic"
 
 # Or use it via MCP in Claude, Cursor, or your favorite AI assistant
 # LeIndex MCP server does the heavy lifting automatically!
+```
+
+OR
+
+### PIP Install
+
+```bash
+pip install leindex
+```
+
+**That's literally it.** No Docker. No databases. No configuration files (unless you want them). Just works. ✨
+
+### Verify It's Alive
+
+```bash
+leindex --version
+# Output: LeIndex 2.0.2 - Ready to search! 🚀
+```
+
+### Install from Source (For the Adventurous)
+
+```bash
+git clone https://github.com/scooter-lacroix/leindex.git
+cd leindex
+pip install -e .
 ```
 
 **Boom!** You're now searching your codebase at the speed of thought. 🎉
@@ -180,39 +211,6 @@ results = indexer.search("authentication flow")
 💡 Everything runs locally. No cloud. No dependencies. Just speed.
 ```
 
----
-
-## 🎮 Installation (Easier Than Making Coffee)
-
-### Requirements
-- Python 3.10 or higher
-- 4GB RAM minimum (8GB+ for large codebases)
-- About 1GB disk space
-
-### One-Line Install
-
-```bash
-pip install leindex
-```
-
-**That's literally it.** No Docker. No databases. No configuration files (unless you want them). Just works. ✨
-
-### Verify It's Alive
-
-```bash
-leindex --version
-# Output: LeIndex 2.0.2 - Ready to search! 🚀
-```
-
-### Install from Source (For the Adventurous)
-
-```bash
-git clone https://github.com/scooter-lacroix/leindex.git
-cd leindex
-pip install -e .
-```
-
----
 
 ## 🎯 Usage: Let's Search Some Code!
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "leindex"
-version = "2.0.0"
+version = "2.0.1"
 description = "LeIndex: AI-powered code search and indexing system with MCP integration"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,7 +35,7 @@ dependencies = [
     "mako>=1.3.0",
     "markupsafe>=3.0.0",
     "httpx>=0.28.1",
-    "leann>=0.3.5,<0.4.0",  # Pin to 0.3.x series - LEANN vector backend (storage-efficient alternative to FAISS)
+    # "leann>=0.3.5,<0.4.0",  # MOVED TO OPTIONAL: LEANN vector backend (has broken dependency chain)
     # CPU-only sentence-transformers - exclude GPU/CUDA dependencies
     "sentence-transformers>=2.2.0",
     "einops>=0.6.0",  # Required by CodeRankEmbed model for tensor operations
@@ -47,6 +47,8 @@ dependencies = [
 
 # Optional dependencies for PostgreSQL backend
 # Install with: pip install leindex[postgresql]
+# Optional dependencies for LEANN vector backend
+# Install with: pip install leindex[leann]
 [project.optional-dependencies]
 postgresql = [
     "sqlalchemy>=2.0.0",
@@ -54,6 +56,13 @@ postgresql = [
     "psycopg2-binary>=2.9.10",
     "elasticsearch>=8.0.0,<9.0.0",  # Required for dual_write_read and postgresql_elasticsearch_only backends
     "elastic-transport>=8.17.0",  # Required by elasticsearch client
+]
+leann = [
+    "leann>=0.3.5,<0.4.0",  # LEANN vector backend (storage-efficient alternative to FAISS)
+    # Note: Requires leann-backend-hnsw which may not be on PyPI
+]
+all = [
+    "leindex[postgresql,leann]",
 ]
 
 # CRITICAL: CPU-only configuration - prevent CUDA/GPU packages

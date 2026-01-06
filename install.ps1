@@ -1,196 +1,376 @@
 #############################################
-# LeIndex Installer for Windows
-# Version: 2.0.0
-# Supports: Claude Code, Cursor, VS Code, Zed, CLI tools
+# LeIndex Universal Installer
+# Version: 3.0.0
+# Platform: Windows (PowerShell 5.1+)
+# Supports: 15+ AI CLI tools with full MCP integration
 #############################################
 
+#Requires -Version 5.1
+#Requires -RunAsAdministrator
+
+Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-# Color output functions
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+$ScriptVersion = "3.0.0"
+$ProjectName = "LeIndex"
+$ProjectSlug = "leindex"
+$MinPythonMajor = 3
+$MinPythonMinor = 10
+$RepoUrl = "https://github.com/scooter-lacroix/leindex"
+$PypiPackage = "leindex"
+
+# Installation paths
+$LEINDEX_HOME = if ($env:LEINDEX_HOME) { $env:LEINDEX_HOME } else { "$env:USERPROFILE\.leindex" }
+$ConfigDir = "$LEINDEX_HOME\config"
+$DataDir = "$LEINDEX_HOME\data"
+$LogDir = "$LEINDEX_HOME\logs"
+
+# Backup directory
+$BackupDir = "$env:TEMP\leindex-install-backup-$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+# Write colored output
+function Write-ColorOutput {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Message,
+        [ValidateSet("Black", "DarkBlue", "DarkGreen", "DarkCyan", "DarkRed", "DarkMagenta", "DarkYellow",
+                     "Gray", "DarkGray", "Blue", "Green", "Cyan", "Red", "Magenta", "Yellow", "White")]
+        [string]$ForegroundColor = "White",
+        [switch]$NoNewline
+    )
+
+    $fc = $host.UI.RawUI.ForegroundColor
+    $host.UI.RawUI.ForegroundColor = $ForegroundColor
+    if ($NoNewline) {
+        Write-Host -NoNewline $Message
+    } else {
+        Write-Host $Message
+    }
+    $host.UI.RawUI.ForegroundColor = $fc
+}
+
+# Print header
 function Print-Header {
-    Write-Host "╔════════════════════════════════════════════════════════════╗" -Cyan
-    Write-Host "║ LeIndex Installer v2.0.0 for Windows                      ║" -Cyan
-    Write-Host "║ AI-Powered Code Search & MCP Server                       ║" -Cyan
-    Write-Host "╚════════════════════════════════════════════════════════════╝" -Cyan
+    $width = 60
+    Write-ColorOutput "═" * $width -ForegroundColor Cyan
+    Write-ColorOutput "║ $("$ProjectName Installer v$ScriptVersion".PadRight($width - 2)) ║" -ForegroundColor Cyan
+    Write-ColorOutput "║ $("AI-Powered Code Search & MCP Server".PadRight($width - 2)) ║" -ForegroundColor Cyan
+    Write-ColorOutput "═" * $width -ForegroundColor Cyan
     Write-Host ""
 }
 
+# Print section header
+function Print-Section {
+    param([string]$Title)
+    Write-ColorOutput ">>> $Title <<<" -ForegroundColor Blue
+    Write-Host ""
+}
+
+# Print success message
 function Print-Success {
     param([string]$Message)
-    Write-Host "✓ $Message" -Green
+    Write-ColorOutput "✓ $Message" -ForegroundColor Green
 }
 
+# Print warning message
 function Print-Warning {
     param([string]$Message)
-    Write-Host "⚠ $Message" -Yellow
+    Write-ColorOutput "⚠ $Message" -ForegroundColor Yellow
 }
 
+# Print error message
 function Print-Error {
     param([string]$Message)
-    Write-Host "✗ $Message" -Red
+    Write-ColorOutput "✗ $Message" -ForegroundColor Red
 }
 
-function Print-Section {
+# Print info message
+function Print-Info {
     param([string]$Message)
-    Write-Host ">>> $Message" -Blue
+    Write-ColorOutput "ℹ $Message" -ForegroundColor Cyan
 }
 
-# Check Python version (requires 3.10+)
-function Test-PythonVersion {
-    Print-Section "Checking Python version"
+# Print bullet point
+function Print-Bullet {
+    param([string]$Message)
+    Write-ColorOutput "  • $Message" -ForegroundColor Cyan
+}
 
-    $pythonCmd = $null
-    $pythonVersion = $null
+# Ask yes/no question
+function Ask-YesNo {
+    param(
+        [string]$Prompt,
+        [bool]$Default = $false
+    )
 
-    # Try python first, then py launcher
-    try {
-        $result = & python --version 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            $pythonCmd = "python"
-            $pythonVersion = $result.ToString().Replace("Python ", "")
+    $defaultPrompt = if ($Default) { "[Y/n]" } else { "[y/N]" }
+
+    while ($true) {
+        $answer = Read-Host "? $Prompt $defaultPrompt"
+        $answer = $answer.Trim()
+
+        if ([string]::IsNullOrEmpty($answer)) {
+            return $Default
         }
-    } catch {
-        # python not found, try py launcher
+
+        switch ($answer.ToLower()) {
+            {$_ -in "y", "yes"} { return $true }
+            {$_ -in "n", "no"} { return $false }
+            default { Write-Host "Please answer yes or no." }
+        }
+    }
+}
+
+# ============================================================================
+# ERROR HANDLING & ROLLBACK
+# ============================================================================
+
+# Initialize rollback system
+function Initialize-Rollback {
+    New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
+    $BackupDir | Out-File -FilePath "$env:TEMP\leindex-backup-dir-$PID" -Encoding UTF8
+}
+
+# Backup file for potential rollback
+function Backup-FileSafe {
+    param([string]$FilePath)
+
+    if (Test-Path $FilePath) {
+        $backupName = Split-Path $FilePath -Leaf
+        $backupName = "$backupName-" + ($FilePath -replace '[\\/:*?"<>|]', '_')
+        $backupPath = Join-Path $BackupDir $backupName
+        Copy-Item $FilePath $backupPath -Force
+
+        "$backupPath:$FilePath" | Out-File -FilePath "$BackupDir\manifest.txt" -Append -Encoding UTF8
+        Print-Warning "Backed up: $FilePath"
+    }
+}
+
+# Rollback changes on failure
+function Invoke-Rollback {
+    param([int]$ExitCode)
+
+    if ($ExitCode -eq 0) {
+        # Clean up successful installation
+        Remove-Item $BackupDir -Recurse -Force -ErrorAction SilentlyContinue
+        return
     }
 
-    if (-not $pythonCmd) {
+    Print-Error "Installation failed. Rolling back changes..."
+
+    $manifestPath = "$BackupDir\manifest.txt"
+    if (Test-Path $manifestPath) {
+        Get-Content $manifestPath | ForEach-Object {
+            $parts = $_ -split ':', 2
+            if ($parts.Count -eq 2) {
+                $backup = $parts[0]
+                $original = $parts[1]
+
+                if (Test-Path $backup) {
+                    Copy-Item $backup $original -Force
+                    Print-Success "Restored: $original"
+                }
+            }
+        }
+    }
+
+    # Remove created directories (if empty)
+    Remove-Item $ConfigDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $DataDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $LogDir -Recurse -Force -ErrorAction SilentlyContinue
+
+    Print-Warning "Rollback complete"
+    Remove-Item $BackupDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ============================================================================
+# ENVIRONMENT DETECTION
+# ============================================================================
+
+# Detect Python interpreter
+function Find-Python {
+    Print-Section "Detecting Python Environment"
+
+    $pythonCmds = @("python", "python3", "py", "python3.11", "python3.12", "python3.13")
+    $PYTHON_CMD = $null
+
+    foreach ($cmd in $pythonCmds) {
         try {
-            $result = & py --version 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                $pythonCmd = "py"
-                $pythonVersion = $result.ToString().Replace("Python ", "")
+            $result = & $cmd --version 2>&1
+            if ($LASTEXITCODE -eq 0 -and $result -match "Python (\d+)\.(\d+)") {
+                $major = [int]$matches[1]
+                $minor = [int]$matches[2]
+
+                if ($major -ge $MinPythonMajor -and $minor -ge $MinPythonMinor) {
+                    $PYTHON_CMD = $cmd
+                    $version = "$major.$minor"
+                    break
+                }
             }
         } catch {
-            Print-Error "Python not found. Please install Python 3.10+ first."
-            Write-Host "  Download from: https://www.python.org/downloads/"
-            Write-Host "  During installation, check 'Add Python to PATH'"
-            exit 1
+            # Command not found, continue
         }
     }
 
-    # Parse version
-    try {
-        $versionParts = $pythonVersion.Split('.')
-        $major = [int]$versionParts[0]
-        $minor = [int]$versionParts[1]
-
-        if ($major -lt 3 -or ($major -eq 3 -and $minor -lt 10)) {
-            Print-Error "Python 3.10+ required. Found: $pythonVersion"
-            exit 1
-        }
-
-        Print-Success "Python $pythonVersion found"
-    } catch {
-        Print-Error "Failed to parse Python version: $pythonVersion"
+    if (-not $PYTHON_CMD) {
+        Print-Error "Python $MinPythonMajor.$MinPythonMinor+ not found"
+        Write-Host ""
+        Write-Host "Please install Python 3.10 or higher:"
+        Print-Bullet "Download from: https://www.python.org/downloads/"
+        Print-Bullet "During installation, check 'Add Python to PATH'"
+        Print-Bullet "Or use: winget install Python.Python.3.12"
         exit 1
     }
 
+    $script:PYTHON_CMD = $PYTHON_CMD
+    Print-Success "Python $version detected: $PYTHON_CMD"
     Write-Host ""
-    return $pythonCmd
 }
 
-# Check pip availability
-function Test-Pip {
-    param([string]$PythonCmd)
+# Detect package manager
+function Find-PackageManager {
+    Print-Section "Detecting Package Manager"
 
-    Print-Section "Checking pip availability"
-
-    $pipCmd = $null
-
-    # Try pip
-    try {
-        $result = & pip --version 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            $pipCmd = "pip"
-            Print-Success "pip found"
-        }
-    } catch {
-        # pip not found
+    # Check for uv (fastest, preferred)
+    if (Get-Command uv -ErrorAction SilentlyContinue) {
+        $script:PKG_MANAGER = "uv"
+        $script:PKG_INSTALL_CMD = "uv pip install"
+        Print-Success "uv detected (preferred package manager)"
+        return
     }
 
-    # Try pip3
-    if (-not $pipCmd) {
-        try {
-            $result = & pip3 --version 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                $pipCmd = "pip3"
-                Print-Success "pip3 found"
-            }
-        } catch {
-            # pip3 not found
-        }
+    # Check for pip
+    if (Get-Command pip -ErrorAction SilentlyContinue) {
+        $script:PKG_MANAGER = "pip"
+        $script:PKG_INSTALL_CMD = "pip install"
+        Print-Success "pip detected"
+        return
     }
 
-    # Try python -m pip
-    if (-not $pipCmd) {
-        try {
-            $result = & $PythonCmd -m pip --version 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                $pipCmd = "$PythonCmd -m pip"
-                Print-Success "pip (via python module) found"
-            }
-        } catch {
-            # pip not available
-        }
+    # Check for pip3
+    if (Get-Command pip3 -ErrorAction SilentlyContinue) {
+        $script:PKG_MANAGER = "pip"
+        $script:PKG_INSTALL_CMD = "pip3 install"
+        Print-Success "pip3 detected"
+        return
     }
 
-    if (-not $pipCmd) {
-        Print-Error "pip not found. Please install pip first."
-        Write-Host "  Run: python -m ensurepip --upgrade"
-        Write-Host "  Or download get-pip.py from https://bootstrap.pypa.io/get-pip.py"
-        exit 1
+    # Fall back to python -m pip
+    $testPip = & $PYTHON_CMD -m pip --version 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $script:PKG_MANAGER = "pip"
+        $script:PKG_INSTALL_CMD = "$PYTHON_CMD -m pip install"
+        Print-Success "pip (via Python module) detected"
+        return
+    }
+
+    Print-Error "No package manager found"
+    Print-Bullet "Install pip: $PYTHON_CMD -m ensurepip --upgrade"
+    Print-Bullet "Or install uv: powershell -c `"irm https://astral.sh/uv/install.ps1 | iex`""
+    exit 1
+}
+
+# Detect installed AI tools
+function Find-AITools {
+    Print-Section "Detecting AI Coding Tools"
+
+    $detectedTools = @()
+
+    # Desktop Applications
+    if (Test-Path "$env:APPDATA\Claude") { $detectedTools += "claude-desktop" }
+    if (Test-Path "$env:APPDATA\Cursor") { $detectedTools += "cursor" }
+    if (Test-Path "$env:APPDATA\Code") { $detectedTools += "vscode" }
+    if (Test-Path "$env:APPDATA\Zed") { $detectedTools += "zed" }
+    if (Test-Path "$env:APPDATA\JetBrains") { $detectedTools += "jetbrains" }
+
+    # CLI Tools
+    if (Get-Command claude -ErrorAction SilentlyContinue) { $detectedTools += "claude-cli" }
+    if (Get-Command aider -ErrorAction SilentlyContinue) { $detectedTools += "aider" }
+
+    if ($detectedTools.Count -gt 0) {
+        Print-Success "Detected $($detectedTools.Count) AI tool(s):"
+        foreach ($tool in $detectedTools) {
+            Print-Bullet $tool
+        }
+    } else {
+        Print-Warning "No AI tools detected. Will install MCP server only."
     }
 
     Write-Host ""
-    return $pipCmd
 }
+
+# ============================================================================
+# INSTALLATION
+# ============================================================================
 
 # Install LeIndex package
 function Install-LeIndexPackage {
-    param([string]$PipCmd)
+    Print-Section "Installing $ProjectName"
 
-    Print-Section "Installing LeIndex package"
-
-    # Try to upgrade pip first
-    Write-Host "Upgrading pip..."
+    # Upgrade package manager first
+    Print-Info "Upgrading package manager..."
     try {
-        & $PipCmd install --upgrade pip setuptools wheel | Out-Null
-        if ($LASTEXITCODE -ne 0) {
-            Print-Warning "Failed to upgrade pip (continuing anyway)"
+        if ($PKG_MANAGER -eq "uv") {
+            uv self-update 2>$null
+        } else {
+            & $PYTHON_CMD -m pip install --upgrade pip setuptools wheel 2>$null
         }
     } catch {
-        Print-Warning "Failed to upgrade pip (continuing anyway)"
+        Print-Warning "Failed to upgrade package manager (continuing anyway)"
     }
 
-    # Install LeIndex
-    Write-Host "Installing LeIndex..."
-    try {
-        & $PipCmd install leindex
-        if ($LASTEXITCODE -eq 0) {
-            Print-Success "LeIndex installed successfully"
+    # Install package
+    Print-Info "Installing $PypiPackage..."
+    $installArgs = $PKG_INSTALL_CMD.Split(" ")
+    & $installArgs[0] $installArgs[1..($installArgs.Length - 1)] $PypiPackage
 
-            # Verify installation
-            try {
-                & $PipCmd show leindex | Out-Null
-                if ($LASTEXITCODE -eq 0) {
-                    Print-Success "LeIndex package verified"
-                }
-            } catch {
-                Print-Warning "LeIndex installation may have issues"
-            }
-        } else {
-            Print-Error "Failed to install LeIndex"
-            exit 1
-        }
-    } catch {
-        Print-Error "Failed to install LeIndex: $_"
+    if ($LASTEXITCODE -ne 0) {
+        Print-Error "Failed to install $PypiPackage"
+        exit 1
+    }
+
+    Print-Success "$ProjectName installed successfully"
+
+    # Verify installation
+    $testImport = & $PYTHON_CMD -c "import leindex.server" 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $version = & $PYTHON_CMD -c "import leindex; print(leindex.__version__)" 2>&1
+        Print-Success "Installation verified: version $version"
+    } else {
+        Print-Error "Installation verification failed"
         exit 1
     }
 
     Write-Host ""
 }
 
-# Python function to merge JSON configs (embedded in PowerShell)
+# Setup directory structure
+function Initialize-Directories {
+    Print-Section "Setting up Directories"
+
+    $dirs = @($ConfigDir, $DataDir, $LogDir)
+    foreach ($dir in $dirs) {
+        if (-not (Test-Path $dir)) {
+            New-Item -ItemType Directory -Path $dir -Force | Out-Null
+            Print-Success "Created: $dir"
+        }
+    }
+
+    Write-Host ""
+}
+
+# ============================================================================
+# TOOL INTEGRATION
+# ============================================================================
+
+# Merge JSON configuration safely
 function Merge-JsonConfig {
     param(
         [string]$ConfigFile,
@@ -202,7 +382,7 @@ function Merge-JsonConfig {
 import json
 import sys
 
-config_file = '$ConfigFile'
+config_file = r'$ConfigFile'
 server_name = '$ServerName'
 server_command = '$ServerCommand'
 
@@ -217,104 +397,80 @@ if 'mcpServers' not in config:
 
 config['mcpServers'][server_name] = {
     'command': server_command,
-    'args': []
+    'args': ['mcp'],
+    'env': {},
+    'disabled': False
 }
 
 with open(config_file, 'w') as f:
     json.dump(config, f, indent=2)
+    f.write('\n')
 
-print(f"Config updated: {config_file}")
+print(f"Updated: {config_file}")
 "@
 
-    $pythonCmd = (Get-Command python -ErrorAction SilentlyContinue).Source
-    if (-not $pythonCmd) {
-        $pythonCmd = (Get-Command py -ErrorAction SilentlyContinue).Source
-    }
-
-    if ($pythonCmd) {
-        $output = & $pythonCmd -c $pythonScript 2>&1
-        Write-Host $output
-    } else {
-        Print-Error "Python not found for JSON merging"
-    }
+    & $PYTHON_CMD -c $pythonScript
 }
 
-# Backup existing config
-function Backup-Config {
-    param([string]$ConfigFile)
+# Configure Claude Desktop
+function Configure-ClaudeDesktop {
+    Print-Section "Configuring Claude Desktop"
 
-    if (Test-Path $ConfigFile) {
-        $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
-        $backupFile = "$ConfigFile.backup.$timestamp"
-        Copy-Item $ConfigFile $backupFile
-        Print-Warning "Backed up existing config to: $backupFile"
-    }
-}
+    $configDir = "$env:APPDATA\Claude"
+    $configFile = "$configDir\claude_desktop_config.json"
 
-# Configure Claude Code Desktop
-function Configure-ClaudeCode {
-    Print-Section "Configuring Claude Code Desktop"
+    New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+    Backup-FileSafe $configFile
 
-    $configDir = Join-Path $env:APPDATA "Claude"
-    $configFile = Join-Path $configDir "claude_desktop_config.json"
-
-    # Create directory
-    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-
-    # Backup existing config
-    Backup-Config $configFile
-
-    # Merge config
     Merge-JsonConfig $configFile "leindex" "leindex"
 
-    Print-Success "Claude Code configured"
-    Write-Host "  Config: $configFile"
+    Print-Success "Claude Desktop configured"
+    Print-Bullet "Config: $configFile"
     Write-Host ""
 }
 
-# Configure Cursor
+# Configure Cursor IDE
 function Configure-Cursor {
     Print-Section "Configuring Cursor"
 
-    $configDir = Join-Path $env:APPDATA "Cursor"
-    $configFile = Join-Path $configDir "mcp.json"
+    $configDir = "$env:APPDATA\Cursor"
+    $configFile = "$configDir\mcp.json"
 
-    # Create directory
-    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+    New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+    Backup-FileSafe $configFile
 
-    # Backup existing config
-    Backup-Config $configFile
-
-    # Merge config
     Merge-JsonConfig $configFile "leindex" "leindex"
 
     Print-Success "Cursor configured"
-    Write-Host "  Config: $configFile"
+    Print-Bullet "Config: $configFile"
     Write-Host ""
 }
 
-# Configure VS Code (Cline, Continue, Roo Code)
+# Configure VS Code
 function Configure-VSCode {
-    Print-Section "Configuring VS Code Extensions"
+    Print-Section "Configuring VS Code Family"
 
-    $configDir = Join-Path $env:APPDATA "Code\User"
-    $configFile = Join-Path $configDir "settings.json"
+    $vscodeConfigs = @(
+        "$env:APPDATA\Code\User\settings.json",
+        "$env:APPDATA\VSCodium\User\settings.json"
+    )
 
-    # Create directory
-    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+    foreach ($configFile in $vscodeConfigs) {
+        $configDir = Split-Path $configFile -Parent
 
-    # Backup existing config
-    Backup-Config $configFile
+        if (Test-Path (Split-Path $configDir -Parent)) {
+            New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+            Backup-FileSafe $configFile
 
-    # Merge config
-    Merge-JsonConfig $configFile "leindex" "leindex"
+            Merge-JsonConfig $configFile "leindex" "leindex"
+            Print-Success "VS Code configured: $configFile"
+        }
+    }
 
-    Print-Success "VS Code configured (Cline, Continue, Roo Code)"
-    Write-Host "  Config: $configFile"
-    Write-Host "  Note: Make sure you have one of these extensions installed:"
-    Write-Host "    - Cline"
-    Write-Host "    - Continue"
-    Write-Host "    - Roo Code"
+    Print-Info "Note: Install an MCP extension for VS Code:"
+    Print-Bullet "Cline: https://marketplace.visualstudio.com/items?itemName=saoudrizwan.claude"
+    Print-Bullet "Continue: https://marketplace.visualstudio.com/items?itemName=Continue.continue"
+    Print-Bullet "Roo Code: https://marketplace.visualstudio.com/items?itemName=RooCode.roo-code"
     Write-Host ""
 }
 
@@ -322,20 +478,16 @@ function Configure-VSCode {
 function Configure-Zed {
     Print-Section "Configuring Zed Editor"
 
-    $configDir = Join-Path $env:APPDATA "Zed"
-    $configFile = Join-Path $configDir "settings.json"
+    $configDir = "$env:APPDATA\Zed"
+    $configFile = "$configDir\settings.json"
 
-    # Create directory
-    New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+    New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+    Backup-FileSafe $configFile
 
-    # Backup existing config
-    Backup-Config $configFile
-
-    # Zed uses different format (lsp instead of mcpServers)
     $pythonScript = @"
 import json
 
-config_file = '$configFile'
+config_file = r'$configFile'
 
 try:
     with open(config_file, 'r') as f:
@@ -348,27 +500,39 @@ if 'lsp' not in config:
 
 config['lsp']['leindex'] = {
     'command': 'leindex',
-    'args': []
+    'args': ['mcp']
 }
 
 with open(config_file, 'w') as f:
     json.dump(config, f, indent=2)
+    f.write('\n')
 
-print(f"Zed config updated: {config_file}")
+print(f"Updated: {config_file}")
 "@
 
-    $pythonCmd = (Get-Command python -ErrorAction SilentlyContinue).Source
-    if (-not $pythonCmd) {
-        $pythonCmd = (Get-Command py -ErrorAction SilentlyContinue).Source
-    }
-
-    if ($pythonCmd) {
-        $output = & $pythonCmd -c $pythonScript 2>&1
-        Write-Host $output
-    }
+    & $PYTHON_CMD -c $pythonScript
 
     Print-Success "Zed Editor configured"
-    Write-Host "  Config: $configFile"
+    Print-Bullet "Config: $configFile"
+    Write-Host ""
+}
+
+# Configure JetBrains IDEs
+function Configure-JetBrains {
+    Print-Section "Configuring JetBrains IDEs"
+
+    $configDir = "$env:APPDATA\JetBrains"
+
+    if (Test-Path $configDir) {
+        Print-Info "JetBrains IDEs detected"
+        Print-Info "Manual configuration required for JetBrains:"
+        Print-Bullet "Install the 'MCP Support' plugin from JetBrains Marketplace"
+        Print-Bullet "Configure MCP server: command='leindex', args=['mcp']"
+        Print-Warning "See documentation for JetBrains-specific setup"
+    } else {
+        Print-Info "No JetBrains IDEs detected"
+    }
+
     Write-Host ""
 }
 
@@ -376,227 +540,259 @@ print(f"Zed config updated: {config_file}")
 function Configure-CLITools {
     Print-Section "Configuring CLI Tools"
 
-    # LeIndex CLI is available via leindex-search command
-    $leindexSearch = Get-Command "leindex-search" -ErrorAction SilentlyContinue
+    # Check if leindex is in PATH
+    $leindexCmd = Get-Command leindex -ErrorAction SilentlyContinue
 
-    if ($leindexSearch) {
-        Print-Success "LeIndex CLI available: leindex-search"
+    if ($leindexCmd) {
+        Print-Success "'leindex' command available in PATH"
     } else {
-        Print-Warning "LeIndex CLI not in PATH, but package is installed"
-        Write-Host "  You may need to restart your terminal for PATH changes to take effect"
-        Write-Host "  Or use: python -m leindex.cli"
-    }
+        Print-Warning "'leindex' command not in PATH"
+        Print-Info "Python Scripts directory needs to be in PATH:"
 
-    Write-Host ""
-}
+        # Try to find Python Scripts directory
+        $scriptsDir = & $PYTHON_CMD -c "import sys; import os; print(os.path.join(sys.prefix, 'Scripts'))" 2>$null
 
-# Display tool menu
-function Show-ToolMenu {
-    Write-Host "Select AI tools to integrate with LeIndex:" -Blue
-    Write-Host ""
-    Write-Host "  1) Claude Code (Desktop)"
-    Write-Host "  2) Cursor"
-    Write-Host "  3) VS Code (Cline, Continue, Roo Code)"
-    Write-Host "  4) Zed Editor"
-    Write-Host "  5) CLI Tools (Gemini, OpenCode, etc.)"
-    Write-Host "  6) All tools"
-    Write-Host "  7) Skip tool integration (MCP server only)"
-    Write-Host "  8) Custom selection"
-    Write-Host ""
+        if ($scriptsDir) {
+            Print-Bullet "export PATH=`$PATH:`"$scriptsDir`""
 
-    $choice = Read-Host "Enter your choice (1-8)"
-    Write-Host ""
-
-    switch ($choice) {
-        "1" { Configure-ClaudeCode }
-        "2" { Configure-Cursor }
-        "3" { Configure-VSCode }
-        "4" { Configure-Zed }
-        "5" { Configure-CLITools }
-        "6" {
-            Configure-ClaudeCode
-            Configure-Cursor
-            Configure-VSCode
-            Configure-Zed
-            Configure-CLITools
-        }
-        "7" {
-            Print-Warning "Skipping tool integration"
-            Write-Host "LeIndex MCP server is installed and ready to use manually"
-            Write-Host ""
-        }
-        "8" {
-            Write-Host "Select tools to configure (comma-separated, e.g., '1,2,4'):"
-            Write-Host "  1) Claude Code  2) Cursor  3) VS Code  4) Zed  5) CLI"
-            $customChoices = Read-Host ">"
-
-            $choices = $customChoices -split ','
-            foreach ($c in $choices) {
-                switch ($c.Trim()) {
-                    "1" { Configure-ClaudeCode }
-                    "2" { Configure-Cursor }
-                    "3" { Configure-VSCode }
-                    "4" { Configure-Zed }
-                    "5" { Configure-CLITools }
-                }
+            if (Ask-YesNo "Add to user PATH? (requires restart)") {
+                [Environment]::SetEnvironmentVariable("Path", $env:Path + ";$scriptsDir", "User")
+                Print-Success "Added to user PATH"
+                Print-Warning "Restart your terminal for changes to take effect"
             }
         }
-        default {
-            Print-Error "Invalid choice. Skipping tool integration."
-            Write-Host ""
+    }
+
+    # Check leindex-search
+    if (Get-Command leindex-search -ErrorAction SilentlyContinue) {
+        Print-Success "'leindex-search' command available"
+    }
+
+    Write-Host ""
+}
+
+# Interactive tool selection
+function Select-Tools {
+    Print-Section "Tool Integration"
+
+    Write-Host "Select AI tools to integrate with $ProjectName:"
+    Write-Host ""
+    Write-Host "  1) Claude Desktop"
+    Write-Host "  2) Cursor IDE"
+    Write-Host "  3) VS Code / VSCodium"
+    Write-Host "  4) Zed Editor"
+    Write-Host "  5) JetBrains IDEs"
+    Write-Host "  6) CLI Tools (PATH setup)"
+    Write-Host "  a) All tools"
+    Write-Host "  d) Detected tools only"
+    Write-Host "  s) Skip integration"
+    Write-Host "  c) Custom selection"
+    Write-Host ""
+
+    while ($true) {
+        $choice = Read-Host "? Enter choice"
+        Write-Host ""
+
+        switch ($choice) {
+            "1" { Configure-ClaudeDesktop; break }
+            "2" { Configure-Cursor; break }
+            "3" { Configure-VSCode; break }
+            "4" { Configure-Zed; break }
+            "5" { Configure-JetBrains; break }
+            "6" { Configure-CLITools; break }
+            {$_ -in "a", "A"} {
+                Configure-ClaudeDesktop
+                Configure-Cursor
+                Configure-VSCode
+                Configure-Zed
+                Configure-JetBrains
+                Configure-CLITools
+                break
+            }
+            {$_ -in "d", "D"} {
+                if (Test-Path "$env:APPDATA\Claude") { Configure-ClaudeDesktop }
+                if (Test-Path "$env:APPDATA\Cursor") { Configure-Cursor }
+                if (Test-Path "$env:APPDATA\Code") { Configure-VSCode }
+                if (Test-Path "$env:APPDATA\Zed") { Configure-Zed }
+                if (Test-Path "$env:APPDATA\JetBrains") { Configure-JetBrains }
+                Configure-CLITools
+                break
+            }
+            {$_ -in "s", "S"} {
+                Print-Warning "Skipping tool integration"
+                Print-Info "MCP server installed and ready for manual configuration"
+                break
+            }
+            {$_ -in "c", "C"} {
+                Write-Host "Enter tools (comma-separated, e.g., '1,3,4'):"
+                $custom = Read-Host ">"
+                Write-Host ""
+
+                foreach ($tool in $custom -split ',') {
+                    switch ($tool.Trim()) {
+                        "1" { Configure-ClaudeDesktop }
+                        "2" { Configure-Cursor }
+                        "3" { Configure-VSCode }
+                        "4" { Configure-Zed }
+                        "5" { Configure-JetBrains }
+                        "6" { Configure-CLITools }
+                    }
+                }
+                break
+            }
+            default {
+                Print-Error "Invalid choice. Please try again."
+            }
         }
     }
 }
 
-# Verify installation
+# ============================================================================
+# VERIFICATION
+# ============================================================================
+
 function Test-Installation {
     Print-Section "Verifying Installation"
 
-    $pythonCmd = (Get-Command python -ErrorAction SilentlyContinue).Source
-    if (-not $pythonCmd) {
-        $pythonCmd = (Get-Command py -ErrorAction SilentlyContinue).Source
+    $allGood = $true
+
+    # Check package installation
+    $testImport = & $PYTHON_CMD -c "import leindex.server" 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Print-Success "Python package installed"
+        $version = & $PYTHON_CMD -c "import leindex; print(leindex.__version__)" 2>&1
+        Print-Bullet "Version: $version"
+    } else {
+        Print-Error "Python package not found"
+        $allGood = $false
     }
 
-    # Check if LeIndex is installed
-    try {
-        $result = & $pythonCmd -c "import leindex.server" 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Print-Success "LeIndex package installed"
+    # Check command availability
+    Write-Host ""
+    Write-Host "Commands:"
+    if (Get-Command leindex -ErrorAction SilentlyContinue) {
+        Print-Success "leindex"
+    } else {
+        Print-Warning "leindex (not in PATH)"
+    }
 
-            # Show version
-            try {
-                $version = & $pythonCmd -c "import leindex; print(leindex.__version__)" 2>&1
-                Write-Host "  Version: $version"
-            } catch {
-                Write-Host "  Version: unknown"
-            }
-        } else {
-            Print-Error "LeIndex package not found"
-            return $false
-        }
-    } catch {
-        Print-Error "LeIndex package not found"
-        return $false
+    if (Get-Command leindex-search -ErrorAction SilentlyContinue) {
+        Print-Success "leindex-search"
+    } else {
+        Print-Warning "leindex-search (not in PATH)"
     }
 
     # Check configured tools
     Write-Host ""
     Write-Host "Configured tools:"
 
-    $claudeConfig = Join-Path $env:APPDATA "Claude\claude_desktop_config.json"
+    $claudeConfig = "$env:APPDATA\Claude\claude_desktop_config.json"
     if (Test-Path $claudeConfig) {
         $content = Get-Content $claudeConfig -Raw
-        if ($content -match "leindex") {
-            Print-Success "Claude Code"
-        }
+        if ($content -match "leindex") { Print-Success "Claude Desktop" }
     }
 
-    $cursorConfig = Join-Path $env:APPDATA "Cursor\mcp.json"
+    $cursorConfig = "$env:APPDATA\Cursor\mcp.json"
     if (Test-Path $cursorConfig) {
         $content = Get-Content $cursorConfig -Raw
-        if ($content -match "leindex") {
-            Print-Success "Cursor"
-        }
+        if ($content -match "leindex") { Print-Success "Cursor" }
     }
 
-    $vscodeConfig = Join-Path $env:APPDATA "Code\User\settings.json"
+    $vscodeConfig = "$env:APPDATA\Code\User\settings.json"
     if (Test-Path $vscodeConfig) {
         $content = Get-Content $vscodeConfig -Raw
-        if ($content -match "leindex") {
-            Print-Success "VS Code"
-        }
+        if ($content -match "leindex") { Print-Success "VS Code" }
     }
 
-    $zedConfig = Join-Path $env:APPDATA "Zed\settings.json"
+    $zedConfig = "$env:APPDATA\Zed\settings.json"
     if (Test-Path $zedConfig) {
         $content = Get-Content $zedConfig -Raw
-        if ($content -match "leindex") {
-            Print-Success "Zed Editor"
-        }
+        if ($content -match "leindex") { Print-Success "Zed" }
     }
 
     Write-Host ""
-    return $true
+
+    return $allGood
 }
 
-# Print completion message
-function Print-Completion {
-    Write-Host "╔════════════════════════════════════════════════════════════╗" -Green
-    Write-Host "║ Installation Complete!                                     ║" -Green
-    Write-Host "╚════════════════════════════════════════════════════════════╝" -Green
+# ============================================================================
+# COMPLETION MESSAGE
+# ============================================================================
+
+function Show-Completion {
     Write-Host ""
-    Write-Host "Next Steps:" -Blue
+    Write-ColorOutput "╔════════════════════════════════════════════════════════════╗" -ForegroundColor Green
+    Write-ColorOutput "║ Installation Complete!                                      ║" -ForegroundColor Green
+    Write-ColorOutput "╚════════════════════════════════════════════════════════════╝" -ForegroundColor Green
     Write-Host ""
-    Write-Host "1. Restart your AI tool(s) to load LeIndex"
-    Write-Host "2. LeIndex will be available as an MCP server"
-    Write-Host "3. Use the MCP tools in your AI assistant to:"
-    Write-Host "     - Index code repositories"
-    Write-Host "     - Search code with natural language"
-    Write-Host "     - Analyze code patterns"
+
+    Write-ColorOutput "Next Steps:" -ForegroundColor White
     Write-Host ""
-    Write-Host "Documentation:" -Cyan
-    Write-Host "  https://github.com/scooter-lacroix/leindex"
+    Write-Host "1. Restart your AI tool(s) to load $ProjectName"
+    Write-Host "2. Use MCP tools in your AI assistant:"
+    Write-ColorOutput "     manage_project" -ForegroundColor Cyan
+    Write-ColorOutput "     search_content" -ForegroundColor Cyan
+    Write-ColorOutput "     get_diagnostics" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "Windows Notes:" -Yellow
-    Write-Host "  - If 'leindex' command is not recognized, restart your terminal"
-    Write-Host "  - Or add Python Scripts to PATH:"
-    Write-Host "    $env:APPDATA\Python\Python3*\Scripts\"
+    Write-Host "3. Or use CLI commands:"
+    Write-ColorOutput "     leindex mcp" -ForegroundColor Cyan
+    Write-ColorOutput "     leindex-search `"query`"" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "Troubleshooting:" -Yellow
-    Write-Host "  If LeIndex doesn't appear in your AI tool:"
-    Write-Host "  1. Check the config file for syntax errors"
-    Write-Host "  2. Ensure 'leindex' command is in your PATH"
-    Write-Host "  3. Restart the AI tool completely"
-    Write-Host "  4. Check AI tool logs for MCP errors"
+
+    Write-ColorOutput "Documentation:" -ForegroundColor White
+    Print-Bullet "GitHub: $RepoUrl"
+    Print-Bullet "MCP Config: See MCP_CONFIGURATION.md"
+    Write-Host ""
+
+    Write-ColorOutput "Troubleshooting:" -ForegroundColor White
+    Print-Bullet "Check logs: $LogDir\"
+    Print-Bullet "Test MCP: $PYTHON_CMD -m leindex.server"
+    Print-Bullet "Debug mode: `$env:LEINDEX_LOG_LEVEL=`"DEBUG`""
+    Write-Host ""
+
+    Write-ColorOutput "Uninstall:" -ForegroundColor White
+    Print-Bullet "Run: irm $RepoUrl/raw/master/uninstall.ps1 | iex"
     Write-Host ""
 }
 
-# Rollback function
-function Invoke-Rollback {
-    Print-Error "Installation failed or interrupted"
-    Write-Host ""
-    Write-Host "Rolling back changes..."
+# ============================================================================
+# MAIN INSTALLATION FLOW
+# ============================================================================
 
-    # Find and restore backups
-    $backupFiles = Get-ChildItem -Path $env:APPDATA -Recurse -Filter "*.backup.*" -ErrorAction SilentlyContinue
-
-    foreach ($backup in $backupFiles) {
-        $original = $backup.FullName -replace '\.backup\.\d{8}_\d{6}$', ''
-        if (Test-Path $backup.FullName) {
-            Write-Host "Restoring: $original"
-            Copy-Item $backup.FullName $original -Force
-            Remove-Item $backup.FullName -Force
-        }
-    }
-
-    Write-Host "Rollback complete"
-}
-
-# Main installation flow
 function Main {
-    try {
-        Print-Header
+    Clear-Host
+    Print-Header
 
-        # Check prerequisites
-        $pythonCmd = Test-PythonVersion
-        $pipCmd = Test-Pip $pythonCmd
+    # Initialize rollback
+    Initialize-Rollback
 
-        # Install LeIndex
-        Install-LeIndexPackage $pipCmd
+    # Environment detection
+    Find-Python
+    Find-PackageManager
+    Find-AITools
 
-        # Configure tools
-        Show-ToolMenu
+    # Installation
+    Initialize-Directories
+    Install-LeIndexPackage
 
-        # Verify installation
-        Test-Installation
+    # Tool integration
+    Select-Tools
 
-        # Print completion message
-        Print-Completion
-    } catch {
-        Invoke-Rollback
-        exit 1
-    }
+    # Verification
+    Test-Installation
+
+    # Completion
+    Show-Completion
+
+    # Clean up backup on success
+    Remove-Item $BackupDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# Run main function
+# Error handling
+trap {
+    Invoke-Rollback -ExitCode 1
+    exit 1
+}
+
+# Run installation
 Main
