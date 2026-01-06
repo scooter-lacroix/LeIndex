@@ -255,6 +255,9 @@ ask_yes_no() {
     done
 }
 
+# Global variable for ask_choice result
+ASK_CHOICE_RESULT=""
+
 # Ask for a choice from a list
 ask_choice() {
     local prompt="$1"
@@ -278,7 +281,8 @@ ask_choice() {
         echo ""
 
         if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
-            return $((choice - 1))
+            ASK_CHOICE_RESULT=$((choice - 1))
+            return 0
         else
             print_error "Invalid choice. Please enter a number between 1 and ${#options[@]}"
         fi
@@ -1123,8 +1127,9 @@ configure_vscode() {
             "Skip VS Code configuration"
         )
 
+        ASK_CHOICE_RESULT=""
         ask_choice "Select your MCP extension:" "${options[@]}"
-        local choice=$?
+        local choice=$ASK_CHOICE_RESULT
         echo ""
 
         if [[ $choice -eq 2 ]]; then
@@ -1464,8 +1469,9 @@ select_tools() {
         "Custom selection"
     )
 
+    ASK_CHOICE_RESULT=""
     ask_choice "Select an option:" "${options[@]}"
-    local choice=$?
+    local choice=$ASK_CHOICE_RESULT
 
     echo ""
 
