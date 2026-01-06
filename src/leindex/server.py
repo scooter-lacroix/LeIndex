@@ -473,7 +473,7 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[LeIndexContext]:
 
     # Initialize Vector Backend based on configuration
     # Read vector_store.backend_type from config to choose between LEANN and FAISS
-    vector_store_settings = config_manager.get_vector_store_settings()
+    vector_store_settings = global_config_manager.get_vector_store_settings()
     backend_type = vector_store_settings.get('backend_type', 'leann').lower()
 
     logger.info(f"Initializing vector backend with type: {backend_type}")

@@ -854,22 +854,37 @@ class SQLiteSearch(SearchInterface):
                 try:
                     conn.execute("DELETE FROM kv_fts")
 
-                    # CRITICAL FIX: Properly convert BLOB values to text for FTS indexing
-                    # The kv_store table has: key (TEXT), value (BLOB), value_type (TEXT)
-                    # We need to decode the BLOB and convert it to searchable text
-                    conn.execute('''
-                        INSERT INTO kv_fts (key, value_text)
-                        SELECT
-                            key,
-                            CASE
-                                WHEN value_type = 'text' THEN CAST(value AS TEXT)
-                                ELSE json_extract(CAST(value AS TEXT), '$')
-                            END as searchable_text
-                        FROM kv_store
-                        WHERE value IS NOT NULL
-                    ''')
+                    # CRITICAL FIX: Read and decode BLOB values in Python before inserting into FTS
+                    # SQLite CAST(value AS TEXT) doesn't properly decode UTF-8 from BLOB columns
+                    # We need to fetch the data, decode it in Python, and then insert it
+                    cursor = conn.execute("SELECT key, value, value_type FROM kv_store WHERE value IS NOT NULL")
+                    rows = cursor.fetchall()
+
+                    for key, value_blob, value_type in rows:
+                        try:
+                            # Decode BLOB to text
+                            if value_type == 'text':
+                                value_text = value_blob.decode('utf-8') if isinstance(value_blob, bytes) else str(value_blob)
+                            else:
+                                # For JSON, decode and convert to string for searchability
+                                json_str = value_blob.decode('utf-8') if isinstance(value_blob, bytes) else str(value_blob)
+                                value_text = json_str  # Store the JSON string as-is for FTS
+
+                            # Insert into kv_fts
+                            conn.execute('''
+                                INSERT INTO kv_fts (key, value_text)
+                                VALUES (?, ?)
+                            ''', (key, value_text))
+
+                        except (UnicodeDecodeError, json.JSONDecodeError) as decode_err:
+                            logger.warning(f"Skipping key {key} due to decode error: {decode_err}")
+                            continue
+                        except Exception as row_err:
+                            logger.warning(f"Error processing key {key}: {row_err}")
+                            continue
+
                     repair_result["kv_fts_repaired"] = True
-                    logger.debug("kv_fts table repaired")
+                    logger.debug(f"kv_fts table repaired with {len(rows)} entries")
                 except Exception as e:
                     logger.error(f"Error repairing kv_fts: {e}")
                     repair_result["error"] = f"kv_fts repair failed: {e}"
