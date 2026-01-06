@@ -8,8 +8,6 @@ from .storage.storage_interface import SearchInterface, DALInterface
 from .logger_config import logger
 from .constants import (
     DEFAULT_MAX_SEARCH_RESULTS,
-    ES_MAX_SEARCH_RESULTS,
-    POSTGRESQL_MAX_SEARCH_RESULTS,
     HEALTH_CHECK_CACHE_TIMEOUT,
     SEARCH_OPERATIONS_MAX_AGE_HOURS,
     RECENT_OPERATIONS_LIMIT,
@@ -117,26 +115,12 @@ class SearchBackendSelector:
                 "supports_prefix_queries": True,
                 "max_result_limit": DEFAULT_MAX_SEARCH_RESULTS
             })
-        elif backend_type == "elasticsearch":
-            capabilities.update({
-                "supports_regex": True,
-                "supports_fuzzy": True,
-                "supports_highlighting": True,
-                "max_result_limit": ES_MAX_SEARCH_RESULTS
-            })
         elif backend_type == "sqlite":
             capabilities.update({
                 "supports_regex": True,  # SQLite supports REGEXP
                 "supports_fuzzy": False,
                 "supports_highlighting": False,
                 "max_result_limit": DEFAULT_MAX_SEARCH_RESULTS
-            })
-        elif backend_type == "postgresql":
-            capabilities.update({
-                "supports_regex": True,
-                "supports_fuzzy": True,
-                "supports_highlighting": False,
-                "max_result_limit": POSTGRESQL_MAX_SEARCH_RESULTS
             })
 
         return capabilities
