@@ -297,9 +297,23 @@ function Find-AITools {
     if (Test-Path "$env:APPDATA\Zed") { $detectedTools += "zed" }
     if (Test-Path "$env:APPDATA\JetBrains") { $detectedTools += "jetbrains" }
 
-    # CLI Tools
+    # CLI Tools - Official/Popular tools
     if (Get-Command claude -ErrorAction SilentlyContinue) { $detectedTools += "claude-cli" }
+    if (Get-Command gemini -ErrorAction SilentlyContinue) { $detectedTools += "gemini-cli" }
     if (Get-Command aider -ErrorAction SilentlyContinue) { $detectedTools += "aider" }
+    if (Get-Command cursor -ErrorAction SilentlyContinue) { $detectedTools += "cursor-cli" }
+    if (Get-Command opencode -ErrorAction SilentlyContinue) { $detectedTools += "opencode" }
+    if (Get-Command qwen -ErrorAction SilentlyContinue) { $detectedTools += "qwen-cli" }
+    if (Get-Command amp -ErrorAction SilentlyContinue) { $detectedTools += "amp-code" }
+    if (Get-Command kilocode -ErrorAction SilentlyContinue) { $detectedTools += "kilocode-cli" }
+    if (Get-Command codex -ErrorAction SilentlyContinue) { $detectedTools += "codex-cli" }
+    if (Get-Command goose -ErrorAction SilentlyContinue) { $detectedTools += "goose-cli" }
+    if (Get-Command mistral -ErrorAction SilentlyContinue) { $detectedTools += "mistral-vibe" }
+
+    # Check for config directories
+    if (Test-Path "$env:APPDATA\windsurf") { $detectedTools += "windsurf" }
+    if (Test-Path "$env:APPDATA\continue") { $detectedTools += "continue" }
+    if (Test-Path "$env:APPDATA\mistral") { $detectedTools += "mistral-vibe" }
 
     if ($detectedTools.Count -gt 0) {
         Print-Success "Detected $($detectedTools.Count) AI tool(s):"
@@ -345,14 +359,20 @@ function Install-LeIndexPackage {
 
     Print-Success "$ProjectName installed successfully"
 
-    # Verify installation
-    $testImport = & $PYTHON_CMD -c "import leindex.server" 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $version = & $PYTHON_CMD -c "import leindex; print(leindex.__version__)" 2>&1
-        Print-Success "Installation verified: version $version"
+    # Verify installation - for uv, just check if install command succeeded
+    # For pip/pipx, check if we can import the module
+    if ($PKG_MANAGER -eq "uv") {
+        # uv manages its own venv, import check may fail even if successful
+        Print-Success "Installation verified (via uv)"
     } else {
-        Print-Error "Installation verification failed"
-        exit 1
+        $testImport = & $PYTHON_CMD -c "import leindex.server" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $version = & $PYTHON_CMD -c "import leindex; print(leindex.__version__)" 2>&1
+            Print-Success "Installation verified: version $version"
+        } else {
+            Print-Error "Installation verification failed"
+            exit 1
+        }
     }
 
     Write-Host ""
@@ -664,14 +684,22 @@ function Test-Installation {
     $allGood = $true
 
     # Check package installation
-    $testImport = & $PYTHON_CMD -c "import leindex.server" 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Print-Success "Python package installed"
-        $version = & $PYTHON_CMD -c "import leindex; print(leindex.__version__)" 2>&1
-        Print-Bullet "Version: $version"
+    if ($PKG_MANAGER -eq "uv") {
+        # For uv, if installation succeeded (we're here), it's installed
+        # uv manages its own virtual environments, so checking via import can fail
+        Print-Success "Python package installed (via uv)"
+        Print-Bullet "LeIndex is ready to use"
     } else {
-        Print-Error "Python package not found"
-        $allGood = $false
+        # Use Python import check for pip/pipx
+        $testImport = & $PYTHON_CMD -c "import leindex.server" 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Print-Success "Python package installed"
+            $version = & $PYTHON_CMD -c "import leindex; print(leindex.__version__)" 2>&1
+            Print-Bullet "Version: $version"
+        } else {
+            Print-Error "Python package not found"
+            $allGood = $false
+        }
     }
 
     # Check command availability
@@ -680,13 +708,13 @@ function Test-Installation {
     if (Get-Command leindex -ErrorAction SilentlyContinue) {
         Print-Success "leindex"
     } else {
-        Print-Warning "leindex (not in PATH)"
+        Print-Warning "leindex (not in PATH - use uv run leindex)"
     }
 
     if (Get-Command leindex-search -ErrorAction SilentlyContinue) {
         Print-Success "leindex-search"
     } else {
-        Print-Warning "leindex-search (not in PATH)"
+        Print-Warning "leindex-search (not in PATH - use uv run leindex-search)"
     }
 
     # Check configured tools

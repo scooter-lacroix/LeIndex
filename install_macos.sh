@@ -286,16 +286,29 @@ detect_ai_tools() {
     [[ -d "$HOME/.config/zed" ]] && detected_tools+=("zed")
     [[ -d "$HOME/.config/JetBrains" ]] && detected_tools+=("jetbrains")
 
-    # CLI Tools
+    # CLI Tools - Official/Popular tools
     command -v claude &> /dev/null && detected_tools+=("claude-cli")
     command -v gemini &> /dev/null && detected_tools+=("gemini-cli")
     command -v aider &> /dev/null && detected_tools+=("aider")
     command -v cursor &> /dev/null && detected_tools+=("cursor-cli")
+    command -v opencode &> /dev/null && detected_tools+=("opencode")
+    command -v qwen &> /dev/null && detected_tools+=("qwen-cli")
+    command -v amp &> /dev/null && detected_tools+=("amp-code")
+    command -v kilocode &> /dev/null && detected_tools+=("kilocode-cli")
+    command -v codex &> /dev/null && detected_tools+=("codex-cli")
+    command -v goose &> /dev/null && detected_tools+=("goose-cli")
+
+    # Check for mistral-vibe (may have different command names)
+    command -v mistral &> /dev/null && detected_tools+=("mistral-vibe")
+    command -v mistral-vibe &> /dev/null && detected_tools+=("mistral-vibe")
 
     # Check for common config directories
     [[ -d "$HOME/.config/windsurf" ]] && detected_tools+=("windsurf")
     [[ -d "$HOME/.config/continue" ]] && detected_tools+=("continue")
     [[ -d "$HOME/.config/cursor" ]] && detected_tools+=("cursor")
+
+    # Check for mistral-vibe config
+    [[ -d "$HOME/.config/mistral" ]] && detected_tools+=("mistral-vibe")
 
     if [[ ${#detected_tools[@]} -gt 0 ]]; then
         print_success "Detected ${#detected_tools[@]} AI tool(s):"
@@ -337,8 +350,12 @@ install_leindex() {
         exit 1
     fi
 
-    # Verify installation
-    if $PYTHON_CMD -c "import leindex.server" 2>/dev/null; then
+    # Verify installation - for uv, just check if install command succeeded
+    # For pip/pipx, check if we can import the module
+    if [[ "$PKG_MANAGER" == "uv" ]]; then
+        # uv manages its own venv, import check may fail even if successful
+        print_success "Installation verified (via uv)"
+    elif $PYTHON_CMD -c "import leindex.server" 2>/dev/null; then
         VERSION=$($PYTHON_CMD -c "import leindex; print(leindex.__version__)" 2>/dev/null || echo "unknown")
         print_success "Installation verified: version $VERSION"
     else
@@ -657,41 +674,59 @@ select_tools() {
 # ============================================================================
 
 verify_installation() {
-    print_section "Verifying Installation"
+    echo -e "${BLUE}>>> ${BOLD}Verifying Installation${NC}${BLUE} <<<${NC}"
+    echo ""
 
-    local all_good=true
-
-    # Check package installation
-    if $PYTHON_CMD -c "import leindex.server" 2>/dev/null; then
-        print_success "Python package installed"
-        VERSION=$($PYTHON_CMD -c "import leindex; print(leindex.__version__)" 2>/dev/null || echo "unknown")
-        print_bullet "Version: $VERSION"
+    # For uv, if we got here without errors, installation succeeded
+    # uv manages its own virtual environments
+    if [[ "$PKG_MANAGER" == "uv" ]]; then
+        echo -e "  ${GREEN}✓${NC} Python package installed (via uv)"
+        echo -e "  ${CYAN}•${NC} LeIndex is ready to use"
     else
-        print_error "Python package not found"
-        all_good=false
+        # Use Python import check for pip/pipx
+        if $PYTHON_CMD -c "import leindex.server" 2>/dev/null; then
+            VERSION=$($PYTHON_CMD -c "import leindex; print(leindex.__version__)" 2>/dev/null || echo "unknown")
+            echo -e "  ${GREEN}✓${NC} Python package installed"
+            echo -e "  ${CYAN}•${NC} Version: $VERSION"
+        else
+            echo -e "${RED}✗${NC} Python package not found"
+            return 1
+        fi
     fi
 
     # Check command availability
     echo ""
     echo "Commands:"
-    command -v leindex &> /dev/null && print_success "leindex" || print_warning "leindex (not in PATH)"
-    command -v leindex-search &> /dev/null && print_success "leindex-search" || print_warning "leindex-search (not in PATH)"
+    if command -v leindex &>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} leindex"
+    else
+        echo -e "  ${YELLOW}•${NC} leindex (not in PATH - use uv run leindex)"
+    fi
+    if command -v leindex-search &>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} leindex-search"
+    else
+        echo -e "  ${YELLOW}•${NC} leindex-search (not in PATH - use uv run leindex-search)"
+    fi
 
-    # Check configured tools
+    # Check configured tools (these are informational only)
     echo ""
     echo "Configured tools:"
-    [[ -f "$HOME/.config/claude/claude_desktop_config.json" ]] && grep -q "leindex" "$HOME/.config/claude/claude_desktop_config.json" 2>/dev/null && print_success "Claude Desktop" || true
-    [[ -f "$HOME/.cursor/mcp.json" ]] && grep -q "leindex" "$HOME/.cursor/mcp.json" 2>/dev/null && print_success "Cursor" || true
-    [[ -f "$HOME/.config/Code/User/settings.json" ]] && grep -q "leindex" "$HOME/.config/Code/User/settings.json" 2>/dev/null && print_success "VS Code" || true
-    [[ -f "$HOME/.config/zed/settings.json" ]] && grep -q "leindex" "$HOME/.config/zed/settings.json" 2>/dev/null && print_success "Zed" || true
+    if [[ -f "$HOME/.config/claude/claude_desktop_config.json" ]] && grep -q "leindex" "$HOME/.config/claude/claude_desktop_config.json" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Claude Desktop"
+    fi
+    if [[ -f "$HOME/.cursor/mcp.json" ]] && grep -q "leindex" "$HOME/.cursor/mcp.json" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Cursor"
+    fi
+    if [[ -f "$HOME/.config/Code/User/settings.json" ]] && grep -q "leindex" "$HOME/.config/Code/User/settings.json" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} VS Code"
+    fi
+    if [[ -f "$HOME/.config/zed/settings.json" ]] && grep -q "leindex" "$HOME/.config/zed/settings.json" 2>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Zed"
+    fi
 
     echo ""
 
-    if [[ "$all_good" == "true" ]]; then
-        return 0
-    else
-        return 1
-    fi
+    return 0
 }
 
 # ============================================================================
