@@ -64,6 +64,7 @@ CLAUDE.md
 data/
 faiss_index/
 file_content_cache.json.tmp
+leann_index/
 
 # Test files
 test_*.py
