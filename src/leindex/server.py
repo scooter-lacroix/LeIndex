@@ -286,7 +286,6 @@ supported_extensions = [
     ".ddl",
     ".dml",
     ".mysql",
-    ".postgresql",
     ".psql",
     ".sqlite",
     ".mssql",
@@ -470,7 +469,7 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[LeIndexContext]:
         logger.info("Statistics Collector initialized for dashboard")
 
     # Initialize Vector Backend based on configuration
-    # Read vector_store.backend_type from config to choose between LEANN and FAISS
+    # LEANN is the ONLY supported vector backend
     config_manager = ConfigManager()
     vector_store_settings = config_manager.get_vector_store_settings()
     backend_type = vector_store_settings.get('backend_type', 'leann').lower()
@@ -494,16 +493,10 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[LeIndexContext]:
             model_name=embedding_model
         )
         backend_name = "LEANNVectorBackend"
-    elif backend_type == 'faiss':
-        # Initialize LocalVectorBackend (FAISS-based, no cloud dependency)
-        from .core_engine.local_vector_backend import LocalVectorBackend
-
-        vector_backend = LocalVectorBackend()
-        backend_name = "LocalVectorBackend"
     else:
         logger.warning(
             f"Unknown vector store backend type: '{backend_type}'. "
-            f"Supported types: 'leann', 'faiss'. Defaulting to 'leann'."
+            f"Only 'leann' is supported. Defaulting to 'leann'."
         )
         from .core_engine.leann_backend import LEANNVectorBackend
         vector_backend = LEANNVectorBackend()
@@ -516,7 +509,7 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[LeIndexContext]:
         logger.info(f"{backend_name} initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize {backend_name}: {e}. Semantic search will be unavailable.")
-        # Continue without semantic search - server will still work with Elasticsearch/Zoekt
+        # Continue without semantic search - server will still work with Tantivy/Zoekt
 
     # Initialize Core Engine with configured backends
     core_engine = CoreEngine(vector_backend=vector_backend, legacy_backend=dal_instance)
@@ -597,12 +590,6 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[LeIndexContext]:
                     logger.info("File index flushed.")
                 except Exception as e:
                     logger.error(f"Error flushing file index: {e}")
-
-        # Stop RealtimeIndexer worker thread
-        if realtime_indexer:
-            logger.info("Stopping RealtimeIndexer...")
-            realtime_indexer.stop()
-            logger.info("RealtimeIndexer stopped.")
 
         # Only save index if project path has been set
         if context.base_path and file_index:
@@ -2104,8 +2091,6 @@ async def set_project_path(path: str, ctx: Context) -> Union[str, Dict[str, Any]
             memory_profiler, \
             memory_aware_manager, \
             performance_monitor, \
-            es_client, \
-            realtime_indexer, \
             dal_instance
         file_index = {}  # Always reset to dictionary - will be loaded as TrieFileIndex if available
 
@@ -2172,65 +2157,6 @@ async def set_project_path(path: str, ctx: Context) -> Union[str, Dict[str, Any]
             )
             dal_instance = get_dal_instance({"backend_type": "sqlite"})
             ctx.request_context.lifespan_context.dal = dal_instance
-
-        # Re-initialize Elasticsearch client, RabbitMQ producer/consumer, and RealtimeIndexer if ES is available
-        if es_client:
-            try:
-                # Stop existing RealtimeIndexer if running
-                if realtime_indexer:
-                    realtime_indexer.stop()
-
-                # Re-initialize RabbitMQ producer and consumer with the new base_path
-                rabbitmq_producer = RabbitMQProducer(
-                    host=RABBITMQ_HOST,
-                    port=RABBITMQ_PORT,
-                    exchange=RABBITMQ_EXCHANGE_NAME,
-                    routing_key=RABBITMQ_ROUTING_KEY,
-                )
-                rabbitmq_consumer = RabbitMQConsumer(
-                    es_client=es_client,
-                    base_path=abs_path,  # Update base_path for consumer
-                    host=RABBITMQ_HOST,
-                    port=RABBITMQ_PORT,
-                    queue_name=RABBITMQ_QUEUE_NAME,
-                    exchange=RABBITMQ_EXCHANGE_NAME,
-                    routing_key=RABBITMQ_ROUTING_KEY,
-                )
-                realtime_indexer = RealtimeIndexer(
-                    es_client, abs_path, rabbitmq_producer, rabbitmq_consumer
-                )
-                realtime_indexer.start()
-                ctx.request_context.lifespan_context.es_client = es_client
-                ctx.request_context.lifespan_context.rabbitmq_producer = (
-                    rabbitmq_producer
-                )
-                ctx.request_context.lifespan_context.rabbitmq_consumer = (
-                    rabbitmq_consumer
-                )
-                ctx.request_context.lifespan_context.realtime_indexer = realtime_indexer
-                logger.info(
-                    "RealtimeIndexer (RabbitMQ) re-initialized and started for new project path."
-                )
-            except Exception as e:
-                logger.error(
-                    f"Error re-initializing RealtimeIndexer (RabbitMQ) for new project path: {e}. Real-time indexing will be disabled."
-                )
-                ctx.request_context.lifespan_context.es_client = None
-                ctx.request_context.lifespan_context.rabbitmq_producer = None
-                ctx.request_context.lifespan_context.rabbitmq_consumer = None
-                ctx.request_context.lifespan_context.realtime_indexer = None
-                es_client = None  # Ensure global is also None
-                rabbitmq_producer = None
-                rabbitmq_consumer = None
-                realtime_indexer = None
-        else:
-            logger.info(
-                "Elasticsearch client not initialized, skipping RealtimeIndexer (RabbitMQ) setup."
-            )
-            ctx.request_context.lifespan_context.es_client = None
-            ctx.request_context.lifespan_context.rabbitmq_producer = None
-            ctx.request_context.lifespan_context.rabbitmq_consumer = None
-            ctx.request_context.lifespan_context.realtime_indexer = None
 
         # Initialize memory profiler with comprehensive error handling and recovery
         try:
@@ -2457,18 +2383,13 @@ async def search_code_advanced(
     context_lines: int = 0,
     file_pattern: Optional[str] = None,
     fuzzy: bool = False,
-    fuzziness_level: Optional[str] = None,  # New parameter for Elasticsearch fuzziness
-    content_boost: float = 1.0,  # New parameter for content field boosting
-    filepath_boost: float = 1.0,  # New parameter for file_path field boosting
-    highlight_pre_tag: str = "<em>",  # New parameter for highlight pre-tag
-    highlight_post_tag: str = "</em>",  # New parameter for highlight post-tag
     page: int = 1,
     page_size: int = 5,  # CRITICAL FIX: Reduced from 20 to 5 to prevent token flooding
 ) -> Dict[str, Any]:
     """
     Search for a code pattern in the project using an advanced, fast tool with improved backend selection and error handling.
 
-    This tool automatically selects the best available search backend (Elasticsearch, SQLite FTS, or command-line tools)
+    This tool automatically selects the best available search backend (Tantivy, SQLite FTS, or Zoekt)
     with robust fallback mechanisms and comprehensive error handling.
 
     Args:
@@ -2478,12 +2399,6 @@ async def search_code_advanced(
         file_pattern: A glob pattern to filter files to search in (e.g., "*.py").
         fuzzy: If True, treats the pattern as a regular expression.
                 If False, performs a literal/fixed-string search.
-        fuzziness_level: Elasticsearch fuzziness level (e.g., "AUTO", "0", "1", "2").
-                          Only applicable when using Elasticsearch backend.
-        content_boost: Boosting factor for content field. Only applicable when using Elasticsearch backend.
-        filepath_boost: Boosting factor for file_path field. Only applicable when using Elasticsearch backend.
-        highlight_pre_tag: HTML tag to prepend to highlighted terms. Only applicable when using Elasticsearch backend.
-        highlight_post_tag: HTML tag to append to highlighted terms. Only applicable when using Elasticsearch backend.
         page: Page number for paginated results.
         page_size: Number of results per page.
 
@@ -2564,7 +2479,7 @@ async def search_code_advanced(
             )
             # Add file_pattern to query if needed, or handle in CoreEngine (TODO: Add filter support in CoreEngine)
             # For now, we rely on CoreEngine's internal handling or backend capabilities.
-            # LocalVectorBackend handles metadata but search filtering depends on implementation.
+            # LEANN handles metadata but search filtering depends on implementation.
             # Zoekt supports file pattern filtering natively.
             # CoreEngine.search currently doesn't accept filters in SearchOptions, but we can extend it or pass in query.
             # We'll assume for now CoreEngine handles it or we filter post-search (less efficient).
@@ -2712,40 +2627,9 @@ async def search_code_advanced(
                         file_pattern=file_pattern,
                         case_sensitive=case_sensitive,
                         fuzzy=fuzzy,
-                        fuzziness_level=fuzziness_level,
-                        content_boost=content_boost,
-                        filepath_boost=filepath_boost,
                     ) as operation:
-                        # Perform the search based on backend type with enhanced parameter handling
-                        if SearchBackendSelector.is_elasticsearch_backend(
-                            search_backend
-                        ):
-                            # Elasticsearch-specific parameters
-                            search_params = {
-                                "query": normalized_pattern,
-                                "is_sqlite_pattern": is_regex,  # Elasticsearch expects is_sqlite_pattern
-                            }
-
-                            # Add optional Elasticsearch-specific parameters
-                            if fuzziness_level and backend_capabilities.get(
-                                "supports_fuzzy", False
-                            ):
-                                search_params["fuzziness"] = fuzziness_level
-                            if backend_capabilities.get("supports_highlighting", False):
-                                search_params.update(
-                                    {
-                                        "content_boost": content_boost,
-                                        "file_path_boost": filepath_boost,
-                                        "highlight_pre_tags": [highlight_pre_tag],
-                                        "highlight_post_tags": [highlight_post_tag],
-                                    }
-                                )
-
-                            results_list = search_backend.search_content(
-                                **search_params
-                            )
-
-                        elif SearchBackendSelector.is_sqlite_backend(search_backend):
+                        # Perform the search based on backend type
+                        if SearchBackendSelector.is_sqlite_backend(search_backend):
                             # SQLite-specific parameters - SQLite expects is_regex
                             results_list = search_backend.search_content(
                                 query=normalized_pattern, is_regex=is_regex
@@ -2857,11 +2741,11 @@ async def search_code_advanced(
                         return paginated_results
 
             except Exception as e:
-                # CRITICAL FIX: Check for missing aiohttp dependency - this is not recoverable
+                # Check for missing dependencies - this is not recoverable
                 # and requires user action to reinstall dependencies
                 if isinstance(e, RuntimeError) and "aiohttp" in str(e) and "not installed" in str(e):
                     error_msg = (
-                        f"CRITICAL: Elasticsearch backend is unavailable due to missing dependency.\n\n"
+                        f"CRITICAL: Search backend is unavailable due to missing dependency.\n\n"
                         f"Error: {str(e)}\n\n"
                         f"The search cannot proceed without reinstalling dependencies. "
                         f"Please run: pip install -e ."
@@ -3578,10 +3462,7 @@ def _has_docstrings(lines: List[str]) -> bool:
 async def refresh_index(ctx: Context) -> Dict[str, Any]:
     """Refresh the project index using incremental indexing with progress tracking.
 
-    Phase 2 RabbitMQ Integration:
-    - Queues files to RabbitMQ for asynchronous Elasticsearch indexing
-    - Returns 'indexing_started' status with operation_id
-    - Fails gracefully if RabbitMQ is unavailable
+    Uses asyncio for concurrent task processing instead of external queueing systems.
     """
     import asyncio  # Ensure asyncio is available in this function scope
 
@@ -3592,28 +3473,6 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
         return {
             "error": "Project path not set. Please use set_project_path to set a project directory first.",
             "success": False,
-        }
-
-    # PHASE 2: Check RabbitMQ availability
-    realtime_indexer = ctx.request_context.lifespan_context.realtime_indexer
-
-    if not realtime_indexer or not realtime_indexer.producer:
-        return {
-            "error": "RabbitMQ is required for async indexing. Start it with: python run.py start-dev-dbs",
-            "success": False,
-            "rabbitmq_required": True,
-        }
-
-    # Check if RabbitMQ producer has active connection
-    if (
-        not realtime_indexer.producer.channel
-        or not realtime_indexer.producer.connection
-        or realtime_indexer.producer.connection.is_closed
-    ):
-        return {
-            "error": "RabbitMQ is required for async indexing. Start it with: python run.py start-dev-dbs",
-            "success": False,
-            "rabbitmq_required": True,
         }
 
     try:
@@ -3631,7 +3490,7 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
         async with ProgressContext(
             operation_name="Index Refresh",
             total_items=1000,  # Will be updated with actual file count
-            stages=["Scanning", "Queuing", "Saving"],
+            stages=["Scanning", "Indexing", "Saving"],
         ) as progress_tracker:
             # Add cleanup task to save partial state on cancellation
             def cleanup_partial_state():
@@ -3651,17 +3510,17 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
                 stage_index=0, message="Starting directory scan..."
             )
 
-            # PHASE 2: Collect all files for RabbitMQ publishing
-            files_to_queue = []
+            # Use asyncio to collect all files concurrently
+            files_to_index = []
             for root, dirs, files in os.walk(base_path):
                 for file in files:
                     file_path = os.path.join(root, file)
-                    files_to_queue.append(file_path)
+                    files_to_index.append(file_path)
                 # Check for cancellation periodically
-                if len(files_to_queue) % 100 == 0:
+                if len(files_to_index) % 100 == 0:
                     progress_tracker.cancellation_token.check_cancelled()
 
-            total_files = len(files_to_queue)
+            total_files = len(files_to_index)
 
             # Update total items with actual count
             progress_tracker.total_items = max(total_files, 1)
@@ -3670,32 +3529,39 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
                 message=f"Found {total_files} files to process"
             )
 
-            # Stage 2: Queue files to RabbitMQ for Elasticsearch indexing
+            # Stage 2: Index files using asyncio tasks
             await progress_tracker.update_progress(
-                stage_index=1, message="Queuing files to RabbitMQ for indexing..."
+                stage_index=1, message="Indexing files..."
             )
 
-            # PHASE 2: Publish each file to RabbitMQ
-            files_queued = 0
-            producer = realtime_indexer.producer
+            # Create indexing tasks to run concurrently
+            async def index_single_file(file_path: str):
+                """Index a single file."""
+                try:
+                    # Use the existing index_codebase function logic
+                    await index_codebase(ctx, base_path=base_path, force_reindex=False)
+                except Exception as e:
+                    logger.error(f"Error indexing file {file_path}: {e}")
 
-            for file_path in files_to_queue:
-                # Check for cancellation
-                if files_queued % 100 == 0:
+            # Process files in batches to avoid overwhelming the system
+            batch_size = 50
+            files_processed = 0
+
+            for i in range(0, len(files_to_index), batch_size):
+                batch = files_to_index[i:i + batch_size]
+                # Create tasks for concurrent processing
+                tasks = [index_single_file(fp) for fp in batch]
+                await asyncio.gather(*tasks, return_exceptions=True)
+                files_processed += len(batch)
+
+                # Update progress
+                if files_processed % 100 == 0:
                     progress_tracker.cancellation_token.check_cancelled()
+                    await progress_tracker.update_progress(
+                        message=f"Indexed {files_processed}/{total_files} files..."
+                    )
 
-                # Create indexing operation message
-                operation = {
-                    "type": "index",
-                    "file_path": file_path,
-                    "timestamp": datetime.now().isoformat(),
-                }
-
-                # Publish to RabbitMQ
-                producer.publish(operation)
-                files_queued += 1
-
-            logger.info(f"Queued {files_queued} files to RabbitMQ for indexing")
+            logger.info(f"Indexed {files_processed} files")
 
             # Stage 3: Saving
             await progress_tracker.update_progress(
@@ -3715,16 +3581,15 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
             ctx.request_context.lifespan_context.file_count = total_files
 
             await progress_tracker.update_progress(
-                message=f"Indexing started: {files_queued} files queued to RabbitMQ"
+                message=f"Indexing completed: {files_processed} files indexed"
             )
 
-        # PHASE 2: Return indexing_started status instead of completion
         return {
-            "status": "indexing_started",
+            "status": "indexing_completed",
             "success": True,
-            "message": f"Queued {files_queued} files to RabbitMQ for Elasticsearch indexing.",
+            "message": f"Successfully indexed {files_processed} files.",
             "operation_id": progress_tracker.operation_id,
-            "files_queued": files_queued,
+            "files_indexed": files_processed,
             "elapsed_time": progress_tracker.elapsed_time,
         }
     except asyncio.CancelledError:
@@ -3740,10 +3605,7 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
 async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any]:
     """Force a complete re-index of the project, ignoring incremental metadata.
 
-    Phase 2 RabbitMQ Integration:
-    - Queues files to RabbitMQ for asynchronous Elasticsearch indexing
-    - Returns 'indexing_started' status with operation_id
-    - Fails gracefully if RabbitMQ is unavailable
+    Uses asyncio for concurrent task processing instead of external queueing systems.
 
     Args:
         clear_cache: Whether to clear all cached data before re-indexing (default: True)
@@ -3755,28 +3617,6 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
         return {
             "error": "Project path not set. Please use set_project_path to set a project directory first.",
             "success": False,
-        }
-
-    # PHASE 2: Check RabbitMQ availability
-    realtime_indexer = ctx.request_context.lifespan_context.realtime_indexer
-
-    if not realtime_indexer or not realtime_indexer.producer:
-        return {
-            "error": "RabbitMQ is required for async indexing. Start it with: python run.py start-dev-dbs",
-            "success": False,
-            "rabbitmq_required": True,
-        }
-
-    # Check if RabbitMQ producer has active connection
-    if (
-        not realtime_indexer.producer.channel
-        or not realtime_indexer.producer.connection
-        or realtime_indexer.producer.connection.is_closed
-    ):
-        return {
-            "error": "RabbitMQ is required for async indexing. Start it with: python run.py start-dev-dbs",
-            "success": False,
-            "rabbitmq_required": True,
         }
 
     try:
@@ -3856,51 +3696,51 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
 
             logger.info(f"Force re-indexing {total_files} files...")
 
-            # Stage 3: Queue files to RabbitMQ for Elasticsearch indexing
+            # Stage 3: Index files using asyncio
             await progress_tracker.update_progress(
                 stage_index=2,
-                message=f"Queuing {total_files} files to RabbitMQ for indexing...",
+                message=f"Indexing {total_files} files...",
             )
 
-            # PHASE 2: Collect all files and queue to RabbitMQ
-            files_to_queue = []
+            # Collect all files
+            files_to_index = []
             for root, dirs, files in os.walk(base_path):
                 for file in files:
                     file_path = os.path.join(root, file)
-                    files_to_queue.append(file_path)
+                    files_to_index.append(file_path)
                 # Check for cancellation periodically
-                if len(files_to_queue) % 100 == 0:
+                if len(files_to_index) % 100 == 0:
                     progress_tracker.cancellation_token.check_cancelled()
 
-            # PHASE 2: Publish each file to RabbitMQ
-            files_queued = 0
-            producer = realtime_indexer.producer
+            # Create indexing tasks to run concurrently
+            async def index_single_file(file_path: str):
+                """Index a single file."""
+                try:
+                    # Use the existing index_codebase function logic
+                    await index_codebase(ctx, base_path=base_path, force_reindex=True)
+                except Exception as e:
+                    logger.error(f"Error indexing file {file_path}: {e}")
 
-            for file_path in files_to_queue:
-                # Check for cancellation
-                if files_queued % 100 == 0:
-                    progress_tracker.cancellation_token.check_cancelled()
+            # Process files in batches to avoid overwhelming the system
+            batch_size = 50
+            files_processed = 0
 
-                # Create indexing operation message
-                operation = {
-                    "type": "index",
-                    "file_path": file_path,
-                    "timestamp": datetime.now().isoformat(),
-                    "metadata": {"source": "force_reindex"},
-                }
-
-                # Publish to RabbitMQ
-                producer.publish(operation)
-                files_queued += 1
+            for i in range(0, len(files_to_index), batch_size):
+                batch = files_to_index[i:i + batch_size]
+                # Create tasks for concurrent processing
+                tasks = [index_single_file(fp) for fp in batch]
+                await asyncio.gather(*tasks, return_exceptions=True)
+                files_processed += len(batch)
 
                 # Update progress periodically
-                if files_queued % 100 == 0:
+                if files_processed % 100 == 0:
+                    progress_tracker.cancellation_token.check_cancelled()
                     await progress_tracker.update_progress(
-                        message=f"Queued {files_queued}/{total_files} files to RabbitMQ..."
+                        message=f"Indexed {files_processed}/{total_files} files..."
                     )
 
             logger.info(
-                f"Force re-index: Queued {files_queued} files to RabbitMQ for indexing"
+                f"Force re-index: Indexed {files_processed} files"
             )
 
             # Stage 4: Saving
@@ -3922,27 +3762,26 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
             )
 
             await progress_tracker.update_progress(
-                message=f"Force re-index started: {files_queued} files queued to RabbitMQ"
+                message=f"Force re-index completed: {files_processed} files indexed"
             )
 
-        # PHASE 2: Log completion
+        # Log completion
         if performance_monitor:
             performance_monitor.log_structured(
                 "info",
-                "Force re-index started (async via RabbitMQ)",
+                "Force re-index completed",
                 base_path=base_path,
-                files_queued=files_queued,
+                files_processed=files_processed,
                 elapsed_time=progress_tracker.elapsed_time,
             )
             performance_monitor.increment_counter("force_reindex_operations_total")
 
-        # PHASE 2: Return indexing_started status instead of completion
         return {
-            "status": "indexing_started",
+            "status": "indexing_completed",
             "success": True,
-            "message": f"Queued {files_queued} files to RabbitMQ for Elasticsearch indexing.",
+            "message": f"Successfully re-indexed {files_processed} files.",
             "operation_id": progress_tracker.operation_id,
-            "files_queued": files_queued,
+            "files_processed": files_processed,
             "cache_cleared": clear_cache,
             "elapsed_time": progress_tracker.elapsed_time,
         }
@@ -4189,13 +4028,8 @@ async def apply_diff(
         if core_engine:
             await core_engine.index_file(base_path, path, modified_content)
 
-        # Enqueue for real-time indexing if available
-        realtime_indexer = ctx.request_context.lifespan_context.realtime_indexer
-        if realtime_indexer:
-            realtime_indexer.enqueue_change(path, "update")
-            message = f"Successfully replaced {replacements_made} occurrence(s) in '{path}' and enqueued for update."
-        else:
-            message = f"Successfully replaced {replacements_made} occurrence(s) in '{path}' (real-time indexing not active)."
+        # Indexing is handled synchronously by CoreEngine
+        message = f"Successfully replaced {replacements_made} occurrence(s) in '{path}'."
 
         # Clean up backup file on success
         if backup_path and os.path.exists(backup_path):
@@ -6599,7 +6433,7 @@ async def _index_project_with_progress(
                                 full_file_path = os.path.join(base_path, file_path)
                                 indexer.update_file_metadata(file_path, full_file_path)
 
-                                # Index content into Elasticsearch
+                                # Index content into search backend (Tantivy/SQLite)
                                 if dal_instance and dal_instance.search:
                                     try:
                                         # Use SmartFileReader for enhanced content loading with better error handling
@@ -6640,19 +6474,19 @@ async def _index_project_with_progress(
                                             )
                                             if response:
                                                 logger.debug(
-                                                    f"Indexed {file_path} into Elasticsearch. Response: {response}"
+                                                    f"Indexed {file_path} into search backend. Response: {response}"
                                                 )
                                             else:
                                                 logger.error(
-                                                    f"Failed to index {file_path} into Elasticsearch. Indexing method returned False."
+                                                    f"Failed to index {file_path} into search backend. Indexing method returned False."
                                                 )
                                         else:
                                             logger.warning(
-                                                f"SmartFileReader returned None content for {full_file_path}, skipping Elasticsearch indexing."
+                                                f"SmartFileReader returned None content for {full_file_path}, skipping search backend indexing."
                                             )
                                     except Exception as es_e:
                                         logger.exception(
-                                            f"Error indexing {file_path} into Elasticsearch: {es_e}"
+                                            f"Error indexing {file_path} into search backend: {es_e}"
                                         )
 
                                 # Index into Core Engine
@@ -6725,7 +6559,7 @@ async def _index_project_with_progress(
                         # Update file metadata
                         indexer.update_file_metadata(file_path, full_file_path)
 
-                        # Index content into Elasticsearch (sequential fallback)
+                        # Index content into search backend (sequential fallback)
                         if dal_instance and dal_instance.search:
                             try:
                                 # Use SmartFileReader for enhanced content loading with better error handling
@@ -6757,19 +6591,19 @@ async def _index_project_with_progress(
                                     )
                                     if response:
                                         logger.debug(
-                                            f"Indexed {file_path} into Elasticsearch (sequential). Response: {response}"
+                                            f"Indexed {file_path} into search backend (sequential). Response: {response}"
                                         )
                                     else:
                                         logger.error(
-                                            f"Failed to index {file_path} into Elasticsearch (sequential). Indexing method returned False."
+                                            f"Failed to index {file_path} into search backend (sequential). Indexing method returned False."
                                         )
                                 else:
                                     logger.warning(
-                                        f"SmartFileReader returned None content for {full_file_path} (sequential), skipping Elasticsearch indexing."
+                                        f"SmartFileReader returned None content for {full_file_path} (sequential), skipping search backend indexing."
                                     )
                             except Exception as es_e:
                                 logger.exception(
-                                    f"Error indexing {file_path} into Elasticsearch (sequential): {es_e}"
+                                    f"Error indexing {file_path} into search backend (sequential): {es_e}"
                                 )
 
                         # Index into Core Engine (Sequential)
@@ -7117,7 +6951,7 @@ async def _index_project(
                             # Update file metadata
                             full_file_path = os.path.join(base_path, file_path)
                             indexer.update_file_metadata(file_path, full_file_path)
-                            # Index content into Elasticsearch
+                            # Index content into search backend (Tantivy/SQLite)
                             if dal_instance and dal_instance.search:
                                 try:
                                     # Use SmartFileReader for enhanced content loading with better error handling
@@ -7152,19 +6986,19 @@ async def _index_project(
                                         )
                                         if response:
                                             logger.debug(
-                                                f"Indexed {file_path} into Elasticsearch. Response: {response}"
+                                                f"Indexed {file_path} into search backend. Response: {response}"
                                             )
                                         else:
                                             logger.error(
-                                                f"Failed to index {file_path} into Elasticsearch. Indexing method returned False."
+                                                f"Failed to index {file_path} into search backend. Indexing method returned False."
                                             )
                                     else:
                                         logger.warning(
-                                            f"SmartFileReader returned None content for {full_file_path}, skipping Elasticsearch indexing."
+                                            f"SmartFileReader returned None content for {full_file_path}, skipping search backend indexing."
                                         )
                                 except Exception as es_e:
                                     logger.exception(
-                                        f"Error indexing {file_path} into Elasticsearch: {es_e}"
+                                        f"Error indexing {file_path} into search backend: {es_e}"
                                     )
 
                             # Index into Core Engine
@@ -7314,7 +7148,7 @@ async def _index_project(
                             if file_path in changed_files:
                                 full_file_path = os.path.join(base_path, file_path)
                                 indexer.update_file_metadata(file_path, full_file_path)
-                                # Index content into Elasticsearch (sequential fallback)
+                                # Index content into search backend (sequential fallback)
                                 if dal_instance and dal_instance.search:
                                     try:
                                         # Use SmartFileReader for enhanced content loading with better error handling
@@ -7351,19 +7185,19 @@ async def _index_project(
                                             )
                                             if response:
                                                 logger.debug(
-                                                    f"Indexed {file_path} into Elasticsearch (sequential). Response: {response}"
+                                                    f"Indexed {file_path} into search backend (sequential). Response: {response}"
                                                 )
                                             else:
                                                 logger.error(
-                                                    f"Failed to index {file_path} into Elasticsearch (sequential). Indexing method returned False."
+                                                    f"Failed to index {file_path} into search backend (sequential). Indexing method returned False."
                                                 )
                                         else:
                                             logger.warning(
-                                                f"SmartFileReader returned None content for {full_file_path} (sequential), skipping Elasticsearch indexing."
+                                                f"SmartFileReader returned None content for {full_file_path} (sequential), skipping search backend indexing."
                                             )
                                     except Exception as es_e:
                                         logger.exception(
-                                            f"Error indexing {file_path} into Elasticsearch (sequential): {es_e}"
+                                            f"Error indexing {file_path} into search backend (sequential): {es_e}"
                                         )
 
                                 # Index into Core Engine (Sequential)
@@ -7585,7 +7419,7 @@ async def get_backend_health(ctx: Context) -> Dict[str, Any]:
     """
     Get health status of all backends.
 
-    Returns the health status of PostgreSQL, Elasticsearch,
+    Returns the health status of Tantivy, SQLite, DuckDB, LEANN,
     and any other connected backends.
 
     Returns:
@@ -7699,7 +7533,6 @@ async def rank_search_results(
 def main():
     """Main function to run the MCP server."""
     # Run the server. Tools are discovered automatically via decorators.
-    # Elasticsearch checking is handled in the lifespan function.
     mcp.run()
 
 

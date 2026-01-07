@@ -124,8 +124,8 @@ def is_recoverable_error(error: Exception) -> bool:
     if "too many requests" in error_message:
         return True
 
-    # Elasticsearch-specific recoverable errors
-    if "timeout" in error_message or "service unavailable" in error_message:
+    # Tantivy-specific recoverable errors
+    if "timeout" in error_message or "index" in error_message:
         return True
 
     # SQLite-specific recoverable errors

@@ -4,7 +4,7 @@ Core Engine - Unified Search and Indexing Orchestrator.
 ARCHITECTURAL FIXES IMPLEMENTED:
 --------------------------------
 Issue #2 (Tight Coupling): Applied Dependency Injection pattern
-- LocalVectorBackend, ZoektStrategy, and LegacyBackend are now injected via constructor
+- LEANNVectorBackend, ZoektStrategy, and LegacyBackend are now injected via constructor
 - CoreEngine depends on abstractions (interfaces) rather than concrete implementations
 - Enables testing with mocks and swapping implementations
 
@@ -15,11 +15,11 @@ Issue #4 (Inconsistent Error Handling): Established consistent error handling
 - All methods raise exceptions instead of returning False/None
 - Consistent logging throughout
 
-MIGRATION: Mixedbread Cloud -> Local Vector Backend
+MIGRATION COMPLETE: LEANN is the ONLY vector backend
 ---------------------------------------------------
-The Core Engine has been migrated from Mixedbread cloud API to LocalVectorBackend:
+The Core Engine uses LEANNVectorBackend exclusively:
 
-- LocalVectorBackend (FAISS-based): Local embeddings using sentence-transformers
+- LEANNVectorBackend: High-performance vector search
 - No cloud API keys required
 - Supports BAAI/bge-small-en-v1.5, microsoft/codebert-base, all-MiniLM-L6-v2
 - Web search feature removed (was Mixedbread-specific)
@@ -29,7 +29,7 @@ PRODUCT.MD ALIGNMENT - Dual-Mode Operation:
 The Core Engine implements PRODUCT.MD's dual-mode operation requirement:
 
 1. STANDALONE POWER MODE (Primary):
-   - LocalVectorBackend (FAISS) provides semantic search
+   - LEANNVectorBackend provides semantic search
    - Zoekt Strategy provides fast code-aware search via regex/symbolic matching
    - Full functionality without external dependencies
    - This is the DEFAULT and PRIMARY mode of operation
@@ -44,14 +44,14 @@ The Core Engine implements PRODUCT.MD's dual-mode operation requirement:
 
 MODE SELECTION STRATEGY:
 -------------------------
-- Search: Zoekt -> Local Vector (primary) -> Legacy (fallback/augmentation only)
-- Index: Local Vector (primary) -> Legacy (dual-write for metadata)
-- Ask (RAG): Local Vector only
+- Search: Zoekt -> LEANN Vector (primary) -> Legacy (fallback/augmentation only)
+- Index: LEANN Vector (primary) -> Legacy (dual-write for metadata)
+- Ask (RAG): LEANN Vector only
 - File History: Legacy only (metadata feature)
 
 Usage:
     # With dependency injection
-    vector_backend = LocalVectorBackend()  # No API key needed
+    vector_backend = LEANNVectorBackend()  # No API key needed
     zoekt_strategy = ZoektStrategy()
     legacy_backend = get_dal_instance()  # Optional - for augmentation only
 
@@ -65,21 +65,6 @@ Usage:
 import os
 import logging
 from typing import Optional, List, Union, Any, Dict
-
-# GRACEFUL IMPORT: Handle optional FAISS/local vector backend
-try:
-    from .local_vector_backend import LocalVectorBackend, get_local_vector_backend_status
-    LOCAL_VECTOR_BACKEND_AVAILABLE = True
-except ImportError as e:
-    LocalVectorBackend = None  # type: ignore
-    get_local_vector_backend_status = None  # type: ignore
-    LOCAL_VECTOR_BACKEND_AVAILABLE = False
-    import logging
-    logging.getLogger(__name__).warning(
-        f"LocalVectorBackend not available: {e}. "
-        "Install with: uv pip install 'faiss-cpu>=1.7.4' 'sentence-transformers>=2.2.0' "
-        "or run: uv sync"
-    )
 
 from .types import SearchOptions, SearchResponse, UploadFileOptions, FileMetadata, AskResponse, StoreInfo, ChunkType
 from ..search.zoekt import ZoektStrategy
@@ -219,8 +204,8 @@ class CoreEngine:
         ARCHITECTURAL FIX (Issue #2): All backends are injected, not instantiated.
 
         Args:
-            vector_backend: Optional vector backend implementation (LocalVectorBackend recommended)
-                           If None, creates a default LocalVectorBackend
+            vector_backend: Optional vector backend implementation (LEANNVectorBackend recommended)
+                           If None, creates a default LEANNVectorBackend
             zoekt_backend: Optional Zoekt search strategy implementation
                           If None, creates a default ZoektStrategy
             legacy_backend: Optional legacy DAL backend
@@ -243,19 +228,12 @@ class CoreEngine:
         # ARCHITECTURAL FIX (Issue #2): Inject backends instead of creating them
         # Use provided backends or create defaults for backward compatibility
 
-        # PREFERRED: LocalVectorBackend (FAISS-based, no cloud dependency)
+        # LEANNVectorBackend is the ONLY supported vector backend
         if vector_backend is None:
-            if LOCAL_VECTOR_BACKEND_AVAILABLE and LocalVectorBackend is not None:
-                self.vector_backend: IVectorBackend = LocalVectorBackend()
-                logger.info("Using LocalVectorBackend (FAISS-based local vector store)")
-            else:
-                # NO BACKEND AVAILABLE
-                self.vector_backend: IVectorBackend = None  # type: ignore
-                logger.error(
-                    "CRITICAL: No vector backend available. "
-                    "Install FAISS for local embeddings: uv pip install 'faiss-cpu>=1.7.4' 'sentence-transformers>=2.2.0' "
-                    "or run: uv sync"
-                )
+            # Create default LEANN backend
+            from .leann_backend import LEANNVectorBackend
+            self.vector_backend: IVectorBackend = LEANNVectorBackend()
+            logger.info("Using LEANNVectorBackend (high-performance vector store)")
         else:
             self.vector_backend = vector_backend
 
@@ -279,19 +257,19 @@ class CoreEngine:
         Raises:
             BackendUnavailableError: If a required backend cannot be initialized
         """
-        # Initialize LocalVectorBackend if it's the active backend
+        # Initialize LEANNVectorBackend if it's the active backend
         if self.vector_backend is not None:
             backend_type = type(self.vector_backend).__name__
             logger.info(f"Initializing vector backend: {backend_type}")
 
-            # LocalVectorBackend requires explicit initialization
-            if backend_type == "LocalVectorBackend" and hasattr(self.vector_backend, "initialize"):
+            # LEANNVectorBackend requires explicit initialization
+            if hasattr(self.vector_backend, "initialize"):
                 try:
                     await self.vector_backend.initialize()
-                    logger.info("LocalVectorBackend initialized successfully")
+                    logger.info(f"{backend_type} initialized successfully")
                 except Exception as e:
-                    logger.error(f"Failed to initialize LocalVectorBackend: {e}")
-                    raise BackendUnavailableError("LocalVectorBackend", str(e))
+                    logger.error(f"Failed to initialize {backend_type}: {e}")
+                    raise BackendUnavailableError(backend_type, str(e))
 
         logger.info("CoreEngine initialization complete")
 
@@ -403,7 +381,7 @@ class CoreEngine:
         options = self._validate_search_options(options)
 
         # Note: Web search was a Mixedbread cloud feature and is not available
-        # with LocalVectorBackend. If include_web is requested, log a warning and continue.
+        # with LEANNVectorBackend. If include_web is requested, log a warning and continue.
 
         # 1. Zoekt Strategy (fast code-aware search)
         if options.use_zoekt and self.zoekt_backend and self.zoekt_backend.is_available():
@@ -504,7 +482,7 @@ class CoreEngine:
             options = SearchOptions()
 
         if not self.vector_backend or not self.vector_backend.is_available():
-            raise BackendUnavailableError("LocalVectorBackend", "Required for ask operation")
+            raise BackendUnavailableError("LEANNVectorBackend", "Required for ask operation")
 
         try:
             return await self.vector_backend.ask(store_ids, question, options)
@@ -561,7 +539,7 @@ class CoreEngine:
                     metadata=metadata or FileMetadata(path=file_path, hash="")
                 )
                 await self.vector_backend.upload_file(store_id, file_path, content, upload_options)
-                logger.debug(f"Successfully indexed {file_path} in LocalVectorBackend")
+                logger.debug(f"Successfully indexed {file_path} in LEANNVectorBackend")
                 return  # Success - don't try other backends
             except Exception as e:
                 error_msg = f"Core Vector indexing failed for {file_path}: {e}"
@@ -621,7 +599,7 @@ class CoreEngine:
         if self.vector_backend and self.vector_backend.is_available():
             try:
                 await self.vector_backend.delete_file(store_id, file_path)
-                logger.debug(f"Successfully deleted {file_path} from LocalVectorBackend")
+                logger.debug(f"Successfully deleted {file_path} from LEANNVectorBackend")
             except Exception as e:
                 error_msg = f"Core Vector delete failed for {file_path}: {e}"
                 logger.error(error_msg)
@@ -667,7 +645,7 @@ class CoreEngine:
             raise ValidationError("store_id", store_id, "Store ID cannot be empty")
 
         if not self.vector_backend or not self.vector_backend.is_available():
-            raise BackendUnavailableError("LocalVectorBackend", "Required for get_store_info")
+            raise BackendUnavailableError("LEANNVectorBackend", "Required for get_store_info")
 
         try:
             return await self.vector_backend.get_info(store_id)

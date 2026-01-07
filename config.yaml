@@ -20,7 +20,7 @@ preferred_search_tool: "ripgrep"
 # Data Access Layer (DAL) Configuration
 dal_settings:
   # Backend type for LeIndex 2.0+
-  # Options: "sqlite_duckdb" (recommended), "sqlite_only", "dual_write_read" (requires PostgreSQL), "postgresql_elasticsearch_only" (requires PostgreSQL)
+  # ONLY option: "sqlite_duckdb" (SQLite + DuckDB for metadata and analytics)
   backend_type: "sqlite_duckdb"
 
   # SQLite database path for transactional metadata
@@ -32,39 +32,9 @@ dal_settings:
   # Enable full-text search in SQLite
   sqlite_enable_fts: "${SQLITE_ENABLE_FTS:-true}"
 
-  # PostgreSQL connection details (OPTIONAL - only required for dual_write_read or postgresql_elasticsearch_only backends)
-  # Install PostgreSQL dependencies with: pip install leindex[postgresql]
-  # SECURITY: Password must be set via POSTGRES_PASSWORD environment variable - no default fallback
-  postgresql_user: "${POSTGRES_USER:-user}"
-  postgresql_password: "${POSTGRES_PASSWORD}"
-  postgresql_host: "${POSTGRES_HOST:-localhost}"
-  postgresql_port: "${POSTGRES_PORT:-5432}"
-  postgresql_database: "${POSTGRES_DB:-leindex_db}"
-  # PostgreSQL SSL arguments (optional, for client certificate authentication or enforced SSL)
-  # Example: ssl_args: {"sslmode": "require", "sslrootcert": "/path/to/ca.pem", "sslcert": "/path/to/client.crt", "sslkey": "/path/to/client.key"}
-  postgresql_ssl_args: {} # Placeholder for SSL arguments
-
-  # Elasticsearch connection details (OPTIONAL - only required for dual_write_read or postgresql_elasticsearch_only backends)
-  # These should ideally be sourced from a secure secrets management system.
-  elasticsearch_hosts: ["http://localhost:9200"]
-  elasticsearch_index_name: "leindex"
-  # Elasticsearch authentication (choose one: api_key or http_auth)
-  # api_key: ["${ELASTICSEARCH_API_KEY_ID}", "${ELASTICSEARCH_API_KEY}"] # (id, api_key) tuple
-  # http_auth: ["${ELASTICSEARCH_USERNAME}", "${ELASTICSEARCH_PASSWORD}"] # (username, password) tuple
-  elasticsearch_api_key_id: "${ELASTICSEARCH_API_KEY_ID:-}"
-  elasticsearch_api_key: "${ELASTICSEARCH_API_KEY:-}"
-  elasticsearch_username: "${ELASTICSEARCH_USERNAME:-}"
-  elasticsearch_password: "${ELASTICSEARCH_PASSWORD:-}"
-  # Elasticsearch SSL/TLS settings
-  elasticsearch_use_ssl: "${ELASTICSEARCH_USE_SSL:-false}"
-  elasticsearch_verify_certs: "${ELASTICSEARCH_VERIFY_CERTS:-true}"
-  elasticsearch_ca_certs: "${ELASTICSEARCH_CA_CERTS:-}" # Path to CA certificate bundle
-  elasticsearch_client_cert: "${ELASTICSEARCH_CLIENT_CERT:-}" # Path to client certificate
-  elasticsearch_client_key: "${ELASTICSEARCH_CLIENT_KEY:-}" # Path to client key
-
 # Vector Store Configuration for Semantic Search
 vector_store:
-  # Backend type: "leann" (storage-efficient) or "faiss" (legacy)
+  # Backend type: ONLY "leann" is supported (high-performance vector store)
   backend_type: "leann"
 
   # LEANN index path
@@ -134,7 +104,7 @@ vector_store:
 
 # Async Processing Configuration for Asynchronous Indexing
 async_processing:
-  # Enable async processing (replaces RabbitMQ)
+  # Enable async processing (uses asyncio ONLY - no RabbitMQ)
   enabled: "${ASYNC_PROCESSING_ENABLED:-true}"
 
   # Queue configuration

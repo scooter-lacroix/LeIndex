@@ -2,7 +2,7 @@
 Multi-Backend Search Result Merger
 
 This module implements a unified search result merger that combines results from
-multiple search backends (FAISS, Elasticsearch, Zoekt) into a single ranked list.
+multiple search backends (LEANN, Tantivy, Zoekt) into a single ranked list.
 
 Features:
 - Reciprocal Rank Fusion (RRF) for rank-based merging
@@ -30,8 +30,8 @@ logger = logging.getLogger(__name__)
 class SearchBackend(Enum):
     """Enum representing the available search backends."""
 
-    FAISS = "faiss"
-    ELASTICSEARCH = "elasticsearch"
+    LEANN = "leann"
+    TANTIVY = "tantivy"
     ZOEKT = "zoekt"
 
 
@@ -60,7 +60,7 @@ class MergedSearchResult:
 
     file_path: str
     score: float = 0.0
-    backend: SearchBackend = SearchBackend.FAISS
+    backend: SearchBackend = SearchBackend.LEANN
     start_line: Optional[int] = None
     end_line: Optional[int] = None
     content: Optional[str] = None
@@ -96,8 +96,8 @@ class ScoreNormalizer:
     Normalize scores from different backends to a common scale.
 
     Different search backends return scores on different scales:
-    - FAISS: Cosine similarity (0-1, higher is better)
-    - Elasticsearch: BM25 score (unbounded, higher is better)
+    - LEANN: Cosine similarity (0-1, higher is better)
+    - Tantivy: BM25 score (unbounded, higher is better)
     - Zoekt: No explicit score, uses rank-based scoring
 
     This class provides methods to normalize these scores to a 0-1 range.
@@ -186,17 +186,17 @@ class ResultConverter:
     """
 
     @staticmethod
-    def from_faiss_chunk(
+    def from_leann_chunk(
         chunk_data: Any,
         original_score: float,
-        backend: SearchBackend = SearchBackend.FAISS,
+        backend: SearchBackend = SearchBackend.LEANN,
     ) -> MergedSearchResult:
         """
-        Convert FAISS ChunkType to MergedSearchResult.
+        Convert LEANN ChunkType to MergedSearchResult.
 
         Args:
-            chunk_data: ChunkType object from FAISS search
-            original_score: Raw similarity score from FAISS
+            chunk_data: ChunkType object from LEANN search
+            original_score: Raw similarity score from LEANN
             backend: The backend identifier
 
         Returns:
@@ -225,19 +225,19 @@ class ResultConverter:
         )
 
     @staticmethod
-    def from_elasticsearch_result(
+    def from_tantivy_result(
         file_path: str,
         result_doc: Dict[str, Any],
         score: float = 0.0,
-        backend: SearchBackend = SearchBackend.ELASTICSEARCH,
+        backend: SearchBackend = SearchBackend.TANTIVY,
     ) -> MergedSearchResult:
         """
-        Convert Elasticsearch result to MergedSearchResult.
+        Convert Tantivy result to MergedSearchResult.
 
         Args:
             file_path: Path to the file
-            result_doc: Document dict from Elasticsearch
-            score: BM25 score from Elasticsearch
+            result_doc: Document dict from Tantivy
+            score: BM25 score from Tantivy
             backend: The backend identifier
 
         Returns:
@@ -480,8 +480,8 @@ class SearchResultMerger:
     Merge search results from multiple backends into a unified ranked list.
 
     This class provides a unified interface for combining results from:
-    - FAISS (local vector semantic search)
-    - Elasticsearch (full-text search)
+    - LEANN (vector semantic search)
+    - Tantivy (full-text search)
     - Zoekt (regex/symbolic search)
 
     Supported merge strategies:
@@ -492,19 +492,19 @@ class SearchResultMerger:
     Example:
         merger = SearchResultMerger(
             merge_strategy="rrf",
-            weights={"faiss": 0.5, "elasticsearch": 0.3, "zoekt": 0.2}
+            weights={"leann": 0.5, "tantivy": 0.3, "zoekt": 0.2}
         )
 
         results = merger.merge(
-            faiss_results=faiss_chunks,
-            elasticsearch_results=es_docs,
+            leann_results=leann_chunks,
+            tantivy_results=tantivy_docs,
             zoekt_results=zoekt_matches
         )
     """
 
     DEFAULT_WEIGHTS = {
-        SearchBackend.FAISS: 0.5,
-        SearchBackend.ELASTICSEARCH: 0.3,
+        SearchBackend.LEANN: 0.5,
+        SearchBackend.TANTIVY: 0.3,
         SearchBackend.ZOEKT: 0.2,
     }
 
@@ -544,16 +544,16 @@ class SearchResultMerger:
 
     def merge(
         self,
-        faiss_results: Optional[List[Any]] = None,
-        elasticsearch_results: Optional[List[Tuple[str, Dict[str, Any]]]] = None,
+        leann_results: Optional[List[Any]] = None,
+        tantivy_results: Optional[List[Tuple[str, Dict[str, Any]]]] = None,
         zoekt_results: Optional[Dict[str, List[Tuple[int, str]]]] = None,
     ) -> List[MergedSearchResult]:
         """
         Merge results from multiple backends.
 
         Args:
-            faiss_results: List of ChunkType results from FAISS
-            elasticsearch_results: List of (path, doc) tuples from Elasticsearch
+            leann_results: List of ChunkType results from LEANN
+            tantivy_results: List of (path, doc) tuples from Tantivy
             zoekt_results: Dict of file_path -> [(line, content)] from Zoekt
 
         Returns:
@@ -562,26 +562,26 @@ class SearchResultMerger:
         # Convert results to unified format and track original backends
         converted_results: List[MergedSearchResult] = []
 
-        # Convert FAISS results
-        if faiss_results:
-            for chunk in faiss_results:
+        # Convert LEANN results
+        if leann_results:
+            for chunk in leann_results:
                 # Handle both raw ChunkType and pre-converted MergedSearchResult
                 if isinstance(chunk, MergedSearchResult):
                     converted_results.append(chunk)
                 else:
                     # Extract score from chunk
                     score = getattr(chunk, "score", 0.0)
-                    converted = ResultConverter.from_faiss_chunk(
-                        chunk, score, SearchBackend.FAISS
+                    converted = ResultConverter.from_leann_chunk(
+                        chunk, score, SearchBackend.LEANN
                     )
                     converted_results.append(converted)
 
-        # Convert Elasticsearch results
-        if elasticsearch_results:
-            for file_path, doc in elasticsearch_results:
+        # Convert Tantivy results
+        if tantivy_results:
+            for file_path, doc in tantivy_results:
                 score = doc.get("score", 0.0)
-                converted = ResultConverter.from_elasticsearch_result(
-                    file_path, doc, score, SearchBackend.ELASTICSEARCH
+                converted = ResultConverter.from_tantivy_result(
+                    file_path, doc, score, SearchBackend.TANTIVY
                 )
                 converted_results.append(converted)
 
@@ -601,8 +601,8 @@ class SearchResultMerger:
 
         # Group results by backend for merging
         results_by_backend: Dict[SearchBackend, List[MergedSearchResult]] = {
-            SearchBackend.FAISS: [],
-            SearchBackend.ELASTICSEARCH: [],
+            SearchBackend.LEANN: [],
+            SearchBackend.TANTIVY: [],
             SearchBackend.ZOEKT: [],
         }
 
@@ -640,8 +640,8 @@ class SearchResultMerger:
         ranked_lists: List[List[MergedSearchResult]] = []
 
         for backend in [
-            SearchBackend.FAISS,
-            SearchBackend.ELASTICSEARCH,
+            SearchBackend.LEANN,
+            SearchBackend.TANTIVY,
             SearchBackend.ZOEKT,
         ]:
             results = results_by_backend.get(backend, [])
@@ -673,8 +673,8 @@ class SearchResultMerger:
 
 
 def merge_search_results(
-    faiss_results: Optional[List[Any]] = None,
-    elasticsearch_results: Optional[List[Tuple[str, Dict[str, Any]]]] = None,
+    leann_results: Optional[List[Any]] = None,
+    tantivy_results: Optional[List[Tuple[str, Dict[str, Any]]]] = None,
     zoekt_results: Optional[Dict[str, List[Tuple[int, str]]]] = None,
     strategy: str = "rrf",
     weights: Optional[Dict[str, float]] = None,
@@ -683,8 +683,8 @@ def merge_search_results(
     Convenience function to merge search results from multiple backends.
 
     Args:
-        faiss_results: Results from FAISS vector search
-        elasticsearch_results: Results from Elasticsearch
+        leann_results: Results from LEANN vector search
+        tantivy_results: Results from Tantivy
         zoekt_results: Results from Zoekt
         strategy: Merge strategy ("rrf" or "weighted")
         weights: Backend weights (if strategy="weighted")
@@ -705,7 +705,7 @@ def merge_search_results(
     merger = SearchResultMerger(merge_strategy=strategy, weights=enum_weights)
 
     return merger.merge(
-        faiss_results=faiss_results,
-        elasticsearch_results=elasticsearch_results,
+        leann_results=leann_results,
+        tantivy_results=tantivy_results,
         zoekt_results=zoekt_results,
     )

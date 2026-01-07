@@ -475,6 +475,7 @@ get_tool_display_name() {
     case "$1" in
         # CLI Tools
         "claude-cli") echo "Claude CLI" ;;
+        "claude-code-cli") echo "Claude Code CLI" ;;
         "codex-cli") echo "Codex CLI" ;;
         "amp-code") echo "Amp Code" ;;
         "opencode") echo "OpenCode" ;;
@@ -559,7 +560,10 @@ detect_ai_tools() {
     # CLI TOOLS - Check executables (with alternative names)
     # ============================================================================
 
-    # Claude CLI
+    # Claude Code CLI (check for config directory)
+    [[ -d "$HOME/.config/claude-code" ]] && detected_clis+=("claude-code-cli")
+
+    # Claude CLI (standalone)
     check_cmd "claude" && detected_clis+=("claude-cli")
 
     # Codex CLI
@@ -910,9 +914,9 @@ configure_claude_desktop() {
 configure_claude_cli() {
     print_section "Configuring Claude Code CLI"
 
-    # Claude Code CLI uses ~/.claude.json
-    local config_file="$HOME/.claude.json"
-    local config_dir="$HOME"
+    # Claude Code CLI uses ~/.config/claude-code/mcp.json
+    local config_file="$HOME/.config/claude-code/mcp.json"
+    local config_dir="$HOME/.config/claude-code"
 
     if [[ -f "$config_file" ]]; then
         print_bullet "Found config at: $config_file"
@@ -923,7 +927,7 @@ configure_claude_cli() {
     mkdir -p "$config_dir" || { print_warning "Failed to create config directory"; return 2; }
     backup_file "$config_file" 2>/dev/null || true
 
-    # Claude Code CLI uses a different format - projects-based
+    # Claude Code CLI MCP config format with proper merging
     if $PYTHON_CMD << PYTHON_EOF
 import json
 import sys
@@ -944,23 +948,28 @@ try:
                 config = {}
         else:
             config = {}
-except (FileNotFoundError, json.JSONDecodeError):
+except FileNotFoundError:
+    config = {}
+except Exception as e:
+    print(f"Warning: Error reading config: {e}", file=sys.stderr)
     config = {}
 
-# Claude Code CLI format: mcpServers under each project or global
+# Ensure mcpServers key exists
 if 'mcpServers' not in config:
     config['mcpServers'] = {}
 
 # Check if server already exists
 if server_name in config.get('mcpServers', {}):
     existing_config = config['mcpServers'][server_name]
-    print(f"Notice: Server '{server_name}' already configured.", file=sys.stderr)
+    print(f"Notice: Server '{server_name}' already configured. Updating...", file=sys.stderr)
 
+# Add/update the LeIndex MCP server with correct args
 config['mcpServers'][server_name] = {
     'command': server_command,
     'args': ['mcp']
 }
 
+# Write back to file
 with open(config_file, 'w') as f:
     json.dump(config, f, indent=2)
     f.write('\n')
@@ -1514,7 +1523,7 @@ select_tools() {
             ;;
         18)
             [[ -d "$HOME/.config/claude" ]] && configure_claude_desktop
-            [[ -f "$HOME/.claude.json" ]] && configure_claude_cli
+            [[ -d "$HOME/.config/claude-code" ]] && configure_claude_cli
             [[ -d "$HOME/.cursor" ]] && configure_cursor
             [[ -d "$HOME/.config/antigravity" ]] && configure_antigravity
             ([[ -d "$HOME/.config/Code" ]] || [[ -d "$HOME/.vscode" ]]) && configure_vscode auto
@@ -1603,6 +1612,9 @@ verify_installation() {
     printf "${BOLD}Configured tools:${NC}\n"
     if [[ -f "$HOME/.config/claude/claude_desktop_config.json" ]] && grep -q "leindex" "$HOME/.config/claude/claude_desktop_config.json" 2>/dev/null; then
         print_success "Claude Desktop"
+    fi
+    if [[ -f "$HOME/.config/claude-code/mcp.json" ]] && grep -q '"leindex"' "$HOME/.config/claude-code/mcp.json" 2>/dev/null; then
+        print_success "Claude Code CLI"
     fi
     if [[ -f "$HOME/.cursor/mcp.json" ]] && grep -q "leindex" "$HOME/.cursor/mcp.json" 2>/dev/null; then
         print_success "Cursor"

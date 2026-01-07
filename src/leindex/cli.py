@@ -80,13 +80,6 @@ async def search_command(args, engine: CoreEngine):
         include_web=args.web,
         content=args.content,
         use_zoekt=not args.no_zoekt,
-        use_faiss=(
-            "faiss" in (args.backend or "all") or "all" in (args.backend or "all")
-        ),
-        use_elasticsearch=(
-            "elasticsearch" in (args.backend or "all")
-            or "all" in (args.backend or "all")
-        ),
     )
 
     # Check if path is provided, otherwise use current directory
@@ -164,13 +157,6 @@ async def batch_search_command(args, engine: CoreEngine):
         rerank=not args.no_rerank,
         top_k=args.max_count,
         use_zoekt=not args.no_zoekt,
-        use_faiss=(
-            "faiss" in (args.backend or "all") or "all" in (args.backend or "all")
-        ),
-        use_elasticsearch=(
-            "elasticsearch" in (args.backend or "all")
-            or "all" in (args.backend or "all")
-        ),
     )
 
     # Read queries from file
@@ -270,7 +256,7 @@ Examples:
   leindex-search "class User" --content --highlight
 
   # Use specific backend
-  leindex-search "async def" --backend=faiss
+  leindex-search "async def" --backend=zoekt
 
   # Export results to JSON
   leindex-search "TODO" --export=json --output=todos.json
@@ -311,7 +297,7 @@ Examples:
     search_parser.add_argument(
         "-b",
         "--backend",
-        choices=["faiss", "elasticsearch", "zoekt", "all"],
+        choices=["zoekt", "all"],
         default="all",
         help="Backend to use (default: all)",
     )
@@ -346,7 +332,7 @@ Examples:
     batch_parser.add_argument(
         "-b",
         "--backend",
-        choices=["faiss", "elasticsearch", "zoekt", "all"],
+        choices=["zoekt", "all"],
         default="all",
         help="Backend to use (default: all)",
     )
@@ -418,7 +404,7 @@ Examples:
             parser.add_argument(
                 "-b",
                 "--backend",
-                choices=["faiss", "elasticsearch", "zoekt", "all"],
+                choices=["zoekt", "all"],
                 default="all",
                 help="Backend to use (default: all)",
             )

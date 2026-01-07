@@ -185,7 +185,7 @@ class ContentExtractor:
         try:
             stat_info = os.stat(full_path)
             return {
-                "path": file_path,  # Use 'path' to match Elasticsearch mapping
+                "path": file_path,  # Use 'path' to match Tantivy field name
                 "content": cleaned_content,
                 "mtime": stat_info.st_mtime,
                 "size": stat_info.st_size,

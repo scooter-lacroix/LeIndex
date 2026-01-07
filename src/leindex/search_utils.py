@@ -57,34 +57,16 @@ class SearchBackendSelector:
         if 'tantivy' in backend_class.lower() or 'tantivy' in backend_module.lower():
             return "tantivy"
 
-        # Check for Elasticsearch (legacy)
-        if 'elasticsearch' in backend_class.lower() or 'elasticsearch' in backend_module.lower():
-            return "elasticsearch"
-
         # Check for SQLite
         if 'sqlite' in backend_class.lower() or 'sqlite' in backend_module.lower():
             return "sqlite"
 
-        # Check for PostgreSQL
-        if 'postgres' in backend_class.lower() or 'postgresql' in backend_module.lower():
-            return "postgresql"
-
         return "unknown"
-
-    @staticmethod
-    def is_elasticsearch_backend(search_backend: SearchInterface) -> bool:
-        """Check if the search backend is Elasticsearch-based."""
-        return SearchBackendSelector._get_backend_type(search_backend) == "elasticsearch"
 
     @staticmethod
     def is_sqlite_backend(search_backend: SearchInterface) -> bool:
         """Check if the search backend is SQLite-based."""
         return SearchBackendSelector._get_backend_type(search_backend) == "sqlite"
-
-    @staticmethod
-    def is_postgresql_backend(search_backend: SearchInterface) -> bool:
-        """Check if the search backend is PostgreSQL-based."""
-        return SearchBackendSelector._get_backend_type(search_backend) == "postgresql"
 
     @staticmethod
     def is_tantivy_backend(search_backend: SearchInterface) -> bool:
@@ -278,31 +260,15 @@ class SearchPatternTranslator:
     @staticmethod
     def escape_for_backend(pattern: str, backend_type: str) -> str:
         """Escape pattern for specific backend requirements."""
-        if backend_type == "elasticsearch":
-            # Elasticsearch has its own escaping rules
-            return SearchPatternTranslator._escape_for_elasticsearch(pattern)
-        elif backend_type == "sqlite":
+        if backend_type == "sqlite":
             # SQLite FTS has specific escaping needs
             return SearchPatternTranslator._escape_for_sqlite_fts(pattern)
+        elif backend_type == "tantivy":
+            # Tantivy uses regex patterns
+            return SearchPatternTranslator._validate_regex_pattern(pattern)
         else:
             # Default: escape for regex
             return SearchPatternTranslator._validate_regex_pattern(pattern)
-
-    @staticmethod
-    def _escape_for_elasticsearch(pattern: str) -> str:
-        """Escape special characters for Elasticsearch queries."""
-        if not pattern:
-            return pattern
-
-        # Characters that need escaping in Elasticsearch query strings
-        # Note: This is for query string syntax, not regex
-        special_chars = ['+', '-', '=', '&&', '||', '>', '<', '!', '(', ')', '{', '}', '[', ']', '^', '"', '~', '*', '?', ':', '\\', '/']
-
-        escaped = pattern
-        for char in special_chars:
-            escaped = escaped.replace(char, f'\\{char}')
-
-        return escaped
 
     @staticmethod
     def _escape_for_sqlite_fts(pattern: str) -> str:
@@ -452,9 +418,9 @@ class SearchResultProcessor:
             if "database is locked" in error_message or "database disk image is malformed" in error_message:
                 return True
 
-        # Elasticsearch-specific recoverable errors
-        if backend_type.lower() == "elasticsearch":
-            if "timeout" in error_message or "service unavailable" in error_message:
+        # Tantivy-specific recoverable errors
+        if backend_type.lower() == "tantivy":
+            if "timeout" in error_message or "index" in error_message:
                 return True
 
         # Some specific exception types are recoverable
@@ -636,70 +602,12 @@ class BackendHealthChecker:
             }
 
     @staticmethod
-    def check_elasticsearch_backend(search_backend: SearchInterface) -> Dict[str, Any]:
-        """
-        Check Elasticsearch backend health with detailed diagnostics.
-
-        CRITICAL FIX: Detects missing aiohttp dependency and provides
-        actionable error messages instead of generic failures.
-        """
-        if not SearchBackendSelector.is_elasticsearch_backend(search_backend):
-            return {"healthy": False, "reason": "Not an Elasticsearch backend"}
-
-        # Check for aiohttp dependency first
-        try:
-            import aiohttp
-        except ImportError:
-            return {
-                "healthy": False,
-                "backend_type": "Elasticsearch",
-                "reason": "Required dependency 'aiohttp' is not installed. "
-                         "This module is required for Elasticsearch connectivity. "
-                         "Please reinstall dependencies: pip install -e .",
-                "error_type": "ImportError",
-                "missing_dependency": "aiohttp"
-            }
-
-        try:
-            # Try a simple query to test connectivity
-            test_results = search_backend.search_content("test", is_sqlite_pattern=False)
-            return {
-                "healthy": True,
-                "backend_type": "Elasticsearch",
-                "test_results_count": len(test_results) if test_results else 0
-            }
-        except RuntimeError as e:
-            # Handle our enhanced error messages
-            error_msg = str(e)
-            if "aiohttp" in error_msg and "not installed" in error_msg:
-                return {
-                    "healthy": False,
-                    "backend_type": "Elasticsearch",
-                    "reason": error_msg,
-                    "error_type": "RuntimeError",
-                    "missing_dependency": "aiohttp"
-                }
-            return {
-                "healthy": False,
-                "backend_type": "Elasticsearch",
-                "reason": error_msg,
-                "error_type": "RuntimeError"
-            }
-        except Exception as e:
-            return {
-                "healthy": False,
-                "backend_type": "Elasticsearch",
-                "reason": str(e),
-                "error_type": type(e).__name__
-            }
-
-    @staticmethod
     def check_tantivy_backend(search_backend: SearchInterface) -> Dict[str, Any]:
         """
         Check Tantivy backend health.
 
         Tantivy is an embedded search engine, so health checks are simpler
-        than for network-based backends like Elasticsearch.
+        than for network-based backends.
         """
         if not SearchBackendSelector.is_tantivy_backend(search_backend):
             return {"healthy": False, "reason": "Not a Tantivy backend"}
@@ -749,8 +657,6 @@ class BackendHealthChecker:
 
         if SearchBackendSelector.is_tantivy_backend(search_backend):
             return BackendHealthChecker.check_tantivy_backend(search_backend)
-        if SearchBackendSelector.is_elasticsearch_backend(search_backend):
-            return BackendHealthChecker.check_elasticsearch_backend(search_backend)
         elif SearchBackendSelector.is_sqlite_backend(search_backend):
             return BackendHealthChecker.check_sqlite_backend(search_backend)
         else:

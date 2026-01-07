@@ -241,7 +241,7 @@ class QualityMetricsRepository(Repository):
             eval_run_id: The evaluation run ID
             query_text: The query text
             query_type: Type of query ('semantic', 'regex', 'hybrid')
-            backend_used: Backend used ('faiss', 'elasticsearch', 'zoekt', 'merged')
+            backend_used: Backend used ('leann', 'tantivy', 'zoekt', 'merged')
             result_count: Number of results returned
             latency_ms: Query latency in milliseconds
             recall_at_k: Recall at K metric

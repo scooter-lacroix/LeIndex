@@ -127,7 +127,7 @@ class ConfigManager:
                 "sqlite_enable_fts": True  # Enable full-text search in SQLite
             },
             "vector_store": {
-                "backend_type": "leann",  # Options: "leann", "faiss"
+                "backend_type": "leann",  # LEANN is the ONLY supported backend
                 "index_path": "${LEANN_INDEX_PATH:-./leann_index}",
                 "leann_backend": "${LEANN_BACKEND:-hnsw}",  # Options: "hnsw", "diskann"
                 "embedding_model": "${LEANN_MODEL:-nomic-ai/CodeRankEmbed}",
