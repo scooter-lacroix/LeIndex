@@ -561,7 +561,7 @@ detect_ai_tools() {
     # ============================================================================
 
     # Claude Code (check for config directory)
-    [[ -d "$HOME/.config/claude-code" ]] && detected_clis+=("claude-code-cli")
+    [[ -d "$HOME/.claude" ]] && detected_clis+=("claude-code-cli")
 
     # Claude CLI (standalone)
     check_cmd "claude" && detected_clis+=("claude-cli")
@@ -914,16 +914,21 @@ configure_claude_desktop() {
 configure_claude_cli() {
     print_section "Configuring Claude Code"
 
-    # Claude Code uses ~/.claude.json as the main config file
-    # Fallback to ~/.config/claude-code/mcp.json if the main file doesn't exist
+    # Claude Code uses ~/.claude/.claude.json as the main config file
+    # Fallback to ~/.claude.json then ~/.config/claude-code/mcp.json if the main file doesn't exist
     local config_file=""
     local config_dir=""
 
-    # Primary location: ~/.claude.json (main Claude Code settings)
-    if [[ -f "$HOME/.claude.json" ]]; then
+    # Primary location: ~/.claude/.claude.json (main Claude Code settings)
+    if [[ -f "$HOME/.claude/.claude.json" ]]; then
+        config_file="$HOME/.claude/.claude.json"
+        config_dir="$HOME/.claude"
+        print_bullet "Found main config at: $config_file"
+    elif [[ -f "$HOME/.claude.json" ]]; then
+        # Secondary location: ~/.claude.json (older location)
         config_file="$HOME/.claude.json"
         config_dir="$HOME"
-        print_bullet "Found main config at: $config_file"
+        print_info "Using secondary config location: $config_file"
     else
         # Fallback location: ~/.config/claude-code/mcp.json
         config_file="$HOME/.config/claude-code/mcp.json"
@@ -1537,7 +1542,7 @@ select_tools() {
             ;;
         18)
             [[ -d "$HOME/.config/claude" ]] && configure_claude_desktop
-            [[ -d "$HOME/.config/claude-code" ]] && configure_claude_cli
+            [[ -d "$HOME/.claude" ]] && configure_claude_cli
             [[ -d "$HOME/.cursor" ]] && configure_cursor
             [[ -d "$HOME/.config/antigravity" ]] && configure_antigravity
             ([[ -d "$HOME/.config/Code" ]] || [[ -d "$HOME/.vscode" ]]) && configure_vscode auto
@@ -1627,8 +1632,10 @@ verify_installation() {
     if [[ -f "$HOME/.config/claude/claude_desktop_config.json" ]] && grep -q "leindex" "$HOME/.config/claude/claude_desktop_config.json" 2>/dev/null; then
         print_success "Claude Desktop"
     fi
-    # Check both primary (~/.claude.json) and fallback (~/.config/claude-code/mcp.json) locations
-    if [[ -f "$HOME/.claude.json" ]] && grep -q '"leindex"' "$HOME/.claude.json" 2>/dev/null; then
+    # Check primary (~/.claude/.claude.json), secondary (~/.claude.json), and fallback (~/.config/claude-code/mcp.json) locations
+    if [[ -f "$HOME/.claude/.claude.json" ]] && grep -q '"leindex"' "$HOME/.claude/.claude.json" 2>/dev/null; then
+        print_success "Claude Code"
+    elif [[ -f "$HOME/.claude.json" ]] && grep -q '"leindex"' "$HOME/.claude.json" 2>/dev/null; then
         print_success "Claude Code"
     elif [[ -f "$HOME/.config/claude-code/mcp.json" ]] && grep -q '"leindex"' "$HOME/.config/claude-code/mcp.json" 2>/dev/null; then
         print_success "Claude Code"
