@@ -66,13 +66,15 @@ class AgStrategy(SearchStrategy):
         try:
             # ag exits with 1 if no matches are found, which is not an error.
             # It exits with 0 on success (match found). Other codes are errors.
+            # CRITICAL FIX: Added 30 second timeout to prevent indefinite hangs
             process = subprocess.run(
-                cmd, 
-                capture_output=True, 
-                text=True, 
+                cmd,
+                capture_output=True,
+                text=True,
                 encoding='utf-8',
                 errors='replace',
-                check=False  # Do not raise CalledProcessError on non-zero exit
+                check=False,  # Do not raise CalledProcessError on non-zero exit
+                timeout=30  # 30 second timeout to prevent hangs on network mounts, etc.
             )
             # We don't check returncode > 1 because ag's exit code behavior
             # is less standardized than rg/ug. 0 for match, 1 for no match.
@@ -81,7 +83,9 @@ class AgStrategy(SearchStrategy):
                  raise RuntimeError(f"ag failed with exit code {process.returncode}: {process.stderr}")
 
             return parse_search_output(process.stdout, base_path)
-        
+
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("ag (The Silver Searcher) search timed out after 30 seconds. This may indicate a network mount, permission issue, or other blocking condition.")
         except FileNotFoundError:
             raise RuntimeError("'ag' (The Silver Searcher) not found. Please install it and ensure it's in your PATH.")
         except Exception as e:

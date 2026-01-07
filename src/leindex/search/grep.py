@@ -70,20 +70,24 @@ class GrepStrategy(SearchStrategy):
         try:
             # grep exits with 1 if no matches are found, which is not an error.
             # It exits with 0 on success (match found). >1 for errors.
+            # CRITICAL FIX: Added 30 second timeout to prevent indefinite hangs
             process = subprocess.run(
-                cmd, 
-                capture_output=True, 
-                text=True, 
+                cmd,
+                capture_output=True,
+                text=True,
                 encoding='utf-8',
                 errors='replace',
-                check=False
+                check=False,
+                timeout=30  # 30 second timeout to prevent hangs on network mounts, etc.
             )
-            
+
             if process.returncode > 1:
                  raise RuntimeError(f"grep failed with exit code {process.returncode}: {process.stderr}")
 
             return parse_search_output(process.stdout, base_path)
-        
+
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("grep search timed out after 30 seconds. This may indicate a network mount, permission issue, or other blocking condition.")
         except FileNotFoundError:
             raise RuntimeError("'grep' not found. Please install it and ensure it's in your PATH.")
         except Exception as e:
