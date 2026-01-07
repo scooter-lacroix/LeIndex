@@ -638,7 +638,7 @@ function Install-LeIndexPackage {
         Print-Warning "Failed to upgrade package manager (continuing anyway)"
     }
 
-    # Force reinstall to ensure new version is used (fixes old elasticsearch import issue)
+    # Force reinstall to ensure clean installation
     Print-Info "Removing old $PypiPackage installation (if present)..."
     try {
         if ($PKG_MANAGER -eq "uv") {
@@ -876,12 +876,12 @@ function Configure-ClaudeDesktop {
     }
 }
 
-# Configure Claude Code CLI (different from Claude Desktop!)
+# Configure Claude Code (different from Claude Desktop!)
 function Configure-ClaudeCLI {
-    Print-Section "Configuring Claude Code CLI"
+    Print-Section "Configuring Claude Code"
 
-    # Claude Code CLI uses ~/.claude.json
-    $configFile = "$env:USERPROFILE\.claude.json"
+    # Claude Code uses ~/.config/claude-code/mcp.json
+    $configFile = "$env:USERPROFILE\.config\claude-code\mcp.json"
     $configDir = Split-Path $configFile -Parent
 
     if (Test-Path $configFile) {
@@ -929,13 +929,13 @@ print(f"Updated: {config_file}")
 
         & $PYTHON_CMD -c $pythonScript
         if ($LASTEXITCODE -eq 0) {
-            Print-Success "Claude Code CLI configured"
+            Print-Success "Claude Code configured"
             Print-Bullet "Config: $configFile"
         } else {
             throw "Python script failed"
         }
     } catch {
-        Print-Warning "Failed to configure Claude Code CLI: $_"
+        Print-Warning "Failed to configure Claude Code: $_"
         return 2
     }
 }
@@ -1483,7 +1483,7 @@ function Select-Tools {
         }
         18 {
             if (Test-Path "$env:APPDATA\Claude") { Configure-ClaudeDesktop }
-            if (Test-Path "$env:USERPROFILE\.claude.json") { Configure-ClaudeCLI }
+            if (Test-Path "$env:USERPROFILE\.config\claude-code") { Configure-ClaudeCLI }
             if (Test-Path "$env:APPDATA\Cursor") { Configure-Cursor }
             if (Test-Path "$env:APPDATA\Antigravity") { Configure-Antigravity }
             if (Test-Path "$env:APPDATA\Code") { Configure-VSCode -Mode auto }

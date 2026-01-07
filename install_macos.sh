@@ -641,7 +641,7 @@ install_leindex() {
             ;;
     esac
 
-    # Force reinstall to ensure new version is used (fixes old elasticsearch import issue)
+    # Force reinstall to ensure clean installation
     print_info "Removing old $PYPI_PACKAGE installation (if present)..."
     case "$PKG_MANAGER" in
         uv)
@@ -862,13 +862,13 @@ configure_claude_desktop() {
     fi
 }
 
-# Configure Claude Code CLI (different from Claude Desktop!)
+# Configure Claude Code (different from Claude Desktop!)
 configure_claude_cli() {
-    print_section "Configuring Claude Code CLI"
+    print_section "Configuring Claude Code"
 
-    # Claude Code CLI uses ~/.claude.json
-    local config_file="$HOME/.claude.json"
-    local config_dir="$HOME"
+    # Claude Code uses ~/.config/claude-code/mcp.json
+    local config_file="$HOME/.config/claude-code/mcp.json"
+    local config_dir="$HOME/.config/claude-code"
 
     if [[ -f "$config_file" ]]; then
         print_bullet "Found config at: $config_file"
@@ -879,7 +879,7 @@ configure_claude_cli() {
     mkdir -p "$config_dir" || { print_warning "Failed to create config directory"; return 2; }
     backup_file "$config_file" 2>/dev/null || true
 
-    # Claude Code CLI uses a different format - projects-based
+    # Claude Code MCP config format with proper merging
     if $PYTHON_CMD << PYTHON_EOF
 import json
 import sys
@@ -903,20 +903,22 @@ try:
 except (FileNotFoundError, json.JSONDecodeError):
     config = {}
 
-# Claude Code CLI format: mcpServers under each project or global
+# Ensure mcpServers key exists
 if 'mcpServers' not in config:
     config['mcpServers'] = {}
 
 # Check if server already exists
 if server_name in config.get('mcpServers', {}):
     existing_config = config['mcpServers'][server_name]
-    print(f"Notice: Server '{server_name}' already configured.", file=sys.stderr)
+    print(f"Notice: Server '{server_name}' already configured. Updating...", file=sys.stderr)
 
+# Add/update the LeIndex MCP server with correct args
 config['mcpServers'][server_name] = {
     'command': server_command,
     'args': ['mcp']
 }
 
+# Write back to file
 with open(config_file, 'w') as f:
     json.dump(config, f, indent=2)
     f.write('\n')
@@ -924,10 +926,10 @@ with open(config_file, 'w') as f:
 print(f"Updated: {config_file}")
 PYTHON_EOF
     then
-        print_success "Claude Code CLI configured"
+        print_success "Claude Code configured"
         print_bullet "Config: $config_file"
     else
-        print_warning "Failed to configure Claude Code CLI"
+        print_warning "Failed to configure Claude Code"
         return 2
     fi
 }
@@ -1466,7 +1468,7 @@ select_tools() {
             ;;
         18)
             [[ -d "$HOME/Library/Application Support/Claude" ]] && configure_claude_desktop
-            [[ -f "$HOME/.claude.json" ]] && configure_claude_cli
+            [[ -d "$HOME/.config/claude-code" ]] && configure_claude_cli
             [[ -d "$HOME/.cursor" ]] && configure_cursor
             [[ -d "$HOME/.config/antigravity" ]] && configure_antigravity
             ([[ -d "$HOME/Library/Application Support/Code" ]] || [[ -d "$HOME/.vscode" ]]) && configure_vscode auto

@@ -475,7 +475,7 @@ get_tool_display_name() {
     case "$1" in
         # CLI Tools
         "claude-cli") echo "Claude CLI" ;;
-        "claude-code-cli") echo "Claude Code CLI" ;;
+        "claude-code-cli") echo "Claude Code" ;;
         "codex-cli") echo "Codex CLI" ;;
         "amp-code") echo "Amp Code" ;;
         "opencode") echo "OpenCode" ;;
@@ -560,7 +560,7 @@ detect_ai_tools() {
     # CLI TOOLS - Check executables (with alternative names)
     # ============================================================================
 
-    # Claude Code CLI (check for config directory)
+    # Claude Code (check for config directory)
     [[ -d "$HOME/.config/claude-code" ]] && detected_clis+=("claude-code-cli")
 
     # Claude CLI (standalone)
@@ -665,7 +665,7 @@ install_leindex() {
             ;;
     esac
 
-    # Force reinstall to ensure new version is used (fixes old elasticsearch import issue)
+    # Force reinstall to ensure clean installation
     print_info "Removing old $PYPI_PACKAGE installation (if present)..."
     case "$PKG_MANAGER" in
         uv)
@@ -848,7 +848,7 @@ configure_claude_desktop() {
     print_section "Configuring Claude Desktop"
     log_info "Starting Claude Desktop configuration"
 
-    # Search for Claude Desktop config (NOT Claude Code CLI!)
+    # Search for Claude Desktop config (NOT Claude Code!)
     # Claude Desktop uses claude_desktop_config.json
     local claude_configs=(
         "$HOME/.config/claude/claude_desktop_config.json"
@@ -910,11 +910,11 @@ configure_claude_desktop() {
     fi
 }
 
-# Configure Claude Code CLI (different from Claude Desktop!)
+# Configure Claude Code (different from Claude Desktop!)
 configure_claude_cli() {
-    print_section "Configuring Claude Code CLI"
+    print_section "Configuring Claude Code"
 
-    # Claude Code CLI uses ~/.config/claude-code/mcp.json
+    # Claude Code uses ~/.config/claude-code/mcp.json
     local config_file="$HOME/.config/claude-code/mcp.json"
     local config_dir="$HOME/.config/claude-code"
 
@@ -927,7 +927,7 @@ configure_claude_cli() {
     mkdir -p "$config_dir" || { print_warning "Failed to create config directory"; return 2; }
     backup_file "$config_file" 2>/dev/null || true
 
-    # Claude Code CLI MCP config format with proper merging
+    # Claude Code MCP config format with proper merging
     if $PYTHON_CMD << PYTHON_EOF
 import json
 import sys
@@ -977,10 +977,10 @@ with open(config_file, 'w') as f:
 print(f"Updated: {config_file}")
 PYTHON_EOF
     then
-        print_success "Claude Code CLI configured"
+        print_success "Claude Code configured"
         print_bullet "Config: $config_file"
     else
-        print_warning "Failed to configure Claude Code CLI"
+        print_warning "Failed to configure Claude Code"
         return 2
     fi
 }
@@ -1456,7 +1456,7 @@ select_tools() {
 
     local options=(
         "Claude Desktop"
-        "Claude Code CLI"
+        "Claude Code"
         "Cursor IDE"
         "Antigravity IDE"
         "VS Code / VSCodium"
@@ -1614,7 +1614,7 @@ verify_installation() {
         print_success "Claude Desktop"
     fi
     if [[ -f "$HOME/.config/claude-code/mcp.json" ]] && grep -q '"leindex"' "$HOME/.config/claude-code/mcp.json" 2>/dev/null; then
-        print_success "Claude Code CLI"
+        print_success "Claude Code"
     fi
     if [[ -f "$HOME/.cursor/mcp.json" ]] && grep -q "leindex" "$HOME/.cursor/mcp.json" 2>/dev/null; then
         print_success "Cursor"
