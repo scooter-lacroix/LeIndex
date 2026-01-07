@@ -866,20 +866,29 @@ configure_claude_desktop() {
 configure_claude_cli() {
     print_section "Configuring Claude Code"
 
-    # Claude Code uses ~/.config/claude-code/mcp.json
-    local config_file="$HOME/.config/claude-code/mcp.json"
-    local config_dir="$HOME/.config/claude-code"
+    # Claude Code uses ~/.claude.json as the main config file
+    # Fallback to ~/.config/claude-code/mcp.json if the main file doesn't exist
+    local config_file=""
+    local config_dir=""
 
-    if [[ -f "$config_file" ]]; then
-        print_bullet "Found config at: $config_file"
+    # Primary location: ~/.claude.json (main Claude Code settings)
+    if [[ -f "$HOME/.claude.json" ]]; then
+        config_file="$HOME/.claude.json"
+        config_dir="$HOME"
+        print_bullet "Found main config at: $config_file"
     else
-        print_info "No existing config found. Will create: $config_file"
+        # Fallback location: ~/.config/claude-code/mcp.json
+        config_file="$HOME/.config/claude-code/mcp.json"
+        config_dir="$HOME/.config/claude-code"
+        print_info "No main config found. Using fallback: $config_file"
     fi
 
     mkdir -p "$config_dir" || { print_warning "Failed to create config directory"; return 2; }
     backup_file "$config_file" 2>/dev/null || true
 
     # Claude Code MCP config format with proper merging
+    # For ~/.claude.json: MERGE into existing mcpServers object
+    # For fallback file: create/update mcpServers structure
     if $PYTHON_CMD << PYTHON_EOF
 import json
 import sys
@@ -887,6 +896,7 @@ import sys
 config_file = "$config_file"
 server_name = "leindex"
 server_command = "leindex"
+is_main_config = config_file.endswith(".claude.json")
 
 # Validate existing config
 try:
@@ -895,16 +905,23 @@ try:
         if existing_content.strip():
             try:
                 config = json.loads(existing_content)
+                print(f"Notice: Loaded existing config from {config_file}", file=sys.stderr)
             except json.JSONDecodeError as e:
                 print(f"Warning: Existing config is invalid JSON: {e}", file=sys.stderr)
                 config = {}
         else:
+            print(f"Notice: Config file exists but is empty", file=sys.stderr)
             config = {}
-except (FileNotFoundError, json.JSONDecodeError):
+except FileNotFoundError:
+    config = {}
+    print(f"Notice: Config file not found, will create: {config_file}", file=sys.stderr)
+except Exception as e:
+    print(f"Warning: Error reading config: {e}", file=sys.stderr)
     config = {}
 
 # Ensure mcpServers key exists
 if 'mcpServers' not in config:
+    print(f"Notice: Creating mcpServers section", file=sys.stderr)
     config['mcpServers'] = {}
 
 # Check if server already exists
@@ -918,7 +935,7 @@ config['mcpServers'][server_name] = {
     'args': ['mcp']
 }
 
-# Write back to file
+# Write back to file (preserving all other settings)
 with open(config_file, 'w') as f:
     json.dump(config, f, indent=2)
     f.write('\n')
@@ -1557,6 +1574,12 @@ verify_installation() {
     printf "${BOLD}Configured tools:${NC}\n"
     if [[ -f "$HOME/Library/Application Support/Claude/claude_desktop_config.json" ]] && grep -q "leindex" "$HOME/Library/Application Support/Claude/claude_desktop_config.json" 2>/dev/null; then
         print_success "Claude Desktop"
+    fi
+    # Check both primary (~/.claude.json) and fallback (~/.config/claude-code/mcp.json) locations
+    if [[ -f "$HOME/.claude.json" ]] && grep -q '"leindex"' "$HOME/.claude.json" 2>/dev/null; then
+        print_success "Claude Code"
+    elif [[ -f "$HOME/.config/claude-code/mcp.json" ]] && grep -q '"leindex"' "$HOME/.config/claude-code/mcp.json" 2>/dev/null; then
+        print_success "Claude Code"
     fi
     if [[ -f "$HOME/.cursor/mcp.json" ]] && grep -q "leindex" "$HOME/.cursor/mcp.json" 2>/dev/null; then
         print_success "Cursor"

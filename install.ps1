@@ -880,14 +880,22 @@ function Configure-ClaudeDesktop {
 function Configure-ClaudeCLI {
     Print-Section "Configuring Claude Code"
 
-    # Claude Code uses ~/.config/claude-code/mcp.json
-    $configFile = "$env:USERPROFILE\.config\claude-code\mcp.json"
-    $configDir = Split-Path $configFile -Parent
+    # Claude Code uses ~/.claude.json as the main config file
+    # Fallback to ~/.config/claude-code/mcp.json if the main file doesn't exist
+    $configFile = $null
+    $configDir = $null
 
-    if (Test-Path $configFile) {
-        Print-Bullet "Found config at: $configFile"
+    # Primary location: ~/.claude.json (main Claude Code settings)
+    $mainConfig = "$env:USERPROFILE\.claude.json"
+    if (Test-Path $mainConfig) {
+        $configFile = $mainConfig
+        $configDir = $env:USERPROFILE
+        Print-Bullet "Found main config at: $configFile"
     } else {
-        Print-Info "No existing config found. Will create: $configFile"
+        # Fallback location: ~/.config/claude-code/mcp.json
+        $configFile = "$env:USERPROFILE\.config\claude-code\mcp.json"
+        $configDir = Split-Path $configFile -Parent
+        Print-Info "No main config found. Using fallback: $configFile"
     }
 
     try {
@@ -901,25 +909,46 @@ import sys
 config_file = r'$configFile'
 server_name = 'leindex'
 server_command = 'leindex'
+is_main_config = config_file.endswith('.claude.json')
 
+# Validate existing config
 try:
     with open(config_file, 'r') as f:
         existing_content = f.read()
         if existing_content.strip():
-            config = json.loads(existing_content)
+            try:
+                config = json.loads(existing_content)
+                print(f"Notice: Loaded existing config from {config_file}", file=sys.stderr)
+            except json.JSONDecodeError as e:
+                print(f"Warning: Existing config is invalid JSON: {e}", file=sys.stderr)
+                config = {}
         else:
+            print(f"Notice: Config file exists but is empty", file=sys.stderr)
             config = {}
-except (FileNotFoundError, json.JSONDecodeError):
+except FileNotFoundError:
+    config = {}
+    print(f"Notice: Config file not found, will create: {config_file}", file=sys.stderr)
+except Exception as e:
+    print(f"Warning: Error reading config: {e}", file=sys.stderr)
     config = {}
 
+# Ensure mcpServers key exists
 if 'mcpServers' not in config:
+    print(f"Notice: Creating mcpServers section", file=sys.stderr)
     config['mcpServers'] = {}
 
+# Check if server already exists
+if server_name in config.get('mcpServers', {}):
+    existing_config = config['mcpServers'][server_name]
+    print(f"Notice: Server '{server_name}' already configured. Updating...", file=sys.stderr)
+
+# Add/update the LeIndex MCP server with correct args
 config['mcpServers'][server_name] = {
     'command': server_command,
     'args': ['mcp']
 }
 
+# Write back to file (preserving all other settings)
 with open(config_file, 'w') as f:
     json.dump(config, f, indent=2)
     f.write('\n')
@@ -1580,6 +1609,24 @@ function Test-Installation {
     if (Test-Path $claudeConfig) {
         $content = Get-Content $claudeConfig -Raw
         if ($content -match "leindex") { Print-Success "Claude Desktop" }
+    }
+
+    # Check both primary (~/.claude.json) and fallback (~/.config/claude-code/mcp.json) locations
+    $claudeCodeMainConfig = "$env:USERPROFILE\.claude.json"
+    $claudeCodeFallbackConfig = "$env:USERPROFILE\.config\claude-code\mcp.json"
+
+    $claudeCodeConfigured = $false
+    if (Test-Path $claudeCodeMainConfig) {
+        $content = Get-Content $claudeCodeMainConfig -Raw
+        if ($content -match '"leindex"') {
+            Print-Success "Claude Code"
+            $claudeCodeConfigured = $true
+        }
+    }
+
+    if (-not $claudeCodeConfigured -and (Test-Path $claudeCodeFallbackConfig)) {
+        $content = Get-Content $claudeCodeFallbackConfig -Raw
+        if ($content -match '"leindex"') { Print-Success "Claude Code" }
     }
 
     $cursorConfig = "$env:APPDATA\Cursor\mcp.json"
