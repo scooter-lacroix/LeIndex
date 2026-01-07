@@ -58,7 +58,7 @@ from .file_reader import (
     ReadingStrategy,
     FileSizeCategory,
 )  # Import SmartFileReader and enums
-from .system_utils import detect_system, async_ensure_infrastructure
+from .system_utils import detect_system
 from .search_utils import (
     SearchBackendSelector,
     SearchErrorHandler,
@@ -341,24 +341,9 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[LeIndexContext]:
     # Load base_path from settings if available, otherwise default to empty string
     logger.info("Initializing LeIndex MCP server...")
 
-    # Auto-start required infrastructure services (db only)
-    # This ensures the MCP server works out-of-the-box without manual service startup
-    logger.info("Checking infrastructure services (db)...")
-    try:
-        infra_ready = await async_ensure_infrastructure(
-            required_services=["db"],
-            timeout=120,  # 2 minutes max wait for services to start
-            auto_start=True
-        )
-        if infra_ready:
-            logger.info("All infrastructure services are running and healthy")
-        else:
-            logger.warning(
-                "Some infrastructure services may not be available. "
-                "The server will continue with limited functionality."
-            )
-    except Exception as e:
-        logger.warning(f"Error ensuring infrastructure services: {e}. Continuing with startup...")
+    # Note: All storage is embedded (SQLite, DuckDB, Tantivy, LEANN)
+    # No external infrastructure services required
+    logger.debug("Using embedded storage backends (SQLite, DuckDB, Tantivy, LEANN)")
 
     # Initialize a temporary settings manager to load the base_path from the default config location
     # This ensures we can retrieve the last saved project path even if the server restarts
