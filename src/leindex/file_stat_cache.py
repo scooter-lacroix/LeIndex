@@ -21,9 +21,64 @@ import os
 import hashlib
 import time
 from collections import OrderedDict
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from threading import RLock
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Union, Callable
+from functools import wraps
+
+from .logger_config import logger
+
+
+def _retry_on_toctou(max_retries: int = 3, delay: float = 0.001):
+    """
+    Decorator to retry operations that may fail due to TOCTOU race conditions.
+
+    TOCTOU (Time-Of-Check-Time-Of-Use) race conditions occur when:
+    1. We check if a file exists and get its stat
+    2. Between the check and use, another process deletes/modifies the file
+    3. Our operation fails because the file state changed
+
+    This decorator retries the operation with a small delay if specific
+    exceptions occur that indicate TOCTOU conditions.
+
+    Args:
+        max_retries: Maximum number of retry attempts (default: 3)
+        delay: Delay between retries in seconds (default: 0.001s = 1ms)
+
+    Example:
+        @_retry_on_toctou(max_retries=3)
+        def potentially_racy_operation(file_path):
+            return os.stat(file_path)
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exception = None
+
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except (FileNotFoundError, PermissionError, OSError) as e:
+                    last_exception = e
+
+                    # Check if this is a retryable error
+                    # (transient errors that might resolve on retry)
+                    if attempt < max_retries - 1:
+                        # Only retry if it looks like a TOCTOU condition
+                        # (file disappeared or became inaccessible)
+                        time.sleep(delay * (attempt + 1))  # Exponential backoff
+                        continue
+                    else:
+                        # Final attempt failed, raise the exception
+                        raise
+
+            # Should never reach here, but just in case
+            if last_exception:
+                raise last_exception
+
+        return wrapper
+    return decorator
 
 
 def _validate_file_path(file_path: str) -> bool:
@@ -218,7 +273,9 @@ class FileStatCache:
         self,
         max_size: int = 10000,
         default_ttl: int = 300,
-        chunk_size: int = 4 * 1024 * 1024  # 4MB chunks
+        chunk_size: int = 4 * 1024 * 1024,  # 4MB chunks
+        toctou_max_retries: int = 3,
+        toctou_retry_delay: float = 0.001
     ):
         """
         Initialize the file stat cache.
@@ -227,11 +284,15 @@ class FileStatCache:
             max_size: Maximum number of entries before LRU eviction (default: 10K)
             default_ttl: Default time-to-live in seconds (default: 300s = 5 min)
             chunk_size: Chunk size for hash computation (default: 4MB)
+            toctou_max_retries: Maximum retries for TOCTOU conditions (default: 3)
+            toctou_retry_delay: Delay between retries in seconds (default: 0.001s)
         """
         self._cache: OrderedDict[str, CachedStatInfo] = OrderedDict()
         self._max_size = max_size
         self._default_ttl = default_ttl
         self._chunk_size = chunk_size
+        self._toctou_max_retries = toctou_max_retries
+        self._toctou_retry_delay = toctou_retry_delay
         self._lock = RLock()
         self._stats = CacheStats()
 
@@ -247,6 +308,9 @@ class FileStatCache:
 
         CRITICAL FIX: os.stat() is called OUTSIDE the lock to prevent blocking
         all threads during I/O. The lock is only acquired for cache operations.
+
+        TOCTOU HANDLING: Includes retry logic for TOCTOU race conditions where
+        files may be deleted/moved between the check and actual stat call.
 
         SECURITY: Input validation is performed before any file system operations.
 
@@ -274,14 +338,33 @@ class FileStatCache:
         # CRITICAL: Call os.stat() OUTSIDE the lock to avoid blocking other threads
         # This is the key fix for the race condition - I/O should never happen
         # while holding the lock, as it causes all threads to block.
+        #
+        # TOCTOU FIX: Added retry logic with exponential backoff to handle
+        # race conditions where files are deleted/moved between cache check
+        # and stat call.
         current_stat = None
         stat_error = False
 
         if not needs_fresh_stat and cached_info is not None:
-            try:
-                current_stat = os.stat(file_path)
-            except (OSError, IOError):
-                stat_error = True
+            # Retry loop for TOCTOU conditions
+            for attempt in range(self._toctou_max_retries):
+                try:
+                    current_stat = os.stat(file_path)
+                    break  # Success, exit retry loop
+                except (FileNotFoundError, PermissionError, OSError) as e:
+                    if attempt < self._toctou_max_retries - 1:
+                        # Transient error - retry with exponential backoff
+                        time.sleep(self._toctou_retry_delay * (attempt + 1))
+                        continue
+                    else:
+                        # Final attempt failed - mark as error
+                        stat_error = True
+                        logger.debug(
+                            f"TOCTOU: File disappeared after {self._toctou_max_retries} retries: {file_path}",
+                            extra={'component': 'FileStatCache', 'action': 'toctou_retry_failed',
+                                   'file_path': file_path, 'attempts': self._toctou_max_retries}
+                        )
+                        break
 
         # Now re-acquire lock only for cache updates (fast, in-memory operations)
         with self._lock:
@@ -308,9 +391,8 @@ class FileStatCache:
             if force_refresh or file_path not in self._cache:
                 self._stats.misses += 1
 
-            # Compute fresh stat info (this calls os.stat inside, but that's OK
-            # since we're outside the hot path and this is a miss scenario)
-            stat_info = self._compute_stat(file_path)
+            # Compute fresh stat info with retry logic for TOCTOU
+            stat_info = self._compute_stat_with_retry(file_path)
             if stat_info:
                 # Add to cache (handles LRU eviction)
                 self._add_to_cache(file_path, stat_info)
@@ -443,6 +525,48 @@ class FileStatCache:
                 del self._cache[key]
 
             return len(expired_keys)
+
+    def _compute_stat_with_retry(self, file_path: str) -> Optional[CachedStatInfo]:
+        """
+        Compute fresh stat info with TOCTOU retry logic.
+
+        PERFORMANCE: This method performs a single os.stat() call and
+        creates a cache entry without hash (lazy hash computation).
+
+        TOCTOU HANDLING: Retries on transient errors with exponential backoff.
+
+        Args:
+            file_path: Absolute path to the file
+
+        Returns:
+            CachedStatInfo with size/mtime but no hash, or None if error
+        """
+        for attempt in range(self._toctou_max_retries):
+            try:
+                stat_result = os.stat(file_path)
+                return CachedStatInfo(
+                    path=file_path,
+                    size=stat_result.st_size,
+                    mtime=stat_result.st_mtime,
+                    hash=None,  # Lazy: compute only when needed
+                    cached_at=time.time(),
+                    ttl_seconds=self._default_ttl
+                )
+            except (FileNotFoundError, PermissionError, OSError) as e:
+                if attempt < self._toctou_max_retries - 1:
+                    # Transient error - retry with exponential backoff
+                    time.sleep(self._toctou_retry_delay * (attempt + 1))
+                    continue
+                else:
+                    # Final attempt failed
+                    logger.debug(
+                        f"Failed to stat file after {self._toctou_max_retries} retries: {file_path}",
+                        extra={'component': 'FileStatCache', 'action': 'stat_retry_failed',
+                               'file_path': file_path, 'attempts': self._toctou_max_retries}
+                    )
+                    return None
+
+        return None
 
     def _compute_stat(self, file_path: str) -> Optional[CachedStatInfo]:
         """
