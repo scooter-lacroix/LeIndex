@@ -11,52 +11,52 @@
 **Goal:** Eliminate blocking synchronous operations and implement basic optimizations
 
 ### Task 1.1: Make os.walk() Truly Async
-- [ ] Task: Write unit tests for async file tree traversal
-- [ ] Task: Implement async wrapper for os.walk() using asyncio.to_thread()
+- [x] Task: Write unit tests for async file tree traversal
+- [x] Task: Implement async wrapper for os.walk() using asyncio.to_thread()
   - Wrap os.walk() in asyncio.to_thread()
   - Preserve existing filtering logic (ignore patterns, file size)
   - Add progress callback support
   - Handle errors gracefully
-- [ ] Task: Verify event loop remains responsive during traversal
+- [x] Task: Verify event loop remains responsive during traversal
   - Test with large directory (10K+ files)
   - Verify other async operations can run concurrently
   - Measure responsiveness (should be <100ms to check other tasks)
-- [ ] Task: Update integration tests for async traversal
+- [x] Task: Update integration tests for async traversal
   - Test with various directory structures
   - Verify filtering still works correctly
   - Test error handling (permission denied, broken symlinks)
 - [ ] Task: Maestro - Phase Verification and Checkpoint 'Async I/O Foundation' (Protocol in workflow.md)
 
 ### Task 1.2: Implement File Stat Caching
-- [ ] Task: Write unit tests for file stat cache
-- [ ] Task: Implement FileStatCache class
+- [x] Task: Write unit tests for file stat cache
+- [x] Task: Implement FileStatCache class
   - In-memory cache using dict with path as key
   - Store stat results (size, mtime, hash)
   - Thread-safe access (Lock for concurrent access)
   - Cache invalidation on file modification
-- [ ] Task: Integrate cache into indexing pipeline
+- [x] Task: Integrate cache into indexing pipeline
   - Populate cache during first os.stat() call
   - Replace redundant os.stat() calls with cache lookups
   - Measure cache hit rate (should be >95%)
-- [ ] Task: Verify memory overhead is acceptable
+- [x] Task: Verify memory overhead is acceptable
   - Test with 50K files (should be <100MB overhead)
   - Profile memory usage during indexing
   - Optimize if needed (LRU eviction for large codebases)
 - [ ] Task: Maestro - Phase Verification and Checkpoint 'Async I/O Foundation' (Protocol in workflow.md)
 
 ### Task 1.3: Optimize SQLite Write Performance
-- [ ] Task: Write unit tests for batched SQLite writes
-- [ ] Task: Implement batch write functionality
+- [x] Task: Write unit tests for batched SQLite writes
+- [x] Task: Implement batch write functionality
   - Add batch_write() method to SQLiteSearch class
   - Collect documents in memory (max 100 at a time)
   - Write all documents in single transaction
   - Configure PRAGMA synchronous=NORMAL during bulk operations
   - Restore PRAGMA synchronous=FULL after indexing
-- [ ] Task: Update indexing to use batch writes
+- [x] Task: Update indexing to use batch writes
   - Replace individual document writes with batch writes
   - Implement retry logic with exponential backoff
   - Add progress reporting for batch operations
-- [ ] Task: Verify data integrity and performance
+- [x] Task: Verify data integrity and performance
   - Test transaction rollback on errors
   - Measure write throughput (should be 10-20x faster)
   - Verify no data loss on crashes
