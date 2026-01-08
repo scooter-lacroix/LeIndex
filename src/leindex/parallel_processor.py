@@ -14,6 +14,8 @@ from dataclasses import dataclass
 import time
 
 # Import progress tracking
+from .file_reader import SmartFileReader
+from .logger_config import logger
 
 
 @dataclass
@@ -143,53 +145,88 @@ class ParallelIndexer:
     
     async def process_files(self, tasks: List[IndexingTask]) -> List[IndexingResult]:
         """Process files using the parallel indexer."""
-        
+
         def process_task(task: IndexingTask) -> IndexingResult:
-            """Process a single indexing task."""
+            """Process a single indexing task.
+
+            This function runs in a worker thread and performs TRUE parallel I/O
+            by reading file content directly in the worker, not sequentially later.
+            """
             start_time = time.time()
             indexed_files = []
             errors = []
-            
+
+            # Create SmartFileReader instance for this worker thread
+            # Each worker gets its own instance for thread safety
+            smart_reader = SmartFileReader(task.directory_path)
+
             try:
                 # Process each file in the task
                 for file_path in task.files:
                     try:
                         # Get file extension
                         _, ext = os.path.splitext(file_path)
-                        
-                        # Create file info
+
+                        # Get full file path for content reading
+                        full_path = os.path.join(task.directory_path, file_path)
+
+                        # ✅ Read content HERE in worker thread (TRUE PARALLEL I/O)
+                        # This is the key change: content is read in parallel by workers,
+                        # not sequentially later in the main thread
+                        content = None
+                        content_error = None
+
+                        try:
+                            content = smart_reader.read_content(full_path)
+                            if content is None:
+                                content_error = "SmartFileReader returned None"
+                        except Exception as read_err:
+                            content_error = str(read_err)
+                            logger.warning(f"Failed to read content for {file_path}: {read_err}")
+
+                        # Create file info with pre-read content
                         file_info = {
                             'path': file_path,
                             'type': 'file',
                             'extension': ext,
+                            'content': content,  # ✅ Include pre-read content
+                            'content_error': content_error,  # ✅ Track read errors
                             'metadata': task.metadata or {}
                         }
-                        
+
                         indexed_files.append(file_info)
-                        
+
                     except Exception as e:
-                        errors.append(f"Error processing {file_path}: {str(e)}")
-                
+                        error_msg = f"Error processing {file_path}: {str(e)}"
+                        errors.append(error_msg)
+                        logger.warning(error_msg)
+
                 processing_time = time.time() - start_time
-                
+
+                # Consider task successful if we processed at least some files
+                # even if some individual files had errors
+                success = len(indexed_files) > 0 or len(errors) == 0
+
                 return IndexingResult(
                     task_id=task.task_id,
                     indexed_files=indexed_files,
                     errors=errors,
                     processing_time=processing_time,
-                    success=len(errors) == 0
+                    success=success
                 )
-                
+
             except Exception as e:
                 processing_time = time.time() - start_time
+                error_msg = f"Task {task.task_id} failed with exception: {str(e)}"
+                logger.error(error_msg)
                 return IndexingResult(
                     task_id=task.task_id,
                     indexed_files=[],
-                    errors=[str(e)],
+                    errors=[error_msg],
                     processing_time=processing_time,
                     success=False
                 )
-        
+
         # Process tasks in parallel
         return await self.process_chunks_parallel(tasks, process_task)
 
