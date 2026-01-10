@@ -124,6 +124,8 @@ class DashboardData:
         languages: Aggregated language statistics
         projects: List of all project metadata
         last_updated: Unix timestamp of last update
+        average_health_score: Mean health score across all projects
+        total_size_mb: Total memory usage of all project indexes (MB)
     """
     total_projects: int
     total_symbols: int
@@ -131,6 +133,8 @@ class DashboardData:
     languages: Dict[str, int]
     projects: List[ProjectMetadata]
     last_updated: float
+    average_health_score: float = 1.0
+    total_size_mb: float = 0.0
 
 
 class GlobalIndexTier1:
@@ -284,7 +288,9 @@ class GlobalIndexTier1:
             total_files=stats.total_files,
             languages=stats.languages,
             projects=projects_list,
-            last_updated=last_updated
+            last_updated=last_updated,
+            average_health_score=stats.average_health_score,
+            total_size_mb=stats.total_size_mb
         )
 
         duration_ms = (time.time() - start_time) * 1000

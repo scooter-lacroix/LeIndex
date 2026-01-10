@@ -315,6 +315,16 @@ def get_dashboard_data(
     dashboard.total_symbols = sum(p.symbol_count for p in dashboard.projects)
     dashboard.total_files = sum(p.file_count for p in dashboard.projects)
 
+    # Recalculate health score and size for filtered results
+    if dashboard.projects:
+        dashboard.average_health_score = (
+            sum(p.health_score for p in dashboard.projects) / len(dashboard.projects)
+        )
+        dashboard.total_size_mb = sum(p.size_mb for p in dashboard.projects)
+    else:
+        dashboard.average_health_score = 1.0
+        dashboard.total_size_mb = 0.0
+
     # Log operation
     duration_ms = (time.time() - start_time) * 1000
     log_global_index_operation(
