@@ -52,6 +52,15 @@ class PatternTrie:
         self._cache_size = cache_size
         self._hits = 0
         self._misses = 0
+        # Pre-compile wildcard regex patterns for better performance
+        self._compiled_wildcards: Dict[str, re.Pattern] = {}
+        for pattern in patterns:
+            if '*' in pattern:
+                regex_pattern = self._wildcard_to_regex(pattern)
+                try:
+                    self._compiled_wildcards[pattern] = re.compile(regex_pattern, re.IGNORECASE)
+                except re.error:
+                    pass  # Invalid regex, skip
 
     def _build_trie(self, patterns: List[str]) -> Dict:
         """
@@ -220,15 +229,20 @@ class PatternTrie:
         Returns:
             True if pattern matches path, False otherwise
         """
-        # Handle wildcard patterns
+        # Handle wildcard patterns - use pre-compiled regex if available
         if '*' in pattern:
-            # Convert wildcard to regex
-            regex_pattern = self._wildcard_to_regex(pattern)
-            try:
-                if re.search(regex_pattern, path, re.IGNORECASE):
+            # Use pre-compiled regex for better performance
+            if pattern in self._compiled_wildcards:
+                if self._compiled_wildcards[pattern].search(path):
                     return True
-            except re.error:
-                pass  # Invalid regex, skip
+            else:
+                # Fallback to on-the-fly compilation
+                regex_pattern = self._wildcard_to_regex(pattern)
+                try:
+                    if re.search(regex_pattern, path, re.IGNORECASE):
+                        return True
+                except re.error:
+                    pass  # Invalid regex, skip
         else:
             # Check for exact match or directory match
             if path == pattern:
@@ -292,25 +306,64 @@ class IgnorePatternMatcher:
     # Default exclude patterns that should always be ignored
     DEFAULT_EXCLUDES = {
         # Version control
-        '.git', '.svn', '.hg', '.bzr',
-        # Virtual environments
-        'venv', 'env', 'ENV', '.venv', '.env',
+        '.git', '.svn', '.hg', '.bzr', 'CVS',
+        # Node.js dependencies
+        'node_modules',
+        # Virtual environments (Python, Conda, etc.)
+        'venv', 'env', 'ENV', '.venv', '.env', 'virtualenv',
         # Python cache
-        '__pycache__', '*.pyc', '*.pyo', '*.pyd', '.Python',
-        # Build directories
-        'build', 'dist', 'target', 'out', 'bin',
+        '__pycache__', '*.pyc', '*.pyo', '*.pyd', '.Python', '.pytest_cache',
+        '.mypy_cache', '.ruff_cache', 'site-packages',
+        # Build directories (general, Java, C/C++, Rust, Go)
+        'build', 'dist', 'target', 'out', 'bin', 'obj', 'cmake-build-*',
+        # JavaScript/TypeScript frameworks
+        '.next', '.nuxt', '.svelte-kit', '.angular', '.cache',
+        # PHP dependencies
+        'vendor',
+        # Ruby dependencies
+        'vendor/bundle', 'gems',
+        # Go dependencies
+        'vendor',
+        # Rust specific
+        'Cargo.lock',
+        # Swift/CocoaPods
+        'Pods',
+        # Haskell/Cabal
+        'dist-newstyle', 'cabal-dev',
+        # Elixir/Phoenix
+        '_build', 'deps',
+        # Lua dependencies
+        'lua_modules', 'deps',
+        # Cache directories
+        '.cache', '.parcel-cache', '.webpack', '.turbo', '.vite',
         # IDE and editor files
-        '.vscode', '.idea', '.vs', '*.swp', '*.swo', '*~',
+        '.vscode', '.idea', '.vs', '*.swp', '*.swo', '*~', '.eclipse',
+        '.netrwhist', 'Session.vim', '.project',
         # OS specific
-        '.DS_Store', 'Thumbs.db', 'desktop.ini',
+        '.DS_Store', 'Thumbs.db', 'desktop.ini', '.Spotlight-V100',
+        '.Trashes', 'Desktop.ini',
         # Documentation builds (but not docs/ itself)
         'docs/_build', 'docs/build', '_build',
         # Logs and temporary files
         '*.log', '*.tmp', 'tmp', 'temp',
         # Coverage reports
-        'htmlcov', '.coverage', '.pytest_cache',
+        'htmlcov', '.coverage', '.nyc_output', 'coverage',
         # Package files
-        '*.egg-info', '.eggs',
+        '*.egg-info', '.eggs', '*.whl',
+        # Environment files
+        '.env.*', '*.local', '.venv',
+        # Database
+        '*.db', '*.sqlite', '*.sqlite3',
+        # Compiled files
+        '*.class', '*.jar', '*.war', '*.ear', '*.so', '*.dylib', '*.dll',
+        # MacOS
+        '__MACOSX',
+        # Windows
+        '$RECYCLE.BIN', 'System Volume Information',
+        # Linux
+        '*.swx', '.directory',
+        # Node
+        '.yarn', '.pnp', '.pnpm',
     }
     
     def __init__(self, base_path: str, use_pattern_trie: bool = True):
@@ -475,45 +528,75 @@ class IgnorePatternMatcher:
     
     def should_ignore_directory(self, dir_path: str) -> bool:
         """Check if a directory should be ignored.
-        
-        This is a specialized check for directories that can help optimize
-        directory traversal by skipping entire directory trees.
-        
+
+        OPTIMIZED: Uses fast path checks before expensive PatternTrie matching.
+        Directory names are checked against directory-specific patterns first.
+
+        PERFORMANCE: This method is called for EVERY directory during scanning.
+        The fast path checks avoid expensive PatternTrie regex matching for common cases.
+
         Args:
             dir_path: The directory path to check (relative to base_path)
-            
+
         Returns:
             True if the directory should be ignored, False otherwise
         """
-        # Check if the directory itself should be ignored
-        if self.should_ignore(dir_path):
-            return True
-        
-        # Check if it's a common directory that should be ignored
         dir_name = os.path.basename(dir_path)
-        
-        # Common directories to ignore
-        ignore_dirs = {
-            '.git', '.svn', '.hg', '.bzr',
-            '__pycache__', '.pytest_cache',
-            'venv', 'env', 'ENV', '.venv', '.env',
-            'build', 'dist', 'target', 'out',
-            '.vscode', '.idea', '.vs',
-            'htmlcov', '.coverage', '.eggs',
-            'docs/_build', 'docs/build', '_build'
+
+        # FAST PATH 1: Check directory name against directory-only patterns
+        # These are patterns that should NEVER match directories
+        # This is an O(1) set lookup - much faster than PatternTrie regex matching
+        dir_only_excludes = {
+            # Version control
+            '.git', '.svn', '.hg', '.bzr', 'CVS',
+            # Node.js dependencies
+            'node_modules',
+            # Virtual environments
+            'venv', 'env', 'ENV', '.venv', '.env', 'virtualenv',
+            # Python cache
+            '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache',
+            # Build directories
+            'build', 'dist', 'target', 'out', 'bin', 'obj',
+            # JavaScript/TypeScript frameworks
+            '.next', '.nuxt', '.svelte-kit', '.angular', '.cache',
+            # PHP/Ruby/Go dependencies
+            'vendor', 'vendor/bundle', 'gems',
+            # Rust/Swift/Haskell/Elixir/Lua
+            'Pods', 'dist-newstyle', 'cabal-dev', '_build', 'deps', 'lua_modules',
+            # Cache directories
+            '.cache', '.parcel-cache', '.webpack', '.turbo', '.vite',
+            # IDE and editor directories
+            '.vscode', '.idea', '.vs', '.eclipse', '.project',
+            # Coverage and test reports
+            'htmlcov', '.coverage', '.nyc_output', 'coverage', '.eggs',
+            # Documentation builds
+            'docs/_build', 'docs/build', '_build',
+            # Temporary directories
+            'tmp', 'temp',
+            # Node package managers
+            '.yarn', '.pnp', '.pnpm',
+            # OS specific
+            '__MACOSX', '$RECYCLE.BIN', 'System Volume Information'
         }
-        
-        if dir_name in ignore_dirs:
+
+        if dir_name in dir_only_excludes:
             return True
-        
-        # Check if directory starts with a dot (hidden directories)
+
+        # FAST PATH 2: Check hidden directories
+        # This catches ALL hidden directories (starting with .) except allowed ones
+        # This is faster than running through PatternTrie for patterns like .*
         if dir_name.startswith('.') and dir_name not in {'.', '..'}:
             # Allow some common dotfiles/directories that might contain code
             allowed_dotdirs = {'.github', '.vscode', '.config'}
             if dir_name not in allowed_dotdirs:
                 return True
-        
-        return False
+
+        # SLOW PATH: Only use PatternTrie for complex gitignore patterns
+        # This is now ONLY reached if the fast paths didn't match
+        # PatternTrie will handle wildcard patterns from .gitignore files
+        # NOTE: File glob patterns (*.pyc, *.log, etc.) are checked here but
+        # won't match directories because they require a file extension pattern
+        return self.should_ignore(dir_path)
     
     def get_patterns(self) -> List[str]:
         """Get all loaded patterns.

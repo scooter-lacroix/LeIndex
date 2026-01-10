@@ -145,15 +145,29 @@ try:
     with open(config_file, 'r') as f:
         config = json.load(f)
 
-    if 'mcpServers' in config and 'leindex' in config['mcpServers']:
-        del config['mcpServers']['leindex']
-        if not config['mcpServers']:
-            del config['mcpServers']
+	    if 'mcpServers' in config and 'leindex' in config['mcpServers']:
+	        del config['mcpServers']['leindex']
+	        if not config['mcpServers']:
+	            del config['mcpServers']
 
-    if 'lsp' in config and 'leindex' in config['lsp']:
-        del config['lsp']['leindex']
-        if not config['lsp']:
-            del config['lsp']
+	    if 'context_servers' in config and isinstance(config['context_servers'], dict) and 'leindex' in config['context_servers']:
+	        del config['context_servers']['leindex']
+	        if not config['context_servers']:
+	            del config['context_servers']
+
+	    if 'language_models' in config and isinstance(config['language_models'], dict):
+	        mcp_servers = config['language_models'].get('mcp_servers')
+	        if isinstance(mcp_servers, dict) and 'leindex' in mcp_servers:
+	            del mcp_servers['leindex']
+	            if not mcp_servers:
+	                config['language_models'].pop('mcp_servers', None)
+	        if not config['language_models']:
+	            del config['language_models']
+
+	    if 'lsp' in config and 'leindex' in config['lsp']:
+	        del config['lsp']['leindex']
+	        if not config['lsp']:
+	            del config['lsp']
 
     with open(config_file, 'w') as f:
         json.dump(config, f, indent=2)

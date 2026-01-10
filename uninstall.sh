@@ -125,6 +125,8 @@ remove_mcp_configs() {
         "$HOME/.config/VSCodium/User/settings.json"
         "$HOME/.vscode/settings.json"
         "$HOME/.config/zed/settings.json"
+        "$HOME/.var/app/dev.zed.Zed/config/zed/settings.json"
+        "$HOME/.var/app/com.zed.Zed/config/zed/settings.json"
     )
 
     for config_file in "${configs[@]}"; do
@@ -140,19 +142,39 @@ try:
     with open(config_file, 'r') as f:
         config = json.load(f)
 
-    # Remove leindex from mcpServers
-    if 'mcpServers' in config and 'leindex' in config['mcpServers']:
-        del config['mcpServers']['leindex']
-        print(f"Removed from: {config_file}")
+	    # Remove leindex from mcpServers
+	    if 'mcpServers' in config and 'leindex' in config['mcpServers']:
+	        del config['mcpServers']['leindex']
+	        print(f"Removed from: {config_file}")
 
-        # Clean up empty mcpServers
-        if not config['mcpServers']:
-            del config['mcpServers']
+	        # Clean up empty mcpServers
+	        if not config['mcpServers']:
+	            del config['mcpServers']
 
-    # Remove leindex from lsp (Zed)
-    if 'lsp' in config and 'leindex' in config['lsp']:
-        del config['lsp']['leindex']
-        print(f"Removed from: {config_file}")
+	    # Remove leindex from context_servers (Zed MCP)
+	    if 'context_servers' in config and isinstance(config['context_servers'], dict) and 'leindex' in config['context_servers']:
+	        del config['context_servers']['leindex']
+	        print(f"Removed from: {config_file}")
+
+	        # Clean up empty context_servers
+	        if not config['context_servers']:
+	            del config['context_servers']
+
+	    # Remove leindex from legacy language_models.mcp_servers (older installer versions)
+	    if 'language_models' in config and isinstance(config['language_models'], dict):
+	        mcp_servers = config['language_models'].get('mcp_servers')
+	        if isinstance(mcp_servers, dict) and 'leindex' in mcp_servers:
+	            del mcp_servers['leindex']
+	            print(f"Removed from: {config_file}")
+	            if not mcp_servers:
+	                config['language_models'].pop('mcp_servers', None)
+	        if not config['language_models']:
+	            del config['language_models']
+
+	    # Remove leindex from lsp (Zed)
+	    if 'lsp' in config and 'leindex' in config['lsp']:
+	        del config['lsp']['leindex']
+	        print(f"Removed from: {config_file}")
 
         # Clean up empty lsp
         if not config['lsp']:

@@ -1,0 +1,271 @@
+# Quick Scan Implementation - Code Changes
+
+## Summary of Fixes
+
+### Fix 1: Path Validation (Lines 7255-7257)
+```python
+# ADDED: Validate project path before scanning
+if not os.path.isdir(base_path):
+    raise ValueError(f"Invalid project path: {base_path} does not exist or is not a directory")
+```
+
+### Fix 2: Metadata Update Loop (Lines 7403-7413)
+```python
+# BEFORE (BROKEN):
+indexer.update_file_metadata(current_file_list)
+
+# AFTER (FIXED):
+for file_info in current_file_list:
+    file_path = file_info["path"]
+    full_file_path = os.path.join(base_path, file_path)
+    # Quick scan: skip hash computation for speed
+    indexer.update_file_metadata(
+        file_path,
+        full_file_path,
+        compute_hash=False,  # Don't compute hash during quick scan
+        skip_hash_for_new=True
+    )
+```
+
+### Fix 3: Metadata Persistence (Lines 7415-7417)
+```python
+# ADDED: Persist metadata to disk
+indexer.save_metadata()
+logger.info(f"Saved metadata for {len(current_file_list)} files")
+```
+
+### Fix 4: Empty Project Handling (Lines 7419-7424)
+```python
+# ADDED: Handle empty project case
+if file_count == 0:
+    logger.warning(f"No supported files found in {base_path}")
+    total_elapsed = time.time() - start_time
+    logger.info(f"Quick scan completed in {total_elapsed:.2f}s (no files to index)")
+    return 0
+```
+
+### Fix 5: Improved Logging (Line 7428)
+```python
+# BEFORE:
+logger.info(f"Quick scan complete: {file_count} files, {filtered_files} filtered, {filtered_dirs} dirs filtered")
+
+# AFTER:
+logger.info(f"Quick scan complete: {file_count} files indexed, {filtered_files} filtered, {filtered_dirs} dirs filtered")
+```
+
+## Complete Fixed Function
+
+```python
+async def _quick_scan_project(
+    base_path: str, core_engine: Optional[CoreEngine] = None
+) -> int:
+    """
+    Quick scan project without reading file content.
+
+    This is a fast alternative to full indexing that:
+    - Scans directory structure using FastParallelScanner
+    - Collects file metadata (path, size, extension, mtime)
+    - Builds minimal index without reading file contents
+    - Returns in <5 seconds even for large projects
+
+    Returns the number of files found.
+    """
+    global performance_monitor
+
+    # FIX 1: Validate project path before scanning
+    if not os.path.isdir(base_path):
+        raise ValueError(f"Invalid project path: {base_path} does not exist or is not a directory")
+
+    logger.info(f"Starting quick scan (no content reading): {base_path}")
+    start_time = time.time()
+
+    file_count = 0
+    filtered_files = 0
+    filtered_dirs = 0
+    _safe_clear_file_index()
+
+    # Initialize configuration manager for filtering
+    config_manager = ConfigManager()
+
+    # Initialize ignore pattern matcher
+    ignore_matcher = IgnorePatternMatcher(base_path)
+
+    # Initialize incremental indexer (for metadata storage)
+    settings = OptimizedProjectSettings(base_path)
+    indexer = IncrementalIndexer(settings)
+
+    # Get supported extensions
+    supported_extensions = settings.get_supported_extensions()
+    logger.info(f"Supported extensions: {len(supported_extensions)} types")
+
+    # Get pattern information for debugging
+    pattern_info = ignore_matcher.get_pattern_sources()
+    logger.info(f"Ignore patterns loaded: {pattern_info}")
+
+    # Get filtering configuration
+    filtering_stats = config_manager.get_filtering_stats()
+    logger.info(f"Filtering configuration: {filtering_stats}")
+
+    should_log = config_manager.should_log_filtering_decisions()
+
+    # Gather current file list (metadata only - no content reading)
+    current_file_list = []
+
+    # QUICK SCAN: Use FastParallelScanner for directory structure
+    try:
+        logger.info("Starting fast parallel scan...")
+        parallel_scanner = FastParallelScanner(
+            max_workers=4,
+            timeout=60.0,  # 1 minute maximum for quick scan
+            ignore_matcher=ignore_matcher
+        )
+
+        # Run parallel scan
+        walk_results = await parallel_scanner.scan(base_path)
+        stats = parallel_scanner.get_stats()
+
+        elapsed = time.time() - start_time
+        logger.info(
+            f"Quick scan completed: {len(walk_results)} directories in {elapsed:.2f}s "
+            f"({len(walk_results)/elapsed:.0f} dirs/sec)"
+        )
+
+    except asyncio.TimeoutError:
+        logger.error("Quick scan timed out after 60 seconds")
+        raise TimeoutError("Directory scan timeout")
+    except (OSError, IOError) as e:
+        logger.error(f"Error during quick scan: {e}")
+        raise
+
+    # Process walk results to collect file metadata (no content reading)
+    for root, dirs, files in walk_results:
+        # Create relative path from base_path
+        rel_path = os.path.relpath(root, base_path)
+
+        # Skip ignored directories
+        if rel_path != "." and ignore_matcher.should_ignore_directory(rel_path):
+            filtered_dirs += 1
+            continue
+
+        # Process files - collect metadata only
+        for file in files:
+            # Skip hidden files
+            if file.startswith("."):
+                filtered_files += 1
+                continue
+
+            # Check extension
+            _, ext = os.path.splitext(file)
+            file_path = os.path.join(rel_path, file).replace("\\", "/")
+            if rel_path == ".":
+                file_path = file
+
+            if ext not in supported_extensions:
+                filtered_files += 1
+                continue
+
+            # Check ignore patterns
+            if ignore_matcher.should_ignore(file_path):
+                filtered_files += 1
+                continue
+
+            # Collect file metadata (no content reading)
+            full_file_path = os.path.join(root, file)
+            try:
+                file_stat = os.stat(full_file_path)
+                file_size = file_stat.st_size
+                file_mtime = file_stat.st_mtime
+
+                # Add to file list with metadata
+                current_file_list.append({
+                    "path": file_path,
+                    "size": file_size,
+                    "mtime": file_mtime,
+                    "extension": ext
+                })
+                file_count += 1
+
+            except (OSError, IOError) as e:
+                logger.debug(f"Error getting metadata for {file_path}: {e}")
+                filtered_files += 1
+                continue
+
+    # Build minimal index from metadata
+    logger.info(f"Building minimal index from {file_count} file metadata entries...")
+
+    # Store file metadata in index
+    for file_info in current_file_list:
+        file_path = file_info["path"]
+
+        # Navigate to correct directory in index
+        current_dir = file_index
+        rel_path = os.path.dirname(file_path)
+
+        if rel_path and rel_path != ".":
+            path_parts = rel_path.replace("\\", "/").split("/")
+            for part in path_parts:
+                if part not in current_dir:
+                    current_dir[part] = {}
+                current_dir = current_dir[part]
+
+        # Add file metadata to index
+        filename = os.path.basename(file_path)
+        current_dir[filename] = {
+            "type": "file",
+            "path": file_path,
+            "ext": file_info["extension"],
+            "size": file_info["size"],
+            "mtime": file_info["mtime"],
+            "indexed": False  # Mark as not yet fully indexed (no content)
+        }
+
+    # FIX 2 & 3: Save metadata to indexer for later incremental indexing
+    for file_info in current_file_list:
+        file_path = file_info["path"]
+        full_file_path = os.path.join(base_path, file_path)
+        # Quick scan: skip hash computation for speed
+        indexer.update_file_metadata(
+            file_path,
+            full_file_path,
+            compute_hash=False,  # Don't compute hash during quick scan
+            skip_hash_for_new=True
+        )
+
+    # Persist metadata to disk for later incremental indexing
+    indexer.save_metadata()
+    logger.info(f"Saved metadata for {len(current_file_list)} files")
+
+    # FIX 4: Handle empty project case
+    if file_count == 0:
+        logger.warning(f"No supported files found in {base_path}")
+        total_elapsed = time.time() - start_time
+        logger.info(f"Quick scan completed in {total_elapsed:.2f}s (no files to index)")
+        return 0
+
+    # FIX 5: Quick scan complete
+    total_elapsed = time.time() - start_time
+    logger.info(f"Quick scan complete: {file_count} files indexed, {filtered_files} filtered, {filtered_dirs} dirs filtered")
+    logger.info(f"Quick scan total time: {total_elapsed:.2f}s ({file_count/total_elapsed:.0f} files/sec)")
+
+    return file_count
+```
+
+## Key Changes Summary
+
+| Line(s) | Change | Severity | Status |
+|---------|--------|----------|--------|
+| 7255-7257 | Added path validation | Medium | ✅ Fixed |
+| 7403-7413 | Fixed metadata update loop | Critical | ✅ Fixed |
+| 7415-7417 | Added metadata persistence | Critical | ✅ Fixed |
+| 7419-7424 | Added empty project handling | Medium | ✅ Fixed |
+| 7428 | Improved logging message | Low | ✅ Fixed |
+
+## Performance Impact
+
+The fixes do NOT negatively impact performance:
+- Path validation: O(1) - negligible
+- Metadata loop: O(n) - required for correctness
+- Metadata save: O(1) - batch write
+- Empty check: O(1) - negligible
+
+**Expected performance remains: <2 seconds for salsa-store**

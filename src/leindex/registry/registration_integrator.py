@@ -3,9 +3,14 @@ Auto-Registration Integration for the meta-registry system.
 
 This module provides automatic registration integration with the indexing
 pipeline, ensuring projects are registered after their index is saved.
+
+Event Integration:
+    This module emits ProjectIndexedEvent after successful registration,
+    which triggers updates to the global index (Tier 1 and Tier 2).
 """
 
 import os
+import time
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 import logging
@@ -14,6 +19,21 @@ from .project_registry import ProjectRegistry, ProjectInfo, DuplicateProjectErro
 from .directories import get_project_index_dir
 
 logger = logging.getLogger(__name__)
+
+
+def _get_event_bus():
+    """
+    Lazy import and get the global event bus.
+
+    This avoids circular imports and ensures the event bus is only
+    imported when actually needed.
+    """
+    try:
+        from leindex.global_index.event_bus import get_global_event_bus
+        return get_global_event_bus()
+    except ImportError:
+        logger.warning("Global index event bus not available, events will not be emitted")
+        return None
 
 
 class RegistrationIntegrator:
@@ -25,19 +45,26 @@ class RegistrationIntegrator:
     - Sequential write pattern (index first, registry second)
     - Graceful failure handling (log warning, continue)
     - Registry updates on reindex (update timestamp, stats)
+    - Event emission for global index integration
 
     The integrator is designed to be called after index save operations,
     ensuring that the registry is always kept in sync with the filesystem.
 
+    Event Integration:
+        After successful registration, this class emits ProjectIndexedEvent
+        to trigger updates to the global index (Tier 1 metadata and Tier 2 cache).
+
     Attributes:
         registry: ProjectRegistry instance for registration
         enabled: Whether auto-registration is enabled
+        emit_events: Whether to emit events for global index integration
     """
 
     def __init__(
         self,
         registry: Optional[ProjectRegistry] = None,
         enabled: bool = True,
+        emit_events: bool = True,
     ):
         """
         Initialize the registration integrator.
@@ -45,12 +72,84 @@ class RegistrationIntegrator:
         Args:
             registry: ProjectRegistry instance. If None, creates a new instance.
             enabled: Whether auto-registration is enabled (default: True)
+            emit_events: Whether to emit events for global index (default: True)
         """
         self.registry = registry if registry is not None else ProjectRegistry()
         self.enabled = enabled
+        self.emit_events = emit_events
+        self._event_bus = None
+
         logger.info(
-            f"RegistrationIntegrator initialized (enabled={enabled})"
+            f"RegistrationIntegrator initialized "
+            f"(enabled={enabled}, emit_events={emit_events})"
         )
+
+    # ------------------------------------------------------------------------
+    # Event Emission
+    # ------------------------------------------------------------------------
+
+    def _emit_project_indexed_event(
+        self,
+        project_path: str,
+        project_id: str,
+        file_count: int,
+        stats: Dict[str, Any],
+        status: str = "completed"
+    ) -> None:
+        """
+        Emit ProjectIndexedEvent for global index integration.
+
+        This method is called after successful project registration to trigger
+        updates to Tier 1 (metadata) and Tier 2 (cache invalidation) of the
+        global index.
+
+        Args:
+            project_path: Absolute path to the project
+            project_id: Unique project identifier (database ID)
+            file_count: Number of files in the index
+            stats: Index statistics
+            status: Indexing status ("completed", "error", "partial")
+        """
+        if not self.emit_events:
+            return
+
+        try:
+            # Lazy load event bus
+            if self._event_bus is None:
+                self._event_bus = _get_event_bus()
+
+            if self._event_bus is None:
+                return
+
+            # Create event
+            from leindex.global_index.event_bus import Event
+
+            event = Event(
+                event_type="project_indexed",
+                timestamp=time.time(),
+                data={
+                    "project_id": project_id,
+                    "project_path": project_path,
+                    "file_count": file_count,
+                    "stats": stats,
+                    "status": status,
+                }
+            )
+
+            # Emit event (synchronous, should complete in <1ms)
+            self._event_bus.emit(event)
+
+            logger.debug(
+                f"Emitted project_indexed event for {project_path} "
+                f"(id={project_id}, status={status})"
+            )
+
+        except Exception as e:
+            # Don't fail registration if event emission fails
+            logger.warning(
+                f"Failed to emit project_indexed event: {e}. "
+                f"Registration succeeded but global index may be out of sync."
+            )
 
     # ------------------------------------------------------------------------
     # Registration Methods
@@ -174,12 +273,32 @@ class RegistrationIntegrator:
             )
 
             logger.info(f"Auto-registered new project: {project_path}")
+
+            # Emit event for global index integration
+            self._emit_project_indexed_event(
+                project_path=project_path,
+                project_id=str(project_info.id),
+                file_count=file_count,
+                stats=stats,
+                status="completed"
+            )
+
             return project_info
 
         except DuplicateProjectError:
             # Race condition - project was just registered by another process
             logger.debug(f"Project already registered (race condition): {project_path}")
-            return self.registry.get_by_path(project_path)
+            project_info = self.registry.get_by_path(project_path)
+            # Still emit event since the project is now registered
+            if project_info:
+                self._emit_project_indexed_event(
+                    project_path=project_path,
+                    project_id=str(project_info.id),
+                    file_count=file_count,
+                    stats={"file_count": file_count},
+                    status="completed"
+                )
+            return project_info
         except Exception as e:
             logger.error(f"Failed to register new project {project_path}: {e}")
             return None
@@ -217,6 +336,16 @@ class RegistrationIntegrator:
             )
 
             logger.info(f"Auto-updated project on reindex: {project_path}")
+
+            # Emit event for global index integration
+            self._emit_project_indexed_event(
+                project_path=project_path,
+                project_id=str(project_info.id),
+                file_count=file_count,
+                stats=stats,
+                status="completed"
+            )
+
             return project_info
 
         except Exception as e:

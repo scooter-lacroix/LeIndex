@@ -286,6 +286,13 @@ def validate_int(
             return default
         raise ValidationError(f"{param_name} is required")
 
+    # Try to convert string to int
+    if isinstance(value, str):
+        try:
+            value = int(value)
+        except ValueError:
+            raise ValidationError(f"{param_name} must be a number")
+
     if not isinstance(value, (int, float)):
         raise ValidationError(f"{param_name} must be a number")
 
@@ -464,11 +471,6 @@ async def search_content_router(
     context_lines: int = 0,
     file_pattern: Optional[str] = None,
     fuzzy: bool = False,
-    fuzziness_level: Optional[str] = None,
-    content_boost: float = 1.0,
-    filepath_boost: float = 1.0,
-    highlight_pre_tag: str = "<em>",
-    highlight_post_tag: str = "</em>",
     page: int = 1,
     page_size: int = 20,
     # Parameters for "rank" action (rank_search_results)
@@ -489,11 +491,6 @@ async def search_content_router(
         context_lines: For "search" - lines of context around matches
         file_pattern: For "search" - glob pattern to filter files
         fuzzy: For "search" - whether to treat pattern as regex
-        fuzziness_level: For "search" - ES fuzziness level (e.g., "AUTO", "0", "1", "2")
-        content_boost: For "search" - content field boosting factor
-        filepath_boost: For "search" - file_path field boosting factor
-        highlight_pre_tag: For "search" - HTML tag before highlighted terms
-        highlight_post_tag: For "search" - HTML tag after highlighted terms
         page: For "search" - page number for pagination
         page_size: For "search" - results per page
         results: For "rank" - list of search results to rank
@@ -545,17 +542,6 @@ async def search_content_router(
                     min_val=_MIN_PAGE_SIZE, max_val=_MAX_PAGE_SIZE,
                     default=20
                 )
-                validated_content_boost = validate_float(
-                    content_boost, "content_boost",
-                    min_val=0, max_val=10,
-                    default=1.0
-                )
-                validated_filepath_boost = validate_float(
-                    filepath_boost, "filepath_boost",
-                    min_val=0, max_val=10,
-                    default=1.0
-                )
-
                 return await search_code_advanced(
                     pattern=pattern,
                     ctx=ctx,
@@ -563,11 +549,6 @@ async def search_content_router(
                     context_lines=validated_context_lines,
                     file_pattern=file_pattern,
                     fuzzy=fuzzy,
-                    fuzziness_level=fuzziness_level,
-                    content_boost=validated_content_boost,
-                    filepath_boost=validated_filepath_boost,
-                    highlight_pre_tag=highlight_pre_tag,
-                    highlight_post_tag=highlight_post_tag,
                     page=validated_page,
                     page_size=validated_page_size,
                 )

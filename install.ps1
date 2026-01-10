@@ -1175,16 +1175,23 @@ function Configure-Zed {
     New-Item -ItemType Directory -Path $configDir -Force | Out-Null
     Backup-FileSafe $configFile
 
+    $leindexCmd = "leindex"
+    try {
+        $cmd = Get-Command leindex -ErrorAction Stop
+        if ($cmd.Source) { $leindexCmd = $cmd.Source }
+    } catch {}
+
     $pythonScript = @"
-import json
-import sys
+	import json
+	import sys
 
-config_file = r'$configFile'
+	config_file = r'$configFile'
+	leindex_cmd = r'$leindexCmd'
 
-# Validate existing config
-try:
-    with open(config_file, 'r') as f:
-        existing_content = f.read()
+	# Validate existing config
+	try:
+	    with open(config_file, 'r') as f:
+	        existing_content = f.read()
         if existing_content.strip():
             try:
                 config = json.loads(existing_content)
@@ -1194,33 +1201,40 @@ try:
                 config = {}
         else:
             config = {}
-except (FileNotFoundError, json.JSONDecodeError):
-    config = {}
+	except (FileNotFoundError, json.JSONDecodeError):
+	    config = {}
 
-# Ensure language_models exists
-if 'language_models' not in config:
-    config['language_models'] = {}
+	# Ensure context_servers exists (Zed expects MCP servers here)
+	if 'context_servers' not in config:
+	    config['context_servers'] = {}
 
-# Ensure mcp_servers exists
-if 'mcp_servers' not in config['language_models']:
-    config['language_models']['mcp_servers'] = {}
+	# Check if server already exists and explicitly remove it for a fresh config
+	if 'leindex' in config['context_servers']:
+	    existing_config = config['context_servers']['leindex']
+	    print(f"Notice: Server 'leindex' already configured in Zed. Removing for refresh...", file=sys.stderr)
+	    print(f"Existing config: {existing_config}", file=sys.stderr)
+	    del config['context_servers']['leindex']
 
-# Check if server already exists
-if 'language_models' in config and 'mcp_servers' in config['language_models']:
-    if 'leindex' in config['language_models']['mcp_servers']:
-        existing_config = config['language_models']['mcp_servers']['leindex']
-        print(f"Notice: Server 'leindex' already configured in Zed MCP servers.", file=sys.stderr)
-        print(f"Existing config: {existing_config}", file=sys.stderr)
+	# Clean up legacy location from older installer versions
+	if 'language_models' in config and isinstance(config['language_models'], dict):
+	    mcp_servers = config['language_models'].get('mcp_servers')
+	    if isinstance(mcp_servers, dict) and 'leindex' in mcp_servers:
+	        del mcp_servers['leindex']
+	        if not mcp_servers:
+	            config['language_models'].pop('mcp_servers', None)
+	    if not config['language_models']:
+	        del config['language_models']
 
-# Add MCP server configuration
-config['language_models']['mcp_servers']['leindex'] = {
-    'command': 'leindex',
-    'args': ['mcp']
-}
+	# Add MCP server configuration
+	config['context_servers']['leindex'] = {
+	    'enabled': True,
+	    'command': leindex_cmd,
+	    'args': ['mcp']
+	}
 
-# Validate config can be serialized
-try:
-    json.dumps(config)
+	# Validate config can be serialized
+	try:
+	    json.dumps(config)
 except (TypeError, ValueError) as e:
     print(f"Error: Invalid configuration structure: {e}", file=sys.stderr)
     sys.exit(1)

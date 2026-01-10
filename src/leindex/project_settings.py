@@ -638,17 +638,53 @@ class ProjectSettings:
     
     def get_config_manager(self) -> ConfigManager:
         """Get ConfigManager instance with project-specific overrides.
-        
+
         Returns:
             ConfigManager: Configured instance with project path for overrides
         """
         return ConfigManager(project_path=self.base_path)
-    
+
     def get_effective_config(self) -> dict:
         """Get the effective configuration with project overrides applied.
-        
+
         Returns:
             dict: Merged configuration with project overrides
         """
         config_manager = self.get_config_manager()
         return config_manager.get_config()
+
+    def get_memory_config(self) -> dict:
+        """Get effective memory configuration with project overrides.
+
+        Integrates with the new project_config module to provide memory
+        allocation hints and eviction priorities.
+
+        Returns:
+            dict: Effective memory configuration with keys:
+                - estimated_mb: Memory estimate (project override or global default)
+                - priority: Eviction priority (high/normal/low)
+                - priority_score: Numeric priority score (2.0/1.0/0.5)
+                - is_overridden: True if project overrode defaults
+                - max_override_mb: Maximum allowed override (512MB)
+
+        Example:
+            >>> settings = ProjectSettings("/path/to/project")
+            >>> mem_config = settings.get_memory_config()
+            >>> print(f"Memory: {mem_config['estimated_mb']}MB")
+            >>> print(f"Priority: {mem_config['priority']}")
+        """
+        try:
+            # Import here to avoid circular dependency
+            from .project_config import get_effective_memory_config
+
+            return get_effective_memory_config(self.base_path)
+        except Exception as e:
+            print(f"Error loading project memory config: {e}")
+            # Return defaults if project config fails
+            return {
+                "estimated_mb": 256,  # Global default
+                "priority": "normal",
+                "priority_score": 1.0,
+                "is_overridden": False,
+                "max_override_mb": 512,
+            }
