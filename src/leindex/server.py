@@ -290,20 +290,26 @@ class LeIndexProjectUnloader(ProjectUnloader):
             # Previously, counting and removal were in separate locked sections,
             # allowing another thread to modify file_index between them.
             files_in_project = 0
-            estimated_mb = 0.0
 
-            # CRITICAL FIX: Single atomic critical section for count + remove
+            # CRITICAL FIX: Single atomic critical section for count + remove + memory calculation
             with file_index_lock:
                 if file_index:
                     try:
-                        # First pass: count files and collect paths to remove
+                        # First pass: count files, collect paths to remove, and calculate memory
                         files_to_remove = []
+                        estimated_mb = 0.0  # Calculate actual memory freed
+
                         for file_path, _info in _eviction_get_all_files(file_index):
                             # CRITICAL FIX: Use normalized path comparison to avoid false positives
                             normalized_file_path = os.path.normpath(file_path)
                             if normalized_file_path.startswith(match_path + os.sep) or normalized_file_path == match_path:
                                 files_in_project += 1
                                 files_to_remove.append(file_path)
+                                # Calculate memory freed based on file metadata
+                                if _info and 'size_mb' in _info:
+                                    estimated_mb += _info['size_mb']
+                                else:
+                                    estimated_mb += 0.256  # Default: 256KB per file
                     except Exception as e:
                         logger.warning(f"Error counting files in project: {e}")
 
