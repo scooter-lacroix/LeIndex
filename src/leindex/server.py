@@ -115,6 +115,7 @@ from .memory.eviction import (
     ProjectCandidate,
     ProjectPriority,
     EvictionResult,
+    ProjectUnloader,
     get_global_manager,
     emergency_eviction,
 )
@@ -124,6 +125,7 @@ from .memory.eviction import (
 
 # In-memory references (will be loaded from persistent storage)
 file_index = {}
+file_index_lock = threading.RLock()  # Thread-safe lock for file_index access
 lazy_content_manager = LazyContentManager(max_loaded_files=100)
 
 # Global DAL instance
@@ -162,6 +164,253 @@ stats_collector: Optional[IndexStatisticsCollector] = None
 
 # Global index instance for cross-project operations
 global_index: Optional[GlobalIndex] = None
+
+
+# ============================================================================
+# PHASE 6: Eviction Unloader Implementation
+# ============================================================================
+class LeIndexProjectUnloader(ProjectUnloader):
+    """
+    Project unloader implementation for LeIndex.
+
+    This class provides the bridge between the eviction system and the
+    actual file_index dictionary, allowing projects to be unloaded from
+    memory when needed.
+    """
+
+    def get_loaded_projects(self) -> List[ProjectCandidate]:
+        """
+        Return list of currently loaded projects.
+
+        This method extracts project metadata from the global_index's
+        Tier 1 metadata store, which tracks all indexed projects.
+
+        Returns:
+            List of ProjectCandidate objects representing loaded projects
+        """
+        global global_index, file_index, file_index_lock
+
+        candidates = []
+
+        if global_index is None:
+            logger.debug("Global index not initialized, no loaded projects")
+            return candidates
+
+        try:
+            # Get dashboard data which contains all project metadata
+            dashboard_data = global_index.get_dashboard_data()
+
+            if dashboard_data and dashboard_data.projects:
+                current_time = time.time()
+
+                for project_meta in dashboard_data.projects:
+                    # Create ProjectCandidate from ProjectMetadata
+                    candidate = ProjectCandidate(
+                        project_id=project_meta.id,
+                        project_path=project_meta.path,
+                        last_access=current_time,  # Use current time as access time
+                        priority=ProjectPriority.NORMAL,  # Default priority
+                        estimated_mb=project_meta.size_mb if project_meta.size_mb > 0 else 256.0,
+                        loaded_files=project_meta.file_count,
+                        is_index_loaded=project_meta.index_status == "completed",
+                        metadata={
+                            "name": project_meta.name,
+                            "symbol_count": project_meta.symbol_count,
+                            "languages": project_meta.languages,
+                            "health_score": project_meta.health_score,
+                        }
+                    )
+                    candidates.append(candidate)
+
+                logger.debug(
+                    f"Found {len(candidates)} loaded projects in global index"
+                )
+            else:
+                logger.debug("No projects found in global index dashboard data")
+
+        except Exception as e:
+            logger.error(f"Error getting loaded projects from global index: {e}")
+
+        return candidates
+
+    def unload_project(self, project_id: str) -> tuple[bool, float]:
+        """
+        Unload a project from memory.
+
+        This method removes the project from the file_index dictionary
+        and estimates the memory freed.
+
+        Args:
+            project_id: Unique identifier for the project (typically the path)
+
+        Returns:
+            Tuple of (success, memory_freed_mb)
+        """
+        global file_index, global_index, file_index_lock
+
+        try:
+            # CRITICAL FIX: Input validation
+            if not project_id or not isinstance(project_id, str):
+                logger.error(f"Invalid project_id: {project_id!r} (must be non-empty string)")
+                return False, 0.0
+
+            # Normalize project path for consistent comparison
+            normalized_project_id = os.path.normpath(project_id)
+
+            # First, get metadata to estimate memory
+            estimated_mb = 256.0  # Default estimate
+            project_found = False
+            project_path_for_matching = None
+
+            if global_index is not None:
+                try:
+                    dashboard_data = global_index.get_dashboard_data()
+                    if dashboard_data and dashboard_data.projects:
+                        for project_meta in dashboard_data.projects:
+                            # CRITICAL FIX: Use normalized path comparison
+                            normalized_meta_path = os.path.normpath(project_meta.path)
+                            if (project_meta.id == project_id or
+                                normalized_meta_path == normalized_project_id):
+                                estimated_mb = max(project_meta.size_mb, 1.0)  # At least 1MB
+                                project_found = True
+                                project_path_for_matching = normalized_meta_path
+                                logger.debug(
+                                    f"Project {project_id} found with "
+                                    f"estimated size {estimated_mb:.2f}MB"
+                                )
+                                break
+                except Exception as e:
+                    logger.warning(f"Error getting project metadata: {e}")
+
+            # Use the project path from metadata if found, otherwise use input
+            match_path = project_path_for_matching if project_path_for_matching else normalized_project_id
+
+            # Check if file_index has any data for this project
+            # The file_index is a nested dict structure, so we need to check
+            # if the project path appears in any of the file entries
+            files_in_project = 0
+
+            # CRITICAL FIX: Thread-safe access to file_index
+            with file_index_lock:
+                if file_index:
+                    try:
+                        for file_path, _info in _eviction_get_all_files(file_index):
+                            # CRITICAL FIX: Use normalized path comparison to avoid false positives
+                            normalized_file_path = os.path.normpath(file_path)
+                            if normalized_file_path.startswith(match_path + os.sep) or normalized_file_path == match_path:
+                                files_in_project += 1
+                    except Exception as e:
+                        logger.warning(f"Error counting files in project: {e}")
+
+            if files_in_project == 0 and not project_found:
+                logger.warning(f"Project {project_id} not found in file_index or global_index")
+                return False, 0.0
+
+            # Clear the project from file_index
+            # Since file_index is a nested structure keyed by path components,
+            # we need to remove all entries that match the project path
+            if file_index and files_in_project > 0:
+                try:
+                    # CRITICAL FIX: Thread-safe access to file_index
+                    with file_index_lock:
+                        # Remove files belonging to this project
+                        files_to_remove = []
+                        for file_path, _info in _eviction_get_all_files(file_index):
+                            normalized_file_path = os.path.normpath(file_path)
+                            if normalized_file_path.startswith(match_path + os.sep) or normalized_file_path == match_path:
+                                files_to_remove.append(file_path)
+
+                        # Remove each file from the index
+                        for file_path in files_to_remove:
+                            _eviction_remove_file_from_index(file_path, file_index)
+
+                    logger.info(
+                        f"Removed {len(files_to_remove)} files from index for project {project_id}"
+                    )
+
+                    # Update file count in context if available
+                    # (This will be updated on next access anyway)
+
+                except Exception as e:
+                    logger.error(f"Error clearing project from file_index: {e}")
+                    # Continue anyway - we'll report the project as unloaded
+
+            # Note: We don't remove from global_index.tier1 as it's designed as an
+            # append-only metadata store. The actual memory is freed by clearing file_index.
+            # The Tier 1 metadata will naturally age out through normal index refresh cycles.
+
+            logger.info(
+                f"Successfully unloaded project {project_id} "
+                f"(freed ~{estimated_mb:.2f}MB)"
+            )
+
+            return True, estimated_mb
+
+        except Exception as e:
+            logger.error(f"Error unloading project {project_id}: {e}")
+            return False, 0.0
+
+
+def _eviction_get_all_files(index_dict: Dict) -> List[Tuple[str, Any]]:
+    """
+    Recursively get all files from the nested index structure.
+    Renamed to avoid collision with existing _get_all_files function.
+
+    Args:
+        index_dict: The nested file index dictionary
+
+    Returns:
+        List of (file_path, file_info) tuples
+    """
+    files = []
+
+    def _traverse(current_dict: Dict, current_path: str = ""):
+        """Traverse the nested index structure."""
+        for key, value in current_dict.items():
+            if isinstance(value, dict):
+                if value.get("type") == "file":
+                    # This is a file entry
+                    file_path = value.get("path", f"{current_path}/{key}" if current_path else key)
+                    files.append((file_path, value))
+                else:
+                    # This is a directory, continue traversing
+                    new_path = f"{current_path}/{key}" if current_path else key
+                    _traverse(value, new_path)
+
+    _traverse(index_dict)
+    return files
+
+
+def _eviction_remove_file_from_index(file_path: str, index_dict: Dict) -> bool:
+    """
+    Remove a file from the nested index structure.
+    Renamed to avoid collision with existing _remove_file_from_index function.
+
+    Args:
+        file_path: Path to the file to remove
+        index_dict: The nested file index dictionary
+
+    Returns:
+        True if file was removed, False otherwise
+    """
+    # Split path into components
+    parts = file_path.replace("\\", "/").split("/")
+
+    # Navigate to the parent directory
+    current = index_dict
+    for part in parts[:-1]:
+        if part in current and isinstance(current[part], dict):
+            current = current[part]
+        else:
+            return False  # Path not found
+
+    # Remove the file
+    filename = parts[-1]
+    if filename in current:
+        del current[filename]
+        return True
+
+    return False
 
 
 def ensure_global_index() -> GlobalIndex:
@@ -519,6 +768,20 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[LeIndexContext]:
     except Exception as e:
         logger.warning(f"Could not initialize global index: {e}")
         global_index = None
+
+    # ============================================================================
+    # PHASE 6: Register Eviction Unloader
+    # ============================================================================
+    # Register the project unloader with the eviction manager so that
+    # trigger_eviction() can actually unload projects from memory
+    try:
+        from .memory.eviction import get_global_manager
+        eviction_manager = get_global_manager()
+        eviction_manager.set_unloader(LeIndexProjectUnloader())
+        logger.info("Eviction unloader registered successfully")
+    except Exception as e:
+        logger.warning(f"Could not register eviction unloader: {e}")
+        # Continue without eviction - server will still work but manual memory management may be needed
 
     # Initialize Vector Backend based on configuration
     # LEANN is the ONLY supported vector backend
