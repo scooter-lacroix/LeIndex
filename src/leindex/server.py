@@ -285,51 +285,41 @@ class LeIndexProjectUnloader(ProjectUnloader):
             # Use the project path from metadata if found, otherwise use input
             match_path = project_path_for_matching if project_path_for_matching else normalized_project_id
 
-            # Check if file_index has any data for this project
-            # The file_index is a nested dict structure, so we need to check
-            # if the project path appears in any of the file entries
+            # CRITICAL FIX: Merge count and remove into single critical section
+            # to prevent TOCTOU (Time-Of-Check-Time-Of-Use) race condition.
+            # Previously, counting and removal were in separate locked sections,
+            # allowing another thread to modify file_index between them.
             files_in_project = 0
+            estimated_mb = 0.0
 
-            # CRITICAL FIX: Thread-safe access to file_index
+            # CRITICAL FIX: Single atomic critical section for count + remove
             with file_index_lock:
                 if file_index:
                     try:
+                        # First pass: count files and collect paths to remove
+                        files_to_remove = []
                         for file_path, _info in _eviction_get_all_files(file_index):
                             # CRITICAL FIX: Use normalized path comparison to avoid false positives
                             normalized_file_path = os.path.normpath(file_path)
                             if normalized_file_path.startswith(match_path + os.sep) or normalized_file_path == match_path:
                                 files_in_project += 1
+                                files_to_remove.append(file_path)
                     except Exception as e:
                         logger.warning(f"Error counting files in project: {e}")
 
-            if files_in_project == 0 and not project_found:
-                logger.warning(f"Project {project_id} not found in file_index or global_index")
-                return False, 0.0
+                if files_in_project == 0 and not project_found:
+                    logger.warning(f"Project {project_id} not found in file_index or global_index")
+                    return False, 0.0
 
-            # Clear the project from file_index
-            # Since file_index is a nested structure keyed by path components,
-            # we need to remove all entries that match the project path
-            if file_index and files_in_project > 0:
+                # Second pass: remove files (still in same lock - atomic with count)
                 try:
-                    # CRITICAL FIX: Thread-safe access to file_index
-                    with file_index_lock:
-                        # Remove files belonging to this project
-                        files_to_remove = []
-                        for file_path, _info in _eviction_get_all_files(file_index):
-                            normalized_file_path = os.path.normpath(file_path)
-                            if normalized_file_path.startswith(match_path + os.sep) or normalized_file_path == match_path:
-                                files_to_remove.append(file_path)
-
-                        # Remove each file from the index
-                        for file_path in files_to_remove:
-                            _eviction_remove_file_from_index(file_path, file_index)
+                    # Remove each file from the index
+                    for file_path in files_to_remove:
+                        _eviction_remove_file_from_index(file_path, file_index)
 
                     logger.info(
                         f"Removed {len(files_to_remove)} files from index for project {project_id}"
                     )
-
-                    # Update file count in context if available
-                    # (This will be updated on next access anyway)
 
                 except Exception as e:
                     logger.error(f"Error clearing project from file_index: {e}")
@@ -2832,7 +2822,8 @@ async def set_project_path(path: str, ctx: Context) -> Union[str, Dict[str, Any]
             memory_aware_manager, \
             performance_monitor, \
             dal_instance
-        file_index = {}  # Always reset to dictionary - will be loaded as TrieFileIndex if available
+        with file_index_lock:
+            file_index = {}  # Always reset to dictionary - will be loaded as TrieFileIndex if available
 
         # CRITICAL FIX: Properly dispose of the old LazyContentManager before creating a new one
         # This prevents memory leaks from cached content of the previous project
@@ -3038,29 +3029,31 @@ async def set_project_path(path: str, ctx: Context) -> Union[str, Dict[str, Any]
             # Convert TrieFileIndex to dictionary format for compatibility
             if hasattr(loaded_index, "get_all_files"):
                 # This is a TrieFileIndex - convert to dict format
-                file_index = {}
-                for file_path, file_info in loaded_index.get_all_files():
-                    # Navigate to correct directory in index
-                    current_dir = file_index
-                    rel_path = os.path.dirname(file_path)
+                with file_index_lock:
+                    file_index = {}
+                    for file_path, file_info in loaded_index.get_all_files():
+                        # Navigate to correct directory in index
+                        current_dir = file_index
+                        rel_path = os.path.dirname(file_path)
 
-                    if rel_path and rel_path != ".":
-                        path_parts = rel_path.replace("\\", "/").split("/")
-                        for part in path_parts:
-                            if part not in current_dir:
-                                current_dir[part] = {}
-                            current_dir = current_dir[part]
+                        if rel_path and rel_path != ".":
+                            path_parts = rel_path.replace("\\", "/").split("/")
+                            for part in path_parts:
+                                if part not in current_dir:
+                                    current_dir[part] = {}
+                                current_dir = current_dir[part]
 
-                    # Add file to index
-                    filename = os.path.basename(file_path)
-                    current_dir[filename] = {
-                        "type": "file",
-                        "path": file_path,
-                        "ext": file_info.get("extension", ""),
-                    }
+                        # Add file to index
+                        filename = os.path.basename(file_path)
+                        current_dir[filename] = {
+                            "type": "file",
+                            "path": file_path,
+                            "ext": file_info.get("extension", ""),
+                        }
                 logger.info("Converted TrieFileIndex to dictionary format")
             else:
-                file_index = loaded_index
+                with file_index_lock:
+                    file_index = loaded_index
 
             file_count = _count_files(file_index)
             ctx.request_context.lifespan_context.file_count = file_count
@@ -5420,7 +5413,8 @@ def reset_server_state(ctx: Context) -> str:
 
     try:
         # Reset global file_index to empty dict
-        file_index = {}
+        with file_index_lock:
+            file_index = {}
 
         # Clear lazy content manager
         lazy_content_manager.unload_all()
@@ -6895,7 +6889,8 @@ def _safe_clear_file_index():
     global file_index
 
     # Always reset to empty dictionary to ensure compatibility
-    file_index = {}
+    with file_index_lock:
+        file_index = {}
 
 
 async def _index_project_with_progress(
