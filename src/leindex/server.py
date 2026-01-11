@@ -973,7 +973,6 @@ async def search_content(
     context_lines: int = 0,
     file_pattern: Optional[str] = None,
     fuzzy: bool = False,
-    fuzziness_level: Optional[str] = None,
     content_boost: float = 1.0,
     filepath_boost: float = 1.0,
     highlight_pre_tag: str = "<em>",
@@ -1013,7 +1012,6 @@ async def search_content(
                 context_lines=context_lines,
                 file_pattern=file_pattern,
                 fuzzy=fuzzy,
-                fuzziness_level=fuzziness_level,
                 content_boost=content_boost,
                 filepath_boost=filepath_boost,
                 highlight_pre_tag=highlight_pre_tag,
@@ -2383,8 +2381,7 @@ async def cross_project_search_tool(
     case_sensitive: bool = True,
     file_pattern: Optional[str] = None,
     context_lines: int = 0,
-    max_results_per_project: int = 100,
-    use_tier2_cache: bool = True,
+    limit: int = 100,
 ) -> Dict[str, Any]:
     """
     Search across multiple projects for a given pattern.
@@ -2400,8 +2397,7 @@ async def cross_project_search_tool(
         case_sensitive: Case-sensitive search
         file_pattern: Filter results by file pattern (glob)
         context_lines: Number of context lines to include around matches
-        max_results_per_project: Maximum results per project (default: 100)
-        use_tier2_cache: Use Tier 2 cache if available (default: True)
+        limit: Maximum results per project (default: 100)
 
     Returns:
         Aggregated search results across projects including:
@@ -2425,8 +2421,7 @@ async def cross_project_search_tool(
             case_sensitive=case_sensitive,
             file_pattern=file_pattern,
             context_lines=context_lines,
-            max_results_per_project=max_results_per_project,
-            use_tier2_cache=use_tier2_cache
+            limit=limit
         )
 
         # Convert results to dicts
