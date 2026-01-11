@@ -2247,8 +2247,8 @@ async def get_dashboard(
     """
     try:
         dashboard = get_dashboard_data(
-            status=status,
-            language=language,
+            status_filter=status,
+            language_filter=language,
             min_health_score=min_health_score,
             max_health_score=max_health_score,
             sort_by=sort_by,
@@ -2328,8 +2328,8 @@ async def list_projects(
     """
     try:
         dashboard = get_dashboard_data(
-            status=status,
-            language=language,
+            status_filter=status,
+            language_filter=language,
             min_health_score=min_health_score
         )
 
