@@ -1284,7 +1284,7 @@ async def search_content(
                     "success": False,
                     "error": "pattern parameter is required for find action",
                 }
-            return find_files(pattern, ctx)
+            return await find_files(pattern, ctx)
         case "rank":
             if results is None:
                 return {
@@ -1482,27 +1482,33 @@ async def get_diagnostics(
         await get_diagnostics(ctx, "backend")
         await get_diagnostics(ctx, "performance")
     """
-    match type:
-        case "memory":
-            return get_memory_profile()
-        case "index":
-            return await get_index_statistics(ctx, force_refresh)
-        case "backend":
-            return await get_backend_health(ctx)
-        case "performance":
-            return get_performance_metrics()
-        case "operations":
-            return get_active_operations()
-        case "settings":
-            return get_settings_info(ctx)
-        case "ignore":
-            return get_ignore_patterns(ctx)
-        case "filtering":
-            return get_filtering_config()
-        case "ranking":
-            return get_ranking_configuration(ctx)
-        case _:
-            return {"success": False, "error": f"Unknown type: {type}"}
+    logger.debug(f"get_diagnostics called with type='{type}', force_refresh={force_refresh}")
+    try:
+        match type:
+            case "memory":
+                return get_memory_profile()
+            case "index":
+                return await get_index_statistics(ctx, force_refresh)
+            case "backend":
+                return await get_backend_health(ctx)
+            case "performance":
+                return get_performance_metrics()
+            case "operations":
+                return get_active_operations()
+            case "settings":
+                return get_settings_info(ctx)
+            case "ignore":
+                return get_ignore_patterns(ctx)
+            case "filtering":
+                return get_filtering_config()
+            case "ranking":
+                return get_ranking_configuration(ctx)
+            case _:
+                logger.warning(f"get_diagnostics called with unknown type: {type}")
+                return {"success": False, "error": f"Unknown type: {type}"}
+    except Exception as e:
+        logger.error(f"Error in get_diagnostics for type='{type}': {e}", exc_info=True)
+        return {"success": False, "error": f"Error getting diagnostics for {type}: {e}"}
 
 
 # -----------------------------------------------------------------------------
@@ -1510,7 +1516,7 @@ async def get_diagnostics(
 # Consolidates: trigger_memory_cleanup, configure_memory_limits, export_memory_profile
 # -----------------------------------------------------------------------------
 @mcp.tool()
-def manage_memory(
+async def manage_memory(
     ctx: Context,
     action: Literal["cleanup", "configure", "export"],
     soft_limit_mb: Optional[float] = None,
@@ -1536,7 +1542,7 @@ def manage_memory(
     """
     match action:
         case "cleanup":
-            return trigger_memory_cleanup()
+            return await trigger_memory_cleanup_async()
         case "configure":
             return configure_memory_limits(
                 soft_limit_mb, hard_limit_mb, max_loaded_files, max_cached_queries
@@ -1661,7 +1667,7 @@ def read_file(
 # Consolidates: create_temp_directory, check_temp_directory
 # -----------------------------------------------------------------------------
 @mcp.tool()
-def manage_temp(
+async def manage_temp(
     ctx: Context,
     action: Literal["create", "check"],
 ) -> Dict[str, Any]:
@@ -1681,9 +1687,9 @@ def manage_temp(
     """
     match action:
         case "create":
-            return create_temp_directory()
+            return await create_temp_directory_async()
         case "check":
-            return check_temp_directory()
+            return await check_temp_directory_async()
         case _:
             return {"success": False, "error": f"Unknown action: {action}"}
 
@@ -2270,6 +2276,13 @@ async def detect_orphaned_indexes(
 
     Offers recovery options (register or cleanup) for each orphan.
 
+    CRITICAL: This operation has been fixed to prevent indefinite hangs:
+    - All filesystem operations are async-safe using asyncio.to_thread
+    - Symlink loop detection using device/inode tracking
+    - Periodic event loop yielding during deep recursion
+    - Comprehensive diagnostic logging with progress tracking
+    - Resilient to network-mounted drives and permission errors
+
     Args:
         max_depth: Maximum directory depth to search (default: 3)
 
@@ -2292,8 +2305,8 @@ async def detect_orphaned_indexes(
     try:
         detector = OrphanDetector()
 
-        # Scan for orphans
-        orphans = detector.scan_for_orphans(max_depth=max_depth)
+        # Scan for orphans using async-safe method
+        orphans = await detector.scan_for_orphans(max_depth=max_depth)
 
         if not orphans:
             return {
@@ -3787,8 +3800,22 @@ async def search_code_advanced(
     }
 
 
-def find_files(pattern: str, ctx: Context) -> List[str]:
-    """Find files in the project matching a specific glob pattern."""
+async def find_files(pattern: str, ctx: Context, max_results: int = 100000) -> List[str]:
+    """
+    Find files in the project matching a specific glob pattern.
+
+    This is an async function that properly awaits the indexing operation and
+    implements pagination/checkpointing to prevent indefinite hanging on large
+    file sets (100K+ files).
+
+    Args:
+        pattern: Glob pattern to match files against
+        ctx: MCP context
+        max_results: Maximum number of results to return (default 100K to prevent OOM)
+
+    Returns:
+        List of matching file paths
+    """
     base_path = ctx.request_context.lifespan_context.base_path
 
     # Check if base_path is set
@@ -3797,16 +3824,43 @@ def find_files(pattern: str, ctx: Context) -> List[str]:
             "Error: Project path not set. Please use set_project_path to set a project directory first."
         ]
 
-    # Check if we need to index the project
+    # Check if we need to index the project - CRITICAL FIX: await the async function
     if not file_index:
-        _index_project(base_path)
+        logger.info(f"No file index found, triggering indexing for {base_path}")
+        await _index_project(base_path)
         ctx.request_context.lifespan_context.file_count = _count_files(file_index)
         ctx.request_context.lifespan_context.settings.save_index(file_index)
+        logger.info(f"Indexing completed, {ctx.request_context.lifespan_context.file_count} files indexed")
 
+    # Get all files from index with diagnostic logging
+    start_time = time.time()
+    all_files = _get_all_files(file_index)
+    logger.info(f"Retrieved {len(all_files)} files from index in {time.time() - start_time:.2f}s")
+
+    # Pattern matching with early exit to prevent hanging on large result sets
     matching_files = []
-    for file_path, _info in _get_all_files(file_index):
+    checked = 0
+    for file_path, _info in all_files:
+        checked += 1
         if fnmatch.fnmatch(file_path, pattern):
             matching_files.append(file_path)
+            # Early exit if we've hit max_results to prevent memory issues
+            if len(matching_files) >= max_results:
+                logger.warning(
+                    f"find_files: Reached max_results limit ({max_results}) "
+                    f"after checking {checked} files. Results may be truncated."
+                )
+                break
+
+        # Yield control every 1000 files to allow other coroutines to run
+        if checked % 1000 == 0:
+            await asyncio.sleep(0)
+
+    elapsed = time.time() - start_time
+    logger.info(
+        f"find_files: Pattern '{pattern}' matched {len(matching_files)} files "
+        f"from {checked} files checked in {elapsed:.2f}s"
+    )
 
     return matching_files
 
@@ -5401,6 +5455,138 @@ def check_temp_directory() -> Dict[str, Any]:
     return result
 
 
+async def create_temp_directory_async() -> Dict[str, Any]:
+    """
+    Async version of create_temp_directory that offloads blocking I/O to a thread pool.
+
+    This prevents filesystem operations from blocking the event loop, which is
+    important for network-mounted filesystems or large directory operations.
+    """
+    # Offload the blocking filesystem operations to a thread pool
+    return await asyncio.to_thread(create_temp_directory)
+
+
+async def check_temp_directory_async() -> Dict[str, Any]:
+    """
+    Async version of check_temp_directory with non-blocking I/O and checkpointing.
+
+    This implementation:
+    - Uses asyncio.to_thread() for blocking filesystem operations
+    - Adds checkpointing to prevent excessive processing on large directories
+    - Includes diagnostic logging for monitoring
+
+    Root cause fix for: MEDIUM priority issue where check_temp_directory could hang
+    due to blocking os.listdir() calls, especially on network mounts or large directories.
+    """
+    temp_dir = os.path.join(tempfile.gettempdir(), SETTINGS_DIR)
+    start_time = time.time()
+
+    logger.debug(f"[check_temp_directory_async] Starting check for: {temp_dir}")
+
+    result = {
+        "temp_directory": temp_dir,
+        "exists": False,
+        "is_directory": False,
+        "temp_root": tempfile.gettempdir(),
+        "scan_timestamp": datetime.now().isoformat(),
+    }
+
+    # Offload initial existence checks to thread pool
+    try:
+        exists = await asyncio.to_thread(os.path.exists, temp_dir)
+        result["exists"] = exists
+
+        if exists:
+            is_dir = await asyncio.to_thread(os.path.isdir, temp_dir)
+            result["is_directory"] = is_dir
+    except Exception as e:
+        logger.error(f"[check_temp_directory_async] Error checking directory: {e}")
+        result["error"] = str(e)
+        return result
+
+    # If the directory exists, list its contents with checkpointing
+    if result["exists"] and result["is_directory"]:
+        try:
+            # Offload the main directory listing to thread pool
+            contents = await asyncio.to_thread(os.listdir, temp_dir)
+            result["contents"] = contents
+            result["item_count"] = len(contents)
+            result["subdirectories"] = []
+            result["subdirectory_scan_limit_reached"] = False
+
+            # Checkpointing: Limit subdirectory scanning to prevent excessive processing
+            # This is the key fix - don't recursively scan everything blindly
+            MAX_SUBDIRS_TO_SCAN = 50  # Configurable limit
+            MAX_ITEMS_PER_SUBDIR = 1000  # Limit items per subdirectory
+
+            # Filter to only subdirectories - use async to check each path
+            subdirs_to_scan = []
+            for item in contents:
+                item_path = os.path.join(temp_dir, item)
+                try:
+                    is_dir = await asyncio.to_thread(os.path.isdir, item_path)
+                    if is_dir:
+                        subdirs_to_scan.append(item)
+                except Exception:
+                    # Skip items that can't be checked
+                    pass
+
+            if len(subdirs_to_scan) > MAX_SUBDIRS_TO_SCAN:
+                logger.warning(
+                    f"[check_temp_directory_async] Too many subdirectories ({len(subdirs_to_scan)}), "
+                    f"limiting scan to {MAX_SUBDIRS_TO_SCAN}"
+                )
+                result["total_subdirectories"] = len(subdirs_to_scan)
+                result["subdirectory_scan_limit"] = MAX_SUBDIRS_TO_SCAN
+                subdirs_to_scan = subdirs_to_scan[:MAX_SUBDIRS_TO_SCAN]
+                result["subdirectory_scan_limit_reached"] = True
+
+            # Check each subdirectory with async I/O and yielding to event loop
+            for i, item in enumerate(subdirs_to_scan):
+                item_path = os.path.join(temp_dir, item)
+
+                # Yield control to event loop periodically to prevent blocking
+                if i % 5 == 0:
+                    await asyncio.sleep(0)
+
+                try:
+                    # Offload subdirectory listing to thread pool
+                    subdir_contents = await asyncio.to_thread(os.listdir, item_path)
+
+                    subdir_info = {
+                        "name": item,
+                        "path": item_path,
+                        "item_count": len(subdir_contents),
+                        "contents": subdir_contents if len(subdir_contents) <= MAX_ITEMS_PER_SUBDIR else subdir_contents[:MAX_ITEMS_PER_SUBDIR],
+                    }
+
+                    if len(subdir_contents) > MAX_ITEMS_PER_SUBDIR:
+                        subdir_info["item_limit_reached"] = True
+                        subdir_info["item_limit"] = MAX_ITEMS_PER_SUBDIR
+
+                    result["subdirectories"].append(subdir_info)
+                except Exception as e:
+                    logger.error(f"[check_temp_directory_async] Error scanning subdirectory {item}: {e}")
+                    result["subdirectories"].append({
+                        "name": item,
+                        "path": item_path,
+                        "error": str(e),
+                    })
+
+            elapsed = time.time() - start_time
+            result["scan_duration_seconds"] = round(elapsed, 3)
+            logger.debug(f"[check_temp_directory_async] Completed in {elapsed:.3f}s, "
+                        f"scanned {len(result['subdirectories'])} subdirectories")
+
+        except Exception as e:
+            logger.error(f"[check_temp_directory_async] Error listing directory: {e}")
+            result["error"] = str(e)
+            elapsed = time.time() - start_time
+            result["scan_duration_seconds"] = round(elapsed, 3)
+
+    return result
+
+
 def clear_settings(ctx: Context) -> str:
     """Clear all settings and cached data."""
     settings = ctx.request_context.lifespan_context.settings
@@ -6073,7 +6259,7 @@ def get_memory_profile() -> Dict[str, Any]:
 
 
 def trigger_memory_cleanup() -> Dict[str, Any]:
-    """Manually trigger memory cleanup and garbage collection."""
+    """Manually trigger memory cleanup and garbage collection (synchronous version for backward compatibility)."""
     global memory_profiler, memory_aware_manager, lazy_content_manager
 
     if memory_profiler is None:
@@ -6123,6 +6309,119 @@ def trigger_memory_cleanup() -> Dict[str, Any]:
             "peak_memory_mb": snapshot.peak_memory_mb,
         }
     except Exception as e:
+        return {"error": f"Error during memory cleanup: {e}", "success": False}
+
+
+async def trigger_memory_cleanup_async() -> Dict[str, Any]:
+    """
+    Manually trigger memory cleanup and garbage collection (async version with checkpointing).
+
+    This async version prevents blocking by:
+    - Running blocking operations in thread pool executor
+    - Adding asyncio checkpoints between phases
+    - Providing detailed diagnostic logging
+
+    Root cause fix for: Memory operation blocking issues in manage_memory "cleanup" action.
+    """
+    global memory_profiler, memory_aware_manager, lazy_content_manager
+    import gc
+
+    if memory_profiler is None:
+        return {
+            "error": "Memory profiler not initialized. Please set a project path first.",
+            "success": False,
+        }
+
+    try:
+        logger.info("[ASYNC CLEANUP] Starting memory cleanup operation")
+        start_time = time.time()
+
+        # Phase 1: Get stats before cleanup (lightweight operation)
+        logger.info("[ASYNC CLEANUP] Phase 1: Collecting pre-cleanup stats")
+        stats_before = lazy_content_manager.get_memory_stats()
+        logger.debug(f"[ASYNC CLEANUP] Pre-cleanup stats: {stats_before}")
+
+        # Checkpoint: Yield to event loop
+        await asyncio.sleep(0)
+
+        # Phase 2: Run blocking cleanup operations in executor to prevent blocking
+        logger.info("[ASYNC CLEANUP] Phase 2: Executing cleanup operations")
+
+        def run_cleanup_operations():
+            """Run blocking cleanup operations in a separate thread."""
+            if memory_aware_manager:
+                logger.debug("[ASYNC CLEANUP] Using MemoryAwareManager cleanup")
+                memory_aware_manager.cleanup()
+            else:
+                logger.debug("[ASYNC CLEANUP] Using LazyContentManager unload_all")
+                lazy_content_manager.unload_all()
+            return "cleanup_complete"
+
+        # Run the blocking cleanup in a thread pool executor
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, run_cleanup_operations)
+        logger.info("[ASYNC CLEANUP] Cleanup operations completed")
+
+        # Checkpoint: Yield to event loop
+        await asyncio.sleep(0)
+
+        # Phase 3: Force garbage collection (may block, so run in executor)
+        logger.info("[ASYNC CLEANUP] Phase 3: Running garbage collection")
+
+        def run_gc():
+            """Run garbage collection in a separate thread."""
+            collected = gc.collect()
+            logger.debug(f"[ASYNC CLEANUP] GC collected {collected} objects")
+            return collected
+
+        collected = await loop.run_in_executor(None, run_gc)
+        logger.info(f"[ASYNC CLEANUP] Garbage collection completed: {collected} objects collected")
+
+        # Checkpoint: Yield to event loop
+        await asyncio.sleep(0)
+
+        # Phase 4: Get stats after cleanup (lightweight operation)
+        logger.info("[ASYNC CLEANUP] Phase 4: Collecting post-cleanup stats")
+        stats_after = lazy_content_manager.get_memory_stats()
+        logger.debug(f"[ASYNC CLEANUP] Post-cleanup stats: {stats_after}")
+
+        # Checkpoint: Yield to event loop
+        await asyncio.sleep(0)
+
+        # Phase 5: Take memory snapshot (may involve memory introspection)
+        logger.info("[ASYNC CLEANUP] Phase 5: Taking memory snapshot")
+
+        def take_snapshot():
+            """Take memory snapshot in a separate thread."""
+            return memory_profiler.take_snapshot(
+                loaded_files=stats_after["loaded_files"],
+                cached_queries=stats_after["query_cache_size"],
+            )
+
+        snapshot = await loop.run_in_executor(None, take_snapshot)
+        logger.info(f"[ASYNC CLEANUP] Memory snapshot: {snapshot.process_memory_mb:.2f}MB")
+
+        elapsed_time = time.time() - start_time
+        logger.info(f"[ASYNC CLEANUP] Completed in {elapsed_time:.3f} seconds")
+
+        return {
+            "success": True,
+            "cleanup_results": {
+                "gc_objects_collected": collected,
+                "before_cleanup": stats_before,
+                "after_cleanup": stats_after,
+                "memory_freed_mb": max(
+                    0,
+                    stats_before.get("total_managed_files", 0)
+                    - stats_after.get("total_managed_files", 0),
+                ),
+            },
+            "current_memory_mb": snapshot.process_memory_mb,
+            "peak_memory_mb": snapshot.peak_memory_mb,
+            "execution_time_seconds": elapsed_time,
+        }
+    except Exception as e:
+        logger.error(f"[ASYNC CLEANUP] Error during memory cleanup: {e}", exc_info=True)
         return {"error": f"Error during memory cleanup: {e}", "success": False}
 
 
@@ -6278,18 +6577,26 @@ def export_performance_metrics(file_path: Optional[str] = None) -> Dict[str, Any
 
 
 def get_active_operations() -> Dict[str, Any]:
-    """Get status of all active operations with progress tracking."""
+    """Get status of all active operations with progress tracking.
+
+    This function now includes proper error handling and logging to diagnose
+    any threading issues that may cause operations to hang.
+    """
     try:
+        logger.debug("Fetching active operations from progress manager")
         active_ops = progress_manager.get_active_operations()
         all_ops = progress_manager.get_all_operations_status()
 
-        return {
+        result = {
             "success": True,
             "active_operations": active_ops,
             "total_operations": len(all_ops),
             "active_count": len(active_ops),
         }
+        logger.debug(f"Retrieved {len(active_ops)} active operations out of {len(all_ops)} total")
+        return result
     except Exception as e:
+        logger.error(f"Error getting active operations: {e}", exc_info=True)
         return {"error": f"Error getting active operations: {e}", "success": False}
 
 
@@ -8784,9 +9091,9 @@ async def configure_memory(
         # Import GlobalConfigManager
         from .config.global_config import GlobalConfigManager
 
-        # Get current config
+        # Get current config using async-safe I/O
         config_manager = GlobalConfigManager()
-        current_config = config_manager.get_config()
+        current_config = await config_manager.load_config_async()
 
         # Store old values
         old_values = {
@@ -8869,8 +9176,8 @@ async def configure_memory(
                 "error_type": "ValueError",
             }
 
-        # Save updated configuration
-        config_manager.save_config(current_config)
+        # Save updated configuration using async-safe I/O
+        await config_manager.save_config_async(current_config)
 
         # Store new values
         new_values = {

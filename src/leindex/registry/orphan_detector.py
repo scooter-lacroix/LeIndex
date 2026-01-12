@@ -4,11 +4,16 @@ Orphan Detection and Recovery for the meta-registry system.
 This module provides functionality to detect orphaned indexes that exist
 on the filesystem but are not registered in the project registry, and
 offers recovery options to register or clean them up.
+
+CRITICAL: All filesystem operations are designed to be non-blocking
+and resilient to filesystem edge cases (symlink loops, network mounts,
+permission errors, etc.).
 """
 
+import asyncio
 import os
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Set
 import logging
 from datetime import datetime
 
@@ -96,15 +101,34 @@ class OrphanDetector:
     project registry.
 
     The detector performs:
-    1. Filesystem scan for .leindex directories
+    1. Async filesystem scan for .leindex directories
     2. Comparison against registry entries
     3. Classification of orphaned projects
     4. Recovery options (register or cleanup)
 
+    IMPORTANT: All scanning operations are async-safe with:
+    - Symlink loop detection using device/inode tracking
+    - Event loop yielding during traversal
+    - Progress tracking and diagnostics
+    - Bounded depth with checkpointing
+
     Attributes:
         registry: ProjectRegistry instance for checking registered projects
         search_paths: List of root paths to search for orphaned projects
+        visited_inodes: Set of (device, inode) tuples to detect loops
     """
+
+    # Directories to skip during traversal
+    SKIP_DIRECTORIES = {
+        "node_modules",
+        "venv", "virtualenv", "env", ".venv",
+        ".git", ".svn", ".hg",
+        "__pycache__",
+        "target", "build", "dist",
+        "site-packages",
+        ".idea", ".vscode",
+        "vendor", "bower_components",
+    }
 
     def __init__(
         self,
@@ -120,6 +144,7 @@ class OrphanDetector:
         """
         self.registry = registry if registry is not None else ProjectRegistry()
         self.search_paths = search_paths if search_paths is not None else self._default_search_paths()
+        self.visited_inodes: Set[Tuple[int, int]] = set()
         logger.info(
             f"OrphanDetector initialized with {len(self.search_paths)} search paths"
         )
@@ -153,11 +178,30 @@ class OrphanDetector:
         logger.debug(f"Default search paths: {paths}")
         return paths
 
+    async def _get_file_inode(self, path: Path) -> Optional[Tuple[int, int]]:
+        """
+        Get the device and inode of a file for loop detection.
+
+        Uses asyncio.to_thread to avoid blocking the event loop.
+
+        Args:
+            path: Path to get inode for
+
+        Returns:
+            Tuple of (device, inode) or None if not accessible
+        """
+        try:
+            stat_result = await asyncio.to_thread(path.stat)
+            return (stat_result.st_dev, stat_result.st_ino)
+        except (PermissionError, OSError) as e:
+            logger.debug(f"Cannot stat {path}: {e}")
+            return None
+
     # ------------------------------------------------------------------------
     # Detection Methods
     # ------------------------------------------------------------------------
 
-    def scan_for_orphans(
+    async def scan_for_orphans(
         self,
         max_depth: int = 3,
         follow_symlinks: bool = False,
@@ -165,9 +209,13 @@ class OrphanDetector:
         """
         Scan filesystem for orphaned projects.
 
-        This method performs a depth-first search of the configured search
-        paths, looking for .leindex directories that are not registered
+        This method performs an async-safe depth-first search of the configured
+        search paths, looking for .leindex directories that are not registered
         in the project registry.
+
+        CRITICAL: This method uses asyncio.to_thread for all filesystem
+        operations to prevent blocking the event loop. It also includes
+        symlink loop detection and periodic event loop yielding.
 
         Args:
             max_depth: Maximum directory depth to search (default: 3)
@@ -178,26 +226,40 @@ class OrphanDetector:
         """
         logger.info(f"Scanning for orphaned projects (max_depth={max_depth})...")
 
+        # Reset visited inodes for this scan
+        self.visited_inodes.clear()
+
         orphans = []
-        registered_paths = self._get_registered_paths()
+        registered_paths = await self._get_registered_paths()
+
+        # Track scan progress
+        paths_scanned = 0
+        total_search_paths = len(self.search_paths)
 
         for search_path in self.search_paths:
             try:
-                found_orphans = self._scan_directory(
+                logger.info(f"Scanning search path {paths_scanned + 1}/{total_search_paths}: {search_path}")
+                found_orphans = await self._scan_directory_async(
                     Path(search_path),
                     registered_paths,
                     max_depth=max_depth,
+                    current_depth=0,
                     follow_symlinks=follow_symlinks,
                 )
                 orphans.extend(found_orphans)
+                paths_scanned += 1
+
+                # Yield control to event loop between search paths
+                await asyncio.sleep(0)
+
             except (PermissionError, OSError) as e:
                 logger.warning(f"Cannot access search path {search_path}: {e}")
                 continue
 
-        logger.info(f"Found {len(orphans)} orphaned projects")
+        logger.info(f"Scan complete: found {len(orphans)} orphaned projects across {paths_scanned} paths")
         return orphans
 
-    def _get_registered_paths(self) -> set:
+    async def _get_registered_paths(self) -> set:
         """
         Get set of all registered project paths.
 
@@ -205,7 +267,8 @@ class OrphanDetector:
             Set of registered absolute paths
         """
         try:
-            registered = self.registry.list_all()
+            # Run registry.list_all in thread pool to avoid blocking
+            registered = await asyncio.to_thread(self.registry.list_all)
             paths = {project.path for project in registered}
             logger.debug(f"Found {len(paths)} registered projects")
             return paths
@@ -213,7 +276,7 @@ class OrphanDetector:
             logger.error(f"Error getting registered paths: {e}")
             return set()
 
-    def _scan_directory(
+    async def _scan_directory_async(
         self,
         root_path: Path,
         registered_paths: set,
@@ -222,7 +285,10 @@ class OrphanDetector:
         follow_symlinks: bool = False,
     ) -> List[OrphanedProject]:
         """
-        Recursively scan a directory for orphaned projects.
+        Recursively scan a directory for orphaned projects (async-safe).
+
+        This method uses asyncio.to_thread for all filesystem operations
+        and includes symlink loop detection using device/inode tracking.
 
         Args:
             root_path: Root directory to scan
@@ -240,43 +306,53 @@ class OrphanDetector:
         if current_depth > max_depth:
             return orphans
 
+        # Check for symlink loops using inode tracking
+        inode = await self._get_file_inode(root_path)
+        if inode:
+            if inode in self.visited_inodes:
+                logger.debug(f"Detected symlink loop at {root_path} (inode already visited)")
+                return orphans
+            self.visited_inodes.add(inode)
+
+        # Yield control periodically during deep recursion
+        if current_depth > 0 and current_depth % 3 == 0:
+            await asyncio.sleep(0)
+
         # Check if this is an orphaned project
-        orphan = self._check_orphaned_project(root_path, registered_paths)
+        orphan = await self._check_orphaned_project_async(root_path, registered_paths)
         if orphan:
+            logger.debug(f"Found orphan at depth {current_depth}: {root_path}")
             orphans.append(orphan)
             # Don't recurse into orphaned project directories
             return orphans
 
         # Recurse into subdirectories
         try:
-            for entry in root_path.iterdir():
-                if entry.is_dir():
-                    # Skip hidden directories and common non-project directories
+            # Use asyncio.to_thread for the blocking iterdir() call
+            entries = await asyncio.to_thread(list, root_path.iterdir())
+
+            for entry in entries:
+                try:
+                    # Check if entry is a directory (async-safe)
+                    is_dir = await asyncio.to_thread(entry.is_dir)
+                    if not is_dir:
+                        continue
+
+                    # Skip hidden directories
                     if entry.name.startswith("."):
                         continue
 
-                    skip_dirs = {
-                        "node_modules",
-                        "venv",
-                        "virtualenv",
-                        "env",
-                        ".git",
-                        ".svn",
-                        ".hg",
-                        "__pycache__",
-                        "target",
-                        "build",
-                        "dist",
-                    }
-                    if entry.name in skip_dirs:
+                    # Skip common non-project directories
+                    if entry.name in self.SKIP_DIRECTORIES:
                         continue
 
                     # Check symlinks
-                    if entry.is_symlink() and not follow_symlinks:
+                    is_symlink = await asyncio.to_thread(entry.is_symlink)
+                    if is_symlink and not follow_symlinks:
                         continue
 
                     # Recurse
-                    sub_orphans = self._scan_directory(
+                    sub_orphans = await self._scan_directory_async(
                         entry,
                         registered_paths,
                         max_depth=max_depth,
@@ -284,23 +360,31 @@ class OrphanDetector:
                         follow_symlinks=follow_symlinks,
                     )
                     orphans.extend(sub_orphans)
+
+                except (PermissionError, OSError) as e:
+                    logger.debug(f"Cannot access entry {entry}: {e}")
+                    continue
+
         except (PermissionError, OSError) as e:
             logger.debug(f"Cannot scan directory {root_path}: {e}")
 
         return orphans
 
-    def _check_orphaned_project(
+    async def _check_orphaned_project_async(
         self,
         project_path: Path,
         registered_paths: set,
     ) -> Optional[OrphanedProject]:
         """
-        Check if a directory is an orphaned project.
+        Check if a directory is an orphaned project (async-safe).
 
         An orphaned project has:
         1. A .leindex directory
         2. Index data present
         3. Not registered in the registry
+
+        CRITICAL: Uses asyncio.to_thread for all filesystem operations
+        including resolve(), exists(), rglob(), and stat() calls.
 
         Args:
             project_path: Path to the project directory
@@ -310,35 +394,48 @@ class OrphanDetector:
             OrphanedProject if orphaned, None otherwise
         """
         try:
-            # Normalize path for comparison
-            abs_path = str(project_path.resolve())
+            # Normalize path for comparison (async-safe)
+            abs_path = str(await asyncio.to_thread(project_path.resolve))
             if abs_path in registered_paths:
                 return None
 
-            # Check for .leindex directory
+            # Check for .leindex directory (async-safe)
             project_dir = get_project_registry_dir(project_path)
-            if not project_dir.exists():
+            dir_exists = await asyncio.to_thread(project_dir.exists)
+            if not dir_exists:
                 return None
 
-            # Check for index data
+            # Check for index data (async-safe)
             index_dir = get_project_index_dir(project_path)
-            index_exists = index_dir.exists()
+            index_exists = await asyncio.to_thread(index_dir.exists)
 
-            # Check for index files
+            # Check for index files (async-safe)
             index_size = 0
             if index_exists:
-                for index_file in index_dir.rglob("*"):
-                    if index_file.is_file():
-                        index_size += index_file.stat().st_size
+                # Use asyncio.to_thread for the potentially slow rglob operation
+                index_files = await asyncio.to_thread(list, index_dir.rglob("*"))
+
+                for index_file in index_files:
+                    try:
+                        is_file = await asyncio.to_thread(index_file.is_file)
+                        if is_file:
+                            stat_result = await asyncio.to_thread(index_file.stat)
+                            index_size += stat_result.st_size
+                    except (PermissionError, OSError):
+                        # Skip files we can't access
+                        continue
 
             # Only consider orphaned if there's actual index data
             if index_size == 0:
                 return None
 
-            # Get last modified time
+            # Get last modified time (async-safe)
             last_modified = None
-            if project_dir.exists():
-                last_modified = datetime.fromtimestamp(project_dir.stat().st_mtime)
+            try:
+                project_stat = await asyncio.to_thread(project_dir.stat)
+                last_modified = datetime.fromtimestamp(project_stat.st_mtime)
+            except (PermissionError, OSError):
+                pass
 
             # Determine reason
             if not index_exists:

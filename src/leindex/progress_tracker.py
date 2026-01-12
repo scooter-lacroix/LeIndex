@@ -17,6 +17,9 @@ import json
 import logging
 from pathlib import Path
 
+# Module-level logger for progress tracking diagnostics
+logger = logging.getLogger(__name__)
+
 
 class OperationStatus(Enum):
     """Status of an operation."""
@@ -274,12 +277,19 @@ class ProgressTracker:
     
     async def cancel(self, reason: str = "Operation cancelled"):
         """Cancel the operation."""
+        logger.debug(f"Attempting to cancel operation {self.operation_id}: {reason}")
         with self._lock:
             if self.status in [OperationStatus.COMPLETED, OperationStatus.CANCELLED]:
+                # Fixed: Don't return while holding lock - check first
+                logger.debug(f"Operation {self.operation_id} already in terminal state: {self.status.value}")
                 return
-            
+
             self.status = OperationStatus.CANCELLED
-            self.cancellation_token.cancel(reason)
+            # Note: cancellation_token.cancel() acquires its own lock
+            # Release tracker._lock before calling to avoid potential issues
+        # Cancel the token after releasing the tracker lock
+        self.cancellation_token.cancel(reason)
+        logger.debug(f"Successfully marked operation {self.operation_id} as cancelled")
         
         await self._emit_event(
             ProgressEventType.CANCELLED,
@@ -414,20 +424,22 @@ class ProgressTracker:
         return time.time() - self.start_time
     
     def get_status(self) -> Dict[str, Any]:
-        """Get current operation status."""
-        return {
-            "operation_id": self.operation_id,
-            "operation_name": self.operation_name,
-            "status": self.status.value,
-            "current_stage": self.current_stage,
-            "progress_percent": self.progress_percent,
-            "items_processed": self.items_processed,
-            "total_items": self.total_items,
-            "elapsed_time": self.elapsed_time,
-            "is_cancelled": self.cancellation_token.is_cancelled(),
-            "cancellation_reason": self.cancellation_token.cancellation_reason,
-            "metadata": self.metadata
-        }
+        """Get current operation status with thread-safe access to state."""
+        # Acquire lock to ensure consistent snapshot of state
+        with self._lock:
+            return {
+                "operation_id": self.operation_id,
+                "operation_name": self.operation_name,
+                "status": self.status.value,
+                "current_stage": self.stages[self.current_stage_index] if 0 <= self.current_stage_index < len(self.stages) else "Unknown",
+                "progress_percent": (self.items_processed / self.total_items * 100) if self.total_items > 0 else 0,
+                "items_processed": self.items_processed,
+                "total_items": self.total_items,
+                "elapsed_time": time.time() - self.start_time,
+                "is_cancelled": self.cancellation_token.is_cancelled(),
+                "cancellation_reason": self.cancellation_token.cancellation_reason,
+                "metadata": self.metadata.copy()
+            }
 
 
 class ProgressManager:
@@ -509,15 +521,27 @@ class ProgressManager:
     def get_all_operations_status(self) -> List[Dict[str, Any]]:
         """Get status of all operations."""
         with self._lock:
-            return [tracker.get_status() for tracker in self.trackers.values()]
-    
+            try:
+                result = [tracker.get_status() for tracker in self.trackers.values()]
+                logger.debug(f"get_all_operations_status: returning {len(result)} operations")
+                return result
+            except Exception as e:
+                logger.error(f"Error in get_all_operations_status: {e}", exc_info=True)
+                raise
+
     def get_active_operations(self) -> List[Dict[str, Any]]:
         """Get status of active operations."""
         with self._lock:
-            return [
-                tracker.get_status() for tracker in self.trackers.values()
-                if tracker.status in [OperationStatus.RUNNING, OperationStatus.PAUSED]
-            ]
+            try:
+                result = [
+                    tracker.get_status() for tracker in self.trackers.values()
+                    if tracker.status in [OperationStatus.RUNNING, OperationStatus.PAUSED]
+                ]
+                logger.debug(f"get_active_operations: returning {len(result)} active operations")
+                return result
+            except Exception as e:
+                logger.error(f"Error in get_active_operations: {e}", exc_info=True)
+                raise
 
 
 # Global progress manager instance

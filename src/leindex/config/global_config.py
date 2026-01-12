@@ -11,8 +11,10 @@ Key Features:
 - Secure file permissions (0o600)
 - Validation against min/max limits
 - Version tracking for migrations
+- Async-safe file I/O operations to prevent event loop blocking
 """
 
+import asyncio
 import os
 import copy
 from dataclasses import dataclass, field
@@ -237,6 +239,122 @@ class GlobalConfigManager:
 
         except IOError as e:
             raise ValidationError(f"Failed to write config file: {e}")
+
+    # ========================================================================
+    # Async-safe I/O methods for MCP tools
+    # These methods prevent event loop blocking on network filesystems
+    # ========================================================================
+
+    async def load_config_async(self) -> GlobalConfig:
+        """Async version of load_config that prevents event loop blocking.
+
+        This method offloads blocking file I/O operations to a thread pool
+        using asyncio.to_thread(), preventing the async event loop from
+        hanging on network filesystems or slow I/O.
+
+        Returns:
+            Validated configuration as GlobalConfig dataclass
+
+        Raises:
+            ValidationError: If configuration cannot be loaded or parsed
+        """
+        def _blocking_load() -> GlobalConfig:
+            """Blocking file I/O operation executed in thread pool."""
+            if not os.path.exists(self.config_path):
+                # First run - create default config
+                return self._create_default_config()
+
+            try:
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    config_dict = yaml.safe_load(f)
+
+                if config_dict is None:
+                    return self._create_default_config()
+
+                # Check version and migrate if needed
+                config_version = config_dict.get('version', '1.0')
+                if config_version != self.CURRENT_VERSION:
+                    config_dict = self.migrator.migrate_config(
+                        config_dict,
+                        config_version,
+                        self.CURRENT_VERSION
+                    )
+
+                # Validate configuration
+                self.validator.validate_config(config_dict)
+
+                # Deep merge with defaults and create dataclass
+                default_dict = self.get_default_config_dict()
+                merged_dict = self._deep_merge(default_dict, config_dict)
+
+                return self._dict_to_dataclass(merged_dict)
+
+            except yaml.YAMLError as e:
+                raise ValidationError(f"Failed to parse YAML config: {e}")
+            except Exception as e:
+                raise ValidationError(f"Failed to load config: {e}")
+
+        try:
+            return await asyncio.to_thread(_blocking_load)
+        except ValidationError:
+            # Re-raise validation errors directly
+            raise
+        except Exception as e:
+            raise ValidationError(f"Async load config failed: {e}")
+
+    async def save_config_async(self, config: GlobalConfig) -> None:
+        """Async version of save_config that prevents event loop blocking.
+
+        This method offloads blocking file I/O operations to a thread pool
+        using asyncio.to_thread(), preventing the async event loop from
+        hanging on network filesystems or slow I/O.
+
+        Args:
+            config: Configuration to save
+
+        Raises:
+            ValidationError: If configuration is invalid or cannot be written
+        """
+        def _blocking_save() -> None:
+            """Blocking file I/O operation executed in thread pool."""
+            # Validate before saving
+            config_dict = self._dataclass_to_dict(config)
+            self.validator.validate_config(config_dict)
+
+            # Ensure directory exists
+            self._ensure_config_directory()
+
+            # Save with comments
+            try:
+                with open(self.config_path, 'w', encoding='utf-8') as f:
+                    f.write("# LeIndex Global Configuration\n")
+                    f.write("# This file controls memory management, performance, and defaults\n")
+                    f.write("# See https://github.com/scooter-lacroix/leindex/docs/MEMORY_MANAGEMENT.md\n")
+                    f.write("\n")
+
+                    yaml.dump(
+                        config_dict,
+                        f,
+                        default_flow_style=False,
+                        sort_keys=False,
+                        allow_unicode=True
+                    )
+
+                # Set secure permissions (owner read/write only)
+                os.chmod(self.config_path, 0o600)
+
+            except IOError as e:
+                raise ValidationError(f"Failed to write config file: {e}")
+
+        try:
+            await asyncio.to_thread(_blocking_save)
+            # Update cache after successful save
+            self._config_cache = config
+        except ValidationError:
+            # Re-raise validation errors directly
+            raise
+        except Exception as e:
+            raise ValidationError(f"Async save config failed: {e}")
 
     def get_default_config_dict(self) -> Dict[str, Any]:
         """Get default configuration as a dictionary.
