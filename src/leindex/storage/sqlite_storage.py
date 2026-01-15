@@ -750,6 +750,17 @@ class SQLiteSearch(SearchInterface):
     def _init_db(self):
         """Initialize the database schema for search with critical PRAGMA settings."""
         with sqlite3.connect(self.db_path) as conn:
+            # Register REGEXP function for all connections
+            def regexp(expr, item):
+                import re
+                try:
+                    reg = re.compile(expr)
+                    return reg.search(item) is not None
+                except Exception:
+                    return False
+
+            conn.create_function("REGEXP", 2, regexp)
+
             # CRITICAL: Set PRAGMA settings for durability and consistency
             # PRAGMA synchronous = FULL: Ensure all writes are synced to disk
             conn.execute('PRAGMA synchronous = FULL')
@@ -990,6 +1001,16 @@ class SQLiteSearch(SearchInterface):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 if is_regex:
+                    # Register REGEXP function for this connection
+                    def regexp(expr, item):
+                        import re
+                        try:
+                            reg = re.compile(expr)
+                            return reg.search(item) is not None
+                        except Exception:
+                            return False
+                    conn.create_function("REGEXP", 2, regexp)
+
                     # CRITICAL FIX: For regex patterns, use REGEXP operator directly on kv_fts
                     # Since kv_fts is no longer external content, we query it directly
                     cursor = conn.execute('''

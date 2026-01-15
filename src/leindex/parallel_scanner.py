@@ -22,6 +22,7 @@ from pathlib import Path
 import time
 
 from .logger_config import logger
+from .ignore_patterns import IgnorePatternMatcher
 
 
 class SymlinkCycleDetector:
@@ -396,16 +397,17 @@ class ParallelScanner:
             errors: List to append any errors to (shared state).
             symlink_depth: Current symlink depth (for cycle detection).
         """
-        async with self._semaphore:
-            try:
+        try:
+            async with self._semaphore:
                 # Scan this directory with symlink depth tracking
                 dir_result = await self._scan_directory(dirpath, symlink_depth)
-                if dir_result:
-                    results.append(dir_result)
-                    _, dirs, _ = dir_result
 
-                    # Recursively scan subdirectories in parallel
-                    if dirs:
+            if dir_result:
+                results.append(dir_result)
+                _, dirs, _ = dir_result
+
+                # Recursively scan subdirectories in parallel
+                if dirs:
                         subtasks = []
                         for dirname in dirs:
                             subdirpath = os.path.join(dirpath, dirname)
@@ -440,17 +442,17 @@ class ParallelScanner:
                             if task in self._pending_tasks:
                                 self._pending_tasks.remove(task)
 
-            except (PermissionError, OSError) as e:
-                # Log error but continue scanning other directories
-                error_msg = f"Error scanning {dirpath}: {e}"
-                errors.append(error_msg)
-                logger.debug(error_msg)
+        except (PermissionError, OSError) as e:
+            # Log error but continue scanning other directories
+            error_msg = f"Error scanning {dirpath}: {e}"
+            errors.append(error_msg)
+            logger.debug(error_msg)
 
-            except Exception as e:
-                # Catch any unexpected errors
-                error_msg = f"Unexpected error scanning {dirpath}: {e}"
-                errors.append(error_msg)
-                logger.warning(error_msg)
+        except Exception as e:
+            # Catch any unexpected errors
+            error_msg = f"Unexpected error scanning {dirpath}: {e}"
+            errors.append(error_msg)
+            logger.warning(error_msg)
 
     async def _scan_directory(
         self,
@@ -703,7 +705,8 @@ async def scan_parallel(
     timeout: float = 300.0,
     max_symlink_depth: int = 8,
     enable_symlink_protection: bool = True,
-    debug_performance: bool = False
+    debug_performance: bool = False,
+    ignore_patterns: Optional[List[str]] = None
 ) -> List[Tuple[str, List[str], List[str]]]:
     """
     Convenience function for parallel directory scanning.
@@ -719,6 +722,7 @@ async def scan_parallel(
         max_symlink_depth: Maximum symlink depth to prevent cycles.
         enable_symlink_protection: Enable symlink cycle detection.
         debug_performance: Enable detailed performance debugging logs.
+        ignore_patterns: Optional list of glob patterns to ignore (e.g. ['*.pyc', '.git']).
 
     Returns:
         List of (root, dirs, files) tuples compatible with os.walk().
@@ -728,12 +732,17 @@ async def scan_parallel(
         for root, dirs, files in results:
             print(f"Found {len(files)} files in {root}")
     """
+    ignore_matcher = None
+    if ignore_patterns:
+        ignore_matcher = IgnorePatternMatcher(root_path, extra_patterns=ignore_patterns)
+
     scanner = ParallelScanner(
         max_workers=max_workers,
         progress_callback=progress_callback,
         timeout=timeout,
         max_symlink_depth=max_symlink_depth,
         enable_symlink_protection=enable_symlink_protection,
-        debug_performance=debug_performance
+        debug_performance=debug_performance,
+        ignore_matcher=ignore_matcher
     )
     return await scanner.scan(root_path)

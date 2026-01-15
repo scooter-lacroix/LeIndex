@@ -366,12 +366,13 @@ class IgnorePatternMatcher:
         '.yarn', '.pnp', '.pnpm',
     }
     
-    def __init__(self, base_path: str, use_pattern_trie: bool = True):
+    def __init__(self, base_path: str, use_pattern_trie: bool = True, extra_patterns: Optional[List[str]] = None):
         """Initialize the ignore pattern matcher.
 
         Args:
             base_path: The base path of the project
             use_pattern_trie: Whether to use PatternTrie for optimized matching (default: True)
+            extra_patterns: Additional ignore patterns to add (e.g. from command line)
         """
         self.base_path = Path(base_path).resolve()
         self.patterns: List[str] = []
@@ -383,6 +384,10 @@ class IgnorePatternMatcher:
         self._load_default_patterns()
         self._load_gitignore_patterns()
         self._load_ignore_patterns()
+
+        # Add extra patterns if provided
+        if extra_patterns:
+            self.patterns.extend(extra_patterns)
 
         # Compile patterns for better performance
         self._compile_patterns()

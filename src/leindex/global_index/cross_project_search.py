@@ -31,6 +31,7 @@ import hashlib
 import logging
 import re
 import time
+import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -573,6 +574,7 @@ async def cross_project_search(
                 fuzzy=fuzzy,
                 limit=limit,
                 circuit_breaker=circuit_breaker,
+                tier1=tier1,
             ),
             timeout=timeout
         )
@@ -982,6 +984,7 @@ async def _execute_federated_search(
     fuzzy: bool,
     limit: int,
     circuit_breaker: Optional[ProjectCircuitBreaker],
+    tier1: Optional[GlobalIndexTier1] = None,
 ) -> CrossProjectSearchResult:
     """
     Execute parallel federated search across projects with circuit breaker protection.
@@ -995,6 +998,7 @@ async def _execute_federated_search(
         fuzzy: Fuzzy matching
         limit: Max results per project
         circuit_breaker: Circuit breaker for failing project protection
+        tier1: Tier 1 metadata for resolving project paths
 
     Returns:
         CrossProjectSearchResult with per-project results
@@ -1033,6 +1037,7 @@ async def _execute_federated_search(
             fuzzy=fuzzy,
             limit=limit,
             circuit_breaker=circuit_breaker,
+            tier1=tier1,
         )
         for pid in active_project_ids
     ]
@@ -1100,6 +1105,7 @@ async def _search_single_project(
     fuzzy: bool,
     limit: int,
     circuit_breaker: Optional[ProjectCircuitBreaker],
+    tier1: Optional[GlobalIndexTier1] = None,
 ) -> ProjectSearchResult:
     """
     Search a single project using the actual search backend.
@@ -1117,6 +1123,7 @@ async def _search_single_project(
         fuzzy: Fuzzy matching
         limit: Max results
         circuit_breaker: Circuit breaker for failure tracking
+        tier1: Optional Tier 1 metadata to resolve project paths
 
     Returns:
         ProjectSearchResult from this project
@@ -1125,6 +1132,24 @@ async def _search_single_project(
 
     try:
         logger.debug(f"Searching project {project_id} for pattern '{pattern}'")
+
+        # Get project path from Tier 1 if available
+        project_path = None
+        if tier1:
+            meta = tier1.get_project_metadata(project_id)
+            if meta:
+                project_path = meta.path
+
+        # If not found in Tier 1, check if project_id looks like a path
+        if not project_path:
+            if os.path.isabs(project_id) and os.path.exists(project_id):
+                project_path = project_id
+
+        # If still no path, we can't search
+        if not project_path:
+             # Try to check if we can query by project_id directly in DAL
+             # Some DALs might support project IDs
+             pass
 
         # Get project index from DAL
         from ..storage.dal_factory import get_dal_instance
@@ -1135,38 +1160,43 @@ async def _search_single_project(
                 f"DAL not initialized. Cannot search project {project_id}"
             )
 
-        # Get project metadata from DAL
-        project_metadata = await dal.get_project_metadata(project_id)
-
-        if project_metadata is None:
-            raise ProjectNotFoundError([project_id])
-
-        project_path = project_metadata.get('path')
-        if not project_path:
-            raise RuntimeError(
-                f"Project {project_id} has no path in metadata"
-            )
-
         # Get search interface from DAL
-        search_interface = dal.search()
+        search_interface = dal.search
         if search_interface is None:
             raise RuntimeError(
                 f"Search interface not available for project {project_id}"
             )
 
         # Build search query
-        # Note: This is a simplified search implementation
-        # The full implementation would use more sophisticated query building
-        if fuzzy:
-            # For fuzzy/regex search, use content search
-            search_results_tuples = search_interface.search_content(pattern)
-        else:
-            # For literal search, also use content search
-            search_results_tuples = search_interface.search_content(pattern)
+        # We need to filter by project path if possible, or just search everything and filter
+        # SQLite FTS searches typically are global across the DB unless filtered
 
-        # Convert search results to expected format
+        # NOTE: The current SQLite DAL implementation of search_content searches the WHOLE database
+        # It does NOT support filtering by project path natively in the search method yet
+        # We will search and then filter results by path
+
+        # For fuzzy/regex search
+        is_regex = fuzzy
+        search_results_tuples = search_interface.search_content(pattern, is_regex=is_regex)
+
+        # Convert search results to expected format and filter by project path
         results = []
-        for file_path, content_match in search_results_tuples[:limit]:
+
+        # If we have a project path, filter results
+        # NOTE: This assumes file paths in DAL are absolute or relative to known root
+        # Ideally DAL search should support path filtering
+
+        for file_path, content_match in search_results_tuples:
+            # Filter by project path if known
+            if project_path and not file_path.startswith(project_path):
+                continue
+
+            # Filter by file pattern if provided
+            if file_pattern:
+                import fnmatch
+                if not fnmatch.fnmatch(os.path.basename(file_path), file_pattern):
+                    continue
+
             # Extract line number and content from the match
             # The structure depends on what the search interface returns
             if isinstance(content_match, dict):
@@ -1187,7 +1217,10 @@ async def _search_single_project(
                 'project_id': project_id,
             })
 
-        total_count = len(search_results_tuples)
+            if len(results) >= limit:
+                break
+
+        total_count = len(results)
 
         logger.debug(
             f"Found {total_count} results in project {project_id} "
