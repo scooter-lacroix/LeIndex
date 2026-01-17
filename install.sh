@@ -1923,9 +1923,96 @@ configure_amp_code() {
 }
 
 # OpenCode - Uses 'mcp' key (not 'mcpServers')
+# Requires 'type: local', command as array, and 'enabled' field
 # Source: https://opencode.ai/docs/config/
 configure_opencode() {
-    configure_cli_mcp "leindex" "$HOME/.config/opencode/opencode.json" "OpenCode" "mcp"
+    print_section "Configuring OpenCode"
+
+    local config_file="$HOME/.config/opencode/opencode.json"
+    local config_dir
+    config_dir=$(dirname "$config_file")
+
+    mkdir -p "$config_dir"
+    backup_file "$config_file" 2>/dev/null || true
+
+    # Get the correct server command (handles venv, PATH, or Python module)
+    local server_cmd
+    server_cmd=$(get_server_command)
+
+    # OpenCode requires 'type: local', command as array, and enabled field
+    $PYTHON_CMD << PYTHON_EOF
+import json
+import sys
+import shlex
+
+config_file = "$config_file"
+server_cmd = "$server_cmd"
+
+
+# Parse server command into array
+# If it's just "leindex", use that. Otherwise split by spaces.
+if server_cmd.strip() == "leindex":
+    command_array = ["leindex", "mcp"]
+else:
+    # Split the command properly (handles paths with spaces)
+    cmd_parts = shlex.split(server_cmd)
+    # Add 'mcp' as the last argument
+    command_array = cmd_parts + ["mcp"]
+
+
+try:
+    with open(config_file, 'r') as f:
+        existing_content = f.read()
+        if existing_content.strip():
+            try:
+                config = json.loads(existing_content)
+            except json.JSONDecodeError as e:
+                print(f"Warning: Existing config is invalid JSON: {e}", file=sys.stderr)
+                config = {}
+        else:
+            config = {}
+except (FileNotFoundError, json.JSONDecodeError):
+    config = {}
+
+# Ensure 'mcp' key exists
+if 'mcp' not in config:
+    config['mcp'] = {}
+
+# Check if server already exists and explicitly remove it for fresh config
+if 'leindex' in config.get('mcp', {}):
+    existing_config = config['mcp']['leindex']
+    print(f"Notice: Server 'leindex' already configured. Removing for refresh...", file=sys.stderr)
+    print(f"Debug: Old config: {existing_config}", file=sys.stderr)
+    del config['mcp']['leindex']
+
+# OpenCode requires: type='local', command as array (not string), enabled field
+# Args should be merged into command array, not separate field
+print(f"Notice: Writing fresh config for 'leindex' with OpenCode format...", file=sys.stderr)
+new_config = {
+    'type': 'local',
+    'command': command_array,
+    'enabled': True
+}
+config['mcp']['leindex'] = new_config
+
+
+# Validate config can be serialized
+try:
+    json.dumps(config)
+except (TypeError, ValueError) as e:
+    print(f"Error: Invalid configuration structure: {e}", file=sys.stderr)
+    sys.exit(1)
+
+with open(config_file, 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+
+
+print(f"Updated: {config_file}")
+PYTHON_EOF
+
+    print_success "OpenCode configured"
+    print_bullet "Config: $config_file"
 }
 
 # Qwen CLI - Standard JSON, corrected filename
