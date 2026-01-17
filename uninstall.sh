@@ -242,7 +242,8 @@ PYTHON_EOF
         fi
     done
 
-    # Handle TOML config (Codex CLI)
+    # Handle TOML config (Codex CLI) - uses mcp_servers with underscore format
+    # Source: https://github.com/openai/codex/issues/2760
     local toml_config="$HOME/.codex/config.toml"
     if [[ -f "$toml_config" ]]; then
         # Remove leindex section from TOML file
@@ -256,15 +257,16 @@ try:
     with open(config_file, 'r') as f:
         content = f.read()
 
-    # Remove [mcpServers.leindex] section and its content
+    # Remove [mcp_servers.leindex] section and its content
+    # Note: Codex uses underscore format [mcp_servers.servername] (not camelCase!)
     # Pattern matches from section header to next section or EOF
-    pattern = r'\n?\[mcpServers\.leindex\](?:\n(?:[^\[]))*'
+    pattern = r'\n?\[mcp_servers\.leindex\](?:\n(?:[^\[]))*'
     new_content = re.sub(pattern, '', content)
 
     if new_content != content:
         with open(config_file, 'w') as f:
             f.write(new_content)
-        print(f"Removed from TOML: {config_file}", file=sys.stderr)
+        print(f"Removed from TOML mcp_servers.leindex: {config_file}", file=sys.stderr)
 
 except (FileNotFoundError, OSError):
     pass

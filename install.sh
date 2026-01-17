@@ -1788,8 +1788,9 @@ PYTHON_EOF
     print_bullet "Config: $config_file"
 }
 
-# Configure tool with TOML format (for tools like Codex)
+# Configure tool with TOML format (for tools like Codex CLI)
 # Source: https://developers.openai.com/codex/mcp/
+# Note: Codex uses [mcp_servers.servername] format (underscore, not camelCase!)
 configure_toml_mcp() {
     local tool_name="$1"
     local config_file="$2"
@@ -1804,10 +1805,11 @@ configure_toml_mcp() {
     backup_file "$config_file" 2>/dev/null || true
 
     # Append TOML configuration
-    # TOML format: [mcpServers.leindex] section with command and args
+    # Codex uses [mcp_servers.servername] format (underscore in key, not camelCase!)
+    # Source: https://github.com/openai/codex/issues/2760
     cat >> "$config_file" << EOF
 
-[mcpServers.leindex]
+[mcp_servers.$tool_name]
 command = "leindex"
 args = ["mcp"]
 EOF

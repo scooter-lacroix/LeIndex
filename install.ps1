@@ -1339,8 +1339,9 @@ print(f"Updated: {config_file}")
     }
 }
 
-# Configure tool with TOML format (for tools like Codex)
-# Source: https://github.com/openai/codex/blob/main/docs/config.md
+# Configure tool with TOML format (for tools like Codex CLI)
+# Source: https://developers.openai.com/codex/mcp/
+# Note: Codex uses [mcp_servers.servername] format (underscore, not camelCase!)
 function Configure-TOMLMCP {
     param(
         [string]$ToolName,
@@ -1357,11 +1358,13 @@ function Configure-TOMLMCP {
         Backup-FileSafe $ConfigFile
 
         # Append TOML configuration
+        # Codex uses [mcp_servers.servername] format (underscore in key, not camelCase!)
+        # Source: https://github.com/openai/codex/issues/2760
         $tomlContent = @"
 
-[mcpServers.leindex]
-command = "leindex"
-args = ["mcp"]
+[mcp_servers.$ToolName]
+command = leindex
+args = @("mcp")
 "@
 
         Add-Content -Path $ConfigFile -Value $tomlContent -Encoding UTF8
