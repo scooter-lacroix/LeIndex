@@ -53,6 +53,10 @@ class SearchOptions:
     include_web: bool = False
     content: bool = False # Show content in result
     use_zoekt: bool = False # Use Zoekt strategy if available
+    content_boost: float = 1.0
+    filepath_boost: float = 1.0
+    highlight_pre_tag: str = "<em>"
+    highlight_post_tag: str = "</em>"
 
 @dataclass
 class Metrics:

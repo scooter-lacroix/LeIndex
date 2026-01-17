@@ -2534,7 +2534,7 @@ class LEANNVectorBackend:
         Args:
             store_ids: List of store identifiers (used as path prefixes)
             query: Search query
-            options: Search options
+            options: Search options (including content_boost, filepath_boost, highlight_pre_tag, highlight_post_tag)
 
         Returns:
             SearchResponse with results

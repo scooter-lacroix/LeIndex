@@ -471,6 +471,10 @@ async def search_content_router(
     context_lines: int = 0,
     file_pattern: Optional[str] = None,
     fuzzy: bool = False,
+    content_boost: float = 1.0,
+    filepath_boost: float = 1.0,
+    highlight_pre_tag: str = "<em>",
+    highlight_post_tag: str = "</em>",
     page: int = 1,
     page_size: int = 20,
     # Parameters for "rank" action (rank_search_results)
@@ -519,41 +523,24 @@ async def search_content_router(
     match action:
         case "search":
             if pattern is None:
-                return _create_error_response(
-                    "The pattern parameter is required for this operation",
-                    "MISSING_PARAMETER",
-                    {"parameter": "pattern"}
-                )
-
-            try:
-                # Validate numeric parameters
-                validated_context_lines = validate_int(
-                    context_lines, "context_lines",
-                    min_val=0, max_val=_MAX_CONTEXT_LINES,
-                    default=0
-                )
-                validated_page = validate_int(
-                    page, "page",
-                    min_val=_MIN_PAGE, max_val=_MAX_PAGE,
-                    default=1
-                )
-                validated_page_size = validate_int(
-                    page_size, "page_size",
-                    min_val=_MIN_PAGE_SIZE, max_val=_MAX_PAGE_SIZE,
-                    default=20
-                )
-                return await search_code_advanced(
-                    pattern=pattern,
-                    ctx=ctx,
-                    case_sensitive=case_sensitive,
-                    context_lines=validated_context_lines,
-                    file_pattern=file_pattern,
-                    fuzzy=fuzzy,
-                    page=validated_page,
-                    page_size=validated_page_size,
-                )
-            except ValidationError as e:
-                return _create_error_response(str(e), "INVALID_PARAMETER")
+                return {
+                    "success": False,
+                    "error": "pattern parameter is required for search action",
+                }
+            return await search_code_advanced(
+                pattern=pattern,
+                ctx=ctx,
+                case_sensitive=case_sensitive,
+                context_lines=context_lines,
+                file_pattern=file_pattern,
+                fuzzy=fuzzy,
+                content_boost=content_boost,
+                filepath_boost=filepath_boost,
+                highlight_pre_tag=highlight_pre_tag,
+                highlight_post_tag=highlight_post_tag,
+                page=page,
+                page_size=page_size,
+            )
 
         case "find":
             if pattern is None:

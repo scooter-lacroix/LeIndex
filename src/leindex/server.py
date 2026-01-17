@@ -2735,7 +2735,7 @@ async def cross_project_search_tool(
         logger.error(f"Invalid search pattern: {e}")
         return {
             "success": False,
-            "error": f"Invalid search pattern: {e.message}",
+            "error": f"Invalid search pattern: {str(e)}",
             "error_type": "InvalidPatternError"
         }
     except AllProjectsFailedError as e:
@@ -3137,6 +3137,10 @@ async def search_code_advanced(
     context_lines: int = 0,
     file_pattern: Optional[str] = None,
     fuzzy: bool = False,
+    content_boost: float = 1.0,
+    filepath_boost: float = 1.0,
+    highlight_pre_tag: str = "<em>",
+    highlight_post_tag: str = "</em>",
     page: int = 1,
     page_size: int = 5,  # CRITICAL FIX: Reduced from 20 to 5 to prevent token flooding
 ) -> Dict[str, Any]:
@@ -3153,6 +3157,10 @@ async def search_code_advanced(
         file_pattern: A glob pattern to filter files to search in (e.g., "*.py").
         fuzzy: If True, treats the pattern as a regular expression.
                 If False, performs a literal/fixed-string search.
+        content_boost: Weight multiplier for content matches.
+        filepath_boost: Weight multiplier for file path matches.
+        highlight_pre_tag: HTML tag to prepend to search highlights.
+        highlight_post_tag: HTML tag to append to search highlights.
         page: Page number for paginated results.
         page_size: Number of results per page.
 
@@ -3170,16 +3178,30 @@ async def search_code_advanced(
     # Ensure performance monitor is initialized
     ensure_performance_monitor()
 
+    # Validate parameters
+    content_boost = max(0.0, min(10.0, content_boost))
+    filepath_boost = max(0.0, min(10.0, filepath_boost))
+    
+    # Sanitize highlight tags (very basic check)
+    if not (highlight_pre_tag.startswith("<") and highlight_pre_tag.endswith(">")):
+        highlight_pre_tag = "<em>"
+    if not (highlight_post_tag.startswith("<") and highlight_post_tag.endswith(">")):
+        highlight_post_tag = "</em>"
+
     # Use global lazy_content_manager for now
     global lazy_content_manager
 
     # Create query key for caching
-    query_key = "{}:{}:{}:{}:{}:{}:{}".format(
+    query_key = "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}".format(
         pattern,
         case_sensitive,
         context_lines,
         file_pattern,
         fuzzy,
+        content_boost,
+        filepath_boost,
+        highlight_pre_tag,
+        highlight_post_tag,
         page,
         page_size,
     )
@@ -3226,6 +3248,10 @@ async def search_code_advanced(
                 rerank=True,  # Default to True as per mgrep default
                 top_k=fetch_k,  # Fetch extra for deduplication
                 use_zoekt=use_zoekt_for_search,  # Use Zoekt only for pattern/regex search
+                content_boost=content_boost,
+                filepath_boost=filepath_boost,
+                highlight_pre_tag=highlight_pre_tag,
+                highlight_post_tag=highlight_post_tag,
             )
             # Add file_pattern to query if needed, or handle in CoreEngine (TODO: Add filter support in CoreEngine)
             # For now, we rely on CoreEngine's internal handling or backend capabilities.
@@ -3274,13 +3300,30 @@ async def search_code_advanced(
                 if f_path not in results_dict:
                     results_dict[f_path] = []
 
+                # Basic highlighting (if requested and not already highlighted by backend)
+                text = chunk.text
+                if highlight_pre_tag != "<em>" or highlight_post_tag != "</em>":
+                    # Simple literal highlighting for now
+                    # (In a real scenario, this would use the same regex/pattern as the search)
+                    if pattern in text:
+                         text = text.replace(pattern, f"{highlight_pre_tag}{pattern}{highlight_post_tag}")
+
+                # Calculate boosted score
+                boosted_score = chunk.score
+                if content_boost != 1.0:
+                    boosted_score *= content_boost
+                
+                # Apply filepath boost if the pattern matches the file path
+                if filepath_boost != 1.0 and pattern.lower() in f_path.lower():
+                    boosted_score *= filepath_boost
+
                 results_dict[f_path].append(
                     {
                         "line": chunk.generated_metadata.get("line_number", 0)
                         if chunk.generated_metadata
                         else 0,
-                        "text": chunk.text,
-                        "score": chunk.score,
+                        "text": text,
+                        "score": boosted_score,
                     }
                 )
 
