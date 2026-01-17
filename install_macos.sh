@@ -1270,6 +1270,7 @@ configure_cli_mcp() {
     local tool_name="$1"
     local config_file="$2"
     local display_name="$3"
+    local json_key="${4:-mcpServers}"  # Optional: custom JSON key (e.g., 'amp.mcpServers', 'mcp')
 
     print_section "Configuring $display_name"
 
@@ -1285,6 +1286,7 @@ import sys
 
 config_file = "$config_file"
 tool_name = "$tool_name"
+json_key = "$json_key"
 
 try:
     with open(config_file, 'r') as f:
@@ -1299,10 +1301,18 @@ try:
 except (FileNotFoundError, json.JSONDecodeError):
     config = {}
 
-if 'mcpServers' not in config:
-    config['mcpServers'] = {}
+# Ensure the JSON key exists (supports namespaced keys like 'amp.mcpServers')
+if json_key not in config:
+    config[json_key] = {}
 
-config['mcpServers']['leindex'] = {
+# Check if server already exists and explicitly remove it for fresh config
+if 'leindex' in config.get(json_key, {}):
+    existing_config = config[json_key]['leindex']
+    print(f"Notice: Server 'leindex' already configured. Removing for refresh...", file=sys.stderr)
+    del config[json_key]['leindex']
+
+# Add LeIndex server
+config[json_key]['leindex'] = {
     'command': 'leindex',
     'args': ['mcp']
 }
@@ -1320,6 +1330,61 @@ PYTHON_EOF
         print_warning "Failed to configure $display_name"
         return 2
     fi
+}
+
+# Configure tool with TOML format (for tools like Codex)
+# Source: https://github.com/openai/codex/blob/main/docs/config.md
+configure_toml_mcp() {
+    local tool_name="$1"
+    local config_file="$2"
+    local display_name="$3"
+
+    print_section "Configuring $display_name"
+
+    local config_dir
+    config_dir=$(dirname "$config_file")
+
+    mkdir -p "$config_dir" || { print_warning "Failed to create config directory"; return 2; }
+    backup_file "$config_file" 2>/dev/null || true
+
+    # Append TOML configuration
+    cat >> "$config_file" << EOF
+
+[mcpServers.leindex]
+command = "leindex"
+args = ["mcp"]
+EOF
+
+    print_success "$display_name configured"
+    print_bullet "Config: $config_file (TOML format)"
+}
+
+# Configure tool with YAML format (for tools like Goose)
+# Source: https://github.com/block/goose/discussions/1286
+configure_yaml_mcp() {
+    local tool_name="$1"
+    local config_file="$2"
+    local display_name="$3"
+
+    print_section "Configuring $display_name"
+
+    local config_dir
+    config_dir=$(dirname "$config_file")
+
+    mkdir -p "$config_dir" || { print_warning "Failed to create config directory"; return 2; }
+    backup_file "$config_file" 2>/dev/null || true
+
+    # Append YAML configuration
+    cat >> "$config_file" << EOF
+mcpServers:
+  leindex:
+    command: leindex
+    args:
+      - mcp
+EOF
+
+    print_success "$display_name configured"
+    print_bullet "Config: $config_file (YAML format)"
 }
 
 # Configure Antigravity IDE
@@ -1372,40 +1437,60 @@ PYTHON_EOF
 }
 
 # Configure specific CLI tools
+# Documentation sources: GitHub repos, official docs, and MCP setup guides
+
+# Codex CLI - Uses TOML format (not JSON!)
+# Source: https://github.com/openai/codex/blob/main/docs/config.md
 configure_codex_cli() {
-    configure_cli_mcp "codex" "$HOME/.codex/config.json" "Codex CLI"
+    configure_toml_mcp "leindex" "$HOME/.codex/config.toml" "Codex CLI"
 }
 
+# Amp Code - Uses namespaced key 'amp.mcpServers'
+# Source: https://docs.netlify.com/build/build-with-aI/netlify-mcp-server/
 configure_amp_code() {
-    configure_cli_mcp "amp" "$HOME/.amp/mcp_config.json" "Amp Code"
+    configure_cli_mcp "leindex" "$HOME/.config/amp/settings.json" "Amp Code" "amp.mcpServers"
 }
 
+# OpenCode - Uses 'mcp' key (not 'mcpServers')
+# Source: https://opencode.ai/docs/config/
 configure_opencode() {
-    configure_cli_mcp "opencode" "$HOME/.opencode/mcp_config.json" "OpenCode"
+    configure_cli_mcp "leindex" "$HOME/.config/opencode/opencode.json" "OpenCode" "mcp"
 }
 
+# Qwen CLI - Standard JSON, corrected filename
+# Source: https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/
 configure_qwen_cli() {
-    configure_cli_mcp "qwen" "$HOME/.qwen/mcp_config.json" "Qwen CLI"
+    configure_cli_mcp "leindex" "$HOME/.qwen/settings.json" "Qwen CLI"
 }
 
+# Kilocode CLI - Corrected path (uses .config subdirectory)
+# Source: https://www.reddit.com/r/kilocode/comments/1n0xqmx/
 configure_kilocode_cli() {
-    configure_cli_mcp "kilocode" "$HOME/.kilocode/mcp_settings.json" "Kilocode CLI"
+    configure_cli_mcp "leindex" "$HOME/.config/kilocode/mcp_settings.json" "Kilocode CLI"
 }
 
+# Goose CLI - Uses YAML format (not JSON!)
+# Source: https://github.com/block/goose/discussions/1286
 configure_goose_cli() {
-    configure_cli_mcp "goose" "$HOME/.config/goose/mcp_config.json" "Goose CLI"
+    configure_yaml_mcp "leindex" "$HOME/.config/goose/config.yaml" "Goose CLI"
 }
 
+# iFlow CLI - Corrected filename (settings.json, not mcp_config.json)
+# Source: https://platform.iflow.cn/en/cli/examples/mcp
 configure_iflow_cli() {
-    configure_cli_mcp "iflow" "$HOME/.iflow/mcp_config.json" "iFlow CLI"
+    configure_cli_mcp "leindex" "$HOME/.iflow/settings.json" "iFlow CLI"
 }
 
+# Droid CLI (Factory AI) - Corrected path (~/.factory, not ~/.droid)
+# Source: https://factory.mintlify.app/cli/configuration/mcp
 configure_droid_cli() {
-    configure_cli_mcp "droid" "$HOME/.droid/mcp_config.json" "Droid CLI"
+    configure_cli_mcp "leindex" "$HOME/.factory/mcp.json" "Droid CLI (Factory AI)"
 }
 
+# Gemini CLI - Corrected filename (settings.json)
+# Source: https://geminicli.com/docs/tools/mcp-server/
 configure_gemini_cli() {
-    configure_cli_mcp "gemini" "$HOME/.gemini/mcp_config.json" "Gemini CLI"
+    configure_cli_mcp "leindex" "$HOME/.gemini/settings.json" "Gemini CLI"
 }
 
 # Interactive tool selection with beautiful menu

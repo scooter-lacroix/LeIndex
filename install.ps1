@@ -1274,7 +1274,8 @@ function Configure-CLIMCP {
     param(
         [string]$ToolName,
         [string]$ConfigFile,
-        [string]$DisplayName
+        [string]$DisplayName,
+        [string]$JsonKey = "mcpServers"  # Optional: custom JSON key (e.g., 'amp.mcpServers', 'mcp')
     )
 
     Print-Section "Configuring $DisplayName"
@@ -1290,6 +1291,7 @@ import json
 import sys
 
 config_file = r'$ConfigFile'
+json_key = '$JsonKey'
 
 try:
     with open(config_file, 'r') as f:
@@ -1301,10 +1303,18 @@ try:
 except (FileNotFoundError, json.JSONDecodeError):
     config = {}
 
-if 'mcpServers' not in config:
-    config['mcpServers'] = {}
+# Ensure the JSON key exists (supports namespaced keys like 'amp.mcpServers')
+if json_key not in config:
+    config[json_key] = {}
 
-config['mcpServers']['leindex'] = {
+# Check if server already exists and explicitly remove it for fresh config
+if 'leindex' in config.get(json_key, {}):
+    existing_config = config[json_key]['leindex']
+    print(f"Notice: Server 'leindex' already configured. Removing for refresh...", file=sys.stderr)
+    del config[json_key]['leindex']
+
+# Add LeIndex server
+config[json_key]['leindex'] = {
     'command': 'leindex',
     'args': ['mcp']
 }
@@ -1323,6 +1333,77 @@ print(f"Updated: {config_file}")
         } else {
             throw "Python script failed"
         }
+    } catch {
+        Print-Warning "Failed to configure $DisplayName`: $_"
+        return 2
+    }
+}
+
+# Configure tool with TOML format (for tools like Codex)
+# Source: https://github.com/openai/codex/blob/main/docs/config.md
+function Configure-TOMLMCP {
+    param(
+        [string]$ToolName,
+        [string]$ConfigFile,
+        [string]$DisplayName
+    )
+
+    Print-Section "Configuring $DisplayName"
+
+    $configDir = Split-Path $ConfigFile -Parent
+
+    try {
+        New-Item -ItemType Directory -Path $configDir -Force -ErrorAction Stop | Out-Null
+        Backup-FileSafe $ConfigFile
+
+        # Append TOML configuration
+        $tomlContent = @"
+
+[mcpServers.leindex]
+command = "leindex"
+args = ["mcp"]
+"@
+
+        Add-Content -Path $ConfigFile -Value $tomlContent -Encoding UTF8
+
+        Print-Success "$DisplayName configured"
+        Print-Bullet "Config: $ConfigFile (TOML format)"
+    } catch {
+        Print-Warning "Failed to configure $DisplayName`: $_"
+        return 2
+    }
+}
+
+# Configure tool with YAML format (for tools like Goose)
+# Source: https://github.com/block/goose/discussions/1286
+function Configure-YAMLMCP {
+    param(
+        [string]$ToolName,
+        [string]$ConfigFile,
+        [string]$DisplayName
+    )
+
+    Print-Section "Configuring $DisplayName"
+
+    $configDir = Split-Path $ConfigFile -Parent
+
+    try {
+        New-Item -ItemType Directory -Path $configDir -Force -ErrorAction Stop | Out-Null
+        Backup-FileSafe $ConfigFile
+
+        # Append YAML configuration
+        $yamlContent = @"
+mcpServers:
+  leindex:
+    command: leindex
+    args:
+      - mcp
+"@
+
+        Add-Content -Path $ConfigFile -Value $yamlContent -Encoding UTF8
+
+        Print-Success "$DisplayName configured"
+        Print-Bullet "Config: $ConfigFile (YAML format)"
     } catch {
         Print-Warning "Failed to configure $DisplayName`: $_"
         return 2
@@ -1385,40 +1466,60 @@ print(f"Updated: {config_file}")
 }
 
 # Configure specific CLI tools
+# Documentation sources: GitHub repos, official docs, and MCP setup guides
+
+# Codex CLI - Uses TOML format (not JSON!)
+# Source: https://github.com/openai/codex/blob/main/docs/config.md
 function Configure-CodexCLI {
-    Configure-CLIMCP "codex" "$env:USERPROFILE\.codex\config.json" "Codex CLI"
+    Configure-TOMLMCP "leindex" "$env:USERPROFILE\.codex\config.toml" "Codex CLI"
 }
 
+# Amp Code - Uses namespaced key 'amp.mcpServers'
+# Source: https://docs.netlify.com/build/build-with-aI/netlify-mcp-server/
 function Configure-AmpCode {
-    Configure-CLIMCP "amp" "$env:USERPROFILE\.amp\mcp_config.json" "Amp Code"
+    Configure-CLIMCP "leindex" "$env:USERPROFILE\.config\amp\settings.json" "Amp Code" "amp.mcpServers"
 }
 
+# OpenCode - Uses 'mcp' key (not 'mcpServers')
+# Source: https://opencode.ai/docs/config/
 function Configure-OpenCode {
-    Configure-CLIMCP "opencode" "$env:USERPROFILE\.opencode\mcp_config.json" "OpenCode"
+    Configure-CLIMCP "leindex" "$env:USERPROFILE\.config\opencode\opencode.json" "OpenCode" "mcp"
 }
 
+# Qwen CLI - Standard JSON, corrected filename
+# Source: https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/
 function Configure-QwenCLI {
-    Configure-CLIMCP "qwen" "$env:USERPROFILE\.qwen\mcp_config.json" "Qwen CLI"
+    Configure-CLIMCP "leindex" "$env:USERPROFILE\.qwen\settings.json" "Qwen CLI"
 }
 
+# Kilocode CLI - Corrected path (uses .config subdirectory)
+# Source: https://www.reddit.com/r/kilocode/comments/1n0xqmx/
 function Configure-KilocodeCLI {
-    Configure-CLIMCP "kilocode" "$env:USERPROFILE\.kilocode\mcp_settings.json" "Kilocode CLI"
+    Configure-CLIMCP "leindex" "$env:USERPROFILE\.config\kilocode\mcp_settings.json" "Kilocode CLI"
 }
 
+# Goose CLI - Uses YAML format (not JSON!)
+# Source: https://github.com/block/goose/discussions/1286
 function Configure-GooseCLI {
-    Configure-CLIMCP "goose" "$env:USERPROFILE\.config\goose\mcp_config.json" "Goose CLI"
+    Configure-YAMLMCP "leindex" "$env:USERPROFILE\.config\goose\config.yaml" "Goose CLI"
 }
 
+# iFlow CLI - Corrected filename (settings.json, not mcp_config.json)
+# Source: https://platform.iflow.cn/en/cli/examples/mcp
 function Configure-iFlowCLI {
-    Configure-CLIMCP "iflow" "$env:USERPROFILE\.iflow\mcp_config.json" "iFlow CLI"
+    Configure-CLIMCP "leindex" "$env:USERPROFILE\.iflow\settings.json" "iFlow CLI"
 }
 
+# Droid CLI (Factory AI) - Corrected path (~/.factory, not ~/.droid)
+# Source: https://factory.mintlify.app/cli/configuration/mcp
 function Configure-DroidCLI {
-    Configure-CLIMCP "droid" "$env:USERPROFILE\.droid\mcp_config.json" "Droid CLI"
+    Configure-CLIMCP "leindex" "$env:USERPROFILE\.factory\mcp.json" "Droid CLI (Factory AI)"
 }
 
+# Gemini CLI - Corrected filename (settings.json)
+# Source: https://geminicli.com/docs/tools/mcp-server/
 function Configure-GeminiCLI {
-    Configure-CLIMCP "gemini" "$env:USERPROFILE\.gemini\mcp_config.json" "Gemini CLI"
+    Configure-CLIMCP "leindex" "$env:USERPROFILE\.gemini\settings.json" "Gemini CLI"
 }
 
 # Configure CLI tools (PATH setup for leindex command)

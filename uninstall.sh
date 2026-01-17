@@ -119,6 +119,7 @@ remove_mcp_configs() {
     echo ""
 
     local configs=(
+        # Editor/IDE configs
         "$HOME/.config/claude/claude_desktop_config.json"
         "$HOME/.cursor/mcp.json"
         "$HOME/.config/Code/User/settings.json"
@@ -127,14 +128,23 @@ remove_mcp_configs() {
         "$HOME/.config/zed/settings.json"
         "$HOME/.var/app/dev.zed.Zed/config/zed/settings.json"
         "$HOME/.var/app/com.zed.Zed/config/zed/settings.json"
+        # CLI tool configs - with CORRECTED paths
+        "$HOME/.config/amp/settings.json"
+        "$HOME/.config/opencode/opencode.json"
+        "$HOME/.qwen/settings.json"
+        "$HOME/.config/kilocode/mcp_settings.json"
+        "$HOME/.iflow/settings.json"
+        "$HOME/.factory/mcp.json"
+        "$HOME/.gemini/settings.json"
     )
 
     for config_file in "${configs[@]}"; do
         if [[ -f "$config_file" ]]; then
-            # Remove leindex from config
+            # Remove leindex from JSON config
             if command -v python3 &> /dev/null; then
                 python3 << PYTHON_EOF
 import json
+import sys
 
 config_file = "$config_file"
 
@@ -142,47 +152,88 @@ try:
     with open(config_file, 'r') as f:
         config = json.load(f)
 
-	    # Remove leindex from mcpServers
-	    if 'mcpServers' in config and 'leindex' in config['mcpServers']:
-	        del config['mcpServers']['leindex']
-	        print(f"Removed from: {config_file}")
+    modified = False
 
-	        # Clean up empty mcpServers
-	        if not config['mcpServers']:
-	            del config['mcpServers']
+    # Remove leindex from mcpServers (standard key)
+    if 'mcpServers' in config and 'leindex' in config['mcpServers']:
+        del config['mcpServers']['leindex']
+        print(f"Removed from mcpServers: {config_file}", file=sys.stderr)
+        modified = True
 
-	    # Remove leindex from context_servers (Zed MCP)
-	    if 'context_servers' in config and isinstance(config['context_servers'], dict) and 'leindex' in config['context_servers']:
-	        del config['context_servers']['leindex']
-	        print(f"Removed from: {config_file}")
+        # Clean up empty mcpServers
+        if not config['mcpServers']:
+            del config['mcpServers']
 
-	        # Clean up empty context_servers
-	        if not config['context_servers']:
-	            del config['context_servers']
+    # Remove leindex from amp.mcpServers (Amp Code namespaced key)
+    if 'amp' in config and isinstance(config['amp'], dict) and 'mcpServers' in config['amp'] and 'leindex' in config['amp']['mcpServers']:
+        del config['amp']['mcpServers']['leindex']
+        print(f"Removed from amp.mcpServers: {config_file}", file=sys.stderr)
+        modified = True
 
-	    # Remove leindex from legacy language_models.mcp_servers (older installer versions)
-	    if 'language_models' in config and isinstance(config['language_models'], dict):
-	        mcp_servers = config['language_models'].get('mcp_servers')
-	        if isinstance(mcp_servers, dict) and 'leindex' in mcp_servers:
-	            del mcp_servers['leindex']
-	            print(f"Removed from: {config_file}")
-	            if not mcp_servers:
-	                config['language_models'].pop('mcp_servers', None)
-	        if not config['language_models']:
-	            del config['language_models']
+        # Clean up empty amp.mcpServers
+        if not config['amp']['mcpServers']:
+            del config['amp']['mcpServers']
+        if not config['amp']:
+            del config['amp']
 
-	    # Remove leindex from lsp (Zed)
-	    if 'lsp' in config and 'leindex' in config['lsp']:
-	        del config['lsp']['leindex']
-	        print(f"Removed from: {config_file}")
+    # Remove leindex from mcp (OpenCode key)
+    if 'mcp' in config and isinstance(config['mcp'], dict) and 'leindex' in config['mcp']:
+        del config['mcp']['leindex']
+        print(f"Removed from mcp: {config_file}", file=sys.stderr)
+        modified = True
+
+        # Clean up empty mcp
+        if not config['mcp']:
+            del config['mcp']
+
+    # Remove leindex from context_servers (Zed MCP)
+    if 'context_servers' in config and isinstance(config['context_servers'], dict) and 'leindex' in config['context_servers']:
+        del config['context_servers']['leindex']
+        print(f"Removed from context_servers: {config_file}", file=sys.stderr)
+        modified = True
+
+        # Clean up empty context_servers
+        if not config['context_servers']:
+            del config['context_servers']
+
+    # Remove leindex from legacy language_models.mcp_servers (older installer versions)
+    if 'language_models' in config and isinstance(config['language_models'], dict):
+        mcp_servers = config['language_models'].get('mcp_servers')
+        if isinstance(mcp_servers, dict) and 'leindex' in mcp_servers:
+            del mcp_servers['leindex']
+            print(f"Removed from language_models.mcp_servers: {config_file}", file=sys.stderr)
+            modified = True
+            if not mcp_servers:
+                config['language_models'].pop('mcp_servers', None)
+        if not config['language_models']:
+            del config['language_models']
+
+    # Remove leindex from lsp (Zed legacy)
+    if 'lsp' in config and 'leindex' in config['lsp']:
+        del config['lsp']['leindex']
+        print(f"Removed from lsp: {config_file}", file=sys.stderr)
+        modified = True
 
         # Clean up empty lsp
         if not config['lsp']:
             del config['lsp']
 
-    with open(config_file, 'w') as f:
-        json.dump(config, f, indent=2)
-        f.write('\n')
+    # Remove leindex from extension-specific keys (VS Code extensions)
+    for ext_key in ['cline.mcpServers', 'continue.mcpServers']:
+        if ext_key in config and isinstance(config[ext_key], dict) and 'leindex' in config[ext_key]:
+            del config[ext_key]['leindex']
+            print(f"Removed from {ext_key}: {config_file}", file=sys.stderr)
+            modified = True
+
+            # Clean up empty extension key
+            if not config[ext_key]:
+                del config[ext_key]
+
+    # Write back only if modified
+    if modified:
+        with open(config_file, 'w') as f:
+            json.dump(config, f, indent=2)
+            f.write('\n')
 
 except (FileNotFoundError, json.JSONDecodeError):
     pass
@@ -190,6 +241,66 @@ PYTHON_EOF
             fi
         fi
     done
+
+    # Handle TOML config (Codex CLI)
+    local toml_config="$HOME/.codex/config.toml"
+    if [[ -f "$toml_config" ]]; then
+        # Remove leindex section from TOML file
+        if command -v python3 &> /dev/null; then
+            python3 << PYTHON_EOF
+import re
+
+config_file = "$toml_config"
+
+try:
+    with open(config_file, 'r') as f:
+        content = f.read()
+
+    # Remove [mcpServers.leindex] section and its content
+    # Pattern matches from section header to next section or EOF
+    pattern = r'\n?\[mcpServers\.leindex\](?:\n(?:[^\[]))*'
+    new_content = re.sub(pattern, '', content)
+
+    if new_content != content:
+        with open(config_file, 'w') as f:
+            f.write(new_content)
+        print(f"Removed from TOML: {config_file}", file=sys.stderr)
+
+except (FileNotFoundError, OSError):
+    pass
+PYTHON_EOF
+        fi
+    fi
+
+    # Handle YAML config (Goose CLI)
+    local yaml_config="$HOME/.config/goose/config.yaml"
+    if [[ -f "$yaml_config" ]]; then
+        # Remove leindex section from YAML file
+        if command -v python3 &> /dev/null; then
+            python3 << PYTHON_EOF
+import re
+
+config_file = "$yaml_config"
+
+try:
+    with open(config_file, 'r') as f:
+        content = f.read()
+
+    # Remove leindex entry from mcpServers section
+    # Pattern matches "  leindex:" section to next top-level item or same-level item
+    pattern = r'  leindex:\n(?:    .*\n)*'
+    new_content = re.sub(pattern, '', content)
+
+    if new_content != content:
+        with open(config_file, 'w') as f:
+            f.write(new_content)
+        print(f"Removed from YAML: {config_file}", file=sys.stderr)
+
+except (FileNotFoundError, OSError):
+    pass
+PYTHON_EOF
+        fi
+    fi
 
     print_success "MCP configurations cleaned"
     echo ""
