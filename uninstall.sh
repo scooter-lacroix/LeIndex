@@ -272,10 +272,10 @@ PYTHON_EOF
         fi
     fi
 
-    # Handle YAML config (Goose CLI)
+    # Handle YAML config (Goose CLI) - uses extensions: key, not mcpServers
     local yaml_config="$HOME/.config/goose/config.yaml"
     if [[ -f "$yaml_config" ]]; then
-        # Remove leindex section from YAML file
+        # Remove leindex entry from extensions section
         if command -v python3 &> /dev/null; then
             python3 << PYTHON_EOF
 import re
@@ -286,15 +286,16 @@ try:
     with open(config_file, 'r') as f:
         content = f.read()
 
-    # Remove leindex entry from mcpServers section
+    # Remove leindex entry from extensions section
     # Pattern matches "  leindex:" section to next top-level item or same-level item
+    # Goose uses: extensions:\n  leindex:\n    type: stdio\n    cmd: ...
     pattern = r'  leindex:\n(?:    .*\n)*'
     new_content = re.sub(pattern, '', content)
 
     if new_content != content:
         with open(config_file, 'w') as f:
             f.write(new_content)
-        print(f"Removed from YAML: {config_file}", file=sys.stderr)
+        print(f"Removed from YAML extensions: {config_file}", file=sys.stderr)
 
 except (FileNotFoundError, OSError):
     pass

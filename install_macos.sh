@@ -1359,8 +1359,9 @@ EOF
     print_bullet "Config: $config_file (TOML format)"
 }
 
-# Configure tool with YAML format (for tools like Goose)
-# Source: https://github.com/block/goose/discussions/1286
+# Configure tool with YAML format for Goose extensions
+# Source: https://block.github.io/goose/docs/guides/config-files/
+# Goose uses 'extensions:' key with 'type: stdio' and 'cmd:' (not 'command:')
 configure_yaml_mcp() {
     local tool_name="$1"
     local config_file="$2"
@@ -1374,17 +1375,21 @@ configure_yaml_mcp() {
     mkdir -p "$config_dir" || { print_warning "Failed to create config directory"; return 2; }
     backup_file "$config_file" 2>/dev/null || true
 
-    # Append YAML configuration
+    # Append YAML configuration for Goose extensions
+    # Goose uses extensions: key (not mcpServers), with type: stdio and cmd:
     cat >> "$config_file" << EOF
-mcpServers:
-  leindex:
-    command: leindex
+
+extensions:
+  $tool_name:
+    type: stdio
+    cmd: "leindex"
     args:
-      - mcp
+      - "mcp"
+    description: "LeIndex code search MCP server"
 EOF
 
     print_success "$display_name configured"
-    print_bullet "Config: $config_file (YAML format)"
+    print_bullet "Config: $config_file (YAML extensions format)"
 }
 
 # Configure Antigravity IDE
@@ -1481,10 +1486,69 @@ configure_iflow_cli() {
     configure_cli_mcp "leindex" "$HOME/.iflow/settings.json" "iFlow CLI"
 }
 
-# Droid CLI (Factory AI) - Corrected path (~/.factory, not ~/.droid)
-# Source: https://factory.mintlify.app/cli/configuration/mcp
+# Droid CLI (Factory AI) - Requires 'type: stdio' field!
+# Source: https://docs.factory.ai/cli/configuration/mcp
 configure_droid_cli() {
-    configure_cli_mcp "leindex" "$HOME/.factory/mcp.json" "Droid CLI (Factory AI)"
+    print_section "Configuring Droid CLI (Factory AI)"
+
+    local config_file="$HOME/.factory/mcp.json"
+    local config_dir
+    config_dir=$(dirname "$config_file")
+
+    mkdir -p "$config_dir" || { print_warning "Failed to create config directory"; return 2; }
+    backup_file "$config_file" 2>/dev/null || true
+
+    # Droid requires 'type: stdio' field for stdio MCP servers
+    if $PYTHON_CMD << PYTHON_EOF
+import json
+import sys
+
+config_file = "$config_file"
+
+try:
+    with open(config_file, 'r') as f:
+        existing_content = f.read()
+        if existing_content.strip():
+            try:
+                config = json.loads(existing_content)
+            except json.JSONDecodeError as e:
+                print(f"Warning: Existing config is invalid JSON: {e}", file=sys.stderr)
+                config = {}
+        else:
+            config = {}
+except (FileNotFoundError, json.JSONDecodeError):
+    config = {}
+
+# Ensure mcpServers exists
+if 'mcpServers' not in config:
+    config['mcpServers'] = {}
+
+# Remove existing leindex entry for fresh config
+if 'leindex' in config.get('mcpServers', {}):
+    existing_config = config['mcpServers']['leindex']
+    print(f"Notice: Server 'leindex' already configured. Removing for refresh...", file=sys.stderr)
+    del config['mcpServers']['leindex']
+
+# Droid requires 'type: stdio' field for stdio servers
+config['mcpServers']['leindex'] = {
+    'type': 'stdio',
+    'command': 'leindex',
+    'args': ['mcp']
+}
+
+with open(config_file, 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+
+print(f"Updated: {config_file}")
+PYTHON_EOF
+    then
+        print_success "Droid CLI (Factory AI) configured"
+        print_bullet "Config: $config_file (with type: stdio field)"
+    else
+        print_warning "Failed to configure Droid CLI"
+        return 2
+    fi
 }
 
 # Gemini CLI - Corrected filename (settings.json)
