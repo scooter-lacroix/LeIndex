@@ -217,7 +217,7 @@ ask_yes_no() {
 
     while true; do
         printf "\n${YELLOW}?${NC} %s %s " "$prompt" "$prompt_suffix"
-        read -r answer
+        read -r answer < /dev/tty
         answer=${answer:-$default_value}
 
         case "$answer" in
@@ -258,7 +258,7 @@ ask_choice() {
 
     while true; do
         printf "${YELLOW}#${NC} Enter choice [1-%d]: " "${#options[@]}"
-        read -r choice
+        read -r choice < /dev/tty
         echo ""
 
         if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#options[@]}" ]; then
@@ -1661,7 +1661,7 @@ select_tools() {
         20)
             echo ""
             printf "${BOLD}Enter tools (space-separated, e.g., '1 3 4'):${NC}\n"
-            read -rp "> " custom
+            read -rp "> " custom < /dev/tty
             echo ""
 
             for tool in $custom; do
