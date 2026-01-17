@@ -79,3 +79,14 @@ This file tracks all major tracks for the project. Each track has its own detail
 - configure_memory ✅
 - manage_memory (cleanup action) ✅
 - manage_temp (check action) ✅
+
+---
+
+## [x] Track: Fix Critical Search Bugs - Parameter Mismatch and InvalidPatternError
+*Link: [./maestro/tracks/search_bug_fix_20260117/](./maestro/tracks/search_bug_fix_20260117/)*
+
+**Description:** Fix two critical bugs:
+1. Bug #1: `search_content` passes unsupported parameters (`content_boost`, `filepath_boost`, `highlight_pre_tag`, `highlight_post_tag`) to `search_code_advanced()` which doesn't accept them
+2. Bug #2: `cross_project_search_tool` accesses non-existent `.message` attribute on `InvalidPatternError`, causing `AttributeError`
+
+**Status:** New

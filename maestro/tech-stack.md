@@ -98,8 +98,9 @@ We NEVER install NVIDIA torch on AMD systems, or vice versa. Hardware detection 
 - **Features:**
   - Token-based search with regex support
   - Case-sensitive and insensitive search
-  - Context-aware result highlighting
+  - Context-aware result highlighting (with custom tag support)
   - Fielded search (file name, path, content)
+  - Relevance boosting (content and filepath multipliers)
 - **Performance:** Millisecond search times even for large codebases
 
 ---
