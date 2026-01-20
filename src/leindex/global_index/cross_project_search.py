@@ -123,26 +123,107 @@ class AllProjectsFailedError(CrossProjectSearchError):
 
 
 class InvalidPatternError(CrossProjectSearchError):
-    """Raised when search pattern is invalid."""
+    """Raised when search pattern is invalid.
+    
+    This exception provides detailed context about pattern validation failures,
+    including the original pattern, the specific reason for rejection, and
+    suggestions for fixing the pattern.
+    
+    Attributes:
+        pattern: The invalid search pattern
+        reason: Human-readable explanation of why the pattern is invalid
+        suggestions: List of suggestions for fixing the pattern
+    """
 
-    def __init__(self, pattern: str, reason: str):
+    def __init__(self, pattern: str, reason: str, suggestions: Optional[List[str]] = None):
         """Initialize the error.
 
         Args:
             pattern: The invalid pattern
             reason: Reason why the pattern is invalid
+            suggestions: Optional list of suggestions for fixing the pattern
         """
+        self.pattern = pattern
+        self.reason = reason
+        self.suggestions = suggestions or self._generate_suggestions(reason)
+        
         message = f"Invalid search pattern: {reason}"
         super().__init__(
             message,
-            details={'pattern': pattern, 'reason': reason}
+            details={
+                'pattern': pattern,
+                'reason': reason,
+                'pattern_length': len(pattern) if pattern else 0,
+                'pattern_preview': pattern[:50] + '...' if pattern and len(pattern) > 50 else pattern,
+                'suggestions': self.suggestions
+            }
         )
+    
+    def _generate_suggestions(self, reason: str) -> List[str]:
+        """Generate suggestions based on the error reason."""
+        suggestions = []
+        reason_lower = reason.lower()
+        
+        if 'empty' in reason_lower:
+            suggestions.append("Provide a non-empty search pattern")
+        elif 'null' in reason_lower:
+            suggestions.append("Remove null bytes from the pattern")
+        elif 'too long' in reason_lower:
+            suggestions.append("Reduce pattern length to under 10000 characters")
+            suggestions.append("Consider using more specific search terms")
+        elif 'nested quantifiers' in reason_lower or 'catastrophic' in reason_lower:
+            suggestions.append("Simplify the regex pattern to avoid nested quantifiers like (a+)+")
+            suggestions.append("Use atomic groups or possessive quantifiers if supported")
+            suggestions.append("Consider using a simpler pattern without complex nesting")
+        elif 'overlapping alternations' in reason_lower:
+            suggestions.append("Remove duplicate alternatives from the pattern")
+            suggestions.append("Simplify alternations to avoid overlapping matches")
+        elif 'nesting' in reason_lower and 'deep' in reason_lower:
+            suggestions.append("Reduce parentheses nesting to 10 levels or fewer")
+        elif 'invalid regex' in reason_lower:
+            suggestions.append("Check regex syntax for unbalanced parentheses or brackets")
+            suggestions.append("Escape special regex characters with backslash")
+        
+        if not suggestions:
+            suggestions.append("Review the pattern for syntax errors")
+            suggestions.append("Try a simpler search pattern")
+        
+        return suggestions
+    
+    def __str__(self) -> str:
+        """Return a detailed string representation."""
+        base = f"Invalid search pattern: {self.reason}"
+        if self.pattern:
+            preview = self.pattern[:50] + '...' if len(self.pattern) > 50 else self.pattern
+            base += f" (pattern: '{preview}')"
+        return base
+    
+    def __repr__(self) -> str:
+        """Return a repr string."""
+        return f"InvalidPatternError(pattern={self.pattern!r}, reason={self.reason!r})"
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert error to dictionary for logging."""
+        """Convert error to dictionary for logging and API responses."""
         base = super().to_dict()
         base['error_type'] = 'invalid_pattern'
+        base['pattern'] = self.pattern
+        base['reason'] = self.reason
+        base['suggestions'] = self.suggestions
         return base
+    
+    def to_response(self) -> Dict[str, Any]:
+        """Convert to a user-friendly API response format."""
+        return {
+            'success': False,
+            'error': str(self),
+            'error_type': 'InvalidPatternError',
+            'error_context': {
+                'pattern': self.pattern,
+                'reason': self.reason,
+                'pattern_length': len(self.pattern) if self.pattern else 0,
+            },
+            'suggestions': self.suggestions
+        }
 
 
 # =============================================================================

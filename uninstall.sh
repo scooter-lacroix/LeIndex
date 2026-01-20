@@ -56,6 +56,10 @@ print_bullet() {
     echo -e "  ${CYAN}•${NC} $1"
 }
 
+print_info() {
+    echo -e "${BLUE}ℹ${NC} $1"
+}
+
 ask_yes_no() {
     local prompt="$1"
     local default="${2:-n}"
@@ -250,6 +254,7 @@ PYTHON_EOF
         if command -v python3 &> /dev/null; then
             python3 << PYTHON_EOF
 import re
+import sys
 
 config_file = "$toml_config"
 
@@ -281,6 +286,7 @@ PYTHON_EOF
         if command -v python3 &> /dev/null; then
             python3 << PYTHON_EOF
 import re
+import sys
 
 config_file = "$yaml_config"
 

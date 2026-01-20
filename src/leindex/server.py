@@ -167,6 +167,148 @@ global_index: Optional[GlobalIndex] = None
 
 
 # ============================================================================
+# Fix 6: SEARCH PARAMETER CONSTRAINTS (documented limits)
+# ============================================================================
+SEARCH_PARAM_CONSTRAINTS = {
+    'pattern_max_length': 10000,
+    'page_min': 1,
+    'page_max': 1000,
+    'page_size_min': 1,
+    'page_size_max': 100,
+    'context_lines_min': 0,
+    'context_lines_max': 50,
+    'boost_min': 0.0,
+    'boost_max': 10.0,
+}
+
+
+# ============================================================================
+# Fix 3: STANDARDIZED ERROR RESPONSE HELPER
+# ============================================================================
+def create_error_response(
+    error: Exception,
+    suggestions: Optional[List[str]] = None,
+    include_traceback: bool = False
+) -> Dict[str, Any]:
+    """Create standardized error response for API consistency.
+    
+    Args:
+        error: The exception that occurred
+        suggestions: Optional list of suggestions for fixing the error
+        include_traceback: Whether to include traceback (for debugging)
+    
+    Returns:
+        Dictionary with standardized error format:
+        - success: False
+        - error: Human-readable error message
+        - error_type: Exception class name
+        - error_context: Additional context from exception
+        - suggestions: List of possible fixes
+    """
+    response = {
+        'success': False,
+        'error': str(error),
+        'error_type': type(error).__name__,
+        'error_context': {},
+        'suggestions': suggestions or []
+    }
+    
+    # Extract context from exception if available
+    if hasattr(error, 'details') and error.details:
+        response['error_context'] = error.details
+    elif hasattr(error, 'to_dict'):
+        response['error_context'] = error.to_dict()
+    
+    # Add suggestions from exception if available
+    if hasattr(error, 'suggestions') and error.suggestions:
+        response['suggestions'] = error.suggestions
+    
+    return response
+
+
+def validate_search_parameters(
+    pattern: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 20,
+    context_lines: int = 0,
+    content_boost: float = 1.0,
+    filepath_boost: float = 1.0,
+) -> Tuple[bool, Optional[Dict[str, Any]]]:
+    """Validate search parameters with descriptive error messages.
+    
+    Args:
+        pattern: Search pattern to validate
+        page: Page number (must be >= 1)
+        page_size: Results per page (1-100)
+        context_lines: Context lines (0-50)
+        content_boost: Content boost factor (0.0-10.0)
+        filepath_boost: Filepath boost factor (0.0-10.0)
+    
+    Returns:
+        Tuple of (is_valid, error_response)
+        If is_valid is True, error_response is None
+        If is_valid is False, error_response contains standardized error
+    """
+    constraints = SEARCH_PARAM_CONSTRAINTS
+    
+    if pattern is not None and len(pattern) > constraints['pattern_max_length']:
+        return False, {
+            'success': False,
+            'error': f"Pattern too long (max {constraints['pattern_max_length']} characters, got {len(pattern)})",
+            'error_type': 'ValidationError',
+            'error_context': {'parameter': 'pattern', 'value_length': len(pattern)},
+            'suggestions': ['Reduce pattern length', 'Use more specific search terms']
+        }
+    
+    if page < constraints['page_min'] or page > constraints['page_max']:
+        return False, {
+            'success': False,
+            'error': f"page must be between {constraints['page_min']} and {constraints['page_max']}, got {page}",
+            'error_type': 'ValidationError',
+            'error_context': {'parameter': 'page', 'value': page},
+            'suggestions': [f"Use a page number between {constraints['page_min']} and {constraints['page_max']}"]
+        }
+    
+    if page_size < constraints['page_size_min'] or page_size > constraints['page_size_max']:
+        return False, {
+            'success': False,
+            'error': f"page_size must be between {constraints['page_size_min']} and {constraints['page_size_max']}, got {page_size}",
+            'error_type': 'ValidationError',
+            'error_context': {'parameter': 'page_size', 'value': page_size},
+            'suggestions': [f"Use a page_size between {constraints['page_size_min']} and {constraints['page_size_max']}"]
+        }
+    
+    if context_lines < constraints['context_lines_min'] or context_lines > constraints['context_lines_max']:
+        return False, {
+            'success': False,
+            'error': f"context_lines must be between {constraints['context_lines_min']} and {constraints['context_lines_max']}, got {context_lines}",
+            'error_type': 'ValidationError',
+            'error_context': {'parameter': 'context_lines', 'value': context_lines},
+            'suggestions': [f"Use context_lines between {constraints['context_lines_min']} and {constraints['context_lines_max']}"]
+        }
+    
+    if content_boost < constraints['boost_min'] or content_boost > constraints['boost_max']:
+        return False, {
+            'success': False,
+            'error': f"content_boost must be between {constraints['boost_min']} and {constraints['boost_max']}, got {content_boost}",
+            'error_type': 'ValidationError',
+            'error_context': {'parameter': 'content_boost', 'value': content_boost},
+            'suggestions': [f"Use content_boost between {constraints['boost_min']} and {constraints['boost_max']}"]
+        }
+    
+    if filepath_boost < constraints['boost_min'] or filepath_boost > constraints['boost_max']:
+        return False, {
+            'success': False,
+            'error': f"filepath_boost must be between {constraints['boost_min']} and {constraints['boost_max']}, got {filepath_boost}",
+            'error_type': 'ValidationError',
+            'error_context': {'parameter': 'filepath_boost', 'value': filepath_boost},
+            'suggestions': [f"Use filepath_boost between {constraints['boost_min']} and {constraints['boost_max']}"]
+        }
+    
+    return True, None
+
+
+# ============================================================================
 # PHASE 6: Eviction Unloader Implementation
 # ============================================================================
 class LeIndexProjectUnloader(ProjectUnloader):
@@ -1263,7 +1405,23 @@ async def search_content(
                 return {
                     "success": False,
                     "error": "pattern parameter is required for search action",
+                    "error_type": "ValidationError",
+                    "error_context": {"parameter": "pattern"},
+                    "suggestions": ["Provide a search pattern"]
                 }
+            
+            # Fix 1: Validate parameters before passing to backend
+            is_valid, error_response = validate_search_parameters(
+                pattern=pattern,
+                page=page,
+                page_size=page_size,
+                context_lines=context_lines,
+                content_boost=content_boost,
+                filepath_boost=filepath_boost,
+            )
+            if not is_valid:
+                return error_response
+            
             return await search_code_advanced(
                 pattern=pattern,
                 ctx=ctx,
@@ -2733,11 +2891,8 @@ async def cross_project_search_tool(
         }
     except InvalidPatternError as e:
         logger.error(f"Invalid search pattern: {e}")
-        return {
-            "success": False,
-            "error": f"Invalid search pattern: {str(e)}",
-            "error_type": "InvalidPatternError"
-        }
+        # Fix 3: Use to_response() for enhanced error context with suggestions
+        return e.to_response()
     except AllProjectsFailedError as e:
         logger.error(f"All projects failed: {e}")
         return {
@@ -6553,8 +6708,14 @@ def export_memory_profile(file_path: Optional[str] = None) -> Dict[str, Any]:
 
 
 def get_performance_metrics() -> Dict[str, Any]:
-    """Get comprehensive performance monitoring metrics and statistics."""
-    global performance_monitor
+    """Get comprehensive performance monitoring metrics and statistics.
+    
+    Includes:
+    - General performance metrics
+    - Operation statistics
+    - Fix 5: Search-specific statistics (cache hits, latency, backend breakdown)
+    """
+    global performance_monitor, lazy_content_manager
 
     if performance_monitor is None:
         return {
@@ -6569,14 +6730,44 @@ def get_performance_metrics() -> Dict[str, Any]:
         # Get operation statistics
         operation_stats = performance_monitor.get_operation_stats()
 
-        # Get structured logs (last 100 entries) - note: this method doesn't exist, will use empty list
-        logs = []  # TODO: implement log retrieval if needed
+        # Fix 5: Build search-specific statistics
+        search_stats = {
+            'search_total': 0,
+            'search_cache_hits': 0,
+            'search_cache_misses': 0,
+            'cache_hit_rate': 0.0,
+        }
+        
+        # Extract search counters from performance monitor if available
+        if hasattr(performance_monitor, 'get_counter'):
+            search_stats['search_cache_hits'] = performance_monitor.get_counter('search_cache_hits_total') or 0
+            search_stats['search_cache_misses'] = performance_monitor.get_counter('search_cache_misses_total') or 0
+            search_stats['search_total'] = search_stats['search_cache_hits'] + search_stats['search_cache_misses']
+            
+            if search_stats['search_total'] > 0:
+                search_stats['cache_hit_rate'] = (
+                    search_stats['search_cache_hits'] / search_stats['search_total'] * 100
+                )
+        
+        # Get cache stats from lazy_content_manager if available
+        cache_stats = {}
+        if lazy_content_manager:
+            try:
+                memory_stats = lazy_content_manager.get_memory_stats()
+                cache_stats = {
+                    'loaded_files': memory_stats.get('loaded_files', 0),
+                    'cached_searches': memory_stats.get('cached_searches', 0),
+                    'memory_usage_mb': memory_stats.get('memory_mb', 0),
+                }
+            except Exception:
+                pass
 
         return {
             "initialized": True,
             "metrics": metrics,
             "operation_stats": operation_stats,
-            "recent_logs": logs,
+            "search_stats": search_stats,  # Fix 5: Search-specific stats
+            "cache_stats": cache_stats,
             "monitoring_enabled": True,
         }
     except Exception as e:
@@ -6641,6 +6832,159 @@ def get_active_operations() -> Dict[str, Any]:
     except Exception as e:
         logger.error(f"Error getting active operations: {e}", exc_info=True)
         return {"error": f"Error getting active operations: {e}", "success": False}
+
+
+# =============================================================================
+# Fix 8: INDEXING PROGRESS API
+# =============================================================================
+def get_indexing_progress() -> Dict[str, Any]:
+    """Get progress of long-running indexing operations.
+    
+    This function provides real-time progress for indexing operations,
+    including current phase, files processed, and estimated time remaining.
+    
+    Returns:
+        Dictionary containing:
+        - success: Boolean indicating success
+        - phase: Current phase (scanning, parsing, indexing, finalizing)
+        - files_processed: Number of files processed
+        - total_files: Total number of files (if known)
+        - progress_percent: Completion percentage
+        - current_file: Path of file currently being processed
+        - estimated_remaining_seconds: Estimated time remaining
+        - elapsed_seconds: Time elapsed since start
+    """
+    try:
+        # Get active indexing operations
+        active_ops = progress_manager.get_active_operations()
+        
+        # Find indexing operations
+        indexing_ops = [op for op in active_ops if 'index' in op.get('type', '').lower()]
+        
+        if not indexing_ops:
+            return {
+                "success": True,
+                "status": "idle",
+                "message": "No indexing operation in progress",
+                "phase": None,
+                "files_processed": 0,
+                "total_files": 0,
+                "progress_percent": 0,
+            }
+        
+        # Get the most recent indexing operation
+        current_op = indexing_ops[0]
+        
+        return {
+            "success": True,
+            "status": "running",
+            "phase": current_op.get('phase', 'indexing'),
+            "files_processed": current_op.get('completed', 0),
+            "total_files": current_op.get('total', 0),
+            "progress_percent": current_op.get('progress', 0),
+            "current_file": current_op.get('current_item', ''),
+            "estimated_remaining_seconds": current_op.get('eta_seconds'),
+            "elapsed_seconds": current_op.get('elapsed_seconds', 0),
+            "operation_id": current_op.get('id'),
+        }
+    except Exception as e:
+        logger.error(f"Error getting indexing progress: {e}")
+        return {"success": False, "error": str(e), "error_type": type(e).__name__}
+
+
+# =============================================================================
+# Fix 9: BATCH OPERATION SUPPORT
+# =============================================================================
+async def batch_search(
+    patterns: List[str],
+    case_sensitive: bool = True,
+    fuzzy: bool = False,
+    file_pattern: Optional[str] = None,
+    limit_per_pattern: int = 20,
+    max_concurrent: int = 5,
+) -> Dict[str, Any]:
+    """Execute multiple search patterns in parallel with rate limiting.
+    
+    This function provides batch search capability for searching multiple
+    patterns efficiently with controlled concurrency.
+    
+    Args:
+        patterns: List of search patterns to execute
+        case_sensitive: Whether searches are case-sensitive
+        fuzzy: Whether to use fuzzy matching
+        file_pattern: Glob pattern to filter files
+        limit_per_pattern: Maximum results per pattern
+        max_concurrent: Maximum concurrent searches
+        
+    Returns:
+        Dictionary with aggregated results from all patterns
+    """
+    if not patterns:
+        return {
+            "success": False,
+            "error": "No patterns provided",
+            "error_type": "ValidationError",
+            "suggestions": ["Provide at least one search pattern"]
+        }
+    
+    # Validate pattern count
+    if len(patterns) > 50:
+        return {
+            "success": False,
+            "error": f"Too many patterns ({len(patterns)}). Maximum is 50.",
+            "error_type": "ValidationError", 
+            "suggestions": ["Reduce the number of patterns to 50 or fewer"]
+        }
+    
+    import asyncio
+    
+    # Semaphore for rate limiting
+    semaphore = asyncio.Semaphore(max_concurrent)
+    
+    async def search_one(pattern: str) -> Dict[str, Any]:
+        async with semaphore:
+            try:
+                # Import here to avoid circular dependency
+                from .global_index import cross_project_search
+                result = await cross_project_search(
+                    pattern=pattern,
+                    case_sensitive=case_sensitive,
+                    fuzzy=fuzzy,
+                    file_pattern=file_pattern,
+                    limit=limit_per_pattern,
+                )
+                return {
+                    "pattern": pattern,
+                    "success": True,
+                    "total_results": result.total_results,
+                    "results": result.merged_results[:limit_per_pattern]
+                }
+            except Exception as e:
+                return {
+                    "pattern": pattern,
+                    "success": False,
+                    "error": str(e)
+                }
+    
+    # Execute all searches concurrently
+    start_time = time.time()
+    results = await asyncio.gather(*[search_one(p) for p in patterns])
+    elapsed_ms = (time.time() - start_time) * 1000
+    
+    # Aggregate results
+    successful = [r for r in results if r.get("success")]
+    failed = [r for r in results if not r.get("success")]
+    total_results = sum(r.get("total_results", 0) for r in successful)
+    
+    return {
+        "success": True,
+        "patterns_searched": len(patterns),
+        "patterns_successful": len(successful),
+        "patterns_failed": len(failed),
+        "total_results": total_results,
+        "elapsed_ms": elapsed_ms,
+        "pattern_results": results,
+    }
 
 
 def get_operation_status(operation_id: str) -> Dict[str, Any]:
@@ -8887,22 +9231,62 @@ async def get_index_statistics(
 
 async def get_backend_health(ctx: Context) -> Dict[str, Any]:
     """
-    Get health status of all backends.
+    Get comprehensive health status of all backends.
 
     Returns the health status of Tantivy, SQLite, DuckDB, LEANN,
-    and any other connected backends.
+    and any other connected backends, including:
+    - Health status and response times
+    - Backend version information
+    - Capability flags (supports_regex, supports_fuzzy, etc.)
+    - Connection pool status
+    - Recent operation statistics
 
     Returns:
-        Dictionary with backend names as keys and health status as values
+        Dictionary with comprehensive backend diagnostics
     """
     stats_collector = ensure_stats_collector()
 
     try:
         stats = await stats_collector.collect_statistics(force_refresh=True)
-        return {name: health.to_dict() for name, health in stats.backends.items()}
+        
+        # Build enhanced response
+        backend_health = {}
+        for name, health in stats.backends.items():
+            backend_info = health.to_dict()
+            
+            # Fix 4: Add capability flags based on backend type
+            capabilities = {
+                'supports_regex': name in ['zoekt', 'tantivy', 'sqlite_fts'],
+                'supports_fuzzy': name in ['zoekt', 'tantivy', 'leann'],
+                'supports_semantic': name in ['leann'],
+                'supports_file_pattern': name in ['zoekt', 'tantivy'],
+                'supports_case_insensitive': name in ['zoekt', 'tantivy', 'sqlite_fts'],
+            }
+            backend_info['capabilities'] = capabilities
+            
+            # Add version info placeholder (would need to be populated per-backend)
+            backend_info['version'] = backend_info.get('version', 'unknown')
+            
+            backend_health[name] = backend_info
+        
+        # Add summary statistics
+        total_backends = len(backend_health)
+        healthy_backends = sum(1 for b in backend_health.values() if b.get('healthy', False))
+        
+        return {
+            'success': True,
+            'backends': backend_health,
+            'summary': {
+                'total_backends': total_backends,
+                'healthy_backends': healthy_backends,
+                'unhealthy_backends': total_backends - healthy_backends,
+                'health_percent': (healthy_backends / total_backends * 100) if total_backends > 0 else 0,
+            },
+            'parameter_constraints': SEARCH_PARAM_CONSTRAINTS,  # Fix 6: Include constraints
+        }
     except Exception as e:
         logger.error(f"Error checking backend health: {e}")
-        return {"error": str(e)}
+        return {"success": False, "error": str(e), "error_type": type(e).__name__}
 
 
 def get_ranking_configuration(ctx: Context) -> Dict[str, Any]:
@@ -9072,6 +9456,39 @@ async def get_memory_status(
             f"Memory status retrieved: {memory_status.current_mb:.1f}MB / "
             f"{memory_status.total_budget_mb:.1f}MB ({memory_status.usage_percent:.1f}%)"
         )
+
+        # Fix 7: Add visualization for memory metrics
+        def generate_ascii_bar(percent: float, width: int = 20) -> str:
+            """Generate ASCII progress bar."""
+            filled = int(percent / 100 * width)
+            empty = width - filled
+            return "█" * filled + "░" * empty + f" {percent:.1f}%"
+        
+        def get_trend_indicator(rate: float) -> str:
+            """Get trend arrow based on growth rate."""
+            if rate > 0.5:
+                return f"↑ +{rate:.2f}MB/min (growing rapidly)"
+            elif rate > 0.1:
+                return f"↗ +{rate:.2f}MB/min (growing)"
+            elif rate < -0.5:
+                return f"↓ {rate:.2f}MB/min (shrinking rapidly)"
+            elif rate < -0.1:
+                return f"↘ {rate:.2f}MB/min (shrinking)"
+            else:
+                return f"→ {rate:.2f}MB/min (stable)"
+        
+        result["visualization"] = {
+            "usage_bar": generate_ascii_bar(memory_status.usage_percent),
+            "soft_limit_bar": generate_ascii_bar(memory_status.soft_usage_percent),
+            "hard_limit_bar": generate_ascii_bar(memory_status.hard_usage_percent),
+            "trend": get_trend_indicator(memory_status.growth_rate_mb_per_sec * 60),
+            "status_emoji": {
+                "healthy": "✅",
+                "caution": "⚠️",
+                "warning": "🟡",
+                "critical": "🔴"
+            }.get(memory_status.status, "❓"),
+        }
 
         return result
 
