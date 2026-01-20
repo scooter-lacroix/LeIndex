@@ -108,6 +108,21 @@ class SQLiteStorage(StorageInterface):
         except Exception as e:
             logger.error(f"Error retrieving key {key}: {e}")
             return None
+
+    def save_file_content(self, file_path: str, content: str) -> None:
+        """Save file content to storage."""
+        if not self.put(file_path, content):
+            raise IOError(f"Failed to save file content to SQLite for {file_path}")
+
+    def get_file_content(self, file_path: str) -> Optional[str]:
+        """Retrieve file content from storage."""
+        val = self.get(file_path)
+        return str(val) if val is not None else None
+
+    def delete_file_content(self, file_path: str) -> None:
+        """Delete file content from storage."""
+        if not self.delete(file_path):
+            logger.warning(f"Failed to delete file content or it didn't exist: {file_path}")
     
     def delete(self, key: str) -> bool:
         """Delete a key-value pair."""
@@ -963,8 +978,6 @@ class SQLiteSearch(SearchInterface):
                     return True
                 else:
                     logger.error(f"FTS table repair failed: {repair_result['error']}")
-                    self._fts_validated = False
-                    return False
             else:
                 logger.debug("FTS tables are healthy")
                 self._fts_validated = True
@@ -1018,12 +1031,11 @@ class SQLiteSearch(SearchInterface):
                         FROM kv_fts
                         JOIN kv_store ON kv_fts.key = kv_store.key
                         WHERE kv_fts.value_text REGEXP ?
-                        ORDER BY rank
                     ''', (search_query,))
                 else:
                     # CRITICAL FIX: Standard FTS search with MATCH on kv_fts directly
                     cursor = conn.execute('''
-                        SELECT kv_store.key, kv_store.value, kv_store.value_type
+                        SELECT kv_store.key, kv_store.value, kv_store.value_type, rank
                         FROM kv_fts
                         JOIN kv_store ON kv_fts.key = kv_store.key
                         WHERE kv_fts MATCH ?
@@ -1034,9 +1046,17 @@ class SQLiteSearch(SearchInterface):
                 row_count = 0
                 for row in cursor:
                     row_count += 1
-                    key, value_blob, value_type = row
-
                     try:
+                        # Extract rank if available
+                        if is_regex:
+                            key, value_blob, value_type = row
+                            score = 1.0
+                        else:
+                            key, value_blob, value_type, rank_val = row
+                            # SQLite rank is negative by default (smaller is better), 
+                            # so we negate it for consistency (larger is better).
+                            score = -rank_val
+
                         if value_type == 'text':
                             value = value_blob.decode('utf-8') if isinstance(value_blob, bytes) else str(value_blob)
                         else:
@@ -1044,9 +1064,20 @@ class SQLiteSearch(SearchInterface):
                             json_str = value_blob.decode('utf-8') if isinstance(value_blob, bytes) else str(value_blob)
                             value = json.loads(json_str)
 
+                        # Wrap in a dict if it's not already, to include the score
+                        if isinstance(value, str):
+                            value = {"content": value}
+                        
+                        if isinstance(value, dict):
+                            value["score"] = score
+
                         results.append((key, value))
                     except (UnicodeDecodeError, json.JSONDecodeError) as e:
-                        logger.warning(f"Error decoding result for key {key}: {e}")
+                        logger.warning(f"Error decoding result: {e}")
+                        continue
+                    except Exception as e:
+                        logger.warning(f"Error processing search row: {e}")
+                        continue
                         continue
 
                 logger.debug(f"SQLite search returned {len(results)} results (processed {row_count} rows)")

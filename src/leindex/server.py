@@ -98,6 +98,7 @@ from .global_index import (
     InvalidPatternError
 )
 from .global_index.global_index import GlobalIndex, GlobalIndexConfig
+from .global_index.events import ProjectIndexedEvent
 
 # ============================================================================
 # META-REGISTRY: Startup Migration
@@ -948,6 +949,14 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[LeIndexContext]:
         global_index = ensure_global_index()
         if global_index:
             logger.info("Global Index initialized for cross-project operations")
+            # CRITICAL FIX: Initialize GlobalIndex from registry to populate tier1 metadata
+            # This ensures list_projects returns registered projects from the registry
+            if project_registry:
+                try:
+                    global_index.initialize_from_registry(project_registry)
+                    logger.info("GlobalIndex initialized from project registry")
+                except Exception as e:
+                    logger.warning(f"Could not initialize GlobalIndex from registry: {e}")
     except Exception as e:
         logger.warning(f"Could not initialize global index: {e}")
         global_index = None
@@ -1499,7 +1508,7 @@ async def search_content(
                     "success": False,
                     "error": "query parameter is required for rank action",
                 }
-            return await rank_search_results(results, query, ctx)
+            return await rank_search_results(ctx, results, query)
         case _:
             return {"success": False, "error": f"Unknown action: {action}"}
 
@@ -3520,11 +3529,19 @@ async def search_code_advanced(
 
                 # CRITICAL: Ensure file is within the project base_path
                 try:
-                    abs_fpath = os.path.abspath(f_path)
+                    # If f_path is relative, join it with base_path
+                    full_p = f_path
+                    if not os.path.isabs(f_path):
+                        full_p = os.path.join(base_path, f_path)
+                    
+                    abs_fpath = os.path.abspath(full_p)
                     abs_basepath = os.path.abspath(base_path)
+                    
                     if not abs_fpath.startswith(abs_basepath + os.sep) and abs_fpath != abs_basepath:
+                        logger.debug(f"Search result {f_path} filtered out: not in {base_path}")
                         continue
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"Error validating path {f_path}: {e}")
                     continue
 
                 if f_path not in results_dict:
@@ -3561,6 +3578,17 @@ async def search_code_advanced(
             if page == 1:
                 shown_files = list(results_dict.keys())
                 _mark_files_as_shown(shown_files)
+
+            if not results_dict:
+                return {
+                    "success": True,
+                    "results": [],
+                    "message": (
+                        "No results found within the project. "
+                        "If you just added files or changed the project path, "
+                        "try refreshing the index using 'manage_project' with action 'refresh'."
+                    )
+                }
 
             # Paginate
             paginated_results = lazy_content_manager.paginate_results(
@@ -3708,14 +3736,20 @@ async def search_code_advanced(
                             # CRITICAL: Ensure file_path is within the project base_path
                             # This prevents returning results from outside the set project
                             try:
-                                # Normalize both paths for comparison
-                                abs_file_path = os.path.abspath(file_path)
+                                # If file_path is relative, join it with base_path
+                                full_p = file_path
+                                if not os.path.isabs(file_path):
+                                    full_p = os.path.join(base_path, file_path)
+                                
+                                abs_file_path = os.path.abspath(full_p)
                                 abs_base_path = os.path.abspath(base_path)
+                                
                                 if not abs_file_path.startswith(abs_base_path + os.sep) and abs_file_path != abs_base_path:
+                                    logger.debug(f"Search result {file_path} filtered out by backend processor: not in {base_path}")
                                     filtered_count += 1
                                     continue
-                            except Exception as path_error:
-                                logger.warning(f"Error validating path {file_path}: {path_error}")
+                            except Exception as e:
+                                logger.warning(f"Error validating path {file_path} in backend results: {e}")
                                 filtered_count += 1
                                 continue
 
@@ -4630,8 +4664,8 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
             async def index_single_file(file_path: str):
                 """Index a single file."""
                 try:
-                    # Use the existing index_codebase function logic
-                    await index_codebase(ctx, base_path=base_path, force_reindex=False)
+                    # CRITICAL FIX: Replace non-existent index_codebase with _index_project
+                    await _index_project(base_path, core_engine=ctx.request_context.lifespan_context.core_engine)
                 except Exception as e:
                     logger.error(f"Error indexing file {file_path}: {e}")
 
@@ -4808,8 +4842,8 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
             async def index_single_file(file_path: str):
                 """Index a single file."""
                 try:
-                    # Use the existing index_codebase function logic
-                    await index_codebase(ctx, base_path=base_path, force_reindex=True)
+                    # CRITICAL FIX: Replace non-existent index_codebase with _index_project
+                    await _index_project(base_path, core_engine=ctx.request_context.lifespan_context.core_engine)
                 except Exception as e:
                     logger.error(f"Error indexing file {file_path}: {e}")
 
@@ -5305,13 +5339,10 @@ async def search_and_replace(
                     new_line_content, count = re.subn(
                         search, replace, line_content, flags=flags
                     )
+                    replacements_made += count
                 else:
+                    replacements_made += line_content.count(search)
                     new_line_content = line_content.replace(search, replace)
-                    count = (len(line_content) - len(new_line_content)) // max(
-                        1, len(search)
-                    )  # Simple count for non-regex
-
-                replacements_made += count
                 modified_lines.append(new_line_content)
             else:
                 modified_lines.append(line_content)
@@ -6834,8 +6865,11 @@ def get_performance_metrics() -> Dict[str, Any]:
         
         # Extract search counters from performance monitor if available
         if hasattr(performance_monitor, 'get_counter'):
-            search_stats['search_cache_hits'] = performance_monitor.get_counter('search_cache_hits_total') or 0
-            search_stats['search_cache_misses'] = performance_monitor.get_counter('search_cache_misses_total') or 0
+            hits_counter = performance_monitor.get_counter('search_cache_hits_total')
+            misses_counter = performance_monitor.get_counter('search_cache_misses_total')
+            # Counter objects need .get_value() to extract the integer value
+            search_stats['search_cache_hits'] = hits_counter.get_value() if hits_counter else 0
+            search_stats['search_cache_misses'] = misses_counter.get_value() if misses_counter else 0
             search_stats['search_total'] = search_stats['search_cache_hits'] + search_stats['search_cache_misses']
             
             if search_stats['search_total'] > 0:
