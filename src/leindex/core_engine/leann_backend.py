@@ -1916,17 +1916,27 @@ class LEANNVectorBackend:
         # Build index using LeannBuilder
         # Note: In a real implementation, we'd need to generate embeddings
         # and pass them to the builder. For now, this is a placeholder.
+        # CRITICAL FIX: LeannBuilder does NOT support context manager protocol
+        # (no __enter__/__exit__), so we use try/finally instead
+        builder = None
         try:
-            with LeannBuilder(
+            builder = LeannBuilder(
                 backend_name=self.backend_name,
                 embedding_dim=self.dimension,
                 **self.backend_config
-            ) as builder:
-                # In real implementation, add vectors and embeddings here
-                # builder.add_vectors(embeddings, metadatas)
-                builder.build_index(self.index_path, chunks)
+            )
+            # In real implementation, add vectors and embeddings here
+            # builder.add_vectors(embeddings, metadatas)
+            builder.build_index(self.index_path, chunks)
         except Exception as e:
             logger.error(f"Failed to rebuild index: {e}")
+        finally:
+            # Clean up builder resources if close method exists
+            if builder is not None and hasattr(builder, 'close'):
+                try:
+                    builder.close()
+                except Exception as close_err:
+                    logger.debug(f"Error closing LeannBuilder: {close_err}")
 
     def _chunk_content(
         self,
@@ -2732,6 +2742,13 @@ class LEANNVectorBackend:
             File content for the chunk (intelligently truncated)
         """
         try:
+            # CRITICAL FIX: Normalize file path to ensure leading slash
+            # Vector metadata may store paths without leading '/' (e.g., "home/user/...")
+            # which causes os.path.exists() to fail
+            if file_path and not file_path.startswith('/'):
+                file_path = '/' + file_path
+            file_path = os.path.normpath(file_path)
+            
             if not os.path.exists(file_path):
                 logger.warning(f"File not found: {file_path}")
                 return "[Content not available: file not found]"

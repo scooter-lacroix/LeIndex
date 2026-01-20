@@ -787,27 +787,54 @@ class SQLiteSearch(SearchInterface):
             conn.execute('PRAGMA foreign_keys = ON')
 
             if self.enable_fts:
-                # CRITICAL FIX: Drop old FTS tables that may have incorrect schemas
-                # This handles databases created with older versions that used external content mode
-                # The FTS tables will be repopulated during repair, so dropping is safe
-                conn.execute('DROP TABLE IF EXISTS files_fts')
-                conn.execute('DROP TABLE IF EXISTS kv_fts')
-
-                # Create FTS table for file paths using external content
-                # The 'content' option points to the source table for automatic indexing
+                # CRITICAL FIX: Check if FTS tables exist BEFORE creating
+                # DO NOT DROP - this causes data loss on every restart!
+                # Previous code dropped tables unconditionally which caused the
+                # "FTS data inconsistency" errors (kv_store: N, kv_fts: 0)
+                cursor = conn.execute("""
+                    SELECT name FROM sqlite_master 
+                    WHERE type='table' AND name IN ('files_fts', 'kv_fts')
+                """)
+                existing_fts = [row[0] for row in cursor.fetchall()]
+                
+                # Only create FTS tables if they don't exist
+                if 'files_fts' not in existing_fts:
+                    # Create FTS table for file paths using external content
+                    conn.execute('''
+                        CREATE VIRTUAL TABLE files_fts USING fts5(
+                            file_path, content='files', content_rowid='id'
+                        )
+                    ''')
+                    logger.info("Created files_fts FTS table")
+                
+                if 'kv_fts' not in existing_fts:
+                    # Create FTS table for kv_store WITHOUT external content
+                    conn.execute('''
+                        CREATE VIRTUAL TABLE kv_fts USING fts5(
+                            key, value_text
+                        )
+                    ''')
+                    logger.info("Created kv_fts FTS table")
+                
+                # Create triggers to keep FTS in sync (IF NOT EXISTS is safe)
+                # These ensure FTS tables stay synchronized with main tables
                 conn.execute('''
-                    CREATE VIRTUAL TABLE files_fts USING fts5(
-                        file_path, content='files', content_rowid='id'
-                    )
+                    CREATE TRIGGER IF NOT EXISTS files_fts_insert AFTER INSERT ON files BEGIN
+                        INSERT INTO files_fts(rowid, file_path) VALUES (new.id, new.file_path);
+                    END
                 ''')
-
-                # Create FTS table for kv_store WITHOUT external content
-                # We cannot use content='kv_store' because kv_fts needs a 'value_text' column
-                # that doesn't exist in kv_store. Instead, we'll manually populate kv_fts.
                 conn.execute('''
-                    CREATE VIRTUAL TABLE kv_fts USING fts5(
-                        key, value_text
-                    )
+                    CREATE TRIGGER IF NOT EXISTS files_fts_delete AFTER DELETE ON files BEGIN
+                        INSERT INTO files_fts(files_fts, rowid, file_path) 
+                        VALUES('delete', old.id, old.file_path);
+                    END
+                ''')
+                conn.execute('''
+                    CREATE TRIGGER IF NOT EXISTS files_fts_update AFTER UPDATE ON files BEGIN
+                        INSERT INTO files_fts(files_fts, rowid, file_path) 
+                        VALUES('delete', old.id, old.file_path);
+                        INSERT INTO files_fts(rowid, file_path) VALUES (new.id, new.file_path);
+                    END
                 ''')
 
             conn.commit()

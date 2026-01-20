@@ -13,6 +13,7 @@ Architecture:
 
 import logging
 import os
+import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -99,7 +100,34 @@ class DuckDBAnalytics:
         """
         # Create DuckDB connection with unsigned extensions allowed
         # This must be set at connection time, cannot be changed after database is created
-        self.conn = duckdb.connect(self.db_path, config={'allow_unsigned_extensions': 'true'})
+        # CRITICAL FIX: Add retry logic for lock conflicts when multiple processes
+        # try to access the same DuckDB file
+        max_retries = 3
+        retry_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                self.conn = duckdb.connect(self.db_path, config={
+                    'allow_unsigned_extensions': 'true',
+                    'access_mode': 'automatic'
+                })
+                break
+            except duckdb.IOException as e:
+                if 'lock' in str(e).lower() and attempt < max_retries - 1:
+                    logger.warning(
+                        f"DuckDB lock conflict (attempt {attempt + 1}/{max_retries}), "
+                        f"retrying in {retry_delay:.1f}s..."
+                    )
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                    continue
+                # Re-raise if not a lock error or if we're out of retries
+                logger.error(f"DuckDB connection failed after {max_retries} attempts: {e}")
+                raise
+            except Exception as e:
+                # Non-IOException errors should be raised immediately
+                logger.error(f"DuckDB connection error: {e}")
+                raise
 
         try:
             # Configure DuckDB for optimal performance

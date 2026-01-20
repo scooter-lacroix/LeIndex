@@ -1394,6 +1394,24 @@ async def manage_project(
         await manage_project(ctx, "clear")
         await manage_project(ctx, "reset")
     """
+    # CRITICAL FIX: Timeout configuration for long-running operations
+    # This prevents the server from hanging indefinitely during reindex
+    REFRESH_TIMEOUT_SECONDS = 300  # 5 minutes
+    REINDEX_TIMEOUT_SECONDS = 600  # 10 minutes
+    
+    async def _run_with_timeout(coro, timeout: float, operation_name: str):
+        """Run a coroutine with timeout and proper error handling."""
+        try:
+            return await asyncio.wait_for(coro, timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.error(f"{operation_name} timed out after {timeout}s")
+            return {
+                "success": False,
+                "error": f"Operation timed out after {timeout} seconds. The project may be too large or the index is corrupted. Try 'clear' action first.",
+                "error_type": "timeout",
+                "timeout_seconds": timeout
+            }
+    
     match action:
         case "set_path":
             if path is None:
@@ -1403,9 +1421,17 @@ async def manage_project(
                 }
             return await set_project_path(path, ctx)
         case "refresh":
-            return await refresh_index(ctx)
+            return await _run_with_timeout(
+                refresh_index(ctx), 
+                REFRESH_TIMEOUT_SECONDS, 
+                "Index refresh"
+            )
         case "reindex":
-            return await force_reindex(ctx, clear_cache)
+            return await _run_with_timeout(
+                force_reindex(ctx, clear_cache), 
+                REINDEX_TIMEOUT_SECONDS, 
+                "Force reindex"
+            )
         case "clear":
             return clear_settings(ctx)
         case "reset":
