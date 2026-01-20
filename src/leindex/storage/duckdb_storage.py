@@ -97,8 +97,9 @@ class DuckDBAnalytics:
             - Analytical views are created only if SQLite is attached
             - Database attachment is idempotent - checks if already attached
         """
-        # Create DuckDB connection
-        self.conn = duckdb.connect(self.db_path)
+        # Create DuckDB connection with unsigned extensions allowed
+        # This must be set at connection time, cannot be changed after database is created
+        self.conn = duckdb.connect(self.db_path, config={'allow_unsigned_extensions': 'true'})
 
         try:
             # Configure DuckDB for optimal performance
