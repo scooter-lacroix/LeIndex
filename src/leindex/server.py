@@ -165,6 +165,51 @@ stats_collector: Optional[IndexStatisticsCollector] = None
 # Global index instance for cross-project operations
 global_index: Optional[GlobalIndex] = None
 
+# Global Tier1 singleton for consistent project metadata across all tools
+# This ensures get_global_stats, list_projects, and get_dashboard all see the same data
+_global_tier1: Optional[GlobalIndexTier1] = None
+
+
+def ensure_global_tier1() -> GlobalIndexTier1:
+    """Get or create the global Tier1 singleton for project metadata.
+    
+    This singleton ensures all tools (get_global_stats, list_projects, get_dashboard)
+    share the same project registry state.
+    """
+    global _global_tier1
+    if _global_tier1 is None:
+        _global_tier1 = GlobalIndexTier1()
+        logger.info("Created GlobalIndexTier1 singleton for project registry")
+    return _global_tier1
+
+
+def register_project_in_tier1(
+    project_id: str,
+    project_path: str,
+    file_count: int,
+    status: str = "completed"
+) -> None:
+    """Register a project in the global Tier1 metadata store.
+    
+    This should be called after a project is successfully indexed.
+    """
+    tier1 = ensure_global_tier1()
+    event = ProjectIndexedEvent(
+        project_id=project_id,
+        project_path=project_path,
+        timestamp=time.time(),
+        status=status,
+        stats={
+            "files": file_count,
+            "symbols": 0,  # Will be updated when symbols are indexed
+            "languages": {},  # Will be updated when file types are analyzed
+            "size_mb": 0.0
+        }
+    )
+    tier1.on_project_indexed(event)
+    logger.info(f"Registered project '{project_id}' in Tier1 with {file_count} files")
+
+
 
 # ============================================================================
 # Fix 6: SEARCH PARAMETER CONSTRAINTS (documented limits)
@@ -2609,7 +2654,7 @@ async def get_global_stats(
         }
     """
     try:
-        tier1 = GlobalIndexTier1()
+        tier1 = ensure_global_tier1()  # Use singleton for registry consistency
         dashboard = tier1.get_dashboard_data()
 
         return {
@@ -2675,6 +2720,7 @@ async def get_dashboard(
     """
     try:
         dashboard = get_dashboard_data(
+            tier1=ensure_global_tier1(),  # Use singleton for registry consistency
             status_filter=status,
             language_filter=language,
             min_health_score=min_health_score,
@@ -2756,6 +2802,7 @@ async def list_projects(
     """
     try:
         dashboard = get_dashboard_data(
+            tier1=ensure_global_tier1(),  # Use singleton for registry consistency
             status_filter=status,
             language_filter=language,
             min_health_score=min_health_score
@@ -2847,6 +2894,7 @@ async def cross_project_search_tool(
         result = await cross_project_search(
             pattern=pattern,
             project_ids=project_ids,
+            tier1=ensure_global_tier1(),  # Use singleton for registry consistency
             fuzzy=fuzzy,
             case_sensitive=case_sensitive,
             file_pattern=file_pattern,
@@ -2855,24 +2903,26 @@ async def cross_project_search_tool(
         )
 
         # Convert results to dicts
+        # Note: project_results is Dict[str, ProjectSearchResult], not a list
         projects_results = []
-        for proj_result in result.project_results:
+        for project_id, proj_result in result.project_results.items():
             projects_results.append({
-                "project_id": proj_result.project_id,
-                "success": proj_result.success,
+                "project_id": project_id,
+                "success": proj_result.error is None,
                 "error": proj_result.error,
-                "result_count": len(proj_result.matches) if proj_result.matches else 0,
+                "result_count": len(proj_result.results) if proj_result.results else 0,
                 "matches": [
                     {
-                        "file_path": m.file_path,
-                        "line_number": m.line_number,
-                        "line_content": m.line_content,
-                        "context_before": m.context_before,
-                        "context_after": m.context_after
+                        "file_path": m.get("file_path", ""),
+                        "line_number": m.get("line_number", 0),
+                        "line_content": m.get("line_content", ""),
+                        "context_before": m.get("context_before", []),
+                        "context_after": m.get("context_after", [])
                     }
-                    for m in (proj_result.matches or [])
+                    for m in (proj_result.results or [])
                 ]
             })
+
 
         return {
             "success": True,
@@ -3242,6 +3292,14 @@ async def set_project_path(path: str, ctx: Context) -> Union[str, Dict[str, Any]
             else:
                 search_info = f" Advanced search enabled ({search_tool.name})."
 
+            # Register project in Tier1 for registry consistency
+            register_project_in_tier1(
+                project_id=abs_path,
+                project_path=abs_path,
+                file_count=file_count,
+                status="completed"
+            )
+
             return f"Project path set to: {abs_path}. Loaded existing index with {file_count} files.{search_info}"
         else:
             logger.info("No existing index found, creating new index...")
@@ -3276,6 +3334,14 @@ async def set_project_path(path: str, ctx: Context) -> Union[str, Dict[str, Any]
             search_info = " Basic search available."
         else:
             search_info = f" Advanced search enabled ({search_tool.name})."
+
+        # Register project in Tier1 for registry consistency
+        register_project_in_tier1(
+            project_id=abs_path,
+            project_path=abs_path,
+            file_count=file_count,
+            status="completed"
+        )
 
         return (
             f"Project path set to: {abs_path}. Indexed {file_count} files.{search_info}"
@@ -3452,6 +3518,15 @@ async def search_code_advanced(
                 if file_pattern and not fnmatch.fnmatch(f_path, file_pattern):
                     continue
 
+                # CRITICAL: Ensure file is within the project base_path
+                try:
+                    abs_fpath = os.path.abspath(f_path)
+                    abs_basepath = os.path.abspath(base_path)
+                    if not abs_fpath.startswith(abs_basepath + os.sep) and abs_fpath != abs_basepath:
+                        continue
+                except Exception:
+                    continue
+
                 if f_path not in results_dict:
                     results_dict[f_path] = []
 
@@ -3622,10 +3697,26 @@ async def search_code_advanced(
                             # Don't treat empty results as an error, just log and continue
 
                         # Convert to the expected format for pagination
+                        # CRITICAL FIX: Filter results to only include files within base_path
                         results_dict = {}
+                        filtered_count = 0
                         for result in standardized_results:
                             file_path = result.get("file_path", "")
                             if not file_path:
+                                continue
+
+                            # CRITICAL: Ensure file_path is within the project base_path
+                            # This prevents returning results from outside the set project
+                            try:
+                                # Normalize both paths for comparison
+                                abs_file_path = os.path.abspath(file_path)
+                                abs_base_path = os.path.abspath(base_path)
+                                if not abs_file_path.startswith(abs_base_path + os.sep) and abs_file_path != abs_base_path:
+                                    filtered_count += 1
+                                    continue
+                            except Exception as path_error:
+                                logger.warning(f"Error validating path {file_path}: {path_error}")
+                                filtered_count += 1
                                 continue
 
                             if file_path not in results_dict:
@@ -3640,6 +3731,9 @@ async def search_code_advanced(
                                     "score": result.get("score", 0.0),
                                 }
                             )
+                        
+                        if filtered_count > 0:
+                            logger.info(f"SEARCH_DEBUG: Filtered out {filtered_count} results outside base_path: {base_path}")
 
                         total_matches = len(standardized_results)
                         operation.metadata.update(
