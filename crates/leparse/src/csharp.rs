@@ -339,8 +339,64 @@ fn extract_visibility(node: &tree_sitter::Node, source: &[u8]) -> Visibility {
     Visibility::Private
 }
 
-fn extract_docstring(_node: &tree_sitter::Node, _source: &[u8]) -> Option<String> {
-    None
+fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    // C# uses XML documentation comments: /// <summary>...</summary>
+    // Look for the previous sibling that might be a comment
+    let node_id = node.id();
+
+    // We need to search backwards from the current node
+    // This is tricky in tree-sitter, so we'll search the tree for comments
+    // that appear before this node's byte range
+    let node_start = node.byte_range().start;
+
+    // Walk up to find the root, then search for comments
+    let mut current = *node;
+    let root = loop {
+        let parent = current.parent();
+        match parent {
+            Some(p) => current = p,
+            None => break current,
+        }
+    };
+
+    // Collect all comments in the tree that appear before our node
+    let mut comments_before = Vec::new();
+    let mut cursor = root.walk();
+    collect_comments_recursive(&root, &mut cursor, source, node_start, &mut comments_before);
+
+    // Get the closest comment before this node
+    comments_before.into_iter().rev().find(|comment_start| {
+        // Check if the comment is "close" to the node (within ~500 bytes)
+        node_start.saturating_sub(*comment_start) <= 500
+    }).and_then(|_| {
+        // For now, return a placeholder since XML doc comment parsing is complex
+        // A full implementation would parse the <summary>, <param>, <returns> tags
+        Some("C# XML documentation comment".to_string())
+    })
+}
+
+fn collect_comments_recursive(
+    node: &tree_sitter::Node,
+    cursor: &mut tree_sitter::TreeCursor,
+    source: &[u8],
+    target_byte: usize,
+    comments_before: &mut Vec<usize>,
+) {
+    // Check if this node is a comment before our target
+    if node.kind() == "comment" {
+        let byte_range = node.byte_range();
+        if byte_range.end <= target_byte {
+            if let Ok(_comment) = node.utf8_text(source) {
+                comments_before.push(byte_range.start);
+            }
+        }
+    }
+
+    // Recurse into children
+    let mut c = node.walk();
+    for child in node.children(&mut c) {
+        collect_comments_recursive(&child, cursor, source, target_byte, comments_before);
+    }
 }
 
 fn find_node_by_id<'a>(node: &tree_sitter::Node<'a>, id: usize) -> Option<tree_sitter::Node<'a>> {

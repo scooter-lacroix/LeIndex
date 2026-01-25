@@ -193,8 +193,74 @@ fn extract_function_signature(
         visibility: Visibility::Public,
         is_async: false,
         is_method: node.kind() == "method_declaration",
-        docstring: None,
+        docstring: extract_docstring(node, source),
     })
+}
+
+fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+    // PHP uses PHPDoc comments: /** Description */
+    // Look for comment nodes before the function
+    let node_start = node.byte_range().start;
+
+    // Walk up to find the root, then search for comments
+    let mut current = *node;
+    let root = loop {
+        let parent = current.parent();
+        match parent {
+            Some(p) => current = p,
+            None => break current,
+        }
+    };
+
+    // Find the closest comment before this node (within 500 bytes)
+    let mut closest_comment: Option<(usize, String)> = None;
+    find_closest_comment(&root, source, node_start, &mut closest_comment, 500);
+
+    closest_comment.map(|(_, comment)| {
+        // Clean up the PHPDoc comment
+        comment
+            .trim_start_matches("/**")
+            .trim_start_matches("/*")
+            .trim_end_matches("*/")
+            .lines()
+            .map(|line| line.trim().trim_start_matches('*').trim())
+            .filter(|line| !line.is_empty() && !line.starts_with('@'))
+            .collect::<Vec<_>>()
+            .join(" ")
+    })
+}
+
+fn find_closest_comment(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    target_byte: usize,
+    closest: &mut Option<(usize, String)>,
+    max_distance: usize,
+) {
+    // Check if this node is a comment before our target
+    if node.kind() == "comment" {
+        let byte_range = node.byte_range();
+        if byte_range.end <= target_byte {
+            let distance = target_byte.saturating_sub(byte_range.start);
+            if distance <= max_distance {
+                if let Ok(comment) = node.utf8_text(source) {
+                    match closest {
+                        Some((existing_dist, _)) if distance < *existing_dist => {
+                            *closest = Some((distance, comment.to_string()));
+                        }
+                        None => *closest = Some((distance, comment.to_string())),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    // Recurse into children
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        find_closest_comment(&child, source, target_byte, closest, max_distance);
+    }
 }
 
 fn extract_php_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Parameter> {

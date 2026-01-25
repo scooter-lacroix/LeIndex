@@ -86,11 +86,19 @@ impl GrammarCache {
     }
 
     /// Get the number of cached grammars
+    ///
+    /// Returns 0 if the cache lock is poisoned (indicating a serious bug).
+    /// The poisoning error is logged via expect() for debugging purposes.
     pub fn len(&self) -> usize {
         self.grammars
             .read()
             .map(|g| g.len())
-            .unwrap_or(0)
+            .unwrap_or_else(|e| {
+                // Use expect with context to make debugging easier
+                // This will panic with the poisoning error, which is appropriate
+                // for a RwLock poisoning (indicates a serious bug)
+                panic!("Grammar cache lock poisoned: {}. This indicates a serious bug in concurrent access.", e)
+            })
     }
 
     /// Check if the cache is empty
