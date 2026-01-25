@@ -1,0 +1,15 @@
+{
+  "track_id": "lepasserelle_20250125",
+  "type": "standard_track",
+  "status": "new",
+  "created_at": "2025-01-25T00:00:00Z",
+  "updated_at": "2025-01-25T00:00:00Z",
+  "description": "Bridge & Integration - PyO3 FFI bindings and unified MCP tool. Part of LeIndex Rust Renaissance master track.",
+  "dependencies": ["lerecherche_20250125", "lestockage_20250125"],
+  "performance_targets": {
+    "ffi_overhead": "Minimal overhead across Python-Rust boundary",
+    "memory_management": "RSS monitoring with 90% threshold spilling",
+    "mcp_tool": "Unified leindex_deep_analyze tool"
+  },
+  "parent_track": "leindex_rust_refactor_20250125"
+}

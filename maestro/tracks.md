@@ -79,3 +79,39 @@ This file tracks all major tracks for the project. Each track has its own detail
 - configure_memory ✅
 - manage_memory (cleanup action) ✅
 - manage_temp (check action) ✅
+
+---
+
+## [~] Track: LeIndex Rust Renaissance 🦀 MASTER TRACK
+*Link: [./maestro/tracks/leindex_rust_refactor_20250125/](./maestro/tracks/leindex_rust_refactor_20250125/)*
+
+**Description:** Transform LeIndex from Python to Rust-based Deep Code Intelligence Engine. Complete greenfield rewrite with integrated code analysis capabilities.
+
+**Status:** Orchestration In Progress
+
+**Created:** 2025-01-25
+
+**Type:** Master Track (orchestrate-ready with 5 sub-tracks)
+
+**Sub-Tracks:**
+1. `leparse_20250125` - Core Parsing Engine (zero-copy AST, tree-sitter, 17+ languages)
+2. `legraphe_20250125` - Graph Intelligence Core (PDG, gravity-based traversal)
+3. `lerecherche_20250125` - Search & Analysis Fusion (node-level embeddings, semantic entry points)
+4. `lestockage_20250125` - Persistent Storage Layer (SQLite, Salsa incremental computation)
+5. `lepasserelle_20250125` - Bridge & Integration (PyO3, MCP tools, memory management)
+
+**Performance Targets:**
+- 10x memory reduction (400→32 bytes per node)
+- <60s indexing for 50K files (match Python baseline)
+- <100ms P95 search latency
+- 20% token efficiency improvement
+
+**Approach:** Greenfield architecture with reference-code-guidance only (no 1:1 copying)
+
+**Key Features:**
+- Zero-copy AST extraction with tree-sitter
+- Gravity-based traversal for intelligent context expansion
+- Node-level semantic search with vector-AST synergy
+- Cross-project intelligence with global symbol resolution
+- Salsa-based incremental computation (node-level hashing)
+- Unified MCP tool: `leindex_deep_analyze`

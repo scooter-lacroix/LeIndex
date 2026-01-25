@@ -1,0 +1,25 @@
+{
+  "track_id": "leindex_rust_refactor_20250125",
+  "type": "master_track",
+  "status": "in_progress",
+  "created_at": "2025-01-25T00:00:00Z",
+  "updated_at": "2025-01-25T00:00:00Z",
+  "description": "Transform LeIndex from Python to Rust-based Deep Code Intelligence Engine with integrated 5-layer code analysis. Complete greenfield rewrite with orchestrate-ready sub-tracks: leparse (AST), legraphe (PDG), lerecherche (search), lestockage (storage), lepasserelle (integration).",
+  "sub_tracks": [
+    "leparse_20250125",
+    "legraphe_20250125",
+    "lerecherche_20250125",
+    "lestockage_20250125",
+    "lepasserelle_20250125"
+  ],
+  "performance_targets": {
+    "memory_reduction": "10x (400→32 bytes/node)",
+    "indexing_speed": "<60s for 50K files",
+    "search_latency": "<100ms P95",
+    "token_efficiency": "+20% improvement"
+  },
+  "approach": "greenfield",
+  "orchestrate_ready": true,
+  "memory_integration": "deferred",
+  "memory_notes": "Maestro memory system not yet available in this project. Track memory storage deferred until memory infrastructure is implemented."
+}
