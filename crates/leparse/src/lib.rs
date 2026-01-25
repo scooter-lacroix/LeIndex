@@ -24,6 +24,9 @@ pub mod languages;
 /// Python language implementation.
 pub mod python;
 
+/// JavaScript and TypeScript language implementation.
+pub mod javascript;
+
 /// Re-exports of commonly used types.
 pub mod prelude;
 

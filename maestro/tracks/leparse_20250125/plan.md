@@ -96,11 +96,11 @@ Implement the trait-based extractor pattern.
   - [x] Add `compute_cfg()` control flow graph generation
   - [x] Add `extract_complexity()` metrics calculation
 
-- [ ] **Task 3.3: Implement JavaScript/TypeScript support**
-  - [ ] Implement `CodeIntelligence` for JavaScript
-  - [ ] Implement `CodeIntelligence` for TypeScript
-  - [ ] Handle TS-specific syntax (types, interfaces)
-  - [ ] Write tests for JS/TS extraction
+- [x] **Task 3.3: Implement JavaScript/TypeScript support** ✅
+  - [x] Implement `CodeIntelligence` for JavaScript
+  - [x] Implement `CodeIntelligence` for TypeScript
+  - [x] Handle TS-specific syntax (types, interfaces)
+  - [x] Write tests for JS/TS extraction
 
 - [ ] **Task 3.4: Implement Go language support**
   - [ ] Implement `CodeIntelligence` for Go
