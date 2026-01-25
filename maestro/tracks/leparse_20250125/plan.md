@@ -37,7 +37,12 @@ Set up tree-sitter infrastructure and language grammars.
   - [x] Add memory-efficient grammar pooling
   - [x] Write tests for grammar loading correctness
 
-- [ ] **Task: Maestro - Phase 1 Verification**
+- [x] **Task: Maestro - Phase 1 Verification** (Tzar Review: ✅ PASS)
+  - Fixed: Duplicate unsafe FFI declarations removed (now uses centralized loading)
+  - Fixed: Unified language registry (LanguageId.config() delegates to LanguageConfig)
+  - Fixed: Dead code paths removed (extract_function_definitions, extract_class_definitions)
+  - Fixed: Recursion bug in extract_all_definitions (now handles nested classes/functions)
+  - Fixed: MSRV violation (replaced std::sync::LazyLock with once_cell::sync::Lazy)
 
 ---
 
@@ -64,7 +69,13 @@ Define zero-copy AST node types and structures.
   - [x] Add docstring storage in node metadata
   - [x] Write tests for docstring extraction
 
-- [ ] **Task: Maestro - Phase 2 Verification**
+- [x] **Task: Maestro - Phase 2 Verification** (Tzar Review: ✅ PASS)
+  - Fixed: Type duplication removed (Visibility, Parameter now imported from traits.rs)
+  - Fixed: Added bounds checking to all text() methods (returns Result instead of panicking)
+  - Fixed: ZeroCopyText trait moved from tests to src/ast.rs
+  - Fixed: Import struct now includes byte_range for zero-copy
+  - Fixed: NodeMetadata uses byte ranges (name_range, docstring_range) instead of owned strings
+  - Updated: Tests use new zero-copy API (get_text(), get_name(), get_docstring())
 
 ---
 

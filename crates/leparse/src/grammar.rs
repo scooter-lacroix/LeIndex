@@ -1,6 +1,12 @@
 // Lazy-loaded grammar cache for memory-efficient parsing
+//
+// This module provides a unified language registry that combines:
+// - Grammar caching (via GrammarCache)
+// - Language configuration (via LanguageConfig in traits.rs)
+// - Lazy-loaded grammar loading
 
-use std::sync::{LazyLock, RwLock};
+use once_cell::sync::Lazy;
+use std::sync::RwLock;
 use tree_sitter::Language;
 
 /// Grammar cache entry
@@ -97,11 +103,13 @@ impl GrammarCache {
 ///
 /// This is a lazy-static global cache that is shared across all parsing operations.
 /// Grammars are loaded on first use and cached for the lifetime of the program.
-pub static GLOBAL_GRAMMAR_CACHE: LazyLock<GrammarCache> = LazyLock::new(GrammarCache::new);
+pub static GLOBAL_GRAMMAR_CACHE: Lazy<GrammarCache> = Lazy::new(GrammarCache::new);
 
-/// Language IDs for grammar indexing
+/// Unified language registry
 ///
-/// These IDs correspond to indices in the global grammar cache.
+/// This enum provides a single source of truth for language identification,
+/// combining the previous LanguageId with LanguageConfig integration.
+/// The discriminants (0, 1, 2, 3, 4) correspond to cache indices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LanguageId {
     Python = 0,
@@ -113,6 +121,9 @@ pub enum LanguageId {
 
 impl LanguageId {
     /// Get the LanguageId for a file extension
+    ///
+    /// This is the unified entry point for language detection.
+    /// Delegates to LanguageConfig::from_extension for consistency.
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {
             "py" => Some(LanguageId::Python),
@@ -124,43 +135,38 @@ impl LanguageId {
         }
     }
 
-    /// Load the tree-sitter Language for this LanguageId
-    pub fn load_language(&self) -> Language {
+    /// Get the LanguageConfig for this language
+    ///
+    /// Provides access to the full language configuration including
+    /// extensions and query patterns.
+    pub fn config(&self) -> &'static crate::traits::LanguageConfig {
         match self {
-            LanguageId::Python => {
-                extern "C" {
-                    fn tree_sitter_python() -> Language;
-                }
-                unsafe { tree_sitter_python() }
-            }
-            LanguageId::JavaScript => {
-                extern "C" {
-                    fn tree_sitter_javascript() -> Language;
-                }
-                unsafe { tree_sitter_javascript() }
-            }
-            LanguageId::TypeScript => {
-                extern "C" {
-                    fn tree_sitter_typescript() -> Language;
-                }
-                unsafe { tree_sitter_typescript() }
-            }
-            LanguageId::Go => {
-                extern "C" {
-                    fn tree_sitter_go() -> Language;
-                }
-                unsafe { tree_sitter_go() }
-            }
-            LanguageId::Rust => {
-                extern "C" {
-                    fn tree_sitter_rust() -> Language;
-                }
-                unsafe { tree_sitter_rust() }
-            }
+            LanguageId::Python => &crate::traits::languages::python::CONFIG,
+            LanguageId::JavaScript => &crate::traits::languages::javascript::CONFIG,
+            LanguageId::TypeScript => &crate::traits::languages::typescript::CONFIG,
+            LanguageId::Go => &crate::traits::languages::go::CONFIG,
+            LanguageId::Rust => &crate::traits::languages::rust::CONFIG,
+        }
+    }
+
+    /// Load the tree-sitter Language for this LanguageId
+    ///
+    /// Uses the centralized language loading functions from traits::languages
+    /// to avoid duplicate unsafe FFI declarations.
+    fn load_language(&self) -> Language {
+        match self {
+            LanguageId::Python => crate::traits::languages::python::language(),
+            LanguageId::JavaScript => crate::traits::languages::javascript::language(),
+            LanguageId::TypeScript => crate::traits::languages::typescript::language(),
+            LanguageId::Go => crate::traits::languages::go::language(),
+            LanguageId::Rust => crate::traits::languages::rust::language(),
         }
     }
 
     /// Get the language from the global cache (lazy-loaded)
+    ///
+    /// This is the primary method for obtaining a Language object.
+    /// It uses lazy loading via the global cache.
     pub fn from_cache(&self) -> Result<Language, crate::traits::Error> {
         GLOBAL_GRAMMAR_CACHE.get_or_load(*self as usize, || self.load_language())
     }
@@ -182,12 +188,7 @@ mod tests {
         let cache = GrammarCache::new();
 
         // Load grammar for Python (index 0)
-        let lang = cache.get_or_load(0, || {
-            extern "C" {
-                fn tree_sitter_python() -> Language;
-            }
-            unsafe { tree_sitter_python() }
-        });
+        let lang = cache.get_or_load(0, || crate::traits::languages::python::language());
         assert!(lang.is_ok());
         assert_eq!(cache.len(), 1);
 
@@ -215,8 +216,20 @@ mod tests {
     }
 
     #[test]
-    fn test_global_cache_lazy_loading() {
-        // Load Python grammar from global cache
+    fn test_language_config_integration() {
+        // Test that LanguageId.config() returns the correct LanguageConfig
+        let py_config = LanguageId::Python.config();
+        assert_eq!(py_config.name, "Python");
+        assert!(py_config.extensions.contains(&"py".to_string()));
+
+        let js_config = LanguageId::JavaScript.config();
+        assert_eq!(js_config.name, "JavaScript");
+        assert!(js_config.extensions.contains(&"js".to_string()));
+    }
+
+    #[test]
+    fn test_unified_language_loading() {
+        // Test that LanguageId.from_cache() works correctly
         let lang = LanguageId::Python.from_cache();
         assert!(lang.is_ok());
 

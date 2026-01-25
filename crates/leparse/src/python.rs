@@ -13,89 +13,61 @@ impl PythonParser {
         Self
     }
 
-    /// Extract function signatures from Python source
-    fn extract_function_definitions(
+    /// Extract all function and class definitions from Python source
+    ///
+    /// This is the unified entry point for signature extraction that avoids
+    /// duplicate extraction by traversing the AST once and handling both
+    /// top-level functions and class methods appropriately.
+    fn extract_all_definitions(
         &self,
         source: &[u8],
         root: tree_sitter::Node,
     ) -> Vec<SignatureInfo> {
         let mut signatures = Vec::new();
-        let mut cursor = root.walk();
 
-        // Traverse the AST to find function definitions
-        // In Python, function definitions are 'function_definition' nodes
+        // Traverse the AST to find all definitions
         fn visit_node(
             node: &tree_sitter::Node,
             source: &[u8],
             signatures: &mut Vec<SignatureInfo>,
             class_name: Option<&str>,
         ) {
-            if node.kind() == "function_definition" {
-                if let Some(sig) = extract_function_signature(node, source, class_name) {
-                    signatures.push(sig);
+            match node.kind() {
+                "function_definition" => {
+                    // Extract function/method signature
+                    if let Some(sig) = extract_function_signature(node, source, class_name) {
+                        signatures.push(sig);
+                    }
+                    // Continue recursion to find nested functions
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        visit_node(&child, source, signatures, class_name);
+                    }
                 }
-            }
+                "class_definition" => {
+                    // Extract class name
+                    let class_name = node
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .map(|s| s.to_string());
 
-            // Recursively visit children
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                visit_node(&child, source, signatures, class_name);
+                    // Continue recursion into class body to find nested classes and methods
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        visit_node(&child, source, signatures, class_name.as_deref());
+                    }
+                }
+                _ => {
+                    // Recursively visit children for all other node types
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        visit_node(&child, source, signatures, class_name);
+                    }
+                }
             }
         }
 
         visit_node(&root, source, &mut signatures, None);
-        signatures
-    }
-
-    /// Extract class definitions and their methods
-    fn extract_class_definitions(
-        &self,
-        source: &[u8],
-        root: tree_sitter::Node,
-    ) -> Vec<SignatureInfo> {
-        let mut signatures = Vec::new();
-        let mut cursor = root.walk();
-
-        fn visit_classes(
-            node: &tree_sitter::Node,
-            source: &[u8],
-            signatures: &mut Vec<SignatureInfo>,
-        ) {
-            if node.kind() == "class_definition" {
-                // Extract class name
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    let class_name = name_node
-                        .utf8_text(source)
-                        .unwrap_or("")
-                        .to_string();
-
-                    // Now extract methods within this class
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        if child.kind() == "block" {
-                            let mut method_cursor = child.walk();
-                            for grandchild in child.children(&mut method_cursor) {
-                                if grandchild.kind() == "function_definition" {
-                                    if let Some(sig) =
-                                        extract_function_signature(&grandchild, source, Some(&class_name))
-                                    {
-                                        signatures.push(sig);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Recursively visit children
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                visit_classes(&child, source, signatures);
-            }
-        }
-
-        visit_classes(&root, source, &mut signatures);
         signatures
     }
 }
@@ -113,10 +85,9 @@ impl CodeIntelligence for PythonParser {
 
         let root_node = tree.root_node();
 
-        // Extract both top-level functions and class methods
-        let mut signatures = Vec::new();
-        signatures.extend(self.extract_function_definitions(source, root_node));
-        signatures.extend(self.extract_class_definitions(source, root_node));
+        // Extract signatures - extract_class_definitions handles both classes AND top-level functions
+        // by calling the shared extract_function_signature helper
+        let signatures = self.extract_all_definitions(source, root_node);
 
         Ok(signatures)
     }

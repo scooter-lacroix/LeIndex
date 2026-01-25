@@ -1,6 +1,7 @@
 // Tests for zero-copy AST node types
 
 use crate::ast::*;
+use crate::traits::Parameter;
 
 #[cfg(test)]
 mod zero_copy_tests {
@@ -53,10 +54,21 @@ mod zero_copy_tests {
     }
 
     #[test]
+    fn test_ast_node_bounds_checking() {
+        let source = b"short";
+        let node = AstNode::new(NodeType::Function, 0..100, 1, 0); // Out of bounds!
+
+        // Should return an error, not panic
+        let result = node.text(source);
+        assert!(result.is_err());
+        assert!(matches!(result, Err(crate::traits::Error::ParseFailed(_))));
+    }
+
+    #[test]
     fn test_function_element_zero_copy() {
         let source = b"function test(a, b) { return a + b; }";
         let func = FunctionElement {
-            name: "test".to_string(),
+            name_range: 9..13, // "test"
             qualified_name: "test".to_string(),
             parameters: vec![
                 Parameter {
@@ -74,37 +86,46 @@ mod zero_copy_tests {
             byte_range: 0..source.len(),
             line_number: 1,
             is_async: false,
-            docstring: None,
+            docstring_range: None,
         };
 
         // FunctionElement stores byte range, not owned text
-        // We can reconstruct the text from source if needed
-        assert_eq!(&source[func.byte_range.clone()], func.text(source).unwrap().as_bytes());
+        let text = func.get_text(source).unwrap();
+        assert_eq!(text, "function test(a, b) { return a + b; }");
+
+        // Can get name via byte range
+        let name = func.get_name(source).unwrap();
+        assert_eq!(name, Some("test"));
     }
 
     #[test]
     fn test_class_element_zero_copy() {
         let source = b"class MyClass extends Base { }";
         let class = ClassElement {
-            name: "MyClass".to_string(),
+            name_range: 6..13, // "MyClass"
             qualified_name: "MyClass".to_string(),
             base_classes: vec!["Base".to_string()],
             methods: vec![],
             byte_range: 0..source.len(),
             line_number: 1,
-            docstring: None,
+            docstring_range: None,
         };
 
         // Zero-copy verification
         assert_eq!(class.byte_range.len(), source.len());
-        assert_eq!(&source[class.byte_range.clone()], class.text(source).unwrap().as_bytes());
+        let text = class.get_text(source).unwrap();
+        assert_eq!(text, "class MyClass extends Base { }");
+
+        // Can get name via byte range
+        let name = class.get_name(source).unwrap();
+        assert_eq!(name, Some("MyClass"));
     }
 
     #[test]
     fn test_nested_ast_nodes() {
         let source = b"function outer() { function inner() {} }";
         let mut outer = AstNode::new(NodeType::Function, 0..source.len(), 1, 0);
-        outer.metadata.name = Some("outer".to_string());
+        outer.metadata.name_range = Some(9..14); // "outer"
 
         // Find the actual position of "function inner" in the source
         let inner_text = b"function inner() {}";
@@ -114,13 +135,19 @@ mod zero_copy_tests {
         let inner_range = inner_start..(inner_start + inner_text.len());
 
         let mut inner = AstNode::new(NodeType::Function, inner_range, 1, inner_start);
-        inner.metadata.name = Some("inner".to_string());
+        inner.metadata.name_range = Some(inner_start + 9..inner_start + 14); // "inner"
 
         outer.add_child(inner);
 
         // Both nodes store byte ranges, not text
         assert_eq!(outer.text(source).unwrap(), "function outer() { function inner() {} }");
         assert_eq!(outer.children[0].text(source).unwrap(), "function inner() {}");
+
+        // Can get names via byte ranges
+        let outer_name = outer.name(source).unwrap();
+        assert_eq!(outer_name, "outer");
+        let inner_name = outer.children[0].name(source).unwrap();
+        assert_eq!(inner_name, "inner");
     }
 
     #[test]
@@ -139,22 +166,19 @@ mod zero_copy_tests {
         let text = node.text(&large_source).unwrap();
         assert_eq!(text.len(), large_source.len());
     }
-}
 
-// Helper extension trait for testing
-trait ZeroCopyText {
-    fn text<'source>(&self, source: &'source [u8]) -> Result<&'source str, std::str::Utf8Error>;
-}
+    #[test]
+    fn test_import_with_byte_range() {
+        let source = b"import std::collections::HashMap";
+        let import = Import {
+            module_path: "std::collections".to_string(),
+            items: vec!["HashMap".to_string()],
+            alias: None,
+            byte_range: 0..source.len(),
+            line_number: 1,
+        };
 
-impl ZeroCopyText for FunctionElement {
-    fn text<'source>(&self, source: &'source [u8]) -> Result<&'source str, std::str::Utf8Error> {
-        std::str::from_utf8(&source[self.byte_range.clone()])
-    }
-}
-
-impl ZeroCopyText for ClassElement {
-    fn text<'source>(&self, source: &'source [u8]) -> Result<&'source str, std::str::Utf8Error> {
-        std::str::from_utf8(&source[self.byte_range.clone()])
+        assert_eq!(import.byte_range.len(), source.len());
     }
 }
 
@@ -185,16 +209,19 @@ mod ast_structure_tests {
 
     #[test]
     fn test_ast_node_hierarchy() {
+        let source = b"module test_module function test_func() end";
         let mut module = AstNode::new(NodeType::Module, 0..100, 1, 0);
-        module.metadata.name = Some("test_module".to_string());
+        module.metadata.name_range = Some(7..19); // "test_module"
 
-        let mut func = AstNode::new(NodeType::Function, 10..50, 2, 4);
-        func.metadata.name = Some("test_func".to_string());
+        let mut func = AstNode::new(NodeType::Function, 20..50, 2, 4);
+        // Find the correct position of "test_func" in the source
+        func.metadata.name_range = Some(28..37); // "test_func"
 
         module.add_child(func);
 
         assert_eq!(module.children.len(), 1);
-        assert_eq!(module.children[0].metadata.name.as_ref().unwrap(), "test_func");
+        let func_name = module.children[0].name(source).unwrap();
+        assert_eq!(func_name, "test_func");
     }
 
     #[test]
@@ -216,6 +243,7 @@ mod ast_structure_tests {
             module_path: "std::collections".to_string(),
             items: vec!["HashMap".to_string(), "HashSet".to_string()],
             alias: Some("collections".to_string()),
+            byte_range: 0..30,
             line_number: 5,
         };
 
@@ -223,6 +251,7 @@ mod ast_structure_tests {
         assert_eq!(import.items.len(), 2);
         assert_eq!(import.alias.unwrap(), "collections");
         assert_eq!(import.line_number, 5);
+        assert_eq!(import.byte_range.len(), 30);
     }
 }
 
@@ -246,7 +275,7 @@ mod benchmark_style_tests {
         }
         let duration = start.elapsed();
 
-        // Zero-copy access should be very fast (< 1ms for 1000 iterations)
+        // Zero-copy access should be very fast (< 10ms for 1000 iterations)
         assert!(duration.as_millis() < 10, "Zero-copy access should be fast");
     }
 

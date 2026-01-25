@@ -1,7 +1,7 @@
 // Core traits for code intelligence extraction
 
 use serde::{Deserialize, Serialize};
-use std::sync::LazyLock;
+use once_cell::sync::Lazy;
 
 /// Result type for parsing operations
 pub type Result<T> = std::result::Result<T, Error>;
@@ -186,7 +186,7 @@ pub struct QueryPatterns {
 
 impl LanguageConfig {
     /// Get language by file extension
-    pub fn from_extension(ext: &str) -> Option<&'static LazyLock<LanguageConfig>> {
+    pub fn from_extension(ext: &str) -> Option<&'static Lazy<LanguageConfig>> {
         match ext.to_lowercase().as_str() {
             "py" => Some(&languages::python::CONFIG),
             "js" | "jsx" => Some(&languages::javascript::CONFIG),
@@ -209,15 +209,15 @@ impl LanguageConfig {
 
 // Language-specific modules
 pub mod languages {
-    use std::sync::LazyLock;
+    use once_cell::sync::Lazy;
     use tree_sitter::Language;
     use crate::traits::LanguageConfig;
 
     pub mod python {
         use super::{LanguageConfig, Language};
-        use std::sync::LazyLock;
+        use once_cell::sync::Lazy;
 
-        pub static CONFIG: LazyLock<LanguageConfig> = LazyLock::new(|| LanguageConfig {
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
             name: "Python".to_string(),
             extensions: vec!["py".to_string()],
             queries: LanguageConfig::default_queries(),
@@ -230,9 +230,9 @@ pub mod languages {
 
     pub mod javascript {
         use super::{LanguageConfig, Language};
-        use std::sync::LazyLock;
+        use once_cell::sync::Lazy;
 
-        pub static CONFIG: LazyLock<LanguageConfig> = LazyLock::new(|| LanguageConfig {
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
             name: "JavaScript".to_string(),
             extensions: vec!["js".to_string(), "jsx".to_string()],
             queries: LanguageConfig::default_queries(),
@@ -245,9 +245,9 @@ pub mod languages {
 
     pub mod typescript {
         use super::{LanguageConfig, Language};
-        use std::sync::LazyLock;
+        use once_cell::sync::Lazy;
 
-        pub static CONFIG: LazyLock<LanguageConfig> = LazyLock::new(|| LanguageConfig {
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
             name: "TypeScript".to_string(),
             extensions: vec!["ts".to_string(), "tsx".to_string()],
             queries: LanguageConfig::default_queries(),
@@ -260,9 +260,9 @@ pub mod languages {
 
     pub mod go {
         use super::{LanguageConfig, Language};
-        use std::sync::LazyLock;
+        use once_cell::sync::Lazy;
 
-        pub static CONFIG: LazyLock<LanguageConfig> = LazyLock::new(|| LanguageConfig {
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
             name: "Go".to_string(),
             extensions: vec!["go".to_string()],
             queries: LanguageConfig::default_queries(),
@@ -275,9 +275,9 @@ pub mod languages {
 
     pub mod rust {
         use super::{LanguageConfig, Language};
-        use std::sync::LazyLock;
+        use once_cell::sync::Lazy;
 
-        pub static CONFIG: LazyLock<LanguageConfig> = LazyLock::new(|| LanguageConfig {
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
             name: "Rust".to_string(),
             extensions: vec!["rs".to_string()],
             queries: LanguageConfig::default_queries(),
