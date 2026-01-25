@@ -19,23 +19,23 @@ This track implements the Core Parsing Engine for LeIndex Rust Renaissance. It p
 ### Objective
 Set up tree-sitter infrastructure and language grammars.
 
-- [ ] **Task 1.1: Add tree-sitter dependencies**
-  - [ ] Add tree-sitter to `Cargo.toml`
-  - [ ] Add language grammar crates for all 17+ languages
-  - [ ] Configure build scripts for grammar compilation
-  - [ ] Verify tree-sitter compiles successfully
+- [x] **Task 1.1: Add tree-sitter dependencies**
+  - [x] Add tree-sitter to `Cargo.toml`
+  - [x] Add language grammar crates for all 17+ languages
+  - [x] Configure build scripts for grammar compilation
+  - [x] Verify tree-sitter compiles successfully
 
-- [ ] **Task 1.2: Create LanguageConfig structures**
-  - [ ] Define `LanguageConfig` struct per language
-  - [ ] Implement language detection (file extension based)
-  - [ ] Create language registry for runtime lookup
-  - [ ] Write tests for language detection
+- [x] **Task 1.2: Create LanguageConfig structures**
+  - [x] Define `LanguageConfig` struct per language
+  - [x] Implement language detection (file extension based)
+  - [x] Create language registry for runtime lookup
+  - [x] Write tests for language detection
 
-- [ ] **Task 1.3: Implement lazy-loaded grammar loading**
-  - [ ] Create grammar cache with lazy initialization
-  - [ ] Implement thread-safe grammar storage
-  - [ ] Add memory-efficient grammar pooling
-  - [ ] Write tests for grammar loading correctness
+- [x] **Task 1.3: Implement lazy-loaded grammar loading**
+  - [x] Create grammar cache with lazy initialization
+  - [x] Implement thread-safe grammar storage
+  - [x] Add memory-efficient grammar pooling
+  - [x] Write tests for grammar loading correctness
 
 - [ ] **Task: Maestro - Phase 1 Verification**
 
