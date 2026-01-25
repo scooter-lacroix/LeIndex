@@ -27,6 +27,54 @@ pub mod python;
 /// JavaScript and TypeScript language implementation.
 pub mod javascript;
 
+/// Go language implementation.
+pub mod go;
+
+/// Rust language implementation.
+pub mod rust;
+
+/// Java language implementation.
+pub mod java;
+
+/// C++ language implementation.
+pub mod cpp;
+
+/// C# language implementation.
+pub mod csharp;
+
+/// Ruby language implementation.
+pub mod ruby;
+
+/// PHP language implementation.
+pub mod php;
+
+// Swift language implementation - disabled due to tree-sitter version incompatibility
+// pub mod swift;
+
+// Kotlin language implementation - disabled due to tree-sitter version incompatibility
+// pub mod kotlin;
+
+// Dart language implementation - disabled due to parsing issues
+// pub mod dart;
+
+/// Lua language implementation.
+pub mod lua;
+
+/// Scala language implementation.
+pub mod scala;
+
+#[cfg(test)]
+mod debug_go;
+
+#[cfg(test)]
+mod debug_go_returns;
+
+#[cfg(test)]
+mod debug_go_params;
+
+#[cfg(test)]
+mod debug_rust;
+
 /// Re-exports of commonly used types.
 pub mod prelude;
 
@@ -39,3 +87,11 @@ pub fn init() {
     // Initialize logging if not already set up
     let _ = tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
 }
+
+#[cfg(test)]
+mod debug_csharp_ast;
+
+
+#[cfg(test)]
+mod debug_lua_ast;
+

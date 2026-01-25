@@ -282,4 +282,159 @@ pub mod languages {
             tree_sitter_rust::LANGUAGE.into()
         }
     }
+
+    pub mod java {
+        use super::{LanguageConfig, Language};
+        use once_cell::sync::Lazy;
+
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+            name: "Java".to_string(),
+            extensions: vec!["java".to_string()],
+            queries: LanguageConfig::default_queries(),
+        });
+
+        pub fn language() -> Language {
+            tree_sitter_java::LANGUAGE.into()
+        }
+    }
+
+    pub mod cpp {
+        use super::{LanguageConfig, Language};
+        use once_cell::sync::Lazy;
+
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+            name: "C++".to_string(),
+            extensions: vec!["cpp".to_string(), "cc".to_string(), "cxx".to_string(), "hpp".to_string(), "h".to_string()],
+            queries: LanguageConfig::default_queries(),
+        });
+
+        pub fn language() -> Language {
+            tree_sitter_cpp::LANGUAGE.into()
+        }
+    }
+
+    pub mod csharp {
+        use super::{LanguageConfig, Language};
+        use once_cell::sync::Lazy;
+
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+            name: "C#".to_string(),
+            extensions: vec!["cs".to_string()],
+            queries: LanguageConfig::default_queries(),
+        });
+
+        pub fn language() -> Language {
+            tree_sitter_c_sharp::LANGUAGE.into()
+        }
+    }
+
+    pub mod ruby {
+        use super::{LanguageConfig, Language};
+        use once_cell::sync::Lazy;
+
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+            name: "Ruby".to_string(),
+            extensions: vec!["rb".to_string()],
+            queries: LanguageConfig::default_queries(),
+        });
+
+        pub fn language() -> Language {
+            tree_sitter_ruby::LANGUAGE.into()
+        }
+    }
+
+    pub mod php {
+        use super::{LanguageConfig, Language};
+        use once_cell::sync::Lazy;
+
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+            name: "PHP".to_string(),
+            extensions: vec!["php".to_string()],
+            queries: LanguageConfig::default_queries(),
+        });
+
+        pub fn language() -> Language {
+            // tree_sitter_php provides LANGUAGE_PHP constant (LanguageFn type)
+            tree_sitter_php::LANGUAGE_PHP.into()
+        }
+    }
+
+    // Swift language implementation - disabled due to tree-sitter version incompatibility (grammar v15 vs library v13-14)
+    // pub mod swift {
+    //     use super::{LanguageConfig, Language};
+    //     use once_cell::sync::Lazy;
+    //
+    //     pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+    //         name: "Swift".to_string(),
+    //         extensions: vec!["swift".to_string()],
+    //         queries: LanguageConfig::default_queries(),
+    //     });
+    //
+    //     pub fn language() -> Language {
+    //         tree_sitter_swift::LANGUAGE.into()
+    //     }
+    // }
+
+    // TODO: Kotlin support disabled due to tree-sitter version incompatibility (0.20.10 vs 0.24.7)
+    // The kotlin crate depends on an older version of tree-sitter, causing duplicate symbol errors
+    // pub mod kotlin {
+    //     use super::{LanguageConfig, Language};
+    //     use once_cell::sync::Lazy;
+    //
+    //     pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+    //         name: "Kotlin".to_string(),
+    //         extensions: vec!["kt".to_string(), "kts".to_string()],
+    //         queries: LanguageConfig::default_queries(),
+    //     });
+    //
+    //     pub fn language() -> Language {
+    //         tree_sitter_kotlin::language()
+    //     }
+    // }
+
+    // Dart language implementation - disabled due to parsing issues
+    // pub mod dart {
+    //     use super::{LanguageConfig, Language};
+    //     use once_cell::sync::Lazy;
+    //
+    //     pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+    //         name: "Dart".to_string(),
+    //         extensions: vec!["dart".to_string()],
+    //         queries: LanguageConfig::default_queries(),
+    //     });
+    //
+    //     pub fn language() -> Language {
+    //         tree_sitter_dart::language()
+    //     }
+    // }
+
+    pub mod lua {
+        use super::{LanguageConfig, Language};
+        use once_cell::sync::Lazy;
+
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+            name: "Lua".to_string(),
+            extensions: vec!["lua".to_string()],
+            queries: LanguageConfig::default_queries(),
+        });
+
+        pub fn language() -> Language {
+            tree_sitter_lua::LANGUAGE.into()
+        }
+    }
+
+    pub mod scala {
+        use super::{LanguageConfig, Language};
+        use once_cell::sync::Lazy;
+
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+            name: "Scala".to_string(),
+            extensions: vec!["scala".to_string(), "sc".to_string()],
+            queries: LanguageConfig::default_queries(),
+        });
+
+        pub fn language() -> Language {
+            tree_sitter_scala::LANGUAGE.into()
+        }
+    }
 }

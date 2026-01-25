@@ -109,7 +109,7 @@ pub static GLOBAL_GRAMMAR_CACHE: Lazy<GrammarCache> = Lazy::new(GrammarCache::ne
 ///
 /// This enum provides a single source of truth for language identification,
 /// combining the previous LanguageId with LanguageConfig integration.
-/// The discriminants (0, 1, 2, 3, 4) correspond to cache indices.
+/// The discriminants correspond to cache indices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LanguageId {
     Python = 0,
@@ -117,6 +117,16 @@ pub enum LanguageId {
     TypeScript = 2,
     Go = 3,
     Rust = 4,
+    Java = 5,
+    Cpp = 6,
+    CSharp = 7,
+    Ruby = 8,
+    Php = 9,
+    // Swift = 10, // TODO: Disabled due to tree-sitter version incompatibility (grammar v15 vs library v13-14)
+    // Kotlin = 11, // TODO: Disabled due to tree-sitter version incompatibility (0.20.10 vs 0.24.7)
+    // Dart = 11, // TODO: Disabled due to parsing issues
+    Lua = 10,
+    Scala = 11,
 }
 
 impl LanguageId {
@@ -131,6 +141,16 @@ impl LanguageId {
             "ts" | "tsx" => Some(LanguageId::TypeScript),
             "go" => Some(LanguageId::Go),
             "rs" => Some(LanguageId::Rust),
+            "java" => Some(LanguageId::Java),
+            "cpp" | "cc" | "cxx" | "hpp" | "h" => Some(LanguageId::Cpp),
+            "cs" => Some(LanguageId::CSharp),
+            "rb" => Some(LanguageId::Ruby),
+            "php" => Some(LanguageId::Php),
+            // "swift" => Some(LanguageId::Swift), // TODO: Disabled
+            // "kt" | "kts" => Some(LanguageId::Kotlin), // TODO: Disabled
+            // "dart" => Some(LanguageId::Dart), // TODO: Disabled
+            "lua" => Some(LanguageId::Lua),
+            "scala" | "sc" => Some(LanguageId::Scala),
             _ => None,
         }
     }
@@ -146,6 +166,16 @@ impl LanguageId {
             LanguageId::TypeScript => &crate::traits::languages::typescript::CONFIG,
             LanguageId::Go => &crate::traits::languages::go::CONFIG,
             LanguageId::Rust => &crate::traits::languages::rust::CONFIG,
+            LanguageId::Java => &crate::traits::languages::java::CONFIG,
+            LanguageId::Cpp => &crate::traits::languages::cpp::CONFIG,
+            LanguageId::CSharp => &crate::traits::languages::csharp::CONFIG,
+            LanguageId::Ruby => &crate::traits::languages::ruby::CONFIG,
+            LanguageId::Php => &crate::traits::languages::php::CONFIG,
+            // LanguageId::Swift => &crate::traits::languages::swift::CONFIG, // TODO: Disabled
+            // LanguageId::Kotlin => &crate::traits::languages::kotlin::CONFIG, // TODO: Disabled
+            // LanguageId::Dart => &crate::traits::languages::dart::CONFIG, // TODO: Disabled
+            LanguageId::Lua => &crate::traits::languages::lua::CONFIG,
+            LanguageId::Scala => &crate::traits::languages::scala::CONFIG,
         }
     }
 
@@ -160,6 +190,16 @@ impl LanguageId {
             LanguageId::TypeScript => crate::traits::languages::typescript::language(),
             LanguageId::Go => crate::traits::languages::go::language(),
             LanguageId::Rust => crate::traits::languages::rust::language(),
+            LanguageId::Java => crate::traits::languages::java::language(),
+            LanguageId::Cpp => crate::traits::languages::cpp::language(),
+            LanguageId::CSharp => crate::traits::languages::csharp::language(),
+            LanguageId::Ruby => crate::traits::languages::ruby::language(),
+            LanguageId::Php => crate::traits::languages::php::language(),
+            // LanguageId::Swift => crate::traits::languages::swift::language(), // TODO: Disabled
+            // LanguageId::Kotlin => crate::traits::languages::kotlin::language(), // TODO: Disabled
+            // LanguageId::Dart => crate::traits::languages::dart::language(), // TODO: Disabled
+            LanguageId::Lua => crate::traits::languages::lua::language(),
+            LanguageId::Scala => crate::traits::languages::scala::language(),
         }
     }
 

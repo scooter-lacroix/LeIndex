@@ -28,9 +28,9 @@ tree-sitter-cpp = "0.23"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-ruby = "0.23"
 tree-sitter-php = "0.23"
-tree-sitter-swift = "0.7"
-tree-sitter-kotlin = "0.3"
-tree-sitter-dart = "0.0.4"
+# tree-sitter-swift = "0.7"  # TODO: Disabled due to tree-sitter version incompatibility (grammar v15 vs library v13-14)
+# tree-sitter-kotlin = "0.3"  # TODO: Disabled due to tree-sitter version incompatibility (0.20.10 vs 0.24.7)
+# tree-sitter-dart = "0.0.4"  # TODO: Disabled due to parsing issues
 tree-sitter-lua = "0.2"
 tree-sitter-scala = "0.24"
 # Additional grammars for future expansion
