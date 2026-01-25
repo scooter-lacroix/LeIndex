@@ -46,23 +46,23 @@ Set up tree-sitter infrastructure and language grammars.
 ### Objective
 Define zero-copy AST node types and structures.
 
-- [ ] **Task 2.1: Define core AST types**
-  - [ ] Create `AstNode` struct with byte-slice references
-  - [ ] Implement `SignatureInfo` for function/class signatures
-  - [ ] Define `FunctionElement`, `ClassElement`, `ModuleElement`
-  - [ ] Add documentation for all types
+- [x] **Task 2.1: Define core AST types**
+  - [x] Create `AstNode` struct with byte-slice references
+  - [x] Implement `SignatureInfo` for function/class signatures
+  - [x] Define `FunctionElement`, `ClassElement`, `ModuleElement`
+  - [x] Add documentation for all types
 
-- [ ] **Task 2.2: Implement zero-copy node references**
-  - [ ] Use `&[u8]` for source text references
-  - [ ] Implement lifetime-safe AST node borrowing
-  - [ ] Add tests verifying zero-copy properties
-  - [ ] Benchmark memory usage vs string-based approach
+- [x] **Task 2.2: Implement zero-copy node references**
+  - [x] Use `&[u8]` for source text references
+  - [x] Implement lifetime-safe AST node borrowing
+  - [x] Add tests verifying zero-copy properties
+  - [x] Benchmark memory usage vs string-based approach
 
-- [ ] **Task 2.3: Implement docstring extraction**
-  - [ ] Extract docstrings from AST nodes
-  - [ ] Implement semantic summarization (basic)
-  - [ ] Add docstring storage in node metadata
-  - [ ] Write tests for docstring extraction
+- [x] **Task 2.3: Implement docstring extraction**
+  - [x] Extract docstrings from AST nodes
+  - [x] Implement semantic summarization (basic)
+  - [x] Add docstring storage in node metadata
+  - [x] Write tests for docstring extraction
 
 - [ ] **Task: Maestro - Phase 2 Verification**
 

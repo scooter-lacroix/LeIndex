@@ -1,0 +1,8 @@
+((&str, A), (&str, B), (&str, C), (&str, D), (&str, E), (&str, F), (&str, G), (&str, H), (&str, I))
+((&str, A), (&str, B), (&str, C), (&str, D), (&str, E), (&str, F), (&str, G), (&str, H), (&str, I), (&str, J))
+((&str, A), (&str, B), (&str, C), (&str, D), (&str, E), (&str, F), (&str, G), (&str, H), (&str, I), (&str, J), (&str, K))
+((&str, A), (&str, B), (&str, C), (&str, D), (&str, E), (&str, F), (&str, G), (&str, H), (&str, I), (&str, J), (&str, K), (&str, L))
+((&str, A), (&str, B), (&str, C), (&str, D), (&str, E), (&str, F), (&str, G), (&str, H), (&str, I), (&str, J), (&str, K), (&str, L), (&str, M))
+((&str, A), (&str, B), (&str, C), (&str, D), (&str, E), (&str, F), (&str, G), (&str, H), (&str, I), (&str, J), (&str, K), (&str, L), (&str, M), (&str, N))
+((&str, A), (&str, B), (&str, C), (&str, D), (&str, E), (&str, F), (&str, G), (&str, H), (&str, I), (&str, J), (&str, K), (&str, L), (&str, M), (&str, N), (&str, O))
+((&str, A), (&str, B), (&str, C), (&str, D), (&str, E), (&str, F), (&str, G), (&str, H), (&str, I), (&str, J), (&str, K), (&str, L), (&str, M), (&str, N), (&str, O), (&str, P))

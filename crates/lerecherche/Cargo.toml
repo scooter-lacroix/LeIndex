@@ -1,0 +1,26 @@
+[package]
+name = "lerecherche"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Workspace dependencies
+serde.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+# Internal dependencies
+leparse = { path = "../leparse" }
+legraphe = { path = "../legraphe" }
+
+[dev-dependencies]
+rstest.workspace = true
+
+[lib]
+name = "lerecherche"
+crate-type = ["rlib"]

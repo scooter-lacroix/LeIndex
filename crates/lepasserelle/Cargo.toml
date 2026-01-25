@@ -1,0 +1,35 @@
+[package]
+name = "lepasserelle"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "lepasserelle"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Workspace dependencies
+pyo3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+psutil.workspace = true
+
+# Internal dependencies
+leparse = { path = "../leparse" }
+legraphe = { path = "../legraphe" }
+lerecherche = { path = "../lerecherche" }
+lestockage = { path = "../lestockage" }
+
+[features]
+# Extension module for Python
+python-bindings = ["pyo3/extension-module"]
+
+[dev-dependencies]
+rstest.workspace = true

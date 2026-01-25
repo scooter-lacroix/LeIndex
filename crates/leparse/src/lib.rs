@@ -14,6 +14,10 @@ pub mod grammar;
 /// AST node types and implementations.
 pub mod ast;
 
+/// Tests for AST zero-copy properties.
+#[cfg(test)]
+mod ast_tests;
+
 /// Language-specific parsers.
 pub mod languages;
 
