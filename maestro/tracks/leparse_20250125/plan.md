@@ -73,17 +73,17 @@ Define zero-copy AST node types and structures.
 ### Objective
 Implement the trait-based extractor pattern.
 
-- [ ] **Task 3.1: Define CodeIntelligence trait**
-  - [ ] Create trait definition with required methods
-  - [ ] Add documentation for trait methods
-  - [ ] Define associated types for trait
-  - [ ] Write trait documentation examples
+- [x] **Task 3.1: Define CodeIntelligence trait**
+  - [x] Create trait definition with required methods
+  - [x] Add documentation for trait methods
+  - [x] Define associated types for trait
+  - [x] Write trait documentation examples
 
-- [ ] **Task 3.2: Implement Python language support**
-  - [ ] Implement `CodeIntelligence` for Python
-  - [ ] Add `get_signatures()` extraction
-  - [ ] Add `compute_cfg()` control flow graph generation
-  - [ ] Add `extract_complexity()` metrics calculation
+- [x] **Task 3.2: Implement Python language support**
+  - [x] Implement `CodeIntelligence` for Python
+  - [x] Add `get_signatures()` extraction
+  - [x] Add `compute_cfg()` control flow graph generation
+  - [x] Add `extract_complexity()` metrics calculation
 
 - [ ] **Task 3.3: Implement JavaScript/TypeScript support**
   - [ ] Implement `CodeIntelligence` for JavaScript

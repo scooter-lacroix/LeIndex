@@ -21,6 +21,9 @@ mod ast_tests;
 /// Language-specific parsers.
 pub mod languages;
 
+/// Python language implementation.
+pub mod python;
+
 /// Re-exports of commonly used types.
 pub mod prelude;
 
