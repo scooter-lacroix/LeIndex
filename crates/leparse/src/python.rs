@@ -7,6 +7,12 @@ use tree_sitter::Parser;
 /// Python language parser with full CodeIntelligence implementation
 pub struct PythonParser;
 
+impl Default for PythonParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PythonParser {
     /// Create a new Python parser
     pub fn new() -> Self {
@@ -18,6 +24,8 @@ impl PythonParser {
     /// This is the unified entry point for signature extraction that avoids
     /// duplicate extraction by traversing the AST once and handling both
     /// top-level functions and class methods appropriately.
+    ///
+    /// Tracks the full qualified name path including nested functions.
     fn extract_all_definitions(
         &self,
         source: &[u8],
@@ -26,22 +34,43 @@ impl PythonParser {
         let mut signatures = Vec::new();
 
         // Traverse the AST to find all definitions
+        // We track the full qualified name path as a vector of name components
         fn visit_node(
             node: &tree_sitter::Node,
             source: &[u8],
             signatures: &mut Vec<SignatureInfo>,
-            class_name: Option<&str>,
+            parent_path: &[String],
         ) {
             match node.kind() {
                 "function_definition" => {
-                    // Extract function/method signature
-                    if let Some(sig) = extract_function_signature(node, source, class_name) {
-                        signatures.push(sig);
-                    }
-                    // Continue recursion to find nested functions
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        visit_node(&child, source, signatures, class_name);
+                    // Extract function name
+                    let func_name = node
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                        .map(|s| s.to_string());
+
+                    if let Some(name) = func_name {
+                        // Build the full qualified path
+                        let mut qualified_path = parent_path.to_vec();
+                        qualified_path.push(name.clone());
+                        let qualified_name = qualified_path.join(".");
+
+                        // Extract function signature with full qualified name
+                        if let Some(sig) = extract_function_signature_with_path(node, source, &qualified_name) {
+                            signatures.push(sig);
+                        }
+
+                        // Continue recursion to find nested functions with updated path
+                        let mut cursor = node.walk();
+                        for child in node.children(&mut cursor) {
+                            visit_node(&child, source, signatures, &qualified_path);
+                        }
+                    } else {
+                        // Continue recursion without adding to path
+                        let mut cursor = node.walk();
+                        for child in node.children(&mut cursor) {
+                            visit_node(&child, source, signatures, parent_path);
+                        }
                     }
                 }
                 "class_definition" => {
@@ -51,23 +80,35 @@ impl PythonParser {
                         .and_then(|n| n.utf8_text(source).ok())
                         .map(|s| s.to_string());
 
-                    // Continue recursion into class body to find nested classes and methods
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        visit_node(&child, source, signatures, class_name.as_deref());
+                    if let Some(name) = class_name {
+                        // Add class to path
+                        let mut class_path = parent_path.to_vec();
+                        class_path.push(name);
+
+                        // Continue recursion into class body
+                        let mut cursor = node.walk();
+                        for child in node.children(&mut cursor) {
+                            visit_node(&child, source, signatures, &class_path);
+                        }
+                    } else {
+                        // Continue recursion without adding to path
+                        let mut cursor = node.walk();
+                        for child in node.children(&mut cursor) {
+                            visit_node(&child, source, signatures, parent_path);
+                        }
                     }
                 }
                 _ => {
                     // Recursively visit children for all other node types
                     let mut cursor = node.walk();
                     for child in node.children(&mut cursor) {
-                        visit_node(&child, source, signatures, class_name);
+                        visit_node(&child, source, signatures, parent_path);
                     }
                 }
             }
         }
 
-        visit_node(&root, source, &mut signatures, None);
+        visit_node(&root, source, &mut signatures, &[]);
         signatures
     }
 }
@@ -129,6 +170,10 @@ impl CodeIntelligence for PythonParser {
 }
 
 /// Extract function signature from a function_definition node
+///
+/// This is the legacy version for backward compatibility.
+/// New code should use `extract_function_signature_with_path`.
+#[allow(dead_code)]
 fn extract_function_signature(
     node: &tree_sitter::Node,
     source: &[u8],
@@ -137,6 +182,27 @@ fn extract_function_signature(
     // Extract function name
     let name_node = node.child_by_field_name("name")?;
     let name = name_node.utf8_text(source).ok()?.to_string();
+
+    // Build qualified name from class_name if present
+    let qualified_name = if let Some(class) = class_name {
+        format!("{}.{}", class, name)
+    } else {
+        name.clone()
+    };
+
+    extract_function_signature_with_path(node, source, &qualified_name)
+}
+
+/// Extract function signature from a function_definition node with a pre-computed qualified name
+///
+/// This version supports full qualified name paths including nested functions.
+fn extract_function_signature_with_path(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    qualified_name: &str,
+) -> Option<SignatureInfo> {
+    // Extract function name (the last component of the qualified name)
+    let name = qualified_name.split('.').next_back().unwrap_or(qualified_name).to_string();
 
     // Extract parameters
     let parameters_node = node.child_by_field_name("parameters")?;
@@ -156,21 +222,17 @@ fn extract_function_signature(
     // Extract docstring (if present)
     let docstring = extract_docstring(node, source);
 
-    // Build qualified name
-    let qualified_name = if let Some(class) = class_name {
-        format!("{}.{}", class, name)
-    } else {
-        name.clone()
-    };
+    // Determine if this is a method (qualified name contains at least one dot)
+    let is_method = qualified_name.contains('.');
 
     Some(SignatureInfo {
         name,
-        qualified_name,
+        qualified_name: qualified_name.to_string(),
         parameters,
         return_type,
         visibility: Visibility::Public, // Python doesn't have explicit visibility
         is_async,
-        is_method: class_name.is_some(),
+        is_method,
         docstring,
     })
 }

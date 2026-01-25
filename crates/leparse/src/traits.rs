@@ -1,7 +1,6 @@
 // Core traits for code intelligence extraction
 
 use serde::{Deserialize, Serialize};
-use once_cell::sync::Lazy;
 
 /// Result type for parsing operations
 pub type Result<T> = std::result::Result<T, Error>;
@@ -186,15 +185,12 @@ pub struct QueryPatterns {
 
 impl LanguageConfig {
     /// Get language by file extension
-    pub fn from_extension(ext: &str) -> Option<&'static Lazy<LanguageConfig>> {
-        match ext.to_lowercase().as_str() {
-            "py" => Some(&languages::python::CONFIG),
-            "js" | "jsx" => Some(&languages::javascript::CONFIG),
-            "ts" | "tsx" => Some(&languages::typescript::CONFIG),
-            "go" => Some(&languages::go::CONFIG),
-            "rs" => Some(&languages::rust::CONFIG),
-            _ => None,
-        }
+    ///
+    /// This method delegates to `LanguageId::from_extension` to eliminate
+    /// duplicate extension mapping logic and maintain a single source of truth.
+    pub fn from_extension(ext: &str) -> Option<&'static LanguageConfig> {
+        crate::grammar::LanguageId::from_extension(ext)
+            .map(|id| id.config())
     }
 
     const fn default_queries() -> QueryPatterns {
@@ -209,7 +205,6 @@ impl LanguageConfig {
 
 // Language-specific modules
 pub mod languages {
-    use once_cell::sync::Lazy;
     use tree_sitter::Language;
     use crate::traits::LanguageConfig;
 

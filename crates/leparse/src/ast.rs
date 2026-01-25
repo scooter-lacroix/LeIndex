@@ -215,8 +215,11 @@ pub struct ClassElement {
 /// Module element
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModuleElement {
-    /// Module name
-    pub name: String,
+    /// Module name range (zero-copy)
+    pub name_range: std::ops::Range<usize>,
+
+    /// Qualified name (computed from file path, not source)
+    pub qualified_name: String,
 
     /// Functions defined in module
     pub functions: Vec<FunctionElement>,
@@ -358,5 +361,32 @@ impl ZeroCopyText for ClassElement {
         } else {
             Ok(None)
         }
+    }
+}
+
+impl ZeroCopyText for ModuleElement {
+    fn get_text<'source>(&self, source: &'source [u8]) -> Result<&'source str, crate::traits::Error> {
+        if self.byte_range.end > source.len() {
+            return Err(crate::traits::Error::ParseFailed(
+                "Module byte range out of bounds".to_string()
+            ));
+        }
+        std::str::from_utf8(&source[self.byte_range.clone()])
+            .map_err(|e| crate::traits::Error::Utf8(e))
+    }
+
+    fn get_name<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
+        if self.name_range.end > source.len() {
+            return Err(crate::traits::Error::ParseFailed(
+                "Module name range out of bounds".to_string()
+            ));
+        }
+        Ok(Some(std::str::from_utf8(&source[self.name_range.clone()])
+            .map_err(|e| crate::traits::Error::Utf8(e))?))
+    }
+
+    fn get_docstring<'source>(&self, _source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
+        // Module elements don't have docstrings in the same way
+        Ok(None)
     }
 }
