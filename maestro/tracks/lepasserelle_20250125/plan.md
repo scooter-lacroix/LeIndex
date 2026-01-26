@@ -14,9 +14,9 @@ This track implements the **Integration & API Layer** for LeIndex Rust Renaissan
 
 **IMPORTANT:** This is a **100% Pure Rust implementation**. All PyO3/Python bindings from the prototype are being removed and replaced with native Rust implementations.
 
-**Source-Code-Verified Status:** ~25% COMPLETE ⚠️ IN PROGRESS
+**Source-Code-Verified Status:** ~40% COMPLETE ⚠️ IN PROGRESS
 
-**Current State:** PyO3 dependencies removed, pure Rust foundation established. Ready for Phase 2/4 implementation.
+**Current State:** PyO3 dependencies removed, pure Rust foundation established, core orchestration layer implemented. Working on Phase 2/4/5.
 
 ---
 
@@ -105,18 +105,19 @@ Create command-line interface for LeIndex.
 
 ---
 
-## Phase 4: Integration Layer ❌ NOT STARTED
+## Phase 4: Integration Layer ⚠️ IN PROGRESS
 
 ### Objective
 Create unified API that brings all crates together.
 
-- [ ] **Task 4.1: Implement LeIndex orchestration** ❌ NOT STARTED
-  - [ ] `LeIndex` struct with project management
-  - [ ] `index_project()` - Full pipeline (parse → graph → index → store)
-  - [ ] `search()` - Unified search interface
-  - [ ] `analyze()` - Deep analysis with PDG expansion
-  - [ ] `get_diagnostics()` - Project statistics
-  - **File:** `src/leindex.rs` (new file, ~400 lines)
+- [x] **Task 4.1: Implement LeIndex orchestration** ✅ COMPLETE (2933c6a)
+  - [x] `LeIndex` struct with project management
+  - [x] `index_project()` - Full pipeline (parse → graph → index → store)
+  - [x] `search()` - Unified search interface
+  - [x] `analyze()` - Deep analysis with PDG expansion
+  - [x] `get_diagnostics()` - Project statistics
+  - [x] `load_from_storage()` - Reload previously indexed projects
+  - **File:** `src/leindex.rs` (690 lines created)
 
 - [ ] **Task 4.2: Implement project configuration** ❌ NOT STARTED
   - [ ] `ProjectConfig` with TOML/JSON support
@@ -221,27 +222,27 @@ The track is complete when:
 
 ## Files to Delete
 
-- `src/bridge.rs` - Entire file (Python FFI, no longer needed)
-- Python bindings from `src/lib.rs`
+- [x] `src/bridge.rs` - Entire file (Python FFI, no longer needed) ✅ DELETED (e2c6243)
+- [x] Python bindings from `src/lib.rs` ✅ REMOVED (e2c6243)
 
 ---
 
-## Files to Create
+## Files Created
 
-| File | Purpose | Est. Lines |
-|------|---------|------------|
-| `src/mcp/server.rs` | MCP JSON-RPC server | ~300 |
-| `src/mcp/handlers.rs` | MCP tool handlers | ~400 |
-| `src/integration.rs` | Crate integration layer | ~300 |
-| `src/cli.rs` | CLI structure | ~300 |
-| `src/cli/index.rs` | Index command | ~200 |
-| `src/cli/search.rs` | Search command | ~150 |
-| `src/leindex.rs` | Main orchestration | ~400 |
-| `src/config.rs` | Configuration | ~200 |
-| `src/errors.rs` | Error handling | ~150 |
-| `tests/integration.rs` | Integration tests | ~500 |
+| File | Purpose | Lines | Status |
+|------|---------|------------|--------|
+| `src/leindex.rs` | Main orchestration | 690 | ✅ DONE (2933c6a) |
+| `src/mcp/server.rs` | MCP JSON-RPC server | ~300 | ⏳ TODO |
+| `src/mcp/handlers.rs` | MCP tool handlers | ~400 | ⏳ TODO |
+| `src/integration.rs` | Crate integration layer | ~300 | ⏳ TODO |
+| `src/cli.rs` | CLI structure | ~300 | ⏳ TODO |
+| `src/cli/index.rs` | Index command | ~200 | ⏳ TODO |
+| `src/cli/search.rs` | Search command | ~150 | ⏳ TODO |
+| `src/config.rs` | Configuration | ~200 | ⏳ TODO |
+| `src/errors.rs` | Error handling | ~150 | ⏳ TODO |
+| `tests/integration.rs` | Integration tests | ~500 | ⏳ TODO |
 
-**Total New Code:** ~2,900 lines of pure Rust
+**Progress:** 690 / ~2,900 lines (~24%)
 
 ---
 

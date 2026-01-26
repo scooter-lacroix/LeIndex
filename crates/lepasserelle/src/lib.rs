@@ -5,12 +5,16 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
+pub mod config;
+pub mod errors;
 pub mod leindex;
 pub mod memory;
 pub mod mcp;
 
+pub use config::{ProjectConfig, LanguageConfig, TokenConfig, StorageConfig};
+pub use errors::{LeIndexError, Result as LeIndexResult, RecoveryStrategy, ErrorContext};
 pub use leindex::{LeIndex, IndexStats, AnalysisResult as LeIndexAnalysisResult, Diagnostics};
-pub use memory::{MemoryManager, MemoryConfig};
+pub use memory::{MemoryManager, MemoryConfig as MemoryManagementConfig};
 pub use mcp::{LeIndexDeepAnalyze, AnalysisResult as McpAnalysisResult};
 
 /// Library initialization

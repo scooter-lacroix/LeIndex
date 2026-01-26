@@ -193,6 +193,34 @@ Serialize and deserialize PDG for storage.
 
 ---
 
+## Phase 7.3: Cross-Project PDG Extension ✅ COMPLETE
+
+### Objective
+Extend PDG with cross-project capabilities for multi-project analysis.
+
+- [x] **Task 7.3.1: Implement CrossProjectPDG** ✅ COMPLETE
+  - [x] CrossProjectPDG with merged_pdg and node_origins
+  - [x] merge_external_pdg() for combining graphs
+  - [x] External node reference tracking
+  - [x] max_depth limiting for lazy loading
+  - **File:** `src/cross_project.rs` (471 lines)
+  - **Tests:** 5 comprehensive tests passing
+
+- [x] **Task 7.3.2: External PDG lazy loading** ✅ COMPLETE
+  - [x] add_external_ref() for lazy external references
+  - [x] is_external_node() for origin checking
+  - [x] get_referenced_projects() for project discovery
+  - [x] local_nodes() and external_nodes() filtering
+  - **Tests:** 3 tests passing
+
+- [x] **Task 7.3.3: Cross-project serialization** ✅ COMPLETE
+  - [x] to_serializable() for storage format
+  - [x] from_serializable_with_pdg() for reconstruction
+  - [x] SerializableCrossProjectPDG with metadata
+  - **Tests:** 1 test passing
+
+---
+
 ## Success Criteria
 
 The track is complete when:
@@ -203,6 +231,7 @@ The track is complete when:
 4. **✅ Impact analysis working** - Forward/backward reachability implemented (ACHIEVED)
 5. **✅ PDG builds from code** - Signature→PDG extraction IMPLEMENTED
 6. **✅ Serialization working** - Save/load PDG IMPLEMENTED
+7. **✅ Cross-project PDG working** - Multi-project graph merging IMPLEMENTED
 
 ---
 
@@ -210,13 +239,14 @@ The track is complete when:
 
 | File | Lines | Purpose | Status |
 |------|-------|---------|--------|
-| `src/lib.rs` | 22 | Module declarations, exports | ✅ COMPLETE |
+| `src/lib.rs` | 24 | Module declarations, exports | ✅ COMPLETE |
 | `src/pdg.rs` | 771 | PDG data structures, operations, serialization | ✅ COMPLETE |
 | `src/traversal.rs` | 205 | Gravity-based traversal | ✅ COMPLETE |
 | `src/embedding.rs` | 143 | Node embeddings, cache | ✅ COMPLETE |
 | `src/extraction.rs` | 703 | AST→PDG extraction | ✅ COMPLETE |
+| `src/cross_project.rs` | 471 | Cross-project PDG extension | ✅ COMPLETE |
 
-**Total:** ~1,844 lines of production Rust code
+**Total:** ~2,315 lines of production Rust code
 
 ---
 
@@ -242,7 +272,10 @@ The track is complete when:
 │  ├── extract_inheritance_edges() - Class hierarchy parsing ✅        │
 │  ├── serialize() - Full PDG serialization to bytes ✅                │
 │  ├── deserialize() - Reconstruct PDG from bytes ✅                  │
-│  └── 31/31 tests passing (100% coverage)                             │
+│  ├── CrossProjectPDG - Multi-project graph merging ✅                 │
+│  ├── merge_external_pdg() - External PDG integration ✅               │
+│  ├── external node tracking with lazy loading ✅                     │
+│  └── 36/36 tests passing (100% coverage)                             │
 │                                                                       │
 │  ⚠️  LIMITATIONS (Documented):                                        │
 │  ├── Call graph extraction requires AST (SignatureInfo lacks bodies) │
@@ -275,6 +308,7 @@ All planned phases for legraphe have been successfully implemented:
 - Phase 1-5: Data structures and algorithms ✅
 - Phase 6: Signature-based PDG extraction ✅
 - Phase 7: Serialization/deserialization ✅
+- Phase 7.3: Cross-project PDG extension ✅
 
 The legraphe crate is now ready for integration with the rest of LeIndex.
 
