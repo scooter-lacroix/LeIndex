@@ -1,8 +1,8 @@
-# Implementation Plan: lepasserelle - Bridge & Integration
+# Implementation Plan: lepasserelle - Integration & API Layer
 
 **Track ID:** `lepasserelle_20250125`
 **Track Type:** Standard Track
-**Status:** OPTIONAL (Source-Code-Verified: 2025-01-25)
+**Status:** PENDING (Source-Code-Verified: 2025-01-26)
 **Created:** 2025-01-25
 **Parent Track:** `leindex_rust_refactor_20250125`
 
@@ -10,158 +10,184 @@
 
 ## Overview
 
-**IMPORTANT:** This track is **OPTIONAL** for a 100% pure Rust implementation. The `lepasserelle` crate provides PyO3 FFI bindings and MCP tool integration **ONLY IF** Python interoperability is required. For a pure Rust implementation, this crate can be **skipped entirely**.
+This track implements the **Integration & API Layer** for LeIndex Rust Renaissance. It brings together all core crates (leparse, legraphe, lerecherche, lestockage) into a cohesive system with CLI and MCP server interfaces.
 
-This track implements the Bridge & Integration layer for LeIndex Rust Renaissance. It creates PyO3 FFI bindings for Python-Rust interop and implements the unified MCP tool.
+**IMPORTANT:** This is a **100% Pure Rust implementation**. All PyO3/Python bindings from the prototype are being removed and replaced with native Rust implementations.
 
-**Source-Code-Verified Status:** ~15% COMPLETE ⚠️ MOSTLY PLACEHOLDERS
+**Source-Code-Verified Status:** ~25% COMPLETE ⚠️ IN PROGRESS
 
-**Test Results:** PyO3 linker error (expected without Python interpreter)
-**Code State:** Structure exists, most functions return placeholder data
-
----
-
-## Phase 1: PyO3 Module Setup ⚠️ PLACEHOLDER
-
-### Objective
-Create Python module with Rust bindings.
-
-- [x] **Task 1.1: Create PyO3 module structure** ✅ COMPLETE
-  - [x] Create `leindex_rust` Python module
-  - [x] Configure `python-bindings` feature in Cargo.toml
-  - [x] Set up PyO3 with extension-module
-  - **File:** `src/lib.rs` (34 lines)
-
-- [ ] **Task 1.2: Expose RustAnalyzer class** ⚠️ PLACEHOLDER
-  - [x] `RustAnalyzer` PyClass structure exists
-  - [ ] `initialize()` - Only sets flag (line 37-40)
-  - [ ] `parse_file()` - Returns fake JSON (line 43-55)
-  - [ ] `build_context()` - Returns formatted string (line 58-74)
-  - [ ] `get_node()` - Returns fake data (line 77-86)
-  - **File:** `src/bridge.rs` (194 lines)
-  - **Status:** All methods return placeholder data
+**Current State:** PyO3 dependencies removed, pure Rust foundation established. Ready for Phase 2/4 implementation.
 
 ---
 
-## Phase 2: Zero-Copy Data Transfer ❌ NOT IMPLEMENTED
+## Phase 1: Remove PyO3, Create Pure Rust Foundation ✅ COMPLETE (e2c6243)
 
 ### Objective
-Implement efficient data transfer across FFI boundary.
+Remove all Python dependencies and establish pure Rust architecture.
 
-- [ ] **Task 2.1: Implement mmap for source files** ❌ NOT STARTED
-  - [ ] Use mmap for passing large source files
-  - [ ] Avoid copying across FFI boundary
-  - [ ] Memory-mapped file handling
+- [x] **Task 1.1: Remove PyO3 dependencies** ✅ COMPLETE (e2c6243)
+  - [x] Remove `python-bindings` feature from Cargo.toml
+  - [x] Remove `pyo3` dependency entirely
+  - [x] Change crate-type from `["cdylib", "rlib"]` to `["rlib"]`
+  - [x] Delete `src/bridge.rs` (Python FFI layer)
+  - **Files:** `Cargo.toml`, `src/lib.rs`, `src/bridge.rs`
 
-- [ ] **Task 2.2: Create shared memory buffers** ❌ NOT STARTED
-  - [ ] Zero-copy embedding transfer
-  - [ ] Shared memory for large data structures
-  - [ ] Memory-aware buffer management
+- [x] **Task 1.2: Create pure Rust module structure** ✅ COMPLETE (e2c6243)
+  - [x] Basic module structure exists (mcp.rs, memory.rs)
+  - [x] Updated lib.rs exports for non-Python API
+  - [x] Removed all Python-related exports
+  - **File:** `src/lib.rs`
 
-- [ ] **Task 2.3: Optimize FFI boundary crossings** ❌ NOT STARTED
-  - [ ] Batch operations across FFI
-  - [ ] Minimize serialization overhead
-  - [ ] Benchmark transfer overhead
+- [x] **Task 1.3: Add MCP server dependencies** ✅ COMPLETE (e2c6243)
+  - [x] `tokio` already in workspace dependencies
+  - [x] MCP server dependencies added as comments (will enable in Phase 2)
+  - [x] CLI dependencies added as comments (will enable in Phase 3)
+  - **File:** `Cargo.toml`
 
 ---
 
-## Phase 3: Unified MCP Tool ⚠️ PLACEHOLDER
+## Phase 2: Pure Rust MCP Server ❌ NOT STARTED
 
 ### Objective
-Implement `leindex_deep_analyze` MCP tool.
+Implement native Rust MCP server (no Python).
 
-- [x] **Task 3.1: Create MCP tool structure** ✅ COMPLETE
-  - [x] `LeIndexDeepAnalyze` struct exists
-  - [x] `McpRequest`, `McpResponse` types
-  - [x] `AnalysisResult`, `EntryPoint` types
-  - **File:** `src/mcp.rs` (218 lines)
+- [ ] **Task 2.1: Implement MCP JSON-RPC server** ❌ NOT STARTED
+  - [ ] Create `McpServer` struct with axum/warp
+  - [ ] Implement JSON-RPC 2.0 handler
+  - [ ] Add CORS and error handling middleware
+  - [ ] Support SSE (Server-Sent Events) for streaming
+  - **File:** `src/mcp/server.rs` (new file)
 
-- [ ] **Task 3.2: Implement semantic search** ⚠️ PLACEHOLDER
-  - [ ] `semantic_search()` - Returns single placeholder entry (line 65-73)
-  - [ ] Should use lerecherche for actual search
-  - [ ] Currently returns hardcoded data
+- [ ] **Task 2.2: Implement MCP tool handlers** ❌ NOT STARTED
+  - [ ] `leindex_deep_analyze` - Main analysis tool
+  - [ ] `leindex_search` - Semantic search tool
+  - [ ] `leindex_context` - Graph expansion tool
+  - [ ] `leindex_index` - Project indexing tool
+  - [ ] `leindex_diagnostics` - System diagnostics tool
+  - **File:** `src/mcp/handlers.rs` (new file)
 
-- [ ] **Task 3.3: Implement context expansion** ⚠️ PLACEHOLDER
-  - [ ] `expand_context()` - Returns formatted comment string (line 76-83)
-  - [ ] Should use legraphe for actual expansion
-  - [ ] Currently returns placeholder text
-
-- [x] **Task 3.4: LLM-ready formatting** ✅ COMPLETE
-  - [x] `McpResponse::to_llm_string()` - Formats for LLM consumption
-  - [x] Includes query, context, entry points, tokens used
-  - **File:** `src/mcp.rs` lines 165-175
+- [ ] **Task 2.3: Wire up actual crate integration** ❌ NOT STARTED
+  - [ ] Call `lerecherche::SearchEngine` for semantic search
+  - [ ] Call `legraphe::GravityTraversal` for context expansion
+  - [ ] Call `leparse::ParallelParser` for parsing
+  - [ ] Call `lestockage::*` for persistence
+  - **File:** `src/integration.rs` (new file)
 
 ---
 
-## Phase 4: Memory Management ⚠️ PARTIAL
+## Phase 3: CLI Interface ❌ NOT STARTED
 
 ### Objective
-Implement RSS monitoring and cache spilling.
+Create command-line interface for LeIndex.
 
-- [x] **Task 4.1: Implement RSS monitoring** ✅ COMPLETE
+- [ ] **Task 3.1: Implement CLI structure with clap** ❌ NOT STARTED
+  - [ ] `leindex index <path>` - Index a project
+  - [ ] `leindex search <query>` - Search code
+  - [ ] `leindex analyze <query>` - Deep analysis
+  - [ ] `leindex diagnostics` - System status
+  - [ ] `leindex serve` - Start MCP server
+  - **File:** `src/cli.rs` (new file, ~300 lines)
+
+- [ ] **Task 3.2: Implement index command** ❌ NOT STARTED
+  - [ ] Parse project files with leparse
+  - [ ] Build PDG with legraphe
+  - [ ] Index with lerecherche
+  - [ ] Persist to lestockage
+  - [ ] Show progress and statistics
+  - **File:** `src/cli/index.rs` (new file)
+
+- [ ] **Task 3.3: Implement search command** ❌ NOT STARTED
+  - [ ] Load project from lestockage
+  - [ ] Execute search via lerecherche
+  - [ ] Display results with formatting
+  - [ ] Support JSON output mode
+  - **File:** `src/cli/search.rs` (new file)
+
+---
+
+## Phase 4: Integration Layer ❌ NOT STARTED
+
+### Objective
+Create unified API that brings all crates together.
+
+- [ ] **Task 4.1: Implement LeIndex orchestration** ❌ NOT STARTED
+  - [ ] `LeIndex` struct with project management
+  - [ ] `index_project()` - Full pipeline (parse → graph → index → store)
+  - [ ] `search()` - Unified search interface
+  - [ ] `analyze()` - Deep analysis with PDG expansion
+  - [ ] `get_diagnostics()` - Project statistics
+  - **File:** `src/leindex.rs` (new file, ~400 lines)
+
+- [ ] **Task 4.2: Implement project configuration** ❌ NOT STARTED
+  - [ ] `ProjectConfig` with TOML/JSON support
+  - [ ] Language filtering (which languages to parse)
+  - [ ] Path exclusions (.git, node_modules, etc.)
+  - [ ] Token budget settings
+  - [ ] Storage backend selection
+  - **File:** `src/config.rs` (new file, ~200 lines)
+
+- [ ] **Task 4.3: Implement error recovery** ❌ NOT STARTED
+  - [ ] Graceful handling of parse failures
+  - [ ] Partial indexing (continue on error)
+  - [ ] Corruption detection and recovery
+  - [ ] Detailed error reporting
+  - **File:** `src/errors.rs` (new file)
+
+---
+
+## Phase 5: Memory Management (Port from Prototype) ⚠️ PARTIAL
+
+### Objective
+Memory-aware operations with RSS monitoring and cache spilling.
+
+- [x] **Task 5.1: RSS monitoring** ✅ COMPLETE (from prototype)
   - [x] `MemoryManager` with process access
-  - [x] `get_rss_bytes()` - Get current RSS memory
-  - [x] `get_total_memory()` - Get system memory
-  - [x] `is_threshold_exceeded()` - Check 90% threshold
-  - **File:** `src/memory.rs` (202 lines) lines 48-70
+  - [x] `get_rss_bytes()` - Current RSS memory
+  - [x] `get_total_memory()` - System memory
+  - [x] `is_threshold_exceeded()` - 90% threshold check
+  - **File:** `src/memory.rs` (keep existing code)
 
-- [ ] **Task 4.2: Implement cache spilling** ⚠️ PLACEHOLDER
-  - [ ] `spill_cache()` - Returns fake result (line 73-85)
-  - [ ] Should clear PDG cache from legraphe
-  - [ ] Should track memory freed
+- [ ] **Task 5.2: Implement cache spilling** ❌ NOT STARTED
+  - [ ] `spill_pdg_cache()` - Unload PDG from memory
+  - [ ] `spill_vector_cache()` - Unload HNSW index
+  - [ ] Track memory freed
+  - [ ] Automatic spill on threshold
+  - **File:** `src/memory.rs` (extend existing)
 
-- [ ] **Task 4.3: DuckDB cache spilling** ⚠️ EMPTY
-  - [ ] `spill_to_duckdb()` - Empty implementation (line 88-91)
-  - [ ] Should spill analytics cache to DuckDB
-
-- [ ] **Task 4.4: Python GC coordination** ⚠️ EMPTY
-  - [ ] `trigger_python_gc()` - Empty implementation (line 94-97)
-  - [ ] Should trigger Python garbage collection
-
----
-
-## Phase 5: Error Handling ⚠️ BASIC
-
-### Objective
-Implement error handling and logging.
-
-- [x] **Task 5.1: Create Rust error types** ✅ COMPLETE
-  - [x] `BridgeError` with thiserror (init, parse, IO, serialization)
-  - [x] `McpError` with thiserror (search, context, project, query)
-  - [x] `MemoryError` with thiserror (process, memory_info, spill)
-  - **Files:** `src/bridge.rs`, `src/mcp.rs`, `src/memory.rs`
-
-- [x] **Task 5.2: Convert to Python exceptions** ✅ COMPLETE
-  - [x] `From<BridgeError> for PyErr` implementation
-  - [x] Automatic conversion with error messages
-  - **File:** `src/bridge.rs` lines 170-174
-
-- [ ] **Task 5.3: Add structured logging** ❌ NOT STARTED
-  - [ ] No tracing integration yet
-  - [ ] No FFI crossing logs
-  - [ ] No debug/trace modes
+- [ ] **Task 5.3: Implement cache reloading** ❌ NOT STARTED
+  - [ ] Reload PDG from lestockage
+  - [ ] Reload HNSW index from disk
+  - [ ] Lazy loading strategy
+  - **File:** `src/memory.rs` (extend existing)
 
 ---
 
-## Phase 6: Documentation ❌ NOT STARTED
+## Phase 6: Testing & Documentation ❌ NOT STARTED
 
 ### Objective
-Complete documentation and usage examples.
+Comprehensive testing and documentation.
 
-- [ ] **Task 6.1: Write API documentation** ❌ NOT STARTED
-  - [ ] Document RustAnalyzer class
-  - [ ] Document build_weighted_context
-  - [ ] Document all exposed functions
+- [ ] **Task 6.1: Integration tests** ❌ NOT STARTED
+  - [ ] Test full indexing pipeline
+  - [ ] Test search functionality
+  - [ ] Test MCP server endpoints
+  - [ ] Test CLI commands
+  - [ ] Test error handling
+  - **File:** `tests/integration.rs` (new file)
 
-- [ ] **Task 6.2: Create usage examples** ❌ NOT STARTED
-  - [ ] Write basic usage example
-  - [ ] Write advanced usage example
-  - [ ] Write MCP tool usage example
+- [ ] **Task 6.2: Unit tests** ❌ NOT STARTED
+  - [ ] Test LeIndex orchestration
+  - [ ] Test configuration loading
+  - [ ] Test memory management
+  - [ ] Test error handling
+  - **Files:** Unit tests in each module
 
-- [ ] **Task 6.3: Add migration guide from Python** ❌ NOT STARTED
-  - [ ] Document changes from Python
-  - [ ] Add migration checklist
-  - [ ] Show before/after examples
+- [ ] **Task 6.3: Documentation** ❌ NOT STARTED
+  - [ ] API documentation with rustdoc
+  - [ ] CLI usage examples
+  - [ ] MCP server protocol docs
+  - [ ] Architecture overview
+  - [ ] Migration guide from Python prototype
 
 ---
 
@@ -169,159 +195,65 @@ Complete documentation and usage examples.
 
 The track is complete when:
 
-1. **⚠️ PyO3 bindings working** - Python can call Rust **PLACEHOLDER**
-2. **❌ Zero-copy transfer working** - mmap implemented **NOT STARTED**
-3. **❌ MCP tool functional** - Actual search/expansion **PLACEHOLDER**
-4. **✅ RSS monitoring working** - Memory tracking **ACHIEVED**
-5. **❌ Cache spilling working** - Actual spilling **NOT STARTED**
-6. **❌ Documentation complete** - API docs **NOT STARTED**
+1. **✅ PyO3 completely removed** - Zero Python dependencies
+2. **✅ Pure Rust MCP server** - Native JSON-RPC server working
+3. **✅ CLI interface functional** - All commands working
+4. **✅ Integration complete** - All crates wired together
+5. **✅ Memory management working** - RSS monitoring + cache spilling
+6. **✅ Tests passing** - Integration + unit tests
+7. **✅ Documentation complete** - API docs + usage examples
 
 ---
 
-## Files Implemented
+## Implementation Priority
 
-| File | Lines | Purpose | Status |
-|------|-------|---------|--------|
-| `src/lib.rs` | 34 | Module declarations, Python module | ✅ COMPLETE (partial) |
-| `src/bridge.rs` | 194 | PyO3 bindings, RustAnalyzer | ⚠️ PLACEHOLDER |
-| `src/mcp.rs` | 218 | MCP tool structures | ⚠️ PLACEHOLDER |
-| `src/memory.rs` | 202 | Memory manager, RSS monitoring | ⚠️ PARTIAL |
+**Phase 1 is CRITICAL** - Must remove all Python code first.
 
-**Total:** ~648 lines of code (mostly placeholders)
+**Phase 2 & 4 are HIGH PRIORITY** - Core integration functionality.
 
----
+**Phase 3 is MEDIUM** - CLI is important but can be incremental.
 
-## What Works vs What's Missing
+**Phase 5 is LOW** - Memory management is nice-to-have for MVP.
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                       lepasserelle STATUS                           │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  ✅ COMPLETE (Working):                                              │
-│  ├── PyO3 module structure configured                               │
-│  ├── RustAnalyzer PyClass structure                                │
-│  ├── MCP tool structures (LeIndexDeepAnalyze, etc.)                │
-│  ├── Memory manager with RSS monitoring                            │
-│  └── LLM-ready response formatting                                   │
-│                                                                       │
-│  ⚠️ PARTIAL (Structure exists, needs implementation):                 │
-│  ├── RSS monitoring works (get_rss_bytes, is_threshold_exceeded)     │
-│  └── LLM formatting works (to_llm_string)                           │
-│                                                                       │
-│  ❌ MISSING (All integration with actual Rust crates):               │
-│  ├── initialize() - Sets flag only                                  │
-│  ├── parse_file() - Returns fake JSON                             │
-│  ├── build_context() - Returns formatted string                    │
-│  ├── get_node() - Returns fake data                                │
-│  ├── semantic_search() - Returns placeholder                       │
-│  ├── expand_context() - Returns placeholder                        │
-│  ├── spill_cache() - Returns fake result                          │
-│  ├── spill_to_duckdb() - Empty                                    │
-│  ├── trigger_python_gc() - Empty                                  │
-│  └── No structured logging                                           │
-│                                                                       │
-└─────────────────────────────────────────────────────────────────────┘
-```
+**Phase 6 is ONGOING** - Tests and docs should be developed alongside.
 
 ---
 
-## Implementation Plan for Remaining Work
+## Files to Delete
 
-### Task 1.2: Complete RustAnalyzer Implementation
-
-**Objective:** Make RustAnalyzer actually work with leparse
-
-**Implementation Strategy:**
-
-1. **Update `src/bridge.rs` methods**
-   ```rust
-   pub fn parse_file(&self, file_path: &str) -> PyResult<String> {
-       // Use leparse to parse the file
-       let source = std::fs::read(file_path)?;
-       let lang_parser = leparse::languages::parser_for_language(/* ... */)?;
-       let signatures = lang_parser.get_signatures(&source)?;
-
-       // Convert to JSON
-       serde_json::to_string(&signatures).map_err(Into::into)
-   }
-   ```
-
-2. **Implement `build_context()`**
-   - Use legraphe for PDG expansion
-   - Use GravityTraversal for context building
-   - Return actual expanded context
-
-3. **Integration Tests**
-   - Test with real Python code
-   - Validate AST extraction
-   - Test context expansion
-
-### Task 3.2-3.3: Complete MCP Tool Implementation
-
-**Objective:** Make MCP tool actually work
-
-**Implementation Strategy:**
-
-1. **Update `src/mcp.rs` methods**
-   ```rust
-   async fn semantic_search(&self, query: &str, top_k: usize) -> Result<Vec<EntryPoint>, Error> {
-       // Use lerecherche for actual semantic search
-       // Return actual entry points from search
-   }
-
-   async fn expand_context(&self, entry_points: &[EntryPoint]) -> Result<String, Error> {
-       // Use legraphe for actual PDG expansion
-       // Use GravityTraversal for context building
-       // Return actual expanded context
-   }
-   ```
-
-2. **Integration with legraphe/lerecherche**
-   - Add dependencies on legraphe and lerecherche
-   - Implement actual search and expansion
-   - Test end-to-end workflow
+- `src/bridge.rs` - Entire file (Python FFI, no longer needed)
+- Python bindings from `src/lib.rs`
 
 ---
 
-## Decision: Pure Rust vs Python Interop
+## Files to Create
 
-### For 100% Pure Rust Implementation:
+| File | Purpose | Est. Lines |
+|------|---------|------------|
+| `src/mcp/server.rs` | MCP JSON-RPC server | ~300 |
+| `src/mcp/handlers.rs` | MCP tool handlers | ~400 |
+| `src/integration.rs` | Crate integration layer | ~300 |
+| `src/cli.rs` | CLI structure | ~300 |
+| `src/cli/index.rs` | Index command | ~200 |
+| `src/cli/search.rs` | Search command | ~150 |
+| `src/leindex.rs` | Main orchestration | ~400 |
+| `src/config.rs` | Configuration | ~200 |
+| `src/errors.rs` | Error handling | ~150 |
+| `tests/integration.rs` | Integration tests | ~500 |
 
-**RECOMMENDATION:** Skip this track entirely
-
-**Reasons:**
-1. All core functionality can be implemented in pure Rust
-2. PyO3 adds complexity and dependency on Python
-3. MCP tool can be implemented as native Rust CLI
-4. No Python ecosystem required
-
-**Alternative:** Implement native Rust CLI tool
-- Replace MCP tool with native Rust CLI
-- Use same leparse/legraphe/lerecherche/lestockage
-- No FFI overhead
-
-### For Python Integration Required:
-
-**IMPLEMENTATION PATH:**
-1. Complete RustAnalyzer integration with leparse
-2. Complete MCP tool integration with legraphe/lerecherche
-3. Implement actual cache spilling with legraphe
-4. Add zero-copy data transfer with mmap
+**Total New Code:** ~2,900 lines of pure Rust
 
 ---
 
-## Status: OPTIONAL - PLACEHOLDER IMPLEMENTATION ⚠️
+## Next Steps
 
-The `lepasserelle` crate exists but is mostly placeholder code. The RSS monitoring works, but all integration with the core Rust crates (leparse, legraphe, lerecherche, lestockage) is missing.
-
-**For a 100% pure Rust implementation, this crate can be SKIPPED ENTIRELY.**
+1. **Start with Phase 1** - Remove PyO3 and reorganize module structure
+2. **Move to Phase 4** - Implement core LeIndex orchestration
+3. **Add Phase 2** - MCP server on top of orchestration
+4. **Complete with Phase 3** - CLI interface
 
 ---
 
-## Notes
+## Status: READY TO START ⚠️
 
-- **Optional for Pure Rust:** This crate is only needed if Python interoperability is a requirement
-- **Placeholder Status:** Most methods return fake data and need actual implementation
-- **PyO3 Linker Error:** Expected when building without Python interpreter
-- **Memory Monitoring Works:** RSS monitoring functions are implemented and working
+This track requires a complete rewrite of the existing prototype code to remove Python dependencies and implement pure Rust integration. The foundation exists but needs significant restructuring.

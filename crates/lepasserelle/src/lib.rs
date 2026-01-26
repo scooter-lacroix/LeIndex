@@ -5,11 +5,13 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
+pub mod leindex;
 pub mod memory;
 pub mod mcp;
 
+pub use leindex::{LeIndex, IndexStats, AnalysisResult as LeIndexAnalysisResult, Diagnostics};
 pub use memory::{MemoryManager, MemoryConfig};
-pub use mcp::{LeIndexDeepAnalyze, AnalysisResult};
+pub use mcp::{LeIndexDeepAnalyze, AnalysisResult as McpAnalysisResult};
 
 /// Library initialization
 pub fn init() {

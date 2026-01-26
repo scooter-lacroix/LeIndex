@@ -33,6 +33,9 @@ tokio.workspace = true
 # Configuration
 toml = "0.8"
 
+# File utilities
+walkdir = "2.5"
+
 # Internal dependencies
 leparse = { path = "../leparse" }
 legraphe = { path = "../legraphe" }
