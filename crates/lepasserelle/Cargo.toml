@@ -9,11 +9,10 @@ rust-version.workspace = true
 
 [lib]
 name = "lepasserelle"
-crate-type = ["cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [dependencies]
 # Workspace dependencies
-pyo3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -22,15 +21,23 @@ tracing.workspace = true
 psutil.workspace = true
 tokio.workspace = true
 
+# MCP server dependencies (will add in Phase 2)
+# axum = { version = "0.7", features = ["json"] }
+# tower = { version = "0.5", features = ["full"] }
+# tower-http = { version = "0.5", features = ["cors", "trace"] }
+# jsonrpc = { version = "0.18", default-features = false, features = ["server"] }
+
+# CLI dependencies (will add in Phase 3)
+# clap = { version = "4.5", features = ["derive"] }
+
+# Configuration
+toml = "0.8"
+
 # Internal dependencies
 leparse = { path = "../leparse" }
 legraphe = { path = "../legraphe" }
 lerecherche = { path = "../lerecherche" }
 lestockage = { path = "../lestockage" }
-
-[features]
-# Extension module for Python
-python-bindings = ["pyo3/extension-module"]
 
 [dev-dependencies]
 rstest.workspace = true
