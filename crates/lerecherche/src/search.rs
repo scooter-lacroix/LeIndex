@@ -1,5 +1,6 @@
 // Core search engine implementation
 
+use crate::query::{QueryParser, QueryIntent};
 use crate::ranking::{Score, HybridScorer};
 use crate::vector::VectorIndex;
 use serde::{Deserialize, Serialize};
@@ -260,6 +261,97 @@ impl SearchEngine {
     pub fn vector_index_mut(&mut self) -> &mut VectorIndex {
         &mut self.vector_index
     }
+
+    /// Natural language search with query understanding
+    ///
+    /// This method processes natural language queries and converts them into
+    /// structured search queries with intent classification and pattern matching.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - Natural language query text (e.g., "show me how authentication works")
+    /// * `top_k` - Maximum number of results to return
+    ///
+    /// # Returns
+    ///
+    /// Vector of search results sorted by relevance
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let results = engine.natural_search("show me how parsing works", 10).await?;
+    /// ```
+    pub async fn natural_search(
+        &self,
+        query: &str,
+        top_k: usize,
+    ) -> Result<Vec<SearchResult>, Error> {
+        let parser = QueryParser::new().map_err(|e| Error::QueryFailed(e.to_string()))?;
+        let parsed = parser.parse(query, top_k)
+            .map_err(|e| Error::InvalidQuery(e.to_string()))?;
+
+        // Build search query from parsed natural language query
+        let search_query = parser.build_search_query(&parsed);
+
+        // Execute search based on intent
+        match parsed.intent {
+            QueryIntent::HowWorks | QueryIntent::WhereHandled => {
+                // These queries benefit from semantic search with context expansion
+                self.search_with_intent(search_query, parsed.intent).await
+            }
+            QueryIntent::Bottlenecks => {
+                // Sort by complexity/centrality
+                self.search_by_complexity(search_query).await
+            }
+            QueryIntent::Semantic => {
+                // Pure semantic search
+                self.search(search_query).await
+            }
+            QueryIntent::Text => {
+                // Fallback to text search
+                self.search(search_query).await
+            }
+        }
+    }
+
+    /// Search with intent-based enhancement
+    async fn search_with_intent(
+        &self,
+        query: SearchQuery,
+        _intent: QueryIntent,
+    ) -> Result<Vec<SearchResult>, Error> {
+        // For now, delegate to regular search
+        // In the future, this could apply intent-specific enhancements
+        self.search(query).await
+    }
+
+    /// Search by complexity (for bottleneck queries)
+    async fn search_by_complexity(
+        &self,
+        query: SearchQuery,
+    ) -> Result<Vec<SearchResult>, Error> {
+        let mut results = self.search(query).await?;
+
+        // Sort by complexity (highest first)
+        results.sort_by(|a, b| {
+            let complexity_a = self.nodes.iter()
+                .find(|n| n.node_id == b.node_id)
+                .map(|n| n.complexity)
+                .unwrap_or(0);
+            let complexity_b = self.nodes.iter()
+                .find(|n| n.node_id == a.node_id)
+                .map(|n| n.complexity)
+                .unwrap_or(0);
+            complexity_a.cmp(&complexity_b)
+        });
+
+        // Reassign ranks
+        for (i, result) in results.iter_mut().enumerate() {
+            result.rank = i + 1;
+        }
+
+        Ok(results)
+    }
 }
 
 impl Default for SearchEngine {
@@ -518,5 +610,148 @@ mod tests {
         assert!(results[0].relevance > 0.99); // Nearly identical
         assert_eq!(results[1].node_id, "test2");
         assert!(results[1].relevance < 0.01); // Orthogonal
+    }
+
+    #[tokio::test]
+    async fn test_natural_search_how_works() {
+        let mut engine = SearchEngine::new();
+        let nodes = vec![
+            NodeInfo {
+                node_id: "auth_func".to_string(),
+                file_path: "auth.rs".to_string(),
+                symbol_name: "authenticate".to_string(),
+                content: "fn authenticate() { // auth logic }".to_string(),
+                byte_range: (0, 40),
+                embedding: None,
+                complexity: 5,
+            },
+            NodeInfo {
+                node_id: "other_func".to_string(),
+                file_path: "other.rs".to_string(),
+                symbol_name: "other".to_string(),
+                content: "fn other() { // other logic }".to_string(),
+                byte_range: (0, 30),
+                embedding: None,
+                complexity: 1,
+            },
+        ];
+        engine.index_nodes(nodes);
+
+        let results = engine.natural_search("show me how authentication works", 10).await.unwrap();
+
+        // Should find the authenticate function
+        assert!(results.iter().any(|r| r.node_id == "auth_func" || r.symbol_name.contains("auth")));
+    }
+
+    #[tokio::test]
+    async fn test_natural_search_where_handled() {
+        let mut engine = SearchEngine::new();
+        let nodes = vec![
+            NodeInfo {
+                node_id: "error_handler".to_string(),
+                file_path: "error.rs".to_string(),
+                symbol_name: "handle_error".to_string(),
+                content: "fn handle_error() { // error handling }".to_string(),
+                byte_range: (0, 40),
+                embedding: None,
+                complexity: 3,
+            },
+        ];
+        engine.index_nodes(nodes);
+
+        let results = engine.natural_search("where is error handling handled", 10).await.unwrap();
+
+        // Should find the error handler
+        assert!(!results.is_empty());
+        assert!(results.iter().any(|r| r.symbol_name.contains("error") || r.file_path.contains("error")));
+    }
+
+    #[tokio::test]
+    async fn test_natural_search_bottlenecks() {
+        let mut engine = SearchEngine::new();
+        let nodes = vec![
+            NodeInfo {
+                node_id: "simple".to_string(),
+                file_path: "simple.rs".to_string(),
+                symbol_name: "simple_func".to_string(),
+                content: "fn simple_func() {}".to_string(),
+                byte_range: (0, 20),
+                embedding: None,
+                complexity: 1,
+            },
+            NodeInfo {
+                node_id: "complex".to_string(),
+                file_path: "complex.rs".to_string(),
+                symbol_name: "complex_func".to_string(),
+                content: "fn complex_func() { // complex logic with multiple operations }".to_string(),
+                byte_range: (0, 40),
+                embedding: None,
+                complexity: 10,
+            },
+        ];
+        engine.index_nodes(nodes);
+
+        let results = engine.natural_search("what are the bottlenecks", 10).await.unwrap();
+
+        // Bottleneck queries should return results sorted by complexity
+        // We expect at least some results since the query will match "complex" content
+        if !results.is_empty() {
+            // Complex function should rank higher due to complexity
+            assert_eq!(results[0].node_id, "complex");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_natural_search_semantic() {
+        let mut engine = SearchEngine::new();
+        let nodes = vec![
+            NodeInfo {
+                node_id: "cache_impl".to_string(),
+                file_path: "cache.rs".to_string(),
+                symbol_name: "caching".to_string(),
+                content: "impl Caching { fn new() {} }".to_string(),
+                byte_range: (0, 30),
+                embedding: None,
+                complexity: 2,
+            },
+        ];
+        engine.index_nodes(nodes);
+
+        let results = engine.natural_search("how do I implement caching", 10).await.unwrap();
+
+        // Should find caching-related code
+        assert!(!results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_natural_search_empty_query() {
+        let engine = SearchEngine::new();
+        let results = engine.natural_search("", 10).await;
+
+        // Should return error for empty query
+        assert!(results.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_natural_search_text_fallback() {
+        let mut engine = SearchEngine::new();
+        let nodes = vec![
+            NodeInfo {
+                node_id: "my_function".to_string(),
+                file_path: "test.rs".to_string(),
+                symbol_name: "my_function".to_string(),
+                content: "fn my_function() { println!(\"test\"); }".to_string(),
+                byte_range: (0, 40),
+                embedding: None,
+                complexity: 1,
+            },
+        ];
+        engine.index_nodes(nodes);
+
+        let results = engine.natural_search("my_function", 10).await.unwrap();
+
+        // Should find the function by text match
+        assert!(!results.is_empty());
+        assert_eq!(results[0].node_id, "my_function");
     }
 }

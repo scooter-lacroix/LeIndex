@@ -538,6 +538,7 @@ dependencies = [
  "anyhow",
  "legraphe",
  "leparse",
+ "regex",
  "rstest",
  "serde",
  "thiserror 2.0.18",

@@ -14,6 +14,9 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 
+# External dependencies
+regex = "1.10"
+
 # Internal dependencies
 leparse = { path = "../leparse" }
 legraphe = { path = "../legraphe" }
