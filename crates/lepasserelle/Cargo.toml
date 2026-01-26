@@ -11,6 +11,14 @@ rust-version.workspace = true
 name = "lepasserelle"
 crate-type = ["rlib"]
 
+[[bin]]
+name = "leindex"
+path = "src/bin/leindex.rs"
+
+[features]
+default = ["mcp-server"]
+mcp-server = ["axum", "tower", "tower-http", "tokio-stream", "futures-util", "bytes", "http-body-util", "http"]
+
 [dependencies]
 # Workspace dependencies
 serde.workspace = true
@@ -21,18 +29,26 @@ tracing.workspace = true
 psutil.workspace = true
 tokio.workspace = true
 
-# MCP server dependencies
-axum = { version = "0.7", features = ["json"] }
-tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.5", features = ["cors", "trace", "limit"] }
-tokio-stream = "0.1"
-futures-util = "0.3"
+# MCP server dependencies (optional, gated by mcp-server feature)
+# Downgraded to axum 0.6 to match libsql/tonic dependency
+axum = { version = "0.6", features = ["json", "headers"], optional = true }
+tower = { version = "0.4", features = ["full"], optional = true }
+tower-http = { version = "0.4", features = ["cors", "trace", "limit"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
+futures-util = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+http = { version = "1", optional = true }
 
-# CLI dependencies (will add in Phase 3)
-# clap = { version = "4.5", features = ["derive"] }
+# CLI dependencies
+clap = { version = "4.5", features = ["derive"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Configuration
 toml = "0.8"
+
+# Synchronization primitives
+once_cell = "1"
 
 # File utilities
 walkdir = "2.5"

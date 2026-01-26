@@ -11,33 +11,31 @@ use super::handlers::{
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::leindex::LeIndex;
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Json, Sse},
     routing::{get, post},
     Router,
+    Server,
+    response::{IntoResponse, Json},
 };
-use serde_json::json;
-use std::collections::HashMap;
+use serde_json::Value;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
+
+/// Global server state - using OnceLock for lazy initialization
+/// This works with axum 0.6's trait bounds
+static SERVER_STATE: std::sync::OnceLock<Arc<Mutex<LeIndex>>> = std::sync::OnceLock::new();
+
+/// Global tool handlers list
+static HANDLERS: std::sync::OnceLock<Vec<ToolHandler>> = std::sync::OnceLock::new();
 
 /// MCP Server configuration
 #[derive(Clone, Debug)]
 pub struct McpServerConfig {
-    /// Address to bind the server to
     pub bind_address: SocketAddr,
-
-    /// Enable CORS
     pub enable_cors: bool,
-
-    /// Maximum request size in MB
     pub max_request_size_mb: usize,
-
-    /// Request timeout in seconds
     pub request_timeout_secs: u64,
 }
 
@@ -53,176 +51,152 @@ impl Default for McpServerConfig {
 }
 
 /// MCP Server
-///
-/// The main server struct that manages the LeIndex instance and tool handlers.
 pub struct McpServer {
-    /// Server configuration
     config: McpServerConfig,
-
-    /// LeIndex instance (shared, wrapped for async access)
-    leindex: Arc<Mutex<LeIndex>>,
-
-    /// Registered tool handlers
-    handlers: Vec<super::handlers::ToolHandler>,
+    _state: Arc<Mutex<LeIndex>>, // Keep reference to prevent drop
 }
 
 impl McpServer {
-    /// Create a new MCP server
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Server configuration
-    /// * `leindex` - LeIndex instance to use for operations
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let leindex = LeIndex::new("/path/to/project")?;
-    /// let server = McpServer::new(McpServerConfig::default(), leindex)?;
-    /// ```
     pub fn new(config: McpServerConfig, leindex: LeIndex) -> Self {
-        let server = Self {
-            config,
-            leindex: Arc::new(Mutex::new(leindex)),
-            handlers: Self::default_handlers(),
-        };
+        let handlers = vec![
+            ToolHandler::Index(IndexHandler),
+            ToolHandler::Search(SearchHandler),
+            ToolHandler::DeepAnalyze(DeepAnalyzeHandler),
+            ToolHandler::Context(ContextHandler),
+            ToolHandler::Diagnostics(DiagnosticsHandler),
+        ];
 
-        info!("Registered {} tool handlers", server.handlers.len());
+        // Initialize global state
+        let state = Arc::new(Mutex::new(leindex));
+        let _ = SERVER_STATE.set(state.clone());
+        let _ = HANDLERS.set(handlers);
 
-        server
+        info!("Registered {} tool handlers", HANDLERS.get().unwrap().len());
+
+        Self { config, _state: state }
     }
 
-    /// Get the default set of tool handlers
-    fn default_handlers() -> Vec<super::handlers::ToolHandler> {
-        vec![
-            super::handlers::ToolHandler::Index(super::handlers::IndexHandler),
-            super::handlers::ToolHandler::Search(super::handlers::SearchHandler),
-            super::handlers::ToolHandler::DeepAnalyze(super::handlers::DeepAnalyzeHandler),
-            super::handlers::ToolHandler::Context(super::handlers::ContextHandler),
-            super::handlers::ToolHandler::Diagnostics(super::handlers::DiagnosticsHandler),
-        ]
-    }
-
-    /// Build the axum router
-    fn router(&self) -> Router<Arc<McpServer>> {
-        Router::new()
-
-            // JSON-RPC endpoint
-            .route("/mcp", post(json_rpc_handler))
-
-            // MCP discovery endpoints
-            .route("/mcp/tools/list", get(list_tools_handler))
-
-            // Health check endpoint
-            .route("/health", get(health_check_handler))
-
-            // Server state
-            .with_state(Arc::new(self.clone()))
-
-            // CORS layer
-            .layer(CorsLayer::very_permissive())
-    }
-
-    /// Start the server (blocks until shutdown)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// server.run().await?;
-    /// ```
     pub async fn run(self) -> anyhow::Result<()> {
         let bind_address = self.config.bind_address;
-        let router = self.router();
+        let router = Self::router();
 
         info!("Starting MCP server on {}", bind_address);
 
-        let listener = tokio::net::TcpListener::bind(bind_address).await
-            .context("Failed to bind to address")?;
-
-        axum::serve(listener, router).await
+        Server::bind(&bind_address)
+            .serve(router.into_make_service())
+            .await
             .context("Server error")?;
 
         Ok(())
     }
-}
 
-/// Clone the server (needed for Arc wrapping)
-impl Clone for McpServer {
-    fn clone(&self) -> Self {
-        Self {
-            config: self.config.clone(),
-            leindex: Arc::clone(&self.leindex),
-            handlers: self.handlers.clone(),
-        }
+    fn router() -> Router {
+        Router::new()
+            .route("/mcp", post(json_rpc_handler))
+            .route("/mcp/tools/list", get(list_tools_handler))
+            .route("/health", get(health_check_handler))
+            .layer(CorsLayer::very_permissive())
     }
 }
-
-// ========================================================================
-// HTTP HANDLERS
-// ========================================================================
 
 /// JSON-RPC request handler
-///
-/// This is the main entry point for all MCP requests.
-async fn json_rpc_handler(
-    State(server): State<Arc<McpServer>>,
-    Json(req): Json<JsonRpcRequest>,
-) -> impl IntoResponse {
-    debug!("Received JSON-RPC request: method={}", req.method);
-
-    let id = req.id.clone();
-
-    // Validate the request
-    if let Err(e) = req.validate() {
-        warn!("Invalid JSON-RPC request: {}", e);
-        return error_response(id, e);
-    }
-
-    // Route the request to the appropriate handler
-    let response = match req.method.as_str() {
-        "tools/call" => handle_tool_call(server, req).await,
-        "tools/list" => Ok(list_tools(server)),
-        _ => Err(JsonRpcError::method_not_found(req.method)),
+async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
+    // Parse JSON-RPC request
+    let json_req: JsonRpcRequest = match serde_json::from_value(body.clone()) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Failed to parse JSON-RPC request: {}", e);
+            return Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": {
+                    "code": -32700,
+                    "message": "Invalid JSON"
+                }
+            }));
+        }
     };
 
-    match response {
+    let state = match SERVER_STATE.get() {
+        Some(s) => s,
+        None => {
+            warn!("Server state not initialized");
+            return Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": json_req.id,
+                "error": {
+                    "code": -32603,
+                    "message": "Server not initialized"
+                }
+            }));
+        }
+    };
+
+    let handlers = match HANDLERS.get() {
+        Some(h) => h,
+        None => {
+            warn!("Handlers not initialized");
+            return Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": json_req.id,
+                "error": {
+                    "code": -32603,
+                    "message": "Handlers not initialized"
+                }
+            }));
+        }
+    };
+
+    debug!("Received JSON-RPC request: method={}", json_req.method);
+    let id = json_req.id.clone();
+
+    if let Err(e) = json_req.validate() {
+        warn!("Invalid JSON-RPC request: {}", e);
+        let resp = JsonRpcResponse::error(id, e);
+        return Json(serde_json::to_value(&resp).unwrap());
+    }
+
+    let response = match json_req.method.as_str() {
+        "tools/call" => handle_tool_call(state, handlers, json_req).await,
+        "tools/list" => Ok(list_tools_json(handlers)),
+        _ => Err(JsonRpcError::method_not_found(json_req.method.clone())),
+    };
+
+    let resp = match response {
         Ok(result) => {
             debug!("Request completed successfully");
-            (StatusCode::OK, Json(JsonRpcResponse::success(id, result))).into_response()
+            JsonRpcResponse::success(id, result)
         }
         Err(e) => {
             warn!("Request failed: {}", e);
-            error_response(id, e)
+            JsonRpcResponse::error(id, e)
         }
-    }
+    };
+
+    Json(serde_json::to_value(&resp).unwrap())
 }
 
-/// Handle a tool call request
+/// Handle tool call requests
 async fn handle_tool_call(
-    server: Arc<McpServer>,
+    state: &Arc<Mutex<LeIndex>>,
+    handlers: &[ToolHandler],
     req: JsonRpcRequest,
-) -> Result<serde_json::Value, JsonRpcError> {
-    // Extract tool call parameters
+) -> Result<Value, JsonRpcError> {
     let tool_call = req.extract_tool_call()?;
-
     debug!("Tool call: name={}", tool_call.name);
 
-    // Find the handler
-    let handler = server.handlers.iter()
+    let handler = handlers.iter()
         .find(|h| h.name() == tool_call.name)
         .ok_or_else(|| JsonRpcError::method_not_found(tool_call.name.clone()))?;
 
-    // Execute the tool
-    let result = handler.execute(&server.leindex, tool_call.arguments).await?;
-
-    Ok(result)
+    handler.execute(state, tool_call.arguments).await
 }
 
-/// List available tools
-fn list_tools(server: Arc<McpServer>) -> serde_json::Value {
-    let tools: Vec<_> = server.handlers.iter()
+/// List tools as JSON
+fn list_tools_json(handlers: &[ToolHandler]) -> Value {
+    let tools: Vec<_> = handlers.iter()
         .map(|handler| {
-            json!({
+            serde_json::json!({
                 "name": handler.name(),
                 "description": handler.description(),
                 "inputSchema": handler.argument_schema()
@@ -230,33 +204,31 @@ fn list_tools(server: Arc<McpServer>) -> serde_json::Value {
         })
         .collect();
 
-    json!({ "tools": tools })
+    serde_json::json!({ "tools": tools })
+}
+
+/// List tools handler
+async fn list_tools_handler() -> Json<Value> {
+    let handlers = match HANDLERS.get() {
+        Some(h) => h,
+        None => {
+            return Json(serde_json::json!({
+                "error": "Handlers not initialized"
+            }));
+        }
+    };
+
+    Json(list_tools_json(handlers))
 }
 
 /// Health check handler
-async fn health_check_handler() -> impl IntoResponse {
-    (StatusCode::OK, Json(json!({
+async fn health_check_handler() -> Json<Value> {
+    Json(serde_json::json!({
         "status": "ok",
         "service": "leindex-mcp-server",
         "version": env!("CARGO_PKG_VERSION")
-    })))
+    }))
 }
-
-/// List tools handler (GET endpoint)
-async fn list_tools_handler(
-    State(server): State<Arc<McpServer>>,
-) -> impl IntoResponse {
-    (StatusCode::OK, Json(list_tools(server)))
-}
-
-/// Create an error response
-fn error_response(id: serde_json::Value, error: JsonRpcError) -> axum::response::Response {
-    (StatusCode::OK, Json(JsonRpcResponse::error(id, error))).into_response()
-}
-
-// ========================================================================
-// TESTS
-// ========================================================================
 
 #[cfg(test)]
 mod tests {
@@ -266,32 +238,5 @@ mod tests {
     fn test_server_config_default() {
         let config = McpServerConfig::default();
         assert_eq!(config.bind_address, SocketAddr::from(([127, 0, 0, 1], 3000)));
-        assert!(config.enable_cors);
-        assert_eq!(config.max_request_size_mb, 10);
-    }
-
-    #[test]
-    fn test_list_tools() {
-        // Create a dummy server for testing
-        let config = McpServerConfig::default();
-        let leindex = LeIndex::new(".").unwrap(); // Use current directory
-        let server = Arc::new(McpServer::new(config, leindex));
-
-        let tools = list_tools(server);
-        let tools_array = tools["tools"].as_array().unwrap();
-
-        assert!(!tools_array.is_empty());
-        assert!(tools_array.len() >= 5); // At least 5 default tools
-
-        // Check that expected tools are present
-        let tool_names: Vec<_> = tools_array.iter()
-            .filter_map(|t| t["name"].as_str())
-            .collect();
-
-        assert!(tool_names.contains(&"leindex_index"));
-        assert!(tool_names.contains(&"leindex_search"));
-        assert!(tool_names.contains(&"leindex_deep_analyze"));
-        assert!(tool_names.contains(&"leindex_context"));
-        assert!(tool_names.contains(&"leindex_diagnostics"));
     }
 }

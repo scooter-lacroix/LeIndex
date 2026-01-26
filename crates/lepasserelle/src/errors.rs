@@ -15,7 +15,6 @@ pub type Result<T> = std::result::Result<T, LeIndexError>;
 #[derive(Debug)]
 pub enum LeIndexError {
     /// Parsing-related errors
-    #[error("Parsing error: {message}")]
     Parse {
         message: String,
         file_path: Option<PathBuf>,
@@ -23,50 +22,42 @@ pub enum LeIndexError {
     },
 
     /// Indexing-related errors
-    #[error("Indexing error: {message}")]
     Index {
         message: String,
         recoverable: bool,
     },
 
     /// Storage-related errors
-    #[error("Storage error: {message}")]
     Storage {
         message: String,
         recoverable: bool,
     },
 
     /// Search-related errors
-    #[error("Search error: {message}")]
     Search {
         message: String,
     },
 
     /// Configuration errors
-    #[error("Configuration error: {message}")]
     Config {
         message: String,
         suggestion: Option<String>,
     },
 
     /// I/O errors with context
-    #[error("I/O error: {context} (path: {path:?})")]
     Io {
         context: String,
         path: Option<PathBuf>,
-        #[source]
         source: std::io::Error,
     },
 
     /// Memory-related errors
-    #[error("Memory error: {message}")]
     Memory {
         message: String,
         suggestion: Option<String>,
     },
 
     /// Validation errors
-    #[error("Validation error: {message}")]
     Validation {
         message: String,
         suggestion: Option<String>,
