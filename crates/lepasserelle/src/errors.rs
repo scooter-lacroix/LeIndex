@@ -173,6 +173,18 @@ impl std::fmt::Display for LeIndexError {
     }
 }
 
+impl std::error::Error for LeIndexError {}
+
+impl From<std::io::Error> for LeIndexError {
+    fn from(err: std::io::Error) -> Self {
+        LeIndexError::Io {
+            context: err.to_string(),
+            path: None,
+            source: err,
+        }
+    }
+}
+
 /// Error recovery strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryStrategy {
@@ -190,7 +202,7 @@ pub enum RecoveryStrategy {
 }
 
 /// Error recovery context
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ErrorContext {
     /// Current operation being performed
     pub operation: String,

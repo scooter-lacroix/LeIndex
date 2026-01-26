@@ -21,11 +21,12 @@ tracing.workspace = true
 psutil.workspace = true
 tokio.workspace = true
 
-# MCP server dependencies (will add in Phase 2)
-# axum = { version = "0.7", features = ["json"] }
-# tower = { version = "0.5", features = ["full"] }
-# tower-http = { version = "0.5", features = ["cors", "trace"] }
-# jsonrpc = { version = "0.18", default-features = false, features = ["server"] }
+# MCP server dependencies
+axum = { version = "0.7", features = ["json"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.5", features = ["cors", "trace", "limit"] }
+tokio-stream = "0.1"
+futures-util = "0.3"
 
 # CLI dependencies (will add in Phase 3)
 # clap = { version = "4.5", features = ["derive"] }

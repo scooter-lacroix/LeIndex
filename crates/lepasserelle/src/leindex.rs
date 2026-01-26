@@ -444,6 +444,35 @@ impl LeIndex {
     }
 
     // ========================================================================
+    // ACCESSOR METHODS (for MCP server integration)
+    // ========================================================================
+
+    /// Get the project path
+    pub fn project_path(&self) -> &Path {
+        &self.project_path
+    }
+
+    /// Get the project ID
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    /// Get a reference to the search engine
+    pub fn search_engine(&self) -> &SearchEngine {
+        &self.search_engine
+    }
+
+    /// Get the current indexing statistics
+    pub fn get_stats(&self) -> &IndexStats {
+        &self.stats
+    }
+
+    /// Check if the project has been indexed
+    pub fn is_indexed(&self) -> bool {
+        self.search_engine.node_count() > 0
+    }
+
+    // ========================================================================
     // PRIVATE METHODS
     // ========================================================================
 

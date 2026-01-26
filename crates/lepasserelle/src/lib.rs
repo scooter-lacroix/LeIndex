@@ -15,7 +15,7 @@ pub use config::{ProjectConfig, LanguageConfig, TokenConfig, StorageConfig};
 pub use errors::{LeIndexError, Result as LeIndexResult, RecoveryStrategy, ErrorContext};
 pub use leindex::{LeIndex, IndexStats, AnalysisResult as LeIndexAnalysisResult, Diagnostics};
 pub use memory::{MemoryManager, MemoryConfig as MemoryManagementConfig};
-pub use mcp::{LeIndexDeepAnalyze, AnalysisResult as McpAnalysisResult};
+pub use mcp::{McpServer, McpServerConfig, JsonRpcRequest, JsonRpcResponse, JsonRpcError, error_codes};
 
 /// Library initialization
 pub fn init() {
