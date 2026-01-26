@@ -65,3 +65,4 @@ lestockage = { path = "../lestockage" }
 
 [dev-dependencies]
 rstest.workspace = true
+tempfile = "3.13"
