@@ -2,7 +2,10 @@
 //
 // *L'Index* (The Index) - Unified API that brings together all LeIndex crates
 
-use crate::memory::MemoryManager;
+use crate::memory::{
+    analysis_cache_key, create_pdg_entry, create_search_entry, pdg_cache_key, search_cache_key,
+    CacheEntry, CacheSpiller, MemoryConfig, MemoryManager,
+};
 use anyhow::{Context, Result};
 use legraphe::{
     pdg::{Node, NodeType, ProgramDependenceGraph},
@@ -44,8 +47,8 @@ pub struct LeIndex {
     /// Program Dependence Graph
     pdg: Option<ProgramDependenceGraph>,
 
-    /// Memory manager
-    memory_manager: MemoryManager,
+    /// Cache spiller for memory management
+    cache_spiller: CacheSpiller,
 
     /// Indexing statistics
     stats: IndexStats,
@@ -121,6 +124,18 @@ pub struct Diagnostics {
 
     /// Whether memory threshold is exceeded
     pub memory_threshold_exceeded: bool,
+
+    /// Number of cache entries in memory
+    pub cache_entries: usize,
+
+    /// Size of cache in memory (bytes)
+    pub cache_bytes: usize,
+
+    /// Number of spilled entries on disk
+    pub spilled_entries: usize,
+
+    /// Size of spilled cache on disk (bytes)
+    pub spilled_bytes: usize,
 }
 
 impl LeIndex {
@@ -163,8 +178,14 @@ impl LeIndex {
         // Initialize search engine
         let search_engine = SearchEngine::new();
 
-        // Initialize memory manager
-        let memory_manager = MemoryManager::default();
+        // Initialize cache spiller with project-specific cache directory
+        let cache_dir = storage_path.join("cache");
+        let memory_config = MemoryConfig {
+            cache_dir,
+            ..Default::default()
+        };
+        let cache_spiller = CacheSpiller::new(memory_config)
+            .context("Failed to initialize cache spiller")?;
 
         Ok(Self {
             project_path,
@@ -172,7 +193,7 @@ impl LeIndex {
             storage,
             search_engine,
             pdg: None,
-            memory_manager,
+            cache_spiller,
             stats: IndexStats {
                 files_parsed: 0,
                 successful_parses: 0,
@@ -383,22 +404,25 @@ impl LeIndex {
     /// println!("Memory usage: {:.1}%", diag.memory_usage_percent);
     /// ```
     pub fn get_diagnostics(&self) -> Result<Diagnostics> {
-        let memory_usage = self.memory_manager.get_rss_bytes()
-            .context("Failed to get memory usage")?;
-        let total_memory = self.memory_manager.get_total_memory()
-            .context("Failed to get total memory")?;
-        let memory_percent = (memory_usage as f64 / total_memory as f64) * 100.0;
-        let threshold_exceeded = self.memory_manager.is_threshold_exceeded()
-            .unwrap_or(false);
+        let memory_stats = self.cache_spiller.memory_stats()
+            .context("Failed to get memory stats")?;
+        let memory_percent = memory_stats.memory_percent();
+        let threshold_exceeded = self.cache_spiller.store().total_bytes() > 0
+            && self.cache_spiller.is_threshold_exceeded()
+                .unwrap_or(false);
 
         Ok(Diagnostics {
             project_path: self.project_path.display().to_string(),
             project_id: self.project_id.clone(),
             stats: self.stats.clone(),
-            memory_usage_bytes: memory_usage,
-            total_memory_bytes: total_memory,
+            memory_usage_bytes: memory_stats.rss_bytes,
+            total_memory_bytes: memory_stats.total_bytes,
             memory_usage_percent: memory_percent,
             memory_threshold_exceeded: threshold_exceeded,
+            cache_entries: memory_stats.cache_entries,
+            cache_bytes: memory_stats.cache_bytes,
+            spilled_entries: memory_stats.spilled_entries,
+            spilled_bytes: memory_stats.spilled_bytes,
         })
     }
 
@@ -708,6 +732,10 @@ mod tests {
             total_memory_bytes: 8192,
             memory_usage_percent: 12.5,
             memory_threshold_exceeded: false,
+            cache_entries: 5,
+            cache_bytes: 50000,
+            spilled_entries: 3,
+            spilled_bytes: 30000,
         };
 
         let json = serde_json::to_string(&diagnostics).unwrap();
@@ -715,5 +743,7 @@ mod tests {
 
         assert_eq!(deserialized.project_id, "test");
         assert_eq!(deserialized.memory_usage_bytes, 1024);
+        assert_eq!(deserialized.cache_entries, 5);
+        assert_eq!(deserialized.spilled_bytes, 30000);
     }
 }
