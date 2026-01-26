@@ -1,6 +1,7 @@
 // Core search engine implementation
 
 use crate::ranking::{Score, HybridScorer};
+use crate::vector::VectorIndex;
 use serde::{Deserialize, Serialize};
 
 /// Node information for indexing
@@ -76,6 +77,7 @@ pub struct SearchResult {
 pub struct SearchEngine {
     nodes: Vec<NodeInfo>,
     scorer: HybridScorer,
+    vector_index: VectorIndex,
 }
 
 impl SearchEngine {
@@ -84,12 +86,30 @@ impl SearchEngine {
         Self {
             nodes: Vec::new(),
             scorer: HybridScorer::new(),
+            vector_index: VectorIndex::new(768), // Default 768-dim embeddings
+        }
+    }
+
+    /// Create a new search engine with custom embedding dimension
+    pub fn with_dimension(dimension: usize) -> Self {
+        Self {
+            nodes: Vec::new(),
+            scorer: HybridScorer::new(),
+            vector_index: VectorIndex::new(dimension),
         }
     }
 
     /// Index nodes for searching
     pub fn index_nodes(&mut self, nodes: Vec<NodeInfo>) {
-        self.nodes = nodes;
+        // Store nodes for text search
+        self.nodes = nodes.clone();
+
+        // Build vector index from embeddings
+        for node in nodes {
+            if let Some(embedding) = node.embedding {
+                let _ = self.vector_index.insert(node.node_id.clone(), embedding);
+            }
+        }
     }
 
     /// Execute a search query
@@ -173,13 +193,72 @@ impl SearchEngine {
     }
 
     /// Semantic search for entry points
+    ///
+    /// This method performs vector similarity search using cosine similarity.
+    /// For now, it requires pre-computed embeddings in the indexed nodes.
+    ///
+    /// # Arguments
+    ///
+    /// * `query_embedding` - Query embedding vector (must match index dimension)
+    /// * `top_k` - Maximum number of results to return
+    ///
+    /// # Returns
+    ///
+    /// Vector of semantic entries sorted by similarity score
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let query_embedding = vec![0.1, 0.2, 0.3, ...]; // 768-dim vector
+    /// let results = engine.semantic_search(&query_embedding, 10).await?;
+    /// ```
     pub async fn semantic_search(
         &self,
-        _query: &str,
-        _top_k: usize,
+        query_embedding: &[f32],
+        top_k: usize,
     ) -> Result<Vec<SemanticEntry>, Error> {
-        // Placeholder - will use LEANN backend
-        Ok(Vec::new())
+        if self.vector_index.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Perform vector similarity search
+        let results = self.vector_index.search(query_embedding, top_k);
+
+        // Convert to SemanticEntry format
+        let entries = results
+            .into_iter()
+            .map(|(node_id, score)| {
+                // Determine entry type based on node info
+                let entry_type = self
+                    .nodes
+                    .iter()
+                    .find(|n| n.node_id == node_id)
+                    .map(|_| EntryType::Function)
+                    .unwrap_or(EntryType::Function);
+
+                SemanticEntry {
+                    node_id,
+                    relevance: score,
+                    entry_type,
+                }
+            })
+            .collect();
+
+        Ok(entries)
+    }
+
+    /// Get the vector index for direct access
+    ///
+    /// This provides access to the underlying vector index for advanced use cases.
+    pub fn vector_index(&self) -> &VectorIndex {
+        &self.vector_index
+    }
+
+    /// Get mutable access to the vector index
+    ///
+    /// This allows direct manipulation of the vector index.
+    pub fn vector_index_mut(&mut self) -> &mut VectorIndex {
+        &mut self.vector_index
     }
 }
 
@@ -320,5 +399,124 @@ mod tests {
         assert_eq!(results.len(), 2);
         // High complexity should rank higher due to structural score
         assert_eq!(results[0].node_id, "high_complexity");
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_integration() {
+        let mut engine = SearchEngine::new();
+
+        // Create nodes with embeddings
+        let nodes = vec![
+            NodeInfo {
+                node_id: "func1".to_string(),
+                file_path: "test.rs".to_string(),
+                symbol_name: "function_one".to_string(),
+                content: "fn function_one() {}".to_string(),
+                byte_range: (0, 20),
+                embedding: Some(vec![1.0, 0.0, 0.0]), // 3-dim for testing
+                complexity: 1,
+            },
+            NodeInfo {
+                node_id: "func2".to_string(),
+                file_path: "test.rs".to_string(),
+                symbol_name: "function_two".to_string(),
+                content: "fn function_two() {}".to_string(),
+                byte_range: (20, 40),
+                embedding: Some(vec![0.0, 1.0, 0.0]),
+                complexity: 2,
+            },
+            NodeInfo {
+                node_id: "func3".to_string(),
+                file_path: "test.rs".to_string(),
+                symbol_name: "function_three".to_string(),
+                content: "fn function_three() {}".to_string(),
+                byte_range: (40, 60),
+                embedding: Some(vec![0.9, 0.1, 0.0]), // Similar to func1
+                complexity: 3,
+            },
+        ];
+
+        // Index with 3-dim embeddings (not 768, just for this test)
+        let mut custom_engine = SearchEngine::with_dimension(3);
+        custom_engine.index_nodes(nodes);
+
+        // Search with query similar to func1
+        let query = vec![1.0, 0.0, 0.0];
+        let results = custom_engine.semantic_search(&query, 10).await.unwrap();
+
+        // func1 should be most similar (identical)
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].node_id, "func1");
+        assert!(results[0].relevance > 0.9); // Should be very close to 1.0
+
+        // func3 should be second (similar to func1)
+        assert_eq!(results[1].node_id, "func3");
+
+        // func2 should be last (different direction)
+        assert_eq!(results[2].node_id, "func2");
+        assert!(results[2].relevance < 0.1); // Should be close to 0.0
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_empty_index() {
+        let engine = SearchEngine::new();
+        let query = vec![0.1, 0.2, 0.3];
+        let results = engine.semantic_search(&query, 10).await.unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_vector_search_top_k() {
+        let mut engine = SearchEngine::with_dimension(2);
+        let nodes = (0..10).map(|i| NodeInfo {
+            node_id: format!("node{}", i),
+            file_path: "test.rs".to_string(),
+            symbol_name: format!("func{}", i),
+            content: String::new(),
+            byte_range: (0, 0),
+            embedding: Some(vec![1.0 / (i + 1) as f32, 0.0]),
+            complexity: 1,
+        }).collect::<Vec<_>>();
+
+        engine.index_nodes(nodes);
+
+        let query = vec![1.0, 0.0];
+        let results = engine.semantic_search(&query, 3).await.unwrap();
+        assert_eq!(results.len(), 3); // Should only return top 3
+    }
+
+    #[test]
+    fn test_search_engine_with_dimension() {
+        let engine = SearchEngine::with_dimension(128);
+        assert_eq!(engine.vector_index().dimension(), 128);
+    }
+
+    #[test]
+    fn test_search_engine_default_dimension() {
+        let engine = SearchEngine::new();
+        assert_eq!(engine.vector_index().dimension(), 768);
+    }
+
+    #[tokio::test]
+    async fn test_direct_vector_index_access() {
+        let mut engine = SearchEngine::with_dimension(3);
+
+        // Add vectors directly via index - use truly orthogonal vectors
+        let index = engine.vector_index_mut();
+        index.insert("test1".to_string(), vec![1.0, 0.0, 0.0]).unwrap(); // X axis
+        index.insert("test2".to_string(), vec![0.0, 1.0, 0.0]).unwrap(); // Y axis
+
+        assert_eq!(engine.vector_index().len(), 2);
+
+        // Search for X-axis vector should only find test1
+        let query = vec![1.0, 0.0, 0.0];
+        let results = engine.semantic_search(&query, 10).await.unwrap();
+
+        // Should return both results, but test1 has similarity 1.0, test2 has 0.0
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].node_id, "test1");
+        assert!(results[0].relevance > 0.99); // Nearly identical
+        assert_eq!(results[1].node_id, "test2");
+        assert!(results[1].relevance < 0.01); // Orthogonal
     }
 }
