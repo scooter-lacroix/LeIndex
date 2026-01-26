@@ -292,6 +292,27 @@ impl ProgramDependenceGraph {
         self.graph.edge_count()
     }
 
+    /// Iterate over all node indices
+    ///
+    /// This provides access to all nodes in the graph for iteration.
+    pub fn node_indices(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.graph.node_indices()
+    }
+
+    /// Iterate over all edge indices
+    ///
+    /// This provides access to all edges in the graph for iteration.
+    pub fn edge_indices(&self) -> impl Iterator<Item = EdgeId> + '_ {
+        self.graph.edge_indices()
+    }
+
+    /// Get edge endpoints
+    ///
+    /// Returns the source and target nodes for the given edge ID.
+    pub fn edge_endpoints(&self, edge_id: EdgeId) -> Option<(NodeId, NodeId)> {
+        self.graph.edge_endpoints(edge_id)
+    }
+
     /// Get neighbors of a node (outgoing)
     pub fn neighbors(&self, node_id: NodeId) -> Vec<NodeId> {
         self.graph.neighbors(node_id).collect()

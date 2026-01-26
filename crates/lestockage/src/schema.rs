@@ -106,6 +106,52 @@ impl Storage {
             [],
         )?;
 
+        // Create global_symbols table (Phase 7: Cross-Project Resolution)
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS global_symbols (
+                symbol_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                symbol_name TEXT NOT NULL,
+                symbol_type TEXT NOT NULL,
+                signature TEXT,
+                file_path TEXT NOT NULL,
+                byte_range_start INTEGER,
+                byte_range_end INTEGER,
+                complexity INTEGER DEFAULT 1,
+                is_public INTEGER DEFAULT 0,
+                created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                UNIQUE(project_id, symbol_name, signature)
+            )",
+            [],
+        )?;
+
+        // Create external_refs table (Phase 7: Cross-Project Resolution)
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS external_refs (
+                ref_id TEXT PRIMARY KEY,
+                source_project_id TEXT NOT NULL,
+                source_symbol_id TEXT NOT NULL,
+                target_project_id TEXT NOT NULL,
+                target_symbol_id TEXT NOT NULL,
+                ref_type TEXT NOT NULL,
+                FOREIGN KEY (source_symbol_id) REFERENCES global_symbols(symbol_id),
+                FOREIGN KEY (target_symbol_id) REFERENCES global_symbols(symbol_id)
+            )",
+            [],
+        )?;
+
+        // Create project_deps table (Phase 7: Cross-Project Resolution)
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS project_deps (
+                dep_id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                depends_on_project_id TEXT NOT NULL,
+                dependency_type TEXT NOT NULL,
+                UNIQUE(project_id, depends_on_project_id)
+            )",
+            [],
+        )?;
+
         // Create indexes for query performance
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_nodes_project ON intel_nodes(project_id)",
@@ -121,6 +167,40 @@ impl Storage {
         )?;
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_nodes_hash ON intel_nodes(content_hash)",
+            [],
+        )?;
+
+        // Create indexes for global_symbols (Phase 7)
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_global_symbols_name ON global_symbols(symbol_name)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_global_symbols_type ON global_symbols(symbol_type)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_global_symbols_project ON global_symbols(project_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_global_symbols_public ON global_symbols(symbol_id) WHERE is_public = 1",
+            [],
+        )?;
+
+        // Create indexes for external_refs (Phase 7)
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_refs_source ON external_refs(source_symbol_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_external_refs_target ON external_refs(target_symbol_id)",
+            [],
+        )?;
+
+        // Create indexes for project_deps (Phase 7)
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_project_deps_project ON project_deps(project_id)",
             [],
         )?;
 
@@ -159,12 +239,12 @@ mod tests {
         let table_count: i64 = storage
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND (name LIKE 'intel_%' OR name = 'analysis_cache')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND (name LIKE 'intel_%' OR name = 'analysis_cache' OR name LIKE 'global_%' OR name LIKE 'external_%' OR name LIKE 'project_%')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
 
-        assert_eq!(table_count, 3); // intel_nodes, intel_edges, analysis_cache
+        assert_eq!(table_count, 6); // intel_nodes, intel_edges, analysis_cache, global_symbols, external_refs, project_deps
     }
 }

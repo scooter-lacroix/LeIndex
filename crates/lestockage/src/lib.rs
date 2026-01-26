@@ -10,12 +10,19 @@ pub mod nodes;
 pub mod edges;
 pub mod salsa;
 pub mod analytics;
+pub mod pdg_store;
+pub mod global_symbols;
 
 pub use schema::{Storage, StorageConfig};
 pub use nodes::{NodeStore, NodeRecord};
 pub use edges::{EdgeStore, EdgeRecord};
 pub use salsa::{IncrementalCache, NodeHash};
 pub use analytics::Analytics;
+pub use pdg_store::{save_pdg, load_pdg, pdg_exists, delete_pdg, PdgStoreError, Result as PdgStoreResult};
+pub use global_symbols::{
+    GlobalSymbolTable, GlobalSymbol, GlobalSymbolId, SymbolType,
+    ExternalRef, RefType, ProjectDep, DepType, GlobalSymbolError
+};
 
 /// Storage library initialization
 pub fn init() {
