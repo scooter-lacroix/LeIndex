@@ -216,6 +216,26 @@ impl CacheStore {
         self.total_bytes
     }
 
+    /// Get maximum cache size in bytes
+    pub fn max_bytes(&self) -> usize {
+        self.max_bytes
+    }
+
+    /// Get the cache directory path
+    pub fn cache_dir(&self) -> &PathBuf {
+        &self.cache_dir
+    }
+
+    /// Pop the least recently used entry from cache
+    pub fn pop_lru(&mut self) -> Option<(CacheKey, CacheEntry)> {
+        if let Some((key, entry)) = self.cache.pop_lru() {
+            self.total_bytes = self.total_bytes.saturating_sub(entry.size_bytes());
+            Some((key, entry))
+        } else {
+            None
+        }
+    }
+
     /// Clear all entries from the cache
     pub fn clear(&mut self) -> Result<usize, Error> {
         let bytes_freed = self.total_bytes;
@@ -341,6 +361,72 @@ impl CacheStore {
 
         Ok(total)
     }
+
+    /// Validate a cache entry's integrity
+    pub fn validate_entry(&self, key: &str) -> Result<ValidationResult, Error> {
+        let cache_file = self.cache_dir.join(format!("{}.bin", sanitize_key(key)));
+
+        if !cache_file.exists() {
+            return Ok(ValidationResult {
+                is_valid: false,
+                entry_type: None,
+                size_bytes: 0,
+                error: Some("File not found".to_string()),
+            });
+        }
+
+        // Try to read and deserialize the entry
+        match self.load_from_disk(key) {
+            Ok(entry) => {
+                let entry_type = match &entry {
+                    CacheEntry::PDG { .. } => Some("PDG".to_string()),
+                    CacheEntry::SearchIndex { .. } => Some("SearchIndex".to_string()),
+                    CacheEntry::Analysis { .. } => Some("Analysis".to_string()),
+                    CacheEntry::Binary { .. } => Some("Binary".to_string()),
+                };
+
+                Ok(ValidationResult {
+                    is_valid: true,
+                    entry_type,
+                    size_bytes: entry.size_bytes(),
+                    error: None,
+                })
+            }
+            Err(e) => Ok(ValidationResult {
+                is_valid: false,
+                entry_type: None,
+                size_bytes: 0,
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+
+    /// Restore spilled cache entries into memory
+    pub fn restore_spilled(&mut self, keys: &[String]) -> Result<RestoreResult, Error> {
+        let mut restored = 0;
+        let mut failed = Vec::new();
+
+        for key in keys {
+            match self.load_from_disk(key) {
+                Ok(entry) => {
+                    // Insert into cache (this may trigger eviction if needed)
+                    if self.insert(key.clone(), entry).is_ok() {
+                        restored += 1;
+                    } else {
+                        failed.push((key.clone(), "Insert failed".to_string()));
+                    }
+                }
+                Err(e) => {
+                    failed.push((key.clone(), e.to_string()));
+                }
+            }
+        }
+
+        Ok(RestoreResult {
+            entries_restored: restored,
+            entries_failed: failed,
+        })
+    }
 }
 
 /// Sanitize a cache key for use as a filename
@@ -405,7 +491,7 @@ impl CacheSpiller {
         let mut spilled_keys = Vec::new();
 
         for _ in 0..target_entries {
-            if let Some((key, _entry)) = self.store.cache.pop_lru() {
+            if let Some((key, _entry)) = self.store.pop_lru() {
                 spilled_keys.push(key.clone());
             }
         }
@@ -461,6 +547,190 @@ impl CacheSpiller {
     /// Get reference to the memory manager
     pub fn memory_manager(&self) -> &MemoryManager {
         &self.memory_manager
+    }
+
+    /// Validate all spilled cache entries
+    pub fn validate_all_spilled(&self) -> Result<Vec<(String, ValidationResult)>, Error> {
+        let spilled_keys = self.store.list_spilled()?;
+        let mut results = Vec::new();
+
+        for key in spilled_keys {
+            let validation = self.store.validate_entry(&key)?;
+            results.push((key, validation));
+        }
+
+        Ok(results)
+    }
+
+    /// Restore cache entries for specific keys
+    pub fn restore_keys(&mut self, keys: &[String]) -> Result<RestoreResult, Error> {
+        self.store.restore_spilled(keys)
+    }
+
+    /// Warm cache with frequently accessed entries
+    ///
+    /// This strategy prioritizes:
+    /// 1. PDG entries (most expensive to rebuild)
+    /// 2. Search index entries (expensive to rebuild)
+    /// 3. Recent analysis results
+    pub fn warm_cache(&mut self, strategy: WarmStrategy) -> Result<WarmResult, Error> {
+        let spilled_keys = self.store.list_spilled()?;
+        if spilled_keys.is_empty() {
+            return Ok(WarmResult {
+                entries_warmed: 0,
+                entries_skipped: 0,
+                warming_strategy: strategy,
+            });
+        }
+
+        // Filter and prioritize keys based on strategy
+        let prioritized_keys = self.prioritize_keys_for_warming(&spilled_keys, strategy)?;
+
+        // Calculate how many entries we can fit in memory
+        let current_bytes = self.store.total_bytes();
+        let max_bytes = self.store.max_bytes;
+        let available_bytes = max_bytes.saturating_sub(current_bytes);
+
+        // Warm entries until we run out of space or entries
+        let mut warmed = 0;
+        let mut skipped = 0;
+        let mut used_bytes = 0;
+
+        for key in prioritized_keys {
+            // Check if entry will fit
+            if let Ok(validation) = self.store.validate_entry(&key) {
+                if validation.is_valid {
+                    if used_bytes + validation.size_bytes > available_bytes {
+                        skipped += 1;
+                        continue;
+                    }
+
+                    match self.store.load_from_disk(&key) {
+                        Ok(entry) => {
+                            if self.store.insert(key.clone(), entry).is_ok() {
+                                warmed += 1;
+                                used_bytes += validation.size_bytes;
+                            } else {
+                                skipped += 1;
+                            }
+                        }
+                        Err(_) => {
+                            skipped += 1;
+                        }
+                    }
+                } else {
+                    skipped += 1;
+                }
+            } else {
+                skipped += 1;
+            }
+        }
+
+        info!(
+            "Cache warming complete: {} entries warmed, {} skipped",
+            warmed, skipped
+        );
+
+        Ok(WarmResult {
+            entries_warmed: warmed,
+            entries_skipped: skipped,
+            warming_strategy: strategy,
+        })
+    }
+
+    /// Prioritize keys for warming based on strategy
+    fn prioritize_keys_for_warming(&self, keys: &[String], strategy: WarmStrategy) -> Result<Vec<String>, Error> {
+        match strategy {
+            WarmStrategy::All => Ok(keys.to_vec()),
+            WarmStrategy::PDGOnly => {
+                Ok(keys.iter()
+                    .filter(|k| k.starts_with("pdg:"))
+                    .cloned()
+                    .collect())
+            }
+            WarmStrategy::SearchIndexOnly => {
+                Ok(keys.iter()
+                    .filter(|k| k.starts_with("search:"))
+                    .cloned()
+                    .collect())
+            }
+            WarmStrategy::RecentFirst => {
+                // Sort by file modification time (most recent first)
+                let mut keyed: Vec<(String, std::time::SystemTime)> = Vec::new();
+
+                for key in keys {
+                    let cache_file = self.store.cache_dir().join(format!("{}.bin", sanitize_key(key)));
+                    if let Ok(metadata) = std::fs::metadata(&cache_file) {
+                        if let Ok(modified) = metadata.modified() {
+                            keyed.push((key.clone(), modified));
+                        }
+                    }
+                }
+
+                keyed.sort_by(|a, b| b.1.cmp(&a.1));
+                Ok(keyed.into_iter().map(|(k, _)| k).collect())
+            }
+        }
+    }
+
+    /// Automatically restore cache on startup
+    ///
+    /// This is called when CacheSpiller is created to restore recently used entries
+    pub fn auto_restore(&mut self) -> Result<RestoreResult, Error> {
+        info!("Auto-restoring cache from disk...");
+
+        let spilled_keys = self.store.list_spilled()?;
+        if spilled_keys.is_empty() {
+            info!("No spilled cache entries to restore");
+            return Ok(RestoreResult {
+                entries_restored: 0,
+                entries_failed: Vec::new(),
+            });
+        }
+
+        // Use recent-first strategy to prioritize recently accessed entries
+        let prioritized = self.prioritize_keys_for_warming(&spilled_keys, WarmStrategy::RecentFirst)?;
+
+        // Only restore entries that fit in available memory
+        let current_bytes = self.store.total_bytes();
+        let max_bytes = self.store.max_bytes;
+        let available_bytes = max_bytes.saturating_sub(current_bytes);
+
+        let mut restored = 0;
+        let mut failed = Vec::new();
+        let mut used_bytes = 0;
+
+        for key in prioritized {
+            // Check if we have space
+            if let Ok(validation) = self.store.validate_entry(&key) {
+                if validation.is_valid && used_bytes + validation.size_bytes <= available_bytes {
+                    match self.store.load_from_disk(&key) {
+                        Ok(entry) => {
+                            if self.store.insert(key.clone(), entry).is_ok() {
+                                restored += 1;
+                                used_bytes += validation.size_bytes;
+                            } else {
+                                failed.push((key, "Insert failed".to_string()));
+                            }
+                        }
+                        Err(e) => {
+                            failed.push((key, e.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        info!(
+            "Auto-restore complete: {} entries restored, {} failed",
+            restored,
+            failed.len()
+        );
+
+        Ok(RestoreResult {
+            entries_restored: restored,
+            entries_failed: failed,
+        })
     }
 }
 
@@ -559,6 +829,61 @@ pub struct MemoryStats {
 
     /// Size of spilled cache on disk (bytes)
     pub spilled_bytes: usize,
+}
+
+/// Cache entry validation result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationResult {
+    /// Whether the entry is valid
+    pub is_valid: bool,
+
+    /// Type of cache entry (if valid)
+    pub entry_type: Option<String>,
+
+    /// Size of entry in bytes (if valid)
+    pub size_bytes: usize,
+
+    /// Error message (if invalid)
+    pub error: Option<String>,
+}
+
+/// Result of cache restoration operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RestoreResult {
+    /// Number of entries successfully restored
+    pub entries_restored: usize,
+
+    /// Entries that failed to restore with error messages
+    pub entries_failed: Vec<(String, String)>,
+}
+
+/// Cache warming strategy
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WarmStrategy {
+    /// Warm all cached entries
+    All,
+
+    /// Only warm PDG entries (most expensive to rebuild)
+    PDGOnly,
+
+    /// Only warm search index entries
+    SearchIndexOnly,
+
+    /// Warm recently accessed entries first
+    RecentFirst,
+}
+
+/// Result of cache warming operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WarmResult {
+    /// Number of entries warmed
+    pub entries_warmed: usize,
+
+    /// Number of entries skipped (due to space or errors)
+    pub entries_skipped: usize,
+
+    /// Strategy used for warming
+    pub warming_strategy: WarmStrategy,
 }
 
 impl MemoryStats {
@@ -771,5 +1096,86 @@ mod tests {
 
         let percent = stats.memory_percent();
         assert!(percent > 0.0 && percent < 100.0);
+    }
+
+    #[test]
+    fn test_validation_result() {
+        let result = ValidationResult {
+            is_valid: true,
+            entry_type: Some("PDG".to_string()),
+            size_bytes: 1024,
+            error: None,
+        };
+
+        assert!(result.is_valid);
+        assert_eq!(result.entry_type.unwrap(), "PDG");
+        assert_eq!(result.size_bytes, 1024);
+    }
+
+    #[test]
+    fn test_restore_result() {
+        let result = RestoreResult {
+            entries_restored: 5,
+            entries_failed: vec![("key1".to_string(), "error".to_string())],
+        };
+
+        assert_eq!(result.entries_restored, 5);
+        assert_eq!(result.entries_failed.len(), 1);
+    }
+
+    #[test]
+    fn test_warm_strategy() {
+        assert_eq!(WarmStrategy::All, WarmStrategy::All);
+        assert_eq!(WarmStrategy::PDGOnly, WarmStrategy::PDGOnly);
+        assert_eq!(WarmStrategy::SearchIndexOnly, WarmStrategy::SearchIndexOnly);
+        assert_eq!(WarmStrategy::RecentFirst, WarmStrategy::RecentFirst);
+    }
+
+    #[test]
+    fn test_warm_result() {
+        let result = WarmResult {
+            entries_warmed: 10,
+            entries_skipped: 2,
+            warming_strategy: WarmStrategy::RecentFirst,
+        };
+
+        assert_eq!(result.entries_warmed, 10);
+        assert_eq!(result.entries_skipped, 2);
+        assert_eq!(result.warming_strategy, WarmStrategy::RecentFirst);
+    }
+
+    #[test]
+    fn test_cache_store_max_bytes() {
+        let config = MemoryConfig {
+            max_cache_bytes: 100_000,
+            ..Default::default()
+        };
+
+        let store = CacheStore::new(&config);
+        assert_eq!(store.max_bytes(), 100_000);
+    }
+
+    #[test]
+    fn test_cache_store_pop_lru() {
+        let config = MemoryConfig {
+            max_cache_bytes: 10_000,
+            ..Default::default()
+        };
+
+        let mut store = CacheStore::new(&config);
+
+        let entry = CacheEntry::Binary {
+            metadata: HashMap::new(),
+            serialized_data: vec![0u8; 100],
+        };
+
+        store.insert("test_key".to_string(), entry.clone()).unwrap();
+
+        let popped = store.pop_lru();
+        assert!(popped.is_some());
+        assert_eq!(popped.unwrap().0, "test_key");
+
+        // Should be empty now
+        assert!(store.pop_lru().is_none());
     }
 }
