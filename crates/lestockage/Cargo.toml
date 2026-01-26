@@ -20,6 +20,10 @@ chrono.workspace = true
 rusqlite = { version = "0.32", features = ["bundled"] }
 blake3.workspace = true
 
+# Turso/libsql for vector store
+libsql = "0.5.0"
+rusqlite_migration = "1.0.0"
+
 # Internal dependencies
 leparse = { path = "../leparse" }
 legraphe = { path = "../legraphe" }

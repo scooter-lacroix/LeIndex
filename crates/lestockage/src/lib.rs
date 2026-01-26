@@ -13,6 +13,7 @@ pub mod analytics;
 pub mod pdg_store;
 pub mod global_symbols;
 pub mod cross_project;
+pub mod turso_config;
 
 pub use schema::{Storage, StorageConfig};
 pub use nodes::{NodeStore, NodeRecord};
@@ -27,6 +28,9 @@ pub use global_symbols::{
 pub use cross_project::{
     CrossProjectResolver, ResolvedSymbol, ResolutionError,
     MergeError
+};
+pub use turso_config::{
+    TursoConfig, HybridStorage, StorageMode, MigrationStats, StorageError
 };
 
 /// Storage library initialization

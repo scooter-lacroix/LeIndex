@@ -12,8 +12,9 @@
 use crate::query::{QueryParser, QueryIntent, MAX_EMBEDDING_DIMENSION, MIN_EMBEDDING_DIMENSION};
 use crate::ranking::{Score, HybridScorer};
 use crate::vector::VectorIndex;
+use crate::hnsw::{HNSWIndex, HNSWParams};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ============================================================================
 // CONSTANTS & VALIDATION
@@ -24,6 +25,93 @@ pub const DEFAULT_EMBEDDING_DIMENSION: usize = 768;
 
 /// Maximum number of nodes that can be indexed (prevents memory exhaustion)
 pub const MAX_NODES: usize = 1_000_000;
+
+// ============================================================================
+// VECTOR INDEX IMPLEMENTATION
+// ============================================================================
+
+/// Vector index implementation
+///
+/// Enum that wraps either the brute-force VectorIndex or the HNSW-based HNSWIndex.
+/// This allows switching between implementations at runtime.
+pub enum VectorIndexImpl {
+    /// Brute-force vector index (exact search)
+    BruteForce(VectorIndex),
+
+    /// HNSW-based approximate nearest neighbor index
+    HNSW(HNSWIndex),
+}
+
+impl VectorIndexImpl {
+    /// Get the number of vectors in the index
+    #[must_use]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::BruteForce(idx) => idx.len(),
+            Self::HNSW(idx) => idx.len(),
+        }
+    }
+
+    /// Check if the index is empty
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::BruteForce(idx) => idx.is_empty(),
+            Self::HNSW(idx) => idx.is_empty(),
+        }
+    }
+
+    /// Get the embedding dimension
+    #[must_use]
+    pub fn dimension(&self) -> usize {
+        match self {
+            Self::BruteForce(idx) => idx.dimension(),
+            Self::HNSW(idx) => idx.dimension(),
+        }
+    }
+
+    /// Search for similar vectors
+    pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
+        match self {
+            Self::BruteForce(idx) => idx.search(query, top_k),
+            Self::HNSW(idx) => idx.search(query, top_k),
+        }
+    }
+
+    /// Insert a vector into the index
+    pub fn insert(&mut self, node_id: String, vector: Vec<f32>) -> Result<(), VectorIndexError> {
+        match self {
+            Self::BruteForce(idx) => idx.insert(node_id, vector)
+                .map_err(|e| VectorIndexError::InsertionFailed(e.to_string())),
+            Self::HNSW(idx) => idx.insert(node_id, vector)
+                .map_err(|e| VectorIndexError::InsertionFailed(e.to_string())),
+        }
+    }
+
+    /// Clear all vectors from the index
+    pub fn clear(&mut self) {
+        match self {
+            Self::BruteForce(idx) => idx.clear(),
+            Self::HNSW(idx) => idx.clear(),
+        }
+    }
+
+    /// Check if HNSW is enabled
+    #[must_use]
+    pub fn is_hnsw_enabled(&self) -> bool {
+        matches!(self, Self::HNSW(_))
+    }
+}
+
+/// Vector index errors
+#[derive(Debug, thiserror::Error)]
+pub enum VectorIndexError {
+    #[error("Insertion failed: {0}")]
+    InsertionFailed(String),
+
+    #[error("Index operation failed: {0}")]
+    IndexOperationFailed(String),
+}
 
 // ============================================================================
 // NODE INFORMATION
@@ -55,6 +143,39 @@ pub struct NodeInfo {
 
     /// Complexity score (0-100+, higher = more complex)
     pub complexity: u32,
+}
+
+/// Pre-computed query data for optimized text scoring
+///
+/// This struct holds data that is pre-computed once per search to avoid
+/// repeated allocations in the hot path. When searching N nodes, this reduces
+/// allocations from O(N) to O(1).
+struct TextQueryPreprocessed {
+    /// Original query string
+    query: String,
+    /// Lowercase query for case-insensitive matching
+    query_lower: String,
+    /// Query tokens for overlap calculation
+    query_tokens: HashSet<String>,
+}
+
+impl TextQueryPreprocessed {
+    /// Create pre-computed query data
+    fn from_query(query: &str) -> Self {
+        let query_lower = query.to_ascii_lowercase();
+        // Tokenize using the same logic as the content indexing
+        let query_tokens: HashSet<_> = query
+            .split(|c: char| !c.is_alphanumeric())
+            .map(|s| s.to_ascii_lowercase())
+            .filter(|s| s.len() >= 2)
+            .collect();
+
+        Self {
+            query: query.to_string(),
+            query_lower,
+            query_tokens,
+        }
+    }
 }
 
 // ============================================================================
@@ -125,13 +246,15 @@ pub struct SearchResult {
 /// - Vector-based semantic search for similarity
 /// - Hybrid scoring combining multiple signals
 ///
+/// Supports both brute-force and HNSW vector search backends.
+///
 /// # Thread Safety
 ///
 /// - Reads (`&SearchEngine`) are thread-safe for concurrent access
 /// - Writes (`&mut SearchEngine`) require exclusive access
-/// - The internal VectorIndex is NOT thread-safe for concurrent writes
+/// - The internal VectorIndexImpl is NOT thread-safe for concurrent writes
 ///
-/// For concurrent read-write access, wrap in `Arc<RwLock<SearchEngine>>.
+/// For concurrent read-write access, wrap in `Arc<RwLock<SearchEngine>>`.
 ///
 /// # Example
 ///
@@ -143,13 +266,18 @@ pub struct SearchResult {
 pub struct SearchEngine {
     nodes: Vec<NodeInfo>,
     scorer: HybridScorer,
-    vector_index: VectorIndex,
+    vector_index: VectorIndexImpl,
     /// Complexity cache for O(1) lookups (fixes O(n²) bug)
     complexity_cache: HashMap<String, u32>,
+    /// Inverted index for O(1) text lookups: token -> set of node IDs
+    /// This allows sub-linear text search instead of O(N) scan
+    text_index: HashMap<String, HashSet<String>>,
 }
 
 impl SearchEngine {
     /// Create a new search engine with default 768-dim embeddings
+    ///
+    /// Uses brute-force vector search by default.
     ///
     /// # Panics
     ///
@@ -159,12 +287,15 @@ impl SearchEngine {
         Self {
             nodes: Vec::new(),
             scorer: HybridScorer::new(),
-            vector_index: VectorIndex::new(DEFAULT_EMBEDDING_DIMENSION),
+            vector_index: VectorIndexImpl::BruteForce(VectorIndex::new(DEFAULT_EMBEDDING_DIMENSION)),
             complexity_cache: HashMap::new(),
+            text_index: HashMap::new(),
         }
     }
 
     /// Create a new search engine with custom embedding dimension
+    ///
+    /// Uses brute-force vector search by default.
     ///
     /// # Arguments
     ///
@@ -192,8 +323,9 @@ impl SearchEngine {
         Self {
             nodes: Vec::new(),
             scorer: HybridScorer::new(),
-            vector_index: VectorIndex::new(dimension),
+            vector_index: VectorIndexImpl::BruteForce(VectorIndex::new(dimension)),
             complexity_cache: HashMap::new(),
+            text_index: HashMap::new(),
         }
     }
 
@@ -226,6 +358,7 @@ impl SearchEngine {
 
         // Clear cache when re-indexing
         self.complexity_cache.clear();
+        self.text_index.clear();
 
         // Store nodes for text search
         self.nodes = nodes.clone();
@@ -233,6 +366,23 @@ impl SearchEngine {
         // Build complexity cache for O(1) lookups
         for node in &nodes {
             self.complexity_cache.insert(node.node_id.clone(), node.complexity);
+        }
+
+        // Build inverted index for O(1) text lookups
+        // This maps each token to the set of node IDs containing it
+        for node in &nodes {
+            // Tokenize content into individual words, splitting on word boundaries
+            // This handles punctuation and special characters properly
+            for token in node.content.split(|c: char| !c.is_alphanumeric()) {
+                let normalized_token = token.to_ascii_lowercase();
+                // Skip empty tokens and very short ones (< 2 chars) to reduce noise
+                if normalized_token.len() >= 2 {
+                    self.text_index
+                        .entry(normalized_token)
+                        .or_insert_with(HashSet::new)
+                        .insert(node.node_id.clone());
+                }
+            }
         }
 
         // Build vector index from embeddings
@@ -294,21 +444,77 @@ impl SearchEngine {
 
         let mut results = Vec::new();
 
-        for node in &self.nodes {
-            let text_score = self.calculate_text_score(&query.query, &node.content);
+        // Pre-compute vector search if semantic search is requested
+        let vector_results: std::collections::HashMap<String, f32> = if query.semantic {
+            // Find if there's a node with an embedding we can use as query
+            let query_embedding = self.nodes.iter()
+                .find_map(|n| n.embedding.as_ref())
+                .cloned();
 
-            // For now, if no text match and not semantic, skip
-            if text_score == 0.0 && !query.semantic {
-                continue;
+            if let Some(embedding) = query_embedding {
+                let search_results = self.vector_index.search(&embedding, query.top_k);
+                search_results.into_iter()
+                    .map(|(id, score)| (id, score))
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
+
+        // Pre-compute query data for optimized text scoring
+        // This reduces allocations from O(N) to O(1) per search
+        let text_query = TextQueryPreprocessed::from_query(&query.query);
+
+        // Use inverted index to filter candidates - only check nodes that contain query terms
+        // This reduces search complexity from O(N) to O(M) where M is number of matching nodes
+        let candidates = if text_query.query_tokens.is_empty() {
+            // No query tokens, check all nodes
+            self.nodes.iter().collect::<Vec<_>>()
+        } else {
+            // Build candidate set using inverted index - O(1) per token lookup
+            let mut candidate_ids: HashSet<&str> = HashSet::new();
+
+            for token in &text_query.query_tokens {
+                if let Some(node_ids) = self.text_index.get(token) {
+                    for node_id in node_ids {
+                        candidate_ids.insert(node_id.as_str());
+                    }
+                }
             }
 
+            // If no matches in inverted index, return empty results early
+            if candidate_ids.is_empty() && !query.semantic {
+                return Ok(Vec::new());
+            }
+
+            // Convert candidate IDs to node references
+            if candidate_ids.is_empty() {
+                // Semantic-only search, use all nodes
+                self.nodes.iter().collect()
+            } else {
+                self.nodes
+                    .iter()
+                    .filter(|node| candidate_ids.contains(node.node_id.as_str()))
+                    .collect()
+            }
+        };
+
+        for node in candidates {
+            let text_score = self.calculate_text_score_optimized(&text_query, &node.content);
+
+            // Get semantic score from vector search results
             let semantic_score = if query.semantic {
-                // In a real implementation, we would use a vector database
-                // Here we'll use a placeholder or basic similarity if query had embedding
-                0.0
+                *vector_results.get(&node.node_id).unwrap_or(&0.0)
             } else {
                 0.0
             };
+
+            // For now, if no text match and not semantic, skip
+            if text_score == 0.0 && !query.semantic && semantic_score == 0.0 {
+                continue;
+            }
 
             // Normalize complexity to 0-1 range (divide by 100, not 10)
             let structural_score = (node.complexity as f32 / 100.0).min(1.0);
@@ -379,6 +585,42 @@ impl SearchEngine {
 
         let intersection = query_tokens.intersection(&content_tokens).count();
         intersection as f32 / query_tokens.len() as f32
+    }
+
+    /// Optimized text score calculation using pre-computed query data
+    ///
+    /// This avoids repeated allocations in the hot path by using pre-computed
+    /// query tokens and lowercase strings.
+    ///
+    /// # Performance
+    ///
+    /// - Time complexity: O(m) where m is content length (query preprocessing is O(1) per call)
+    /// - Space complexity: O(t) where t is number of content tokens (vs O(q + t) before)
+    fn calculate_text_score_optimized(&self, precomputed: &TextQueryPreprocessed, content: &str) -> f32 {
+        // Try exact match first (fast path)
+        if content.eq_ignore_ascii_case(&precomputed.query) {
+            return 1.0;
+        }
+
+        // Check if query is a substring (case-insensitive)
+        if content.to_ascii_lowercase().contains(&precomputed.query_lower) {
+            return 0.8;
+        }
+
+        // Token overlap calculation using pre-computed query tokens
+        if precomputed.query_tokens.is_empty() {
+            return 0.0;
+        }
+
+        // Count matching tokens without allocating content_tokens HashSet
+        let mut matching = 0;
+        for token in content.split_whitespace() {
+            if precomputed.query_tokens.contains(token) {
+                matching += 1;
+            }
+        }
+
+        matching as f32 / precomputed.query_tokens.len() as f32
     }
 
     /// Semantic search for entry points
@@ -461,7 +703,7 @@ impl SearchEngine {
     /// let count = engine.vector_index().len();
     /// ```
     #[must_use]
-    pub fn vector_index(&self) -> &VectorIndex {
+    pub fn vector_index(&self) -> &VectorIndexImpl {
         &self.vector_index
     }
 
@@ -481,8 +723,193 @@ impl SearchEngine {
     /// index.insert("my_func", vec![0.1, 0.2, ...])?;
     /// ```
     #[must_use]
-    pub fn vector_index_mut(&mut self) -> &mut VectorIndex {
+    pub fn vector_index_mut(&mut self) -> &mut VectorIndexImpl {
         &mut self.vector_index
+    }
+
+    /// Create engine with HNSW index
+    ///
+    /// Creates a new search engine with HNSW-based approximate nearest neighbor search.
+    /// HNSW provides 10-100x speedup for large datasets (>10K vectors).
+    ///
+    /// # Arguments
+    ///
+    /// * `dimension` - Embedding vector dimension
+    /// * `hnsw_params` - HNSW parameters (optional, uses defaults if not provided)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let engine = SearchEngine::with_hnsw(768, HNSWParams::default());
+    /// ```
+    #[must_use]
+    pub fn with_hnsw(dimension: usize, hnsw_params: HNSWParams) -> Self {
+        // Validate dimension at construction time
+        if dimension < MIN_EMBEDDING_DIMENSION || dimension > MAX_EMBEDDING_DIMENSION {
+            panic!(
+                "Invalid embedding dimension: {} (must be between {} and {})",
+                dimension, MIN_EMBEDDING_DIMENSION, MAX_EMBEDDING_DIMENSION
+            );
+        }
+
+        Self {
+            nodes: Vec::new(),
+            scorer: HybridScorer::new(),
+            vector_index: VectorIndexImpl::HNSW(HNSWIndex::with_params(dimension, hnsw_params)),
+            complexity_cache: HashMap::new(),
+            text_index: HashMap::new(),
+        }
+    }
+
+    /// Enable HNSW index
+    ///
+    /// Switches the vector index to use HNSW-based approximate nearest neighbor search.
+    /// This is useful when you have a large dataset and want faster search performance.
+    ///
+    /// This operation is transactional: if migration fails, the original index is preserved.
+    ///
+    /// # Arguments
+    ///
+    /// * `params` - HNSW parameters (optional, uses defaults if not provided)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if successful, `Err(Error)` if switch fails
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// engine.enable_hnsw(HNSWParams::default())?;
+    /// ```
+    pub fn enable_hnsw(&mut self, params: HNSWParams) -> Result<(), Error> {
+        let dimension = self.vector_index.dimension();
+        let mut new_hnsw_index = HNSWIndex::with_params(dimension, params);
+
+        // Migrate all existing embeddings to the new HNSW index
+        // This prevents data loss when switching from brute-force to HNSW
+        let mut migrated = 0;
+        let mut failed = 0;
+        let total_embeddings = self.nodes.iter().filter(|n| n.embedding.is_some()).count();
+
+        for node in &self.nodes {
+            if let Some(ref embedding) = node.embedding {
+                match new_hnsw_index.insert(node.node_id.clone(), embedding.clone()) {
+                    Ok(()) => migrated += 1,
+                    Err(e) => {
+                        tracing::warn!("Failed to migrate embedding for {}: {}", node.node_id, e);
+                        failed += 1;
+                        // Fail-fast if more than 10% of embeddings fail to migrate
+                        // This prevents using a corrupted index
+                        if failed > total_embeddings / 10 {
+                            return Err(Error::QueryFailed(format!(
+                                "Too many migration failures ({}/{}), aborting index switch",
+                                failed, total_embeddings
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Only swap if migration was successful
+        if migrated == 0 && total_embeddings > 0 {
+            return Err(Error::QueryFailed(
+                "No embeddings were successfully migrated".to_string()
+            ));
+        }
+
+        tracing::info!(
+            "Migrated to HNSW index: {}/{} embeddings transferred, {} failed",
+            migrated,
+            total_embeddings,
+            failed
+        );
+
+        // Atomic swap: only replace the index after successful migration
+        self.vector_index = VectorIndexImpl::HNSW(new_hnsw_index);
+        Ok(())
+    }
+
+    /// Disable HNSW index
+    ///
+    /// Switches the vector index to use brute-force exact search.
+    /// This is useful when you want exact search results or have a small dataset.
+    ///
+    /// This operation is transactional: if migration fails, the original index is preserved.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if successful, `Err(Error)` if switch fails
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// engine.disable_hnsw()?;
+    /// ```
+    pub fn disable_hnsw(&mut self) -> Result<(), Error> {
+        let dimension = self.vector_index.dimension();
+        let mut new_brute_index = VectorIndex::new(dimension);
+
+        // Migrate all existing embeddings to the new brute-force index
+        // This prevents data loss when switching from HNSW to brute-force
+        let mut migrated = 0;
+        let mut failed = 0;
+        let total_embeddings = self.nodes.iter().filter(|n| n.embedding.is_some()).count();
+
+        for node in &self.nodes {
+            if let Some(ref embedding) = node.embedding {
+                match new_brute_index.insert(node.node_id.clone(), embedding.clone()) {
+                    Ok(()) => migrated += 1,
+                    Err(e) => {
+                        tracing::warn!("Failed to migrate embedding for {}: {}", node.node_id, e);
+                        failed += 1;
+                        // Fail-fast if more than 10% of embeddings fail to migrate
+                        if failed > total_embeddings / 10 {
+                            return Err(Error::QueryFailed(format!(
+                                "Too many migration failures ({}/{}), aborting index switch",
+                                failed, total_embeddings
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Only swap if migration was successful
+        if migrated == 0 && total_embeddings > 0 {
+            return Err(Error::QueryFailed(
+                "No embeddings were successfully migrated".to_string()
+            ));
+        }
+
+        tracing::info!(
+            "Migrated to brute-force index: {}/{} embeddings transferred, {} failed",
+            migrated,
+            total_embeddings,
+            failed
+        );
+
+        // Atomic swap: only replace the index after successful migration
+        self.vector_index = VectorIndexImpl::BruteForce(new_brute_index);
+        Ok(())
+    }
+
+    /// Check if HNSW is enabled
+    ///
+    /// # Returns
+    ///
+    /// `true` if HNSW is enabled, `false` if using brute-force
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// if engine.is_hnsw_enabled() {
+    ///     println!("Using HNSW for fast approximate search");
+    /// }
+    /// ```
+    #[must_use]
+    pub fn is_hnsw_enabled(&self) -> bool {
+        self.vector_index.is_hnsw_enabled()
     }
 
     /// Natural language search with query understanding
