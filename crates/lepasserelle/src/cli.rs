@@ -185,7 +185,7 @@ async fn cmd_search_impl(query: String, top_k: usize, project: Option<PathBuf>) 
     }
 
     // Perform search
-    let results = leindex.search(&query, top_k).await
+    let results = leindex.search(&query, top_k)
         .context("Search failed")?;
 
     if results.is_empty() {
@@ -231,7 +231,7 @@ async fn cmd_analyze_impl(query: String, token_budget: usize, project: Option<Pa
     }
 
     // Perform analysis
-    let result = leindex.analyze(&query, token_budget).await
+    let result = leindex.analyze(&query, token_budget)
         .context("Analysis failed")?;
 
     // Print results

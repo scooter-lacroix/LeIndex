@@ -14,7 +14,7 @@ use axum::{
     routing::{get, post},
     Router,
     Server,
-    response::{IntoResponse, Json},
+    response::Json,
 };
 use serde_json::Value;
 use std::net::SocketAddr;

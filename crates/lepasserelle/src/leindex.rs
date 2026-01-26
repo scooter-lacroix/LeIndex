@@ -292,7 +292,7 @@ impl LeIndex {
     ///     println!("{}: {} ({:.2})", result.rank, result.symbol_name, result.score.total);
     /// }
     /// ```
-    pub async fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+    pub fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         if self.search_engine.is_empty() {
             warn!("Search attempted on empty index");
             return Ok(Vec::new());
@@ -306,7 +306,7 @@ impl LeIndex {
             expand_context: false,
         };
 
-        let results = self.search_engine.search(search_query).await
+        let results = self.search_engine.search(search_query)
             .context("Search operation failed")?;
 
         debug!("Search for '{}' returned {} results", query, results.len());
@@ -335,7 +335,7 @@ impl LeIndex {
     /// println!("Found {} entry points", analysis.results.len());
     /// println!("Context: {}", analysis.context.unwrap_or_default());
     /// ```
-    pub async fn analyze(&mut self, query: &str, token_budget: usize) -> Result<AnalysisResult> {
+    pub fn analyze(&mut self, query: &str, token_budget: usize) -> Result<AnalysisResult> {
         let start_time = std::time::Instant::now();
 
         // Step 1: Semantic search for entry points
@@ -347,7 +347,7 @@ impl LeIndex {
             expand_context: false,
         };
 
-        let results = self.search_engine.search(search_query).await
+        let results = self.search_engine.search(search_query)
             .context("Search for analysis failed")?;
 
         // Step 2: Expand context using PDG traversal

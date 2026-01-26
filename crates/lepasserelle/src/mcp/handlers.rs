@@ -210,7 +210,7 @@ impl SearchHandler {
             ));
         }
 
-        let results = reader.search(&query, top_k).await
+        let results = reader.search(&query, top_k)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
         Ok(serde_json::to_value(results)
@@ -269,7 +269,7 @@ impl DeepAnalyzeHandler {
             ));
         }
 
-        let result = writer.analyze(&query, token_budget).await
+        let result = writer.analyze(&query, token_budget)
             .map_err(|e| JsonRpcError::internal_error(format!("Analysis error: {}", e)))?;
 
         Ok(serde_json::to_value(result)
