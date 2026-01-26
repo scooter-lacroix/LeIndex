@@ -9,11 +9,13 @@ pub mod pdg;
 pub mod traversal;
 pub mod embedding;
 pub mod extraction;
+pub mod cross_project;
 
 pub use pdg::{ProgramDependenceGraph, Node, Edge};
 pub use traversal::{GravityTraversal, TraversalConfig};
 pub use embedding::NodeEmbedding;
 pub use extraction::extract_pdg_from_signatures;
+pub use cross_project::{CrossProjectPDG, ExternalNodeRef, MergeError};
 
 /// Graph library initialization
 pub fn init() {
