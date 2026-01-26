@@ -153,19 +153,19 @@ impl DepType {
 }
 
 /// Global symbol table operations
-pub struct GlobalSymbolTable {
-    db: Storage,
+pub struct GlobalSymbolTable<'a> {
+    db: &'a Storage,
 }
 
-impl GlobalSymbolTable {
+impl<'a> GlobalSymbolTable<'a> {
     /// Create new global symbol table
-    pub fn new(db: Storage) -> Self {
+    pub fn new(db: &'a Storage) -> Self {
         Self { db }
     }
 
     /// Get the underlying storage
     pub fn storage(&self) -> &Storage {
-        &self.db
+        self.db
     }
 
     /// Generate a unique symbol ID using BLAKE3 hash
@@ -522,6 +522,34 @@ impl GlobalSymbolTable {
         Ok(deps)
     }
 
+    /// Get all projects that depend on the given project (reverse dependencies)
+    ///
+    /// This is used for change propagation - when a project changes,
+    /// we need to find all projects that depend on it.
+    pub fn get_reverse_project_deps(&self, depends_on_project_id: &str) -> Result<Vec<ProjectDep>, GlobalSymbolError> {
+        let mut stmt = self.db.conn().prepare(
+            "SELECT dep_id, project_id, depends_on_project_id, dependency_type
+             FROM project_deps
+             WHERE depends_on_project_id = ?1"
+        ).map_err(GlobalSymbolError::from)?;
+
+        let deps = stmt
+            .query_map(params![depends_on_project_id], |row| {
+                Ok(ProjectDep {
+                    dep_id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    depends_on_project_id: row.get(2)?,
+                    dependency_type: DepType::from_str(row.get::<_, String>(3)?.as_str())
+                        .unwrap_or(DepType::Direct),
+                })
+            })
+            .map_err(GlobalSymbolError::from)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(GlobalSymbolError::from)?;
+
+        Ok(deps)
+    }
+
     /// Find public symbols (exported API)
     pub fn find_public_symbols(&self, project_id: &str) -> Result<Vec<GlobalSymbol>, GlobalSymbolError> {
         let mut stmt = self.db.conn().prepare(
@@ -579,15 +607,11 @@ mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    fn create_test_table() -> GlobalSymbolTable {
-        let temp_file = NamedTempFile::new().unwrap();
-        let db = Storage::open(temp_file.path()).unwrap();
-        GlobalSymbolTable::new(db)
-    }
-
     #[test]
     fn test_upsert_and_get_symbol() {
-        let table = create_test_table();
+        let temp_file = NamedTempFile::new().unwrap();
+        let db = Storage::open(temp_file.path()).unwrap();
+        let table = GlobalSymbolTable::new(&db);
 
         let symbol = GlobalSymbol {
             symbol_id: GlobalSymbolTable::generate_symbol_id("test_project", "foo", Some("fn()")),
@@ -612,7 +636,9 @@ mod tests {
 
     #[test]
     fn test_batch_insert() {
-        let table = create_test_table();
+        let temp_file = NamedTempFile::new().unwrap();
+        let db = Storage::open(temp_file.path()).unwrap();
+        let table = GlobalSymbolTable::new(&db);
 
         let symbols = vec![
             GlobalSymbol {
@@ -648,7 +674,9 @@ mod tests {
 
     #[test]
     fn test_resolve_by_name() {
-        let table = create_test_table();
+        let temp_file = NamedTempFile::new().unwrap();
+        let db = Storage::open(temp_file.path()).unwrap();
+        let table = GlobalSymbolTable::new(&db);
 
         let symbol1 = GlobalSymbol {
             symbol_id: GlobalSymbolTable::generate_symbol_id("proj_a", "util", None),
@@ -683,7 +711,9 @@ mod tests {
 
     #[test]
     fn test_detect_conflicts() {
-        let table = create_test_table();
+        let temp_file = NamedTempFile::new().unwrap();
+        let db = Storage::open(temp_file.path()).unwrap();
+        let table = GlobalSymbolTable::new(&db);
 
         let symbol1 = GlobalSymbol {
             symbol_id: GlobalSymbolTable::generate_symbol_id("proj_a", "util", None),
@@ -718,7 +748,9 @@ mod tests {
 
     #[test]
     fn test_external_refs() {
-        let table = create_test_table();
+        let temp_file = NamedTempFile::new().unwrap();
+        let db = Storage::open(temp_file.path()).unwrap();
+        let table = GlobalSymbolTable::new(&db);
 
         // Create source and target symbols
         let source = GlobalSymbol {
@@ -772,7 +804,9 @@ mod tests {
 
     #[test]
     fn test_project_deps() {
-        let table = create_test_table();
+        let temp_file = NamedTempFile::new().unwrap();
+        let db = Storage::open(temp_file.path()).unwrap();
+        let table = GlobalSymbolTable::new(&db);
 
         let dep = ProjectDep {
             dep_id: "dep_1".to_string(),
@@ -790,7 +824,9 @@ mod tests {
 
     #[test]
     fn test_find_public_symbols() {
-        let table = create_test_table();
+        let temp_file = NamedTempFile::new().unwrap();
+        let db = Storage::open(temp_file.path()).unwrap();
+        let table = GlobalSymbolTable::new(&db);
 
         let public_symbol = GlobalSymbol {
             symbol_id: GlobalSymbolTable::generate_symbol_id("proj_a", "public_fn", None),

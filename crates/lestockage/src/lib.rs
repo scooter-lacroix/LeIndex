@@ -12,6 +12,7 @@ pub mod salsa;
 pub mod analytics;
 pub mod pdg_store;
 pub mod global_symbols;
+pub mod cross_project;
 
 pub use schema::{Storage, StorageConfig};
 pub use nodes::{NodeStore, NodeRecord};
@@ -22,6 +23,10 @@ pub use pdg_store::{save_pdg, load_pdg, pdg_exists, delete_pdg, PdgStoreError, R
 pub use global_symbols::{
     GlobalSymbolTable, GlobalSymbol, GlobalSymbolId, SymbolType,
     ExternalRef, RefType, ProjectDep, DepType, GlobalSymbolError
+};
+pub use cross_project::{
+    CrossProjectResolver, ResolvedSymbol, ResolutionError,
+    MergeError
 };
 
 /// Storage library initialization
