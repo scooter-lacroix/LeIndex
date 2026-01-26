@@ -39,6 +39,7 @@ tree-sitter-scala = "0.24"
 
 [dev-dependencies]
 rstest.workspace = true
+tempfile = "3.13"
 
 [lib]
 name = "leparse"

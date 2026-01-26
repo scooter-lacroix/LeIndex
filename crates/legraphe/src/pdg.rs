@@ -1,6 +1,7 @@
 // Program Dependence Graph implementation
 
 use petgraph::stable_graph::StableGraph;
+use petgraph::visit::Dfs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -151,6 +152,103 @@ impl ProgramDependenceGraph {
         self.graph.edge_count()
     }
 
+    /// Get neighbors of a node (outgoing)
+    pub fn neighbors(&self, node_id: NodeId) -> Vec<NodeId> {
+        self.graph.neighbors(node_id).collect()
+    }
+
+    /// Add multiple call edges
+    ///
+    /// # Arguments
+    /// * `calls` - Vector of (caller_id, callee_id) tuples
+    pub fn add_call_graph_edges(&mut self, calls: Vec<(NodeId, NodeId)>) {
+        for (caller, callee) in calls {
+            self.add_edge(
+                caller,
+                callee,
+                Edge {
+                    edge_type: EdgeType::Call,
+                    metadata: EdgeMetadata {
+                        call_count: None,
+                        variable_name: None,
+                    },
+                },
+            );
+        }
+    }
+
+    /// Add multiple data flow edges
+    ///
+    /// # Arguments
+    /// * `flows` - Vector of (from_id, to_id, variable_name) tuples
+    pub fn add_data_flow_edges(&mut self, flows: Vec<(NodeId, NodeId, String)>) {
+        for (from, to, var_name) in flows {
+            self.add_edge(
+                from,
+                to,
+                Edge {
+                    edge_type: EdgeType::DataDependency,
+                    metadata: EdgeMetadata {
+                        call_count: None,
+                        variable_name: Some(var_name),
+                    },
+                },
+            );
+        }
+    }
+
+    /// Add multiple inheritance edges
+    ///
+    /// # Arguments
+    /// * `inheritances` - Vector of (child_id, parent_id) tuples
+    pub fn add_inheritance_edges(&mut self, inheritances: Vec<(NodeId, NodeId)>) {
+        for (child, parent) in inheritances {
+            self.add_edge(
+                child,
+                parent,
+                Edge {
+                    edge_type: EdgeType::Inheritance,
+                    metadata: EdgeMetadata {
+                        call_count: None,
+                        variable_name: None,
+                    },
+                },
+            );
+        }
+    }
+
+    /// Get forward impact (nodes reachable from this node)
+    ///
+    /// # Arguments
+    /// * `node_id` - Starting node for reachability analysis
+    pub fn get_forward_impact(&self, node_id: NodeId) -> Vec<NodeId> {
+        let mut impact = Vec::new();
+        let mut dfs = Dfs::new(&self.graph, node_id);
+        while let Some(nx) = dfs.next(&self.graph) {
+            if nx != node_id {
+                impact.push(nx);
+            }
+        }
+        impact
+    }
+
+    /// Get backward impact (nodes that can reach this node)
+    ///
+    /// # Arguments
+    /// * `node_id` - Target node for reachability analysis
+    pub fn get_backward_impact(&self, node_id: NodeId) -> Vec<NodeId> {
+        let mut impact = Vec::new();
+        // Use neighbors_directed with Incoming to traverse backwards
+        let reversed_graph = petgraph::visit::Reversed(&self.graph);
+        let mut dfs = Dfs::new(reversed_graph, node_id);
+        while let Some(nx) = dfs.next(reversed_graph) {
+            if nx != node_id {
+                impact.push(nx);
+            }
+        }
+        impact
+    }
+
     /// Serialize the graph (placeholder - needs proper implementation for StableGraph)
     pub fn serialize(&self) -> Result<Vec<u8>, String> {
         // TODO: Implement proper serialization for StableGraph
@@ -216,5 +314,49 @@ mod tests {
         pdg.add_node(node);
         let found = pdg.find_by_symbol("my_func");
         assert!(found.is_some());
+    }
+
+    #[test]
+    fn test_impact_analysis() {
+        let mut pdg = ProgramDependenceGraph::new();
+        let n1 = pdg.add_node(Node {
+            id: "n1".to_string(),
+            node_type: NodeType::Function,
+            name: "n1".to_string(),
+            file_path: "f1.py".to_string(),
+            byte_range: (0, 10),
+            complexity: 1,
+            embedding: None,
+        });
+        let n2 = pdg.add_node(Node {
+            id: "n2".to_string(),
+            node_type: NodeType::Function,
+            name: "n2".to_string(),
+            file_path: "f1.py".to_string(),
+            byte_range: (20, 30),
+            complexity: 1,
+            embedding: None,
+        });
+        let n3 = pdg.add_node(Node {
+            id: "n3".to_string(),
+            node_type: NodeType::Function,
+            name: "n3".to_string(),
+            file_path: "f1.py".to_string(),
+            byte_range: (40, 50),
+            complexity: 1,
+            embedding: None,
+        });
+
+        pdg.add_call_graph_edges(vec![(n1, n2), (n2, n3)]);
+
+        let forward = pdg.get_forward_impact(n1);
+        assert_eq!(forward.len(), 2);
+        assert!(forward.contains(&n2));
+        assert!(forward.contains(&n3));
+
+        let backward = pdg.get_backward_impact(n3);
+        assert_eq!(backward.len(), 2);
+        assert!(backward.contains(&n2));
+        assert!(backward.contains(&n1));
     }
 }

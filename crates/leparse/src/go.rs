@@ -107,6 +107,14 @@ impl GoParser {
 impl CodeIntelligence for GoParser {
     fn get_signatures(&self, source: &[u8]) -> Result<Vec<SignatureInfo>> {
         let mut parser = Parser::new();
+        self.get_signatures_with_parser(source, &mut parser)
+    }
+
+    fn get_signatures_with_parser(
+        &self,
+        source: &[u8],
+        parser: &mut tree_sitter::Parser,
+    ) -> Result<Vec<SignatureInfo>> {
         parser
             .set_language(&crate::traits::languages::go::language())
             .map_err(|e| Error::ParseFailed(e.to_string()))?;

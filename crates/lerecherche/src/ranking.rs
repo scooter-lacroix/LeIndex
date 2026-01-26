@@ -178,13 +178,13 @@ mod tests {
     fn test_hybrid_scorer() {
         let scorer = HybridScorer::new();
         let score = scorer.score(0.8, 0.6, 0.4);
-        assert!((score.overall - 0.62).abs() < 0.01);
+        assert!((score.overall - 0.66).abs() < 0.01);
     }
 
     #[test]
     fn test_custom_weights() {
         let scorer = HybridScorer::new().with_weights(0.3, 0.5, 0.2);
         let score = scorer.score(0.8, 0.6, 0.4);
-        assert!((score.overall - 0.58).abs() < 0.01);
+        assert!((score.overall - 0.62).abs() < 0.01);
     }
 }

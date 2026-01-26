@@ -1,6 +1,6 @@
 // Gravity-based traversal algorithm
 
-use crate::pdg::{NodeId, ProgramDependenceGraph, EdgeType};
+use crate::pdg::{NodeId, ProgramDependenceGraph};
 use std::collections::BinaryHeap;
 use serde::{Deserialize, Serialize};
 
@@ -144,8 +144,7 @@ impl GravityTraversal {
         pdg: &ProgramDependenceGraph,
         node_id: NodeId,
     ) -> Vec<NodeId> {
-        // Placeholder - will use petgraph neighbors in full implementation
-        Vec::new()
+        pdg.neighbors(node_id)
     }
 }
 

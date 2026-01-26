@@ -9,7 +9,7 @@ pub mod search;
 pub mod semantic;
 pub mod ranking;
 
-pub use search::{SearchEngine, SearchResult, SearchQuery, SemanticEntry};
+pub use search::{SearchEngine, SearchResult, SearchQuery, SemanticEntry, NodeInfo};
 pub use semantic::SemanticProcessor;
 pub use ranking::{HybridScorer, Score};
 

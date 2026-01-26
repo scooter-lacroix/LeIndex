@@ -1,46 +1,32 @@
 // Language-specific parser implementations
 
 pub use crate::python::PythonParser;
-
-/// JavaScript language parser
-pub struct JavaScriptParser;
-
-impl crate::traits::CodeIntelligence for JavaScriptParser {
-    fn get_signatures(&self, _source: &[u8]) -> crate::traits::Result<Vec<crate::traits::SignatureInfo>> {
-        // Placeholder implementation
-        Ok(Vec::new())
-    }
-
-    fn compute_cfg(
-        &self,
-        _source: &[u8],
-        _node_id: usize,
-    ) -> crate::traits::Result<crate::traits::Graph<crate::traits::Block, crate::traits::Edge>> {
-        // Placeholder implementation
-        Ok(crate::traits::Graph {
-            blocks: vec![],
-            edges: vec![],
-            entry_block: 0,
-            exit_blocks: vec![],
-        })
-    }
-
-    fn extract_complexity(&self, _node: &tree_sitter::Node) -> crate::traits::ComplexityMetrics {
-        crate::traits::ComplexityMetrics {
-            cyclomatic: 1,
-            nesting_depth: 0,
-            line_count: 1,
-            token_count: 0,
-        }
-    }
-}
+pub use crate::javascript::{JavaScriptParser, TypeScriptParser};
+pub use crate::rust::RustParser;
+pub use crate::go::GoParser;
+pub use crate::java::JavaParser;
+pub use crate::cpp::CppParser;
+pub use crate::csharp::CSharpParser;
+pub use crate::ruby::RubyParser;
+pub use crate::php::PhpParser;
+pub use crate::lua::LuaParser;
+pub use crate::scala::ScalaParser;
 
 /// Type-specific parser factory
 pub fn parser_for_language(language: &str) -> Option<Box<dyn crate::traits::CodeIntelligence>> {
     match language.to_lowercase().as_str() {
         "python" | "py" => Some(Box::new(PythonParser::new())),
-        "javascript" | "js" => Some(Box::new(JavaScriptParser)),
-        // Other languages will be added during sub-track implementation
+        "javascript" | "js" => Some(Box::new(JavaScriptParser::new())),
+        "typescript" | "ts" => Some(Box::new(TypeScriptParser::new())),
+        "rust" | "rs" => Some(Box::new(RustParser::new())),
+        "go" => Some(Box::new(GoParser::new())),
+        "java" => Some(Box::new(JavaParser::new())),
+        "cpp" | "c++" => Some(Box::new(CppParser::new())),
+        "csharp" | "c#" => Some(Box::new(CSharpParser::new())),
+        "ruby" | "rb" => Some(Box::new(RubyParser::new())),
+        "php" => Some(Box::new(PhpParser::new())),
+        "lua" => Some(Box::new(LuaParser::new())),
+        "scala" => Some(Box::new(ScalaParser::new())),
         _ => None,
     }
 }

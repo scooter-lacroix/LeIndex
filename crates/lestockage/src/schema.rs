@@ -45,12 +45,12 @@ impl Storage {
 
         // Enable WAL mode for better concurrency
         if config.wal_enabled {
-            conn.execute("PRAGMA journal_mode=WAL", [])?;
+            conn.pragma_update(None, "journal_mode", "WAL")?;
         }
 
         // Set cache size if specified
         if let Some(cache_size) = config.cache_size_pages {
-            conn.execute(&format!("PRAGMA cache_size={}", cache_size), [])?;
+            conn.pragma_update(None, "cache_size", cache_size)?;
         }
 
         let mut storage = Self { conn, config };
@@ -159,7 +159,7 @@ mod tests {
         let table_count: i64 = storage
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name LIKE 'intel_%'",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND (name LIKE 'intel_%' OR name = 'analysis_cache')",
                 [],
                 |row| row.get(0),
             )

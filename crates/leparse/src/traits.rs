@@ -134,6 +134,21 @@ pub trait CodeIntelligence {
     /// Vector of signature information
     fn get_signatures(&self, source: &[u8]) -> Result<Vec<SignatureInfo>>;
 
+    /// Extract signatures using a provided parser instance (for pooling)
+    ///
+    /// # Arguments
+    /// * `source` - Source code as bytes
+    /// * `parser` - Tree-sitter parser instance to reuse
+    fn get_signatures_with_parser(
+        &self,
+        source: &[u8],
+        _parser: &mut tree_sitter::Parser,
+    ) -> Result<Vec<SignatureInfo>> {
+        // Default implementation delegates to get_signatures
+        // Implementations should override this to provide pooling benefits
+        self.get_signatures(source)
+    }
+
     /// Compute control flow graph for a node
     ///
     /// # Arguments

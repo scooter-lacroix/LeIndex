@@ -18,6 +18,9 @@ pub mod ast;
 #[cfg(test)]
 mod ast_tests;
 
+/// Parallel parsing implementation.
+pub mod parallel;
+
 /// Language-specific parsers.
 pub mod languages;
 

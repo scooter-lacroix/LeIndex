@@ -8,10 +8,12 @@
 pub mod pdg;
 pub mod traversal;
 pub mod embedding;
+pub mod extraction;
 
 pub use pdg::{ProgramDependenceGraph, Node, Edge};
 pub use traversal::{GravityTraversal, TraversalConfig};
 pub use embedding::NodeEmbedding;
+pub use extraction::extract_pdg_from_signatures;
 
 /// Graph library initialization
 pub fn init() {

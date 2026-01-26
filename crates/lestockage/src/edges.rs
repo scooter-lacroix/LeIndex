@@ -184,11 +184,39 @@ mod tests {
     fn test_edge_insert_and_get() {
         let temp_file = NamedTempFile::new().unwrap();
         let mut storage = Storage::open(temp_file.path()).unwrap();
+        
+        // Insert nodes first to satisfy foreign key constraints
+        let mut node_store = crate::nodes::NodeStore::new(&mut storage);
+        let node1 = crate::nodes::NodeRecord {
+            id: None,
+            project_id: "p1".to_string(),
+            file_path: "f1.py".to_string(),
+            symbol_name: "s1".to_string(),
+            node_type: crate::nodes::NodeType::Function,
+            signature: None,
+            complexity: None,
+            content_hash: "h1".to_string(),
+            embedding: None,
+        };
+        let node2 = crate::nodes::NodeRecord {
+            id: None,
+            project_id: "p1".to_string(),
+            file_path: "f2.py".to_string(),
+            symbol_name: "s2".to_string(),
+            node_type: crate::nodes::NodeType::Function,
+            signature: None,
+            complexity: None,
+            content_hash: "h2".to_string(),
+            embedding: None,
+        };
+        let id1 = node_store.insert(&node1).unwrap();
+        let id2 = node_store.insert(&node2).unwrap();
+
         let mut store = EdgeStore::new(&mut storage);
 
         let record = EdgeRecord {
-            caller_id: 1,
-            callee_id: 2,
+            caller_id: id1,
+            callee_id: id2,
             edge_type: EdgeType::Call,
             metadata: Some(EdgeMetadata {
                 call_count: Some(5),
@@ -197,9 +225,9 @@ mod tests {
         };
 
         store.insert(&record).unwrap();
-        let edges = store.get_by_caller(1).unwrap();
+        let edges = store.get_by_caller(id1).unwrap();
 
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].callee_id, 2);
+        assert_eq!(edges[0].callee_id, id2);
     }
 }
