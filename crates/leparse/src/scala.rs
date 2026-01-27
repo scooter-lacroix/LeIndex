@@ -397,7 +397,8 @@ mod tests {
     fn test_scala_function() {
         let source = b"def greet(name: String): String = s\"Hello, $name\"";
         let parser = ScalaParser::new();
-        assert!(parser.get_signatures(source).unwrap().len() > 0);
+        let sigs = parser.get_signatures(source).unwrap();
+        assert!(!sigs.is_empty());
     }
 
     #[test]

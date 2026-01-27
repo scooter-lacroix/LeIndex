@@ -892,7 +892,7 @@ mod tests {
         let parser = JavaScriptParser::new();
         let signatures = parser.get_signatures(source).unwrap();
 
-        assert!(signatures.len() >= 1);
+        assert!(!signatures.is_empty());
         let add_sig = signatures.iter().find(|s| s.name == "add");
         assert!(add_sig.is_some());
         if let Some(sig) = add_sig {
@@ -964,7 +964,7 @@ type JsonObject = Record<string, unknown>;";
         let parser = TypeScriptParser::new();
         let signatures = parser.get_signatures(source).unwrap();
 
-        assert!(signatures.len() >= 1);
+        assert!(!signatures.is_empty());
     }
 
     #[test]

@@ -664,7 +664,7 @@ type Person struct {
         assert_eq!(signatures.len(), 1);
         let sig = &signatures[0];
         assert_eq!(sig.name, "sum");
-        assert!(sig.parameters.len() >= 1);
+        assert!(!sig.parameters.is_empty());
     }
 
     #[test]

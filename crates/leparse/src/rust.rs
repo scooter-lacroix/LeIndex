@@ -712,7 +712,7 @@ impl Client for Server {
 
         // Should find methods from impl blocks
         let methods: Vec<_> = signatures.iter().filter(|s| s.is_method).collect();
-        assert!(methods.len() >= 1);
+        assert!(!methods.is_empty());
     }
 
     #[test]

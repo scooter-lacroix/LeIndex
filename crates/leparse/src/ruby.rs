@@ -333,7 +333,7 @@ end";
         let signatures = parser.get_signatures(source).unwrap();
 
         // Should find class and method
-        assert!(signatures.len() >= 1);
+        assert!(!signatures.is_empty());
         let class = signatures.iter().find(|s| s.name == "Person");
         assert!(class.is_some());
     }

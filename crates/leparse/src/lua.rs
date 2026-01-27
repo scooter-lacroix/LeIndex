@@ -362,7 +362,7 @@ mod tests {
         let source = b"function greet(name)\n  return \"Hello, \" .. name\nend";
         let parser = LuaParser::new();
         let sigs = parser.get_signatures(source).unwrap();
-        assert!(sigs.len() > 0);
+        assert!(!sigs.is_empty());
         assert_eq!(sigs[0].name, "greet");
         assert_eq!(sigs[0].parameters.len(), 1);
         assert_eq!(sigs[0].parameters[0].name, "name");

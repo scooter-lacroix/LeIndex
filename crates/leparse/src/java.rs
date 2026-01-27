@@ -660,7 +660,7 @@ mod tests {
         let signatures = parser.get_signatures(source).unwrap();
 
         // Should find the interface
-        assert!(signatures.len() >= 1);
+        assert!(!signatures.is_empty());
 
         let runnable = signatures.iter().find(|s| s.name == "Runnable");
         assert!(runnable.is_some());
