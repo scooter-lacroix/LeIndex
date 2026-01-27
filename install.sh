@@ -638,7 +638,7 @@ backup_config_file() {
     return 1
 }
 
-# Configure Claude Code MCP (mcp.json format)
+# Configure Claude Code MCP (mcp.json format with stdio command)
 configure_json_mcp() {
     local config_file="$1"
     local backup_file="$2"
@@ -647,13 +647,13 @@ configure_json_mcp() {
     if [[ ! -f "$config_file" ]]; then
         # Create parent directory if needed
         mkdir -p "$(dirname "$config_file")"
-        # Create new config with leindex
+        # Create new config with leindex as subprocess (stdio mode)
         cat > "$config_file" << 'EOF'
 {
   "mcpServers": {
     "leindex": {
-      "type": "http",
-      "url": "http://127.0.0.1:47268/mcp"
+      "command": "leindex",
+      "args": ["mcp"]
     }
   }
 }
@@ -679,9 +679,10 @@ except:
 if 'mcpServers' not in config:
     config['mcpServers'] = {}
 
+# Use stdio command mode (subprocess) - AI tools will start/stop automatically
 config['mcpServers']['leindex'] = {
-    'type': 'http',
-    'url': 'http://127.0.0.1:47268/mcp'
+    'command': 'leindex',
+    'args': ['mcp']
 }
 
 with open('$config_file', 'w') as f:
@@ -691,7 +692,7 @@ PYTHON
         return $?
     elif command -v jq &> /dev/null; then
         # Fallback to jq if python3 is not available
-        jq '.mcpServers.leindex = {"type": "http", "url": "http://127.0.0.1:47268/mcp"}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+        jq '.mcpServers.leindex = {"command": "leindex", "args": ["mcp"]}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
         return $?
     else
         return 1
@@ -843,69 +844,70 @@ show_mcp_config_instructions() {
     echo "  MCP Server Configuration"
     echo "═══════════════════════════════════════════════════"
     echo ""
-    echo "LeIndex runs as an HTTP-based MCP server on port 47268"
+    echo "LeIndex runs as a subprocess (stdio mode) for automatic AI tool integration"
     echo ""
-    echo "Start the server:"
-    echo "  ${CYAN}leindex serve${NC}"
-    echo ""
-    echo "Or customize port:"
-    echo "  ${CYAN}LEINDEX_PORT=3000 leindex serve${NC}"
+    echo "The AI tool will automatically start and stop LeIndex as needed."
     echo ""
     echo "For manual configuration, add to your tool's config:"
     echo ""
     echo "  Claude Code (~/.config/claude-code/mcp.json):"
-    echo '    {"mcpServers": {"leindex": {"type": "http", "url": "http://127.0.0.1:47268/mcp"}}}'
+    echo '    {"mcpServers": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
     echo ""
-    echo "  Cursor/VS Code (settings.json or mcp.json):"
-    echo '    {"mcpServers": {"leindex": {"type": "http", "url": "http://127.0.0.1:47268/mcp"}}}'
+    echo "  Cursor (~/.cursor/mcp.json):"
+    echo '    {"mcpServers": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
+    echo ""
+    echo "  VS Code (~/.config/Code/User/mcp.json):"
+    echo '    {"mcpServers": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
     echo ""
     echo "  Zed (~/.config/zed/settings.json):"
-    echo '    {"lsp": {"leindex": {"type": "http", "url": "http://127.0.0.1:47268/mcp"}}}'
+    echo '    {"lsp": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
     echo ""
     echo "  LM Studio (~/.lmstudio/mcp.json):"
-    echo '    {"mcpServers": {"leindex": {"type": "http", "url": "http://127.0.0.1:47268/mcp"}}}'
+    echo '    {"mcpServers": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
     echo ""
-    echo "Note: The LeIndex server must be running for MCP integration to work."
+    echo "Note: When configured this way, AI tools automatically start LeIndex"
+    echo "      when needed and stop it when the tool closes."
     echo ""
-    echo "Start it manually, or set up as a background service:"
-    echo "  ${CYAN}nohup leindex serve > ~/.leindex/logs/server.log 2>&1 &${NC}"
+    echo "To run LeIndex manually (for testing):"
+    echo "  ${CYAN}leindex mcp${NC}  # stdio mode (reads from stdin, writes to stdout)"
+    echo "  ${CYAN}leindex serve${NC}  # HTTP server mode on port 47268"
     echo ""
 }
 
 offer_start_server() {
-    print_header "Start LeIndex MCP Server"
+    print_header "Server Status & Testing"
 
-    echo "The LeIndex MCP server needs to be running for AI tools to connect."
+    echo "The LeIndex MCP server is configured to run as a subprocess (stdio mode)."
+    echo "Your AI tools will automatically start and stop it as needed."
+    echo ""
+    echo "You can test the configuration manually:"
     echo ""
     echo "Options:"
-    echo "  ${CYAN}1)${NC} Start server now (runs until you stop it with Ctrl+C)"
-    echo "  ${CYAN}2)${NC} Start server in background (persistent across restarts)"
-    echo "  ${CYAN}3)${NC} Skip (start manually later with 'leindex serve')"
+    echo "  ${CYAN}1)${NC} Test server in stdio mode (verify JSON-RPC communication)"
+    echo "  ${CYAN}2)${NC} Start HTTP server for testing (legacy mode, not recommended)"
+    echo "  ${CYAN}3)${NC} Skip (AI tools will manage server automatically)"
     echo ""
     read -p "Choose an option [1-3]: " -n 1 -r
     echo ""
 
     case $REPLY in
         1)
-            log_info "Starting LeIndex MCP server..."
+            log_info "Testing LeIndex MCP stdio mode..."
             echo ""
-            echo "Server is running. Press ${CYAN}Ctrl+C${NC} to stop it."
+            echo "Enter a JSON-RPC request (one line) to test, or press Ctrl+C to exit."
+            echo "Example: {\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"
             echo ""
-            echo "Your AI tools should now be able to connect to LeIndex."
-            echo ""
-            echo "To start the server in the background in the future:"
-            echo "  ${CYAN}nohup leindex serve > ~/.leindex/logs/server.log 2>&1 &${NC}"
-            echo ""
-            # Start server in foreground
-            exec "$INSTALL_BIN_DIR/$PROJECT_SLUG" serve
+            echo "Starting stdio mode..."
+            # Start server in stdio mode for testing
+            exec "$INSTALL_BIN_DIR/$PROJECT_SLUG" mcp
             ;;
         2)
-            log_info "Starting LeIndex MCP server in background..."
+            log_info "Starting LeIndex MCP HTTP server (legacy mode)..."
             echo ""
 
             # Check if server is already running
             if pgrep -f "$PROJECT_SLUG serve" > /dev/null; then
-                log_warn "LeIndex server is already running!"
+                log_warn "LeIndex HTTP server is already running!"
                 echo ""
                 echo "Server PID: $(pgrep -f '$PROJECT_SLUG serve')"
                 echo ""
@@ -915,7 +917,7 @@ offer_start_server() {
             # Create log directory
             mkdir -p "$LOG_DIR"
 
-            # Start server in background
+            # Start HTTP server in background
             nohup "$INSTALL_BIN_DIR/$PROJECT_SLUG" serve > "$LOG_DIR/server.log" 2>&1 &
             local server_pid=$!
 
@@ -945,13 +947,16 @@ offer_start_server() {
             fi
             ;;
         3|*)
-            log_info "Skipping server startup"
+            log_info "Server will be managed by your AI tools automatically"
             echo ""
-            echo "To start the server manually:"
+            echo "When you use your AI tool's code search or analysis features,"
+            echo "it will automatically start the LeIndex server in stdio mode."
+            echo ""
+            echo "To test stdio mode manually:"
+            echo "  ${CYAN}$PROJECT_SLUG mcp${NC}"
+            echo ""
+            echo "To start HTTP server (not recommended):"
             echo "  ${CYAN}$PROJECT_SLUG serve${NC}"
-            echo ""
-            echo "Or start it in the background:"
-            echo "  ${CYAN}nohup $PROJECT_SLUG serve > ~/.leindex/logs/server.log 2>&1 &${NC}"
             echo ""
             ;;
     esac

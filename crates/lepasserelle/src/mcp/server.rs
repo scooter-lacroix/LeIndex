@@ -25,10 +25,10 @@ use tracing::{debug, info, warn};
 
 /// Global server state - using OnceLock for lazy initialization
 /// This works with axum 0.6's trait bounds
-static SERVER_STATE: std::sync::OnceLock<Arc<Mutex<LeIndex>>> = std::sync::OnceLock::new();
+pub static SERVER_STATE: std::sync::OnceLock<Arc<Mutex<LeIndex>>> = std::sync::OnceLock::new();
 
 /// Global tool handlers list
-static HANDLERS: std::sync::OnceLock<Vec<ToolHandler>> = std::sync::OnceLock::new();
+pub static HANDLERS: std::sync::OnceLock<Vec<ToolHandler>> = std::sync::OnceLock::new();
 
 /// MCP Server configuration
 #[derive(Clone, Debug)]

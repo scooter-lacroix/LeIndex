@@ -5,10 +5,13 @@
 use anyhow::Context;
 use crate::leindex::LeIndex;
 use crate::mcp::McpServer;
+use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use anyhow::Result as AnyhowResult;
 use clap::{Parser, Subcommand};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 /// LeIndex - Code Search and Analysis Engine
@@ -84,6 +87,9 @@ pub enum Commands {
         #[arg(long = "port", default_value = "47268")]
         port: u16,
     },
+
+    /// Run MCP server in stdio mode (for AI tool subprocess integration)
+    Mcp,
 }
 
 impl Cli {
@@ -111,6 +117,9 @@ impl Cli {
             }
             Commands::Serve { host, port } => {
                 cmd_serve_impl(host, port).await
+            }
+            Commands::Mcp => {
+                cmd_mcp_stdio_impl(global_project).await
             }
         }
     }
@@ -340,6 +349,165 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
         .context("Server error")?;
 
     Ok(())
+}
+
+/// MCP stdio command implementation - Run MCP server in stdio mode
+/// This mode allows AI tools to start LeIndex as a subprocess for automatic integration
+async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
+    use crate::mcp::handlers::{IndexHandler, SearchHandler, DiagnosticsHandler, DeepAnalyzeHandler, ContextHandler};
+    use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError};
+    use std::io::{self, BufRead, Write};
+
+    let project_path = get_project_path(project);
+    let canonical_path = project_path.canonicalize()
+        .context("Failed to canonicalize project path")?;
+
+    info!("Starting LeIndex MCP stdio server for project: {}", canonical_path.display());
+
+    // Create LeIndex instance
+    let mut leindex = LeIndex::new(&canonical_path)
+        .context("Failed to create LeIndex instance")?;
+
+    // Try to load from storage, but don't fail if not indexed yet
+    let _ = leindex.load_from_storage();
+
+    // Initialize global state for handlers
+    let state = Arc::new(Mutex::new(leindex));
+    let _ = crate::mcp::server::SERVER_STATE.set(state.clone());
+
+    // Initialize handlers
+    let _ = crate::mcp::server::HANDLERS.set(vec![
+        crate::mcp::handlers::ToolHandler::DeepAnalyze(DeepAnalyzeHandler),
+        crate::mcp::handlers::ToolHandler::Diagnostics(DiagnosticsHandler),
+        crate::mcp::handlers::ToolHandler::Index(IndexHandler),
+        crate::mcp::handlers::ToolHandler::Context(ContextHandler),
+        crate::mcp::handlers::ToolHandler::Search(SearchHandler),
+    ]);
+
+    eprintln!("[INFO] LeIndex MCP stdio server starting");
+    eprintln!("[INFO] Project: {}", canonical_path.display());
+    eprintln!("[INFO] Reading JSON-RPC from stdin, writing to stdout");
+    eprintln!("[INFO] Press Ctrl+C to stop\n");
+
+    let stdin = io::stdin();
+    let mut stdout = io::stdout().lock();
+
+    // Read stdin line by line for JSON-RPC requests
+    let reader = stdin.lock();
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("[ERROR] Failed to read stdin: {}", e);
+                continue;
+            }
+        };
+
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Parse JSON-RPC request
+        let request: JsonRpcRequest = match serde_json::from_str(&line) {
+            Ok(r) => r,
+            Err(e) => {
+                let error_response = JsonRpcResponse::error(
+                    serde_json::Value::Null,
+                    JsonRpcError::parse_error(e.to_string())
+                );
+                let response = serde_json::to_string(&error_response).unwrap_or_default();
+                if writeln!(stdout, "{}\n", response).is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+
+        // Extract request ID before moving request
+        let request_id = request.id.clone();
+
+        // Handle the request
+        let response = match handle_mcp_request(request, project_path.clone()).await {
+            Ok(r) => r,
+            Err(e) => {
+                JsonRpcResponse::error(
+                    request_id,
+                    JsonRpcError::internal_error(e.to_string())
+                )
+            }
+        };
+
+        // Write response to stdout
+        let response_json = match serde_json::to_string(&response) {
+            Ok(j) => j,
+            Err(e) => {
+                // If we can't serialize, create a simple error response
+                format!("{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":-32700,\"message\":\"Failed to serialize response: {}\"}}}}", e)
+            }
+        };
+
+        if writeln!(stdout, "{}\n", response_json).is_err() {
+            eprintln!("[ERROR] Failed to write to stdout");
+            break;
+        }
+
+        // Flush to ensure immediate delivery
+        let _ = stdout.flush();
+    }
+
+    Ok(())
+}
+
+/// Handle a single MCP request and return the response
+async fn handle_mcp_request(request: JsonRpcRequest, _project_path: PathBuf) -> anyhow::Result<JsonRpcResponse> {
+    use crate::mcp::server::{HANDLERS, SERVER_STATE};
+
+    let method_name = request.method.clone();
+    let id = request.id.clone();
+
+    // Get the global state and handlers
+    let state = SERVER_STATE.get()
+        .ok_or_else(|| anyhow::anyhow!("Server state not initialized"))?;
+
+    let handlers = HANDLERS.get()
+        .ok_or_else(|| anyhow::anyhow!("Handlers not initialized"))?;
+
+    // Handle different methods
+    let result = match method_name.as_str() {
+        "tools/call" => {
+            // Extract tool call from request
+            let tool_call = request.extract_tool_call()
+                .map_err(|e| anyhow::anyhow!("Failed to extract tool call: {}", e))?;
+
+            // Find the handler for this tool
+            let handler = handlers.iter()
+                .find(|h| h.name() == tool_call.name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", tool_call.name))?;
+
+            // Execute the handler
+            handler.execute(state, tool_call.arguments).await
+                .map_err(|e| anyhow::anyhow!("Handler execution failed: {:?}", e))?
+        }
+        "tools/list" => {
+            // List all available tools
+            let tools: Vec<_> = handlers.iter()
+                .map(|handler| {
+                    serde_json::json!({
+                        "name": handler.name(),
+                        "description": handler.description(),
+                        "inputSchema": handler.argument_schema()
+                    })
+                })
+                .collect();
+            serde_json::json!({ "tools": tools })
+        }
+        _ => {
+            return Err(anyhow::anyhow!("Unknown method: {}", method_name));
+        }
+    };
+
+    Ok(JsonRpcResponse::success(id, result))
 }
 
 /// Main entry point for the CLI
