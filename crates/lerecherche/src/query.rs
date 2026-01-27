@@ -563,41 +563,62 @@ unsafe impl Sync for QueryParser {}
 /// Provides detailed error context for debugging and user feedback.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The query is empty or contains only whitespace
     #[error("Query cannot be empty")]
     EmptyQuery,
 
+    /// The query exceeds the maximum allowed length
     #[error("Query too long: {provided} characters (max: {max}). Query: '{actual_prefix}'")]
     QueryTooLong {
+        /// Number of characters provided
         provided: usize,
+        /// Maximum allowed characters
         max: usize,
+        /// Truncated prefix of the actual query
         actual_prefix: String,
     },
 
+    /// The query contains invalid or control characters
     #[error("Query contains invalid characters: {reason}")]
-    InvalidCharacters { reason: String },
+    InvalidCharacters {
+        /// Reason why the characters are invalid
+        reason: String,
+    },
 
+    /// The top_k parameter is out of the valid range
     #[error("Invalid top_k value: {provided} (must be between {min} and {max})")]
     InvalidTopK {
+        /// Provided top_k value
         provided: usize,
+        /// Minimum allowed value
         min: usize,
+        /// Maximum allowed value
         max: usize,
     },
 
+    /// The token budget exceeds the maximum allowed value
     #[error("Token budget too large: {provided} (max: {max})")]
     TokenBudgetTooLarge {
+        /// Provided budget value
         provided: usize,
+        /// Maximum allowed budget
         max: usize,
     },
 
+    /// The query contains no meaningful terms after stop-word filtering
     #[error("Query contains no meaningful terms: '{query}'. {suggestion}")]
     NoMeaningfulTerms {
+        /// The query that resulted in no terms
         query: String,
+        /// Suggestion for improving the query
         suggestion: &'static str,
     },
 
+    /// A regex pattern failed to compile or is invalid
     #[error("Invalid regex pattern: {0}")]
     InvalidPattern(String),
 
+    /// General failure during query parsing
     #[error("Query parsing failed: {0}")]
     ParseFailed(String),
 }

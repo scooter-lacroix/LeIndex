@@ -13,50 +13,67 @@ pub type Result<T> = std::result::Result<T, LeIndexError>;
 pub enum LeIndexError {
     /// Parsing-related errors
     Parse {
+        /// The error message
         message: String,
+        /// The path to the file that failed to parse
         file_path: Option<PathBuf>,
+        /// An optional suggestion for resolving the error
         suggestion: Option<String>,
     },
 
     /// Indexing-related errors
     Index {
+        /// The error message
         message: String,
+        /// Whether the operation can be retried or continued
         recoverable: bool,
     },
 
     /// Storage-related errors
     Storage {
+        /// The error message
         message: String,
+        /// Whether the operation can be retried or continued
         recoverable: bool,
     },
 
     /// Search-related errors
     Search {
+        /// The error message
         message: String,
     },
 
     /// Configuration errors
     Config {
+        /// The error message
         message: String,
+        /// An optional suggestion for resolving the error
         suggestion: Option<String>,
     },
 
     /// I/O errors with context
     Io {
+        /// Context description of the failed operation
         context: String,
+        /// The path related to the I/O error
         path: Option<PathBuf>,
+        /// The underlying I/O error
         source: std::io::Error,
     },
 
     /// Memory-related errors
     Memory {
+        /// The error message
         message: String,
+        /// An optional suggestion for resolving the error
         suggestion: Option<String>,
     },
 
     /// Validation errors
     Validation {
+        /// The error message
         message: String,
+        /// An optional suggestion for resolving the error
         suggestion: Option<String>,
     },
 }

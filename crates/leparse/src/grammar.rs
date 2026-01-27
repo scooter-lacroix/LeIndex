@@ -120,20 +120,32 @@ pub static GLOBAL_GRAMMAR_CACHE: Lazy<GrammarCache> = Lazy::new(GrammarCache::ne
 /// The discriminants correspond to cache indices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LanguageId {
+    /// Python programming language
     Python = 0,
+    /// JavaScript programming language
     JavaScript = 1,
+    /// TypeScript programming language
     TypeScript = 2,
+    /// Go programming language
     Go = 3,
+    /// Rust programming language
     Rust = 4,
+    /// Java programming language
     Java = 5,
+    /// C++ programming language
     Cpp = 6,
+    /// C# programming language
     CSharp = 7,
+    /// Ruby programming language
     Ruby = 8,
+    /// PHP programming language
     Php = 9,
     // Swift = 10, // TODO: Disabled due to tree-sitter version incompatibility (grammar v15 vs library v13-14)
     // Kotlin = 11, // TODO: Disabled due to tree-sitter version incompatibility (0.20.10 vs 0.24.7)
     // Dart = 11, // TODO: Disabled due to parsing issues
+    /// Lua programming language
     Lua = 10,
+    /// Scala programming language
     Scala = 11,
 }
 

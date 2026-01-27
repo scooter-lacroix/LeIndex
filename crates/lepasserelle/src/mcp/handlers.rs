@@ -82,13 +82,6 @@ fn extract_string(args: &Value, key: &str) -> Result<String, JsonRpcError> {
         ))
 }
 
-/// Helper to extract optional string argument
-fn extract_optional_string(args: &Value, key: &str) -> Option<String> {
-    args.get(key)
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-}
-
 /// Helper to extract usize argument with default
 fn extract_usize(args: &Value, key: &str, default: usize) -> Result<usize, JsonRpcError> {
     args.get(key)

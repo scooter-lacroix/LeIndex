@@ -268,7 +268,7 @@ mod tests {
             .map(|j| if j == 0 { 1.0 } else { 0.0 })
             .collect();
 
-        let results = engine.semantic_search(&query_embedding, 5).await.unwrap();
+        let results = engine.semantic_search(&query_embedding, 5).unwrap();
 
         // Should return results
         assert!(!results.is_empty());

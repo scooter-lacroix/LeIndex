@@ -64,9 +64,11 @@ impl Default for SemanticProcessor {
 /// Semantic processing errors
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// General semantic processing failure
     #[error("Processing failed: {0}")]
     ProcessingFailed(String),
 
+    /// Failed to expand context using the PDG
     #[error("Context expansion failed: {0}")]
     ContextExpansionFailed(String),
 }

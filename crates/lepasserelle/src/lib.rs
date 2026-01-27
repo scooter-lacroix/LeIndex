@@ -76,12 +76,18 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
+/// Command-line interface definitions and handling.
 pub mod cli;
+/// Configuration for projects, languages, and storage.
 pub mod config;
+/// Error types and error handling logic.
 pub mod errors;
+/// Core orchestration logic for indexing and search.
 pub mod leindex;
+/// Memory management and cache orchestration.
 pub mod memory;
 
+/// Model Context Protocol (MCP) server implementation.
 #[cfg(feature = "mcp-server")]
 pub mod mcp;
 

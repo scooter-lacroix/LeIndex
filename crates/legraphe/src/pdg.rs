@@ -49,10 +49,15 @@ pub struct Edge {
 /// Node type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NodeType {
+    /// A function definition
     Function,
+    /// A class definition
     Class,
+    /// A method definition
     Method,
+    /// A variable definition
     Variable,
+    /// A module or file
     Module,
 }
 

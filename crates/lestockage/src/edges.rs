@@ -7,22 +7,31 @@ use crate::schema::Storage;
 /// Edge record for database storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeRecord {
+    /// ID of the caller (source) node
     pub caller_id: i64,
+    /// ID of the callee (target) node
     pub callee_id: i64,
+    /// Type of the edge (call, dependency, etc.)
     pub edge_type: EdgeType,
+    /// Optional metadata for the edge
     pub metadata: Option<EdgeMetadata>,
 }
 
 /// Edge type
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EdgeType {
+    /// Function or method call
     Call,
+    /// Data dependency (e.g., variable usage)
     DataDependency,
+    /// Class or interface inheritance
     Inheritance,
+    /// Import or dependency relationship
     Import,
 }
 
 impl EdgeType {
+    /// Return the string representation of the edge type.
     pub fn as_str(&self) -> &'static str {
         match self {
             EdgeType::Call => "call",
@@ -32,6 +41,7 @@ impl EdgeType {
         }
     }
 
+    /// Create an edge type from its string representation.
     pub fn from_str_name(s: &str) -> Option<Self> {
         match s {
             "call" => Some(EdgeType::Call),
@@ -46,7 +56,9 @@ impl EdgeType {
 /// Edge metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeMetadata {
+    /// Number of times the call occurs (for call edges)
     pub call_count: Option<usize>,
+    /// Name of the variable (for data dependency)
     pub variable_name: Option<String>,
 }
 

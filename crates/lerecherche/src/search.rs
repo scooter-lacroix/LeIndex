@@ -106,9 +106,11 @@ impl VectorIndexImpl {
 /// Vector index errors
 #[derive(Debug, thiserror::Error)]
 pub enum VectorIndexError {
+    /// Failed to insert a vector into the index
     #[error("Insertion failed: {0}")]
     InsertionFailed(String),
 
+    /// General index operation failure
     #[error("Index operation failed: {0}")]
     IndexOperationFailed(String),
 }
@@ -553,39 +555,6 @@ impl SearchEngine {
         Ok(final_results)
     }
 
-    /// Calculate text similarity score using case-insensitive matching
-    ///
-    /// This is optimized to avoid unnecessary allocations by using
-    /// case-insensitive matching instead of lowercasing entire strings.
-    ///
-    /// # Performance
-    ///
-    /// - Time complexity: O(n + m) where n is query length and m is content length
-    /// - Space complexity: O(1) - no additional allocations
-    fn calculate_text_score(&self, query: &str, content: &str) -> f32 {
-        // Try exact match first (fast path)
-        if content.eq_ignore_ascii_case(query) {
-            return 1.0;
-        }
-
-        // Check if query is a substring (case-insensitive)
-        if content.to_ascii_lowercase().contains(query.to_ascii_lowercase().as_str()) {
-            return 0.8;
-        }
-
-        // Token overlap calculation
-        let query_tokens: std::collections::HashSet<_> =
-            query.split_whitespace().collect();
-        let content_tokens: std::collections::HashSet<_> =
-            content.split_whitespace().collect();
-
-        if query_tokens.is_empty() {
-            return 0.0;
-        }
-
-        let intersection = query_tokens.intersection(&content_tokens).count();
-        intersection as f32 / query_tokens.len() as f32
-    }
 
     /// Optimized text score calculation using pre-computed query data
     ///
@@ -1098,12 +1067,15 @@ pub enum EntryType {
 /// These errors can occur during search operations.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The search query execution failed
     #[error("Query failed: {0}")]
     QueryFailed(String),
 
+    /// The search index is not yet initialized or ready
     #[error("Index not ready")]
     IndexNotReady,
 
+    /// The provided query is invalid or malformed
     #[error("Invalid query: {0}")]
     InvalidQuery(String),
 }
@@ -1196,7 +1168,7 @@ mod tests {
 
     #[test]
     fn test_vector_search_integration() {
-        let engine = SearchEngine::new();
+        let _engine = SearchEngine::new();
 
         // Create nodes with embeddings
         let nodes = vec![
@@ -1543,15 +1515,18 @@ mod tests {
         let engine = SearchEngine::new();
 
         // Test case-insensitive exact match (fast path)
-        let score1 = engine.calculate_text_score("hello", "hello");
+        let query1 = TextQueryPreprocessed::from_query("hello");
+        let score1 = engine.calculate_text_score_optimized(&query1, "hello");
         assert_eq!(score1, 1.0);
 
         // Test substring match
-        let score2 = engine.calculate_text_score("hello", "hello world");
+        let query2 = TextQueryPreprocessed::from_query("hello");
+        let score2 = engine.calculate_text_score_optimized(&query2, "hello world");
         assert_eq!(score2, 0.8);
 
         // Test token overlap (no common tokens = 0.0)
-        let score3 = engine.calculate_text_score("hello world", "hi there");
+        let query3 = TextQueryPreprocessed::from_query("hello world");
+        let score3 = engine.calculate_text_score_optimized(&query3, "hi there");
         assert_eq!(score3, 0.0);
     }
 

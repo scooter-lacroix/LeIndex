@@ -107,31 +107,42 @@ impl Analytics {
 /// Node type count
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeTypeCount {
+    /// Type of the node (as string)
     pub node_type: String,
+    /// Number of nodes of this type
     pub count: i64,
 }
 
 /// Complexity bucket
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ComplexityBucket {
+    /// Complexity category (e.g., 'simple', 'moderate', etc.)
     pub bucket: String,
+    /// Number of nodes in this complexity bucket
     pub count: i64,
 }
 
 /// Edge type count
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EdgeTypeCount {
+    /// Type of the edge (as string)
     pub edge_type: String,
+    /// Number of edges of this type
     pub count: i64,
 }
 
 /// Hotspot node
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Hotspot {
+    /// ID of the hotspot node
     pub node_id: i64,
+    /// Name of the symbol
     pub symbol_name: String,
+    /// Path to the file containing the symbol
     pub file_path: String,
+    /// Complexity score of the node
     pub complexity: i32,
+    /// Number of outgoing edges (fan-out)
     pub fan_out: i64,
 }
 

@@ -1,6 +1,5 @@
 // Salsa incremental computation
 
-use blake3::Hash;
 use rusqlite::{params, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use crate::schema::Storage;
@@ -118,6 +117,9 @@ pub struct CachedComputation {
 }
 
 /// Query-based invalidation system
+///
+/// This system tracks dependencies between nodes and allows for
+/// targeted invalidation of cached analysis results when source code changes.
 pub struct QueryInvalidation {
     storage: Storage,
 }
@@ -129,6 +131,9 @@ impl QueryInvalidation {
     }
 
     /// Invalidate a node and its dependents
+    ///
+    /// # Arguments
+    /// * `node_hash` - The hash of the node to invalidate
     pub fn invalidate_node(&mut self, node_hash: &NodeHash) -> SqliteResult<()> {
         // Remove from cache
         self.storage.conn().execute(
@@ -138,7 +143,13 @@ impl QueryInvalidation {
         Ok(())
     }
 
-    /// Get affected nodes for a change
+    /// Get affected nodes for a change in a file
+    ///
+    /// # Arguments
+    /// * `file_path` - The path to the changed file
+    ///
+    /// # Returns
+    /// Vector of content hashes for the affected nodes
     pub fn get_affected_nodes(&self, file_path: &str) -> SqliteResult<Vec<String>> {
         let mut stmt = self.storage.conn().prepare(
             "SELECT content_hash FROM intel_nodes WHERE file_path = ?1"

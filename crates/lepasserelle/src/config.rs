@@ -307,7 +307,8 @@ impl ExclusionConfig {
 /// String pattern for matching (supports wildcards)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StringPattern {
-    pattern: String,
+    /// The pattern string, which may contain wildcards
+    pub pattern: String,
 }
 
 impl From<&str> for StringPattern {
@@ -458,15 +459,19 @@ impl Default for MemoryConfig {
 /// Configuration error
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// Input/Output error during configuration file handling
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// Failed to serialize configuration to TOML/JSON
     #[error("Serialization error: {0}")]
     Serialization(String),
 
+    /// Failed to parse configuration from file
     #[error("Parse error: {0}")]
     Parse(String),
 
+    /// The configuration contains invalid values or settings
     #[error("Invalid configuration: {0}")]
     Invalid(String),
 }

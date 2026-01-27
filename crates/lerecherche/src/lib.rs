@@ -1,15 +1,21 @@
-// lerecherche - Search & Analysis Fusion
-//
-// *La Recherche* (The Search) - Node-level semantic search with vector-AST synergy
+//! lerecherche - Search & Analysis Fusion
+//!
+//! *La Recherche* (The Search) - Node-level semantic search with vector-AST synergy
 
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
+/// Unified search engine combining keyword and semantic search.
 pub mod search;
+/// Semantic analysis and embedding generation.
 pub mod semantic;
+/// Hybrid ranking and scoring algorithms.
 pub mod ranking;
+/// Vector storage and indexing.
 pub mod vector;
+/// Query parsing and intent detection.
 pub mod query;
+/// Hierarchical Navigable Small World (HNSW) implementation for vector search.
 pub mod hnsw;
 
 pub use search::{SearchEngine, SearchResult, SearchQuery, SemanticEntry, NodeInfo};

@@ -283,6 +283,7 @@ fn extract_method_signature(
     })
 }
 
+#[allow(clippy::manual_find)]
 fn extract_csharp_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Parameter> {
     let mut parameters = Vec::new();
 
@@ -376,10 +377,10 @@ fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> 
     comments_before.into_iter().rev().find(|comment_start| {
         // Check if the comment is "close" to the node (within ~500 bytes)
         node_start.saturating_sub(*comment_start) <= 500
-    }).and_then(|_| {
+    }).map(|_| {
         // For now, return a placeholder since XML doc comment parsing is complex
         // A full implementation would parse the <summary>, <param>, <returns> tags
-        Some("C# XML documentation comment".to_string())
+        "C# XML documentation comment".to_string()
     })
 }
 

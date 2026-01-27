@@ -1,4 +1,4 @@
-/// Debug module to understand Lua tree-sitter AST structure
+//! Debug module to understand Lua tree-sitter AST structure
 
 use tree_sitter::Parser;
 

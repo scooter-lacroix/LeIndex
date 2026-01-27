@@ -14,6 +14,7 @@ impl Default for RubyParser {
 }
 
 impl RubyParser {
+    /// Create a new instance of the Ruby parser.
     pub fn new() -> Self {
         Self
     }

@@ -1,6 +1,6 @@
-// leparse - Core Parsing Engine
-//
-// *Le Parse* (The Parsing) - Zero-copy AST extraction with multi-language support
+//! leparse - Core Parsing Engine
+//!
+//! *Le Parse* (The Parsing) - Zero-copy AST extraction with multi-language support
 
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]

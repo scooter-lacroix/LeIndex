@@ -4,6 +4,7 @@ use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, Result, S
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use tree_sitter::Parser;
 
+/// Scala language parser with full CodeIntelligence implementation
 pub struct ScalaParser;
 
 impl Default for ScalaParser {
@@ -11,6 +12,7 @@ impl Default for ScalaParser {
 }
 
 impl ScalaParser {
+    /// Create a new instance of the Scala parser.
     pub fn new() -> Self { Self }
 }
 

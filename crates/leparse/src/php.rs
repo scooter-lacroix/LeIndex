@@ -14,6 +14,7 @@ impl Default for PhpParser {
 }
 
 impl PhpParser {
+    /// Create a new instance of the PHP parser.
     pub fn new() -> Self {
         Self
     }

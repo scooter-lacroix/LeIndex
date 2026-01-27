@@ -1,18 +1,27 @@
-// lestockage - Persistent Storage Layer
-//
-// *Le Stockage* (The Storage) - Extended SQLite schema with Salsa incremental computation
+//! lestockage - Persistent Storage Layer
+//!
+//! *Le Stockage* (The Storage) - Extended SQLite schema with Salsa incremental computation
 
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
+/// Database schema and connection management.
 pub mod schema;
+/// Storage and retrieval of code nodes.
 pub mod nodes;
+/// Storage and retrieval of graph edges.
 pub mod edges;
+/// Salsa-inspired incremental computation and caching.
 pub mod salsa;
+/// Storage analytics and metrics.
 pub mod analytics;
+/// Persistent storage for Program Dependence Graphs.
 pub mod pdg_store;
+/// Global symbol table for cross-project indexing.
 pub mod global_symbols;
+/// Cross-project reference resolution and graph merging.
 pub mod cross_project;
+/// Configuration for Turso and hybrid storage backends.
 pub mod turso_config;
 
 pub use schema::{Storage, StorageConfig};

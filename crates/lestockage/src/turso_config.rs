@@ -306,13 +306,13 @@ impl HybridStorage {
 /// Indicates the current storage mode of the HybridStorage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageMode {
-    /// No storage configured
+    /// No storage backend is configured or available
     None,
-    /// Local-only storage
+    /// Only local SQLite storage is being used
     LocalOnly,
-    /// Remote-only storage
+    /// Only remote Turso storage is being used
     RemoteOnly,
-    /// Hybrid storage (local + remote)
+    /// Both local and remote storage are being used in a hybrid configuration
     Hybrid,
 }
 
@@ -321,18 +321,23 @@ pub enum StorageMode {
 /// Errors that can occur when working with HybridStorage.
 #[derive(Debug, Error)]
 pub enum StorageError {
+    /// Failed to connect to the storage backend
     #[error("Connection failed: {0}")]
     ConnectionFailed(String),
 
+    /// Failed to migrate data between storage backends
     #[error("Migration failed: {0}")]
     MigrationFailed(String),
 
+    /// The vector search extension is not available on the remote backend
     #[error("Vector extension not available")]
     VectorExtensionNotAvailable,
 
+    /// An error occurred in the local SQLite storage
     #[error("Local storage error: {0}")]
     LocalStorageError(String),
 
+    /// A query executed on the remote backend failed
     #[error("Remote query failed: {0}")]
     RemoteQueryFailed(String),
 }

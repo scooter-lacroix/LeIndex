@@ -191,9 +191,13 @@ impl CrossProjectPDG {
 /// External node reference
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalNodeRef {
-    pub node_id: u32,  // Serialized as u32 since NodeId doesn't implement Serialize
+    /// Serialized node index
+    pub node_id: u32,
+    /// Origin project ID
     pub project_id: String,
+    /// Symbol name of the node
     pub symbol_name: String,
+    /// Type of the node
     pub node_type: NodeType,
 }
 
@@ -204,8 +208,11 @@ pub struct ExternalNodeRef {
 /// The full PDG serialization is handled separately by the pdg module.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SerializableCrossProjectPDG {
+    /// Root project ID
     pub root_project_id: String,
-    pub node_origins: Vec<(u32, String)>,  // (node_index, project_id)
+    /// List of node origins as (node_index, project_id)
+    pub node_origins: Vec<(u32, String)>,
+    /// Map of external project IDs to their node references
     pub external_refs: HashMap<String, Vec<ExternalNodeRef>>,
 }
 
@@ -276,12 +283,15 @@ impl CrossProjectPDG {
 /// Error for PDG merging
 #[derive(Debug, Error)]
 pub enum MergeError {
+    /// Conflict between local and external node IDs
     #[error("Node ID conflict: {0:?} exists in both local and external")]
     NodeConflict(NodeId),
 
+    /// Conflict between local and external edge IDs
     #[error("Edge ID conflict: {0:?} exists in both local and external")]
     EdgeConflict(EdgeId),
 
+    /// Merging exceeded the maximum allowed depth
     #[error("Max depth exceeded: {0}")]
     MaxDepthExceeded(usize),
 }

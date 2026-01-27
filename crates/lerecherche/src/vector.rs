@@ -242,12 +242,20 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Vector search errors
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Provided embedding dimension does not match the index dimension
     #[error("Dimension mismatch: expected {expected}, got {got}")]
-    DimensionMismatch { expected: usize, got: usize },
+    DimensionMismatch {
+        /// Expected dimension
+        expected: usize,
+        /// Actual dimension received
+        got: usize,
+    },
 
+    /// The index contains no vectors
     #[error("Index is empty")]
     EmptyIndex,
 
+    /// The provided embedding is invalid (e.g., contains NaN or infinite values)
     #[error("Invalid embedding: {0}")]
     InvalidEmbedding(String),
 }

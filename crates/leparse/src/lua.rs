@@ -4,6 +4,7 @@ use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, Result, S
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use tree_sitter::Parser;
 
+/// Lua language parser with full CodeIntelligence implementation
 pub struct LuaParser;
 
 impl Default for LuaParser {
@@ -11,6 +12,7 @@ impl Default for LuaParser {
 }
 
 impl LuaParser {
+    /// Create a new instance of the Lua parser.
     pub fn new() -> Self { Self }
 }
 

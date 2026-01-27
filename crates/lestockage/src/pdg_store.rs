@@ -16,18 +16,28 @@ use std::collections::HashMap;
 /// Errors that can occur during PDG persistence
 #[derive(Debug, thiserror::Error)]
 pub enum PdgStoreError {
+    /// Error originating from the underlying SQLite database
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// The specified node ID was not found in the database
     #[error("Node not found: {0}")]
     NodeNotFound(i64),
 
+    /// An edge refers to a node that does not exist in the database
     #[error("Edge refers to non-existent node: caller={caller}, callee={callee}")]
-    EdgeNodeMissing { caller: i64, callee: i64 },
+    EdgeNodeMissing {
+        /// ID of the caller node
+        caller: i64,
+        /// ID of the callee node
+        callee: i64,
+    },
 
+    /// Failed to serialize PDG data for storage
     #[error("Serialization error: {0}")]
     Serialization(String),
 
+    /// Failed to deserialize stored data back into a PDG
     #[error("Deserialization error: {0}")]
     Deserialization(String),
 }

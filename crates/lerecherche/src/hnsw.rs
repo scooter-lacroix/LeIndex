@@ -537,24 +537,36 @@ impl Default for HNSWIndex {
 /// Index errors
 #[derive(Debug, Error)]
 pub enum IndexError {
+    /// Provided embedding dimension does not match the index dimension
     #[error("Dimension mismatch: expected {expected}, got {got}")]
-    DimensionMismatch { expected: usize, got: usize },
+    DimensionMismatch {
+        /// Expected dimension
+        expected: usize,
+        /// Actual dimension received
+        got: usize,
+    },
 
+    /// A node with the same ID already exists in the index
     #[error("Node {0} already exists")]
     NodeExists(String),
 
+    /// The specified node was not found in the index
     #[error("Node {0} not found")]
     NodeNotFound(String),
 
+    /// An invalid parameter was provided for HNSW construction or search
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
 
+    /// Failed to insert a vector into the HNSW graph
     #[error("Insertion failed: {0}")]
     InsertionFailed(String),
 
+    /// Failed to serialize the HNSW index
     #[error("Serialization failed: {0}")]
     SerializationFailed(String),
 
+    /// Failed to deserialize the HNSW index
     #[error("Deserialization failed: {0}")]
     DeserializationFailed(String),
 }
@@ -563,14 +575,6 @@ pub enum IndexError {
 mod tests {
     use super::*;
 
-    fn create_test_vector(id: u32) -> Vec<f32> {
-        // Create orthogonal test vectors
-        match id % 3 {
-            0 => vec![1.0, 0.0, 0.0],
-            1 => vec![0.0, 1.0, 0.0],
-            _ => vec![0.0, 0.0, 1.0],
-        }
-    }
 
     #[test]
     fn test_hnsw_index_creation() {

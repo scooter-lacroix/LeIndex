@@ -316,6 +316,6 @@ mod tests {
 
         assert_eq!(stats.total_files, 1);
         assert_eq!(stats.successful_files, 1);
-        assert!(stats.total_time_ms >= 0);
+        assert!(stats.total_time_ms > 0);
     }
 }

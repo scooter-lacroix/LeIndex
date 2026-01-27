@@ -8,7 +8,6 @@ use crate::memory::{
 use anyhow::{Context, Result};
 use legraphe::{
     pdg::{Node, NodeType, ProgramDependenceGraph},
-    traversal::TraversalConfig,
 };
 use leparse::parallel::{ParallelParser, ParsingResult};
 use leparse::traits::SignatureInfo;
@@ -638,15 +637,13 @@ impl LeIndex {
         &self,
         _pdg: &ProgramDependenceGraph,
         results: &[SearchResult],
-        token_budget: usize,
+        _token_budget: usize,
     ) -> Result<String> {
         let mut context = String::from("/* Context Expansion */\n");
 
-        let mut config = TraversalConfig::default();
-        config.max_tokens = token_budget;
-
         // Note: Gravity traversal would be used here for actual context expansion
-        // let _traversal = GravityTraversal::with_config(config.clone());
+        // let config = TraversalConfig { max_tokens: token_budget, ..Default::default() };
+        // let _traversal = GravityTraversal::with_config(config);
 
         for result in results.iter().take(5) {
             context.push_str(&format!("\n// Entry Point: {}\n", result.symbol_name));

@@ -336,21 +336,18 @@ fn extract_java_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Param
 fn extract_visibility(node: &tree_sitter::Node, source: &[u8]) -> Visibility {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        match child.kind() {
-            "modifiers" => {
-                let mut mcursor = child.walk();
-                for modifier in child.children(&mut mcursor) {
-                    if let Ok(text) = modifier.utf8_text(source) {
-                        match text.trim() {
-                            "public" => return Visibility::Public,
-                            "protected" => return Visibility::Protected,
-                            "private" => return Visibility::Private,
-                            _ => {}
-                        }
+        if child.kind() == "modifiers" {
+            let mut mcursor = child.walk();
+            for modifier in child.children(&mut mcursor) {
+                if let Ok(text) = modifier.utf8_text(source) {
+                    match text.trim() {
+                        "public" => return Visibility::Public,
+                        "protected" => return Visibility::Protected,
+                        "private" => return Visibility::Private,
+                        _ => {}
                     }
                 }
             }
-            _ => {}
         }
     }
     Visibility::Private

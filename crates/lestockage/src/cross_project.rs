@@ -147,7 +147,7 @@ impl CrossProjectResolver {
         let mut merged_pdg = root_pdg;
         for (project_id, pdg) in &self.pdg_cache {
             if project_id != root_project_id {
-                Self::merge_pdgs(&mut merged_pdg, pdg, project_id)
+                Self::merge_pdgs(&mut merged_pdg, pdg)
                     .map_err(|e| ResolutionError::MergeError(format!("{:?}", e)))?;
             }
         }
@@ -191,7 +191,6 @@ impl CrossProjectResolver {
     fn merge_pdgs(
         root_pdg: &mut ProgramDependenceGraph,
         external_pdg: &ProgramDependenceGraph,
-        external_project_id: &str,
     ) -> Result<(), MergeError> {
         // Track ID mappings to avoid conflicts
         let mut node_map = HashMap::new();
@@ -327,33 +326,44 @@ impl CrossProjectResolver {
 /// Resolved symbol with context
 #[derive(Debug, Clone)]
 pub struct ResolvedSymbol {
+    /// The global symbol information
     pub symbol: GlobalSymbol,
+    /// ID of the project containing the symbol
     pub project_id: String,
+    /// Whether the symbol is local to the current project
     pub is_local: bool,
-    pub is_loaded: bool, // PDG loaded in memory
+    /// Whether the project's PDG is currently loaded in memory
+    pub is_loaded: bool,
 }
 
 /// Errors for cross-project resolution
 #[derive(Debug, Error)]
 pub enum ResolutionError {
+    /// The specified symbol was not found
     #[error("Symbol not found: {0}")]
     SymbolNotFound(String),
 
+    /// Multiple symbols match the name across different projects
     #[error("Ambiguous symbol: {0} found in {1} projects")]
     AmbiguousSymbol(String, usize),
 
+    /// Failed to load the Program Dependence Graph for an external project
     #[error("Failed to load external PDG for project {0}: {1}")]
     PdgLoadFailed(String, #[source] PdgStoreError),
 
+    /// A circular dependency was detected between projects
     #[error("Circular dependency detected: {0}")]
     CircularDependency(String),
 
+    /// The resolution process exceeded the maximum allowed depth
     #[error("Maximum depth exceeded")]
     MaxDepthExceeded,
 
+    /// An error occurred while merging Program Dependence Graphs
     #[error("Merge error: {0}")]
     MergeError(String),
 
+    /// An error occurred during global symbol operations
     #[error("Global symbol error: {0}")]
     GlobalSymbolError(#[from] crate::global_symbols::GlobalSymbolError),
 }
@@ -361,12 +371,15 @@ pub enum ResolutionError {
 /// Error for PDG merging
 #[derive(Debug, Error)]
 pub enum MergeError {
+    /// Conflict between local and external node IDs
     #[error("Node ID conflict: {0:?} exists in both local and external")]
     NodeConflict(NodeId),
 
+    /// Conflict between local and external edge IDs
     #[error("Edge ID conflict: {0:?} exists in both local and external")]
     EdgeConflict(EdgeId),
 
+    /// Merging exceeded the maximum allowed depth
     #[error("Max depth exceeded: {0}")]
     MaxDepthExceeded(usize),
 }

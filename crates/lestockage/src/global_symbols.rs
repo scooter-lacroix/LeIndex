@@ -4,7 +4,6 @@
 // symbols across multiple projects, enabling cross-project symbol resolution.
 
 use crate::schema::Storage;
-use blake3::Hash;
 use rusqlite::{params, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,31 +15,49 @@ pub type GlobalSymbolId = String;
 /// Global symbol record
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GlobalSymbol {
+    /// Unique identifier for the symbol
     pub symbol_id: GlobalSymbolId,
+    /// ID of the project containing the symbol
     pub project_id: String,
+    /// Name of the symbol
     pub symbol_name: String,
+    /// Type of the symbol (function, class, etc.)
     pub symbol_type: SymbolType,
+    /// Code signature or declaration
     pub signature: Option<String>,
+    /// Path to the file containing the symbol
     pub file_path: String,
+    /// Byte range in the source file
     pub byte_range: (usize, usize),
+    /// Complexity score of the symbol
     pub complexity: u32,
+    /// Whether the symbol is publicly accessible
     pub is_public: bool,
 }
 
 /// Symbol type classification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum SymbolType {
+    /// A function definition
     Function,
+    /// A class definition
     Class,
+    /// A method definition
     Method,
+    /// A variable definition
     Variable,
+    /// A module or file
     Module,
+    /// A struct definition
     Struct,
+    /// An enum definition
     Enum,
+    /// A trait or interface definition
     Trait,
 }
 
 impl SymbolType {
+    /// Return the string representation of the symbol type.
     pub fn as_str(&self) -> &'static str {
         match self {
             SymbolType::Function => "function",
@@ -54,6 +71,7 @@ impl SymbolType {
         }
     }
 
+    /// Create a symbol type from its string representation.
     pub fn from_str_name(s: &str) -> Option<Self> {
         match s {
             "function" => Some(SymbolType::Function),
@@ -72,25 +90,37 @@ impl SymbolType {
 /// External reference between symbols
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ExternalRef {
+    /// Unique identifier for the reference
     pub ref_id: String,
+    /// ID of the project containing the source symbol
     pub source_project_id: String,
+    /// ID of the source symbol
     pub source_symbol_id: GlobalSymbolId,
+    /// ID of the project containing the target symbol
     pub target_project_id: String,
+    /// ID of the target symbol
     pub target_symbol_id: GlobalSymbolId,
+    /// Type of the reference (call, inheritance, etc.)
     pub ref_type: RefType,
 }
 
 /// Reference type between symbols
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum RefType {
+    /// Function or method call
     Call,
+    /// Class or interface inheritance
     Inheritance,
+    /// Module or file import
     Import,
+    /// General usage reference
     Use,
+    /// Data dependency
     DataDependency,
 }
 
 impl RefType {
+    /// Return the string representation of the reference type.
     pub fn as_str(&self) -> &'static str {
         match self {
             RefType::Call => "call",
@@ -101,6 +131,7 @@ impl RefType {
         }
     }
 
+    /// Create a reference type from its string representation.
     pub fn from_str_name(s: &str) -> Option<Self> {
         match s {
             "call" => Some(RefType::Call),
@@ -116,22 +147,31 @@ impl RefType {
 /// Project dependency
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProjectDep {
+    /// Unique identifier for the dependency
     pub dep_id: String,
+    /// ID of the project that has the dependency
     pub project_id: String,
+    /// ID of the project that is depended upon
     pub depends_on_project_id: String,
+    /// Type of the dependency (direct, dev, etc.)
     pub dependency_type: DepType,
 }
 
 /// Dependency type between projects
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DepType {
+    /// Direct production dependency
     Direct,
+    /// Transitive dependency (dependency of a dependency)
     Transitive,
+    /// Development-only dependency
     Dev,
+    /// Build-time dependency
     Build,
 }
 
 impl DepType {
+    /// Return the string representation of the dependency type.
     pub fn as_str(&self) -> &'static str {
         match self {
             DepType::Direct => "direct",
@@ -141,6 +181,7 @@ impl DepType {
         }
     }
 
+    /// Create a dependency type from its string representation.
     pub fn from_str_name(s: &str) -> Option<Self> {
         match s {
             "direct" => Some(DepType::Direct),
@@ -592,12 +633,15 @@ impl<'a> GlobalSymbolTable<'a> {
 /// Errors for global symbol operations
 #[derive(Debug, Error)]
 pub enum GlobalSymbolError {
+    /// Error originating from the underlying SQLite database
     #[error("SQLite error: {0}")]
     Sqlite(#[from] rusqlite::Error),
 
+    /// The specified symbol ID was not found
     #[error("Symbol not found: {0}")]
     SymbolNotFound(String),
 
+    /// Multiple symbols match the name across different projects
     #[error("Ambiguous symbol: {0} found in {1} projects")]
     AmbiguousSymbol(String, usize),
 }

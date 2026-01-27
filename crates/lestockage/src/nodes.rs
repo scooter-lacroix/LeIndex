@@ -7,28 +7,43 @@ use crate::schema::Storage;
 /// Node record for database storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRecord {
+    /// Unique database ID
     pub id: Option<i64>,
+    /// Origin project ID
     pub project_id: String,
+    /// Path to the file containing the node
     pub file_path: String,
+    /// Name of the symbol
     pub symbol_name: String,
+    /// Type of the node (function, class, etc.)
     pub node_type: NodeType,
+    /// Code signature or declaration
     pub signature: Option<String>,
+    /// Complexity score
     pub complexity: Option<i32>,
+    /// Content hash for change detection
     pub content_hash: String,
+    /// Vector embedding for semantic search
     pub embedding: Option<Vec<u8>>,
 }
 
 /// Node type enum
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NodeType {
+    /// A function definition
     Function,
+    /// A class definition
     Class,
+    /// A method definition
     Method,
+    /// A variable definition
     Variable,
+    /// A module or file
     Module,
 }
 
 impl NodeType {
+    /// Return the string representation of the node type.
     pub fn as_str(&self) -> &'static str {
         match self {
             NodeType::Function => "function",
@@ -39,6 +54,7 @@ impl NodeType {
         }
     }
 
+    /// Create a node type from its string representation.
     pub fn from_str_name(s: &str) -> Option<Self> {
         match s {
             "function" => Some(NodeType::Function),

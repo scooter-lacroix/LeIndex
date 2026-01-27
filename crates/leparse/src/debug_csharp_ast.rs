@@ -1,4 +1,4 @@
-/// Debug module to understand C# tree-sitter AST structure
+//! Debug module to understand C# tree-sitter AST structure
 
 use tree_sitter::Parser;
 
