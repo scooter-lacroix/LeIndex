@@ -282,6 +282,13 @@ update_path() {
         shell_config="$HOME/.profile"
     fi
 
+    # Also create symlink in ~/.local/bin for tools that expect it there
+    mkdir -p ~/.local/bin
+    if [[ ! -L ~/.local/bin/$PROJECT_SLUG ]]; then
+        ln -sf "$BIN_DIR/$PROJECT_SLUG" ~/.local/bin/$PROJECT_SLUG
+        log_success "Created symlink: ~/.local/bin/$PROJECT_SLUG"
+    fi
+
     # Check if PATH is already configured
     if grep -q "$BIN_DIR" "$shell_config" 2>/dev/null; then
         log_info "PATH already configured in $shell_config"
