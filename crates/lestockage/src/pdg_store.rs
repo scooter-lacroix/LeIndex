@@ -2,8 +2,8 @@
 //
 // *Le Pont* (The Bridge) - Converts between legraphe PDG and lestockage records
 
-use crate::edges::{EdgeRecord, EdgeStore, EdgeType as StorageEdgeType, EdgeMetadata as StorageEdgeMetadata};
-use crate::nodes::{NodeRecord, NodeStore, NodeType as StorageNodeType};
+use crate::edges::{EdgeType as StorageEdgeType, EdgeMetadata as StorageEdgeMetadata};
+use crate::nodes::{NodeRecord, NodeType as StorageNodeType};
 use crate::schema::Storage;
 use legraphe::pdg::{
     ProgramDependenceGraph, Node as PDGNode, Edge as PDGEdge,

@@ -124,7 +124,7 @@ impl CrossProjectPDG {
     pub fn add_external_ref(&mut self, node_id: NodeId, project_id: &str) {
         self.external_refs
             .entry(project_id.to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(node_id);
         self.node_origins.insert(node_id, project_id.to_string());
     }

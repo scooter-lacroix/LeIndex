@@ -3,11 +3,10 @@
 // This module provides cross-project resolution capabilities, enabling
 // symbols to be resolved across project boundaries with lazy PDG loading.
 
-use crate::global_symbols::{GlobalSymbol, GlobalSymbolId, ExternalRef, ProjectDep};
+use crate::global_symbols::{GlobalSymbol, GlobalSymbolId};
 use crate::pdg_store::{load_pdg, save_pdg, PdgStoreError};
 use legraphe::pdg::{ProgramDependenceGraph, NodeId, EdgeId};
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use thiserror::Error;
 
 /// Cross-project resolver

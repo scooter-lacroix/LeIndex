@@ -14,10 +14,15 @@ use tokio::sync::Mutex;
 /// we use an enum to dispatch to the appropriate handler.
 #[derive(Clone)]
 pub enum ToolHandler {
+    /// Handler for project indexing
     Index(IndexHandler),
+    /// Handler for semantic search
     Search(SearchHandler),
+    /// Handler for deep code analysis
     DeepAnalyze(DeepAnalyzeHandler),
+    /// Handler for code context expansion
     Context(ContextHandler),
+    /// Handler for system diagnostics
     Diagnostics(DiagnosticsHandler),
 }
 

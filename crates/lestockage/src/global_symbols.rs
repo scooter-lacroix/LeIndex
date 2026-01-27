@@ -4,9 +4,8 @@
 // symbols across multiple projects, enabling cross-project symbol resolution.
 
 use crate::schema::Storage;
-use rusqlite::{params, OptionalExtension, Result as SqliteResult};
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use thiserror::Error;
 
 /// Global symbol identifier (BLAKE3 hash)

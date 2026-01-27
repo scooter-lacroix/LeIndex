@@ -17,9 +17,13 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// - params: Optional parameters (can be omitted if not needed)
 #[derive(Debug, Clone, Deserialize)]
 pub struct JsonRpcRequest {
+    /// JSON-RPC version string, must be "2.0"
     pub jsonrpc: String,
+    /// Unique identifier for the request
     pub id: Value,
+    /// Method name to be invoked
     pub method: String,
+    /// Parameters for the method call
     pub params: Option<Value>,
 }
 
@@ -61,10 +65,14 @@ impl JsonRpcRequest {
 /// A response can contain either a result or an error, but not both.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRpcResponse {
+    /// JSON-RPC version string, must be "2.0"
     pub jsonrpc: String,
+    /// Identifier matching the original request
     pub id: Value,
+    /// Result of the method call, if successful
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    /// Error information, if the method call failed
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<JsonRpcError>,
 }
@@ -102,8 +110,11 @@ impl JsonRpcResponse {
 /// JSON-RPC 2.0 Error
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRpcError {
+    /// Error code indicating the type of failure
     pub code: i32,
+    /// Human-readable description of the error
     pub message: String,
+    /// Optional additional error details
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
@@ -205,7 +216,9 @@ impl std::error::Error for JsonRpcError {}
 /// Tool call parameters extracted from JSON-RPC request
 #[derive(Debug, Clone, Deserialize)]
 pub struct ToolCallParams {
+    /// Name of the tool to be called
     pub name: String,
+    /// Arguments for the tool call
     pub arguments: Value,
 }
 

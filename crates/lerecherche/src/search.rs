@@ -315,7 +315,7 @@ impl SearchEngine {
     #[must_use]
     pub fn with_dimension(dimension: usize) -> Self {
         // Validate dimension at construction time
-        if dimension < MIN_EMBEDDING_DIMENSION || dimension > MAX_EMBEDDING_DIMENSION {
+        if !(MIN_EMBEDDING_DIMENSION..=MAX_EMBEDDING_DIMENSION).contains(&dimension) {
             panic!(
                 "Invalid embedding dimension: {} (must be between {} and {})",
                 dimension, MIN_EMBEDDING_DIMENSION, MAX_EMBEDDING_DIMENSION

@@ -108,7 +108,7 @@ impl TursoConfig {
 /// Migration statistics
 ///
 /// Tracks the progress and results of a migration operation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MigrationStats {
     /// Number of nodes migrated
     pub nodes_migrated: usize,
@@ -121,17 +121,6 @@ pub struct MigrationStats {
 
     /// Time taken for migration (milliseconds)
     pub migration_time_ms: u64,
-}
-
-impl Default for MigrationStats {
-    fn default() -> Self {
-        Self {
-            nodes_migrated: 0,
-            edges_migrated: 0,
-            embeddings_migrated: 0,
-            migration_time_ms: 0,
-        }
-    }
 }
 
 /// Hybrid storage: local SQLite + remote Turso

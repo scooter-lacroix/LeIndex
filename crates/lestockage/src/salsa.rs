@@ -156,7 +156,7 @@ impl QueryInvalidation {
         )?;
 
         let hashes = stmt.query_map(params![file_path], |row| {
-            Ok(row.get::<_, String>(0)?)
+            row.get::<_, String>(0)
         })?.collect::<SqliteResult<Vec<_>>>()?;
 
         Ok(hashes)

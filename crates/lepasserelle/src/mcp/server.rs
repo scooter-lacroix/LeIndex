@@ -59,8 +59,10 @@ impl Default for McpServerConfig {
 
 /// MCP Server
 pub struct McpServer {
-    config: McpServerConfig,
-    _state: Arc<Mutex<LeIndex>>, // Keep reference to prevent drop
+    /// Configuration for the server
+    pub config: McpServerConfig,
+    /// Shared state containing the LeIndex instance
+    pub _state: Arc<Mutex<LeIndex>>, // Keep reference to prevent drop
 }
 
 impl McpServer {

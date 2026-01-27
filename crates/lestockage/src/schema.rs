@@ -30,6 +30,7 @@ impl Default for StorageConfig {
 /// Main storage interface
 pub struct Storage {
     conn: Connection,
+    #[allow(dead_code)]
     config: StorageConfig,
 }
 

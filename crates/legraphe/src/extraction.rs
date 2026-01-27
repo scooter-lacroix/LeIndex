@@ -198,7 +198,7 @@ fn extract_type_dependencies(signatures: &[SignatureInfo]) -> Vec<(String, Strin
             if let Some(type_name) = &param.type_annotation {
                 type_to_signatures
                     .entry(type_name.clone())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(sig.qualified_name.clone());
             }
         }
@@ -255,7 +255,7 @@ fn extract_inheritance_edges(
             if let Some(class_name) = parse_class_hierarchy(&sig.qualified_name) {
                 class_methods
                     .entry(class_name)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(sig.qualified_name.clone());
             }
         }

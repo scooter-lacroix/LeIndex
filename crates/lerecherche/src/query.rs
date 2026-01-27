@@ -59,7 +59,6 @@ pub const MIN_EMBEDDING_DIMENSION: usize = 1;
 /// - Use possessive quantifiers where possible
 /// - Avoid nested optional groups
 /// - Limit repetition ranges
-
 static HOW_WORKS_PATTERN: Lazy<Regex> = Lazy::new(|| {
     Regex::new(
         r"(?i)^(?:show|tell|explain|describe)\s+(?:me\s+)?how\s+(?:does\s+)?\S.{0,400}?(?:\s+(?:work|works|working|function|functions|operate|operates))?\s*\.?\s*$"

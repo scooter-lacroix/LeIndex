@@ -291,32 +291,32 @@ impl ErrorContext {
 /// Partial indexing result
 #[derive(Debug, Clone)]
 pub struct PartialIndexResult {
-    /// Files successfully processed
+    /// Number of files successfully processed
     pub successful_files: usize,
 
-    /// Files that failed to process
+    /// List of paths for files that failed to process
     pub failed_files: Vec<PathBuf>,
 
-    /// Partial statistics
+    /// Partial statistics from the indexing attempt
     pub stats: PartialStats,
 
-    /// Whether indexing completed successfully
+    /// Whether indexing reached its intended conclusion (even if some files failed)
     pub completed: bool,
 }
 
 /// Partial indexing statistics
 #[derive(Debug, Clone)]
 pub struct PartialStats {
-    /// Total files encountered
+    /// Total number of files encountered
     pub total_files: usize,
 
-    /// Successfully parsed files
+    /// Total number of files successfully parsed
     pub parsed_files: usize,
 
-    /// Total signatures extracted
+    /// Total number of code signatures extracted
     pub total_signatures: usize,
 
-    /// Nodes indexed
+    /// Total number of nodes successfully indexed
     pub indexed_nodes: usize,
 }
 
@@ -362,21 +362,24 @@ impl Default for PartialIndexResult {
 /// Corruption detection result
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CorruptionStatus {
-    /// No corruption detected
+    /// No corruption was detected; the index is healthy
     Healthy,
 
-    /// Minor corruption (some files missing)
+    /// Minor corruption detected (e.g., some non-critical files missing)
     Minor {
+        /// Number of missing files
         missing_files: usize,
     },
 
-    /// Major corruption (index inconsistent)
+    /// Major corruption detected (e.g., the index is inconsistent)
     Major {
+        /// Description of the corruption
         description: String,
     },
 
-    /// Severe corruption (requires rebuild)
+    /// Severe corruption detected (e.g., the database is inaccessible)
     Severe {
+        /// Description of the corruption
         description: String,
     },
 }

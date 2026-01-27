@@ -385,6 +385,7 @@ fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> 
 }
 
 #[allow(dead_code)]
+#[allow(clippy::only_used_in_recursion)]
 fn collect_comments_recursive(
     node: &tree_sitter::Node,
     cursor: &mut tree_sitter::TreeCursor,

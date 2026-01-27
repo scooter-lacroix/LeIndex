@@ -286,7 +286,6 @@ mod storage_persistence_tests {
 // ============================================================================
 
 mod error_handling_tests {
-    use super::*;
     use lepasserelle::errors::LeIndexError;
 
     #[test]

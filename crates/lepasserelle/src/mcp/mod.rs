@@ -22,9 +22,12 @@
 // }
 // ```
 
-mod protocol;
-mod server;
-mod handlers;
+/// MCP protocol definitions and JSON-RPC types.
+pub mod protocol;
+/// MCP server implementation.
+pub mod server;
+/// Request handlers for MCP tools.
+pub mod handlers;
 
 pub use server::{McpServer, McpServerConfig};
 pub use protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, error_codes};

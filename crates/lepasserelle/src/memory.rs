@@ -60,29 +60,41 @@ pub type CacheKey = String;
 pub enum CacheEntry {
     /// Program Dependence Graph
     PDG {
+        /// ID of the project the PDG belongs to
         project_id: String,
+        /// Number of nodes in the PDG
         node_count: usize,
+        /// Number of edges in the PDG
         edge_count: usize,
+        /// Binary serialized PDG data
         serialized_data: Vec<u8>,
     },
 
     /// Search index entries
     SearchIndex {
+        /// ID of the project the search index belongs to
         project_id: String,
+        /// Number of entries in the search index
         entry_count: usize,
+        /// Binary serialized search index data
         serialized_data: Vec<u8>,
     },
 
     /// Analysis results
     Analysis {
+        /// The query that produced these results
         query: String,
+        /// Timestamp when the analysis was performed
         timestamp: u64,
+        /// Binary serialized analysis results
         serialized_data: Vec<u8>,
     },
 
     /// Generic binary data
     Binary {
+        /// Metadata associated with the binary data
         metadata: HashMap<String, String>,
+        /// The raw binary data
         serialized_data: Vec<u8>,
     },
 }
@@ -798,90 +810,90 @@ impl Default for MemoryManager {
 /// Result of cache spill operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpillResult {
-    /// Memory freed in bytes
+    /// Total memory freed in bytes
     pub memory_freed: usize,
 
-    /// Names of caches cleared
+    /// List of cache names that were cleared
     pub caches_cleared: Vec<String>,
 
-    /// Number of entries spilled
+    /// Total number of entries successfully spilled to disk
     pub entries_spilled: usize,
 }
 
 /// Memory usage statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryStats {
-    /// Current RSS memory in bytes
+    /// Current RSS memory usage in bytes
     pub rss_bytes: usize,
 
     /// Total system memory in bytes
     pub total_bytes: usize,
 
-    /// Number of cache entries in memory
+    /// Current number of cache entries held in memory
     pub cache_entries: usize,
 
-    /// Size of cache in memory (bytes)
+    /// Total size of the in-memory cache in bytes
     pub cache_bytes: usize,
 
-    /// Number of spilled entries on disk
+    /// Current number of cache entries spilled to disk
     pub spilled_entries: usize,
 
-    /// Size of spilled cache on disk (bytes)
+    /// Total size of the spilled cache on disk in bytes
     pub spilled_bytes: usize,
 }
 
 /// Cache entry validation result
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationResult {
-    /// Whether the entry is valid
+    /// Whether the entry is structurally valid and can be loaded
     pub is_valid: bool,
 
-    /// Type of cache entry (if valid)
+    /// The type of the cache entry (if it could be determined)
     pub entry_type: Option<String>,
 
-    /// Size of entry in bytes (if valid)
+    /// Size of the entry data in bytes
     pub size_bytes: usize,
 
-    /// Error message (if invalid)
+    /// Error message if validation failed
     pub error: Option<String>,
 }
 
 /// Result of cache restoration operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreResult {
-    /// Number of entries successfully restored
+    /// Total number of entries successfully restored to memory
     pub entries_restored: usize,
 
-    /// Entries that failed to restore with error messages
+    /// List of entries that failed to restore, with their error messages
     pub entries_failed: Vec<(String, String)>,
 }
 
 /// Cache warming strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WarmStrategy {
-    /// Warm all cached entries
+    /// Attempt to warm all spilled entries
     All,
 
-    /// Only warm PDG entries (most expensive to rebuild)
+    /// Prioritize warming Program Dependence Graph entries
     PDGOnly,
 
-    /// Only warm search index entries
+    /// Prioritize warming search index entries
     SearchIndexOnly,
 
-    /// Warm recently accessed entries first
+    /// Prioritize warming the most recently accessed entries
     RecentFirst,
 }
 
 /// Result of cache warming operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WarmResult {
-    /// Number of entries warmed
+    /// Total number of entries successfully warmed into memory
     pub entries_warmed: usize,
 
-    /// Number of entries skipped (due to space or errors)
+    /// Number of entries skipped due to space constraints or errors
     pub entries_skipped: usize,
 
-    /// Strategy used for warming
+    /// The warming strategy that was applied
     pub warming_strategy: WarmStrategy,
 }
 
@@ -899,15 +911,19 @@ impl MemoryStats {
 /// Memory management errors
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// Failed to access the current process for memory info
     #[error("Process access failed: {0}")]
     ProcessAccess(String),
 
+    /// Failed to retrieve system memory information
     #[error("Failed to get memory info: {0}")]
     MemoryInfo(String),
 
+    /// Failed to spill cache entry to disk
     #[error("Spill operation failed: {0}")]
     SpillFailed(String),
 
+    /// The requested cache entry was not found on disk
     #[error("Cache entry not found: {0}")]
     CacheNotFound(String),
 }
@@ -919,13 +935,13 @@ pub enum Error {
 /// Memory-aware spilling strategy
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpillStrategy {
-    /// Clear all caches
+    /// Aggressively clear all in-memory caches
     ClearAll,
 
-    /// Clear only non-active project caches
+    /// Clear caches belonging to projects that are not currently being used
     NonActiveProjects,
 
-    /// LRU-based eviction (default)
+    /// Use the Least Recently Used (LRU) policy for eviction
     LRU,
 }
 

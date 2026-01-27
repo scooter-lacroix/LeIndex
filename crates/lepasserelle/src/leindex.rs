@@ -55,84 +55,84 @@ pub struct LeIndex {
 /// Statistics from indexing operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexStats {
-    /// Number of files parsed
+    /// Total number of files encountered during indexing
     pub files_parsed: usize,
 
-    /// Number of successful parses
+    /// Number of files successfully parsed
     pub successful_parses: usize,
 
-    /// Number of failed parses
+    /// Number of files that failed to parse
     pub failed_parses: usize,
 
-    /// Total signatures extracted
+    /// Total number of code signatures extracted across all files
     pub total_signatures: usize,
 
-    /// Total nodes in PDG
+    /// Total number of nodes created in the Program Dependence Graph
     pub pdg_nodes: usize,
 
-    /// Total edges in PDG
+    /// Total number of edges created in the Program Dependence Graph
     pub pdg_edges: usize,
 
-    /// Total nodes indexed for search
+    /// Total number of nodes successfully indexed for semantic search
     pub indexed_nodes: usize,
 
-    /// Indexing time in milliseconds
+    /// Total time taken for the indexing process in milliseconds
     pub indexing_time_ms: u64,
 }
 
 /// Result from a deep analysis operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisResult {
-    /// Original query
+    /// The original analysis query
     pub query: String,
 
-    /// Search results
+    /// Search results serving as entry points for analysis
     pub results: Vec<SearchResult>,
 
-    /// Expanded context (if requested)
+    /// Expanded code context generated from PDG traversal
     pub context: Option<String>,
 
-    /// Tokens used
+    /// Estimated number of tokens used in the expanded context
     pub tokens_used: usize,
 
-    /// Processing time in milliseconds
+    /// Total time taken for the analysis process in milliseconds
     pub processing_time_ms: u64,
 }
 
 /// Diagnostics information about the indexed project
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Diagnostics {
-    /// Project path
+    /// Absolute path to the project directory
     pub project_path: String,
 
-    /// Project ID
+    /// Unique identifier for the project
     pub project_id: String,
 
-    /// Index statistics
+    /// Statistics from the last indexing operation
     pub stats: IndexStats,
 
-    /// Memory usage in bytes
+    /// Current memory usage of the process in bytes
     pub memory_usage_bytes: usize,
 
-    /// Total system memory in bytes
+    /// Total available system memory in bytes
     pub total_memory_bytes: usize,
 
-    /// Memory usage percentage
+    /// Current memory usage as a percentage of total system memory
     pub memory_usage_percent: f64,
 
-    /// Whether memory threshold is exceeded
+    /// Whether the memory usage has exceeded the configured threshold
     pub memory_threshold_exceeded: bool,
 
-    /// Number of cache entries in memory
+    /// Current number of entries stored in the in-memory cache
     pub cache_entries: usize,
 
-    /// Size of cache in memory (bytes)
+    /// Total size of the in-memory cache in bytes
     pub cache_bytes: usize,
 
-    /// Number of spilled entries on disk
+    /// Number of cache entries that have been spilled to disk
     pub spilled_entries: usize,
 
-    /// Size of spilled cache on disk (bytes)
+    /// Total size of the spilled cache on disk in bytes
     pub spilled_bytes: usize,
 }
 
