@@ -40,12 +40,7 @@ mod cli_workflow_tests {
         }
     }
 
-    // Note: Tests skipped due to CLI design bug - duplicate --project option
-    // in both global and subcommand-level options. This should be fixed in the CLI design.
-    // The tests below correctly identify this issue.
-
     #[test]
-    #[ignore = "CLI design bug: duplicate --project option"]
     fn test_cli_search_command_parsing() {
         use lepasserelle::cli::Cli;
 
@@ -59,7 +54,7 @@ mod cli_workflow_tests {
 
         use lepasserelle::cli::Commands;
         match cli.command {
-            Commands::Search { query, top_k, .. } => {
+            Commands::Search { query, top_k } => {
                 assert_eq!(query, "authentication");
                 assert_eq!(top_k, 20);
             }
@@ -68,7 +63,6 @@ mod cli_workflow_tests {
     }
 
     #[test]
-    #[ignore = "CLI design bug: duplicate --project option"]
     fn test_cli_analyze_command_parsing() {
         use lepasserelle::cli::Cli;
 
@@ -76,13 +70,13 @@ mod cli_workflow_tests {
             "leindex",
             "analyze",
             "How does auth work?",
-            "--token-budget",
+            "--tokens",
             "5000",
         ]);
 
         use lepasserelle::cli::Commands;
         match cli.command {
-            Commands::Analyze { query, token_budget, .. } => {
+            Commands::Analyze { query, token_budget } => {
                 assert_eq!(query, "How does auth work?");
                 assert_eq!(token_budget, 5000);
             }
@@ -91,7 +85,6 @@ mod cli_workflow_tests {
     }
 
     #[test]
-    #[ignore = "CLI design bug: duplicate --project option"]
     fn test_cli_diagnostics_command_parsing() {
         use lepasserelle::cli::Cli;
 
@@ -102,7 +95,7 @@ mod cli_workflow_tests {
 
         use lepasserelle::cli::Commands;
         match cli.command {
-            Commands::Diagnostics { .. } => {
+            Commands::Diagnostics => {
                 // Successfully parsed
             }
             _ => panic!("Expected Diagnostics command"),
@@ -110,7 +103,6 @@ mod cli_workflow_tests {
     }
 
     #[test]
-    #[ignore = "CLI design bug: duplicate --project option"]
     fn test_cli_verbose_flag() {
         use lepasserelle::cli::Cli;
 

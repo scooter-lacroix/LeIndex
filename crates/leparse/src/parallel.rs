@@ -8,7 +8,7 @@ use crate::languages::parser_for_language;
 use crate::traits::SignatureInfo;
 use rayon::prelude::*;
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 use tree_sitter::Parser;
 

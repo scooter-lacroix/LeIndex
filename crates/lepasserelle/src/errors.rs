@@ -2,11 +2,8 @@
 //
 // *La Gestion des Erreurs* (The Error Management) - Comprehensive error types and recovery
 
-use crate::config::ProjectConfig;
-use anyhow::{anyhow, Error};
 use std::fs;
 use std::path::{Path, PathBuf};
-use thiserror::Error;
 
 /// Result type for LeIndex operations
 pub type Result<T> = std::result::Result<T, LeIndexError>;

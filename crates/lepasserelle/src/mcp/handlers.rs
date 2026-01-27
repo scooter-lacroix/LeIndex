@@ -3,10 +3,8 @@
 // This module implements the handlers for each MCP tool that the server exposes.
 
 use super::protocol::JsonRpcError;
-use crate::leindex::{AnalysisResult, Diagnostics, IndexStats, LeIndex};
-use lerecherche::search::SearchResult;
+use crate::leindex::LeIndex;
 use serde_json::Value;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -154,8 +152,8 @@ impl IndexHandler {
         }).await
         .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))??;
 
-        Ok(serde_json::to_value(stats)
-            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?)
+        serde_json::to_value(stats)
+            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
     }
 }
 
@@ -213,8 +211,8 @@ impl SearchHandler {
         let results = reader.search(&query, top_k)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
-        Ok(serde_json::to_value(results)
-            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?)
+        serde_json::to_value(results)
+            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
     }
 }
 
@@ -272,8 +270,8 @@ impl DeepAnalyzeHandler {
         let result = writer.analyze(&query, token_budget)
             .map_err(|e| JsonRpcError::internal_error(format!("Analysis error: {}", e)))?;
 
-        Ok(serde_json::to_value(result)
-            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?)
+        serde_json::to_value(result)
+            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
     }
 }
 
@@ -363,8 +361,8 @@ impl DiagnosticsHandler {
         let diagnostics = reader.get_diagnostics()
             .map_err(|e| JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e)))?;
 
-        Ok(serde_json::to_value(diagnostics)
-            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?)
+        serde_json::to_value(diagnostics)
+            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
     }
 }
 

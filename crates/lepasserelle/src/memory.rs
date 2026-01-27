@@ -3,15 +3,14 @@
 // Implements automatic cache spilling to disk when memory thresholds are exceeded,
 // using LRU eviction policy and efficient binary serialization.
 
-use bincode::{config, deserialize, serialize};
+use bincode::{deserialize, serialize};
 use lru::LruCache;
-use psutil::{process, process::Process};
+use psutil::process::Process;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
 // ============================================================================
@@ -516,7 +515,7 @@ impl CacheSpiller {
         let rss_before = self.memory_manager.get_rss_bytes()?;
         let entries_before = self.store.len();
 
-        let bytes_freed = self.store.clear()?;
+        let _bytes_freed = self.store.clear()?;
 
         let rss_after = self.memory_manager.get_rss_bytes()?;
 

@@ -347,10 +347,10 @@ fn extract_visibility(node: &tree_sitter::Node, source: &[u8]) -> Visibility {
     Visibility::Private
 }
 
+#[allow(dead_code)]
 fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     // C# uses XML documentation comments: /// <summary>...</summary>
     // Look for the previous sibling that might be a comment
-    let node_id = node.id();
 
     // We need to search backwards from the current node
     // This is tricky in tree-sitter, so we'll search the tree for comments
@@ -383,6 +383,7 @@ fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> 
     })
 }
 
+#[allow(dead_code)]
 fn collect_comments_recursive(
     node: &tree_sitter::Node,
     cursor: &mut tree_sitter::TreeCursor,

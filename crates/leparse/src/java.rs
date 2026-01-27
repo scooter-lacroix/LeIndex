@@ -359,7 +359,6 @@ fn extract_visibility(node: &tree_sitter::Node, source: &[u8]) -> Visibility {
 /// Extract docstring from a node
 fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     // Look for javadoc comments before the node
-    let mut cursor = node.walk();
     let mut prev_sibling = None;
 
     if let Some(parent) = node.parent() {

@@ -3,7 +3,7 @@
 // This module provides the command-line interface for LeIndex.
 
 use anyhow::Context;
-use crate::leindex::{LeIndex, Diagnostics};
+use crate::leindex::LeIndex;
 use anyhow::Result as AnyhowResult;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -56,10 +56,6 @@ pub enum Commands {
         /// Maximum number of results to return
         #[arg(long = "top-k", default_value = "10")]
         top_k: usize,
-
-        /// Path to the project directory
-        #[arg(long = "project", short = 'p')]
-        project: Option<PathBuf>,
     },
 
     /// Perform deep analysis with context expansion
@@ -71,18 +67,10 @@ pub enum Commands {
         /// Maximum tokens for context expansion
         #[arg(long = "tokens", default_value = "2000")]
         token_budget: usize,
-
-        /// Path to the project directory
-        #[arg(long = "project", short = 'p')]
-        project: Option<PathBuf>,
     },
 
     /// Show system diagnostics
-    Diagnostics {
-        /// Path to the project directory
-        #[arg(long = "project", short = 'p')]
-        project: Option<PathBuf>,
-    },
+    Diagnostics,
 }
 
 impl Cli {
@@ -99,14 +87,14 @@ impl Cli {
             Commands::Index { path, force, progress } => {
                 cmd_index_impl(path, force, progress).await
             }
-            Commands::Search { query, top_k, project } => {
-                cmd_search_impl(query, top_k, project.or(global_project)).await
+            Commands::Search { query, top_k } => {
+                cmd_search_impl(query, top_k, global_project).await
             }
-            Commands::Analyze { query, token_budget, project } => {
-                cmd_analyze_impl(query, token_budget, project.or(global_project)).await
+            Commands::Analyze { query, token_budget } => {
+                cmd_analyze_impl(query, token_budget, global_project).await
             }
-            Commands::Diagnostics { project } => {
-                cmd_diagnostics_impl(project.or(global_project)).await
+            Commands::Diagnostics => {
+                cmd_diagnostics_impl(global_project).await
             }
         }
     }

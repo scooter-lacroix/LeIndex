@@ -52,8 +52,5 @@ chrono = "0.4"
 
 # Dev utilities
 tempfile = "3.13"
-
-[workspace.dev-dependencies]
 criterion = "0.5"
-clippy = "0.1"
 pprof = { version = "0.14", features = ["flamegraph", "criterion"] }

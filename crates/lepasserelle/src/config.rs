@@ -5,14 +5,15 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::{fs, io};
+use std::path::Path;
+use std::fs;
 
 /// Default configuration file name
 pub const DEFAULT_CONFIG_FILE: &str = ".leindex/config.toml";
 
 /// Project configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct ProjectConfig {
     /// Language filtering settings
     pub languages: LanguageConfig,
@@ -30,17 +31,6 @@ pub struct ProjectConfig {
     pub memory: MemoryConfig,
 }
 
-impl Default for ProjectConfig {
-    fn default() -> Self {
-        Self {
-            languages: LanguageConfig::default(),
-            exclusions: ExclusionConfig::default(),
-            tokens: TokenConfig::default(),
-            storage: StorageConfig::default(),
-            memory: MemoryConfig::default(),
-        }
-    }
-}
 
 impl ProjectConfig {
     /// Load configuration from a directory
@@ -279,6 +269,38 @@ impl Default for ExclusionConfig {
                 "*/node_modules/*".into(),
             ],
         }
+    }
+}
+
+impl ExclusionConfig {
+    /// Check if a path should be excluded based on configured patterns
+    pub fn should_exclude(&self, path: &str) -> bool {
+        // Check directory patterns
+        for segment in path.split('/') {
+            for pattern in &self.directory_patterns {
+                if pattern.matches(segment) {
+                    return true;
+                }
+            }
+        }
+
+        // Check file patterns (only the filename part)
+        if let Some(filename) = path.rsplit('/').next() {
+            for pattern in &self.file_patterns {
+                if pattern.matches(filename) {
+                    return true;
+                }
+            }
+        }
+
+        // Check full path patterns
+        for pattern in &self.path_patterns {
+            if pattern.matches(path) {
+                return true;
+            }
+        }
+
+        false
     }
 }
 

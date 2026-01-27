@@ -3,13 +3,12 @@
 // *L'Index* (The Index) - Unified API that brings together all LeIndex crates
 
 use crate::memory::{
-    analysis_cache_key, create_pdg_entry, create_search_entry, pdg_cache_key, search_cache_key,
-    CacheEntry, CacheSpiller, MemoryConfig, MemoryManager,
+    CacheSpiller, MemoryConfig,
 };
 use anyhow::{Context, Result};
 use legraphe::{
     pdg::{Node, NodeType, ProgramDependenceGraph},
-    traversal::{GravityTraversal, TraversalConfig},
+    traversal::TraversalConfig,
 };
 use leparse::parallel::{ParallelParser, ParsingResult};
 use leparse::traits::SignatureInfo;
@@ -442,7 +441,7 @@ impl LeIndex {
         info!("Loading project from storage: {}", self.project_id);
 
         // Load PDG from storage
-        let pdg = pdg_store::load_pdg(&mut self.storage, &self.project_id)
+        let pdg = pdg_store::load_pdg(&self.storage, &self.project_id)
             .context("Failed to load PDG from storage")?;
 
         let pdg_node_count = pdg.node_count();
@@ -637,7 +636,7 @@ impl LeIndex {
     /// Expand context using PDG traversal
     fn expand_context(
         &self,
-        pdg: &ProgramDependenceGraph,
+        _pdg: &ProgramDependenceGraph,
         results: &[SearchResult],
         token_budget: usize,
     ) -> Result<String> {
@@ -646,7 +645,8 @@ impl LeIndex {
         let mut config = TraversalConfig::default();
         config.max_tokens = token_budget;
 
-        let traversal = GravityTraversal::with_config(config.clone());
+        // Note: Gravity traversal would be used here for actual context expansion
+        // let _traversal = GravityTraversal::with_config(config.clone());
 
         for result in results.iter().take(5) {
             context.push_str(&format!("\n// Entry Point: {}\n", result.symbol_name));

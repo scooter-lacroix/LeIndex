@@ -33,9 +33,16 @@ static HANDLERS: std::sync::OnceLock<Vec<ToolHandler>> = std::sync::OnceLock::ne
 /// MCP Server configuration
 #[derive(Clone, Debug)]
 pub struct McpServerConfig {
+    /// Address to bind the server to
     pub bind_address: SocketAddr,
+
+    /// Whether to enable CORS for all origins
     pub enable_cors: bool,
+
+    /// Maximum request size in megabytes
     pub max_request_size_mb: usize,
+
+    /// Request timeout in seconds
     pub request_timeout_secs: u64,
 }
 
@@ -57,6 +64,21 @@ pub struct McpServer {
 }
 
 impl McpServer {
+    /// Create a new MCP server instance
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Server configuration
+    /// * `leindex` - LeIndex instance to use for operations
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let leindex = LeIndex::new("/path/to/project")?;
+    /// let config = McpServerConfig::default();
+    /// let server = McpServer::new(config, leindex);
+    /// server.run().await?;
+    /// ```
     pub fn new(config: McpServerConfig, leindex: LeIndex) -> Self {
         let handlers = vec![
             ToolHandler::Index(IndexHandler),
@@ -76,6 +98,22 @@ impl McpServer {
         Self { config, _state: state }
     }
 
+    /// Run the MCP server
+    ///
+    /// Starts the axum HTTP server and handles incoming requests.
+    /// This function will block until the server is shut down.
+    ///
+    /// # Returns
+    ///
+    /// `anyhow::Result<()>` - Ok on successful shutdown, error on failure
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let config = McpServerConfig::default();
+    /// let server = McpServer::new(config, leindex)?;
+    /// server.run().await?;
+    /// ```
     pub async fn run(self) -> anyhow::Result<()> {
         let bind_address = self.config.bind_address;
         let router = Self::router();
