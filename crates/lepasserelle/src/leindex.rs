@@ -8,7 +8,9 @@ use crate::memory::{
 };
 use anyhow::{Context, Result};
 use legraphe::{
-    pdg::{Node, NodeType, ProgramDependenceGraph},
+    pdg::ProgramDependenceGraph,
+    extract_pdg_from_signatures,
+    traversal::{GravityTraversal, TraversalConfig},
 };
 use leparse::parallel::{ParallelParser, ParsingResult};
 use leparse::traits::SignatureInfo;
@@ -649,32 +651,16 @@ impl LeIndex {
     ///
     /// `Result<usize>` - Number of nodes indexed
     pub fn reload_vector_from_pdg(&mut self) -> Result<usize> {
-        let pdg = self.pdg.as_ref()
+        // Take PDG temporarily to avoid borrow checker issues
+        let pdg = self.pdg.take()
             .ok_or_else(|| anyhow::anyhow!("No PDG available for vector rebuild"))?;
 
-        let mut nodes = Vec::new();
-
-        // Convert PDG nodes to NodeInfo for indexing
-        for node_idx in pdg.node_indices() {
-            if let Some(node) = pdg.get_node(node_idx) {
-                let node_info = NodeInfo {
-                    node_id: node.id.clone(),
-                    file_path: node.file_path.clone(),
-                    symbol_name: node.name.clone(),
-                    content: format!("// {} in {}\n{}", node.name, node.file_path,
-                                   "// Source code would be here"),
-                    byte_range: node.byte_range,
-                    embedding: node.embedding.clone(),
-                    complexity: node.complexity,
-                };
-
-                nodes.push(node_info);
-            }
-        }
-
-        // Index the nodes
-        self.search_engine.index_nodes(nodes);
+        // Re-use the index_nodes logic to ensure consistent embedding generation
+        self.index_nodes(&pdg)?;
         let indexed_count = self.search_engine.node_count();
+
+        // Restore PDG
+        self.pdg = Some(pdg);
 
         info!("Rebuilt vector index from PDG: {} nodes", indexed_count);
 
@@ -802,35 +788,78 @@ impl LeIndex {
 
         let mut pdg = ProgramDependenceGraph::new();
 
-        // Add nodes for each signature
+        // Use extract_pdg_from_signatures for each file and merge results
         for (file_path, signatures) in signatures_by_file {
-            for sig in signatures {
-                let node_type = match sig.visibility {
-                    leparse::traits::Visibility::Public => NodeType::Function,
-                    leparse::traits::Visibility::Private => NodeType::Function,
-                    leparse::traits::Visibility::Protected => NodeType::Function,
-                    leparse::traits::Visibility::Internal => NodeType::Function,
-                    leparse::traits::Visibility::Package => NodeType::Function,
-                };
+            // Extract PDG for this file
+            let file_pdg = extract_pdg_from_signatures(signatures.clone(), &[], file_path);
 
-                let node = Node {
-                    id: format!("{}:{}:{}", file_path, sig.name, sig.parameters.len()),
-                    node_type,
-                    name: sig.name.clone(),
-                    file_path: file_path.clone(),
-                    byte_range: (0, 100), // Placeholder - would need actual byte range
-                    complexity: 10, // Placeholder - would calculate from node
-                    embedding: None, // Placeholder - would be computed later
-                };
+            // Track mapping from file-local node IDs to global node IDs
+            let mut node_id_map = std::collections::HashMap::new();
 
-                // Add node to PDG
-                pdg.add_node(node);
+            // Add all nodes from file PDG to global PDG
+            for old_node_id in file_pdg.node_indices() {
+                if let Some(node) = file_pdg.get_node(old_node_id) {
+                    let new_node_id = pdg.add_node(node.clone());
+                    node_id_map.insert(old_node_id, new_node_id);
+                }
+            }
+
+            // Add all edges from file PDG to global PDG with remapped node IDs
+            for edge_id in file_pdg.edge_indices() {
+                if let Some(edge) = file_pdg.get_edge(edge_id) {
+                    if let Some((old_source, old_target)) = file_pdg.edge_endpoints(edge_id) {
+                        let new_source = node_id_map.get(&old_source).copied();
+                        let new_target = node_id_map.get(&old_target).copied();
+
+                        if let (Some(from), Some(to)) = (new_source, new_target) {
+                            pdg.add_edge(from, to, edge.clone());
+                        }
+                    }
+                }
             }
         }
 
-        info!("PDG construction complete");
+        info!("PDG construction complete with {} nodes and {} edges",
+            pdg.node_count(), pdg.edge_count());
 
         Ok(pdg)
+    }
+
+    /// Generate a deterministic 768-dimensional embedding for a node
+    ///
+    /// This uses a stable hashing approach to generate a vector from symbol metadata.
+    /// While not a real semantic embedding from an LLM, it provides a deterministic
+    /// basis for vector search and HNSW testing.
+    fn generate_deterministic_embedding(
+        &self,
+        symbol_name: &str,
+        file_path: &str,
+        content: &str,
+    ) -> Vec<f32> {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+
+        let mut embedding = Vec::with_capacity(768);
+
+        // Initial seed hash from all inputs
+        let mut base_hasher = DefaultHasher::new();
+        symbol_name.hash(&mut base_hasher);
+        file_path.hash(&mut base_hasher);
+        content.hash(&mut base_hasher);
+        let base_hash = base_hasher.finish();
+
+        for i in 0..768 {
+            let mut hasher = DefaultHasher::new();
+            base_hash.hash(&mut hasher);
+            i.hash(&mut hasher);
+            let hash_val = hasher.finish();
+            
+            // Map 64-bit hash to f32 in [-1.0, 1.0]
+            let val = (hash_val as f64 / u64::MAX as f64) * 2.0 - 1.0;
+            embedding.push(val as f32);
+        }
+
+        embedding
     }
 
     /// Index nodes from PDG for search
@@ -840,14 +869,21 @@ impl LeIndex {
         // Convert PDG nodes to NodeInfo for indexing
         for node_idx in pdg.node_indices() {
             if let Some(node) = pdg.get_node(node_idx) {
+                let content = format!("// {} in {}\n{}", node.name, node.file_path,
+                                   "// Source code would be here");
+                
+                // Use existing embedding if present, otherwise generate a deterministic one
+                let embedding = node.embedding.clone().unwrap_or_else(|| {
+                    self.generate_deterministic_embedding(&node.name, &node.file_path, &content)
+                });
+
                 let node_info = NodeInfo {
                     node_id: node.id.clone(),
                     file_path: node.file_path.clone(),
                     symbol_name: node.name.clone(),
-                    content: format!("// {} in {}\n{}", node.name, node.file_path,
-                                   "// Source code would be here"),
+                    content,
                     byte_range: node.byte_range,
-                    embedding: node.embedding.clone(),
+                    embedding: Some(embedding),
                     complexity: node.complexity,
                 };
 
@@ -864,24 +900,33 @@ impl LeIndex {
     /// Expand context using PDG traversal
     fn expand_context(
         &self,
-        _pdg: &ProgramDependenceGraph,
+        pdg: &ProgramDependenceGraph,
         results: &[SearchResult],
-        _token_budget: usize,
+        token_budget: usize,
     ) -> Result<String> {
-        let mut context = String::from("/* Context Expansion */\n");
+        let config = TraversalConfig {
+            max_tokens: token_budget,
+            ..TraversalConfig::default()
+        };
+        let traversal = GravityTraversal::with_config(config);
 
-        // Note: Gravity traversal would be used here for actual context expansion
-        // let config = TraversalConfig { max_tokens: token_budget, ..Default::default() };
-        // let _traversal = GravityTraversal::with_config(config);
+        // Map SearchResult entries to PDG node IDs for the traversal call
+        let entry_points: Vec<_> = results
+            .iter()
+            .filter_map(|r| pdg.find_by_symbol(&r.node_id))
+            .collect();
 
-        for result in results.iter().take(5) {
-            context.push_str(&format!("\n// Entry Point: {}\n", result.symbol_name));
-            context.push_str(&format!("// File: {}\n", result.file_path));
-            context.push_str(&format!("// Score: {:.2}\n", result.score.overall));
+        let expanded_node_ids = traversal.expand_context(pdg, entry_points);
 
-            // Note: Actual context expansion would use GravityTraversal::expand_context
-            // This requires NodeId values which would need to be mapped from SearchResult
-            context.push_str("// Context expansion would happen here\n");
+        let mut context = String::from("/* Context Expansion via Gravity Traversal */\n");
+
+        for node_id in expanded_node_ids {
+            if let Some(node) = pdg.get_node(node_id) {
+                context.push_str(&format!("\n// Symbol: {}\n", node.name));
+                context.push_str(&format!("// File: {}\n", node.file_path));
+                context.push_str(&format!("// Type: {:?}\n", node.node_type));
+                context.push_str("// Source code would be here\n");
+            }
         }
 
         Ok(context)
