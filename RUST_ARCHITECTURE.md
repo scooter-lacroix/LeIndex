@@ -1,24 +1,14 @@
-# LeIndex Architecture
+# LeIndex Rust Architecture
 
-Pure Rust implementation of an intelligent code search and analysis engine.
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Workspace Structure](#workspace-structure)
-- [Crate Architecture](#crate-architecture)
-- [Data Flow](#data-flow)
-- [Storage Design](#storage-design)
-- [MCP Server](#mcp-server)
-- [Performance](#performance)
+Detailed architecture documentation for LeIndex v0.1.0 pure Rust implementation.
 
 ---
 
 ## Overview
 
-LeIndex v0.1.0 is a **pure Rust** implementation organized as a Cargo workspace with 5 specialized crates:
+LeIndex is organized as a Cargo workspace with 5 crates, each responsible for a specific aspect of the system.
+
+### High-Level Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -51,40 +41,7 @@ LeIndex v0.1.0 is a **pure Rust** implementation organized as a Cargo workspace 
 
 ---
 
-## Workspace Structure
-
-### Root Configuration
-
-```toml
-[workspace]
-members = [
-    "crates/leparse",
-    "crates/legraphe",
-    "crates/lerecherche",
-    "crates/lestockage",
-    "crates/lepasserelle",
-]
-```
-
-### Directory Layout
-
-```
-leindex/
-├── crates/
-│   ├── leparse/        # AST extraction (Tree-sitter)
-│   ├── legraphe/       # PDG analysis (petgraph)
-│   ├── lerecherche/    # Vector search (HNSW)
-│   ├── lestockage/     # Storage layer (Turso/libsql)
-│   └── lepasserelle/   # CLI & MCP server
-├── Cargo.toml          # Workspace configuration
-├── install.sh          # Linux/Unix installer
-├── install_macos.sh    # macOS installer
-└── install.ps1         # Windows PowerShell installer
-```
-
----
-
-## Crate Architecture
+## Crate Details
 
 ### 1. leparse - AST Extraction
 
@@ -92,13 +49,13 @@ leindex/
 
 **Key Responsibilities:**
 - Language detection
-- Tree-sitter parser initialization
+- Tree-sitter parsing initialization
 - AST node extraction and traversal
 - Syntax highlighting queries
 
 **Supported Languages:**
-- ✅ Python, Rust, JavaScript/TypeScript, Go, C/C++, Java, Ruby, PHP
-- ⚠️ Swift, Kotlin, Dart (temporarily disabled)
+- Python, Rust, JavaScript/TypeScript, Go, C/C++, Java, Ruby, PHP
+- Swift, Kotlin, Dart (temporarily disabled due to tree-sitter conflicts)
 
 **Key Types:**
 ```rust
@@ -193,6 +150,13 @@ pub struct SearchResult {
 - `hnsw_rs` - HNSW algorithm
 - `rayon` - Parallel search
 
+**Future (Turso/libsql):**
+```toml
+# Planned dependencies
+libsql = "0.5"
+vec0-extension = "0.1"
+```
+
 ---
 
 ### 4. lestockage - Storage Layer
@@ -208,6 +172,27 @@ pub struct SearchResult {
 - vec0 extension for vector storage
 - F32_BLOB columns for vectors
 - Remote Turso database support
+
+**Key Types (Planned):**
+```rust
+pub struct Storage {
+    pub conn: Connection,
+    pub remote: Option<TursoClient>,
+}
+
+pub struct Document {
+    pub id: String,
+    pub file_path: String,
+    pub content: String,
+    pub embedding: Vec<f32>,
+    pub metadata: serde_json::Value,
+}
+```
+
+**Dependencies (Planned):**
+- `rusqlite` - SQLite bindings
+- `libsql` - Libsql client
+- `vec0` - Vector extension
 
 ---
 
@@ -234,12 +219,26 @@ leindex mcp                # Start MCP server
 - Protocol: MCP 1.0
 - Tools: leindex_index, lesearch_search, leindex_deep_analyze, leindex_context, leindex_diagnostics
 
+**Key Types:**
+```rust
+pub struct Config {
+    pub memory: MemoryConfig,
+    pub file_filtering: FileFilteringConfig,
+    pub parsing: ParsingConfig,
+}
+
+pub struct MemoryManager {
+    pub budget_mb: usize,
+    pub current_mb: usize,
+}
+```
+
 **Dependencies:**
 - `clap` - CLI argument parsing
 - `axum` - HTTP server for MCP
 - `serde` - Configuration serialization
 - `toml` - Config file format
-- All other crates
+- All other crates (leparse, legraphe, lerecherche, lestockage)
 
 ---
 
@@ -305,145 +304,37 @@ leindex mcp                # Start MCP server
 
 ---
 
-## Storage Design
+## Memory Management
 
-### Current State (Temporary)
-
-**In-Memory HNSW:**
-- Vectors stored in `hnsw_rs` structure
-- No persistence between runs
-- Fast search but requires re-indexing
-
-### Target Architecture (Planned)
-
-**Turso/libsql Unified Storage:**
-
-```sql
--- Files table
-CREATE TABLE files (
-    id TEXT PRIMARY KEY,
-    path TEXT NOT NULL,
-    hash TEXT NOT NULL,
-    size INTEGER NOT NULL,
-    language TEXT,
-    indexed_at INTEGER
-);
-
--- Vectors table (using vec0 extension)
-CREATE TABLE vectors (
-    id TEXT PRIMARY KEY REFERENCES files(id),
-    embedding F32_BLOB(768),  -- CodeRankEmbed dimension
-    metadata JSON
-);
-
--- Symbols table
-CREATE TABLE symbols (
-    id TEXT PRIMARY KEY,
-    file_id TEXT REFERENCES files(id),
-    name TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    line_start INTEGER,
-    line_end INTEGER
-);
-```
-
-**Benefits:**
-- Single unified storage for vectors AND metadata
-- Remote Turso database support
-- Persistent across restarts
-- vec0 extension for efficient vector operations
-
----
-
-## MCP Server
-
-### Architecture
+### Hierarchical Configuration
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                   MCP Server                            │
-├─────────────────────────────────────────────────────────┤
-│                                                         │
-│  ┌──────────────┐    ┌──────────────┐                 │
-│  │   Transport  │    │   Protocol   │                 │
-│  │  (stdio/HTTP)│    │    (MCP 1.0) │                 │
-│  └──────┬───────┘    └──────┬───────┘                 │
-│         │                   │                          │
-│         └────────┬──────────┘                          │
-│                  ▼                                     │
-│         ┌──────────────────┐                          │
-│         │  Tool Registry   │                          │
-│         └────────┬─────────┘                          │
-│                  │                                     │
-│    ┌─────────────┼─────────────┐                      │
-│    ▼             ▼             ▼                      │
-│ ┌────────┐  ┌────────┐  ┌────────┐                    │
-│ │ index  │  │ search │  │ analyze│                    │
-│ │  tool  │  │  tool  │  │  tool  │                    │
-│ └────┬───┘  └────┬───┘  └────┬───┘                    │
-│      │          │           │                         │
-│      └──────────┼───────────┘                         │
-│                 ▼                                     │
-│         ┌──────────────┐                              │
-│         │ lepasserelle │                              │
-│         │   (crates)   │                              │
-│         └──────────────┘                              │
-└─────────────────────────────────────────────────────────┘
+Global Config (memory)
+├── total_budget_mb: 3072
+├── soft_limit_percent: 0.80
+├── hard_limit_percent: 0.93
+└── emergency_percent: 0.98
+
+Project Config (projects.*.memory)
+├── max_loaded_files: 1000
+└── max_cached_queries: 500
 ```
 
-### Available Tools
+### Memory Actions
 
-| Tool | Description | Crate |
-|------|-------------|-------|
-| `leindex_index` | Index projects | lepasserelle + leparse |
-| `leindex_search` | Semantic search | lepasserelle + lerecherche |
-| `leindex_deep_analyze` | Deep PDG analysis | lepasserelle + legraphe |
-| `leindex_context` | Context expansion | lepasserelle + leparse |
-| `leindex_diagnostics` | System health | lepasserelle |
+| Threshold | Action |
+|-----------|--------|
+| 80% (soft) | Trigger garbage collection |
+| 93% (hard) | Spill cached data to disk |
+| 98% (emergency) | Evict low-priority data |
 
----
+### Cache Spilling
 
-## Performance
-
-### Design Principles
-
-1. **Zero-Copy Parsing** - Tree-sitter enables direct references into source buffer
-2. **Parallel Processing** - Rayon provides work-stealing parallelism
-3. **Cache Efficiency** - Spatial locality in data structures
-4. **Memory Safety** - Rust guarantees memory safety without GC overhead
-
-### Expected Performance
-
-| Metric | Target | Status |
-|--------|--------|--------|
-| **Indexing Speed** | ~10K files/min | 🎯 Target |
-| **Search Latency (p50)** | ~50ms | 🎯 Target |
-| **Memory Usage** | <3GB | 🎯 Target |
-| **Max Scalability** | 100K+ files | 🎯 Target |
-
-### Optimizations
-
-**Parallel Processing:**
-```rust
-// File scanning (rayon)
-files.par_iter()
-    .map(|file| parse_file(file))
-    .collect()
-
-// Graph traversal (rayon)
-graph.par_nodes()
-    .map(|node| analyze_node(node))
-    .collect()
 ```
-
-**Zero-Copy Parsing:**
-```rust
-// Tree-sitter zero-copy AST
-let node = parser.parse(source, None)?;
-let root = node.root_node();
-
-// Direct references, no allocation
-let text = &source[node.byte_range()];
+In-Memory Cache
+├── L1: Hot data (frequently accessed)
+├── L2: Warm data (recently accessed)
+└── Spill: Cold data (moved to disk)
 ```
 
 ---
@@ -477,15 +368,60 @@ let text = &source[node.byte_range()];
 
 ---
 
+## Concurrency Model
+
+### Parallel Processing
+
+```rust
+// File scanning (rayon)
+files.par_iter()
+    .map(|file| parse_file(file))
+    .collect()
+
+// Graph traversal (rayon)
+graph.par_nodes()
+    .map(|node| analyze_node(node))
+    .collect()
+```
+
+### Async Operations (Future)
+
+```rust
+// Planned async operations
+async fn index_project(path: PathBuf) -> Result<()> {
+    let files = discover_files(path).await?;
+    parse_files_parallel(files).await?;
+    build_index().await?;
+    Ok(())
+}
+```
+
+---
+
+## Technology Rationale
+
+| Technology | Reason |
+|------------|--------|
+| **Rust** | Performance, memory safety, zero-cost abstractions |
+| **Tree-sitter** | Incremental parsing, zero-copy, excellent language support |
+| **petgraph** | Flexible graph algorithms, Rust-native |
+| **hnsw_rs** | Fast approximate nearest neighbors, pure Rust |
+| **axum** | Modern async web framework, excellent ergonomics |
+| **clap** | Best-in-class CLI argument parsing |
+| **tokio** | Industry-standard async runtime |
+| **Turso/libsql** | Edge SQLite, vector support (planned) |
+
+---
+
 ## Implementation Status
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| **leparse** | ✅ Complete | 11+ languages |
-| **legraphe** | ✅ Complete | CFG, DFA |
-| **lerecherche** | ⚠️ Temporary | HNSW in-memory |
-| **lestockage** | ❌ Stub | Planned |
-| **lepasserelle** | ✅ Complete | CLI, MCP |
+| **leparse** | ✅ Complete | 11+ languages, Swift/Kotlin/Dart disabled |
+| **legraphe** | ✅ Complete | CFG, DFA, dependency tracking |
+| **lerecherche** | ⚠️ Temporary | HNSW in-memory, Turso planned |
+| **lestockage** | ❌ Stub | Configuration only, implementation planned |
+| **lepasserelle** | ✅ Complete | CLI, MCP server, orchestration |
 
 ---
 
@@ -509,19 +445,41 @@ let text = &source[node.byte_range()];
 
 ---
 
+## Performance Considerations
+
+### Zero-Copy Parsing
+
+Tree-sitter enables zero-copy AST traversal:
+- No string allocation for node text
+- Direct references into source buffer
+- Minimal memory overhead
+
+### Parallel Processing
+
+Rayon enables work-stealing parallelism:
+- Automatic thread pool management
+- Load balancing across cores
+- No manual thread spawning
+
+### Cache-Friendly Design
+
+- Spatial locality in data structures
+- Sequential access patterns
+- Minimal pointer chasing
+
+---
+
 ## Contributing
 
 See architecture-specific contribution guidelines:
 
-- [leparse](crates/leparse/README.md) - Add language parsers
-- [legraphe](crates/legraphe/README.md) - Improve PDG algorithms
-- [lerecherche](crates/lerecherche/README.md) - Optimize HNSW
-- [lestockage](crates/lestockage/README.md) - Implement Turso/libsql
-- [lepasserelle](crates/lepasserelle/README.md) - Enhance CLI/MCP
+1. **leparse**: Add language parsers
+2. **legraphe**: Improve PDG algorithms
+3. **lerecherche**: Optimize HNSW parameters
+4. **lestockage**: Implement Turso/libsql
+5. **lepasserelle**: Enhance CLI/MCP features
 
 ---
 
-**Built with ❤️ and Rust**
-
-*LeIndex v0.1.0*
 *Last Updated: 2025-01-26*
+*LeIndex v0.1.0*
