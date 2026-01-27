@@ -22,7 +22,8 @@ LEINDEX_HOME="${LEINDEX_HOME:-$HOME/.leindex}"
 CONFIG_DIR="${LEINDEX_HOME}/config"
 DATA_DIR="${LEINDEX_HOME}/data"
 LOG_DIR="${LEINDEX_HOME}/logs"
-BIN_DIR="${LEINDEX_HOME}/bin"
+# Install to XDG standard location which is in everyone's PATH
+INSTALL_BIN_DIR="${HOME}/.local/bin"
 
 # ============================================================================
 # COLOR OUTPUT
@@ -214,10 +215,10 @@ install_leindex() {
     # Install binary
     local binary="target/release/$PROJECT_SLUG"
     if [[ -f "$binary" ]]; then
-        mkdir -p "$BIN_DIR"
-        cp "$binary" "$BIN_DIR/"
-        chmod +x "$BIN_DIR/$PROJECT_SLUG"
-        log_success "Binary installed to: $BIN_DIR/$PROJECT_SLUG"
+        mkdir -p "$INSTALL_BIN_DIR"
+        cp "$binary" "$INSTALL_BIN_DIR/"
+        chmod +x "$INSTALL_BIN_DIR/$PROJECT_SLUG"
+        log_success "Binary installed to: $INSTALL_BIN_DIR/$PROJECT_SLUG"
     else
         log_error "Binary not found after build"
         if [[ "$should_cleanup" == true ]]; then
@@ -239,7 +240,7 @@ install_leindex() {
 verify_installation() {
     print_step 3 4 "Verifying Installation"
 
-    local binary="$BIN_DIR/$PROJECT_SLUG"
+    local binary="$INSTALL_BIN_DIR/$PROJECT_SLUG"
 
     if [[ ! -f "$binary" ]]; then
         log_error "Binary not found: $binary"
@@ -259,7 +260,10 @@ verify_installation() {
 setup_directories() {
     print_step 4 4 "Setting up Directories"
 
-    for dir in "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$BIN_DIR"; do
+    # Create install bin directory and other directories
+    mkdir -p "$INSTALL_BIN_DIR"
+
+    for dir in "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR"; do
         if [[ ! -d "$dir" ]]; then
             mkdir -p "$dir"
             log_success "Created: $dir"
@@ -270,38 +274,23 @@ setup_directories() {
 update_path() {
     print_header "Update PATH"
 
-    local shell_config=""
-    local bin_export="export PATH=\"$BIN_DIR:\$PATH\""
+    # ~/.local/bin should already be in PATH via standard XDG conventions
+    # Most Linux distributions include it in default PATH
+    log_info "Binary installed to ~/.local/bin (standard XDG location)"
+    log_info "This location is typically already in your PATH"
 
-    # Detect shell and config file
-    if [[ -n "${ZSH_VERSION:-}" ]]; then
-        shell_config="$HOME/.zshrc"
-    elif [[ -n "${BASH_VERSION:-}" ]]; then
-        shell_config="$HOME/.bashrc"
+    # Verify ~/.local/bin is in PATH
+    if echo ":$PATH:" | grep -q ":$HOME/.local/bin:"; then
+        log_success "~/.local/bin is already in PATH"
     else
-        shell_config="$HOME/.profile"
+        print_warning "~/.local/bin is not in your PATH"
+        echo ""
+        echo "Add the following to your shell configuration (~/.bashrc or ~/.zshrc):"
+        echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+        echo ""
+        echo "Then restart your shell or run:"
+        echo "  source ~/.bashrc  # or ~/.zshrc"
     fi
-
-    # Also create symlink in ~/.local/bin for tools that expect it there
-    mkdir -p ~/.local/bin
-    if [[ ! -L ~/.local/bin/$PROJECT_SLUG ]]; then
-        ln -sf "$BIN_DIR/$PROJECT_SLUG" ~/.local/bin/$PROJECT_SLUG
-        log_success "Created symlink: ~/.local/bin/$PROJECT_SLUG"
-    fi
-
-    # Check if PATH is already configured
-    if grep -q "$BIN_DIR" "$shell_config" 2>/dev/null; then
-        log_info "PATH already configured in $shell_config"
-        return 0
-    fi
-
-    echo "" >> "$shell_config"
-    echo "# LeIndex" >> "$shell_config"
-    echo "$bin_export" >> "$shell_config"
-
-    log_success "Added to PATH in $shell_config"
-    print_warning "You may need to restart your shell or run:"
-    echo "  source $shell_config"
 }
 
 # ============================================================================
@@ -393,16 +382,16 @@ main() {
 
     log_success "LeIndex has been installed successfully!"
     echo ""
-    echo "  ${BOLD}Binary:${NC}       $BIN_DIR/$PROJECT_SLUG"
+    echo "  ${BOLD}Binary:${NC}       $INSTALL_BIN_DIR/$PROJECT_SLUG"
     echo "  ${BOLD}Config:${NC}       $CONFIG_DIR"
     echo "  ${BOLD}Data:${NC}         $DATA_DIR"
     echo "  ${BOLD}Install log:${NC}  $INSTALL_LOG"
     echo ""
     echo "To get started:"
-    echo "  ${CYAN}1.${NC} Restart your shell or run: ${YELLOW}source ~/.bashrc${NC} (or ~/.zshrc)"
-    echo "  ${CYAN}2.${NC} Verify installation: ${YELLOW}$PROJECT_SLUG --version${NC}"
-    echo "  ${CYAN}3.${NC} Index a project: ${YELLOW}$PROJECT_SLUG index /path/to/project${NC}"
-    echo "  ${CYAN}4.${NC} Run diagnostics: ${YELLOW}$PROJECT_SLUG diagnostics${NC}"
+    echo "  ${CYAN}1.${NC} Verify installation: ${YELLOW}$PROJECT_SLUG --version${NC}"
+    echo "  ${CYAN}2.${NC} Index a project: ${YELLOW}$PROJECT_SLUG index /path/to/project${NC}"
+    echo "  ${CYAN}3.${NC} Run diagnostics: ${YELLOW}$PROJECT_SLUG diagnostics${NC}"
+    echo "  ${CYAN}4.${NC} Start MCP server: ${YELLOW}$PROJECT_SLUG serve${NC}"
     echo ""
     echo "For MCP server configuration, see the documentation."
     echo ""
