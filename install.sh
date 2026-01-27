@@ -457,21 +457,371 @@ detect_ai_tools() {
             echo ""
         fi
 
-        log_info "LeIndex MCP server can be configured for these tools"
+        # In non-interactive mode, show config and exit
+        if [[ "$NONINTERACTIVE" == true ]]; then
+            log_info "Non-interactive mode: Skipping MCP configuration"
+            echo ""
+            show_mcp_config_instructions
+            return 0
+        fi
+
+        # Ask user if they want to configure MCP for detected tools
         echo ""
-        show_mcp_config "${detected_ides[@]}" "${detected_clis[@]}"
+        read -p "Would you like to configure LeIndex MCP server for these tools? [y/N] " -n 1 -r
+        echo ""
+
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Skipping MCP configuration"
+            echo ""
+            show_mcp_config_instructions
+            return 0
+        fi
+
+        # Configure selected tools
+        configure_mcp_servers "${detected_tools[@]}"
     else
         print_warning "No AI tools detected"
         log_info "LeIndex will be installed as a standalone tool"
     fi
 }
 
-show_mcp_config() {
-    local ides=("$@")
-    local clis=("${ides[@]:${#ides[@]}}")
+configure_mcp_servers() {
+    local tools=("$@")
 
-    print_header "MCP Server Configuration"
+    print_header "Select Tools to Configure"
 
+    echo "Select which tools to configure (enter numbers separated by spaces, or 'all'):"
+    echo ""
+
+    local i=1
+    for tool in "${tools[@]}"; do
+        echo "  ${CYAN}$i)${NC} $tool"
+        ((i++))
+    done
+    echo ""
+    echo "  ${CYAN}all)${NC} Configure all detected tools"
+
+    read -p "Selection: " selection
+
+    # Parse selection
+    local selected_tools=()
+    if [[ "$selection" == "all" ]]; then
+        selected_tools=("${tools[@]}")
+    else
+        for num in $selection; do
+            if [[ "$num" =~ ^[0-9]+$ ]] && [[ $num -ge 1 ]] && [[ $num -le ${#tools[@]} ]]; then
+                selected_tools+=("${tools[$((num-1))]}")
+            fi
+        done
+    fi
+
+    if [[ ${#selected_tools[@]} -eq 0 ]]; then
+        log_warn "No valid tools selected"
+        return 0
+    fi
+
+    echo ""
+    log_info "Configuring LeIndex MCP server for: ${selected_tools[*]}"
+    echo ""
+
+    # Configure each selected tool
+    local success_count=0
+    local failed_count=0
+    local skipped_count=0
+
+    for tool in "${selected_tools[@]}"; do
+        echo -n "  Configuring $tool... "
+        if configure_tool_mcp "$tool"; then
+            echo "${GREEN}✓${NC} Done"
+            ((success_count++))
+        elif [[ $? -eq 2 ]]; then
+            echo "${YELLOW}⊘${NC} Skipped (no config file found)"
+            ((skipped_count++))
+        else
+            echo "${RED}✗${NC} Failed"
+            ((failed_count++))
+        fi
+    done
+
+    echo ""
+    echo "Configuration Summary:"
+    echo "  ${GREEN}✓${NC} $success_count tool(s) configured successfully"
+    if [[ $skipped_count -gt 0 ]]; then
+        echo "  ${YELLOW}⊘${NC} $skipped_count tool(s) skipped (no config file)"
+    fi
+    if [[ $failed_count -gt 0 ]]; then
+        echo "  ${RED}✗${NC} $failed_count tool(s) failed to configure"
+    fi
+    echo ""
+
+    if [[ $success_count -gt 0 ]]; then
+        log_success "MCP configuration complete!"
+        echo ""
+        echo "Next steps:"
+        echo "  1. Restart your AI tool(s) to load the new configuration"
+        echo "  2. Start the LeIndex server: ${CYAN}leindex serve${NC}"
+        echo "  3. Or run it in the background: ${CYAN}nohup leindex serve > ~/.leindex/logs/server.log 2>&1 &${NC}"
+    fi
+}
+
+configure_tool_mcp() {
+    local tool="$1"
+    local config_file=""
+    local backup_file=""
+
+    case "$tool" in
+        "Claude Code")
+            config_file="$HOME/.config/claude-code/mcp.json"
+            backup_file="$HOME/.config/claude-code/mcp.json.backup"
+            configure_json_mcp "$config_file" "$backup_file"
+            return $?
+            ;;
+        "Cursor"|"VS Code"|"VSCodium")
+            # Cursor and VS Code family
+            config_file="$HOME/.cursor/settings.json"
+            if [[ ! -f "$config_file" ]]; then
+                config_file="$HOME/.config/Code/User/settings.json"
+            fi
+            if [[ ! -f "$config_file" ]]; then
+                config_file="$HOME/.config/VSCodium/User/settings.json"
+            fi
+            backup_file="${config_file}.backup"
+            configure_vscode_mcp "$config_file" "$backup_file"
+            return $?
+            ;;
+        "Zed")
+            config_file="$HOME/.config/zed/settings.json"
+            backup_file="${config_file}.backup"
+            configure_zed_mcp "$config_file" "$backup_file"
+            return $?
+            ;;
+        "Opencode")
+            config_file="$HOME/.config/opencode/opencode.json"
+            backup_file="${config_file}.backup"
+            configure_opencode_mcp "$config_file" "$backup_file"
+            return $?
+            ;;
+        "Antigravity")
+            # Antigravity uses Cursor/VS Code config
+            config_file="$HOME/.cursor/settings.json"
+            backup_file="${config_file}.backup"
+            configure_vscode_mcp "$config_file" "$backup_file"
+            return $?
+            ;;
+        *)
+            # CLI tools that might have config files
+            return 2  # Skipped
+            ;;
+    esac
+}
+
+# Backup a file before modification
+backup_config_file() {
+    local file="$1"
+    local backup="$2"
+
+    if [[ -f "$file" ]]; then
+        cp "$file" "$backup"
+        return 0
+    fi
+    return 1
+}
+
+# Configure Claude Code MCP (mcp.json format)
+configure_json_mcp() {
+    local config_file="$1"
+    local backup_file="$2"
+
+    # Check if config exists
+    if [[ ! -f "$config_file" ]]; then
+        # Create parent directory if needed
+        mkdir -p "$(dirname "$config_file")"
+        # Create new config with leindex
+        cat > "$config_file" << 'EOF'
+{
+  "mcpServers": {
+    "leindex": {
+      "type": "http",
+      "url": "http://127.0.0.1:47268/mcp"
+    }
+  }
+}
+EOF
+        return 0
+    fi
+
+    # Backup existing config
+    backup_config_file "$config_file" "$backup_file"
+
+    # Use Python or jq to add leindex to mcpServers
+    if command -v python3 &> /dev/null; then
+        python3 <<PYTHON
+import json
+import sys
+
+try:
+    with open('$config_file', 'r') as f:
+        config = json.load(f)
+except:
+    config = {}
+
+if 'mcpServers' not in config:
+    config['mcpServers'] = {}
+
+config['mcpServers']['leindex'] = {
+    'type': 'http',
+    'url': 'http://127.0.0.1:47268/mcp'
+}
+
+with open('$config_file', 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+PYTHON
+        return $?
+    elif command -v jq &> /dev/null; then
+        # Fallback to jq if python3 is not available
+        jq '.mcpServers.leindex = {"type": "http", "url": "http://127.0.0.1:47268/mcp"}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+        return $?
+    else
+        return 1
+    fi
+}
+
+# Configure VS Code/Cursor MCP (settings.json with mcpServers)
+configure_vscode_mcp() {
+    local config_file="$1"
+    local backup_file="$2"
+
+    # Check if config exists
+    if [[ ! -f "$config_file" ]]; then
+        return 2  # Skipped
+    fi
+
+    # Backup existing config
+    backup_config_file "$config_file" "$backup_file"
+
+    # VS Code uses the same mcp.json format as Claude Code
+    # but the file is in a different location
+    local mcp_config_dir="$(dirname "$config_file")"
+    local mcp_config_file="$mcp_config_dir/mcp.json"
+
+    if [[ ! -f "$mcp_config_file" ]]; then
+        # Create mcp.json in the same directory
+        cat > "$mcp_config_file" << 'EOF'
+{
+  "mcpServers": {
+    "leindex": {
+      "type": "http",
+      "url": "http://127.0.0.1:47268/mcp"
+    }
+  }
+}
+EOF
+        return 0
+    fi
+
+    # Update existing mcp.json
+    configure_json_mcp "$mcp_config_file" "${mcp_config_file}.backup"
+    return $?
+}
+
+# Configure Zed MCP (LSP format)
+configure_zed_mcp() {
+    local config_file="$1"
+    local backup_file="$2"
+
+    # Check if config exists
+    if [[ ! -f "$config_file" ]]; then
+        return 2  # Skipped
+    fi
+
+    # Backup existing config
+    backup_config_file "$config_file" "$backup_file"
+
+    # Zed uses a different config format
+    if command -v python3 &> /dev/null; then
+        python3 <<PYTHON
+import json
+import sys
+
+try:
+    with open('$config_file', 'r') as f:
+        config = json.load(f)
+except:
+    config = {}
+
+if 'lsp' not in config:
+    config['lsp'] = {}
+
+config['lsp']['leindex'] = {
+    'type': 'http',
+    'url': 'http://127.0.0.1:47268/mcp'
+}
+
+with open('$config_file', 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+PYTHON
+        return $?
+    elif command -v jq &> /dev/null; then
+        jq '.lsp.leindex = {"type": "http", "url": "http://127.0.0.1:47268/mcp"}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+        return $?
+    else
+        return 1
+    fi
+}
+
+# Configure Opencode MCP
+configure_opencode_mcp() {
+    local config_file="$1"
+    local backup_file="$2"
+
+    # Check if config exists
+    if [[ ! -f "$config_file" ]]; then
+        return 2  # Skipped
+    fi
+
+    # Backup existing config
+    backup_config_file "$config_file" "$backup_file"
+
+    # Opencode uses similar format to Claude Code
+    if command -v python3 &> /dev/null; then
+        python3 <<PYTHON
+import json
+import sys
+
+try:
+    with open('$config_file', 'r') as f:
+        config = json.load(f)
+except:
+    config = {}
+
+if 'mcp' not in config:
+    config['mcp'] = {}
+
+if 'leindex' not in config['mcp']:
+    config['mcp']['leindex'] = {}
+
+config['mcp']['leindex'] = {
+    'command': 'leindex',
+    'args': ['serve']
+}
+
+with open('$config_file', 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+PYTHON
+        return $?
+    else
+        return 1
+    fi
+}
+
+show_mcp_config_instructions() {
+    echo "═══════════════════════════════════════════════════"
+    echo "  MCP Server Configuration"
+    echo "═══════════════════════════════════════════════════"
+    echo ""
     echo "LeIndex runs as an HTTP-based MCP server on port 47268"
     echo ""
     echo "Start the server:"
@@ -480,53 +830,22 @@ show_mcp_config() {
     echo "Or customize port:"
     echo "  ${CYAN}LEINDEX_PORT=3000 leindex serve${NC}"
     echo ""
-
-    # Claude Code / Cursor / VS Code configuration
-    if printf '%s\n' "${ides[@]}" | grep -qE "(Cursor|VS Code|VSCodium|Claude)"; then
-        echo "For ${CYAN}Claude Code / Cursor / VS Code${NC}:"
-        echo ""
-        echo "Edit ~/.config/claude-code/mcp.json (or Cursor's settings.json):"
-        echo ""
-        echo "  {"
-        echo "    \"mcpServers\": {"
-        echo "      \"leindex\": {"
-        echo "        \"type\": \"http\","
-        echo "        \"url\": \"http://127.0.0.1:47268/mcp\""
-        echo "      }"
-        echo "    }"
-        echo "  }"
-        echo ""
-    fi
-
-    # Zed configuration
-    if printf '%s\n' "${ides[@]}" | grep -q "Zed"; then
-        echo "For ${CYAN}Zed${NC}:"
-        echo ""
-        echo "Edit ~/.config/zed/settings.json:"
-        echo ""
-        echo "  {"
-        echo "    \"lsp\": {"
-        echo "      \"leindex\": {"
-        echo "        \"type\": \"http\","
-        echo "        \"url\": \"http://127.0.0.1:47268/mcp\""
-        echo "      }"
-        echo "    }"
-        echo "  }"
-        echo ""
-    fi
-
-    # CLI tools configuration
-    if [[ ${#clis[@]} -gt 0 ]]; then
-        echo "For ${CYAN}CLI Tools${NC} (that support HTTP MCP servers):"
-        echo ""
-        echo "Configure with URL: ${CYAN}http://127.0.0.1:47268/mcp${NC}"
-        echo ""
-    fi
-
+    echo "For manual configuration, add to your tool's config:"
+    echo ""
+    echo "  Claude Code (~/.config/claude-code/mcp.json):"
+    echo '    {"mcpServers": {"leindex": {"type": "http", "url": "http://127.0.0.1:47268/mcp"}}}'
+    echo ""
+    echo "  Cursor/VS Code (settings.json or mcp.json):"
+    echo '    {"mcpServers": {"leindex": {"type": "http", "url": "http://127.0.0.1:47268/mcp"}}}'
+    echo ""
+    echo "  Zed (~/.config/zed/settings.json):"
+    echo '    {"lsp": {"leindex": {"type": "http", "url": "http://127.0.0.1:47268/mcp"}}}'
+    echo ""
     echo "Note: The LeIndex server must be running for MCP integration to work."
     echo ""
     echo "Start it manually, or set up as a background service:"
     echo "  ${CYAN}nohup leindex serve > ~/.leindex/logs/server.log 2>&1 &${NC}"
+    echo ""
 }
 
 # ============================================================================
