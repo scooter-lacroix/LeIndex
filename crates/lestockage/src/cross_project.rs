@@ -4,7 +4,7 @@
 // symbols to be resolved across project boundaries with lazy PDG loading.
 
 use crate::global_symbols::{GlobalSymbol, GlobalSymbolId};
-use crate::pdg_store::{load_pdg, save_pdg, PdgStoreError};
+use crate::pdg_store::{load_pdg, PdgStoreError};
 use legraphe::pdg::{ProgramDependenceGraph, NodeId, EdgeId};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;

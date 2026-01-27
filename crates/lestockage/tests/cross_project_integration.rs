@@ -9,7 +9,7 @@ mod tests {
     use lestockage::{Storage, GlobalSymbolTable, GlobalSymbol, CrossProjectResolver};
     use lestockage::global_symbols::{ExternalRef, ProjectDep, SymbolType, RefType, DepType};
     use legraphe::pdg::{ProgramDependenceGraph, Node, NodeType, Edge, EdgeType, EdgeMetadata};
-    use lestockage::pdg_store::{save_pdg, load_pdg};
+    use lestockage::pdg_store::save_pdg;
 
     /// Helper: Create a test storage with temp file
     fn create_test_storage() -> Storage {

@@ -1270,12 +1270,12 @@ mod tests {
 
         // Invalid dimensions should panic
         let result = std::panic::catch_unwind(|| {
-            SearchEngine::with_dimension(0);
+            let _ = SearchEngine::with_dimension(0);
         });
         assert!(result.is_err(), "Dimension 0 should panic");
 
         let result = std::panic::catch_unwind(|| {
-            SearchEngine::with_dimension(MAX_EMBEDDING_DIMENSION + 1);
+            let _ = SearchEngine::with_dimension(MAX_EMBEDDING_DIMENSION + 1);
         });
         assert!(result.is_err(), "Dimension > MAX_EMBEDDING_DIMENSION should panic");
     }
