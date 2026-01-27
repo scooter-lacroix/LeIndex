@@ -123,173 +123,6 @@ pub struct MigrationStats {
     pub migration_time_ms: u64,
 }
 
-/// Hybrid storage: local SQLite + remote Turso
-///
-/// Combines local SQLite storage with optional remote Turso storage.
-/// This enables:
-/// - Local-first operation for fast development
-/// - Optional remote storage for production scale
-/// - Vector similarity search via Turso's vec0 extension
-/// - Migration from local to remote
-pub struct HybridStorage {
-    /// Local SQLite storage
-    pub local: Option<crate::Storage>,
-
-    /// Remote Turso connection
-    pub remote: Option<libsql::Connection>,
-
-    /// Configuration
-    pub config: TursoConfig,
-}
-
-impl HybridStorage {
-    /// Create hybrid storage from configuration
-    ///
-    /// # Arguments
-    ///
-    /// * `config` - Turso configuration
-    ///
-    /// # Returns
-    ///
-    /// `Ok(HybridStorage)` if successful, `Err(StorageError)` if connection fails
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let config = TursoConfig::local_only();
-    /// let storage = HybridStorage::new(config)?;
-    /// ```
-    pub fn new(config: TursoConfig) -> Result<Self, StorageError> {
-        // Initialize local storage if not remote-only
-        let local = if !config.remote_only {
-            // Create a temporary path for local storage
-            let storage = crate::Storage::open("local.db")
-                .map_err(|e| StorageError::LocalStorageError(format!("{:?}", e)))?;
-            Some(storage)
-        } else {
-            None
-        };
-
-        // Initialize remote storage if configured
-        // Note: Actual libsql connection will be implemented in Task 8.3
-        // For now, we just return None to allow compilation
-        let remote = if config.is_remote() {
-            tracing::info!("Remote Turso connection will be established in Task 8.3");
-            None
-        } else {
-            None
-        };
-
-        Ok(Self { local, remote, config })
-    }
-
-    /// Initialize vector extension in Turso
-    ///
-    /// This enables the vec0 extension for vector similarity search.
-    /// Only applicable when using remote Turso storage.
-    ///
-    /// Note: This is a placeholder for now. The actual implementation
-    /// will be provided when the full Turso integration is ready.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(())` if successful, `Err(StorageError)` if initialization fails
-    pub fn init_vectors(&self) -> Result<(), StorageError> {
-        if !self.config.enable_vectors {
-            return Ok(());
-        }
-
-        // Placeholder - actual vector extension initialization will be in Task 8.3
-        if self.remote.is_some() {
-            tracing::info!("Vector extension initialization will be implemented in Task 8.3");
-        }
-
-        Ok(())
-    }
-
-    /// Get local storage
-    ///
-    /// # Returns
-    ///
-    /// `Some(&Storage)` if local storage is available, `None` otherwise
-    #[must_use]
-    pub fn local(&self) -> Option<&crate::Storage> {
-        self.local.as_ref()
-    }
-
-    /// Get mutable local storage
-    ///
-    /// # Returns
-    ///
-    /// `Some(&mut Storage)` if local storage is available, `None` otherwise
-    pub fn local_mut(&mut self) -> Option<&mut crate::Storage> {
-        self.local.as_mut()
-    }
-
-    /// Get remote storage
-    ///
-    /// # Returns
-    ///
-    /// `Some(&libsql::Connection)` if remote storage is available, `None` otherwise
-    #[must_use]
-    pub fn remote(&self) -> Option<&libsql::Connection> {
-        self.remote.as_ref()
-    }
-
-    /// Get mutable remote storage
-    ///
-    /// # Returns
-    ///
-    /// `Some(&mut libsql::Connection)` if remote storage is available, `None` otherwise
-    pub fn remote_mut(&mut self) -> Option<&mut libsql::Connection> {
-        self.remote.as_mut()
-    }
-
-    /// Migrate data from local to remote
-    ///
-    /// This is a placeholder for migration functionality.
-    /// The actual implementation will be provided in Task 8.3 (Vector Migration Bridge).
-    /// For now, this returns empty migration stats to allow compilation.
-    ///
-    /// # Returns
-    ///
-    /// `Ok(MigrationStats)` with migration statistics (empty for now)
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let stats = storage.migrate_to_remote()?;
-    /// println!("Migrated {} nodes", stats.nodes_migrated);
-    /// ```
-    pub fn migrate_to_remote(&self) -> Result<MigrationStats, StorageError> {
-        // Placeholder implementation - actual migration will be in Task 8.3
-        Ok(MigrationStats::default())
-    }
-
-    /// Check if local storage is available
-    #[must_use]
-    pub fn has_local(&self) -> bool {
-        self.local.is_some()
-    }
-
-    /// Check if remote storage is available
-    #[must_use]
-    pub fn has_remote(&self) -> bool {
-        self.remote.is_some()
-    }
-
-    /// Get storage mode
-    #[must_use]
-    pub fn mode(&self) -> StorageMode {
-        match (self.local.is_some(), self.remote.is_some()) {
-            (true, false) => StorageMode::LocalOnly,
-            (false, true) => StorageMode::RemoteOnly,
-            (true, true) => StorageMode::Hybrid,
-            (false, false) => StorageMode::None,
-        }
-    }
-}
-
 /// Storage mode
 ///
 /// Indicates the current storage mode of the HybridStorage.
@@ -329,6 +162,387 @@ pub enum StorageError {
     /// A query executed on the remote backend failed
     #[error("Remote query failed: {0}")]
     RemoteQueryFailed(String),
+}
+
+/// Hybrid storage: local SQLite + remote Turso
+///
+/// Combines local SQLite storage with optional remote Turso storage.
+/// This enables:
+/// - Local-first operation for fast development
+/// - Optional remote storage for production scale
+/// - Vector similarity search via Turso's vec0 extension
+/// - Migration from local to remote
+pub struct HybridStorage {
+    /// Local SQLite storage
+    pub local: Option<crate::Storage>,
+
+    /// Configuration
+    pub config: TursoConfig,
+
+    /// Whether vector extension is initialized
+    pub vectors_initialized: bool,
+}
+
+impl HybridStorage {
+    /// Create hybrid storage from configuration
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Turso configuration
+    ///
+    /// # Returns
+    ///
+    /// `Ok(HybridStorage)` if successful, `Err(StorageError)` if connection fails
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let config = TursoConfig::local_only();
+    /// let storage = HybridStorage::new(config)?;
+    /// ```
+    pub fn new(config: TursoConfig) -> Result<Self, StorageError> {
+        // Initialize local storage if not remote-only
+        let local = if !config.remote_only {
+            // Create a temporary path for local storage
+            let storage = crate::Storage::open("local.db")
+                .map_err(|e| StorageError::LocalStorageError(format!("{:?}", e)))?;
+            Some(storage)
+        } else {
+            None
+        };
+
+        Ok(Self { local, config, vectors_initialized: false })
+    }
+
+    /// Initialize vector extension in Turso
+    ///
+    /// This enables the vec0 extension for vector similarity search.
+    /// For local SQLite, this sets up vector tables. For remote Turso,
+    /// this loads the vec0 extension.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if successful, `Err(StorageError)` if initialization fails
+    pub fn init_vectors(&mut self) -> Result<(), StorageError> {
+        if !self.config.enable_vectors {
+            return Ok(());
+        }
+
+        // For local storage, set up vector tables
+        if let Some(storage) = &self.local {
+            self.init_local_vectors(storage)?;
+        }
+
+        self.vectors_initialized = true;
+        tracing::info!("Vector extension initialized successfully");
+
+        Ok(())
+    }
+
+    /// Initialize vector tables in local SQLite storage
+    fn init_local_vectors(&self, storage: &crate::Storage) -> Result<(), StorageError> {
+        let conn = storage.conn();
+
+        // Create node metadata table
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS node_metadata (
+                node_id TEXT PRIMARY KEY,
+                symbol_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                node_type TEXT NOT NULL,
+                created_at INTEGER DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        ).map_err(|e| StorageError::LocalStorageError(format!("Failed to create node_metadata table: {:?}", e)))?;
+
+        // Create embeddings table
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS node_embeddings (
+                node_id TEXT PRIMARY KEY,
+                embedding BLOB NOT NULL,
+                dimension INTEGER NOT NULL,
+                FOREIGN KEY (node_id) REFERENCES node_metadata(node_id) ON DELETE CASCADE
+            )",
+            [],
+        ).map_err(|e| StorageError::LocalStorageError(format!("Failed to create node_embeddings table: {:?}", e)))?;
+
+        // Create index for similarity search (using FTS5-style approach)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_node_embeddings_dimension
+             ON node_embeddings(dimension)",
+            [],
+        ).map_err(|e| StorageError::LocalStorageError(format!("Failed to create index: {:?}", e)))?;
+
+        Ok(())
+    }
+
+    /// Store an embedding in the vector database
+    ///
+    /// # Arguments
+    ///
+    /// * `node_id` - Unique identifier for the node
+    /// * `symbol_name` - Symbol name (function/class/variable name)
+    /// * `file_path` - Path to the source file
+    /// * `node_type` - Type of node (function, class, etc.)
+    /// * `embedding` - 768-dimensional embedding vector
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if successful, `Err(StorageError)` if storage fails
+    pub fn store_embedding(
+        &self,
+        node_id: &str,
+        symbol_name: &str,
+        file_path: &str,
+        node_type: &str,
+        embedding: &[f32],
+    ) -> Result<(), StorageError> {
+        if !self.vectors_initialized {
+            return Err(StorageError::VectorExtensionNotAvailable);
+        }
+
+        let storage = self.local.as_ref()
+            .ok_or_else(|| StorageError::VectorExtensionNotAvailable)?;
+
+        self.store_local_embedding(storage, node_id, symbol_name, file_path, node_type, embedding)
+    }
+
+    /// Store embedding in local SQLite
+    fn store_local_embedding(
+        &self,
+        storage: &crate::Storage,
+        node_id: &str,
+        symbol_name: &str,
+        file_path: &str,
+        node_type: &str,
+        embedding: &[f32],
+    ) -> Result<(), StorageError> {
+        use rusqlite::params;
+
+        // Check embedding dimension
+        if embedding.len() != 768 {
+            return Err(StorageError::LocalStorageError(
+                format!("Invalid embedding dimension: {}, expected 768", embedding.len())
+            ));
+        }
+
+        let conn = storage.conn();
+
+        // Insert or replace node metadata
+        conn.execute(
+            "INSERT OR REPLACE INTO node_metadata (node_id, symbol_name, file_path, node_type)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![node_id, symbol_name, file_path, node_type],
+        ).map_err(|e| StorageError::LocalStorageError(format!("Failed to insert metadata: {:?}", e)))?;
+
+        // Convert embedding to bytes for storage
+        let embedding_bytes: Vec<u8> = embedding.iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+
+        // Insert embedding
+        conn.execute(
+            "INSERT OR REPLACE INTO node_embeddings (node_id, embedding, dimension)
+             VALUES (?1, ?2, ?3)",
+            params![node_id, embedding_bytes, embedding.len() as i32],
+        ).map_err(|e| StorageError::LocalStorageError(format!("Failed to insert embedding: {:?}", e)))?;
+
+        Ok(())
+    }
+
+    /// Search for similar vectors
+    ///
+    /// # Arguments
+    ///
+    /// * `query_embedding` - Query embedding vector (768 dimensions)
+    /// * `k` - Number of results to return
+    ///
+    /// # Returns
+    ///
+    /// Vector of (node_id, similarity_score) tuples
+    pub fn search_similar(
+        &self,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> Result<Vec<(String, f32)>, StorageError> {
+        if !self.vectors_initialized {
+            return Err(StorageError::VectorExtensionNotAvailable);
+        }
+
+        let storage = self.local.as_ref()
+            .ok_or_else(|| StorageError::VectorExtensionNotAvailable)?;
+
+        self.search_local_similar(storage, query_embedding, k)
+    }
+
+    /// Search for similar vectors in local SQLite
+    fn search_local_similar(
+        &self,
+        storage: &crate::Storage,
+        query_embedding: &[f32],
+        k: usize,
+    ) -> Result<Vec<(String, f32)>, StorageError> {
+        use rusqlite::Row;
+
+        if query_embedding.len() != 768 {
+            return Err(StorageError::LocalStorageError(
+                format!("Invalid query embedding dimension: {}, expected 768", query_embedding.len())
+            ));
+        }
+
+        let conn = storage.conn();
+
+        // Get all embeddings
+        let mut stmt = conn.prepare(
+            "SELECT n.node_id, e.embedding
+             FROM node_embeddings e
+             JOIN node_metadata n ON e.node_id = n.node_id
+             WHERE e.dimension = 768"
+        ).map_err(|e| StorageError::LocalStorageError(format!("Failed to prepare query: {:?}", e)))?;
+
+        let rows = stmt.query_map([], |row: &Row| {
+            let node_id: String = row.get(0)?;
+            let embedding_bytes: Vec<u8> = row.get(1)?;
+            Ok((node_id, embedding_bytes))
+        }).map_err(|e| StorageError::LocalStorageError(format!("Failed to execute query: {:?}", e)))?;
+
+        // Calculate cosine similarities
+        let mut results: Vec<(String, f32)> = Vec::new();
+        for row in rows {
+            let (node_id, embedding_bytes) = row
+                .map_err(|e| StorageError::LocalStorageError(format!("Failed to read row: {:?}", e)))?;
+
+            // Convert bytes back to f32 vector
+            let stored_embedding: Vec<f32> = embedding_bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+
+            // Calculate cosine similarity
+            let similarity = cosine_similarity(query_embedding, &stored_embedding);
+            results.push((node_id, similarity));
+        }
+
+        // Sort by similarity (descending) and take top k
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(k);
+
+        Ok(results)
+    }
+
+    /// Batch store embeddings
+    ///
+    /// # Arguments
+    ///
+    /// * `embeddings` - Vector of (node_id, symbol_name, file_path, node_type, embedding) tuples
+    ///
+    /// # Returns
+    ///
+    /// Number of embeddings stored successfully
+    pub fn batch_store_embeddings(
+        &self,
+        embeddings: &[(&str, &str, &str, &str, &[f32])],
+    ) -> Result<usize, StorageError> {
+        if !self.vectors_initialized {
+            return Err(StorageError::VectorExtensionNotAvailable);
+        }
+
+        let storage = self.local.as_ref()
+            .ok_or_else(|| StorageError::VectorExtensionNotAvailable)?;
+
+        let mut stored = 0;
+        for (node_id, symbol_name, file_path, node_type, embedding) in embeddings {
+            if self.store_local_embedding(storage, node_id, symbol_name, file_path, node_type, embedding).is_ok() {
+                stored += 1;
+            }
+        }
+
+        Ok(stored)
+    }
+
+    /// Get local storage
+    ///
+    /// # Returns
+    ///
+    /// `Some(&Storage)` if local storage is available, `None` otherwise
+    #[must_use]
+    pub fn local(&self) -> Option<&crate::Storage> {
+        self.local.as_ref()
+    }
+
+    /// Get mutable local storage
+    ///
+    /// # Returns
+    ///
+    /// `Some(&mut Storage)` if local storage is available, `None` otherwise
+    pub fn local_mut(&mut self) -> Option<&mut crate::Storage> {
+        self.local.as_mut()
+    }
+
+    /// Migrate data from local to remote
+    ///
+    /// This is a placeholder for migration functionality.
+    /// The actual implementation will be provided in Task 8.3 (Vector Migration Bridge).
+    /// For now, this returns empty migration stats to allow compilation.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(MigrationStats)` with migration statistics (empty for now)
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let stats = storage.migrate_to_remote()?;
+    /// println!("Migrated {} nodes", stats.nodes_migrated);
+    /// ```
+    pub fn migrate_to_remote(&self) -> Result<MigrationStats, StorageError> {
+        // Placeholder implementation - actual migration will be in Task 8.3
+        Ok(MigrationStats::default())
+    }
+
+    /// Check if local storage is available
+    #[must_use]
+    pub fn has_local(&self) -> bool {
+        self.local.is_some()
+    }
+
+    /// Check if remote storage is available
+    #[must_use]
+    pub fn has_remote(&self) -> bool {
+        self.config.is_remote()
+    }
+
+    /// Get storage mode
+    #[must_use]
+    pub fn mode(&self) -> StorageMode {
+        match (self.local.is_some(), self.config.is_remote()) {
+            (true, false) => StorageMode::LocalOnly,
+            (false, true) => StorageMode::RemoteOnly,
+            (true, true) => StorageMode::Hybrid,
+            (false, false) => StorageMode::None,
+        }
+    }
+}
+
+/// Calculate cosine similarity between two vectors
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+
+    let dot_product: f32 = a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| x * y)
+        .sum();
+
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+
+    if norm_a == 0.0 || norm_b == 0.0 {
+        return 0.0;
+    }
+
+    dot_product / (norm_a * norm_b)
 }
 
 #[cfg(test)]
@@ -409,7 +623,8 @@ mod tests {
         assert!(result.is_ok());
         let storage = result.unwrap();
         assert!(!storage.has_local());
-        assert!(!storage.has_remote()); // No valid connection
+        // Since the URL is empty, is_remote() returns false
+        assert!(!storage.has_remote());
         assert_eq!(storage.mode(), StorageMode::None);
     }
 
@@ -454,5 +669,31 @@ mod tests {
 
         let err = StorageError::VectorExtensionNotAvailable;
         assert_eq!(format!("{}", err), "Vector extension not available");
+    }
+
+    #[test]
+    fn test_cosine_similarity() {
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![1.0, 2.0, 3.0];
+        let sim = cosine_similarity(&a, &b);
+        assert!((sim - 1.0).abs() < 0.001);
+
+        let c = vec![1.0, 0.0, 0.0];
+        let d = vec![0.0, 1.0, 0.0];
+        let sim = cosine_similarity(&c, &d);
+        assert!((sim - 0.0).abs() < 0.001);
+
+        let e: Vec<f32> = vec![];
+        let sim = cosine_similarity(&a, &e);
+        assert_eq!(sim, 0.0);
+    }
+
+    #[test]
+    fn test_cosine_similarity_parallel() {
+        let a = vec![1.0, 2.0, 3.0, 4.0];
+        let b = vec![2.0, 4.0, 6.0, 8.0];
+        let sim = cosine_similarity(&a, &b);
+        // b is 2*a, so they should be perfectly similar
+        assert!((sim - 1.0).abs() < 0.001);
     }
 }

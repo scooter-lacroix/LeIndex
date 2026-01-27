@@ -83,7 +83,7 @@ LeIndex consists of 5 production-ready Rust crates:
 │  • Parsing: tree-sitter (12 langs) • Rayon parallel processing       │
 │  • Graph: petgraph StableGraph • Gravity traversal w/ priority queue │
 │  • Search: HNSW (hnsw-rs) • Cosine similarity • NL query parser     │
-│  • Storage: SQLite + BLAKE3 hashing • Cross-project global symbols  │
+│  • Storage: SQLite + BLAKE3 hashing • Vector embeddings • Cross-project global symbols  │
 │  • Server: axum + tokio • JSON-RPC 2.0 protocol                     │
 │                                                                       │
 └─────────────────────────────────────────────────────────────────────┘
