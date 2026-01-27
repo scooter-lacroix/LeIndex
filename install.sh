@@ -172,11 +172,23 @@ install_leindex() {
     local should_cleanup=false
 
     # Check if we're in the LeIndex repository (local development)
-    if [[ -f "Cargo.toml" ]] && grep -q "name = \"leindex\"" Cargo.toml 2>/dev/null; then
+    # First check for direct package with name = "leindex"
+    if [[ -f "Cargo.toml" ]] && grep -q 'name = "'"$PROJECT_SLUG"'"' Cargo.toml 2>/dev/null; then
         log_info "Building from local LeIndex repository..."
         install_method="local"
         repo_dir="$(pwd)"
-    elif [[ -f "Cargo.toml" ]] && grep -q "$PROJECT_SLUG" Cargo.toml 2>/dev/null; then
+    # Check for workspace project (LeIndex uses a workspace structure)
+    elif [[ -f "Cargo.toml" ]] && grep -q "\[workspace\]" Cargo.toml 2>/dev/null; then
+        log_info "Building from local LeIndex workspace repository..."
+        install_method="workspace"
+        repo_dir="$(pwd)"
+    # Check if we have a leindex crate in crates/ directory
+    elif [[ -d "crates" ]] && [[ -f "crates/lepasserelle/Cargo.toml" ]] && grep -q "name = \"lepasserelle\"" crates/lepasserelle/Cargo.toml 2>/dev/null; then
+        log_info "Building from local LeIndex repository..."
+        install_method="local"
+        repo_dir="$(pwd)"
+    # Check if current directory is a Rust project with Cargo.toml
+    elif [[ -f "Cargo.toml" ]] && cargo check --quiet 2>/dev/null; then
         log_info "Building from current directory..."
         install_method="source"
         repo_dir="$(pwd)"
