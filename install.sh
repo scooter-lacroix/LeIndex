@@ -356,34 +356,177 @@ update_path() {
 detect_ai_tools() {
     print_header "Detecting AI Tools"
 
+    local detected_tools=()
+    local detected_ides=()
     local detected_clis=()
 
-    # Check for Claude Code
-    if command -v claude &> /dev/null || [[ -n "${CLAUDE_CONFIG_DIR:-}" ]]; then
-        detected_clis+=("claude")
-    fi
+    # === IDE Detection ===
 
-    # Check for Cursor
+    # Cursor
     if command -v cursor &> /dev/null || [[ -d "$HOME/.cursor" ]]; then
-        detected_clis+=("cursor")
+        detected_ides+=("Cursor")
     fi
 
-    # Check for Windsurf
-    if command -v windsurf &> /dev/null || [[ -d "$HOME/.windsurf" ]]; then
-        detected_clis+=("windsurf")
+    # VS Code
+    if command -v code &> /dev/null || [[ -d "$HOME/.vscode" ]] || [[ -d "$HOME/.config/Code" ]]; then
+        detected_ides+=("VS Code")
     fi
 
-    if [[ ${#detected_clis[@]} -gt 0 ]]; then
+    # VSCodium
+    if command -v codium &> /dev/null || [[ -d "$HOME/.config/VSCodium" ]]; then
+        detected_ides+=("VSCodium")
+    fi
+
+    # Zed
+    if command -v zed &> /dev/null || [[ -d "$HOME/.config/zed" ]]; then
+        detected_ides+=("Zed")
+    fi
+
+    # Antigravity (uses VS Code config)
+    if [[ -d "$HOME/.antigravity" ]]; then
+        detected_ides+=("Antigravity")
+    fi
+
+    # === CLI Tool Detection ===
+
+    # Claude Code
+    if command -v claude &> /dev/null || [[ -n "${CLAUDE_CONFIG_DIR:-}" ]] || [[ -d "$HOME/.config/claude-code" ]]; then
+        detected_clis+=("Claude Code")
+    fi
+
+    # Codex CLI
+    if command -v codex &> /dev/null; then
+        detected_clis+=("Codex CLI")
+    fi
+
+    # Amp Code
+    if command -v amp &> /dev/null; then
+        detected_clis+=("Amp Code")
+    fi
+
+    # Gemini CLI
+    if command -v gemini &> /dev/null || command -v gemini-cli &> /dev/null; then
+        detected_clis+=("Gemini CLI")
+    fi
+
+    # Opencode
+    if command -v opencode &> /dev/null || [[ -d "$HOME/.config/opencode" ]]; then
+        detected_clis+=("Opencode")
+    fi
+
+    # Droid
+    if command -v droid &> /dev/null; then
+        detected_clis+=("Droid")
+    fi
+
+    # Pi-mono
+    if command -v pi &> /dev/null || command -v pi-mono &> /dev/null; then
+        detected_clis+=("Pi-mono")
+    fi
+
+    # Goose
+    if command -v goose &> /dev/null; then
+        detected_clis+=("Goose")
+    fi
+
+    # Maestro
+    if command -v maestro &> /dev/null; then
+        detected_clis+=("Maestro")
+    fi
+
+    # Combine all detected tools
+    detected_tools=("${detected_ides[@]}" "${detected_clis[@]}")
+
+    if [[ ${#detected_tools[@]} -gt 0 ]]; then
         log_success "Detected AI tools:"
-        for tool in "${detected_clis[@]}"; do
-            print_bullet "$tool"
-        done
         echo ""
+
+        if [[ ${#detected_ides[@]} -gt 0 ]]; then
+            echo "  ${CYAN}IDEs:${NC}"
+            for tool in "${detected_ides[@]}"; do
+                print_bullet "$tool"
+            done
+            echo ""
+        fi
+
+        if [[ ${#detected_clis[@]} -gt 0 ]]; then
+            echo "  ${CYAN}CLI Tools:${NC}"
+            for tool in "${detected_clis[@]}"; do
+                print_bullet "$tool"
+            done
+            echo ""
+        fi
+
         log_info "LeIndex MCP server can be configured for these tools"
+        echo ""
+        show_mcp_config "${detected_ides[@]}" "${detected_clis[@]}"
     else
         print_warning "No AI tools detected"
         log_info "LeIndex will be installed as a standalone tool"
     fi
+}
+
+show_mcp_config() {
+    local ides=("$@")
+    local clis=("${ides[@]:${#ides[@]}}")
+
+    print_header "MCP Server Configuration"
+
+    echo "LeIndex runs as an HTTP-based MCP server on port 47268"
+    echo ""
+    echo "Start the server:"
+    echo "  ${CYAN}leindex serve${NC}"
+    echo ""
+    echo "Or customize port:"
+    echo "  ${CYAN}LEINDEX_PORT=3000 leindex serve${NC}"
+    echo ""
+
+    # Claude Code / Cursor / VS Code configuration
+    if printf '%s\n' "${ides[@]}" | grep -qE "(Cursor|VS Code|VSCodium|Claude)"; then
+        echo "For ${CYAN}Claude Code / Cursor / VS Code${NC}:"
+        echo ""
+        echo "Edit ~/.config/claude-code/mcp.json (or Cursor's settings.json):"
+        echo ""
+        echo "  {"
+        echo "    \"mcpServers\": {"
+        echo "      \"leindex\": {"
+        echo "        \"type\": \"http\","
+        echo "        \"url\": \"http://127.0.0.1:47268/mcp\""
+        echo "      }"
+        echo "    }"
+        echo "  }"
+        echo ""
+    fi
+
+    # Zed configuration
+    if printf '%s\n' "${ides[@]}" | grep -q "Zed"; then
+        echo "For ${CYAN}Zed${NC}:"
+        echo ""
+        echo "Edit ~/.config/zed/settings.json:"
+        echo ""
+        echo "  {"
+        echo "    \"lsp\": {"
+        echo "      \"leindex\": {"
+        echo "        \"type\": \"http\","
+        echo "        \"url\": \"http://127.0.0.1:47268/mcp\""
+        echo "      }"
+        echo "    }"
+        echo "  }"
+        echo ""
+    fi
+
+    # CLI tools configuration
+    if [[ ${#clis[@]} -gt 0 ]]; then
+        echo "For ${CYAN}CLI Tools${NC} (that support HTTP MCP servers):"
+        echo ""
+        echo "Configure with URL: ${CYAN}http://127.0.0.1:47268/mcp${NC}"
+        echo ""
+    fi
+
+    echo "Note: The LeIndex server must be running for MCP integration to work."
+    echo ""
+    echo "Start it manually, or set up as a background service:"
+    echo "  ${CYAN}nohup leindex serve > ~/.leindex/logs/server.log 2>&1 &${NC}"
 }
 
 # ============================================================================
