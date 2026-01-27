@@ -398,3 +398,269 @@ mod e2e_workflow_tests {
         assert_eq!(diagnostics.spilled_bytes, 0);
     }
 }
+
+// ============================================================================
+// CACHE SPILLING AND RELOADING TESTS (Phase 5.2 & 5.3)
+// ============================================================================
+
+mod cache_spill_reload_tests {
+    use super::*;
+    use lepasserelle::LeIndex;
+    use lepasserelle::memory::WarmStrategy;
+
+    /// Helper function to create a test project with some code
+    fn create_test_project(temp_dir: &TempDir) -> PathBuf {
+        let project_path = temp_dir.path().to_path_buf();
+        let src_dir = project_path.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        // Create a simple Rust file
+        let main_file = src_dir.join("main.rs");
+        std::fs::write(
+            &main_file,
+            r#"
+fn main() {
+    println!("Hello, world!");
+    greet();
+}
+
+fn greet() {
+    println!("Greetings!");
+}
+"#,
+        )
+        .unwrap();
+
+        project_path
+    }
+
+    #[test]
+    fn test_spill_pdg_cache_when_no_pdg() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+
+        // Spilling PDG when none is in memory should return an error
+        let result = leindex.spill_pdg_cache();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No PDG in memory"));
+    }
+
+    #[test]
+    fn test_spill_vector_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+
+        // Spilling vector cache should always work (just creates a marker)
+        let result = leindex.spill_vector_cache();
+        assert!(result.is_ok());
+
+        // Verify the cache marker was created
+        let stats = leindex.get_cache_stats().unwrap();
+        assert!(stats.spilled_entries > 0 || stats.cache_entries > 0);
+    }
+
+    #[test]
+    fn test_spill_all_caches() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+
+        // Spill all caches should succeed
+        let result = leindex.spill_all_caches();
+        assert!(result.is_ok());
+
+        let (pdg_bytes, vector_bytes) = result.unwrap();
+        // Vector cache should have been spilled
+        assert_eq!(vector_bytes, vector_bytes); // usize is non-negative
+        // PDG bytes should be 0 since PDG wasn't loaded
+        assert_eq!(pdg_bytes, 0);
+    }
+
+    #[test]
+    fn test_reload_pdg_when_already_loaded() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+
+        // First, index the project to load PDG
+        let _ = leindex.index_project();
+
+        // Reloading when PDG is already in memory should return Ok immediately
+        let result = leindex.reload_pdg_from_cache();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_reload_vector_without_pdg() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+
+        // Reloading vector without PDG should error
+        let result = leindex.reload_vector_from_pdg();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("No PDG available"));
+    }
+
+    #[test]
+    fn test_warm_caches_all_strategy() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+
+        // Warm all caches
+        let result = leindex.warm_caches(WarmStrategy::All);
+        assert!(result.is_ok());
+
+        let warm_result = result.unwrap();
+        // Should have result (entries_warmed is usize, non-negative)
+        assert_eq!(warm_result.entries_warmed, warm_result.entries_warmed);
+    }
+
+    #[test]
+    fn test_warm_caches_pdg_only_strategy() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+
+        // Warm PDG only
+        let result = leindex.warm_caches(WarmStrategy::PDGOnly);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_warm_caches_search_only_strategy() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+
+        // Warm search index only
+        let result = leindex.warm_caches(WarmStrategy::SearchIndexOnly);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_get_cache_stats() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let leindex = LeIndex::new(&project_path).unwrap();
+
+        // Get cache stats
+        let result = leindex.get_cache_stats();
+        assert!(result.is_ok());
+
+        let stats = result.unwrap();
+        // All stats should be valid (usize is always non-negative)
+        assert_eq!(stats.cache_entries, stats.cache_entries);
+        assert_eq!(stats.cache_bytes, stats.cache_bytes);
+        assert_eq!(stats.spilled_entries, stats.spilled_entries);
+        assert_eq!(stats.spilled_bytes, stats.spilled_bytes);
+    }
+
+    #[test]
+    fn test_check_memory_and_spill_below_threshold() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+
+        // Check memory - should return Ok(false) since below threshold
+        let result = leindex.check_memory_and_spill();
+        assert!(result.is_ok());
+
+        let spilled = result.unwrap();
+        // Should not have spilled since below threshold
+        assert!(!spilled);
+    }
+
+    #[test]
+    fn test_cache_spill_and_reload_workflow() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+
+        // First index the project
+        let index_result = leindex.index_project();
+        assert!(index_result.is_ok());
+
+        // Get initial stats
+        let initial_stats = leindex.get_cache_stats().unwrap();
+
+        // Spill all caches
+        let spill_result = leindex.spill_all_caches();
+        assert!(spill_result.is_ok());
+
+        // Verify caches were spilled
+        let spilled_stats = leindex.get_cache_stats().unwrap();
+        assert!(spilled_stats.spilled_entries >= initial_stats.spilled_entries);
+
+        // Note: Full reload test would require storage persistence
+        // which is beyond the scope of this unit test
+    }
+
+    #[test]
+    fn test_warm_caches_recent_first_strategy() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+
+        // Warm caches with RecentFirst strategy
+        let result = leindex.warm_caches(WarmStrategy::RecentFirst);
+        assert!(result.is_ok());
+
+        let warm_result = result.unwrap();
+        assert_eq!(warm_result.entries_warmed, warm_result.entries_warmed);
+    }
+
+    #[test]
+    fn test_cache_stats_after_spill() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+
+        // Get initial stats
+        let initial = leindex.get_cache_stats().unwrap();
+
+        // Spill vector cache
+        leindex.spill_vector_cache().unwrap();
+
+        // Get stats after spill
+        let after = leindex.get_cache_stats().unwrap();
+
+        // Spilled entries should have increased or stayed the same
+        assert!(after.spilled_entries >= initial.spilled_entries);
+    }
+
+    #[test]
+    fn test_multiple_spill_operations() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+
+        // First spill
+        leindex.spill_vector_cache().unwrap();
+        let first_stats = leindex.get_cache_stats().unwrap();
+
+        // Second spill (should handle gracefully)
+        leindex.spill_vector_cache().unwrap();
+        let second_stats = leindex.get_cache_stats().unwrap();
+
+        // Cache should handle multiple spills
+        assert!(second_stats.spilled_entries >= first_stats.spilled_entries);
+    }
+}

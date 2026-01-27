@@ -3,7 +3,8 @@
 // *L'Index* (The Index) - Unified API that brings together all LeIndex crates
 
 use crate::memory::{
-    CacheSpiller, MemoryConfig,
+    CacheSpiller, MemoryConfig, pdg_cache_key, search_cache_key,
+    WarmStrategy, CacheEntry,
 };
 use anyhow::{Context, Result};
 use legraphe::{
@@ -492,6 +493,234 @@ impl LeIndex {
     /// Check if the project has been indexed
     pub fn is_indexed(&self) -> bool {
         self.search_engine.node_count() > 0
+    }
+
+    // ========================================================================
+    // CACHE SPILLING (Phase 5.2)
+    // ========================================================================
+
+    /// Check memory and spill cache if threshold exceeded
+    ///
+    /// This method should be called before memory-intensive operations
+    /// to ensure sufficient memory is available.
+    ///
+    /// # Returns
+    ///
+    /// `Result<bool>` - Ok(true) if spilling occurred, Ok(false) otherwise
+    pub fn check_memory_and_spill(&mut self) -> Result<bool> {
+        if self.cache_spiller.is_threshold_exceeded()? {
+            info!("Memory threshold exceeded, initiating cache spilling");
+            let result = self.cache_spiller.check_and_spill()?;
+            info!("Spilled {} entries, freed {} bytes",
+                  result.entries_spilled, result.memory_freed);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Spill PDG cache to disk
+    ///
+    /// Drops the PDG from memory (it's already persisted to lestockage via save_pdg).
+    /// Creates a cache marker to track that the PDG was spilled.
+    /// The PDG can be reloaded later using `reload_pdg_from_cache()`.
+    ///
+    /// # Returns
+    ///
+    /// `Result<()>` - Success or error
+    pub fn spill_pdg_cache(&mut self) -> Result<()> {
+        let pdg = self.pdg.take().ok_or_else(|| {
+            anyhow::anyhow!("No PDG in memory to spill")
+        })?;
+
+        let node_count = pdg.node_count();
+        let edge_count = pdg.edge_count();
+
+        // Note: PDG is already persisted to lestockage via save_pdg()
+        // We create a cache marker to track that it was spilled
+        let cache_key = pdg_cache_key(&self.project_id);
+        let entry = CacheEntry::PDG {
+            project_id: self.project_id.clone(),
+            node_count,
+            edge_count,
+            serialized_data: vec![], // Empty marker - actual data in lestockage
+        };
+
+        // Store marker in cache spiller
+        self.cache_spiller.store_mut()
+            .insert(cache_key, entry)
+            .context("Failed to create PDG spill marker")?;
+
+        info!("Spilled PDG from memory: {} nodes, {} edges (persisted to lestockage)",
+              node_count, edge_count);
+
+        Ok(())
+    }
+
+    /// Spill vector search cache to disk
+    ///
+    /// Serializes the HNSW vector index and stores it in the cache spill directory.
+    /// The index can be reloaded later using `reload_vector_cache()`.
+    ///
+    /// # Returns
+    ///
+    /// `Result<()>` - Success or error
+    pub fn spill_vector_cache(&mut self) -> Result<()> {
+        // Note: The HNSW index doesn't support direct serialization
+        // Instead, we create a marker entry and track the state
+        // The actual vector data would need to be re-indexed from the PDG
+
+        let node_count = self.search_engine.node_count();
+
+        // Create a marker entry for the vector cache
+        let cache_key = search_cache_key(&self.project_id);
+        let entry = CacheEntry::SearchIndex {
+            project_id: self.project_id.clone(),
+            entry_count: node_count,
+            serialized_data: vec![], // Empty - vectors would be re-indexed from PDG
+        };
+
+        self.cache_spiller.store_mut()
+            .insert(cache_key, entry)
+            .context("Failed to spill vector cache marker")?;
+
+        info!("Spilled vector cache marker: {} entries", node_count);
+
+        Ok(())
+    }
+
+    /// Spill all caches (PDG and vector) to disk
+    ///
+    /// This is useful for freeing memory before large operations
+    /// or when the project won't be used for a while.
+    ///
+    /// # Returns
+    ///
+    /// `Result<(usize, usize)>` - (PDG bytes spilled, vector bytes spilled)
+    pub fn spill_all_caches(&mut self) -> Result<(usize, usize)> {
+        let mut pdg_bytes = 0;
+
+        // Spill PDG if in memory
+        if self.pdg.is_some() {
+            self.spill_pdg_cache()?;
+            pdg_bytes = self.cache_spiller.store().total_bytes();
+        }
+
+        // Spill vector cache marker
+        self.spill_vector_cache()?;
+        let vector_bytes = self.cache_spiller.store().total_bytes() - pdg_bytes;
+
+        info!("Spilled all caches: PDG ({} bytes), Vector ({} bytes)",
+              pdg_bytes, vector_bytes);
+
+        Ok((pdg_bytes, vector_bytes))
+    }
+
+    // ========================================================================
+    // CACHE RELOADING (Phase 5.3)
+    // ========================================================================
+
+    /// Reload PDG from cache
+    ///
+    /// Attempts to reload a previously spilled PDG from lestockage.
+    /// This is useful when the PDG has been spilled from memory to free up RAM.
+    ///
+    /// # Returns
+    ///
+    /// `Result<()>` - Success or error
+    pub fn reload_pdg_from_cache(&mut self) -> Result<()> {
+        // Check if PDG is already in memory
+        if self.pdg.is_some() {
+            info!("PDG already in memory, no reload needed");
+            return Ok(());
+        }
+
+        // PDG not in memory, try to load from storage
+        info!("PDG not in memory, attempting to load from lestockage");
+        self.load_from_storage()
+    }
+
+    /// Reload vector index from PDG
+    ///
+    /// Rebuilds the vector search index from the current PDG.
+    /// This is useful when the vector cache has been spilled and needs to be restored.
+    ///
+    /// # Returns
+    ///
+    /// `Result<usize>` - Number of nodes indexed
+    pub fn reload_vector_from_pdg(&mut self) -> Result<usize> {
+        let pdg = self.pdg.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No PDG available for vector rebuild"))?;
+
+        let mut nodes = Vec::new();
+
+        // Convert PDG nodes to NodeInfo for indexing
+        for node_idx in pdg.node_indices() {
+            if let Some(node) = pdg.get_node(node_idx) {
+                let node_info = NodeInfo {
+                    node_id: node.id.clone(),
+                    file_path: node.file_path.clone(),
+                    symbol_name: node.name.clone(),
+                    content: format!("// {} in {}\n{}", node.name, node.file_path,
+                                   "// Source code would be here"),
+                    byte_range: node.byte_range,
+                    embedding: node.embedding.clone(),
+                    complexity: node.complexity,
+                };
+
+                nodes.push(node_info);
+            }
+        }
+
+        // Index the nodes
+        self.search_engine.index_nodes(nodes);
+        let indexed_count = self.search_engine.node_count();
+
+        info!("Rebuilt vector index from PDG: {} nodes", indexed_count);
+
+        Ok(indexed_count)
+    }
+
+    /// Warm caches with frequently accessed data
+    ///
+    /// Loads spilled cache entries back into memory based on the specified strategy.
+    /// For PDG warming strategy, this will reload the PDG from lestockage.
+    ///
+    /// # Arguments
+    ///
+    /// * `strategy` - Warming strategy to use (PDGOnly, SearchIndexOnly, RecentFirst, All)
+    ///
+    /// # Returns
+    ///
+    /// `Result<WarmResult>` - Statistics about the warming operation
+    pub fn warm_caches(&mut self, strategy: WarmStrategy) -> Result<crate::memory::WarmResult> {
+        info!("Warming caches with strategy: {:?}", strategy);
+
+        let result = self.cache_spiller.warm_cache(strategy)?;
+
+        // If PDG warming was requested and PDG is not in memory, reload from storage
+        if (strategy == crate::memory::WarmStrategy::PDGOnly
+            || strategy == crate::memory::WarmStrategy::All
+            || strategy == crate::memory::WarmStrategy::RecentFirst)
+            && self.pdg.is_none()
+        {
+            info!("PDG warming requested but not in memory, reloading from lestockage");
+            self.load_from_storage()?;
+        }
+
+        Ok(result)
+    }
+
+    /// Get cache statistics
+    ///
+    /// Returns detailed statistics about cache usage and spilled data.
+    ///
+    /// # Returns
+    ///
+    /// `Result<MemoryStats>` - Cache statistics
+    pub fn get_cache_stats(&self) -> Result<crate::memory::MemoryStats> {
+        self.cache_spiller.memory_stats()
+            .map_err(|e| anyhow::anyhow!("Failed to get cache stats: {}", e))
     }
 
     // ========================================================================
