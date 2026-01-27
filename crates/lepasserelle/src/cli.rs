@@ -80,8 +80,8 @@ pub enum Commands {
         #[arg(long = "host", default_value = "127.0.0.1")]
         host: String,
 
-        /// Port to listen on
-        #[arg(long = "port", default_value = "3000")]
+        /// Port to listen on (default: 47268, override with LEINDEX_PORT env var)
+        #[arg(long = "port", default_value = "47268")]
         port: u16,
     },
 }
@@ -298,6 +298,15 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 
 /// Serve command implementation - Start MCP server
 async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
+    // Check for environment variable override (for customization via LEINDEX_PORT)
+    let port = if let Ok(env_port) = std::env::var("LEINDEX_PORT") {
+        env_port.parse::<u16>()
+            .unwrap_or(port)
+            .min(65535)
+    } else {
+        port
+    };
+
     // Parse the address
     let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
@@ -323,6 +332,8 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
     println!("  POST /mcp           - JSON-RPC 2.0 endpoint");
     println!("  GET  /mcp/tools/list - List available tools");
     println!("  GET  /health         - Health check");
+    println!("\nConfiguration:");
+    println!("  Port: {} (override with LEINDEX_PORT env var)", port);
     println!("\nPress Ctrl+C to stop the server\n");
 
     server.run().await
