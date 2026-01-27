@@ -317,21 +317,12 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
     let server = McpServer::with_address(addr, leindex)
         .context("Failed to create MCP server")?;
 
-    println!("\nMaestro-LeIndex MCP Server\n");
+    println!("\nLeIndex MCP Server\n");
     println!("Server starting on http://{}\n", addr);
     println!("Available endpoints:");
     println!("  POST /mcp           - JSON-RPC 2.0 endpoint");
     println!("  GET  /mcp/tools/list - List available tools");
     println!("  GET  /health         - Health check");
-    println!("\nMCP Configuration for AI Assistants:");
-    println!("  {{");
-    println!("    \"mcpServers\": {{");
-    println!("      \"maestro-leindex\": {{");
-    println!("        \"command\": \"leindex\",");
-    println!("        \"args\": [\"serve\", \"--host\", \"127.0.0.1\", \"--port\", \"{}\"]", port);
-    println!("      }}");
-    println!("    }}");
-    println!("  }}");
     println!("\nPress Ctrl+C to stop the server\n");
 
     server.run().await
