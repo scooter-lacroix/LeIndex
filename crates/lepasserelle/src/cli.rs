@@ -135,6 +135,7 @@ fn init_logging_impl(verbose: bool) {
 
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(level)
+        .with_writer(std::io::stderr)
         .finish();
 
     let _ = tracing::subscriber::set_global_default(subscriber);
