@@ -21,8 +21,8 @@ impl NodeHash {
         &self.0
     }
 
-    /// Parse from string
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse from hex string
+    pub fn from_str_name(s: &str) -> Option<Self> {
         if s.len() == 64 {
             Some(Self(s.to_string()))
         } else {

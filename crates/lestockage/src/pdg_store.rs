@@ -269,7 +269,7 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
     })?.collect::<SqliteResult<Vec<_>>>()?;
 
     for (db_id, file_path, symbol_name, node_type_str, complexity, _content_hash, embedding_blob) in node_rows {
-        let node_type = StorageNodeType::from_str(&node_type_str)
+        let node_type = StorageNodeType::from_str_name(&node_type_str)
             .ok_or_else(|| PdgStoreError::Deserialization(format!("Invalid node type: {}", node_type_str)))?;
 
         // Convert embedding BLOB back to Vec<f32>
@@ -324,7 +324,7 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
         let callee_node_id = *db_id_to_node_id.get(&callee_id)
             .ok_or_else(|| PdgStoreError::NodeNotFound(callee_id))?;
 
-        let edge_type = StorageEdgeType::from_str(&edge_type_str)
+        let edge_type = StorageEdgeType::from_str_name(&edge_type_str)
             .ok_or_else(|| PdgStoreError::Deserialization(format!("Invalid edge type: {}", edge_type_str)))?;
 
         let metadata = match metadata_json.as_deref() {

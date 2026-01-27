@@ -32,7 +32,7 @@ impl EdgeType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_str_name(s: &str) -> Option<Self> {
         match s {
             "call" => Some(EdgeType::Call),
             "data_dependency" => Some(EdgeType::DataDependency),
@@ -117,7 +117,7 @@ impl<'a> EdgeStore<'a> {
             Ok(EdgeRecord {
                 caller_id: row.get(0)?,
                 callee_id: row.get(1)?,
-                edge_type: EdgeType::from_str(&edge_type_str).unwrap_or(EdgeType::Call),
+                edge_type: EdgeType::from_str_name(&edge_type_str).unwrap_or(EdgeType::Call),
                 metadata,
             })
         })?.collect::<SqliteResult<Vec<_>>>()?;
@@ -141,7 +141,7 @@ impl<'a> EdgeStore<'a> {
             Ok(EdgeRecord {
                 caller_id: row.get(0)?,
                 callee_id: row.get(1)?,
-                edge_type: EdgeType::from_str(&edge_type_str).unwrap_or(EdgeType::Call),
+                edge_type: EdgeType::from_str_name(&edge_type_str).unwrap_or(EdgeType::Call),
                 metadata,
             })
         })?.collect::<SqliteResult<Vec<_>>>()?;
@@ -165,7 +165,7 @@ impl<'a> EdgeStore<'a> {
             Ok(EdgeRecord {
                 caller_id: row.get(0)?,
                 callee_id: row.get(1)?,
-                edge_type: EdgeType::from_str(&edge_type_str).unwrap_or(EdgeType::Call),
+                edge_type: EdgeType::from_str_name(&edge_type_str).unwrap_or(EdgeType::Call),
                 metadata,
             })
         })?.collect::<SqliteResult<Vec<_>>>()?;

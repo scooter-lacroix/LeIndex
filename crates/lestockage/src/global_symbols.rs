@@ -54,7 +54,7 @@ impl SymbolType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_str_name(s: &str) -> Option<Self> {
         match s {
             "function" => Some(SymbolType::Function),
             "class" => Some(SymbolType::Class),
@@ -101,7 +101,7 @@ impl RefType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_str_name(s: &str) -> Option<Self> {
         match s {
             "call" => Some(RefType::Call),
             "inheritance" => Some(RefType::Inheritance),
@@ -141,7 +141,7 @@ impl DepType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_str_name(s: &str) -> Option<Self> {
         match s {
             "direct" => Some(DepType::Direct),
             "transitive" => Some(DepType::Transitive),
@@ -293,7 +293,7 @@ impl<'a> GlobalSymbolTable<'a> {
                     symbol_id: row.get(0)?,
                     project_id: row.get(1)?,
                     symbol_name: row.get(2)?,
-                    symbol_type: SymbolType::from_str(row.get::<_, String>(3)?.as_str())
+                    symbol_type: SymbolType::from_str_name(row.get::<_, String>(3)?.as_str())
                         .unwrap_or(SymbolType::Function),
                     signature: row.get(4)?,
                     file_path: row.get(5)?,
@@ -328,7 +328,7 @@ impl<'a> GlobalSymbolTable<'a> {
                     symbol_id: row.get(0)?,
                     project_id: row.get(1)?,
                     symbol_name: row.get(2)?,
-                    symbol_type: SymbolType::from_str(row.get::<_, String>(3)?.as_str())
+                    symbol_type: SymbolType::from_str_name(row.get::<_, String>(3)?.as_str())
                         .unwrap_or(SymbolType::Function),
                     signature: row.get(4)?,
                     file_path: row.get(5)?,
@@ -359,7 +359,7 @@ impl<'a> GlobalSymbolTable<'a> {
                     symbol_id: row.get(0)?,
                     project_id: row.get(1)?,
                     symbol_name: row.get(2)?,
-                    symbol_type: SymbolType::from_str(row.get::<_, String>(3)?.as_str())
+                    symbol_type: SymbolType::from_str_name(row.get::<_, String>(3)?.as_str())
                         .unwrap_or(SymbolType::Function),
                     signature: row.get(4)?,
                     file_path: row.get(5)?,
@@ -389,7 +389,7 @@ impl<'a> GlobalSymbolTable<'a> {
                     symbol_id: row.get(0)?,
                     project_id: row.get(1)?,
                     symbol_name: row.get(2)?,
-                    symbol_type: SymbolType::from_str(row.get::<_, String>(3)?.as_str())
+                    symbol_type: SymbolType::from_str_name(row.get::<_, String>(3)?.as_str())
                         .unwrap_or(SymbolType::Function),
                     signature: row.get(4)?,
                     file_path: row.get(5)?,
@@ -442,7 +442,7 @@ impl<'a> GlobalSymbolTable<'a> {
                     source_symbol_id: row.get(2)?,
                     target_project_id: row.get(3)?,
                     target_symbol_id: row.get(4)?,
-                    ref_type: RefType::from_str(row.get::<_, String>(5)?.as_str())
+                    ref_type: RefType::from_str_name(row.get::<_, String>(5)?.as_str())
                         .unwrap_or(RefType::Call),
                 })
             })
@@ -470,7 +470,7 @@ impl<'a> GlobalSymbolTable<'a> {
                     source_symbol_id: row.get(2)?,
                     target_project_id: row.get(3)?,
                     target_symbol_id: row.get(4)?,
-                    ref_type: RefType::from_str(row.get::<_, String>(5)?.as_str())
+                    ref_type: RefType::from_str_name(row.get::<_, String>(5)?.as_str())
                         .unwrap_or(RefType::Call),
                 })
             })
@@ -511,7 +511,7 @@ impl<'a> GlobalSymbolTable<'a> {
                     dep_id: row.get(0)?,
                     project_id: row.get(1)?,
                     depends_on_project_id: row.get(2)?,
-                    dependency_type: DepType::from_str(row.get::<_, String>(3)?.as_str())
+                    dependency_type: DepType::from_str_name(row.get::<_, String>(3)?.as_str())
                         .unwrap_or(DepType::Direct),
                 })
             })
@@ -539,7 +539,7 @@ impl<'a> GlobalSymbolTable<'a> {
                     dep_id: row.get(0)?,
                     project_id: row.get(1)?,
                     depends_on_project_id: row.get(2)?,
-                    dependency_type: DepType::from_str(row.get::<_, String>(3)?.as_str())
+                    dependency_type: DepType::from_str_name(row.get::<_, String>(3)?.as_str())
                         .unwrap_or(DepType::Direct),
                 })
             })
@@ -565,7 +565,7 @@ impl<'a> GlobalSymbolTable<'a> {
                     symbol_id: row.get(0)?,
                     project_id: row.get(1)?,
                     symbol_name: row.get(2)?,
-                    symbol_type: SymbolType::from_str(row.get::<_, String>(3)?.as_str())
+                    symbol_type: SymbolType::from_str_name(row.get::<_, String>(3)?.as_str())
                         .unwrap_or(SymbolType::Function),
                     signature: row.get(4)?,
                     file_path: row.get(5)?,

@@ -39,7 +39,7 @@ impl NodeType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn from_str_name(s: &str) -> Option<Self> {
         match s {
             "function" => Some(NodeType::Function),
             "class" => Some(NodeType::Class),
@@ -126,7 +126,7 @@ impl<'a> NodeStore<'a> {
                 project_id: row.get(1)?,
                 file_path: row.get(2)?,
                 symbol_name: row.get(3)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(4)?).unwrap_or(NodeType::Function),
+                node_type: NodeType::from_str_name(&row.get::<_, String>(4)?).unwrap_or(NodeType::Function),
                 signature: row.get(5)?,
                 complexity: row.get(6)?,
                 content_hash: row.get(7)?,
@@ -150,7 +150,7 @@ impl<'a> NodeStore<'a> {
                 project_id: row.get(1)?,
                 file_path: row.get(2)?,
                 symbol_name: row.get(3)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(4)?).unwrap_or(NodeType::Function),
+                node_type: NodeType::from_str_name(&row.get::<_, String>(4)?).unwrap_or(NodeType::Function),
                 signature: row.get(5)?,
                 complexity: row.get(6)?,
                 content_hash: row.get(7)?,
@@ -174,7 +174,7 @@ impl<'a> NodeStore<'a> {
                 project_id: row.get(1)?,
                 file_path: row.get(2)?,
                 symbol_name: row.get(3)?,
-                node_type: NodeType::from_str(&row.get::<_, String>(4)?).unwrap_or(NodeType::Function),
+                node_type: NodeType::from_str_name(&row.get::<_, String>(4)?).unwrap_or(NodeType::Function),
                 signature: row.get(5)?,
                 complexity: row.get(6)?,
                 content_hash: row.get(7)?,
