@@ -32,8 +32,9 @@ LEINDEX_HOME="${LEINDEX_HOME:-$HOME/.leindex}"
 CONFIG_DIR="${LEINDEX_HOME}/config"
 DATA_DIR="${LEINDEX_HOME}/data"
 LOG_DIR="${LEINDEX_HOME}/logs"
-# Install to XDG standard location which is in everyone's PATH
-INSTALL_BIN_DIR="${HOME}/.local/bin"
+# Install to standard system-wide location (requires sudo)
+# This ensures leindex is accessible to all AI tools regardless of PATH
+INSTALL_BIN_DIR="/usr/local/bin"
 
 # ============================================================================
 # COLOR OUTPUT
@@ -271,10 +272,26 @@ install_leindex() {
     # Install binary
     local binary="target/release/$PROJECT_SLUG"
     if [[ -f "$binary" ]]; then
-        mkdir -p "$INSTALL_BIN_DIR"
-        cp "$binary" "$INSTALL_BIN_DIR/"
-        chmod +x "$INSTALL_BIN_DIR/$PROJECT_SLUG"
-        log_success "Binary installed to: $INSTALL_BIN_DIR/$PROJECT_SLUG"
+        log_info "Installing to system directory: $INSTALL_BIN_DIR"
+        echo ""
+
+        # /usr/local/bin should exist on all Unix systems, but check first
+        if [[ ! -d "$INSTALL_BIN_DIR" ]]; then
+            log_info "Creating $INSTALL_BIN_DIR (requires sudo)..."
+            if ! sudo mkdir -p "$INSTALL_BIN_DIR" 2>/dev/null; then
+                log_error "Failed to create $INSTALL_BIN_DIR (sudo required)"
+                log_error "Please run: sudo mkdir -p $INSTALL_BIN_DIR"
+                exit 1
+            fi
+        fi
+
+        # Copy binary with sudo
+        if sudo cp "$binary" "$INSTALL_BIN_DIR/" && sudo chmod +x "$INSTALL_BIN_DIR/$PROJECT_SLUG"; then
+            log_success "Binary installed to: $INSTALL_BIN_DIR/$PROJECT_SLUG"
+        else
+            log_error "Failed to install binary (sudo required)"
+            exit 1
+        fi
     else
         log_error "Binary not found after build"
         if [[ "$should_cleanup" == true ]]; then
@@ -316,9 +333,7 @@ verify_installation() {
 setup_directories() {
     print_step 4 4 "Setting up Directories"
 
-    # Create install bin directory and other directories
-    mkdir -p "$INSTALL_BIN_DIR"
-
+    # Create LeIndex data directories (bin directory is created during install with sudo)
     for dir in "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR"; do
         if [[ ! -d "$dir" ]]; then
             mkdir -p "$dir"
@@ -328,21 +343,20 @@ setup_directories() {
 }
 
 update_path() {
-    print_header "Update PATH"
+    print_header "Installation Location"
 
-    # ~/.local/bin should already be in PATH via standard XDG conventions
-    # Most Linux distributions include it in default PATH
-    log_info "Binary installed to ~/.local/bin (standard XDG location)"
-    log_info "This location is typically already in your PATH"
+    # Binary is installed to /usr/local/bin which is always in PATH
+    log_info "Binary installed to /usr/local/bin (system-wide location)"
+    log_info "This location is in the standard PATH for all Unix-like systems"
 
-    # Verify ~/.local/bin is in PATH
-    if echo ":$PATH:" | grep -q ":$HOME/.local/bin:"; then
-        log_success "~/.local/bin is already in PATH"
+    # Verify /usr/local/bin is in PATH
+    if echo ":$PATH:" | grep -q ":/usr/local/bin:"; then
+        log_success "/usr/local/bin is in PATH"
     else
-        print_warning "~/.local/bin is not in your PATH"
+        print_warning "/usr/local/bin is not in your PATH"
         echo ""
-        echo "Add the following to your shell configuration (~/.bashrc or ~/.zshrc):"
-        echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
+        echo "This is unusual. Add the following to your shell configuration:"
+        echo "  export PATH=\"/usr/local/bin:\$PATH\""
         echo ""
         echo "Then restart your shell or run:"
         echo "  source ~/.bashrc  # or ~/.zshrc"
