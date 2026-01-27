@@ -3,6 +3,15 @@
 # LeIndex Universal Installer
 # Version: 5.0.0 - Rust Edition
 # Platform: Linux/Unix
+#
+# One-line installer:
+#   curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+#
+# Or with wget:
+#   wget -qO- https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+#
+# Non-interactive mode:
+#   curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash -s -- --yes
 #############################################
 
 set -euo pipefail
@@ -16,6 +25,7 @@ readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
 readonly MIN_RUST_MINOR=75
 readonly REPO_URL="https://github.com/scooter-lacroix/leindex"
+NONINTERACTIVE=false
 
 # Installation paths
 LEINDEX_HOME="${LEINDEX_HOME:-$HOME/.leindex}"
@@ -171,17 +181,65 @@ install_leindex() {
         install_method="source"
         repo_dir="$(pwd)"
     else
-        # Not in repo - skip clone since upstream is outdated Python version
-        # Just build from local if we have a Cargo.toml
-        if [[ -f "Cargo.toml" ]] && cargo check --quiet 2>/dev/null; then
-            log_info "Building from current directory..."
-            install_method="source"
-            repo_dir="$(pwd)"
+        # Not in a LeIndex repository - offer to clone from remote
+        local should_clone=false
+        if [[ "$NONINTERACTIVE" == true ]]; then
+            log_info "Non-interactive mode: Cloning from remote..."
+            should_clone=true
         else
-            log_error "No LeIndex source found. Please run this installer from the LeIndex repository root."
-            log_info "Get LeIndex from: https://github.com/scooter-lacroix/leindex"
-            log_info "Then run this installer from the repository root directory."
-            exit 1
+            log_warn "Not in a LeIndex repository"
+            echo ""
+            echo "LeIndex can be installed from:"
+            echo "  ${CYAN}1.${NC} A local clone (if you've already cloned the repository)"
+            echo "  ${CYAN}2.${NC} Remote repository (requires git)"
+            echo ""
+            read -p "Install from remote? [y/N] " -n 1 -r
+            echo ""
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                should_clone=true
+            fi
+        fi
+
+        if [[ "$should_clone" == true ]]; then
+            log_info "Cloning LeIndex from $REPO_URL..."
+
+            # Create temporary directory for clone
+            local tmp_dir=$(mktemp -d)
+            cd "$tmp_dir" || exit 1
+
+            if git clone --depth 1 "$REPO_URL" leindex 2>&1 | tee -a "$INSTALL_LOG"; then
+                cd leindex || exit 1
+                repo_dir="$(pwd)"
+                should_cleanup=true
+
+                # Verify this is the Rust version
+                if [[ ! -f "Cargo.toml" ]]; then
+                    log_error "The cloned repository does not contain Rust code (no Cargo.toml found)"
+                    log_error "You may have cloned the legacy Python version"
+                    log_info "Please ensure the remote repository has been updated to the Rust version"
+                    log_info "Or install from a local clone: git clone <rust-repo-url> && cd leindex && ./install.sh"
+                    cd /
+                    rm -rf "$tmp_dir"
+                    exit 1
+                fi
+
+                log_success "Repository cloned to: $repo_dir"
+            else
+                log_error "Failed to clone repository"
+                cd /
+                rm -rf "$tmp_dir"
+                exit 1
+            fi
+        else
+            log_error "Installation cancelled"
+            echo ""
+            echo "To install LeIndex, first clone the repository:"
+            echo "  ${CYAN}git clone $REPO_URL${NC}"
+            echo "  ${CYAN}cd leindex${NC}"
+            echo "  ${CYAN}./install.sh${NC}"
+            echo ""
+            echo "Make sure you're cloning the Rust version, not the legacy Python version."
+            exit 0
         fi
     fi
 
@@ -321,6 +379,26 @@ detect_ai_tools() {
 # ============================================================================
 
 main() {
+    # Parse arguments
+    for arg in "$@"; do
+        case $arg in
+            --yes|-y)
+                NONINTERACTIVE=true
+                ;;
+            --help|-h)
+                echo "LeIndex Installer v$SCRIPT_VERSION"
+                echo ""
+                echo "Usage: $0 [--yes|--help]"
+                echo ""
+                echo "Options:"
+                echo "  --yes, -y    Non-interactive mode (auto-confirm all prompts)"
+                echo "  --help, -h   Show this help message"
+                echo ""
+                exit 0
+                ;;
+        esac
+    done
+
     print_header "LeIndex Rust Installer"
 
     echo "  ${BOLD}Project:${NC}     $PROJECT_NAME"
@@ -335,13 +413,18 @@ main() {
         echo ""
         log_warn "Rust is not installed or is too old"
         echo ""
-        read -p "Would you like to install Rust now? [y/N] " -n 1 -r
-        echo ""
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
+        if [[ "$NONINTERACTIVE" == true ]]; then
+            log_info "Non-interactive mode: Installing Rust automatically..."
             install_rust
         else
-            log_error "Rust is required to build LeIndex"
-            exit 1
+            read -p "Would you like to install Rust now? [y/N] " -n 1 -r
+            echo ""
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                install_rust
+            else
+                log_error "Rust is required to build LeIndex"
+                exit 1
+            fi
         fi
     fi
 
