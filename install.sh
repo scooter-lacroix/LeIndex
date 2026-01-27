@@ -872,6 +872,91 @@ show_mcp_config_instructions() {
     echo ""
 }
 
+offer_start_server() {
+    print_header "Start LeIndex MCP Server"
+
+    echo "The LeIndex MCP server needs to be running for AI tools to connect."
+    echo ""
+    echo "Options:"
+    echo "  ${CYAN}1)${NC} Start server now (runs until you stop it with Ctrl+C)"
+    echo "  ${CYAN}2)${NC} Start server in background (persistent across restarts)"
+    echo "  ${CYAN}3)${NC} Skip (start manually later with 'leindex serve')"
+    echo ""
+    read -p "Choose an option [1-3]: " -n 1 -r
+    echo ""
+
+    case $REPLY in
+        1)
+            log_info "Starting LeIndex MCP server..."
+            echo ""
+            echo "Server is running. Press ${CYAN}Ctrl+C${NC} to stop it."
+            echo ""
+            echo "Your AI tools should now be able to connect to LeIndex."
+            echo ""
+            echo "To start the server in the background in the future:"
+            echo "  ${CYAN}nohup leindex serve > ~/.leindex/logs/server.log 2>&1 &${NC}"
+            echo ""
+            # Start server in foreground
+            exec "$INSTALL_BIN_DIR/$PROJECT_SLUG" serve
+            ;;
+        2)
+            log_info "Starting LeIndex MCP server in background..."
+            echo ""
+
+            # Check if server is already running
+            if pgrep -f "$PROJECT_SLUG serve" > /dev/null; then
+                log_warn "LeIndex server is already running!"
+                echo ""
+                echo "Server PID: $(pgrep -f '$PROJECT_SLUG serve')"
+                echo ""
+                return 0
+            fi
+
+            # Create log directory
+            mkdir -p "$LOG_DIR"
+
+            # Start server in background
+            nohup "$INSTALL_BIN_DIR/$PROJECT_SLUG" serve > "$LOG_DIR/server.log" 2>&1 &
+            local server_pid=$!
+
+            # Wait a bit and check if server started successfully
+            sleep 2
+
+            if pgrep -f "$PROJECT_SLUG serve" > /dev/null; then
+                log_success "LeIndex server started successfully!"
+                echo ""
+                echo "  ${BOLD}Server PID:${NC}     $server_pid"
+                echo "  ${BOLD}Log file:${NC}       $LOG_DIR/server.log"
+                echo "  ${BOLD}Server URL:${NC}     http://127.0.0.1:47268/mcp"
+                echo ""
+                echo "To stop the server:"
+                echo "  ${CYAN}kill $server_pid${NC}"
+                echo "  ${CYAN}pkill -f '$PROJECT_SLUG serve'${NC}"
+                echo ""
+                echo "To restart the server:"
+                echo "  ${CYAN}$PROJECT_SLUG serve${NC}"
+                echo ""
+                echo "To view logs:"
+                echo "  ${CYAN}tail -f $LOG_DIR/server.log${NC}"
+                echo ""
+            else
+                log_error "Failed to start server. Check logs: $LOG_DIR/server.log"
+                return 1
+            fi
+            ;;
+        3|*)
+            log_info "Skipping server startup"
+            echo ""
+            echo "To start the server manually:"
+            echo "  ${CYAN}$PROJECT_SLUG serve${NC}"
+            echo ""
+            echo "Or start it in the background:"
+            echo "  ${CYAN}nohup $PROJECT_SLUG serve > ~/.leindex/logs/server.log 2>&1 &${NC}"
+            echo ""
+            ;;
+    esac
+}
+
 # ============================================================================
 # MAIN INSTALLATION FLOW
 # ============================================================================
@@ -943,6 +1028,11 @@ main() {
 
     # Detect AI tools
     detect_ai_tools
+
+    # Offer to start LeIndex server
+    if [[ "$NONINTERACTIVE" != true ]]; then
+        offer_start_server
+    fi
 
     # Success message
     print_header "Installation Complete!"
