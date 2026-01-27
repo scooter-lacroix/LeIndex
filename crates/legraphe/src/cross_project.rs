@@ -4,7 +4,7 @@
 // enabling tracking of external node references and merging graphs
 // from multiple projects.
 
-use crate::pdg::{ProgramDependenceGraph, NodeId, EdgeId, Node, NodeType};
+use crate::pdg::{ProgramDependenceGraph, NodeId, EdgeId, NodeType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -299,6 +299,7 @@ pub enum MergeError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pdg::Node;
 
     fn create_test_node(name: &str) -> Node {
         Node {
