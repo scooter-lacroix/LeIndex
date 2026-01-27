@@ -2,6 +2,8 @@
 
 <div align="center">
 
+<img src="leindex.jpeg" alt="LeIndex" width="600"/>
+
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
 [![MCP Server](https://img.shields.io/badge/MCP-Server-blue?style=for-the-badge)](https://modelcontextprotocol.io)
 [![Tests](https://img.shields.io/badge/Tests-339%2F339-passing-success?style=for-the-badge)](https://github.com/scooter-lacroix/leindex)
