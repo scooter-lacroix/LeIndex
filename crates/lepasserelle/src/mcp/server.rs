@@ -78,26 +78,47 @@ impl McpServer {
     /// ```ignore
     /// let leindex = LeIndex::new("/path/to/project")?;
     /// let config = McpServerConfig::default();
-    /// let server = McpServer::new(config, leindex);
+    /// let server = McpServer::new(config, leindex)?;
     /// server.run().await?;
     /// ```
-    pub fn new(config: McpServerConfig, leindex: LeIndex) -> Self {
-        let handlers = vec![
-            ToolHandler::Index(IndexHandler),
-            ToolHandler::Search(SearchHandler),
-            ToolHandler::DeepAnalyze(DeepAnalyzeHandler),
-            ToolHandler::Context(ContextHandler),
-            ToolHandler::Diagnostics(DiagnosticsHandler),
-        ];
-
+    pub fn new(config: McpServerConfig, leindex: LeIndex) -> anyhow::Result<Self> {
         // Initialize global state
         let state = Arc::new(Mutex::new(leindex));
-        let _ = SERVER_STATE.set(state.clone());
-        let _ = HANDLERS.set(handlers);
+        SERVER_STATE.set(state.clone())
+            .map_err(|_| anyhow::anyhow!("Server state already initialized"))?;
 
-        info!("Registered {} tool handlers", HANDLERS.get().unwrap().len());
+        // Initialize handlers
+        let handlers: Vec<ToolHandler> = vec![
+            ToolHandler::DeepAnalyze(DeepAnalyzeHandler),
+            ToolHandler::Diagnostics(DiagnosticsHandler),
+            ToolHandler::Index(IndexHandler),
+            ToolHandler::Context(ContextHandler),
+            ToolHandler::Search(SearchHandler),
+        ];
+        HANDLERS.set(handlers)
+            .map_err(|_| anyhow::anyhow!("Handlers already initialized"))?;
 
-        Self { config, _state: state }
+        info!("MCP server initialized");
+
+        Ok(Self { config, _state: state })
+    }
+
+    /// Create MCP server with custom configuration
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_address` - Address to bind the server to
+    /// * `leindex` - LeIndex instance to use for operations
+    ///
+    /// # Returns
+    ///
+    /// `Result<McpServer>` - New server instance or error
+    pub fn with_address(bind_address: SocketAddr, leindex: LeIndex) -> anyhow::Result<Self> {
+        let config = McpServerConfig {
+            bind_address,
+            ..Default::default()
+        };
+        Self::new(config, leindex)
     }
 
     /// Run the MCP server

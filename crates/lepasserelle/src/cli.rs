@@ -4,8 +4,10 @@
 
 use anyhow::Context;
 use crate::leindex::LeIndex;
+use crate::mcp::McpServer;
 use anyhow::Result as AnyhowResult;
 use clap::{Parser, Subcommand};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
@@ -71,6 +73,17 @@ pub enum Commands {
 
     /// Show system diagnostics
     Diagnostics,
+
+    /// Start MCP server for AI assistant integration
+    Serve {
+        /// Host address to bind to
+        #[arg(long = "host", default_value = "127.0.0.1")]
+        host: String,
+
+        /// Port to listen on
+        #[arg(long = "port", default_value = "3000")]
+        port: u16,
+    },
 }
 
 impl Cli {
@@ -95,6 +108,9 @@ impl Cli {
             }
             Commands::Diagnostics => {
                 cmd_diagnostics_impl(global_project).await
+            }
+            Commands::Serve { host, port } => {
+                cmd_serve_impl(host, port).await
             }
         }
     }
@@ -276,6 +292,41 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     if diag.memory_threshold_exceeded {
         println!("  ⚠️  Memory threshold exceeded!");
     }
+
+    Ok(())
+}
+
+/// Serve command implementation - Start MCP server
+async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
+    // Parse the address
+    let addr: SocketAddr = format!("{}:{}", host, port)
+        .parse()
+        .context("Invalid address or port")?;
+
+    info!("Starting MCP server on {}", addr);
+
+    // Create a default LeIndex instance for the server
+    // The server will use the current directory as the project path
+    let current_dir = std::env::current_dir()
+        .context("Failed to get current directory")?;
+
+    let leindex = LeIndex::new(&current_dir)
+        .context("Failed to create LeIndex instance")?;
+
+    // Create and run the MCP server
+    let server = McpServer::with_address(addr, leindex)
+        .context("Failed to create MCP server")?;
+
+    println!("\nLeIndex MCP Server\n");
+    println!("Server starting on http://{}\n", addr);
+    println!("Available endpoints:");
+    println!("  POST /mcp           - JSON-RPC 2.0 endpoint");
+    println!("  GET  /mcp/tools/list - List available tools");
+    println!("  GET  /health         - Health check");
+    println!("\nPress Ctrl+C to stop the server\n");
+
+    server.run().await
+        .context("Server error")?;
 
     Ok(())
 }

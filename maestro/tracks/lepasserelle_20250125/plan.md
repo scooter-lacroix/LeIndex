@@ -2,7 +2,7 @@
 
 **Track ID:** `lepasserelle_20250125`
 **Track Type:** Standard Track
-**Status:** PENDING (Source-Code-Verified: 2025-01-26)
+**Status:** ~90% COMPLETE (Source-Code-Verified: 2026-01-27)
 **Created:** 2025-01-25
 **Parent Track:** `leindex_rust_refactor_20250125`
 
@@ -14,9 +14,9 @@ This track implements the **Integration & API Layer** for LeIndex Rust Renaissan
 
 **IMPORTANT:** This is a **100% Pure Rust implementation**. All PyO3/Python bindings from the prototype are being removed and replaced with native Rust implementations.
 
-**Source-Code-Verified Status:** ~50% COMPLETE ⚠️ IN PROGRESS
+**Source-Code-Verified Status:** ~90% COMPLETE ⚠️ NEARLY DONE
 
-**Current State:** Phase 1 (PyO3 removal) COMPLETE. Phase 4.1-4.3 (Orchestration, Config, Errors) COMPLETE. Phase 2 (MCP Server) PARTIAL - has axum version conflict from libsql/tonic dependency. Working on Phase 3 (CLI).
+**Current State:** Phase 1 (PyO3 removal) COMPLETE. Phase 2 (MCP Server) COMPLETE. Phase 3 (CLI) COMPLETE. Phase 4 (Integration Layer) PARTIAL - orchestration done, config/errors pending. Phase 5 (Memory Management) COMPLETE. Phase 6 (Testing & Documentation) PARTIAL - tests complete, user docs pending.
 
 ---
 
@@ -80,33 +80,33 @@ Implement native Rust MCP server (no Python).
 
 ---
 
-## Phase 3: CLI Interface ❌ NOT STARTED
+## Phase 3: CLI Interface ✅ COMPLETE
 
 ### Objective
 Create command-line interface for LeIndex.
 
-- [ ] **Task 3.1: Implement CLI structure with clap** ❌ NOT STARTED
-  - [ ] `leindex index <path>` - Index a project
-  - [ ] `leindex search <query>` - Search code
-  - [ ] `leindex analyze <query>` - Deep analysis
-  - [ ] `leindex diagnostics` - System status
-  - [ ] `leindex serve` - Start MCP server
-  - **File:** `src/cli.rs` (new file, ~300 lines)
+- [x] **Task 3.1: Implement CLI structure with clap** ✅ COMPLETE (2026-01-27)
+  - [x] `leindex index <path>` - Index a project
+  - [x] `leindex search <query>` - Search code
+  - [x] `leindex analyze <query>` - Deep analysis
+  - [x] `leindex diagnostics` - System status
+  - [x] `leindex serve` - Start MCP server
+  - **File:** `src/cli.rs` (~350 lines)
 
-- [ ] **Task 3.2: Implement index command** ❌ NOT STARTED
-  - [ ] Parse project files with leparse
-  - [ ] Build PDG with legraphe
-  - [ ] Index with lerecherche
-  - [ ] Persist to lestockage
-  - [ ] Show progress and statistics
-  - **File:** `src/cli/index.rs` (new file)
+- [x] **Task 3.2: Implement index command** ✅ COMPLETE
+  - [x] Parse project files with leparse
+  - [x] Build PDG with legraphe
+  - [x] Index with lerecherche
+  - [x] Persist to lestockage
+  - [x] Show progress and statistics
+  - **File:** `src/cli.rs` (cmd_index_impl)
 
-- [ ] **Task 3.3: Implement search command** ❌ NOT STARTED
-  - [ ] Load project from lestockage
-  - [ ] Execute search via lerecherche
-  - [ ] Display results with formatting
-  - [ ] Support JSON output mode
-  - **File:** `src/cli/search.rs` (new file)
+- [x] **Task 3.3: Implement search command** ✅ COMPLETE
+  - [x] Load project from lestockage
+  - [x] Execute search via lerecherche
+  - [x] Display results with formatting
+  - [x] Support JSON output mode
+  - **File:** `src/cli.rs` (cmd_search_impl)
 
 ---
 
