@@ -286,7 +286,8 @@ async fn list_tools_handler() -> Json<Value> {
 async fn health_check_handler() -> Json<Value> {
     Json(serde_json::json!({
         "status": "ok",
-        "service": "leindex-mcp-server",
+        "service": "maestro-leindex",
+        "description": "LeIndex MCP Server for Maestro",
         "version": env!("CARGO_PKG_VERSION")
     }))
 }
