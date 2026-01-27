@@ -161,42 +161,28 @@ install_leindex() {
     local repo_dir=""
     local should_cleanup=false
 
-    # Check if we're in the repo directory
-    if [[ -f "Cargo.toml" ]] && grep -q "$PROJECT_SLUG" Cargo.toml 2>/dev/null; then
+    # Check if we're in the LeIndex repository (local development)
+    if [[ -f "Cargo.toml" ]] && grep -q "name = \"leindex\"" Cargo.toml 2>/dev/null; then
+        log_info "Building from local LeIndex repository..."
+        install_method="local"
+        repo_dir="$(pwd)"
+    elif [[ -f "Cargo.toml" ]] && grep -q "$PROJECT_SLUG" Cargo.toml 2>/dev/null; then
         log_info "Building from current directory..."
         install_method="source"
         repo_dir="$(pwd)"
     else
-        # Not in repo - clone it first
-        log_info "Cloning LeIndex repository..."
-
-        # Create a temporary directory for cloning
-        local tmp_dir
-        tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t 'leindex-install')
-        repo_dir="$tmp_dir/leindex"
-
-        # Clone the repository
-        if command -v git &> /dev/null; then
-            if git clone --depth 1 "$REPO_URL" "$repo_dir" 2>&1 | tee -a "$INSTALL_LOG"; then
-                log_success "Repository cloned to: $repo_dir"
-                should_cleanup=true
-            else
-                log_error "Failed to clone repository"
-                rm -rf "$tmp_dir"
-                exit 1
-            fi
+        # Not in repo - skip clone since upstream is outdated Python version
+        # Just build from local if we have a Cargo.toml
+        if [[ -f "Cargo.toml" ]] && cargo check --quiet 2>/dev/null; then
+            log_info "Building from current directory..."
+            install_method="source"
+            repo_dir="$(pwd)"
         else
-            log_error "git not found. Please install git first:"
-            echo "  Visit: https://git-scm.com/"
-            rm -rf "$tmp_dir"
+            log_error "No LeIndex source found. Please run this installer from the LeIndex repository root."
+            log_info "Get LeIndex from: https://github.com/scooter-lacroix/leindex"
+            log_info "Then run this installer from the repository root directory."
             exit 1
         fi
-
-        cd "$repo_dir" || {
-            log_error "Failed to enter repository directory"
-            rm -rf "$tmp_dir"
-            exit 1
-        }
     fi
 
     # Build from source
@@ -323,7 +309,7 @@ detect_ai_tools() {
             print_bullet "$tool"
         done
         echo ""
-        print_info "LeIndex MCP server can be configured for these tools"
+        log_info "LeIndex MCP server can be configured for these tools"
     else
         print_warning "No AI tools detected"
         log_info "LeIndex will be installed as a standalone tool"
