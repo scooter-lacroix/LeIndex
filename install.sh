@@ -434,6 +434,11 @@ detect_ai_tools() {
         detected_clis+=("Maestro")
     fi
 
+    # LM Studio
+    if [[ -f "$HOME/.lmstudio/mcp.json" ]] || [[ -d "$HOME/.lmstudio" ]]; then
+        detected_clis+=("LM Studio")
+    fi
+
     # Combine all detected tools
     detected_tools=("${detected_ides[@]}" "${detected_clis[@]}")
 
@@ -606,6 +611,12 @@ configure_tool_mcp() {
             config_file="$HOME/.cursor/settings.json"
             backup_file="${config_file}.backup"
             configure_vscode_mcp "$config_file" "$backup_file"
+            return $?
+            ;;
+        "LM Studio")
+            config_file="$HOME/.lmstudio/mcp.json"
+            backup_file="${config_file}.backup"
+            configure_lmstudio_mcp "$config_file" "$backup_file"
             return $?
             ;;
         *)
@@ -817,6 +828,16 @@ PYTHON
     fi
 }
 
+# Configure LM Studio MCP (uses mcp.json format like Cursor)
+configure_lmstudio_mcp() {
+    local config_file="$1"
+    local backup_file="$2"
+
+    # LM Studio uses the same mcp.json format as Cursor/Claude Code
+    configure_json_mcp "$config_file" "$backup_file"
+    return $?
+}
+
 show_mcp_config_instructions() {
     echo "═══════════════════════════════════════════════════"
     echo "  MCP Server Configuration"
@@ -840,6 +861,9 @@ show_mcp_config_instructions() {
     echo ""
     echo "  Zed (~/.config/zed/settings.json):"
     echo '    {"lsp": {"leindex": {"type": "http", "url": "http://127.0.0.1:47268/mcp"}}}'
+    echo ""
+    echo "  LM Studio (~/.lmstudio/mcp.json):"
+    echo '    {"mcpServers": {"leindex": {"type": "http", "url": "http://127.0.0.1:47268/mcp"}}}'
     echo ""
     echo "Note: The LeIndex server must be running for MCP integration to work."
     echo ""
