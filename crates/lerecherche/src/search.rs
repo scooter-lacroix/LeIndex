@@ -454,7 +454,7 @@ impl SearchEngine {
                 .cloned();
 
             if let Some(embedding) = query_embedding {
-                self.vector_index.search(&embedding, query.top_k)
+                self.vector_index.search(&embedding, query.top_k).into_iter().collect()
             } else {
                 std::collections::HashMap::new()
             }

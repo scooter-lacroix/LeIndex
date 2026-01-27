@@ -430,7 +430,12 @@ pub enum StorageBackend {
     SQLite,
 
     /// Turso (remote libsql)
-    Turso { database_url: String, auth_token: Option<String> },
+    Turso {
+        /// Turso database URL (e.g., libsql://...")
+        database_url: String,
+        /// Turso authentication token
+        auth_token: Option<String>,
+    },
 }
 
 /// Memory management configuration

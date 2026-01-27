@@ -120,6 +120,7 @@ pub struct JsonRpcError {
 }
 
 impl JsonRpcError {
+    /// Create a new JSON-RPC error with the given code and message
     pub fn new(code: i32, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -128,6 +129,7 @@ impl JsonRpcError {
         }
     }
 
+    /// Create a new JSON-RPC error with additional data
     pub fn with_data(code: i32, message: impl Into<String>, data: Value) -> Self {
         Self {
             code,
@@ -136,14 +138,17 @@ impl JsonRpcError {
         }
     }
 
+    /// Create a parse error (code -32700)
     pub fn parse_error(msg: impl Into<String>) -> Self {
         Self::new(error_codes::PARSE_ERROR, msg)
     }
 
+    /// Create an invalid request error (code -32600)
     pub fn invalid_request(msg: impl Into<String>) -> Self {
         Self::new(error_codes::INVALID_REQUEST, msg)
     }
 
+    /// Create a method not found error (code -32601)
     pub fn method_not_found(method: String) -> Self {
         Self::with_data(
             error_codes::METHOD_NOT_FOUND,
@@ -152,10 +157,12 @@ impl JsonRpcError {
         )
     }
 
+    /// Create an invalid params error (code -32602)
     pub fn invalid_params(msg: impl Into<String>) -> Self {
         Self::new(error_codes::INVALID_PARAMS, msg)
     }
 
+    /// Create an invalid params error with a suggestion
     pub fn invalid_params_with_suggestion(msg: impl Into<String>, suggestion: impl Into<String>) -> Self {
         Self::with_data(
             error_codes::INVALID_PARAMS,
@@ -164,10 +171,12 @@ impl JsonRpcError {
         )
     }
 
+    /// Create an internal error (code -32603)
     pub fn internal_error(msg: impl Into<String>) -> Self {
         Self::new(error_codes::INTERNAL_ERROR, msg)
     }
 
+    /// Create a project not found error
     pub fn project_not_found(project: String) -> Self {
         Self::with_data(
             error_codes::PROJECT_NOT_FOUND,
@@ -176,6 +185,7 @@ impl JsonRpcError {
         )
     }
 
+    /// Create a project not indexed error
     pub fn project_not_indexed(project: String) -> Self {
         Self::with_data(
             error_codes::PROJECT_NOT_INDEXED,
@@ -184,18 +194,22 @@ impl JsonRpcError {
         )
     }
 
+    /// Create an indexing failed error
     pub fn indexing_failed(msg: impl Into<String>) -> Self {
         Self::new(error_codes::INDEXING_FAILED, msg)
     }
 
+    /// Create a search failed error
     pub fn search_failed(msg: impl Into<String>) -> Self {
         Self::new(error_codes::SEARCH_FAILED, msg)
     }
 
+    /// Create a context expansion failed error
     pub fn context_expansion_failed(msg: impl Into<String>) -> Self {
         Self::new(error_codes::CONTEXT_EXPANSION_FAILED, msg)
     }
 
+    /// Create a memory limit exceeded error
     pub fn memory_limit_exceeded() -> Self {
         Self::with_data(
             error_codes::MEMORY_LIMIT_EXCEEDED,

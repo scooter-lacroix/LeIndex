@@ -103,14 +103,17 @@ fn extract_usize(args: &Value, key: &str, default: usize) -> Result<usize, JsonR
 pub struct IndexHandler;
 
 impl IndexHandler {
+    /// Returns the name of this RPC method
     pub fn name(&self) -> &str {
         "leindex_index"
     }
 
+    /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
         "Index a project for code search and analysis. Parses all source files, builds the Program Dependence Graph, and creates the semantic search index."
     }
 
+    /// Returns the JSON schema for the arguments of this RPC method
     pub fn argument_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -129,6 +132,7 @@ impl IndexHandler {
         })
     }
 
+    /// Executes the RPC method
     pub async fn execute(
         &self,
         _leindex: &Arc<Mutex<LeIndex>>,
@@ -162,14 +166,17 @@ impl IndexHandler {
 pub struct SearchHandler;
 
 impl SearchHandler {
+    /// Returns the name of this RPC method
     pub fn name(&self) -> &str {
         "leindex_search"
     }
 
+    /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
         "Search indexed code using semantic search. Returns the most relevant code snippets matching your query."
     }
 
+    /// Returns the JSON schema for the arguments of this RPC method
     pub fn argument_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -190,6 +197,7 @@ impl SearchHandler {
         })
     }
 
+    /// Executes the RPC method
     pub async fn execute(
         &self,
         leindex: &Arc<Mutex<LeIndex>>,
@@ -221,14 +229,17 @@ impl SearchHandler {
 pub struct DeepAnalyzeHandler;
 
 impl DeepAnalyzeHandler {
+    /// Returns the name of this RPC method
     pub fn name(&self) -> &str {
         "leindex_deep_analyze"
     }
 
+    /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
         "Perform deep code analysis with context expansion. Uses semantic search combined with Program Dependence Graph traversal to provide comprehensive understanding."
     }
 
+    /// Returns the JSON schema for the arguments of this RPC method
     pub fn argument_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -249,6 +260,7 @@ impl DeepAnalyzeHandler {
         })
     }
 
+    /// Executes the RPC method
     pub async fn execute(
         &self,
         leindex: &Arc<Mutex<LeIndex>>,
@@ -280,14 +292,17 @@ impl DeepAnalyzeHandler {
 pub struct ContextHandler;
 
 impl ContextHandler {
+    /// Returns the name of this RPC method
     pub fn name(&self) -> &str {
         "leindex_context"
     }
 
+    /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
         "Expand context around a specific code node using Program Dependence Graph traversal. Useful for understanding code relationships."
     }
 
+    /// Returns the JSON schema for the arguments of this RPC method
     pub fn argument_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -308,6 +323,7 @@ impl ContextHandler {
         })
     }
 
+    /// Executes the RPC method
     pub async fn execute(
         &self,
         _leindex: &Arc<Mutex<LeIndex>>,
@@ -333,14 +349,17 @@ impl ContextHandler {
 pub struct DiagnosticsHandler;
 
 impl DiagnosticsHandler {
+    /// Returns the name of this RPC method
     pub fn name(&self) -> &str {
         "leindex_diagnostics"
     }
 
+    /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
         "Get diagnostic information about the indexed project, including memory usage, index statistics, and system health."
     }
 
+    /// Returns the JSON schema for the arguments of this RPC method
     pub fn argument_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -349,6 +368,7 @@ impl DiagnosticsHandler {
         })
     }
 
+    /// Executes the RPC method
     pub async fn execute(
         &self,
         leindex: &Arc<Mutex<LeIndex>>,
