@@ -387,6 +387,7 @@ pub enum MergeError {
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
+    use crate::pdg_store::save_pdg;
 
     fn create_test_resolver() -> CrossProjectResolver {
         let temp_file = NamedTempFile::new().unwrap();
@@ -622,7 +623,7 @@ mod tests {
         symbol_table.add_project_dep(&dep_bc).unwrap();
 
         // Propagate changes from proj_a
-        let affected = resolver.propagate_changes("proj_a", &[symbol_a.symbol_id.clone()]).unwrap();
+        let affected = resolver.propagate_changes("proj_a", std::slice::from_ref(&symbol_a.symbol_id)).unwrap();
 
         // Should include proj_b (direct dependent) and proj_c (transitive through proj_b)
         assert_eq!(affected.len(), 2);
@@ -653,7 +654,7 @@ mod tests {
         // Track usage
         let result = resolver.track_external_usage(
             "my_project",
-            &[ext_symbol.symbol_id.clone()],
+            std::slice::from_ref(&ext_symbol.symbol_id),
         );
 
         assert!(result.is_ok());
@@ -695,7 +696,7 @@ mod tests {
     #[test]
     fn test_build_cross_project_pdg() {
         let temp_file = NamedTempFile::new().unwrap();
-        let storage = crate::Storage::open(temp_file.path()).unwrap();
+        let _storage = crate::Storage::open(temp_file.path()).unwrap();
 
         // Create root project PDG
         let mut root_pdg = ProgramDependenceGraph::new();

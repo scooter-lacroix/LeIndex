@@ -208,7 +208,7 @@ mod tests {
         let resolver = CrossProjectResolver::new(storage);
 
         let affected = resolver
-            .propagate_changes("project_c", &[sym_c.symbol_id.clone()])
+            .propagate_changes("project_c", std::slice::from_ref(&sym_c.symbol_id))
             .unwrap();
 
         // Should include project_b (direct dependent) and project_a (transitive)

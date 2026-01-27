@@ -503,10 +503,8 @@ pub fn format_error(error: &LeIndexError) -> String {
         message.push_str(&format!("\n\nSuggestion: {}", suggestion));
     }
 
-    if let LeIndexError::Io { path, .. } = error {
-        if let Some(p) = path {
-            message.push_str(&format!("\n\nPath: {:?}", p));
-        }
+    if let LeIndexError::Io { path: Some(p), .. } = error {
+        message.push_str(&format!("\n\nPath: {:?}", p));
     }
 
     message
