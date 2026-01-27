@@ -13,6 +13,9 @@ use legraphe::pdg::{
 use rusqlite::{params, Result as SqliteResult};
 use std::collections::HashMap;
 
+/// Type alias for node database rows to reduce type complexity
+type NodeDbRow = (i64, String, String, String, Option<i32>, String, Option<Vec<u8>>);
+
 /// Errors that can occur during PDG persistence
 #[derive(Debug, thiserror::Error)]
 pub enum PdgStoreError {
@@ -266,7 +269,7 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
          FROM intel_nodes WHERE project_id = ?1"
     )?;
 
-    let node_rows: Vec<(i64, String, String, String, Option<i32>, String, Option<Vec<u8>>)> = nodes_stmt.query_map(params![project_id], |row| {
+    let node_rows: Vec<NodeDbRow> = nodes_stmt.query_map(params![project_id], |row| {
         Ok((
             row.get::<_, i64>(0)?,           // id
             row.get::<_, String>(1)?,         // file_path

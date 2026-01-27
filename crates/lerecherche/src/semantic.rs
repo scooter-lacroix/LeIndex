@@ -22,9 +22,11 @@ impl SemanticProcessor {
         entry: SemanticEntry,
         token_budget: usize,
     ) -> Result<String, Error> {
-        let mut config = TraversalConfig::default();
-        config.max_tokens = token_budget;
-        
+        let config = TraversalConfig {
+            max_tokens: token_budget,
+            ..Default::default()
+        };
+
         let traversal = GravityTraversal::with_config(config);
         
         // Map node_id string to graph NodeId

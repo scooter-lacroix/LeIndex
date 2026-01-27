@@ -39,7 +39,7 @@ pub enum VectorIndexImpl {
     BruteForce(VectorIndex),
 
     /// HNSW-based approximate nearest neighbor index
-    HNSW(HNSWIndex),
+    HNSW(Box<HNSWIndex>),
 }
 
 impl VectorIndexImpl {
@@ -381,7 +381,7 @@ impl SearchEngine {
                 if normalized_token.len() >= 2 {
                     self.text_index
                         .entry(normalized_token)
-                        .or_insert_with(HashSet::new)
+                        .or_default()
                         .insert(node.node_id.clone());
                 }
             }
@@ -454,10 +454,7 @@ impl SearchEngine {
                 .cloned();
 
             if let Some(embedding) = query_embedding {
-                let search_results = self.vector_index.search(&embedding, query.top_k);
-                search_results.into_iter()
-                    .map(|(id, score)| (id, score))
-                    .collect()
+                self.vector_index.search(&embedding, query.top_k)
             } else {
                 std::collections::HashMap::new()
             }
@@ -714,7 +711,7 @@ impl SearchEngine {
     #[must_use]
     pub fn with_hnsw(dimension: usize, hnsw_params: HNSWParams) -> Self {
         // Validate dimension at construction time
-        if dimension < MIN_EMBEDDING_DIMENSION || dimension > MAX_EMBEDDING_DIMENSION {
+        if !(MIN_EMBEDDING_DIMENSION..=MAX_EMBEDDING_DIMENSION).contains(&dimension) {
             panic!(
                 "Invalid embedding dimension: {} (must be between {} and {})",
                 dimension, MIN_EMBEDDING_DIMENSION, MAX_EMBEDDING_DIMENSION
@@ -724,7 +721,7 @@ impl SearchEngine {
         Self {
             nodes: Vec::new(),
             scorer: HybridScorer::new(),
-            vector_index: VectorIndexImpl::HNSW(HNSWIndex::with_params(dimension, hnsw_params)),
+            vector_index: VectorIndexImpl::HNSW(Box::new(HNSWIndex::with_params(dimension, hnsw_params))),
             complexity_cache: HashMap::new(),
             text_index: HashMap::new(),
         }
@@ -795,7 +792,7 @@ impl SearchEngine {
         );
 
         // Atomic swap: only replace the index after successful migration
-        self.vector_index = VectorIndexImpl::HNSW(new_hnsw_index);
+        self.vector_index = VectorIndexImpl::HNSW(Box::new(new_hnsw_index));
         Ok(())
     }
 

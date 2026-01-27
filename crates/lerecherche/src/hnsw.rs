@@ -346,7 +346,7 @@ impl HNSWIndex {
                 // For DistCosine, distance = 1 - cosine_similarity
                 // So: similarity = 1 - distance
                 // This gives proper cosine similarity in range [-1, 1]
-                let similarity: f32 = 1.0 - dist as f32;
+                let similarity = 1.0 - dist;
 
                 // Clamp to valid range [0, 1] for non-negative similarity scores
                 // (Most embeddings use normalized vectors, so similarity should be >= 0)

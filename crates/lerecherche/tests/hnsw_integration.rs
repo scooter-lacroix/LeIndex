@@ -13,6 +13,7 @@ mod tests {
     use std::time::Instant;
 
     /// Helper: Create test NodeInfo with embeddings
+    #[allow(dead_code)]
     fn create_test_nodes_with_embeddings(count: usize, dimension: usize) -> Vec<NodeInfo> {
         let mut nodes = Vec::new();
         for i in 0..count {
@@ -37,6 +38,7 @@ mod tests {
     }
 
     /// Helper: Create orthogonal test vectors (for exact similarity testing)
+    #[allow(dead_code)]
     fn create_orthogonal_embeddings(dimension: usize) -> Vec<(String, Vec<f32>)> {
         let mut vectors = Vec::new();
         for i in 0..dimension.min(10) {

@@ -362,7 +362,7 @@ impl QueryParser {
 
     /// Validate top_k parameter
     fn validate_top_k(&self, top_k: usize) -> Result<usize, Error> {
-        if top_k < MIN_TOP_K || top_k > MAX_TOP_K {
+        if !(MIN_TOP_K..=MAX_TOP_K).contains(&top_k) {
             return Err(Error::InvalidTopK {
                 provided: top_k,
                 min: MIN_TOP_K,
