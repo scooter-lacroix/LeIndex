@@ -198,7 +198,7 @@ fn extract_type_dependencies(signatures: &[SignatureInfo]) -> Vec<(String, Strin
             if let Some(type_name) = &param.type_annotation {
                 type_to_signatures
                     .entry(type_name.clone())
-                    .or_insert_with(|| Vec::new())
+                    .or_insert_with(Vec::new)
                     .push(sig.qualified_name.clone());
             }
         }

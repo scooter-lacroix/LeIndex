@@ -1196,7 +1196,7 @@ mod tests {
 
     #[test]
     fn test_vector_search_integration() {
-        let mut engine = SearchEngine::new();
+        let engine = SearchEngine::new();
 
         // Create nodes with embeddings
         let nodes = vec![

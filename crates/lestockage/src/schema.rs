@@ -41,7 +41,7 @@ impl Storage {
 
     /// Open storage with custom config
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: StorageConfig) -> SqliteResult<Self> {
-        let mut conn = Connection::open(path)?;
+        let conn = Connection::open(path)?;
 
         // Enable WAL mode for better concurrency
         if config.wal_enabled {
@@ -233,7 +233,7 @@ mod tests {
     #[test]
     fn test_schema_initialization() {
         let temp_file = NamedTempFile::new().unwrap();
-        let mut storage = Storage::open(temp_file.path()).unwrap();
+        let storage = Storage::open(temp_file.path()).unwrap();
 
         // Check that tables exist
         let table_count: i64 = storage

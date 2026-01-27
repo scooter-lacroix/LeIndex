@@ -236,7 +236,7 @@ mod tests {
         let cache = GrammarCache::new();
 
         // Load grammar for Python (index 0)
-        let lang = cache.get_or_load(0, || crate::traits::languages::python::language());
+        let lang = cache.get_or_load(0, crate::traits::languages::python::language);
         assert!(lang.is_ok());
         assert_eq!(cache.len(), 1);
 

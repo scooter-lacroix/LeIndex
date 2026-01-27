@@ -119,7 +119,7 @@ impl AstNode {
             )));
         }
         std::str::from_utf8(&source[self.byte_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))
+            .map_err(crate::traits::Error::Utf8)
     }
 
     /// Get the name text for this node (if available)
@@ -134,7 +134,7 @@ impl AstNode {
                 )));
             }
             return std::str::from_utf8(&source[range.clone()])
-                .map_err(|e| crate::traits::Error::Utf8(e));
+                .map_err(crate::traits::Error::Utf8);
         }
         Err(crate::traits::Error::ParseFailed("No name range set".to_string()))
     }
@@ -151,7 +151,7 @@ impl AstNode {
                 )));
             }
             let text = std::str::from_utf8(&source[range.clone()])
-                .map_err(|e| crate::traits::Error::Utf8(e))?;
+                .map_err(crate::traits::Error::Utf8)?;
             Ok(Some(text))
         } else {
             Ok(None)
@@ -281,7 +281,7 @@ impl ZeroCopyText for AstNode {
                 ));
             }
             Ok(Some(std::str::from_utf8(&source[range.clone()])
-                .map_err(|e| crate::traits::Error::Utf8(e))?))
+                .map_err(crate::traits::Error::Utf8)?))
         } else {
             Ok(None)
         }
@@ -300,7 +300,7 @@ impl ZeroCopyText for FunctionElement {
             ));
         }
         std::str::from_utf8(&source[self.byte_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))
+            .map_err(crate::traits::Error::Utf8)
     }
 
     fn get_name<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
@@ -310,7 +310,7 @@ impl ZeroCopyText for FunctionElement {
             ));
         }
         Ok(Some(std::str::from_utf8(&source[self.name_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))?))
+            .map_err(crate::traits::Error::Utf8)?))
     }
 
     fn get_docstring<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
@@ -321,7 +321,7 @@ impl ZeroCopyText for FunctionElement {
                 ));
             }
             Ok(Some(std::str::from_utf8(&source[range.clone()])
-                .map_err(|e| crate::traits::Error::Utf8(e))?))
+                .map_err(crate::traits::Error::Utf8)?))
         } else {
             Ok(None)
         }
@@ -336,7 +336,7 @@ impl ZeroCopyText for ClassElement {
             ));
         }
         std::str::from_utf8(&source[self.byte_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))
+            .map_err(crate::traits::Error::Utf8)
     }
 
     fn get_name<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
@@ -346,7 +346,7 @@ impl ZeroCopyText for ClassElement {
             ));
         }
         Ok(Some(std::str::from_utf8(&source[self.name_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))?))
+            .map_err(crate::traits::Error::Utf8)?))
     }
 
     fn get_docstring<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
@@ -357,7 +357,7 @@ impl ZeroCopyText for ClassElement {
                 ));
             }
             Ok(Some(std::str::from_utf8(&source[range.clone()])
-                .map_err(|e| crate::traits::Error::Utf8(e))?))
+                .map_err(crate::traits::Error::Utf8)?))
         } else {
             Ok(None)
         }
@@ -372,7 +372,7 @@ impl ZeroCopyText for ModuleElement {
             ));
         }
         std::str::from_utf8(&source[self.byte_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))
+            .map_err(crate::traits::Error::Utf8)
     }
 
     fn get_name<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
@@ -382,7 +382,7 @@ impl ZeroCopyText for ModuleElement {
             ));
         }
         Ok(Some(std::str::from_utf8(&source[self.name_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))?))
+            .map_err(crate::traits::Error::Utf8)?))
     }
 
     fn get_docstring<'source>(&self, _source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
