@@ -98,27 +98,32 @@ LeIndex consists of 5 Rust crates:
 
 ### Installation
 
-#### From Source (Recommended)
+#### One-Line Installer (Recommended)
+
+**Linux/macOS:**
+```bash
+curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+```
+
+Or with wget:
+```bash
+wget -qO- https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+```
+
+#### From Source
 
 ```bash
 git clone https://github.com/scooter-lacroix/leindex.git
 cd leindex
+./install.sh
+```
+
+Or manually:
+```bash
 cargo build --release --bins
 ```
 
 The binary will be at `target/release/leindex`.
-
-#### Using the Installer
-
-**Linux/macOS:**
-```bash
-./install.sh
-```
-
-**Windows (PowerShell):**
-```powershell
-.\install.ps1
-```
 
 ### Verification
 

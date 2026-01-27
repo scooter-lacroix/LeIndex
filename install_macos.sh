@@ -157,34 +157,82 @@ install_leindex() {
     print_step 2 4 "Building LeIndex"
 
     local install_method=""
+    local repo_dir=""
+    local should_cleanup=false
 
     # Check if we're in the repo directory
     if [[ -f "Cargo.toml" ]] && grep -q "$PROJECT_SLUG" Cargo.toml 2>/dev/null; then
-        log_info "Building from source..."
+        log_info "Building from current directory..."
         install_method="source"
-
-        if cargo build --release --bins 2>&1 | tee -a "$INSTALL_LOG"; then
-            log_success "Build completed successfully"
-        else
-            log_error "Build failed"
-            exit 1
-        fi
-
-        # Install binary
-        local binary="target/release/$PROJECT_SLUG"
-        if [[ -f "$binary" ]]; then
-            mkdir -p "$BIN_DIR"
-            cp "$binary" "$BIN_DIR/"
-            chmod +x "$BIN_DIR/$PROJECT_SLUG"
-            log_success "Binary installed to: $BIN_DIR/$PROJECT_SLUG"
-        else
-            log_error "Binary not found after build"
-            exit 1
-        fi
+        repo_dir="$(pwd)"
     else
-        log_error "Not in LeIndex repository directory"
-        log_info "Please run this script from the root of the LeIndex repository"
+        # Not in repo - clone it first
+        log_info "Cloning LeIndex repository..."
+
+        # Create a temporary directory for cloning
+        local tmp_dir
+        tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t 'leindex-install')
+        repo_dir="$tmp_dir/leindex"
+
+        # Clone the repository
+        if command -v git &> /dev/null; then
+            if git clone --depth 1 "$REPO_URL" "$repo_dir" 2>&1 | tee -a "$INSTALL_LOG"; then
+                log_success "Repository cloned to: $repo_dir"
+                should_cleanup=true
+            else
+                log_error "Failed to clone repository"
+                rm -rf "$tmp_dir"
+                exit 1
+            fi
+        else
+            log_error "git not found. Please install git first:"
+            echo "  Visit: https://git-scm.com/"
+            rm -rf "$tmp_dir"
+            exit 1
+        fi
+
+        cd "$repo_dir" || {
+            log_error "Failed to enter repository directory"
+            rm -rf "$tmp_dir"
+            exit 1
+        }
+    fi
+
+    # Build from source
+    log_info "Building LeIndex..."
+    if cargo build --release --bins 2>&1 | tee -a "$INSTALL_LOG"; then
+        log_success "Build completed successfully"
+    else
+        log_error "Build failed"
+        if [[ "$should_cleanup" == true ]]; then
+            cd /
+            rm -rf "$repo_dir"
+        fi
         exit 1
+    fi
+
+    # Install binary
+    local binary="target/release/$PROJECT_SLUG"
+    if [[ -f "$binary" ]]; then
+        mkdir -p "$BIN_DIR"
+        cp "$binary" "$BIN_DIR/"
+        chmod +x "$BIN_DIR/$PROJECT_SLUG"
+        log_success "Binary installed to: $BIN_DIR/$PROJECT_SLUG"
+    else
+        log_error "Binary not found after build"
+        if [[ "$should_cleanup" == true ]]; then
+            cd /
+            rm -rf "$repo_dir"
+        fi
+        exit 1
+    fi
+
+    # Clean up temporary clone if we created it
+    if [[ "$should_cleanup" == true ]]; then
+        log_info "Cleaning up temporary files..."
+        cd /
+        rm -rf "$repo_dir"
+        log_success "Cleanup complete"
     fi
 }
 
