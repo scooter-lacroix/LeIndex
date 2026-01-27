@@ -141,3 +141,14 @@ dmypy.json
 /test_check/
 /tests/
 /logs/
+
+# Rust build artifacts
+/target/
+**/target/
+Cargo.lock
+
+# Tree-sitter generated files
+*.o
+*.so
+*.dylib
+*.dll
