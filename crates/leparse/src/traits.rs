@@ -60,6 +60,9 @@ pub struct SignatureInfo {
 
     /// Docstring if present
     pub docstring: Option<String>,
+
+    /// Byte range in source code
+    pub byte_range: (usize, usize),
 }
 
 /// Function parameter

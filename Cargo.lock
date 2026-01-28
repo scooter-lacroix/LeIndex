@@ -1229,6 +1229,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bincode",
+ "blake3",
  "bytes",
  "clap",
  "futures-util",

@@ -95,8 +95,7 @@ impl RustParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
-                        });
+                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
                     }
 
                     // Recurse to extract trait methods
@@ -136,8 +135,7 @@ impl RustParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
-                        });
+                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
                     }
                 }
                 "enum_item" => {
@@ -159,8 +157,7 @@ impl RustParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
-                        });
+                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
                     }
                 }
                 "use_declaration" => {
@@ -289,8 +286,7 @@ fn extract_function_signature(
         visibility,
         is_async,
         is_method,
-        docstring: extract_docstring(node, source),
-    })
+        docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) })
 }
 
 /// Extract import signature from a use_declaration node
@@ -325,8 +321,7 @@ fn extract_import_signature(
         visibility: Visibility::Public,
         is_async: false,
         is_method: false,
-        docstring: None,
-    })
+        docstring: None, byte_range: (0, 0) })
 }
 
 /// Extract visibility modifier from a node
@@ -408,17 +403,7 @@ fn extract_rust_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Param
 /// Extract docstring from a node
 fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     // Look for doc comments before the node
-    let mut prev_sibling = None;
-
-    if let Some(parent) = node.parent() {
-        let mut pcursor = parent.walk();
-        for child in parent.children(&mut pcursor) {
-            if child.id() == node.id() {
-                break;
-            }
-            prev_sibling = Some(child);
-        }
-    }
+    let prev_sibling = node.prev_sibling();
 
     // Check for doc comment (line or block)
     if let Some(sibling) = prev_sibling {

@@ -66,8 +66,7 @@ impl JavaScriptParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
-                        });
+                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
 
                         let mut cursor = node.walk();
                         for child in node.children(&mut cursor) {
@@ -252,8 +251,7 @@ impl TypeScriptParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
-                        });
+                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
                     }
 
                     let mut cursor = node.walk();
@@ -283,8 +281,7 @@ impl TypeScriptParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
-                        });
+                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
 
                         let mut cursor = node.walk();
                         for child in node.children(&mut cursor) {
@@ -405,8 +402,7 @@ fn extract_function_signature(
         visibility: Visibility::Public,
         is_async,
         is_method,
-        docstring: extract_docstring(node, source),
-    })
+        docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) })
 }
 
 /// Extract function signature for TypeScript with type annotations
@@ -449,8 +445,7 @@ fn extract_ts_function_signature(
         visibility: Visibility::Public,
         is_async,
         is_method,
-        docstring: extract_docstring(node, source),
-    })
+        docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) })
 }
 
 /// Extract parameters from a JavaScript function
@@ -576,18 +571,7 @@ fn extract_ts_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Paramet
 /// Extract docstring from a node
 fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     // Look for comment before the node
-    let mut prev_sibling = None;
-
-    // Get the previous sibling or parent's previous child
-    if let Some(parent) = node.parent() {
-        let mut pcursor = parent.walk();
-        for child in parent.children(&mut pcursor) {
-            if child.id() == node.id() {
-                break;
-            }
-            prev_sibling = Some(child);
-        }
-    }
+    let prev_sibling = node.prev_sibling();
 
     // Check for comment_block or comment_line
     if let Some(sibling) = prev_sibling {

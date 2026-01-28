@@ -90,8 +90,7 @@ fn visit(
                     visibility: Visibility::Public,
                     is_async: false,
                     is_method: !parent_path.is_empty(),
-                    docstring: extract_docstring(node, source),
-                });
+                    docstring: extract_docstring(node, source), byte_range: (0, 0) });
             }
         }
         _ => {

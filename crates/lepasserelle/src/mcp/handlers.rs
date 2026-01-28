@@ -135,24 +135,48 @@ impl IndexHandler {
     /// Executes the RPC method
     pub async fn execute(
         &self,
-        _leindex: &Arc<Mutex<LeIndex>>,
+        leindex: &Arc<Mutex<LeIndex>>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let project_path = extract_string(&args, "project_path")?;
-        let _force_reindex = args.get("force_reindex")
+        let force_reindex = args.get("force_reindex")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        // Create new LeIndex instance and index the project
+        // Check if already indexed and we're not forcing reindex
+        {
+            let index = leindex.lock().await;
+            if index.is_indexed() && !force_reindex {
+                return serde_json::to_value(index.get_stats())
+                    .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)));
+            }
+        }
+
+        // Create new LeIndex instance and index the project in a blocking task
         let project_path_clone = project_path.clone();
         let stats = tokio::task::spawn_blocking(move || {
-            let mut leindex = LeIndex::new(&project_path_clone)
+            let mut temp_leindex = LeIndex::new(&project_path_clone)
                 .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to create LeIndex: {}", e)))?;
 
-            leindex.index_project()
+            temp_leindex.index_project(force_reindex)
                 .map_err(|e| JsonRpcError::indexing_failed(format!("Indexing failed: {}", e)))
         }).await
         .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))??;
+
+        // Update shared state by loading the newly indexed project from storage
+        let mut index = leindex.lock().await;
+        
+        // Ensure path matches (canonicalize to be safe)
+        let path = std::path::Path::new(&project_path).canonicalize()
+            .map_err(|e| JsonRpcError::internal_error(format!("Failed to canonicalize path: {}", e)))?;
+            
+        if index.project_path() != path {
+            *index = LeIndex::new(&path)
+                .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to re-initialize LeIndex: {}", e)))?;
+        }
+        
+        index.load_from_storage()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load indexed data: {}", e)))?;
 
         serde_json::to_value(stats)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
@@ -326,19 +350,25 @@ impl ContextHandler {
     /// Executes the RPC method
     pub async fn execute(
         &self,
-        _leindex: &Arc<Mutex<LeIndex>>,
+        leindex: &Arc<Mutex<LeIndex>>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let node_id = extract_string(&args, "node_id")?;
-        let _token_budget = extract_usize(&args, "token_budget", 2000)?;
+        let token_budget = extract_usize(&args, "token_budget", 2000)?;
 
-        // Placeholder implementation
-        Ok(serde_json::json!({
-            "node_id": node_id,
-            "context": format!("/* Context expansion for node {} */\n// Note: Full PDG traversal not yet implemented", node_id),
-            "tokens_used": 0,
-            "related_nodes": []
-        }))
+        let reader = leindex.lock().await;
+
+        if !reader.is_indexed() {
+            return Err(JsonRpcError::project_not_indexed(
+                reader.project_path().display().to_string()
+            ));
+        }
+
+        let result = reader.expand_node_context(&node_id, token_budget)
+            .map_err(|e| JsonRpcError::internal_error(format!("Context expansion error: {}", e)))?;
+
+        serde_json::to_value(result)
+            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
     }
 }
 

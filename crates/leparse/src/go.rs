@@ -78,6 +78,7 @@ impl GoParser {
                                         is_async: false,
                                         is_method: false,
                                         docstring: extract_docstring(&child, source),
+                                        byte_range: (child.start_byte(), child.end_byte()),
                                     });
                                 }
                             }
@@ -197,6 +198,7 @@ fn extract_function_signature(
         is_async: false,
         is_method: false,
         docstring: extract_docstring(node, source),
+        byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 
@@ -249,6 +251,7 @@ fn extract_method_signature(
         is_async: false,
         is_method: true,
         docstring: extract_docstring(node, source),
+        byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 
@@ -337,17 +340,7 @@ fn extract_go_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Paramet
 /// Extract docstring from a node
 fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     // Look for comment before the node
-    let mut prev_sibling = None;
-
-    if let Some(parent) = node.parent() {
-        let mut pcursor = parent.walk();
-        for child in parent.children(&mut pcursor) {
-            if child.id() == node.id() {
-                break;
-            }
-            prev_sibling = Some(child);
-        }
-    }
+    let prev_sibling = node.prev_sibling();
 
     // Check for comment
     if let Some(sibling) = prev_sibling {

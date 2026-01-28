@@ -204,6 +204,9 @@ pub struct SearchQuery {
 
     /// Whether to expand context using graph traversal
     pub expand_context: bool,
+
+    /// Optional query embedding for semantic search
+    pub query_embedding: Option<Vec<f32>>,
 }
 
 // ============================================================================
@@ -448,13 +451,19 @@ impl SearchEngine {
 
         // Pre-compute vector search if semantic search is requested
         let vector_results: std::collections::HashMap<String, f32> = if query.semantic {
-            // Find if there's a node with an embedding we can use as query
-            let query_embedding = self.nodes.iter()
-                .find_map(|n| n.embedding.as_ref())
-                .cloned();
+            // Use provided query embedding if available
+            let embedding = if let Some(emb) = query.query_embedding {
+                Some(emb)
+            } else {
+                // Fallback: find if there's a node with an embedding we can use
+                // This is legacy behavior, should be avoided
+                self.nodes.iter()
+                    .find_map(|n| n.embedding.as_ref())
+                    .cloned()
+            };
 
-            if let Some(embedding) = query_embedding {
-                self.vector_index.search(&embedding, query.top_k).into_iter().collect()
+            if let Some(emb) = embedding {
+                self.vector_index.search(&emb, query.top_k).into_iter().collect()
             } else {
                 std::collections::HashMap::new()
             }
@@ -1115,7 +1124,7 @@ mod tests {
             top_k: 10,
             token_budget: None,
             semantic: false,
-            expand_context: false,
+            expand_context: false, query_embedding: None,
         };
 
         let results = engine.search(query).unwrap();
@@ -1154,7 +1163,7 @@ mod tests {
             top_k: 10,
             token_budget: None,
             semantic: false,
-            expand_context: false,
+            expand_context: false, query_embedding: None,
         };
 
         let results = engine.search(query).unwrap();
@@ -1496,7 +1505,7 @@ mod tests {
             top_k: 10,
             token_budget: None,
             semantic: false,
-            expand_context: false,
+            expand_context: false, query_embedding: None,
         };
 
         let results = engine.search_by_complexity(query).unwrap();
@@ -1640,7 +1649,7 @@ mod tests {
             top_k: 10,
             token_budget: None,
             semantic: false,
-            expand_context: false,
+            expand_context: false, query_embedding: None,
         };
 
         let results = engine.search(query).unwrap();

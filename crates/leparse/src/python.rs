@@ -242,6 +242,7 @@ fn extract_function_signature_with_path(
         is_async,
         is_method,
         docstring,
+        byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 

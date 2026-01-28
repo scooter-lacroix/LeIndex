@@ -52,6 +52,7 @@ once_cell = "1"
 
 # File utilities
 walkdir = "2.5"
+blake3 = "1.5"
 
 # Cache spilling
 bincode = "1.3"

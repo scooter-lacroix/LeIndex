@@ -90,8 +90,7 @@ fn visit(
                     visibility: Visibility::Public,
                     is_async: false,
                     is_method: !parent_path.is_empty(),
-                    docstring: extract_docstring(node, source),
-                });
+                    docstring: extract_docstring(node, source), byte_range: (0, 0) });
             }
         }
         "class_definition" | "trait_definition" | "object_definition" => {
@@ -114,8 +113,7 @@ fn visit(
                     visibility: Visibility::Public,
                     is_async: false,
                     is_method: false,
-                    docstring: extract_docstring(node, source),
-                });
+                    docstring: extract_docstring(node, source), byte_range: (0, 0) });
 
                 // Recurse into the body to find nested members
                 let mut c = node.walk();

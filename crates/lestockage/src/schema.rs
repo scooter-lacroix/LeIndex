@@ -64,23 +64,59 @@ impl Storage {
 
     /// Initialize database schema
     fn initialize_schema(&mut self) -> SqliteResult<()> {
+        // Create indexed_files table for incremental indexing
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS indexed_files (
+                file_path TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                file_hash TEXT NOT NULL,
+                last_indexed INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
         // Create intel_nodes table
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS intel_nodes (
                 id INTEGER PRIMARY KEY,
                 project_id TEXT NOT NULL,
                 file_path TEXT NOT NULL,
+                node_id TEXT NOT NULL,
                 symbol_name TEXT NOT NULL,
+                qualified_name TEXT NOT NULL,
                 node_type TEXT NOT NULL,
                 signature TEXT,
                 complexity INTEGER,
                 content_hash TEXT NOT NULL,
                 embedding BLOB,
+                byte_range_start INTEGER,
+                byte_range_end INTEGER,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             )",
             [],
         )?;
+
+        // Migration: Ensure new columns exist for existing databases
+        let columns: Vec<String> = self.conn.prepare("PRAGMA table_info(intel_nodes)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        if !columns.iter().any(|c| c == "node_id") {
+            self.conn.execute("ALTER TABLE intel_nodes ADD COLUMN node_id TEXT DEFAULT ''", [])?;
+            // Update node_id with symbol_name for existing records
+            self.conn.execute("UPDATE intel_nodes SET node_id = symbol_name WHERE node_id = ''", [])?;
+        }
+        if !columns.iter().any(|c| c == "qualified_name") {
+            self.conn.execute("ALTER TABLE intel_nodes ADD COLUMN qualified_name TEXT DEFAULT ''", [])?;
+            self.conn.execute("UPDATE intel_nodes SET qualified_name = symbol_name WHERE qualified_name = ''", [])?;
+        }
+        if !columns.iter().any(|c| c == "byte_range_start") {
+            self.conn.execute("ALTER TABLE intel_nodes ADD COLUMN byte_range_start INTEGER", [])?;
+        }
+        if !columns.iter().any(|c| c == "byte_range_end") {
+            self.conn.execute("ALTER TABLE intel_nodes ADD COLUMN byte_range_end INTEGER", [])?;
+        }
 
         // Create intel_edges table
         self.conn.execute(

@@ -164,7 +164,7 @@ fn get_project_path(explicit: Option<PathBuf>) -> PathBuf {
 }
 
 /// Index command implementation
-async fn cmd_index_impl(path: PathBuf, _force: bool, _progress: bool) -> AnyhowResult<()> {
+async fn cmd_index_impl(path: PathBuf, force: bool, _progress: bool) -> AnyhowResult<()> {
     let canonical_path = path.canonicalize()
         .context("Failed to canonicalize project path")?;
 
@@ -178,7 +178,7 @@ async fn cmd_index_impl(path: PathBuf, _force: bool, _progress: bool) -> AnyhowR
         .context("Failed to create LeIndex instance")?;
 
     let stats = tokio::task::spawn_blocking(move || {
-        leindex.index_project()
+        leindex.index_project(force)
     }).await
         .context("Indexing task failed")?
         .context("Indexing failed")?;
@@ -227,8 +227,11 @@ async fn cmd_search_impl(query: String, top_k: usize, project: Option<PathBuf>) 
     // Print results
     println!("\nFound {} result(s) for: '{}'\n", results.len(), query);
     for (i, result) in results.iter().enumerate() {
-        println!("{}. {} ({}:{})", i + 1, result.symbol_name, result.file_path, result.node_id);
-        println!("   Score: {:.2}", result.score.overall);
+        println!("{}. {} ({})", i + 1, result.symbol_name, result.file_path);
+        println!("   ID: {}", result.node_id);
+        println!("   Overall Score: {:.2}", result.score.overall);
+        println!("   Explanation: [Semantic: {:.2}, Text: {:.2}, Structural: {:.2}]", 
+                 result.score.semantic, result.score.text_match, result.score.structural);
         if let Some(context) = &result.context {
             let context_preview = if context.len() > 100 {
                 format!("{}...", &context[..100])
@@ -445,33 +448,39 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         // Extract request ID before moving request
         let request_id = request.id.clone();
 
+        // Check if this is a notification (no response expected for notifications)
+        let is_notification = request_id.is_null();
+
         // Handle the request
         let response = match handle_mcp_request(request, project_path.clone()).await {
             Ok(r) => r,
             Err(e) => {
                 JsonRpcResponse::error(
-                    request_id,
+                    request_id.clone(),
                     JsonRpcError::internal_error(e.to_string())
                 )
             }
         };
 
-        // Write response to stdout
-        let response_json = match serde_json::to_string(&response) {
-            Ok(j) => j,
-            Err(e) => {
-                // If we can't serialize, create a simple error response
-                format!("{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":-32700,\"message\":\"Failed to serialize response: {}\"}}}}", e)
+        // Only send response if this is not a notification
+        if !is_notification {
+            // Write response to stdout
+            let response_json = match serde_json::to_string(&response) {
+                Ok(j) => j,
+                Err(e) => {
+                    // If we can't serialize, create a simple error response
+                    format!("{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":-32700,\"message\":\"Failed to serialize response: {}\"}}}}", e)
+                }
+            };
+
+            if writeln!(stdout, "{}\n", response_json).is_err() {
+                eprintln!("[ERROR] Failed to write to stdout");
+                break;
             }
-        };
 
-        if writeln!(stdout, "{}\n", response_json).is_err() {
-            eprintln!("[ERROR] Failed to write to stdout");
-            break;
+            // Flush to ensure immediate delivery
+            let _ = stdout.flush();
         }
-
-        // Flush to ensure immediate delivery
-        let _ = stdout.flush();
     }
 
     Ok(())
@@ -479,7 +488,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 
 /// Handle a single MCP request and return the response
 async fn handle_mcp_request(request: JsonRpcRequest, _project_path: PathBuf) -> anyhow::Result<JsonRpcResponse> {
-    use crate::mcp::server::{HANDLERS, SERVER_STATE};
+    use crate::mcp::server::{HANDLERS, SERVER_STATE, handle_tool_call, list_tools_json};
 
     let method_name = request.method.clone();
     let id = request.id.clone();
@@ -492,40 +501,39 @@ async fn handle_mcp_request(request: JsonRpcRequest, _project_path: PathBuf) -> 
         .ok_or_else(|| anyhow::anyhow!("Handlers not initialized"))?;
 
     // Handle different methods
-    let result = match method_name.as_str() {
+    match method_name.as_str() {
+        "initialize" => {
+            // MCP protocol initialization handshake
+            // Return server capabilities
+            Ok(JsonRpcResponse::success(id, serde_json::json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {
+                    "tools": {}
+                },
+                "serverInfo": {
+                    "name": "leindex",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            })))
+        }
+        "notifications/initialized" => {
+            // Client notification sent after successful initialization
+            // No response needed for notifications
+            Ok(JsonRpcResponse::success(id, serde_json::json!({})))
+        }
         "tools/call" => {
-            // Extract tool call from request
-            let tool_call = request.extract_tool_call()
-                .map_err(|e| anyhow::anyhow!("Failed to extract tool call: {}", e))?;
-
-            // Find the handler for this tool
-            let handler = handlers.iter()
-                .find(|h| h.name() == tool_call.name)
-                .ok_or_else(|| anyhow::anyhow!("Unknown tool: {}", tool_call.name))?;
-
-            // Execute the handler
-            handler.execute(state, tool_call.arguments).await
-                .map_err(|e| anyhow::anyhow!("Handler execution failed: {:?}", e))?
+            // Use the centralized tool call handler that formats for MCP
+            let result = handle_tool_call(state, handlers, request).await;
+            Ok(JsonRpcResponse::from_result(id, result))
         }
         "tools/list" => {
-            // List all available tools
-            let tools: Vec<_> = handlers.iter()
-                .map(|handler| {
-                    serde_json::json!({
-                        "name": handler.name(),
-                        "description": handler.description(),
-                        "inputSchema": handler.argument_schema()
-                    })
-                })
-                .collect();
-            serde_json::json!({ "tools": tools })
+            // List all available tools using centralized formatter
+            Ok(JsonRpcResponse::success(id, list_tools_json(handlers)))
         }
         _ => {
-            return Err(anyhow::anyhow!("Unknown method: {}", method_name));
+            Ok(JsonRpcResponse::error(id, crate::mcp::protocol::JsonRpcError::method_not_found(method_name)))
         }
-    };
-
-    Ok(JsonRpcResponse::success(id, result))
+    }
 }
 
 /// Main entry point for the CLI

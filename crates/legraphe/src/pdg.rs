@@ -297,6 +297,28 @@ impl ProgramDependenceGraph {
         self.graph.edge_count()
     }
 
+    /// Remove a node and its associated edges
+    pub fn remove_node(&mut self, node_id: NodeId) -> Option<Node> {
+        if let Some(node) = self.graph.remove_node(node_id) {
+            self.symbol_index.remove(&node.id);
+            if let Some(nodes) = self.file_index.get_mut(&node.file_path) {
+                nodes.retain(|&id| id != node_id);
+            }
+            Some(node)
+        } else {
+            None
+        }
+    }
+
+    /// Remove all nodes and edges for a specific file
+    pub fn remove_file(&mut self, file_path: &str) {
+        let node_ids = self.nodes_in_file(file_path);
+        for node_id in node_ids {
+            self.remove_node(node_id);
+        }
+        self.file_index.remove(file_path);
+    }
+
     /// Iterate over all node indices
     ///
     /// This provides access to all nodes in the graph for iteration.

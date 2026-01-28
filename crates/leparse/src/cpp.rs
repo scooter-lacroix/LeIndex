@@ -59,8 +59,7 @@ impl CppParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
-                        });
+                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
                     }
 
                     // Recurse to extract class methods
@@ -88,8 +87,7 @@ impl CppParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
-                        });
+                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
                     }
                 }
                 "enum_specifier" => {
@@ -111,8 +109,7 @@ impl CppParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
-                        });
+                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
                     }
                 }
                 "namespace_definition" => {
@@ -243,8 +240,7 @@ fn extract_function_signature(
         visibility: Visibility::Public,
         is_async: false,
         is_method: false,
-        docstring: extract_docstring(node, source),
-    })
+        docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) })
 }
 
 /// Extract parameters from a C++ function
@@ -305,17 +301,7 @@ fn extract_cpp_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Parame
 
 /// Extract docstring from a node
 fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
-    let mut prev_sibling = None;
-
-    if let Some(parent) = node.parent() {
-        let mut pcursor = parent.walk();
-        for child in parent.children(&mut pcursor) {
-            if child.id() == node.id() {
-                break;
-            }
-            prev_sibling = Some(child);
-        }
-    }
+    let prev_sibling = node.prev_sibling();
 
     if let Some(sibling) = prev_sibling {
         if sibling.kind() == "comment" {

@@ -53,8 +53,7 @@ impl PhpParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: None,
-                        });
+                            docstring: None, byte_range: (0, 0) });
                     }
 
                     let mut cursor = node.walk();
@@ -81,8 +80,7 @@ impl PhpParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: None,
-                        });
+                            docstring: None, byte_range: (0, 0) });
                     }
                 }
                 "namespace_definition" => {
@@ -194,8 +192,7 @@ fn extract_function_signature(
         visibility: Visibility::Public,
         is_async: false,
         is_method: node.kind() == "method_declaration",
-        docstring: extract_docstring(node, source),
-    })
+        docstring: extract_docstring(node, source), byte_range: (0, 0) })
 }
 
 fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {

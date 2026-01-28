@@ -53,8 +53,7 @@ impl RubyParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: None,
-                        });
+                            docstring: None, byte_range: (0, 0) });
                     }
 
                     let mut cursor = node.walk();
@@ -174,8 +173,7 @@ fn extract_method_signature(
         visibility: Visibility::Public,
         is_async: false,
         is_method: true,
-        docstring: None,
-    })
+        docstring: None, byte_range: (0, 0) })
 }
 
 fn extract_ruby_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Parameter> {

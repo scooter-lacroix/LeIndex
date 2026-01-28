@@ -64,8 +64,7 @@ impl JavaParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
-                        });
+                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
                     }
 
                     // Recurse to extract class methods
@@ -93,8 +92,7 @@ impl JavaParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
-                        });
+                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
                     }
 
                     // Recurse to extract interface methods
@@ -122,8 +120,7 @@ impl JavaParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
-                        });
+                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
                     }
                 }
                 "field_declaration" => {
@@ -149,8 +146,7 @@ impl JavaParser {
                                     visibility: extract_visibility(node, source),
                                     is_async: false,
                                     is_method: false,
-                                    docstring: None,
-                                });
+                                    docstring: None, byte_range: (0, 0) });
                             }
                         }
                     }
@@ -263,8 +259,7 @@ fn extract_method_signature(
         visibility,
         is_async: false, // Java doesn't have async in the same way
         is_method: true,
-        docstring: extract_docstring(node, source),
-    })
+        docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) })
 }
 
 /// Extract constructor signature from a constructor_declaration node
@@ -296,8 +291,7 @@ fn extract_constructor_signature(
         visibility,
         is_async: false,
         is_method: true,
-        docstring: extract_docstring(node, source),
-    })
+        docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) })
 }
 
 /// Extract parameters from a Java method
@@ -356,17 +350,7 @@ fn extract_visibility(node: &tree_sitter::Node, source: &[u8]) -> Visibility {
 /// Extract docstring from a node
 fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     // Look for javadoc comments before the node
-    let mut prev_sibling = None;
-
-    if let Some(parent) = node.parent() {
-        let mut pcursor = parent.walk();
-        for child in parent.children(&mut pcursor) {
-            if child.id() == node.id() {
-                break;
-            }
-            prev_sibling = Some(child);
-        }
-    }
+    let prev_sibling = node.prev_sibling();
 
     // Check for javadoc comment
     if let Some(sibling) = prev_sibling {

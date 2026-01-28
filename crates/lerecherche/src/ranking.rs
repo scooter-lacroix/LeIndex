@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Combined score from multiple signals
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub struct Score {
     /// Overall score (0-1)
     pub overall: f32,

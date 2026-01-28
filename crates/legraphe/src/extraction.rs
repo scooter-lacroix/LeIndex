@@ -154,12 +154,11 @@ fn signature_to_node(sig: &SignatureInfo, file_path: &str) -> Node {
     let param_complexity = sig.parameters.len() as u32;
     let complexity = base_complexity + param_complexity;
 
-    // byte_range is not available in SignatureInfo
-    // Use (0, 0) as default - could be enhanced to search source_code for signature position
-    let byte_range = (0, 0);
+    // byte_range is now available in SignatureInfo
+    let byte_range = sig.byte_range;
 
     Node {
-        id: sig.qualified_name.clone(),
+        id: format!("{}:{}", file_path, sig.qualified_name),
         node_type,
         name: sig.name.clone(),
         file_path: file_path.to_string(),
@@ -389,6 +388,7 @@ mod tests {
             is_async: false,
             is_method,
             docstring: None,
+            byte_range: (0, 0),
         }
     }
 

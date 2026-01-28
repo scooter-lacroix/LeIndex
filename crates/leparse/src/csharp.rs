@@ -59,8 +59,7 @@ impl CSharpParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: None,
-                        });
+                            docstring: None, byte_range: (0, 0) });
                     }
 
                     let mut cursor = node.walk();
@@ -87,8 +86,7 @@ impl CSharpParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: None,
-                        });
+                            docstring: None, byte_range: (0, 0) });
                     }
                 }
                 "struct_declaration" => {
@@ -110,8 +108,7 @@ impl CSharpParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: None,
-                        });
+                            docstring: None, byte_range: (0, 0) });
                     }
                 }
                 "enum_declaration" => {
@@ -133,8 +130,7 @@ impl CSharpParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: None,
-                        });
+                            docstring: None, byte_range: (0, 0) });
                     }
                 }
                 _ => {
@@ -279,8 +275,7 @@ fn extract_method_signature(
         visibility: extract_visibility(node, source),
         is_async,
         is_method: true,
-        docstring: None,
-    })
+        docstring: None, byte_range: (0, 0) })
 }
 
 #[allow(clippy::manual_find)]

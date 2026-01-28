@@ -238,7 +238,7 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
 }
 
 /// Handle tool call requests
-async fn handle_tool_call(
+pub async fn handle_tool_call(
     state: &Arc<Mutex<LeIndex>>,
     handlers: &[ToolHandler],
     req: JsonRpcRequest,
@@ -250,11 +250,40 @@ async fn handle_tool_call(
         .find(|h| h.name() == tool_call.name)
         .ok_or_else(|| JsonRpcError::method_not_found(tool_call.name.clone()))?;
 
-    handler.execute(state, tool_call.arguments).await
+    // Execute the tool and wrap the result in standard MCP content format
+    match handler.execute(state, tool_call.arguments).await {
+        Ok(value) => {
+            // For DeepAnalyze and Context, we might want to be more specific,
+            // but for now, we just stringify the result.
+            // MCP expects { content: [{ type: "text", text: "..." }], isError: false }
+            Ok(serde_json::json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": serde_json::to_string_pretty(&value).unwrap_or_else(|_| "Error serializing result".to_string())
+                    }
+                ],
+                "isError": false
+            }))
+        }
+        Err(e) => {
+            // MCP standard: return errors as a successful JSON-RPC response with isError: true
+            warn!("Tool execution failed: {}", e);
+            Ok(serde_json::json!({
+                "content": [
+                    {
+                        "type": "text",
+                        "text": format!("Error: {}", e)
+                    }
+                ],
+                "isError": true
+            }))
+        }
+    }
 }
 
 /// List tools as JSON
-fn list_tools_json(handlers: &[ToolHandler]) -> Value {
+pub fn list_tools_json(handlers: &[ToolHandler]) -> Value {
     let tools: Vec<_> = handlers.iter()
         .map(|handler| {
             serde_json::json!({

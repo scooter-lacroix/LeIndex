@@ -14,7 +14,8 @@ use rusqlite::{params, Result as SqliteResult};
 use std::collections::HashMap;
 
 /// Type alias for node database rows to reduce type complexity
-type NodeDbRow = (i64, String, String, String, Option<i32>, String, Option<Vec<u8>>);
+#[allow(dead_code)]
+type NodeDbRow = (i64, String, String, String, Option<i32>, String, Option<Vec<u8>>, Option<i64>, Option<i64>);
 
 /// Errors that can occur during PDG persistence
 #[derive(Debug, thiserror::Error)]
@@ -167,27 +168,35 @@ pub fn save_pdg(
             id: None,
             project_id: project_id.to_string(),
             file_path: pdg_node.file_path.clone(),
+            node_id: pdg_node.id.clone(),
             symbol_name: pdg_node.name.clone(),
+            qualified_name: pdg_node.id.split(':').last().unwrap_or(&pdg_node.id).to_string(),
             node_type: convert_node_type(&pdg_node.node_type),
             signature: None, // Could be populated from node content
             complexity: Some(pdg_node.complexity as i32),
             content_hash: blake3::hash(pdg_node.id.as_bytes()).to_hex().to_string(),
             embedding: embedding_blob,
+            byte_range_start: Some(pdg_node.byte_range.0 as i64),
+            byte_range_end: Some(pdg_node.byte_range.1 as i64),
         };
 
         let db_id: i64 = tx.query_row(
-            "INSERT INTO intel_nodes (project_id, file_path, symbol_name, node_type, signature, complexity, content_hash, embedding, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              RETURNING id",
             params![
                 record.project_id,
                 record.file_path,
+                record.node_id,
                 record.symbol_name,
+                record.qualified_name,
                 record.node_type.as_str(),
                 record.signature,
                 record.complexity,
                 record.content_hash,
                 record.embedding.as_deref(),
+                record.byte_range_start,
+                record.byte_range_end,
                 chrono::Utc::now().timestamp(),
                 chrono::Utc::now().timestamp(),
             ],
@@ -265,23 +274,27 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
 
     // Load all nodes for the project
     let mut nodes_stmt = storage.conn().prepare(
-        "SELECT id, file_path, symbol_name, node_type, complexity, content_hash, embedding
+        "SELECT id, file_path, node_id, symbol_name, qualified_name, node_type, complexity, content_hash, embedding, byte_range_start, byte_range_end
          FROM intel_nodes WHERE project_id = ?1"
     )?;
 
-    let node_rows: Vec<NodeDbRow> = nodes_stmt.query_map(params![project_id], |row| {
+    let node_rows: Vec<(i64, String, String, String, String, String, Option<i32>, String, Option<Vec<u8>>, Option<i64>, Option<i64>)> = nodes_stmt.query_map(params![project_id], |row| {
         Ok((
             row.get::<_, i64>(0)?,           // id
             row.get::<_, String>(1)?,         // file_path
-            row.get::<_, String>(2)?,         // symbol_name
-            row.get::<_, String>(3)?,         // node_type
-            row.get::<_, Option<i32>>(4)?,    // complexity
-            row.get::<_, String>(5)?,         // content_hash
-            row.get::<_, Option<Vec<u8>>>(6)?, // embedding
+            row.get::<_, String>(2)?,         // node_id
+            row.get::<_, String>(3)?,         // symbol_name
+            row.get::<_, String>(4)?,         // qualified_name
+            row.get::<_, String>(5)?,         // node_type
+            row.get::<_, Option<i32>>(6)?,    // complexity
+            row.get::<_, String>(7)?,         // content_hash
+            row.get::<_, Option<Vec<u8>>>(8)?, // embedding
+            row.get::<_, Option<i64>>(9)?,    // byte_range_start
+            row.get::<_, Option<i64>>(10)?,    // byte_range_end
         ))
     })?.collect::<SqliteResult<Vec<_>>>()?;
 
-    for (db_id, file_path, symbol_name, node_type_str, complexity, _content_hash, embedding_blob) in node_rows {
+    for (db_id, file_path, node_id_str, symbol_name, _qualified_name, node_type_str, complexity, _content_hash, embedding_blob, start, end) in node_rows {
         let node_type = StorageNodeType::from_str_name(&node_type_str)
             .ok_or_else(|| PdgStoreError::Deserialization(format!("Invalid node type: {}", node_type_str)))?;
 
@@ -299,11 +312,11 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
         });
 
         let pdg_node = PDGNode {
-            id: symbol_name.clone(),
+            id: node_id_str,
             node_type: convert_storage_node_type(&node_type),
-            name: symbol_name.clone(),
+            name: symbol_name,
             file_path,
-            byte_range: (0, 0), // Not stored in DB
+            byte_range: (start.unwrap_or(0) as usize, end.unwrap_or(0) as usize),
             complexity: complexity.unwrap_or(0) as u32,
             embedding,
         };
@@ -380,17 +393,8 @@ pub fn pdg_exists(storage: &Storage, project_id: &str) -> SqliteResult<bool> {
 }
 
 /// Delete a PDG from storage
-///
-/// # Arguments
-///
-/// * `storage` - Mutable reference to the storage backend
-/// * `project_id` - Project identifier to delete
-///
-/// # Returns
-///
-/// `Ok(())` if successful, `Err` if an error occurs
 pub fn delete_pdg(storage: &mut Storage, project_id: &str) -> SqliteResult<()> {
-    // Delete edges first (via subquery to avoid foreign key constraint issues)
+    // Delete edges first
     storage.conn().execute(
         "DELETE FROM intel_edges WHERE caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1)",
         params![project_id],
@@ -400,6 +404,68 @@ pub fn delete_pdg(storage: &mut Storage, project_id: &str) -> SqliteResult<()> {
     storage.conn().execute(
         "DELETE FROM intel_nodes WHERE project_id = ?1",
         params![project_id],
+    )?;
+
+    // Delete indexed files records
+    storage.conn().execute(
+        "DELETE FROM indexed_files WHERE project_id = ?1",
+        params![project_id],
+    )?;
+
+    Ok(())
+}
+
+/// Delete nodes and edges for a specific file in a project
+pub fn delete_file_data(storage: &mut Storage, project_id: &str, file_path: &str) -> SqliteResult<()> {
+    // Delete edges where caller or callee belongs to this file
+    storage.conn().execute(
+        "DELETE FROM intel_edges WHERE 
+         caller_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2) OR
+         callee_id IN (SELECT id FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2)",
+        params![project_id, file_path],
+    )?;
+
+    // Delete nodes for this file
+    storage.conn().execute(
+        "DELETE FROM intel_nodes WHERE project_id = ?1 AND file_path = ?2",
+        params![project_id, file_path],
+    )?;
+
+    // Delete indexed file record
+    storage.conn().execute(
+        "DELETE FROM indexed_files WHERE project_id = ?1 AND file_path = ?2",
+        params![project_id, file_path],
+    )?;
+
+    Ok(())
+}
+
+/// Get all indexed files for a project with their hashes
+pub fn get_indexed_files(storage: &Storage, project_id: &str) -> SqliteResult<HashMap<String, String>> {
+    let mut stmt = storage.conn().prepare(
+        "SELECT file_path, file_hash FROM indexed_files WHERE project_id = ?1"
+    )?;
+
+    let rows = stmt.query_map(params![project_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut result = HashMap::new();
+    for row in rows {
+        let (path, hash) = row?;
+        result.insert(path, hash);
+    }
+
+    Ok(result)
+}
+
+/// Update indexed file record
+pub fn update_indexed_file(storage: &mut Storage, project_id: &str, file_path: &str, hash: &str) -> SqliteResult<()> {
+    storage.conn().execute(
+        "INSERT INTO indexed_files (file_path, project_id, file_hash, last_indexed)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(file_path) DO UPDATE SET file_hash = ?3, last_indexed = ?4",
+        params![file_path, project_id, hash, chrono::Utc::now().timestamp()],
     )?;
     Ok(())
 }

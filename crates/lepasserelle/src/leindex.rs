@@ -226,15 +226,93 @@ impl LeIndex {
     /// let stats = leindex.index_project()?;
     /// println!("Indexed {} files", stats.files_parsed);
     /// ```
-    pub fn index_project(&mut self) -> Result<IndexStats> {
+    /// Index the project
+    ///
+    /// This executes the full indexing pipeline:
+    /// 1. Parse all source files in parallel (incrementally)
+    /// 2. Extract PDG from parsed signatures
+    /// 3. Index nodes for semantic search
+    /// 4. Persist PDG to storage
+    ///
+    /// # Arguments
+    ///
+    /// * `force` - If true, re-index all files regardless of changes
+    ///
+    /// # Returns
+    ///
+    /// `Result<IndexStats>` - Statistics from the indexing operation
+    pub fn index_project(&mut self, force: bool) -> Result<IndexStats> {
         let start_time = std::time::Instant::now();
 
-        info!("Starting project indexing for: {}", self.project_id);
+        info!("Starting project indexing for: {} (force={})", self.project_id, force);
 
-        // Step 1: Parse all source files
-        let parsing_results = self.parse_files()?;
+        // Step 1: Get currently indexed files from storage
+        let indexed_files = lestockage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
+            .unwrap_or_default();
 
-        // Step 2: Extract signatures from successful parses
+        // Step 2: Collect all source files and compute hashes
+        let source_files_with_hashes = self.collect_source_files_with_hashes()?;
+        info!("Found {} source files", source_files_with_hashes.len());
+
+        // Step 3: Identify changed/new/deleted files
+        let mut files_to_parse = Vec::new();
+        let mut unchanged_files = Vec::new();
+        
+        let current_file_paths: std::collections::HashSet<String> = source_files_with_hashes.iter()
+            .map(|(p, _)| p.display().to_string())
+            .collect();
+
+        for (path, hash) in &source_files_with_hashes {
+            let path_str = path.display().to_string();
+            if force || !indexed_files.contains_key(&path_str) || indexed_files.get(&path_str) != Some(hash) {
+                files_to_parse.push(path.clone());
+            } else {
+                unchanged_files.push(path_str);
+            }
+        }
+
+        let deleted_files: Vec<String> = indexed_files.keys()
+            .filter(|p| !current_file_paths.contains(*p))
+            .cloned()
+            .collect();
+
+        info!("Incremental analysis: {} to parse, {} unchanged, {} deleted", 
+              files_to_parse.len(), unchanged_files.len(), deleted_files.len());
+
+        if files_to_parse.is_empty() && deleted_files.is_empty() && self.is_indexed() {
+            info!("No changes detected, skipping indexing");
+            return Ok(self.stats.clone());
+        }
+
+        // Step 4: Parse changed files
+        let parsing_results = if !files_to_parse.is_empty() {
+            let parser = ParallelParser::new();
+            parser.parse_files(files_to_parse)
+        } else {
+            Vec::new()
+        };
+
+        // Step 5: Update PDG
+        // Load existing PDG if we have unchanged files and it's not in memory
+        if !unchanged_files.is_empty() && self.pdg.is_none() {
+            let _ = self.load_from_storage();
+        }
+
+        let mut pdg = self.pdg.take().unwrap_or_else(ProgramDependenceGraph::new);
+
+        // Remove data for changed/deleted files
+        for (path, _) in &source_files_with_hashes {
+            let path_str = path.display().to_string();
+            if !unchanged_files.contains(&path_str) {
+                self.remove_file_from_pdg(&mut pdg, &path_str)?;
+            }
+        }
+        for path in &deleted_files {
+            self.remove_file_from_pdg(&mut pdg, path)?;
+            let _ = lestockage::pdg_store::delete_file_data(&mut self.storage, &self.project_id, path);
+        }
+
+        // Extract signatures from successful parses
         let signatures_by_file: std::collections::HashMap<String, Vec<SignatureInfo>> =
             parsing_results
             .iter()
@@ -247,28 +325,29 @@ impl LeIndex {
             })
             .collect();
 
-        let all_signatures: Vec<_> = signatures_by_file.values()
-            .flat_map(|sigs| sigs.clone())
-            .collect();
+        // Build partial PDG and merge
+        for (file_path, signatures) in signatures_by_file {
+            let file_pdg = extract_pdg_from_signatures(signatures, &[], &file_path);
+            self.merge_pdgs(&mut pdg, file_pdg);
+            
+            // Update hash in storage
+            if let Some((_, hash)) = source_files_with_hashes.iter().find(|(p, _)| p.display().to_string() == file_path) {
+                let _ = lestockage::pdg_store::update_indexed_file(&mut self.storage, &self.project_id, &file_path, hash);
+            }
+        }
 
-        info!("Extracted {} signatures from {} files",
-              all_signatures.len(),
-              signatures_by_file.len());
-
-        // Step 3: Build PDG from signatures
-        let pdg = self.build_pdg(&signatures_by_file)?;
         let pdg_node_count = pdg.node_count();
         let pdg_edge_count = pdg.edge_count();
 
-        info!("Built PDG with {} nodes and {} edges", pdg_node_count, pdg_edge_count);
+        info!("Updated PDG has {} nodes and {} edges", pdg_node_count, pdg_edge_count);
 
-        // Step 4: Index nodes for search
+        // Step 6: Re-index nodes for search (full re-index for simplicity, search engine is fast)
         self.index_nodes(&pdg)?;
         let indexed_count = self.search_engine.node_count();
 
         info!("Indexed {} nodes for search", indexed_count);
 
-        // Step 5: Persist to storage
+        // Step 7: Persist to storage
         self.save_to_storage(&pdg)?;
 
         // Update statistics
@@ -287,12 +366,96 @@ impl LeIndex {
             indexing_time_ms: start_time.elapsed().as_millis() as u64,
         };
 
-        // Keep PDG in memory for analysis operations
+        // Keep PDG in memory
         self.pdg = Some(pdg);
 
         info!("Indexing completed in {}ms", self.stats.indexing_time_ms);
 
         Ok(self.stats.clone())
+    }
+
+    fn remove_file_from_pdg(&self, pdg: &mut ProgramDependenceGraph, file_path: &str) -> Result<()> {
+        pdg.remove_file(file_path);
+        Ok(())
+    }
+
+    fn collect_source_files_with_hashes(&self) -> Result<Vec<(PathBuf, String)>> {
+        let mut source_files = Vec::new();
+
+        // Common source file extensions
+        let extensions = [
+            "rs", "py", "js", "ts", "tsx", "jsx",  // Main languages
+            "go", "java", "cpp", "c", "h", "hpp",    // Systems languages
+            "rb", "php", "lua", "scala",              // Scripting languages
+        ];
+
+        // Walk the project directory efficiently
+        let mut walker = walkdir::WalkDir::new(&self.project_path).into_iter();
+
+        while let Some(entry) = walker.next() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy();
+
+            // Skip hidden files and directories
+            if file_name.starts_with('.') && file_name != "." {
+                if entry.file_type().is_dir() {
+                    walker.skip_current_dir();
+                }
+                continue;
+            }
+
+            // Skip common non-source directories
+            if entry.file_type().is_dir() {
+                if file_name == "target" || file_name == "node_modules"
+                    || file_name == "vendor" || file_name == ".git" {
+                    walker.skip_current_dir();
+                    continue;
+                }
+            }
+
+            // Check if file has a source extension
+            if entry.file_type().is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if extensions.contains(&ext) {
+                        let hash = self.hash_file(path)?;
+                        source_files.push((path.to_path_buf(), hash));
+                    }
+                }
+            }
+        }
+
+        Ok(source_files)
+    }
+
+    fn hash_file(&self, path: &Path) -> Result<String> {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("Failed to read file for hashing: {}", path.display()))?;
+        Ok(blake3::hash(&bytes).to_hex().to_string())
+    }
+
+    fn merge_pdgs(&self, target: &mut ProgramDependenceGraph, source: ProgramDependenceGraph) {
+        for node_idx in source.node_indices() {
+            if let Some(node) = source.get_node(node_idx) {
+                target.add_node(node.clone());
+            }
+        }
+        
+        for edge_idx in source.edge_indices() {
+            if let Some(edge) = source.get_edge(edge_idx) {
+                if let Some((s, t)) = source.edge_endpoints(edge_idx) {
+                    if let (Some(sn), Some(tn)) = (source.get_node(s), source.get_node(t)) {
+                        if let (Some(si), Some(ti)) = (target.find_by_symbol(&sn.id), target.find_by_symbol(&tn.id)) {
+                            target.add_edge(si, ti, edge.clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Search the indexed code
@@ -326,6 +489,7 @@ impl LeIndex {
             token_budget: None,
             semantic: true,
             expand_context: false,
+            query_embedding: Some(self.generate_query_embedding(query)),
         };
 
         let results = self.search_engine.search(search_query)
@@ -367,6 +531,7 @@ impl LeIndex {
             token_budget: Some(token_budget),
             semantic: true,
             expand_context: false,
+            query_embedding: Some(self.generate_query_embedding(query)),
         };
 
         let results = self.search_engine.search(search_query)
@@ -490,6 +655,36 @@ impl LeIndex {
     /// Get the current indexing statistics
     pub fn get_stats(&self) -> &IndexStats {
         &self.stats
+    }
+
+    /// Expand context around a specific node
+    pub fn expand_node_context(&self, node_id: &str, token_budget: usize) -> Result<AnalysisResult> {
+        let start_time = std::time::Instant::now();
+
+        let pdg = self.pdg.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("No PDG available for context expansion. Has the project been indexed?")
+        })?;
+
+        let results = vec![SearchResult {
+            rank: 1,
+            node_id: node_id.to_string(),
+            file_path: String::new(), // Will be filled if found
+            symbol_name: node_id.to_string(),
+            score: lerecherche::ranking::Score::default(),
+            context: None,
+            byte_range: (0, 0),
+        }];
+
+        let context = self.expand_context(pdg, &results, token_budget)?;
+        let tokens_used = context.len() / 4;
+
+        Ok(AnalysisResult {
+            query: format!("Context for node {}", node_id),
+            results,
+            context: Some(context),
+            tokens_used,
+            processing_time_ms: start_time.elapsed().as_millis() as u64,
+        })
     }
 
     /// Check if the project has been indexed
@@ -714,6 +909,7 @@ impl LeIndex {
     // ========================================================================
 
     /// Parse all source files in the project
+    #[allow(dead_code)]
     fn parse_files(&self) -> Result<Vec<ParsingResult>> {
         let parser = ParallelParser::new();
 
@@ -735,6 +931,7 @@ impl LeIndex {
     }
 
     /// Collect all source files from the project
+    #[allow(dead_code)]
     fn collect_source_files(&self) -> Result<Vec<PathBuf>> {
         let mut source_files = Vec::new();
 
@@ -745,33 +942,41 @@ impl LeIndex {
             "rb", "php", "lua", "scala",              // Scripting languages
         ];
 
-        // Walk the project directory
-        for entry in walkdir::WalkDir::new(&self.project_path)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
+        // Walk the project directory efficiently
+        let mut walker = walkdir::WalkDir::new(&self.project_path).into_iter();
+
+        while let Some(entry) = walker.next() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
             let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy();
 
             // Skip hidden files and directories
-            if path.components().any(|c| {
-                c.as_os_str().to_string_lossy().starts_with('.')
-            }) {
+            if file_name.starts_with('.') && file_name != "." {
+                if entry.file_type().is_dir() {
+                    walker.skip_current_dir();
+                }
                 continue;
             }
 
             // Skip common non-source directories
-            if let Some(dir_name) = path.parent().and_then(|p| p.file_name()) {
-                let dir = dir_name.to_string_lossy();
-                if dir.contains("target") || dir.contains("node_modules")
-                    || dir.contains("vendor") || dir.contains(".git") {
+            if entry.file_type().is_dir() {
+                if file_name == "target" || file_name == "node_modules"
+                    || file_name == "vendor" || file_name == ".git" {
+                    walker.skip_current_dir();
                     continue;
                 }
             }
 
             // Check if file has a source extension
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if extensions.contains(&ext) {
-                    source_files.push(path.to_path_buf());
+            if entry.file_type().is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if extensions.contains(&ext) {
+                        source_files.push(path.to_path_buf());
+                    }
                 }
             }
         }
@@ -780,6 +985,7 @@ impl LeIndex {
     }
 
     /// Build PDG from parsed signatures
+    #[allow(dead_code)]
     fn build_pdg(
         &self,
         signatures_by_file: &std::collections::HashMap<String, Vec<SignatureInfo>>,
@@ -825,6 +1031,11 @@ impl LeIndex {
         Ok(pdg)
     }
 
+    /// Generate a deterministic embedding for a query string
+    pub fn generate_query_embedding(&self, query: &str) -> Vec<f32> {
+        self.generate_deterministic_embedding(query, "", "")
+    }
+
     /// Generate a deterministic 768-dimensional embedding for a node
     ///
     /// This uses a stable hashing approach to generate a vector from symbol metadata.
@@ -866,22 +1077,42 @@ impl LeIndex {
     fn index_nodes(&mut self, pdg: &ProgramDependenceGraph) -> Result<()> {
         let mut nodes = Vec::new();
 
+        // Read file contents once per file to avoid repeated I/O
+        let mut file_cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
         // Convert PDG nodes to NodeInfo for indexing
         for node_idx in pdg.node_indices() {
             if let Some(node) = pdg.get_node(node_idx) {
-                let content = format!("// {} in {}\n{}", node.name, node.file_path,
-                                   "// Source code would be here");
+                // Get file content
+                let content = if let Some(fc) = file_cache.get(&node.file_path) {
+                    fc.clone()
+                } else if let Ok(bytes) = std::fs::read(&node.file_path) {
+                    let fc = String::from_utf8_lossy(&bytes).to_string();
+                    file_cache.insert(node.file_path.clone(), fc.clone());
+                    fc
+                } else {
+                    String::new()
+                };
+
+                // Extract node-specific content for better text matching
+                let node_content = if !content.is_empty() && node.byte_range.1 > node.byte_range.0 {
+                    let start = node.byte_range.0;
+                    let end = node.byte_range.1.min(content.len());
+                    format!("// {} in {}\n{}", node.name, node.file_path, &content[start..end])
+                } else {
+                    format!("// {} in {}\n{}", node.name, node.file_path, "// [No source code available]")
+                };
                 
                 // Use existing embedding if present, otherwise generate a deterministic one
                 let embedding = node.embedding.clone().unwrap_or_else(|| {
-                    self.generate_deterministic_embedding(&node.name, &node.file_path, &content)
+                    self.generate_deterministic_embedding(&node.name, &node.file_path, &node_content)
                 });
 
                 let node_info = NodeInfo {
                     node_id: node.id.clone(),
                     file_path: node.file_path.clone(),
                     symbol_name: node.name.clone(),
-                    content,
+                    content: node_content,
                     byte_range: node.byte_range,
                     embedding: Some(embedding),
                     complexity: node.complexity,
@@ -925,7 +1156,24 @@ impl LeIndex {
                 context.push_str(&format!("\n// Symbol: {}\n", node.name));
                 context.push_str(&format!("// File: {}\n", node.file_path));
                 context.push_str(&format!("// Type: {:?}\n", node.node_type));
-                context.push_str("// Source code would be here\n");
+                
+                // Retrieve actual source code if byte_range is valid
+                if node.byte_range.1 > node.byte_range.0 {
+                    if let Ok(content) = std::fs::read(&node.file_path) {
+                        let start = node.byte_range.0;
+                        let end = node.byte_range.1.min(content.len());
+                        if let Ok(code) = std::str::from_utf8(&content[start..end]) {
+                            context.push_str(code);
+                            context.push_str("\n");
+                        } else {
+                            context.push_str("// [Error: Source code is not valid UTF-8]\n");
+                        }
+                    } else {
+                        context.push_str(&format!("// [Error: Could not read file: {}]\n", node.file_path));
+                    }
+                } else {
+                    context.push_str("// [No source code range available for this node]\n");
+                }
             }
         }
 

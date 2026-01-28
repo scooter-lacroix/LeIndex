@@ -530,6 +530,7 @@ impl QueryParser {
             token_budget: parsed.token_budget,
             semantic: matches!(parsed.query_type, QueryType::Semantic),
             expand_context: parsed.expand_context,
+            query_embedding: None,
         }
     }
 

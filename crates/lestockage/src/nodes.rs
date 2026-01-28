@@ -13,8 +13,12 @@ pub struct NodeRecord {
     pub project_id: String,
     /// Path to the file containing the node
     pub file_path: String,
-    /// Name of the symbol
+    /// Unique node ID (file_path:qualified_name)
+    pub node_id: String,
+    /// Name of the symbol (short name)
     pub symbol_name: String,
+    /// Fully qualified name
+    pub qualified_name: String,
     /// Type of the node (function, class, etc.)
     pub node_type: NodeType,
     /// Code signature or declaration
@@ -25,6 +29,10 @@ pub struct NodeRecord {
     pub content_hash: String,
     /// Vector embedding for semantic search
     pub embedding: Option<Vec<u8>>,
+    /// Byte range start
+    pub byte_range_start: Option<i64>,
+    /// Byte range end
+    pub byte_range_end: Option<i64>,
 }
 
 /// Node type enum
@@ -81,17 +89,21 @@ impl<'a> NodeStore<'a> {
     /// Insert a node record
     pub fn insert(&mut self, record: &NodeRecord) -> SqliteResult<i64> {
         self.storage.conn().execute(
-            "INSERT INTO intel_nodes (project_id, file_path, symbol_name, node_type, signature, complexity, content_hash, embedding, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 record.project_id,
                 record.file_path,
+                record.node_id,
                 record.symbol_name,
+                record.qualified_name,
                 record.node_type.as_str(),
                 record.signature,
                 record.complexity,
                 record.content_hash,
                 record.embedding.as_deref(),
+                record.byte_range_start,
+                record.byte_range_end,
                 chrono::Utc::now().timestamp(),
                 chrono::Utc::now().timestamp(),
             ],
@@ -107,17 +119,21 @@ impl<'a> NodeStore<'a> {
         let mut ids = Vec::new();
         for record in records {
             tx.execute(
-                "INSERT INTO intel_nodes (project_id, file_path, symbol_name, node_type, signature, complexity, content_hash, embedding, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     record.project_id,
                     record.file_path,
+                    record.node_id,
                     record.symbol_name,
+                    record.qualified_name,
                     record.node_type.as_str(),
                     record.signature,
                     record.complexity,
                     record.content_hash,
                     record.embedding.as_deref(),
+                    record.byte_range_start,
+                    record.byte_range_end,
                     chrono::Utc::now().timestamp(),
                     chrono::Utc::now().timestamp(),
                 ],
@@ -132,7 +148,7 @@ impl<'a> NodeStore<'a> {
     /// Get node by ID
     pub fn get(&self, id: i64) -> SqliteResult<Option<NodeRecord>> {
         let mut stmt = self.storage.conn().prepare(
-            "SELECT id, project_id, file_path, symbol_name, node_type, signature, complexity, content_hash, embedding
+            "SELECT id, project_id, file_path, node_id, symbol_name, qualified_name, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end
              FROM intel_nodes WHERE id = ?1"
         )?;
 
@@ -141,12 +157,16 @@ impl<'a> NodeStore<'a> {
                 id: Some(row.get(0)?),
                 project_id: row.get(1)?,
                 file_path: row.get(2)?,
-                symbol_name: row.get(3)?,
-                node_type: NodeType::from_str_name(&row.get::<_, String>(4)?).unwrap_or(NodeType::Function),
-                signature: row.get(5)?,
-                complexity: row.get(6)?,
-                content_hash: row.get(7)?,
-                embedding: row.get(8)?,
+                node_id: row.get(3)?,
+                symbol_name: row.get(4)?,
+                qualified_name: row.get(5)?,
+                node_type: NodeType::from_str_name(&row.get::<_, String>(6)?).unwrap_or(NodeType::Function),
+                signature: row.get(7)?,
+                complexity: row.get(8)?,
+                content_hash: row.get(9)?,
+                embedding: row.get(10)?,
+                byte_range_start: row.get(11)?,
+                byte_range_end: row.get(12)?,
             })
         });
 
@@ -156,7 +176,7 @@ impl<'a> NodeStore<'a> {
     /// Find node by content hash
     pub fn find_by_hash(&self, hash: &str) -> SqliteResult<Option<NodeRecord>> {
         let mut stmt = self.storage.conn().prepare(
-            "SELECT id, project_id, file_path, symbol_name, node_type, signature, complexity, content_hash, embedding
+            "SELECT id, project_id, file_path, node_id, symbol_name, qualified_name, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end
              FROM intel_nodes WHERE content_hash = ?1"
         )?;
 
@@ -165,12 +185,16 @@ impl<'a> NodeStore<'a> {
                 id: Some(row.get(0)?),
                 project_id: row.get(1)?,
                 file_path: row.get(2)?,
-                symbol_name: row.get(3)?,
-                node_type: NodeType::from_str_name(&row.get::<_, String>(4)?).unwrap_or(NodeType::Function),
-                signature: row.get(5)?,
-                complexity: row.get(6)?,
-                content_hash: row.get(7)?,
-                embedding: row.get(8)?,
+                node_id: row.get(3)?,
+                symbol_name: row.get(4)?,
+                qualified_name: row.get(5)?,
+                node_type: NodeType::from_str_name(&row.get::<_, String>(6)?).unwrap_or(NodeType::Function),
+                signature: row.get(7)?,
+                complexity: row.get(8)?,
+                content_hash: row.get(9)?,
+                embedding: row.get(10)?,
+                byte_range_start: row.get(11)?,
+                byte_range_end: row.get(12)?,
             })
         });
 
@@ -180,7 +204,7 @@ impl<'a> NodeStore<'a> {
     /// Get nodes by file path
     pub fn get_by_file(&self, file_path: &str) -> SqliteResult<Vec<NodeRecord>> {
         let mut stmt = self.storage.conn().prepare(
-            "SELECT id, project_id, file_path, symbol_name, node_type, signature, complexity, content_hash, embedding
+            "SELECT id, project_id, file_path, node_id, symbol_name, qualified_name, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end
              FROM intel_nodes WHERE file_path = ?1"
         )?;
 
@@ -189,12 +213,16 @@ impl<'a> NodeStore<'a> {
                 id: Some(row.get(0)?),
                 project_id: row.get(1)?,
                 file_path: row.get(2)?,
-                symbol_name: row.get(3)?,
-                node_type: NodeType::from_str_name(&row.get::<_, String>(4)?).unwrap_or(NodeType::Function),
-                signature: row.get(5)?,
-                complexity: row.get(6)?,
-                content_hash: row.get(7)?,
-                embedding: row.get(8)?,
+                node_id: row.get(3)?,
+                symbol_name: row.get(4)?,
+                qualified_name: row.get(5)?,
+                node_type: NodeType::from_str_name(&row.get::<_, String>(6)?).unwrap_or(NodeType::Function),
+                signature: row.get(7)?,
+                complexity: row.get(8)?,
+                content_hash: row.get(9)?,
+                embedding: row.get(10)?,
+                byte_range_start: row.get(11)?,
+                byte_range_end: row.get(12)?,
             })
         })?.collect::<SqliteResult<Vec<_>>>()?;
 
