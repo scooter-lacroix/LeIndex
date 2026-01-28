@@ -20,6 +20,8 @@ use tracing::{info, warn};
 #[command(author = "LeIndex Contributors")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "Index, search, and analyze codebases with semantic understanding", long_about = None)]
+#[command(subcommand_required = false)]
+#[command(arg_required_else_help = false)]
 pub struct Cli {
     /// Path to the project directory
     #[arg(global = true, long = "project", short = 'p')]
@@ -29,9 +31,13 @@ pub struct Cli {
     #[arg(global = true, long = "verbose", short = 'v')]
     pub verbose: bool,
 
+    /// Compatibility flag for some AI tools (defaults to MCP stdio mode)
+    #[arg(long = "stdio")]
+    pub stdio: bool,
+
     /// Subcommand to execute
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 /// Available CLI commands
@@ -89,7 +95,11 @@ pub enum Commands {
     },
 
     /// Run MCP server in stdio mode (for AI tool subprocess integration)
-    Mcp,
+    Mcp {
+        /// Compatibility flag for some AI tools
+        #[arg(long = "stdio")]
+        stdio: bool,
+    },
 }
 
 impl Cli {
@@ -102,7 +112,14 @@ impl Cli {
         let global_project = self.project_path;
 
         // Execute the appropriate command
-        match self.command {
+        // Default to Mcp if no command is provided or if --stdio is set
+        let command = if self.stdio {
+            Commands::Mcp { stdio: true }
+        } else {
+            self.command.unwrap_or(Commands::Mcp { stdio: false })
+        };
+
+        match command {
             Commands::Index { path, force, progress } => {
                 cmd_index_impl(path, force, progress).await
             }
@@ -118,7 +135,7 @@ impl Cli {
             Commands::Serve { host, port } => {
                 cmd_serve_impl(host, port).await
             }
-            Commands::Mcp => {
+            Commands::Mcp { .. } => {
                 cmd_mcp_stdio_impl(global_project).await
             }
         }
@@ -524,14 +541,26 @@ mod tests {
     #[test]
     fn test_cli_parsing() {
         let cli = Cli::try_parse_from(["leindex", "index", "/path/to/project"]).unwrap();
-        assert!(matches!(cli.command, Commands::Index { .. }));
+        assert!(matches!(cli.command, Some(Commands::Index { .. })));
+    }
+
+    #[test]
+    fn test_mcp_command_parsing() {
+        let cli = Cli::try_parse_from(["leindex", "mcp"]).unwrap();
+        assert!(matches!(cli.command, Some(Commands::Mcp { .. })));
+    }
+
+    #[test]
+    fn test_stdio_flag_parsing() {
+        let cli = Cli::try_parse_from(["leindex", "--stdio"]).unwrap();
+        assert!(cli.stdio);
     }
 
     #[test]
     fn test_search_command() {
         let cli = Cli::try_parse_from(["leindex", "search", "test query"]).unwrap();
         match cli.command {
-            Commands::Search { query, top_k, .. } => {
+            Some(Commands::Search { query, top_k, .. }) => {
                 assert_eq!(query, "test query");
                 assert_eq!(top_k, 10);
             }

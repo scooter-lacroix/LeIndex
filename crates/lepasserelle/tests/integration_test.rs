@@ -31,7 +31,7 @@ mod cli_workflow_tests {
 
         use lepasserelle::cli::Commands;
         match cli.command {
-            Commands::Index { path, force, progress } => {
+            Some(Commands::Index { path, force, progress }) => {
                 assert_eq!(path, PathBuf::from("/test/project"));
                 assert!(force);
                 assert!(progress);
@@ -54,7 +54,7 @@ mod cli_workflow_tests {
 
         use lepasserelle::cli::Commands;
         match cli.command {
-            Commands::Search { query, top_k } => {
+            Some(Commands::Search { query, top_k }) => {
                 assert_eq!(query, "authentication");
                 assert_eq!(top_k, 20);
             }
@@ -76,7 +76,7 @@ mod cli_workflow_tests {
 
         use lepasserelle::cli::Commands;
         match cli.command {
-            Commands::Analyze { query, token_budget } => {
+            Some(Commands::Analyze { query, token_budget }) => {
                 assert_eq!(query, "How does auth work?");
                 assert_eq!(token_budget, 5000);
             }
@@ -95,7 +95,7 @@ mod cli_workflow_tests {
 
         use lepasserelle::cli::Commands;
         match cli.command {
-            Commands::Diagnostics => {
+            Some(Commands::Diagnostics) => {
                 // Successfully parsed
             }
             _ => panic!("Expected Diagnostics command"),
