@@ -32,6 +32,9 @@ pub struct Node {
     /// Complexity score
     pub complexity: u32,
 
+    /// Programming language
+    pub language: String,
+
     /// Node-level embedding (optional)
     pub embedding: Option<Vec<f32>>,
 }

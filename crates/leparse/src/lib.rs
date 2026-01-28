@@ -66,6 +66,15 @@ pub mod lua;
 /// Scala language implementation.
 pub mod scala;
 
+/// C language implementation.
+pub mod c;
+
+/// Bash language implementation.
+pub mod bash;
+
+/// JSON language implementation.
+pub mod json;
+
 #[cfg(test)]
 mod debug_go;
 

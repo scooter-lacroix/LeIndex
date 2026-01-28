@@ -12,7 +12,7 @@ use legraphe::{
     extract_pdg_from_signatures,
     traversal::{GravityTraversal, TraversalConfig},
 };
-use leparse::parallel::{ParallelParser, ParsingResult};
+use leparse::parallel::ParallelParser;
 use leparse::traits::SignatureInfo;
 use lerecherche::search::{NodeInfo, SearchEngine, SearchResult, SearchQuery};
 use lestockage::{pdg_store, schema::Storage};
@@ -313,12 +313,13 @@ impl LeIndex {
         }
 
         // Extract signatures from successful parses
-        let signatures_by_file: std::collections::HashMap<String, Vec<SignatureInfo>> =
+        let signatures_by_file: std::collections::HashMap<String, (String, Vec<SignatureInfo>)> =
             parsing_results
             .iter()
             .filter_map(|r| {
                 if r.is_success() {
-                    Some((r.file_path.display().to_string(), r.signatures.clone()))
+                    let lang = r.language.clone().unwrap_or_else(|| "unknown".to_string());
+                    Some((r.file_path.display().to_string(), (lang, r.signatures.clone())))
                 } else {
                     None
                 }
@@ -326,8 +327,8 @@ impl LeIndex {
             .collect();
 
         // Build partial PDG and merge
-        for (file_path, signatures) in signatures_by_file {
-            let file_pdg = extract_pdg_from_signatures(signatures, &[], &file_path);
+        for (file_path, (language, signatures)) in signatures_by_file {
+            let file_pdg = extract_pdg_from_signatures(signatures, &[], &file_path, &language);
             self.merge_pdgs(&mut pdg, file_pdg);
             
             // Update hash in storage
@@ -477,7 +478,7 @@ impl LeIndex {
     ///     println!("{}: {} ({:.2})", result.rank, result.symbol_name, result.score.total);
     /// }
     /// ```
-    pub fn search(&self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+    pub fn search(&mut self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
         if self.search_engine.is_empty() {
             warn!("Search attempted on empty index");
             return Ok(Vec::new());
@@ -490,6 +491,7 @@ impl LeIndex {
             semantic: true,
             expand_context: false,
             query_embedding: Some(self.generate_query_embedding(query)),
+            threshold: Some(0.1), // Added default threshold for better quality
         };
 
         let results = self.search_engine.search(search_query)
@@ -532,6 +534,7 @@ impl LeIndex {
             semantic: true,
             expand_context: false,
             query_embedding: Some(self.generate_query_embedding(query)),
+            threshold: Some(0.1), // Added threshold for better quality
         };
 
         let results = self.search_engine.search(search_query)
@@ -665,11 +668,17 @@ impl LeIndex {
             anyhow::anyhow!("No PDG available for context expansion. Has the project been indexed?")
         })?;
 
+        let language = pdg.find_by_symbol(node_id)
+            .and_then(|id| pdg.get_node(id))
+            .map(|n| n.language.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
         let results = vec![SearchResult {
             rank: 1,
             node_id: node_id.to_string(),
             file_path: String::new(), // Will be filled if found
             symbol_name: node_id.to_string(),
+            language,
             score: lerecherche::ranking::Score::default(),
             context: None,
             byte_range: (0, 0),
@@ -905,131 +914,7 @@ impl LeIndex {
     }
 
     // ========================================================================
-    // PRIVATE METHODS
-    // ========================================================================
 
-    /// Parse all source files in the project
-    #[allow(dead_code)]
-    fn parse_files(&self) -> Result<Vec<ParsingResult>> {
-        let parser = ParallelParser::new();
-
-        // Collect source files from the project
-        let source_files = self.collect_source_files()?;
-
-        info!("Found {} source files to parse", source_files.len());
-
-        // Parse files in parallel
-        let results = parser.parse_files(source_files);
-
-        // Log statistics
-        let successful = results.iter().filter(|r| r.is_success()).count();
-        let failed = results.iter().filter(|r| r.is_failure()).count();
-
-        info!("Parsing complete: {} successful, {} failed", successful, failed);
-
-        Ok(results)
-    }
-
-    /// Collect all source files from the project
-    #[allow(dead_code)]
-    fn collect_source_files(&self) -> Result<Vec<PathBuf>> {
-        let mut source_files = Vec::new();
-
-        // Common source file extensions
-        let extensions = [
-            "rs", "py", "js", "ts", "tsx", "jsx",  // Main languages
-            "go", "java", "cpp", "c", "h", "hpp",    // Systems languages
-            "rb", "php", "lua", "scala",              // Scripting languages
-        ];
-
-        // Walk the project directory efficiently
-        let mut walker = walkdir::WalkDir::new(&self.project_path).into_iter();
-
-        while let Some(entry) = walker.next() {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let path = entry.path();
-            let file_name = entry.file_name().to_string_lossy();
-
-            // Skip hidden files and directories
-            if file_name.starts_with('.') && file_name != "." {
-                if entry.file_type().is_dir() {
-                    walker.skip_current_dir();
-                }
-                continue;
-            }
-
-            // Skip common non-source directories
-            if entry.file_type().is_dir() {
-                if file_name == "target" || file_name == "node_modules"
-                    || file_name == "vendor" || file_name == ".git" {
-                    walker.skip_current_dir();
-                    continue;
-                }
-            }
-
-            // Check if file has a source extension
-            if entry.file_type().is_file() {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if extensions.contains(&ext) {
-                        source_files.push(path.to_path_buf());
-                    }
-                }
-            }
-        }
-
-        Ok(source_files)
-    }
-
-    /// Build PDG from parsed signatures
-    #[allow(dead_code)]
-    fn build_pdg(
-        &self,
-        signatures_by_file: &std::collections::HashMap<String, Vec<SignatureInfo>>,
-    ) -> Result<ProgramDependenceGraph> {
-        info!("Building PDG from {} files", signatures_by_file.len());
-
-        let mut pdg = ProgramDependenceGraph::new();
-
-        // Use extract_pdg_from_signatures for each file and merge results
-        for (file_path, signatures) in signatures_by_file {
-            // Extract PDG for this file
-            let file_pdg = extract_pdg_from_signatures(signatures.clone(), &[], file_path);
-
-            // Track mapping from file-local node IDs to global node IDs
-            let mut node_id_map = std::collections::HashMap::new();
-
-            // Add all nodes from file PDG to global PDG
-            for old_node_id in file_pdg.node_indices() {
-                if let Some(node) = file_pdg.get_node(old_node_id) {
-                    let new_node_id = pdg.add_node(node.clone());
-                    node_id_map.insert(old_node_id, new_node_id);
-                }
-            }
-
-            // Add all edges from file PDG to global PDG with remapped node IDs
-            for edge_id in file_pdg.edge_indices() {
-                if let Some(edge) = file_pdg.get_edge(edge_id) {
-                    if let Some((old_source, old_target)) = file_pdg.edge_endpoints(edge_id) {
-                        let new_source = node_id_map.get(&old_source).copied();
-                        let new_target = node_id_map.get(&old_target).copied();
-
-                        if let (Some(from), Some(to)) = (new_source, new_target) {
-                            pdg.add_edge(from, to, edge.clone());
-                        }
-                    }
-                }
-            }
-        }
-
-        info!("PDG construction complete with {} nodes and {} edges",
-            pdg.node_count(), pdg.edge_count());
-
-        Ok(pdg)
-    }
 
     /// Generate a deterministic embedding for a query string
     pub fn generate_query_embedding(&self, query: &str) -> Vec<f32> {
@@ -1112,6 +997,7 @@ impl LeIndex {
                     node_id: node.id.clone(),
                     file_path: node.file_path.clone(),
                     symbol_name: node.name.clone(),
+                    language: node.language.clone(),
                     content: node_content,
                     byte_range: node.byte_range,
                     embedding: Some(embedding),

@@ -147,6 +147,12 @@ pub enum LanguageId {
     Lua = 10,
     /// Scala programming language
     Scala = 11,
+    /// C programming language
+    C = 12,
+    /// Bash programming language
+    Bash = 13,
+    /// JSON data format
+    Json = 14,
 }
 
 impl LanguageId {
@@ -162,7 +168,9 @@ impl LanguageId {
             "go" => Some(LanguageId::Go),
             "rs" => Some(LanguageId::Rust),
             "java" => Some(LanguageId::Java),
-            "cpp" | "cc" | "cxx" | "hpp" | "h" => Some(LanguageId::Cpp),
+            "cpp" | "cc" | "cxx" | "hpp" => Some(LanguageId::Cpp),
+            "h" => Some(LanguageId::C), // Default .h to C (Cpp override handles .hpp)
+            "c" => Some(LanguageId::C),
             "cs" => Some(LanguageId::CSharp),
             "rb" => Some(LanguageId::Ruby),
             "php" => Some(LanguageId::Php),
@@ -171,6 +179,8 @@ impl LanguageId {
             // "dart" => Some(LanguageId::Dart), // TODO: Disabled
             "lua" => Some(LanguageId::Lua),
             "scala" | "sc" => Some(LanguageId::Scala),
+            "sh" | "bash" => Some(LanguageId::Bash),
+            "json" => Some(LanguageId::Json),
             _ => None,
         }
     }
@@ -196,6 +206,9 @@ impl LanguageId {
             // LanguageId::Dart => &crate::traits::languages::dart::CONFIG, // TODO: Disabled
             LanguageId::Lua => &crate::traits::languages::lua::CONFIG,
             LanguageId::Scala => &crate::traits::languages::scala::CONFIG,
+            LanguageId::C => &crate::traits::languages::c::CONFIG,
+            LanguageId::Bash => &crate::traits::languages::bash::CONFIG,
+            LanguageId::Json => &crate::traits::languages::json::CONFIG,
         }
     }
 
@@ -220,6 +233,9 @@ impl LanguageId {
             // LanguageId::Dart => crate::traits::languages::dart::language(), // TODO: Disabled
             LanguageId::Lua => crate::traits::languages::lua::language(),
             LanguageId::Scala => crate::traits::languages::scala::language(),
+            LanguageId::C => crate::traits::languages::c::language(),
+            LanguageId::Bash => crate::traits::languages::bash::language(),
+            LanguageId::Json => crate::traits::languages::json::language(),
         }
     }
 

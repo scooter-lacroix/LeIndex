@@ -93,7 +93,7 @@ mod tests {
             name: "func1".to_string(),
             file_path: "test.rs".to_string(),
             byte_range: (0, 50),
-            complexity: 2,
+            complexity: 2, language: "rust".to_string(),
             embedding: None,
         });
         let n2 = pdg.add_node(GraphNode {
@@ -102,7 +102,7 @@ mod tests {
             name: "func2".to_string(),
             file_path: "test.rs".to_string(),
             byte_range: (60, 100),
-            complexity: 3,
+            complexity: 3, language: "rust".to_string(),
             embedding: None,
         });
         
@@ -112,7 +112,7 @@ mod tests {
             NodeInfo {
                 node_id: "func1".to_string(),
                 file_path: "test.rs".to_string(),
-                symbol_name: "func1".to_string(),
+                symbol_name: "func1".to_string(), language: "rust".to_string(),
                 content: "fn func1() { func2(); }".to_string(),
                 byte_range: (0, 50),
                 embedding: None,
@@ -121,7 +121,7 @@ mod tests {
             NodeInfo {
                 node_id: "func2".to_string(),
                 file_path: "test.rs".to_string(),
-                symbol_name: "func2".to_string(),
+                symbol_name: "func2".to_string(), language: "rust".to_string(),
                 content: "fn func2() { println!(\"world\"); }".to_string(),
                 byte_range: (60, 100),
                 embedding: None,

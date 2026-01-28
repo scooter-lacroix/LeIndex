@@ -36,6 +36,35 @@ mod language_detection_tests {
     }
 
     #[test]
+    fn test_c_extension_detection() {
+        let config = LanguageConfig::from_extension("c");
+        assert!(config.is_some());
+        assert_eq!(config.unwrap().name, "C");
+
+        let config = LanguageConfig::from_extension("h");
+        assert!(config.is_some());
+        assert_eq!(config.unwrap().name, "C");
+    }
+
+    #[test]
+    fn test_bash_extension_detection() {
+        let config = LanguageConfig::from_extension("sh");
+        assert!(config.is_some());
+        assert_eq!(config.unwrap().name, "Bash");
+
+        let config = LanguageConfig::from_extension("bash");
+        assert!(config.is_some());
+        assert_eq!(config.unwrap().name, "Bash");
+    }
+
+    #[test]
+    fn test_json_extension_detection() {
+        let config = LanguageConfig::from_extension("json");
+        assert!(config.is_some());
+        assert_eq!(config.unwrap().name, "JSON");
+    }
+
+    #[test]
     fn test_go_extension_detection() {
         let config = LanguageConfig::from_extension("go");
         assert!(config.is_some());

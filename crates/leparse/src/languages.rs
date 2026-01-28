@@ -11,6 +11,9 @@ pub use crate::ruby::RubyParser;
 pub use crate::php::PhpParser;
 pub use crate::lua::LuaParser;
 pub use crate::scala::ScalaParser;
+pub use crate::c::CParser;
+pub use crate::bash::BashParser;
+pub use crate::json::JsonParser;
 
 /// Type-specific parser factory
 pub fn parser_for_language(language: &str) -> Option<Box<dyn crate::traits::CodeIntelligence>> {
@@ -27,6 +30,9 @@ pub fn parser_for_language(language: &str) -> Option<Box<dyn crate::traits::Code
         "php" => Some(Box::new(PhpParser::new())),
         "lua" => Some(Box::new(LuaParser::new())),
         "scala" => Some(Box::new(ScalaParser::new())),
+        "c" => Some(Box::new(CParser::new())),
+        "bash" | "sh" => Some(Box::new(BashParser::new())),
+        "json" => Some(Box::new(JsonParser::new())),
         _ => None,
     }
 }

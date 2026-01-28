@@ -524,4 +524,58 @@ pub mod languages {
             tree_sitter_scala::LANGUAGE.into()
         }
     }
+
+    /// C language support.
+    pub mod c {
+        use super::{LanguageConfig, Language};
+        use once_cell::sync::Lazy;
+
+        /// C language configuration.
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+            name: "C".to_string(),
+            extensions: vec!["c".to_string(), "h".to_string()],
+            queries: LanguageConfig::default_queries(),
+        });
+
+        /// Get the tree-sitter language for C.
+        pub fn language() -> Language {
+            tree_sitter_c::LANGUAGE.into()
+        }
+    }
+
+    /// Bash language support.
+    pub mod bash {
+        use super::{LanguageConfig, Language};
+        use once_cell::sync::Lazy;
+
+        /// Bash language configuration.
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+            name: "Bash".to_string(),
+            extensions: vec!["sh".to_string(), "bash".to_string()],
+            queries: LanguageConfig::default_queries(),
+        });
+
+        /// Get the tree-sitter language for Bash.
+        pub fn language() -> Language {
+            tree_sitter_bash::LANGUAGE.into()
+        }
+    }
+
+    /// JSON language support.
+    pub mod json {
+        use super::{LanguageConfig, Language};
+        use once_cell::sync::Lazy;
+
+        /// JSON language configuration.
+        pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
+            name: "JSON".to_string(),
+            extensions: vec!["json".to_string()],
+            queries: LanguageConfig::default_queries(),
+        });
+
+        /// Get the tree-sitter language for JSON.
+        pub fn language() -> Language {
+            tree_sitter_json::LANGUAGE.into()
+        }
+    }
 }

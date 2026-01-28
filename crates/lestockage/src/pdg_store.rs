@@ -14,8 +14,7 @@ use rusqlite::{params, Result as SqliteResult};
 use std::collections::HashMap;
 
 /// Type alias for node database rows to reduce type complexity
-#[allow(dead_code)]
-type NodeDbRow = (i64, String, String, String, Option<i32>, String, Option<Vec<u8>>, Option<i64>, Option<i64>);
+type NodeDbRow = (i64, String, String, String, String, String, String, Option<i32>, String, Option<Vec<u8>>, Option<i64>, Option<i64>);
 
 /// Errors that can occur during PDG persistence
 #[derive(Debug, thiserror::Error)]
@@ -171,6 +170,7 @@ pub fn save_pdg(
             node_id: pdg_node.id.clone(),
             symbol_name: pdg_node.name.clone(),
             qualified_name: pdg_node.id.split(':').last().unwrap_or(&pdg_node.id).to_string(),
+            language: pdg_node.language.clone(),
             node_type: convert_node_type(&pdg_node.node_type),
             signature: None, // Could be populated from node content
             complexity: Some(pdg_node.complexity as i32),
@@ -181,8 +181,8 @@ pub fn save_pdg(
         };
 
         let db_id: i64 = tx.query_row(
-            "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
              RETURNING id",
             params![
                 record.project_id,
@@ -190,6 +190,7 @@ pub fn save_pdg(
                 record.node_id,
                 record.symbol_name,
                 record.qualified_name,
+                record.language,
                 record.node_type.as_str(),
                 record.signature,
                 record.complexity,
@@ -274,27 +275,28 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
 
     // Load all nodes for the project
     let mut nodes_stmt = storage.conn().prepare(
-        "SELECT id, file_path, node_id, symbol_name, qualified_name, node_type, complexity, content_hash, embedding, byte_range_start, byte_range_end
+        "SELECT id, file_path, node_id, symbol_name, qualified_name, language, node_type, complexity, content_hash, embedding, byte_range_start, byte_range_end
          FROM intel_nodes WHERE project_id = ?1"
     )?;
 
-    let node_rows: Vec<(i64, String, String, String, String, String, Option<i32>, String, Option<Vec<u8>>, Option<i64>, Option<i64>)> = nodes_stmt.query_map(params![project_id], |row| {
+    let node_rows: Vec<NodeDbRow> = nodes_stmt.query_map(params![project_id], |row| {
         Ok((
             row.get::<_, i64>(0)?,           // id
             row.get::<_, String>(1)?,         // file_path
             row.get::<_, String>(2)?,         // node_id
             row.get::<_, String>(3)?,         // symbol_name
             row.get::<_, String>(4)?,         // qualified_name
-            row.get::<_, String>(5)?,         // node_type
-            row.get::<_, Option<i32>>(6)?,    // complexity
-            row.get::<_, String>(7)?,         // content_hash
-            row.get::<_, Option<Vec<u8>>>(8)?, // embedding
-            row.get::<_, Option<i64>>(9)?,    // byte_range_start
-            row.get::<_, Option<i64>>(10)?,    // byte_range_end
+            row.get::<_, String>(5)?,         // language
+            row.get::<_, String>(6)?,         // node_type
+            row.get::<_, Option<i32>>(7)?,    // complexity
+            row.get::<_, String>(8)?,         // content_hash
+            row.get::<_, Option<Vec<u8>>>(9)?, // embedding
+            row.get::<_, Option<i64>>(10)?,    // byte_range_start
+            row.get::<_, Option<i64>>(11)?,    // byte_range_end
         ))
     })?.collect::<SqliteResult<Vec<_>>>()?;
 
-    for (db_id, file_path, node_id_str, symbol_name, _qualified_name, node_type_str, complexity, _content_hash, embedding_blob, start, end) in node_rows {
+    for (db_id, file_path, node_id_str, symbol_name, _qualified_name, language, node_type_str, complexity, _content_hash, embedding_blob, start, end) in node_rows {
         let node_type = StorageNodeType::from_str_name(&node_type_str)
             .ok_or_else(|| PdgStoreError::Deserialization(format!("Invalid node type: {}", node_type_str)))?;
 
@@ -318,6 +320,7 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
             file_path,
             byte_range: (start.unwrap_or(0) as usize, end.unwrap_or(0) as usize),
             complexity: complexity.unwrap_or(0) as u32,
+            language,
             embedding,
         };
 

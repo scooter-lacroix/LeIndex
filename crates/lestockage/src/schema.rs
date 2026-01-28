@@ -84,6 +84,7 @@ impl Storage {
                 node_id TEXT NOT NULL,
                 symbol_name TEXT NOT NULL,
                 qualified_name TEXT NOT NULL,
+                language TEXT NOT NULL DEFAULT 'unknown',
                 node_type TEXT NOT NULL,
                 signature TEXT,
                 complexity INTEGER,
@@ -110,6 +111,9 @@ impl Storage {
         if !columns.iter().any(|c| c == "qualified_name") {
             self.conn.execute("ALTER TABLE intel_nodes ADD COLUMN qualified_name TEXT DEFAULT ''", [])?;
             self.conn.execute("UPDATE intel_nodes SET qualified_name = symbol_name WHERE qualified_name = ''", [])?;
+        }
+        if !columns.iter().any(|c| c == "language") {
+            self.conn.execute("ALTER TABLE intel_nodes ADD COLUMN language TEXT DEFAULT 'unknown'", [])?;
         }
         if !columns.iter().any(|c| c == "byte_range_start") {
             self.conn.execute("ALTER TABLE intel_nodes ADD COLUMN byte_range_start INTEGER", [])?;

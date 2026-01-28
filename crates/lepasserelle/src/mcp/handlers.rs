@@ -230,15 +230,15 @@ impl SearchHandler {
         let query = extract_string(&args, "query")?;
         let top_k = extract_usize(&args, "top_k", 10)?;
 
-        let reader = leindex.lock().await;
+        let mut index = leindex.lock().await;
 
-        if reader.search_engine().is_empty() {
+        if index.search_engine().is_empty() {
             return Err(JsonRpcError::project_not_indexed(
-                reader.project_path().display().to_string()
+                index.project_path().display().to_string()
             ));
         }
 
-        let results = reader.search(&query, top_k)
+        let results = index.search(&query, top_k)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
         serde_json::to_value(results)

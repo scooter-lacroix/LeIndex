@@ -531,6 +531,7 @@ impl QueryParser {
             semantic: matches!(parsed.query_type, QueryType::Semantic),
             expand_context: parsed.expand_context,
             query_embedding: None,
+            threshold: None,
         }
     }
 

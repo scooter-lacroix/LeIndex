@@ -83,6 +83,7 @@ pub fn extract_pdg_from_signatures(
     signatures: Vec<SignatureInfo>,
     _source_code: &[u8],
     file_path: &str,
+    language: &str,
 ) -> ProgramDependenceGraph {
     let mut pdg = ProgramDependenceGraph::new();
 
@@ -96,7 +97,7 @@ pub fn extract_pdg_from_signatures(
 
     // Phase 1: Create nodes from signatures
     for signature in &signatures {
-        let node = signature_to_node(signature, file_path);
+        let node = signature_to_node(signature, file_path, language);
         let node_id = pdg.add_node(node);
         node_ids.insert(signature.qualified_name.clone(), node_id);
     }
@@ -140,7 +141,7 @@ pub fn extract_pdg_from_signatures(
 /// # Returns
 ///
 /// A PDG `Node` populated with signature information
-fn signature_to_node(sig: &SignatureInfo, file_path: &str) -> Node {
+fn signature_to_node(sig: &SignatureInfo, file_path: &str, language: &str) -> Node {
     // Determine node type based on is_method flag
     let node_type = if sig.is_method {
         NodeType::Method
@@ -164,6 +165,7 @@ fn signature_to_node(sig: &SignatureInfo, file_path: &str) -> Node {
         file_path: file_path.to_string(),
         byte_range,
         complexity,
+        language: language.to_string(),
         embedding: None, // Embeddings added separately by embedding module
     }
 }

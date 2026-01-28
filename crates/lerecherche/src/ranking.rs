@@ -54,8 +54,8 @@ impl HybridScorer {
     pub fn new() -> Self {
         Self {
             semantic_weight: 0.5,
-            structural_weight: 0.3,
-            text_weight: 0.2,
+            structural_weight: 0.1,
+            text_weight: 0.4,
         }
     }
 
