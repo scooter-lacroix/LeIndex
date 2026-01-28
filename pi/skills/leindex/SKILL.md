@@ -19,4 +19,7 @@ LeIndex provides high-performance semantic search and deep code analysis by buil
 4. **Context**: Use `leindex context` when you need to understand the surroundings of a specific function or class found via search.
 
 ## Integration
-This skill works by calling the `leindex` CLI binary or communicating with the LeIndex MCP server.
+This skill works by calling the `leindex` CLI binary.
+
+## Documentation
+For more information, see the LeIndex repository at `/mnt/e0f7c1a8-b834-4827-b579-0251b006bc1f/code_index_update/LeIndexer`.
