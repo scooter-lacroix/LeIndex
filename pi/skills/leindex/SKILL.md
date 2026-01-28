@@ -1,6 +1,9 @@
-# LeIndex Skill
+---
+name: leindex
+description: AI-powered code search and analysis engine using semantic search and Program Dependence Graph traversal.
+---
 
-AI-powered code search and analysis engine.
+# LeIndex Skill
 
 ## Overview
 LeIndex provides high-performance semantic search and deep code analysis by building a Program Dependence Graph (PDG) of your codebase.
