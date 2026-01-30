@@ -1,6 +1,6 @@
 // Go language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, Result, SignatureInfo};
+use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use tree_sitter::Parser;
 
@@ -77,8 +77,8 @@ impl GoParser {
                                         visibility: Visibility::Public,
                                         is_async: false,
                                         is_method: false,
-                                        docstring: extract_docstring(&child, source),
-                                        byte_range: (child.start_byte(), child.end_byte()),
+                                        docstring: extract_docstring(&child, source), 
+                                         calls: vec![], imports: vec![],  byte_range: (child.start_byte(), child.end_byte()),
                                     });
                                 }
                             }
@@ -126,7 +126,12 @@ impl CodeIntelligence for GoParser {
 
         let root_node = tree.root_node();
 
-        let signatures = self.extract_all_definitions(source, root_node);
+        let imports = extract_go_imports(root_node, source);
+        let mut signatures = self.extract_all_definitions(source, root_node);
+
+        for sig in &mut signatures {
+            sig.imports = imports.clone();
+        }
 
         Ok(signatures)
     }
@@ -165,6 +170,43 @@ impl CodeIntelligence for GoParser {
     }
 }
 
+fn extract_go_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+
+    fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
+        let path = path.trim().trim_matches('"').trim();
+        if path.is_empty() {
+            return;
+        }
+        imports.push(ImportInfo {
+            path: path.to_string(),
+            alias,
+        });
+    }
+
+    fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
+        if node.kind() == "import_spec" {
+            let alias = node.child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+                .map(|s| s.to_string());
+            let path = node.child_by_field_name("path")
+                .and_then(|n| n.utf8_text(source).ok())
+                .unwrap_or_default();
+            let cleaned_path = path.trim_matches('"').trim_matches('`');
+            let alias = alias.or_else(|| cleaned_path.split('/').last().map(|s| s.to_string()));
+            add_import(imports, cleaned_path, alias);
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(&child, source, imports);
+        }
+    }
+
+    visit(&root, source, &mut imports);
+    imports
+}
+
 /// Extract function signature from a function_declaration node
 fn extract_function_signature(
     node: &tree_sitter::Node,
@@ -189,6 +231,8 @@ fn extract_function_signature(
         .and_then(|r| r.utf8_text(source).ok())
         .map(|s| s.trim().to_string());
 
+    let calls = extract_go_calls(node, source);
+
     Some(SignatureInfo {
         name,
         qualified_name,
@@ -198,7 +242,9 @@ fn extract_function_signature(
         is_async: false,
         is_method: false,
         docstring: extract_docstring(node, source),
-        byte_range: (node.start_byte(), node.end_byte()),
+        calls,
+        
+        imports: vec![], byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 
@@ -242,6 +288,8 @@ fn extract_method_signature(
         .and_then(|r| r.utf8_text(source).ok())
         .map(|s| s.trim().to_string());
 
+    let calls = extract_go_calls(node, source);
+
     Some(SignatureInfo {
         name,
         qualified_name,
@@ -251,8 +299,44 @@ fn extract_method_signature(
         is_async: false,
         is_method: true,
         docstring: extract_docstring(node, source),
-        byte_range: (node.start_byte(), node.end_byte()),
+        calls,
+        
+        imports: vec![], byte_range: (node.start_byte(), node.end_byte()),
     })
+}
+
+/// Extract function calls from a Go node
+fn extract_go_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut calls = Vec::new();
+
+    fn clean_call_text(raw: &str) -> String {
+        raw.split('(')
+            .next()
+            .unwrap_or(raw)
+            .trim()
+            .to_string()
+    }
+
+    fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
+        if node.kind() == "call_expression" {
+            if let Some(func) = node.child_by_field_name("function") {
+                if let Ok(text) = func.utf8_text(source) {
+                    let name = clean_call_text(text);
+                    if !name.is_empty() {
+                        calls.push(name);
+                    }
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            find_calls(&child, source, calls);
+        }
+    }
+
+    find_calls(node, source, &mut calls);
+    calls
 }
 
 /// Extract parameters from a Go function

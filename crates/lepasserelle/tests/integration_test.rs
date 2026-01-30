@@ -489,7 +489,7 @@ fn greet() {
         let mut leindex = LeIndex::new(&project_path).unwrap();
 
         // First, index the project to load PDG
-        let _ = leindex.index_project();
+        let _ = leindex.index_project(false);
 
         // Reloading when PDG is already in memory should return Ok immediately
         let result = leindex.reload_pdg_from_cache();
@@ -592,7 +592,7 @@ fn greet() {
         let mut leindex = LeIndex::new(&project_path).unwrap();
 
         // First index the project
-        let index_result = leindex.index_project();
+        let index_result = leindex.index_project(false);
         assert!(index_result.is_ok());
 
         // Get initial stats

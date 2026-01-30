@@ -1,6 +1,6 @@
 // Scala language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, Result, SignatureInfo};
+use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use tree_sitter::Parser;
 
@@ -23,8 +23,13 @@ impl CodeIntelligence for ScalaParser {
             .map_err(|e| Error::ParseFailed(e.to_string()))?;
         let tree = parser.parse(source, None)
             .ok_or_else(|| Error::ParseFailed("Failed to parse Scala source".to_string()))?;
+        let root_node = tree.root_node();
+        let imports = extract_scala_imports(root_node, source);
         let mut signatures = Vec::new();
-        visit(&tree.root_node(), source, &mut signatures, &[]);
+        visit(&root_node, source, &mut signatures, &[]);
+        for sig in &mut signatures {
+            sig.imports = imports.clone();
+        }
         Ok(signatures)
     }
 
@@ -82,6 +87,8 @@ fn visit(
                 qualified_path.push(name.to_string());
                 let qualified_name = qualified_path.join(".");
 
+                let calls = extract_scala_calls(node, source);
+
                 sigs.push(SignatureInfo {
                     name: name.to_string(),
                     qualified_name,
@@ -90,7 +97,11 @@ fn visit(
                     visibility: Visibility::Public,
                     is_async: false,
                     is_method: !parent_path.is_empty(),
-                    docstring: extract_docstring(node, source), byte_range: (0, 0) });
+                    docstring: extract_docstring(node, source),
+                    calls,
+                    
+        imports: vec![], byte_range: (0, 0)
+                });
             }
         }
         "class_definition" | "trait_definition" | "object_definition" => {
@@ -113,7 +124,7 @@ fn visit(
                     visibility: Visibility::Public,
                     is_async: false,
                     is_method: false,
-                    docstring: extract_docstring(node, source), byte_range: (0, 0) });
+                    docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (0, 0) });
 
                 // Recurse into the body to find nested members
                 let mut c = node.walk();
@@ -132,6 +143,100 @@ fn visit(
 }
 
 /// Extract parameters from a parameters node
+fn extract_scala_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+
+    fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
+        let path = path.trim().trim_end_matches(';').trim();
+        if path.is_empty() {
+            return;
+        }
+        imports.push(ImportInfo {
+            path: path.to_string(),
+            alias,
+        });
+    }
+
+    fn parse_import_text(imports: &mut Vec<ImportInfo>, text: &str) {
+        let text = text.trim().trim_end_matches(';').trim_start_matches("import ");
+        if text.contains("=>") {
+            for part in text.split(',') {
+                let part = part.trim().trim_matches('{').trim_matches('}');
+                if let Some((path, alias)) = part.split_once("=>") {
+                    add_import(imports, path.trim(), Some(alias.trim().to_string()));
+                }
+            }
+        } else {
+            for part in text.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                let alias = part.split('.').last().map(|s| s.to_string());
+                add_import(imports, part, alias);
+            }
+        }
+    }
+
+    fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
+        if node.kind() == "import_declaration" {
+            if let Ok(text) = node.utf8_text(source) {
+                parse_import_text(imports, text);
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(&child, source, imports);
+        }
+    }
+
+    visit(&root, source, &mut imports);
+    imports
+}
+
+fn extract_scala_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut calls = Vec::new();
+
+    fn clean_call_text(raw: &str) -> String {
+        raw.split('(')
+            .next()
+            .unwrap_or(raw)
+            .trim()
+            .to_string()
+    }
+
+    fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
+        match node.kind() {
+            "call_expression" | "method_call" | "function_call" => {
+                if let Some(func) = node.child_by_field_name("function")
+                    .or_else(|| node.child_by_field_name("name")) {
+                    if let Ok(text) = func.utf8_text(source) {
+                        let name = clean_call_text(text);
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
+                    }
+                } else if let Ok(text) = node.utf8_text(source) {
+                    let name = clean_call_text(text);
+                    if !name.is_empty() {
+                        calls.push(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            find_calls(&child, source, calls);
+        }
+    }
+
+    find_calls(node, source, &mut calls);
+    calls
+}
+
 fn extract_parameters(params_node: &tree_sitter::Node, source: &[u8]) -> Vec<Parameter> {
     let mut parameters = Vec::new();
     let mut cursor = params_node.walk();

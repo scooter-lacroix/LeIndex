@@ -810,7 +810,7 @@ configure_opencode_mcp() {
     # Backup existing config
     backup_config_file "$config_file" "$backup_file"
 
-    # Opencode uses similar format to Claude Code
+    # Opencode MCP format: command array, type: local
     if command -v python3 &> /dev/null; then
         python3 <<PYTHON
 import json
@@ -825,12 +825,9 @@ except:
 if 'mcp' not in config:
     config['mcp'] = {}
 
-if 'leindex' not in config['mcp']:
-    config['mcp']['leindex'] = {}
-
 config['mcp']['leindex'] = {
-    'command': 'leindex',
-    'args': ['serve']
+    'command': ['leindex', 'mcp'],
+    'type': 'local'
 }
 
 with open('$config_file', 'w') as f:
@@ -875,6 +872,9 @@ show_mcp_config_instructions() {
     echo ""
     echo "  Zed (~/.config/zed/settings.json):"
     echo '    {"lsp": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
+    echo ""
+    echo "  Opencode (~/.config/opencode/opencode.json):"
+    echo '    {"mcp": {"leindex": {"command": ["leindex", "mcp"], "type": "local"}}}'
     echo ""
     echo "  LM Studio (~/.lmstudio/mcp.json):"
     echo '    {"mcpServers": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'

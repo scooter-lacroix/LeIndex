@@ -7,26 +7,26 @@
 // This module bridges leparse (parsing) and legraphe (graph intelligence) by converting
 // `SignatureInfo` structures into `ProgramDependenceGraph` instances.
 //
-// # Critical Limitations
+// # Call Graph Extraction
 //
-// **Call Graph Extraction**: This module CANNOT extract true call graphs because:
-// - `SignatureInfo` contains only function signatures, not bodies
-// - Call relationships require AST-level analysis of function bodies
-// - Future enhancement: Extend `CodeIntelligence` trait to extract full AST with body nodes
+// This module can extract **best-effort** call graph edges when parsers populate
+// `SignatureInfo.calls`. The extraction is limited to what each language parser
+// can recover from its AST (e.g., identifier/method names) and does not resolve
+// dynamic dispatch or cross-module aliasing.
 //
 // # What IS Extracted
 //
 // 1. **Nodes**: Functions/methods from signatures with metadata
 // 2. **Type Dependencies**: Edges between functions using similar parameter types
 // 3. **Class Hierarchy**: Inheritance edges from qualified_name patterns (e.g., `Class::method`)
+// 4. **Call Graph**: Edges from `SignatureInfo.calls` (best-effort)
 //
 // # Future Enhancement Path
 //
-// For full call graph extraction:
-// 1. Extend `SignatureInfo` to include AST node references
-// 2. Add `get_function_body()` method to `CodeIntelligence` trait
-// 3. Implement AST traversal in this module to find call expressions
-// 4. Extract call sites with line/column information
+// For richer call graph extraction:
+// 1. Capture fully-qualified call targets in parsers
+// 2. Add import/namespace resolution to reduce ambiguity
+// 3. Track call sites with line/column information
 
 #![warn(missing_docs)]
 
@@ -119,10 +119,181 @@ pub fn extract_pdg_from_signatures(
     let inheritance_edges = extract_inheritance_edges(&signatures, &node_ids);
     pdg.add_inheritance_edges(inheritance_edges);
 
-    // Note: Call graph extraction is NOT possible with SignatureInfo alone
-    // See module documentation for future enhancement path
+    // Phase 4: Extract and add call graph edges
+    let call_edges = extract_call_edges(&signatures, &node_ids);
+    pdg.add_call_graph_edges(call_edges);
 
     pdg
+}
+
+/// Extract call edges from signatures
+fn extract_call_edges(
+    signatures: &[SignatureInfo],
+    node_ids: &HashMap<String, crate::pdg::NodeId>,
+) -> Vec<(crate::pdg::NodeId, crate::pdg::NodeId)> {
+    let mut edges = Vec::new();
+    let mut seen_edges: HashSet<(crate::pdg::NodeId, crate::pdg::NodeId)> = HashSet::new();
+
+    fn normalize_symbol(raw: &str) -> String {
+        let trimmed = raw.split('(').next().unwrap_or(raw).trim();
+        trimmed
+            .replace("?.", ".")
+            .replace("::", ".")
+            .replace("->", ".")
+            .replace('\\', ".")
+            .replace('/', ".")
+            .replace(':', ".")
+            .replace("..", ".")
+            .trim_matches('.')
+            .to_string()
+    }
+
+    fn symbol_segments(raw: &str) -> Vec<String> {
+        normalize_symbol(raw)
+            .split('.')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn suffix_keys(segments: &[String], max_len: usize) -> Vec<String> {
+        let mut keys = Vec::new();
+        let len = segments.len();
+        if len < 2 {
+            return keys;
+        }
+
+        for suffix_len in 2..=max_len.min(len) {
+            let start = len - suffix_len;
+            let key = segments[start..].join(".");
+            keys.push(key);
+        }
+
+        keys
+    }
+
+    fn namespace_prefix(qualified: &str) -> Option<String> {
+        let segments = symbol_segments(qualified);
+        if segments.len() <= 1 {
+            None
+        } else {
+            Some(segments[..segments.len() - 1].join("."))
+        }
+    }
+
+    let imports = signatures.first().map(|s| s.imports.clone()).unwrap_or_default();
+    let mut alias_map: HashMap<String, String> = HashMap::new();
+    for import in &imports {
+        let alias = import.alias.clone().or_else(|| {
+            import.path.split(|c| c == '.' || c == ':' || c == '\\' || c == '/').last()
+                .map(|s| s.to_string())
+        });
+        if let Some(alias) = alias {
+            alias_map.insert(alias, import.path.clone());
+        }
+    }
+
+    let mut exact_map: HashMap<String, Vec<crate::pdg::NodeId>> = HashMap::new();
+    let mut last_map: HashMap<String, Vec<crate::pdg::NodeId>> = HashMap::new();
+    let mut suffix_map: HashMap<String, Vec<crate::pdg::NodeId>> = HashMap::new();
+    let mut namespace_map: HashMap<String, Vec<crate::pdg::NodeId>> = HashMap::new();
+
+    for sig in signatures {
+        if let Some(&id) = node_ids.get(&sig.qualified_name) {
+            let normalized = normalize_symbol(&sig.qualified_name);
+            let segments = symbol_segments(&sig.qualified_name);
+
+            exact_map.entry(normalized).or_default().push(id);
+
+            if let Some(last) = segments.last() {
+                last_map.entry(last.clone()).or_default().push(id);
+            }
+
+            if let Some(namespace) = namespace_prefix(&sig.qualified_name) {
+                namespace_map.entry(namespace).or_default().push(id);
+            }
+
+            for suffix in suffix_keys(&segments, 3) {
+                suffix_map.entry(suffix).or_default().push(id);
+            }
+        }
+    }
+
+    for sig in signatures {
+        let Some(&caller_id) = node_ids.get(&sig.qualified_name) else {
+            continue;
+        };
+
+        let caller_namespace = namespace_prefix(&sig.qualified_name);
+
+        for call_target in &sig.calls {
+            let mut candidates = Vec::new();
+            candidates.push(call_target.clone());
+
+            let segments = symbol_segments(call_target);
+            if let Some(first) = segments.first() {
+                if let Some(import_path) = alias_map.get(first) {
+                    if segments.len() == 1 {
+                        candidates.push(import_path.clone());
+                    } else {
+                        candidates.push(format!("{}.{}", import_path, segments[1..].join(".")));
+                    }
+                }
+            }
+
+            if let Some(namespace) = &caller_namespace {
+                if let Some(first) = segments.first() {
+                    if matches!(first.as_str(), "self" | "this" | "super" | "Self" | "crate") {
+                        let rest = segments.iter().skip(1).cloned().collect::<Vec<_>>().join(".");
+                        if !rest.is_empty() {
+                            candidates.push(format!("{}.{}", namespace, rest));
+                        }
+                    } else if segments.len() == 1 {
+                        candidates.push(format!("{}.{}", namespace, first));
+                    }
+                }
+            }
+
+            let mut targets: Vec<crate::pdg::NodeId> = Vec::new();
+            for candidate in candidates {
+                let normalized_call = normalize_symbol(&candidate);
+                if normalized_call.is_empty() {
+                    continue;
+                }
+                let candidate_segments = symbol_segments(&candidate);
+
+                if let Some(ids) = exact_map.get(&normalized_call) {
+                    targets.extend(ids.iter().copied());
+                }
+
+                if let Some(last) = candidate_segments.last() {
+                    if let Some(ids) = last_map.get(last) {
+                        targets.extend(ids.iter().copied());
+                    }
+                }
+
+                if candidate_segments.len() > 1 {
+                    for suffix in suffix_keys(&candidate_segments, 3) {
+                        if let Some(ids) = suffix_map.get(&suffix) {
+                            targets.extend(ids.iter().copied());
+                        }
+                    }
+                } else if let Some(namespace) = &caller_namespace {
+                    if let Some(ids) = namespace_map.get(namespace) {
+                        targets.extend(ids.iter().copied());
+                    }
+                }
+            }
+
+            for target_id in targets {
+                if caller_id != target_id && seen_edges.insert((caller_id, target_id)) {
+                    edges.push((caller_id, target_id));
+                }
+            }
+        }
+    }
+
+    edges
 }
 
 /// Convert a SignatureInfo to a PDG Node

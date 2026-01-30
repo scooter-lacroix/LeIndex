@@ -1,6 +1,6 @@
 // PHP language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, Result, SignatureInfo};
+use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use tree_sitter::Parser;
 
@@ -53,7 +53,7 @@ impl PhpParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: None, byte_range: (0, 0) });
+                            docstring: None,  calls: vec![], imports: vec![],  byte_range: (0, 0) });
                     }
 
                     let mut cursor = node.walk();
@@ -80,7 +80,7 @@ impl PhpParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: None, byte_range: (0, 0) });
+                            docstring: None,  calls: vec![], imports: vec![],  byte_range: (0, 0) });
                     }
                 }
                 "namespace_definition" => {
@@ -123,7 +123,12 @@ impl CodeIntelligence for PhpParser {
             .ok_or_else(|| Error::ParseFailed("Failed to parse PHP source".to_string()))?;
 
         let root_node = tree.root_node();
-        let signatures = self.extract_all_definitions(source, root_node);
+        let imports = extract_php_imports(root_node, source);
+        let mut signatures = self.extract_all_definitions(source, root_node);
+
+        for sig in &mut signatures {
+            sig.imports = imports.clone();
+        }
 
         Ok(signatures)
     }
@@ -161,6 +166,53 @@ impl CodeIntelligence for PhpParser {
     }
 }
 
+fn extract_php_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+
+    fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
+        let path = path.trim().trim_end_matches(';').trim();
+        if path.is_empty() {
+            return;
+        }
+        imports.push(ImportInfo {
+            path: path.to_string(),
+            alias,
+        });
+    }
+
+    fn parse_use_text(imports: &mut Vec<ImportInfo>, text: &str) {
+        let text = text.trim().trim_end_matches(';');
+        let text = text.trim_start_matches("use ").trim_start_matches("use function ").trim_start_matches("use const ");
+        for part in text.split(',') {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            if let Some((path, alias)) = part.split_once(" as ") {
+                add_import(imports, path.trim(), Some(alias.trim().to_string()));
+            } else {
+                add_import(imports, part, part.split('\\').last().map(|s| s.to_string()));
+            }
+        }
+    }
+
+    fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
+        if node.kind().contains("namespace_use") || node.kind() == "namespace_use_declaration" {
+            if let Ok(text) = node.utf8_text(source) {
+                parse_use_text(imports, text);
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(&child, source, imports);
+        }
+    }
+
+    visit(&root, source, &mut imports);
+    imports
+}
+
 fn extract_function_signature(
     node: &tree_sitter::Node,
     source: &[u8],
@@ -184,6 +236,8 @@ fn extract_function_signature(
         .and_then(|t| t.utf8_text(source).ok())
         .map(|s| s.trim().to_string());
 
+    let calls = extract_php_calls(node, source);
+
     Some(SignatureInfo {
         name,
         qualified_name,
@@ -192,7 +246,59 @@ fn extract_function_signature(
         visibility: Visibility::Public,
         is_async: false,
         is_method: node.kind() == "method_declaration",
-        docstring: extract_docstring(node, source), byte_range: (0, 0) })
+        docstring: extract_docstring(node, source),
+        calls,
+        
+        imports: vec![], byte_range: (0, 0)
+    })
+}
+
+fn extract_php_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut calls = Vec::new();
+
+    fn clean_call_text(raw: &str) -> String {
+        raw.split('(')
+            .next()
+            .unwrap_or(raw)
+            .trim()
+            .to_string()
+    }
+
+    fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
+        match node.kind() {
+            "function_call_expression" | "method_call_expression" | "scoped_call_expression" => {
+                if let Some(name_node) = node.child_by_field_name("name")
+                    .or_else(|| node.child_by_field_name("function")) {
+                    if let Ok(text) = name_node.utf8_text(source) {
+                        let name = clean_call_text(text);
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
+                    }
+                }
+            }
+            "object_creation_expression" => {
+                if let Some(name_node) = node.child_by_field_name("class")
+                    .or_else(|| node.child_by_field_name("type")) {
+                    if let Ok(text) = name_node.utf8_text(source) {
+                        let name = clean_call_text(text);
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            find_calls(&child, source, calls);
+        }
+    }
+
+    find_calls(node, source, &mut calls);
+    calls
 }
 
 fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {

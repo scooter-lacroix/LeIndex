@@ -1,6 +1,6 @@
 // Bash language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, Result, SignatureInfo};
+use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, Visibility};
 use tree_sitter::Parser;
 
@@ -36,6 +36,8 @@ impl BashParser {
                 "function_definition" => {
                     if let Some(name_node) = node.child_by_field_name("name") {
                         if let Ok(name) = name_node.utf8_text(source) {
+                            let calls = extract_bash_calls(node, source);
+
                             signatures.push(SignatureInfo {
                                 name: name.to_string(),
                                 qualified_name: name.to_string(),
@@ -45,7 +47,9 @@ impl BashParser {
                                 is_async: false,
                                 is_method: false,
                                 docstring: extract_docstring(node, source),
-                                byte_range: (node.start_byte(), node.end_byte()),
+                                calls,
+                                
+        imports: vec![], byte_range: (node.start_byte(), node.end_byte()),
                             });
                         }
                     }
@@ -85,7 +89,12 @@ impl CodeIntelligence for BashParser {
 
         let root_node = tree.root_node();
 
-        let signatures = self.extract_all_definitions(source, root_node);
+        let imports = extract_bash_imports(root_node, source);
+        let mut signatures = self.extract_all_definitions(source, root_node);
+
+        for sig in &mut signatures {
+            sig.imports = imports.clone();
+        }
 
         Ok(signatures)
     }
@@ -134,6 +143,78 @@ fn calculate_complexity(node: &tree_sitter::Node, metrics: &mut ComplexityMetric
     for child in node.children(&mut cursor) {
         calculate_complexity(&child, metrics, depth + 1);
     }
+}
+
+fn extract_bash_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+
+    fn add_import(imports: &mut Vec<ImportInfo>, path: &str) {
+        let path = path.trim().trim_matches('"').trim_matches('\'').trim();
+        if path.is_empty() {
+            return;
+        }
+        imports.push(ImportInfo {
+            path: path.to_string(),
+            alias: None,
+        });
+    }
+
+    fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
+        if node.kind() == "command" || node.kind() == "simple_command" {
+            if let Some(name_node) = node.child_by_field_name("name")
+                .or_else(|| node.child_by_field_name("command"))
+                .or_else(|| node.child_by_field_name("command_name")) {
+                if let Ok(name) = name_node.utf8_text(source) {
+                    if name == "source" || name == "." {
+                        if let Some(arg) = node.child_by_field_name("argument")
+                            .or_else(|| node.child_by_field_name("arguments")) {
+                            if let Ok(text) = arg.utf8_text(source) {
+                                add_import(imports, text);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(&child, source, imports);
+        }
+    }
+
+    visit(&root, source, &mut imports);
+    imports
+}
+
+fn extract_bash_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut calls = Vec::new();
+
+    fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
+        match node.kind() {
+            "command" | "simple_command" => {
+                if let Some(name_node) = node.child_by_field_name("name")
+                    .or_else(|| node.child_by_field_name("command"))
+                    .or_else(|| node.child_by_field_name("command_name")) {
+                    if let Ok(text) = name_node.utf8_text(source) {
+                        let name = text.trim().to_string();
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            find_calls(&child, source, calls);
+        }
+    }
+
+    find_calls(node, source, &mut calls);
+    calls
 }
 
 fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {

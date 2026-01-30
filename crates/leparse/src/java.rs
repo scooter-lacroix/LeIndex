@@ -1,6 +1,6 @@
 // Java language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, Result, SignatureInfo};
+use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use tree_sitter::Parser;
 
@@ -64,7 +64,7 @@ impl JavaParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
                     }
 
                     // Recurse to extract class methods
@@ -92,7 +92,7 @@ impl JavaParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
                     }
 
                     // Recurse to extract interface methods
@@ -120,7 +120,7 @@ impl JavaParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
                     }
                 }
                 "field_declaration" => {
@@ -146,7 +146,7 @@ impl JavaParser {
                                     visibility: extract_visibility(node, source),
                                     is_async: false,
                                     is_method: false,
-                                    docstring: None, byte_range: (0, 0) });
+                                    docstring: None,  calls: vec![], imports: vec![],  byte_range: (0, 0) });
                             }
                         }
                     }
@@ -186,7 +186,12 @@ impl CodeIntelligence for JavaParser {
 
         let root_node = tree.root_node();
 
-        let signatures = self.extract_all_definitions(source, root_node);
+        let imports = extract_java_imports(root_node, source);
+        let mut signatures = self.extract_all_definitions(source, root_node);
+
+        for sig in &mut signatures {
+            sig.imports = imports.clone();
+        }
 
         Ok(signatures)
     }
@@ -225,6 +230,40 @@ impl CodeIntelligence for JavaParser {
     }
 }
 
+fn extract_java_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+
+    fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
+        let path = path.trim().trim_end_matches(';').trim();
+        if path.is_empty() {
+            return;
+        }
+        imports.push(ImportInfo {
+            path: path.to_string(),
+            alias,
+        });
+    }
+
+    fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
+        if node.kind() == "import_declaration" {
+            if let Ok(text) = node.utf8_text(source) {
+                let text = text.trim().trim_end_matches(';').trim();
+                let text = text.trim_start_matches("import ").trim_start_matches("static ");
+                let alias = text.split('.').last().map(|s| s.to_string());
+                add_import(imports, text, alias);
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(&child, source, imports);
+        }
+    }
+
+    visit(&root, source, &mut imports);
+    imports
+}
+
 /// Extract method signature from a method_declaration node
 fn extract_method_signature(
     node: &tree_sitter::Node,
@@ -250,6 +289,7 @@ fn extract_method_signature(
         .map(|s| s.trim().to_string());
 
     let visibility = extract_visibility(node, source);
+    let calls = extract_java_calls(node, source);
 
     Some(SignatureInfo {
         name,
@@ -259,7 +299,11 @@ fn extract_method_signature(
         visibility,
         is_async: false, // Java doesn't have async in the same way
         is_method: true,
-        docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) })
+        docstring: extract_docstring(node, source),
+        calls,
+        
+        imports: vec![], byte_range: (node.start_byte(), node.end_byte())
+    })
 }
 
 /// Extract constructor signature from a constructor_declaration node
@@ -282,6 +326,7 @@ fn extract_constructor_signature(
     let parameters = extract_java_parameters(node, source);
 
     let visibility = extract_visibility(node, source);
+    let calls = extract_java_calls(node, source);
 
     Some(SignatureInfo {
         name,
@@ -291,7 +336,75 @@ fn extract_constructor_signature(
         visibility,
         is_async: false,
         is_method: true,
-        docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) })
+        docstring: extract_docstring(node, source),
+        calls,
+        
+        imports: vec![], byte_range: (node.start_byte(), node.end_byte())
+    })
+}
+
+/// Extract function calls from a Java node
+fn extract_java_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut calls = Vec::new();
+
+    fn clean_call_text(raw: &str) -> String {
+        raw.split('(')
+            .next()
+            .unwrap_or(raw)
+            .trim()
+            .to_string()
+    }
+
+    fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
+        match node.kind() {
+            "method_invocation" => {
+                let object = node.child_by_field_name("object")
+                    .or_else(|| node.child_by_field_name("scope"))
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| clean_call_text(s));
+                let name = node.child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| clean_call_text(s));
+
+                let call_name = match (object, name) {
+                    (Some(obj), Some(method)) => format!("{}.{}", obj, method),
+                    (_, Some(method)) => method,
+                    _ => node.utf8_text(source).ok().map(|s| clean_call_text(s)).unwrap_or_default(),
+                };
+
+                if !call_name.is_empty() {
+                    calls.push(call_name);
+                }
+            }
+            "object_creation_expression" => {
+                if let Some(typ) = node.child_by_field_name("type") {
+                    if let Ok(text) = typ.utf8_text(source) {
+                        let name = clean_call_text(text);
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
+                    }
+                }
+            }
+            "explicit_constructor_invocation" | "constructor_invocation" => {
+                if let Ok(text) = node.utf8_text(source) {
+                    let name = clean_call_text(text);
+                    if !name.is_empty() {
+                        calls.push(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            find_calls(&child, source, calls);
+        }
+    }
+
+    find_calls(node, source, &mut calls);
+    calls
 }
 
 /// Extract parameters from a Java method

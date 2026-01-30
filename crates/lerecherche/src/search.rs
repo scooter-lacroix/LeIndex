@@ -546,7 +546,7 @@ impl SearchEngine {
         };
 
         for node in candidates {
-            let text_score = self.calculate_text_score_optimized(&text_query, &node.content, &node.symbol_name);
+            let text_score = self.calculate_text_score_optimized(&text_query, &node.content, &node.symbol_name, &node.file_path);
 
             // Get semantic score from vector search results
             let semantic_score = if query.semantic {
@@ -618,10 +618,18 @@ impl SearchEngine {
     ///
     /// - Time complexity: O(m) where m is content length (query preprocessing is O(1) per call)
     /// - Space complexity: O(t) where t is number of content tokens (vs O(q + t) before)
-    fn calculate_text_score_optimized(&self, precomputed: &TextQueryPreprocessed, content: &str, symbol_name: &str) -> f32 {
+    fn calculate_text_score_optimized(&self, precomputed: &TextQueryPreprocessed, content: &str, symbol_name: &str, file_path: &str) -> f32 {
         // Boost matches in symbol name
         let symbol_boost = if symbol_name.to_ascii_lowercase().contains(&precomputed.query_lower) {
             0.5
+        } else {
+            0.0
+        };
+
+        // Penalty for test-related files to address Limitation 4
+        let test_penalty = if file_path.to_ascii_lowercase().contains("test") 
+            || symbol_name.to_ascii_lowercase().contains("test") {
+            0.3
         } else {
             0.0
         };
@@ -636,16 +644,23 @@ impl SearchEngine {
         } else {
             // Count matching tokens without allocating content_tokens HashSet
             let mut matching = 0;
-            for token in content.split_whitespace() {
-                if precomputed.query_tokens.contains(token) {
-                    matching += 1;
+            for token in content.split(|c: char| !c.is_alphanumeric()) {
+                let token_lower = token.to_ascii_lowercase();
+                if token_lower.len() >= 2 {
+                    if precomputed.query_tokens.contains(&token_lower) {
+                        matching += 1;
+                    }
                 }
             }
 
-            matching as f32 / precomputed.query_tokens.len() as f32
+            if precomputed.query_tokens.is_empty() {
+                0.0
+            } else {
+                matching as f32 / precomputed.query_tokens.len() as f32
+            }
         };
 
-        (base_score + symbol_boost).min(1.0)
+        ((base_score + symbol_boost) - test_penalty).clamp(0.0, 1.0)
     }
 
     /// Semantic search for entry points

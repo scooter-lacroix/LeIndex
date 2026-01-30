@@ -1,6 +1,6 @@
 // C++ language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, Result, SignatureInfo};
+use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use tree_sitter::Parser;
 
@@ -59,7 +59,7 @@ impl CppParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
                     }
 
                     // Recurse to extract class methods
@@ -87,7 +87,7 @@ impl CppParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
                     }
                 }
                 "enum_specifier" => {
@@ -109,7 +109,7 @@ impl CppParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
                     }
                 }
                 "namespace_definition" => {
@@ -161,7 +161,12 @@ impl CodeIntelligence for CppParser {
 
         let root_node = tree.root_node();
 
-        let signatures = self.extract_all_definitions(source, root_node);
+        let imports = extract_cpp_imports(root_node, source);
+        let mut signatures = self.extract_all_definitions(source, root_node);
+
+        for sig in &mut signatures {
+            sig.imports = imports.clone();
+        }
 
         Ok(signatures)
     }
@@ -232,6 +237,8 @@ fn extract_function_signature(
         .and_then(|t| t.utf8_text(source).ok())
         .map(|s| s.trim().to_string());
 
+    let calls = extract_cpp_calls(node, source);
+
     Some(SignatureInfo {
         name: name.unwrap_or_default(),
         qualified_name,
@@ -240,7 +247,93 @@ fn extract_function_signature(
         visibility: Visibility::Public,
         is_async: false,
         is_method: false,
-        docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) })
+        docstring: extract_docstring(node, source),
+        calls,
+        
+        imports: vec![], byte_range: (node.start_byte(), node.end_byte())
+    })
+}
+
+/// Extract function calls from a C++ node
+fn extract_cpp_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+
+    fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
+        let path = path.trim().trim_matches('"').trim_matches('<').trim_matches('>').trim();
+        if path.is_empty() {
+            return;
+        }
+        let alias = alias.or_else(|| path.split('/').last().map(|s| s.to_string()));
+        imports.push(ImportInfo {
+            path: path.to_string(),
+            alias,
+        });
+    }
+
+    fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
+        if node.kind() == "preproc_include" {
+            if let Ok(text) = node.utf8_text(source) {
+                let parts: Vec<_> = text.split_whitespace().collect();
+                if let Some(last) = parts.last() {
+                    add_import(imports, last, None);
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(&child, source, imports);
+        }
+    }
+
+    visit(&root, source, &mut imports);
+    imports
+}
+
+fn extract_cpp_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut calls = Vec::new();
+
+    fn clean_call_text(raw: &str) -> String {
+        raw.split('(')
+            .next()
+            .unwrap_or(raw)
+            .trim()
+            .to_string()
+    }
+
+    fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
+        match node.kind() {
+            "call_expression" => {
+                if let Some(func) = node.child_by_field_name("function") {
+                    if let Ok(text) = func.utf8_text(source) {
+                        let name = clean_call_text(text);
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
+                    }
+                }
+            }
+            "new_expression" => {
+                if let Some(typ) = node.child_by_field_name("type") {
+                    if let Ok(text) = typ.utf8_text(source) {
+                        let name = clean_call_text(text);
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            find_calls(&child, source, calls);
+        }
+    }
+
+    find_calls(node, source, &mut calls);
+    calls
 }
 
 /// Extract parameters from a C++ function

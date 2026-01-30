@@ -377,7 +377,7 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
 async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     use crate::mcp::handlers::{IndexHandler, SearchHandler, DiagnosticsHandler, DeepAnalyzeHandler, ContextHandler};
     use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError};
-    use std::io::{self, BufRead, Write};
+    use std::io::{self, BufRead, Read, Write};
 
     let project_path = get_project_path(project);
     let canonical_path = project_path.canonicalize()
@@ -412,25 +412,63 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
+    let mut reader = io::BufReader::new(stdin.lock());
+    let mut use_content_length = false;
 
-    // Read stdin line by line for JSON-RPC requests
-    let reader = stdin.lock();
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    loop {
+        let mut line = String::new();
+        let bytes = match reader.read_line(&mut line) {
+            Ok(b) => b,
             Err(e) => {
                 eprintln!("[ERROR] Failed to read stdin: {}", e);
                 continue;
             }
         };
+        if bytes == 0 {
+            break;
+        }
 
-        let line = line.trim();
-        if line.is_empty() {
+        let line_trim = line.trim_end();
+        if line_trim.is_empty() {
             continue;
         }
 
+        let (json_payload, framed) = if line_trim.to_ascii_lowercase().starts_with("content-length:") {
+            let len_str = line_trim.split(':').nth(1).unwrap_or("").trim();
+            let length: usize = match len_str.parse() {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[ERROR] Invalid Content-Length header: {}", e);
+                    continue;
+                }
+            };
+
+            // Consume remaining header lines until blank line
+            loop {
+                let mut header = String::new();
+                if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                    break;
+                }
+                if header.trim().is_empty() {
+                    break;
+                }
+            }
+
+            let mut buf = vec![0u8; length];
+            if let Err(e) = reader.read_exact(&mut buf) {
+                eprintln!("[ERROR] Failed to read JSON payload: {}", e);
+                break;
+            }
+
+            (String::from_utf8_lossy(&buf).to_string(), true)
+        } else {
+            (line_trim.to_string(), false)
+        };
+
+        use_content_length = use_content_length || framed;
+
         // Parse JSON-RPC request
-        let request: JsonRpcRequest = match serde_json::from_str(&line) {
+        let request: JsonRpcRequest = match serde_json::from_str(&json_payload) {
             Ok(r) => r,
             Err(e) => {
                 let error_response = JsonRpcResponse::error(
@@ -438,9 +476,12 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
                     JsonRpcError::parse_error(e.to_string())
                 );
                 let response = serde_json::to_string(&error_response).unwrap_or_default();
-                if writeln!(stdout, "{}\n", response).is_err() {
+                if use_content_length {
+                    let _ = writeln!(stdout, "Content-Length: {}\r\n\r\n{}", response.len(), response);
+                } else if writeln!(stdout, "{}\n", response).is_err() {
                     break;
                 }
+                let _ = stdout.flush();
                 continue;
             }
         };
@@ -473,7 +514,12 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
                 }
             };
 
-            if writeln!(stdout, "{}\n", response_json).is_err() {
+            if use_content_length {
+                if writeln!(stdout, "Content-Length: {}\r\n\r\n{}", response_json.len(), response_json).is_err() {
+                    eprintln!("[ERROR] Failed to write to stdout");
+                    break;
+                }
+            } else if writeln!(stdout, "{}\n", response_json).is_err() {
                 eprintln!("[ERROR] Failed to write to stdout");
                 break;
             }

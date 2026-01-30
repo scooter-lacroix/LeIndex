@@ -58,6 +58,9 @@ pub struct LeIndex {
 /// Statistics from indexing operations
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexStats {
+    /// Total number of files in the project
+    pub total_files: usize,
+
     /// Total number of files encountered during indexing
     pub files_parsed: usize,
 
@@ -196,6 +199,7 @@ impl LeIndex {
             pdg: None,
             cache_spiller,
             stats: IndexStats {
+                total_files: 0,
                 files_parsed: 0,
                 successful_parses: 0,
                 failed_parses: 0,
@@ -357,6 +361,7 @@ impl LeIndex {
         let total_sigs: usize = parsing_results.iter().map(|r| r.signatures.len()).sum();
 
         self.stats = IndexStats {
+            total_files: source_files_with_hashes.len(),
             files_parsed: parsing_results.len(),
             successful_parses: successful,
             failed_parses: failed,
@@ -918,6 +923,8 @@ impl LeIndex {
 
     /// Generate a deterministic embedding for a query string
     pub fn generate_query_embedding(&self, query: &str) -> Vec<f32> {
+        // For query embeddings, we only have the query text.
+        // We use it as the symbol name to match against nodes.
         self.generate_deterministic_embedding(query, "", "")
     }
 
@@ -929,19 +936,19 @@ impl LeIndex {
     fn generate_deterministic_embedding(
         &self,
         symbol_name: &str,
-        file_path: &str,
-        content: &str,
+        _file_path: &str,
+        _content: &str,
     ) -> Vec<f32> {
         use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
 
         let mut embedding = Vec::with_capacity(768);
 
-        // Initial seed hash from all inputs
+        // Initial seed hash from symbol name only for better query matching
+        // In a real system, this would be an LLM embedding of the content.
+        // For this "deterministic" version, matching on symbol name is most useful.
         let mut base_hasher = DefaultHasher::new();
-        symbol_name.hash(&mut base_hasher);
-        file_path.hash(&mut base_hasher);
-        content.hash(&mut base_hasher);
+        symbol_name.to_lowercase().hash(&mut base_hasher);
         let base_hash = base_hasher.finish();
 
         for i in 0..768 {
@@ -1084,6 +1091,7 @@ mod tests {
     #[test]
     fn test_stats_serialization() {
         let stats = IndexStats {
+            total_files: 100,
             files_parsed: 100,
             successful_parses: 95,
             failed_parses: 5,
@@ -1124,6 +1132,7 @@ mod tests {
             project_path: "/test".to_string(),
             project_id: "test".to_string(),
             stats: IndexStats {
+                total_files: 0,
                 files_parsed: 0,
                 successful_parses: 0,
                 failed_parses: 0,

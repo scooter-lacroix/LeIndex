@@ -1,6 +1,6 @@
 // Lua language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, Result, SignatureInfo};
+use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use tree_sitter::Parser;
 
@@ -23,8 +23,13 @@ impl CodeIntelligence for LuaParser {
             .map_err(|e| Error::ParseFailed(e.to_string()))?;
         let tree = parser.parse(source, None)
             .ok_or_else(|| Error::ParseFailed("Failed to parse Lua source".to_string()))?;
+        let root_node = tree.root_node();
+        let imports = extract_lua_imports(root_node, source);
         let mut signatures = Vec::new();
-        visit(&tree.root_node(), source, &mut signatures, &[]);
+        visit(&root_node, source, &mut signatures, &[]);
+        for sig in &mut signatures {
+            sig.imports = imports.clone();
+        }
         Ok(signatures)
     }
 
@@ -82,6 +87,8 @@ fn visit(
                 qualified_path.push(name.clone());
                 let qualified_name = qualified_path.join(".");
 
+                let calls = extract_lua_calls(node, source);
+
                 sigs.push(SignatureInfo {
                     name: name.clone(),
                     qualified_name,
@@ -90,7 +97,11 @@ fn visit(
                     visibility: Visibility::Public,
                     is_async: false,
                     is_method: !parent_path.is_empty(),
-                    docstring: extract_docstring(node, source), byte_range: (0, 0) });
+                    docstring: extract_docstring(node, source),
+                    calls,
+                    
+        imports: vec![], byte_range: (0, 0)
+                });
             }
         }
         _ => {
@@ -103,6 +114,83 @@ fn visit(
 }
 
 /// Extract parameters from a parameters node
+fn extract_lua_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+
+    fn add_import(imports: &mut Vec<ImportInfo>, path: &str) {
+        let path = path.trim().trim_matches('"').trim_matches('\'').trim();
+        if path.is_empty() {
+            return;
+        }
+        imports.push(ImportInfo {
+            path: path.to_string(),
+            alias: None,
+        });
+    }
+
+    fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
+        if node.kind() == "function_call" || node.kind() == "method_call" {
+            if let Some(name) = node.child_by_field_name("name")
+                .or_else(|| node.child_by_field_name("function"))
+                .and_then(|n| n.utf8_text(source).ok()) {
+                if name == "require" {
+                    if let Some(args) = node.child_by_field_name("arguments") {
+                        if let Ok(text) = args.utf8_text(source) {
+                            let cleaned = text.trim().trim_matches('(').trim_matches(')');
+                            add_import(imports, cleaned);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(&child, source, imports);
+        }
+    }
+
+    visit(&root, source, &mut imports);
+    imports
+}
+
+fn extract_lua_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut calls = Vec::new();
+
+    fn clean_call_text(raw: &str) -> String {
+        raw.split('(')
+            .next()
+            .unwrap_or(raw)
+            .trim()
+            .to_string()
+    }
+
+    fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
+        match node.kind() {
+            "function_call" | "method_call" => {
+                if let Some(func) = node.child_by_field_name("name")
+                    .or_else(|| node.child_by_field_name("function")) {
+                    if let Ok(text) = func.utf8_text(source) {
+                        let name = clean_call_text(text);
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            find_calls(&child, source, calls);
+        }
+    }
+
+    find_calls(node, source, &mut calls);
+    calls
+}
+
 fn extract_parameters(params_node: &tree_sitter::Node, source: &[u8]) -> Vec<Parameter> {
     let mut parameters = Vec::new();
     let mut cursor = params_node.walk();

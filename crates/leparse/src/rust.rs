@@ -1,6 +1,6 @@
 // Rust language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, Result, SignatureInfo};
+use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use tree_sitter::Parser;
 
@@ -95,7 +95,9 @@ impl RustParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),
+                            calls: vec![], imports: vec![], 
+                            byte_range: (node.start_byte(), node.end_byte()) });
                     }
 
                     // Recurse to extract trait methods
@@ -135,7 +137,9 @@ impl RustParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),
+                            calls: vec![], imports: vec![], 
+                            byte_range: (node.start_byte(), node.end_byte()) });
                     }
                 }
                 "enum_item" => {
@@ -157,7 +161,9 @@ impl RustParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),
+                            calls: vec![], imports: vec![], 
+                            byte_range: (node.start_byte(), node.end_byte()) });
                     }
                 }
                 "use_declaration" => {
@@ -200,7 +206,12 @@ impl CodeIntelligence for RustParser {
 
         let root_node = tree.root_node();
 
-        let signatures = self.extract_all_definitions(source, root_node);
+        let imports = extract_rust_imports(root_node, source);
+        let mut signatures = self.extract_all_definitions(source, root_node);
+
+        for sig in &mut signatures {
+            sig.imports = imports.clone();
+        }
 
         Ok(signatures)
     }
@@ -237,6 +248,77 @@ impl CodeIntelligence for RustParser {
         calculate_complexity(node, &mut complexity, 0);
         complexity
     }
+}
+
+/// Extract imports from a Rust file
+fn extract_rust_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+
+    fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
+        let path = path.trim().trim_end_matches(';').trim();
+        if path.is_empty() {
+            return;
+        }
+        imports.push(ImportInfo {
+            path: path.to_string(),
+            alias,
+        });
+    }
+
+    fn parse_use_text(imports: &mut Vec<ImportInfo>, text: &str) {
+        let mut text = text.trim();
+        if text.starts_with("use ") {
+            text = text.trim_start_matches("use ");
+        }
+        text = text.trim_end_matches(';').trim();
+
+        if let Some((base, rest)) = text.split_once('{') {
+            let base = base.trim().trim_end_matches("::");
+            let rest = rest.trim_end_matches('}');
+            for item in rest.split(',') {
+                let item = item.trim();
+                if item.is_empty() || item == "*" {
+                    continue;
+                }
+                let (item_path, alias) = if let Some((path, alias)) = item.split_once(" as ") {
+                    (path.trim(), Some(alias.trim().to_string()))
+                } else {
+                    (item, None)
+                };
+                let full_path = if base.is_empty() {
+                    item_path.to_string()
+                } else {
+                    format!("{}::{}", base, item_path)
+                };
+                let alias = alias.or_else(|| item_path.split("::").last().map(|s| s.to_string()));
+                add_import(imports, &full_path, alias);
+            }
+        } else {
+            let (path, alias) = if let Some((path, alias)) = text.split_once(" as ") {
+                (path.trim(), Some(alias.trim().to_string()))
+            } else {
+                (text, None)
+            };
+            let alias = alias.or_else(|| path.split("::").last().map(|s| s.to_string()));
+            add_import(imports, path, alias);
+        }
+    }
+
+    fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
+        if node.kind() == "use_declaration" {
+            if let Ok(text) = node.utf8_text(source) {
+                parse_use_text(imports, text);
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(&child, source, imports);
+        }
+    }
+
+    visit(&root, source, &mut imports);
+    imports
 }
 
 /// Extract function signature from a function_item node
@@ -278,6 +360,8 @@ fn extract_function_signature(
         .map(|p| p.name.contains("self"))
         .unwrap_or(false);
 
+    let calls = extract_rust_calls(node, source);
+
     Some(SignatureInfo {
         name,
         qualified_name,
@@ -286,7 +370,78 @@ fn extract_function_signature(
         visibility,
         is_async,
         is_method,
-        docstring: extract_docstring(node, source), byte_range: (node.start_byte(), node.end_byte()) })
+        docstring: extract_docstring(node, source),
+        calls,
+        
+        imports: vec![], byte_range: (node.start_byte(), node.end_byte()) })
+}
+
+/// Extract function calls from a Rust node
+fn extract_rust_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut calls = Vec::new();
+
+    fn clean_call_text(raw: &str) -> String {
+        raw.split('(')
+            .next()
+            .unwrap_or(raw)
+            .replace("::<", "::")
+            .trim()
+            .trim_end_matches('!')
+            .to_string()
+    }
+    
+    fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
+        match node.kind() {
+            "call_expression" => {
+                if let Some(func) = node.child_by_field_name("function") {
+                    if let Ok(text) = func.utf8_text(source) {
+                        let name = clean_call_text(text);
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
+                    }
+                }
+            }
+            "method_call_expression" => {
+                let receiver = node.child_by_field_name("receiver")
+                    .and_then(|r| r.utf8_text(source).ok())
+                    .map(|s| clean_call_text(s));
+                let method = node.child_by_field_name("method")
+                    .and_then(|m| m.utf8_text(source).ok())
+                    .map(|s| clean_call_text(s));
+
+                let name = match (receiver, method) {
+                    (Some(r), Some(m)) => format!("{}.{}", r, m),
+                    (_, Some(m)) => m,
+                    _ => String::new(),
+                };
+
+                if !name.is_empty() {
+                    calls.push(name);
+                }
+            }
+            "macro_invocation" => {
+                if let Some(name_node) = node.child_by_field_name("macro")
+                    .or_else(|| node.child_by_field_name("name")) {
+                    if let Ok(text) = name_node.utf8_text(source) {
+                        let name = clean_call_text(text);
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            find_calls(&child, source, calls);
+        }
+    }
+    
+    find_calls(node, source, &mut calls);
+    calls
 }
 
 /// Extract import signature from a use_declaration node
@@ -321,7 +476,9 @@ fn extract_import_signature(
         visibility: Visibility::Public,
         is_async: false,
         is_method: false,
-        docstring: None, byte_range: (0, 0) })
+        docstring: None,
+        calls: vec![], imports: vec![], 
+        byte_range: (0, 0) })
 }
 
 /// Extract visibility modifier from a node

@@ -1,6 +1,6 @@
 // Python language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, Result, SignatureInfo};
+use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use tree_sitter::Parser;
 
@@ -134,9 +134,15 @@ impl CodeIntelligence for PythonParser {
 
         let root_node = tree.root_node();
 
+        let imports = extract_python_imports(root_node, source);
+
         // Extract signatures - extract_class_definitions handles both classes AND top-level functions
         // by calling the shared extract_function_signature helper
-        let signatures = self.extract_all_definitions(source, root_node);
+        let mut signatures = self.extract_all_definitions(source, root_node);
+
+        for sig in &mut signatures {
+            sig.imports = imports.clone();
+        }
 
         Ok(signatures)
     }
@@ -175,6 +181,76 @@ impl CodeIntelligence for PythonParser {
         calculate_complexity(node, &mut complexity, 0);
         complexity
     }
+}
+
+fn extract_python_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+
+    fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
+        let path = path.trim().trim_end_matches(';').trim();
+        if path.is_empty() {
+            return;
+        }
+        imports.push(ImportInfo {
+            path: path.to_string(),
+            alias,
+        });
+    }
+
+    fn parse_import_text(imports: &mut Vec<ImportInfo>, text: &str) {
+        let text = text.trim();
+        if text.starts_with("import ") {
+            let rest = text.trim_start_matches("import ");
+            for part in rest.split(',') {
+                let part = part.trim();
+                if part.is_empty() {
+                    continue;
+                }
+                if let Some((path, alias)) = part.split_once(" as ") {
+                    add_import(imports, path.trim(), Some(alias.trim().to_string()));
+                } else {
+                    add_import(imports, part, part.split('.').last().map(|s| s.to_string()));
+                }
+            }
+        } else if text.starts_with("from ") {
+            let rest = text.trim_start_matches("from ");
+            if let Some((module, items)) = rest.split_once(" import ") {
+                let module = module.trim();
+                for item in items.split(',') {
+                    let item = item.trim();
+                    if item.is_empty() || item == "*" {
+                        continue;
+                    }
+                    if let Some((name, alias)) = item.split_once(" as ") {
+                        let path = format!("{}.{}", module, name.trim());
+                        add_import(imports, &path, Some(alias.trim().to_string()));
+                    } else {
+                        let path = format!("{}.{}", module, item);
+                        add_import(imports, &path, item.split('.').last().map(|s| s.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
+        match node.kind() {
+            "import_statement" | "import_from_statement" => {
+                if let Ok(text) = node.utf8_text(source) {
+                    parse_import_text(imports, text);
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(&child, source, imports);
+        }
+    }
+
+    visit(&root, source, &mut imports);
+    imports
 }
 
 /// Extract function signature from a function_definition node
@@ -230,6 +306,9 @@ fn extract_function_signature_with_path(
     // Extract docstring (if present)
     let docstring = extract_docstring(node, source);
 
+    // Extract calls
+    let calls = extract_python_calls(node, source);
+
     // Determine if this is a method (qualified name contains at least one dot)
     let is_method = qualified_name.contains('.');
 
@@ -242,8 +321,45 @@ fn extract_function_signature_with_path(
         is_async,
         is_method,
         docstring,
-        byte_range: (node.start_byte(), node.end_byte()),
+        calls,
+        
+        imports: vec![], byte_range: (node.start_byte(), node.end_byte()),
     })
+}
+
+/// Extract function calls from a Python node
+fn extract_python_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut calls = Vec::new();
+    
+    fn clean_call_text(raw: &str) -> String {
+        raw.split('(')
+            .next()
+            .unwrap_or(raw)
+            .replace("?.", ".")
+            .trim()
+            .to_string()
+    }
+
+    fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
+        if node.kind() == "call" {
+            if let Some(func) = node.child_by_field_name("function") {
+                if let Ok(text) = func.utf8_text(source) {
+                    let name = clean_call_text(text);
+                    if !name.is_empty() {
+                        calls.push(name);
+                    }
+                }
+            }
+        }
+        
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            find_calls(&child, source, calls);
+        }
+    }
+    
+    find_calls(node, source, &mut calls);
+    calls
 }
 
 /// Extract parameters from a parameters node

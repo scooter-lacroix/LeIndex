@@ -34,6 +34,16 @@ pub enum Error {
     Utf8(#[from] std::str::Utf8Error),
 }
 
+/// Import information extracted from a file
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImportInfo {
+    /// Imported path (module, namespace, or file)
+    pub path: String,
+
+    /// Optional alias for the import
+    pub alias: Option<String>,
+}
+
 /// Function signature information
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SignatureInfo {
@@ -60,6 +70,12 @@ pub struct SignatureInfo {
 
     /// Docstring if present
     pub docstring: Option<String>,
+
+    /// List of called functions/methods
+    pub calls: Vec<String>,
+
+    /// Imports in the current file
+    pub imports: Vec<ImportInfo>,
 
     /// Byte range in source code
     pub byte_range: (usize, usize),

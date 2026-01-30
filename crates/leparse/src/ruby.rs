@@ -1,6 +1,6 @@
 // Ruby language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, Result, SignatureInfo};
+use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use tree_sitter::Parser;
 
@@ -53,7 +53,7 @@ impl RubyParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: None, byte_range: (0, 0) });
+                            docstring: None,  calls: vec![], imports: vec![],  byte_range: (0, 0) });
                     }
 
                     let mut cursor = node.walk();
@@ -109,7 +109,12 @@ impl CodeIntelligence for RubyParser {
             .ok_or_else(|| Error::ParseFailed("Failed to parse Ruby source".to_string()))?;
 
         let root_node = tree.root_node();
-        let signatures = self.extract_all_definitions(source, root_node);
+        let imports = extract_ruby_imports(root_node, source);
+        let mut signatures = self.extract_all_definitions(source, root_node);
+
+        for sig in &mut signatures {
+            sig.imports = imports.clone();
+        }
 
         Ok(signatures)
     }
@@ -147,6 +152,47 @@ impl CodeIntelligence for RubyParser {
     }
 }
 
+fn extract_ruby_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+
+    fn add_import(imports: &mut Vec<ImportInfo>, path: &str) {
+        let path = path.trim().trim_matches('"').trim_matches('\'').trim();
+        if path.is_empty() {
+            return;
+        }
+        imports.push(ImportInfo {
+            path: path.to_string(),
+            alias: None,
+        });
+    }
+
+    fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
+        if node.kind() == "call" || node.kind() == "method_call" {
+            if let Some(name_node) = node.child_by_field_name("method")
+                .or_else(|| node.child_by_field_name("name")) {
+                if let Ok(name) = name_node.utf8_text(source) {
+                    if name == "require" || name == "require_relative" {
+                        if let Some(arg) = node.child_by_field_name("arguments") {
+                            if let Ok(text) = arg.utf8_text(source) {
+                                let cleaned = text.trim().trim_matches('(').trim_matches(')');
+                                add_import(imports, cleaned);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(&child, source, imports);
+        }
+    }
+
+    visit(&root, source, &mut imports);
+    imports
+}
+
 fn extract_method_signature(
     node: &tree_sitter::Node,
     source: &[u8],
@@ -165,6 +211,8 @@ fn extract_method_signature(
 
     let parameters = extract_ruby_parameters(node, source);
 
+    let calls = extract_ruby_calls(node, source);
+
     Some(SignatureInfo {
         name,
         qualified_name,
@@ -173,7 +221,56 @@ fn extract_method_signature(
         visibility: Visibility::Public,
         is_async: false,
         is_method: true,
-        docstring: None, byte_range: (0, 0) })
+        docstring: None,
+        calls,
+        
+        imports: vec![], byte_range: (0, 0)
+    })
+}
+
+fn extract_ruby_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut calls = Vec::new();
+
+    fn clean_call_text(raw: &str) -> String {
+        raw.split('(')
+            .next()
+            .unwrap_or(raw)
+            .trim()
+            .to_string()
+    }
+
+    fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
+        match node.kind() {
+            "call" | "method_call" | "command" | "command_call" => {
+                let receiver = node.child_by_field_name("receiver")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| clean_call_text(s));
+                let method = node.child_by_field_name("method")
+                    .or_else(|| node.child_by_field_name("name"))
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| clean_call_text(s));
+
+                let call_name = match (receiver, method) {
+                    (Some(r), Some(m)) => format!("{}.{}", r, m),
+                    (_, Some(m)) => m,
+                    _ => node.utf8_text(source).ok().map(|s| clean_call_text(s)).unwrap_or_default(),
+                };
+
+                if !call_name.is_empty() {
+                    calls.push(call_name);
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            find_calls(&child, source, calls);
+        }
+    }
+
+    find_calls(node, source, &mut calls);
+    calls
 }
 
 fn extract_ruby_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Parameter> {
