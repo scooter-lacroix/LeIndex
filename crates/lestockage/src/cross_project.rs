@@ -5,7 +5,7 @@
 
 use crate::global_symbols::{GlobalSymbol, GlobalSymbolId};
 use crate::pdg_store::{load_pdg, PdgStoreError};
-use legraphe::pdg::{ProgramDependenceGraph, NodeId, EdgeId};
+use legraphe::pdg::{EdgeId, NodeId, ProgramDependenceGraph};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
@@ -121,10 +121,12 @@ impl CrossProjectResolver {
 
         // Get the root PDG from cache (it was just loaded)
         // We need to remove it from the cache to get ownership, then re-add it
-        let root_pdg = self.pdg_cache.remove(root_project_id)
-            .ok_or_else(|| ResolutionError::SymbolNotFound(
-                format!("PDG for project {} not found", root_project_id)
-            ))?;
+        let root_pdg = self.pdg_cache.remove(root_project_id).ok_or_else(|| {
+            ResolutionError::SymbolNotFound(format!(
+                "PDG for project {} not found",
+                root_project_id
+            ))
+        })?;
 
         // Track visited projects to avoid cycles
         let mut visited = HashSet::new();
@@ -232,7 +234,8 @@ impl CrossProjectResolver {
 
         // Verify all symbols exist and track them
         for symbol_id in used_symbols {
-            let symbol = symbol_table.get_symbol(symbol_id)?
+            let symbol = symbol_table
+                .get_symbol(symbol_id)?
                 .ok_or_else(|| ResolutionError::SymbolNotFound(symbol_id.clone()))?;
 
             if symbol.project_id != project_id {
@@ -386,8 +389,8 @@ pub enum MergeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::NamedTempFile;
     use crate::pdg_store::save_pdg;
+    use tempfile::NamedTempFile;
 
     fn create_test_resolver() -> CrossProjectResolver {
         let temp_file = NamedTempFile::new().unwrap();
@@ -407,6 +410,7 @@ mod tests {
             file_path: "src/test.rs".to_string(),
             byte_range: (0, 100),
             complexity: 5,
+            language: "rust".to_string(),
             embedding: None,
         };
         pdg.add_node(node);
@@ -420,7 +424,10 @@ mod tests {
 
         let result = resolver.resolve_symbol("test_proj", "nonexistent");
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ResolutionError::SymbolNotFound(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            ResolutionError::SymbolNotFound(_)
+        ));
     }
 
     #[test]
@@ -623,7 +630,9 @@ mod tests {
         symbol_table.add_project_dep(&dep_bc).unwrap();
 
         // Propagate changes from proj_a
-        let affected = resolver.propagate_changes("proj_a", std::slice::from_ref(&symbol_a.symbol_id)).unwrap();
+        let affected = resolver
+            .propagate_changes("proj_a", std::slice::from_ref(&symbol_a.symbol_id))
+            .unwrap();
 
         // Should include proj_b (direct dependent) and proj_c (transitive through proj_b)
         assert_eq!(affected.len(), 2);
@@ -652,10 +661,8 @@ mod tests {
         symbol_table.upsert_symbol(&ext_symbol).unwrap();
 
         // Track usage
-        let result = resolver.track_external_usage(
-            "my_project",
-            std::slice::from_ref(&ext_symbol.symbol_id),
-        );
+        let result = resolver
+            .track_external_usage("my_project", std::slice::from_ref(&ext_symbol.symbol_id));
 
         assert!(result.is_ok());
     }
@@ -707,6 +714,7 @@ mod tests {
             file_path: "src/root.rs".to_string(),
             byte_range: (0, 100),
             complexity: 5,
+            language: "rust".to_string(),
             embedding: None,
         };
         root_pdg.add_node(root_node);
@@ -720,6 +728,7 @@ mod tests {
             file_path: "src/ext.rs".to_string(),
             byte_range: (0, 100),
             complexity: 3,
+            language: "rust".to_string(),
             embedding: None,
         };
         ext_pdg.add_node(ext_node);
@@ -743,7 +752,9 @@ mod tests {
         resolver.load_external_pdg("ext_proj").unwrap();
 
         // Build merged PDG
-        let merged = resolver.build_cross_project_pdg("root_proj", Some(1)).unwrap();
+        let merged = resolver
+            .build_cross_project_pdg("root_proj", Some(1))
+            .unwrap();
 
         // Should have nodes from both projects
         assert!(merged.node_count() >= 2);

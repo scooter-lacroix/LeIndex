@@ -9,13 +9,13 @@
 //
 // For concurrent access, wrap in `Arc<RwLock<SearchEngine>>`.
 
-use crate::query::{QueryParser, QueryIntent, MAX_EMBEDDING_DIMENSION, MIN_EMBEDDING_DIMENSION};
-use crate::ranking::{Score, HybridScorer};
-use crate::vector::VectorIndex;
 use crate::hnsw::{HNSWIndex, HNSWParams};
+use crate::query::{QueryIntent, QueryParser, MAX_EMBEDDING_DIMENSION, MIN_EMBEDDING_DIMENSION};
+use crate::ranking::{HybridScorer, Score};
+use crate::vector::VectorIndex;
+use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use lru::LruCache;
 use std::num::NonZeroUsize;
 
 // ============================================================================
@@ -83,9 +83,11 @@ impl VectorIndexImpl {
     /// Insert a vector into the index
     pub fn insert(&mut self, node_id: String, vector: Vec<f32>) -> Result<(), VectorIndexError> {
         match self {
-            Self::BruteForce(idx) => idx.insert(node_id, vector)
+            Self::BruteForce(idx) => idx
+                .insert(node_id, vector)
                 .map_err(|e| VectorIndexError::InsertionFailed(e.to_string())),
-            Self::HNSW(idx) => idx.insert(node_id, vector)
+            Self::HNSW(idx) => idx
+                .insert(node_id, vector)
                 .map_err(|e| VectorIndexError::InsertionFailed(e.to_string())),
         }
     }
@@ -305,7 +307,9 @@ impl SearchEngine {
         Self {
             nodes: Vec::new(),
             scorer: HybridScorer::new(),
-            vector_index: VectorIndexImpl::BruteForce(VectorIndex::new(DEFAULT_EMBEDDING_DIMENSION)),
+            vector_index: VectorIndexImpl::BruteForce(VectorIndex::new(
+                DEFAULT_EMBEDDING_DIMENSION,
+            )),
             complexity_cache: HashMap::new(),
             text_index: HashMap::new(),
             search_cache: LruCache::new(NonZeroUsize::new(1000).unwrap()),
@@ -372,7 +376,8 @@ impl SearchEngine {
         if nodes.len() > MAX_NODES {
             panic!(
                 "Cannot index more than {} nodes (provided: {})",
-                MAX_NODES, nodes.len()
+                MAX_NODES,
+                nodes.len()
             );
         }
 
@@ -386,7 +391,8 @@ impl SearchEngine {
 
         // Build complexity cache for O(1) lookups
         for node in &nodes {
-            self.complexity_cache.insert(node.node_id.clone(), node.complexity);
+            self.complexity_cache
+                .insert(node.node_id.clone(), node.complexity);
         }
 
         // Build inverted index for O(1) text lookups
@@ -410,7 +416,11 @@ impl SearchEngine {
         for node in nodes {
             if let Some(embedding) = node.embedding {
                 if let Err(e) = self.vector_index.insert(node.node_id.clone(), embedding) {
-                    tracing::warn!("Failed to insert embedding for node {}: {:?}", node.node_id, e);
+                    tracing::warn!(
+                        "Failed to insert embedding for node {}: {:?}",
+                        node.node_id,
+                        e
+                    );
                 }
             }
         }
@@ -464,7 +474,10 @@ impl SearchEngine {
         }
 
         // Check cache first
-        let cache_key = format!("{}:{}:{:?}:{}", query.query, query.top_k, query.threshold, query.semantic);
+        let cache_key = format!(
+            "{}:{}:{:?}:{}",
+            query.query, query.top_k, query.threshold, query.semantic
+        );
         if let Some(cached) = self.search_cache.get(&cache_key) {
             return Ok(cached.clone());
         }
@@ -479,13 +492,17 @@ impl SearchEngine {
             } else {
                 // Fallback: find if there's a node with an embedding we can use
                 // This is legacy behavior, should be avoided
-                self.nodes.iter()
+                self.nodes
+                    .iter()
                     .find_map(|n| n.embedding.as_ref())
                     .map(|v| v.clone())
             };
 
             if let Some(emb) = embedding {
-                self.vector_index.search(&emb, query.top_k).into_iter().collect()
+                self.vector_index
+                    .search(&emb, query.top_k)
+                    .into_iter()
+                    .collect()
             } else {
                 std::collections::HashMap::new()
             }
@@ -537,8 +554,8 @@ impl SearchEngine {
                     self.nodes
                         .iter()
                         .filter(|node| {
-                            candidate_ids.contains(node.node_id.as_str()) || 
-                            vector_results.contains_key(&node.node_id)
+                            candidate_ids.contains(node.node_id.as_str())
+                                || vector_results.contains_key(&node.node_id)
                         })
                         .collect()
                 }
@@ -546,7 +563,12 @@ impl SearchEngine {
         };
 
         for node in candidates {
-            let text_score = self.calculate_text_score_optimized(&text_query, &node.content, &node.symbol_name, &node.file_path);
+            let text_score = self.calculate_text_score_optimized(
+                &text_query,
+                &node.content,
+                &node.symbol_name,
+                &node.file_path,
+            );
 
             // Get semantic score from vector search results
             let semantic_score = if query.semantic {
@@ -563,7 +585,9 @@ impl SearchEngine {
             // Normalize complexity to 0-1 range (divide by 100, not 10)
             let structural_score = (node.complexity as f32 / 100.0).min(1.0);
 
-            let score = self.scorer.score(semantic_score, structural_score, text_score);
+            let score = self
+                .scorer
+                .score(semantic_score, structural_score, text_score);
 
             if score.overall > 0.0 {
                 // Apply relevance threshold if specified
@@ -608,7 +632,6 @@ impl SearchEngine {
         Ok(final_results)
     }
 
-
     /// Optimized text score calculation using pre-computed query data
     ///
     /// This avoids repeated allocations in the hot path by using pre-computed
@@ -618,17 +641,27 @@ impl SearchEngine {
     ///
     /// - Time complexity: O(m) where m is content length (query preprocessing is O(1) per call)
     /// - Space complexity: O(t) where t is number of content tokens (vs O(q + t) before)
-    fn calculate_text_score_optimized(&self, precomputed: &TextQueryPreprocessed, content: &str, symbol_name: &str, file_path: &str) -> f32 {
+    fn calculate_text_score_optimized(
+        &self,
+        precomputed: &TextQueryPreprocessed,
+        content: &str,
+        symbol_name: &str,
+        file_path: &str,
+    ) -> f32 {
         // Boost matches in symbol name
-        let symbol_boost = if symbol_name.to_ascii_lowercase().contains(&precomputed.query_lower) {
+        let symbol_boost = if symbol_name
+            .to_ascii_lowercase()
+            .contains(&precomputed.query_lower)
+        {
             0.5
         } else {
             0.0
         };
 
         // Penalty for test-related files to address Limitation 4
-        let test_penalty = if file_path.to_ascii_lowercase().contains("test") 
-            || symbol_name.to_ascii_lowercase().contains("test") {
+        let test_penalty = if file_path.to_ascii_lowercase().contains("test")
+            || symbol_name.to_ascii_lowercase().contains("test")
+        {
             0.3
         } else {
             0.0
@@ -637,7 +670,10 @@ impl SearchEngine {
         // Try exact match first (fast path)
         let base_score = if content.eq_ignore_ascii_case(&precomputed.query) {
             1.0
-        } else if content.to_ascii_lowercase().contains(&precomputed.query_lower) {
+        } else if content
+            .to_ascii_lowercase()
+            .contains(&precomputed.query_lower)
+        {
             0.8
         } else if precomputed.query_tokens.is_empty() {
             0.0
@@ -795,7 +831,10 @@ impl SearchEngine {
         Self {
             nodes: Vec::new(),
             scorer: HybridScorer::new(),
-            vector_index: VectorIndexImpl::HNSW(Box::new(HNSWIndex::with_params(dimension, hnsw_params))),
+            vector_index: VectorIndexImpl::HNSW(Box::new(HNSWIndex::with_params(
+                dimension,
+                hnsw_params,
+            ))),
             complexity_cache: HashMap::new(),
             text_index: HashMap::new(),
             search_cache: LruCache::new(NonZeroUsize::new(1000).unwrap()),
@@ -855,7 +894,7 @@ impl SearchEngine {
         // Only swap if migration was successful
         if migrated == 0 && total_embeddings > 0 {
             return Err(Error::QueryFailed(
-                "No embeddings were successfully migrated".to_string()
+                "No embeddings were successfully migrated".to_string(),
             ));
         }
 
@@ -919,7 +958,7 @@ impl SearchEngine {
         // Only swap if migration was successful
         if migrated == 0 && total_embeddings > 0 {
             return Err(Error::QueryFailed(
-                "No embeddings were successfully migrated".to_string()
+                "No embeddings were successfully migrated".to_string(),
             ));
         }
 
@@ -991,7 +1030,8 @@ impl SearchEngine {
         top_k: usize,
     ) -> Result<Vec<SearchResult>, Error> {
         let parser = QueryParser::new().map_err(|e| Error::QueryFailed(e.to_string()))?;
-        let parsed = parser.parse(query, top_k)
+        let parsed = parser
+            .parse(query, top_k)
             .map_err(|e| Error::InvalidQuery(e.to_string()))?;
 
         // Build search query from parsed natural language query
@@ -1049,22 +1089,13 @@ impl SearchEngine {
     /// 1. Execute base search to get all matching results
     /// 2. Sort by complexity in descending order (highest first)
     /// 3. Reassign ranks based on new sort order
-    fn search_by_complexity(
-        &mut self,
-        query: SearchQuery,
-    ) -> Result<Vec<SearchResult>, Error> {
+    fn search_by_complexity(&mut self, query: SearchQuery) -> Result<Vec<SearchResult>, Error> {
         let mut results = self.search(query)?;
 
         // Sort by complexity (highest first) using O(1) cache lookups
         results.sort_by(|a, b| {
-            let complexity_a = self.complexity_cache
-                .get(&b.node_id)
-                .copied()
-                .unwrap_or(0);
-            let complexity_b = self.complexity_cache
-                .get(&a.node_id)
-                .copied()
-                .unwrap_or(0);
+            let complexity_a = self.complexity_cache.get(&b.node_id).copied().unwrap_or(0);
+            let complexity_b = self.complexity_cache.get(&a.node_id).copied().unwrap_or(0);
             complexity_a.cmp(&complexity_b)
         });
 
@@ -1167,7 +1198,8 @@ mod tests {
             NodeInfo {
                 node_id: "1".to_string(),
                 file_path: "test1.rs".to_string(),
-                symbol_name: "func1".to_string(), language: "rust".to_string(),
+                symbol_name: "func1".to_string(),
+                language: "rust".to_string(),
                 content: "fn func1() { println!(\"hello\"); }".to_string(),
                 byte_range: (0, 30),
                 embedding: None,
@@ -1176,7 +1208,8 @@ mod tests {
             NodeInfo {
                 node_id: "2".to_string(),
                 file_path: "test2.rs".to_string(),
-                symbol_name: "func2".to_string(), language: "rust".to_string(),
+                symbol_name: "func2".to_string(),
+                language: "rust".to_string(),
                 content: "fn func2() { println!(\"world\"); }".to_string(),
                 byte_range: (0, 30),
                 embedding: None,
@@ -1190,7 +1223,9 @@ mod tests {
             top_k: 10,
             token_budget: None,
             semantic: false,
-            expand_context: false, query_embedding: None, threshold: None,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
         };
 
         let results = engine.search(query).unwrap();
@@ -1206,7 +1241,8 @@ mod tests {
             NodeInfo {
                 node_id: "low_complexity".to_string(),
                 file_path: "test.rs".to_string(),
-                symbol_name: "low".to_string(), language: "rust".to_string(),
+                symbol_name: "low".to_string(),
+                language: "rust".to_string(),
                 content: "fn low() { search_term }".to_string(),
                 byte_range: (0, 20),
                 embedding: None,
@@ -1215,7 +1251,8 @@ mod tests {
             NodeInfo {
                 node_id: "high_complexity".to_string(),
                 file_path: "test.rs".to_string(),
-                symbol_name: "high".to_string(), language: "rust".to_string(),
+                symbol_name: "high".to_string(),
+                language: "rust".to_string(),
                 content: "fn high() { search_term }".to_string(),
                 byte_range: (0, 20),
                 embedding: None,
@@ -1229,7 +1266,9 @@ mod tests {
             top_k: 10,
             token_budget: None,
             semantic: false,
-            expand_context: false, query_embedding: None, threshold: None,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
         };
 
         let results = engine.search(query).unwrap();
@@ -1247,7 +1286,8 @@ mod tests {
             NodeInfo {
                 node_id: "func1".to_string(),
                 file_path: "test.rs".to_string(),
-                symbol_name: "function_one".to_string(), language: "rust".to_string(),
+                symbol_name: "function_one".to_string(),
+                language: "rust".to_string(),
                 content: "fn function_one() {}".to_string(),
                 byte_range: (0, 20),
                 embedding: Some(vec![1.0, 0.0, 0.0]), // 3-dim for testing
@@ -1256,7 +1296,8 @@ mod tests {
             NodeInfo {
                 node_id: "func2".to_string(),
                 file_path: "test.rs".to_string(),
-                symbol_name: "function_two".to_string(), language: "rust".to_string(),
+                symbol_name: "function_two".to_string(),
+                language: "rust".to_string(),
                 content: "fn function_two() {}".to_string(),
                 byte_range: (20, 40),
                 embedding: Some(vec![0.0, 1.0, 0.0]),
@@ -1265,7 +1306,8 @@ mod tests {
             NodeInfo {
                 node_id: "func3".to_string(),
                 file_path: "test.rs".to_string(),
-                symbol_name: "function_three".to_string(), language: "rust".to_string(),
+                symbol_name: "function_three".to_string(),
+                language: "rust".to_string(),
                 content: "fn function_three() {}".to_string(),
                 byte_range: (40, 60),
                 embedding: Some(vec![0.9, 0.1, 0.0]), // Similar to func1
@@ -1305,15 +1347,18 @@ mod tests {
     #[test]
     fn test_vector_search_top_k() {
         let mut engine = SearchEngine::with_dimension(2);
-        let nodes = (0..10).map(|i| NodeInfo {
-            node_id: format!("node{}", i),
-            file_path: "test.rs".to_string(),
-            symbol_name: format!("func{}", i),
-            content: String::new(),
-            byte_range: (0, 0),
-            embedding: Some(vec![1.0 / (i + 1) as f32, 0.0]),
-            complexity: 1,
-        }).collect::<Vec<_>>();
+        let nodes = (0..10)
+            .map(|i| NodeInfo {
+                node_id: format!("node{}", i),
+                file_path: "test.rs".to_string(),
+                symbol_name: format!("func{}", i),
+                language: "rust".to_string(),
+                content: String::new(),
+                byte_range: (0, 0),
+                embedding: Some(vec![1.0 / (i + 1) as f32, 0.0]),
+                complexity: 1,
+            })
+            .collect::<Vec<_>>();
 
         engine.index_nodes(nodes);
 
@@ -1331,7 +1376,10 @@ mod tests {
     #[test]
     fn test_search_engine_default_dimension() {
         let engine = SearchEngine::new();
-        assert_eq!(engine.vector_index().dimension(), DEFAULT_EMBEDDING_DIMENSION);
+        assert_eq!(
+            engine.vector_index().dimension(),
+            DEFAULT_EMBEDDING_DIMENSION
+        );
     }
 
     #[test]
@@ -1349,7 +1397,10 @@ mod tests {
         let result = std::panic::catch_unwind(|| {
             let _ = SearchEngine::with_dimension(MAX_EMBEDDING_DIMENSION + 1);
         });
-        assert!(result.is_err(), "Dimension > MAX_EMBEDDING_DIMENSION should panic");
+        assert!(
+            result.is_err(),
+            "Dimension > MAX_EMBEDDING_DIMENSION should panic"
+        );
     }
 
     #[test]
@@ -1358,17 +1409,16 @@ mod tests {
         assert_eq!(engine.node_count(), 0);
         assert!(engine.is_empty());
 
-        let nodes = vec![
-            NodeInfo {
-                node_id: "test".to_string(),
-                file_path: "test.rs".to_string(),
-                symbol_name: "test".to_string(), language: "rust".to_string(),
-                content: "fn test() {}".to_string(),
-                byte_range: (0, 10),
-                embedding: None,
-                complexity: 1,
-            },
-        ];
+        let nodes = vec![NodeInfo {
+            node_id: "test".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "test".to_string(),
+            language: "rust".to_string(),
+            content: "fn test() {}".to_string(),
+            byte_range: (0, 10),
+            embedding: None,
+            complexity: 1,
+        }];
         engine.index_nodes(nodes);
         assert_eq!(engine.node_count(), 1);
         assert!(!engine.is_empty());
@@ -1380,8 +1430,12 @@ mod tests {
 
         // Add vectors directly via index - use truly orthogonal vectors
         let index = engine.vector_index_mut();
-        index.insert("test1".to_string(), vec![1.0, 0.0, 0.0]).unwrap(); // X axis
-        index.insert("test2".to_string(), vec![0.0, 1.0, 0.0]).unwrap(); // Y axis
+        index
+            .insert("test1".to_string(), vec![1.0, 0.0, 0.0])
+            .unwrap(); // X axis
+        index
+            .insert("test2".to_string(), vec![0.0, 1.0, 0.0])
+            .unwrap(); // Y axis
 
         assert_eq!(engine.vector_index().len(), 2);
 
@@ -1404,7 +1458,8 @@ mod tests {
             NodeInfo {
                 node_id: "auth_func".to_string(),
                 file_path: "auth.rs".to_string(),
-                symbol_name: "authenticate".to_string(), language: "rust".to_string(),
+                symbol_name: "authenticate".to_string(),
+                language: "rust".to_string(),
                 content: "fn authenticate() { // auth logic }".to_string(),
                 byte_range: (0, 40),
                 embedding: None,
@@ -1413,7 +1468,8 @@ mod tests {
             NodeInfo {
                 node_id: "other_func".to_string(),
                 file_path: "other.rs".to_string(),
-                symbol_name: "other".to_string(), language: "rust".to_string(),
+                symbol_name: "other".to_string(),
+                language: "rust".to_string(),
                 content: "fn other() { // other logic }".to_string(),
                 byte_range: (0, 30),
                 embedding: None,
@@ -1422,33 +1478,40 @@ mod tests {
         ];
         engine.index_nodes(nodes);
 
-        let results = engine.natural_search("show me how authentication works", 10).unwrap();
+        let results = engine
+            .natural_search("show me how authentication works", 10)
+            .unwrap();
 
         // Should find the authenticate function
-        assert!(results.iter().any(|r| r.node_id == "auth_func" || r.symbol_name.contains("auth")));
+        assert!(results
+            .iter()
+            .any(|r| r.node_id == "auth_func" || r.symbol_name.contains("auth")));
     }
 
     #[test]
     fn test_natural_search_where_handled() {
         let mut engine = SearchEngine::new();
-        let nodes = vec![
-            NodeInfo {
-                node_id: "error_handler".to_string(),
-                file_path: "error.rs".to_string(),
-                symbol_name: "handle_error".to_string(), language: "rust".to_string(),
-                content: "fn handle_error() { // error handling }".to_string(),
-                byte_range: (0, 40),
-                embedding: None,
-                complexity: 3,
-            },
-        ];
+        let nodes = vec![NodeInfo {
+            node_id: "error_handler".to_string(),
+            file_path: "error.rs".to_string(),
+            symbol_name: "handle_error".to_string(),
+            language: "rust".to_string(),
+            content: "fn handle_error() { // error handling }".to_string(),
+            byte_range: (0, 40),
+            embedding: None,
+            complexity: 3,
+        }];
         engine.index_nodes(nodes);
 
-        let results = engine.natural_search("where is error handling handled", 10).unwrap();
+        let results = engine
+            .natural_search("where is error handling handled", 10)
+            .unwrap();
 
         // Should find the error handler
         assert!(!results.is_empty());
-        assert!(results.iter().any(|r| r.symbol_name.contains("error") || r.file_path.contains("error")));
+        assert!(results
+            .iter()
+            .any(|r| r.symbol_name.contains("error") || r.file_path.contains("error")));
     }
 
     #[test]
@@ -1458,7 +1521,8 @@ mod tests {
             NodeInfo {
                 node_id: "simple".to_string(),
                 file_path: "simple.rs".to_string(),
-                symbol_name: "simple_func".to_string(), language: "rust".to_string(),
+                symbol_name: "simple_func".to_string(),
+                language: "rust".to_string(),
                 content: "fn simple_func() {}".to_string(),
                 byte_range: (0, 20),
                 embedding: None,
@@ -1467,8 +1531,10 @@ mod tests {
             NodeInfo {
                 node_id: "complex".to_string(),
                 file_path: "complex.rs".to_string(),
-                symbol_name: "complex_func".to_string(), language: "rust".to_string(),
-                content: "fn complex_func() { // complex logic with multiple operations }".to_string(),
+                symbol_name: "complex_func".to_string(),
+                language: "rust".to_string(),
+                content: "fn complex_func() { // complex logic with multiple operations }"
+                    .to_string(),
                 byte_range: (0, 40),
                 embedding: None,
                 complexity: 10,
@@ -1476,7 +1542,9 @@ mod tests {
         ];
         engine.index_nodes(nodes);
 
-        let results = engine.natural_search("what are the bottlenecks", 10).unwrap();
+        let results = engine
+            .natural_search("what are the bottlenecks", 10)
+            .unwrap();
 
         // Bottleneck queries should return results sorted by complexity
         // We expect at least some results since the query will match "complex" content
@@ -1489,20 +1557,21 @@ mod tests {
     #[test]
     fn test_natural_search_semantic() {
         let mut engine = SearchEngine::new();
-        let nodes = vec![
-            NodeInfo {
-                node_id: "cache_impl".to_string(),
-                file_path: "cache.rs".to_string(),
-                symbol_name: "caching".to_string(), language: "rust".to_string(),
-                content: "impl Caching { fn new() {} }".to_string(),
-                byte_range: (0, 30),
-                embedding: None,
-                complexity: 2,
-            },
-        ];
+        let nodes = vec![NodeInfo {
+            node_id: "cache_impl".to_string(),
+            file_path: "cache.rs".to_string(),
+            symbol_name: "caching".to_string(),
+            language: "rust".to_string(),
+            content: "impl Caching { fn new() {} }".to_string(),
+            byte_range: (0, 30),
+            embedding: None,
+            complexity: 2,
+        }];
         engine.index_nodes(nodes);
 
-        let results = engine.natural_search("how do I implement caching", 10).unwrap();
+        let results = engine
+            .natural_search("how do I implement caching", 10)
+            .unwrap();
 
         // Should find caching-related code
         assert!(!results.is_empty());
@@ -1510,7 +1579,7 @@ mod tests {
 
     #[test]
     fn test_natural_search_empty_query() {
-        let engine = SearchEngine::new();
+        let mut engine = SearchEngine::new();
         let results = engine.natural_search("", 10);
 
         // Should return error for empty query
@@ -1520,17 +1589,16 @@ mod tests {
     #[test]
     fn test_natural_search_text_fallback() {
         let mut engine = SearchEngine::new();
-        let nodes = vec![
-            NodeInfo {
-                node_id: "my_function".to_string(),
-                file_path: "test.rs".to_string(),
-                symbol_name: "my_function".to_string(), language: "rust".to_string(),
-                content: "fn my_function() { println!(\"test\"); }".to_string(),
-                byte_range: (0, 40),
-                embedding: None,
-                complexity: 1,
-            },
-        ];
+        let nodes = vec![NodeInfo {
+            node_id: "my_function".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "my_function".to_string(),
+            language: "rust".to_string(),
+            content: "fn my_function() { println!(\"test\"); }".to_string(),
+            byte_range: (0, 40),
+            embedding: None,
+            complexity: 1,
+        }];
         engine.index_nodes(nodes);
 
         let results = engine.natural_search("my_function", 10).unwrap();
@@ -1547,7 +1615,8 @@ mod tests {
             NodeInfo {
                 node_id: "low".to_string(),
                 file_path: "test.rs".to_string(),
-                symbol_name: "low".to_string(), language: "rust".to_string(),
+                symbol_name: "low".to_string(),
+                language: "rust".to_string(),
                 content: "fn low() {}".to_string(),
                 byte_range: (0, 10),
                 embedding: None,
@@ -1556,7 +1625,8 @@ mod tests {
             NodeInfo {
                 node_id: "high".to_string(),
                 file_path: "test.rs".to_string(),
-                symbol_name: "high".to_string(), language: "rust".to_string(),
+                symbol_name: "high".to_string(),
+                language: "rust".to_string(),
                 content: "fn high() {}".to_string(),
                 byte_range: (0, 10),
                 embedding: None,
@@ -1571,7 +1641,9 @@ mod tests {
             top_k: 10,
             token_budget: None,
             semantic: false,
-            expand_context: false, query_embedding: None, threshold: None,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
         };
 
         let results = engine.search_by_complexity(query).unwrap();
@@ -1587,18 +1659,26 @@ mod tests {
         let engine = SearchEngine::new();
 
         // Test case-insensitive exact match (fast path)
+        // score = 1.0 (exact match) + 0.5 (symbol boost) - 0.0 (no test penalty) = 1.0 (clamped)
         let query1 = TextQueryPreprocessed::from_query("hello");
-        let score1 = engine.calculate_text_score_optimized(&query1, "hello");
+        let score1 = engine.calculate_text_score_optimized(&query1, "hello", "hello", "src/lib.rs");
         assert_eq!(score1, 1.0);
 
-        // Test substring match
+        // Test substring match without symbol boost
+        // score = 0.8 (substring) + 0.0 (no symbol boost) - 0.0 (no test penalty) = 0.8
         let query2 = TextQueryPreprocessed::from_query("hello");
-        let score2 = engine.calculate_text_score_optimized(&query2, "hello world");
+        let score2 = engine.calculate_text_score_optimized(
+            &query2,
+            "hello world",
+            "something_else",
+            "src/lib.rs",
+        );
         assert_eq!(score2, 0.8);
 
         // Test token overlap (no common tokens = 0.0)
         let query3 = TextQueryPreprocessed::from_query("hello world");
-        let score3 = engine.calculate_text_score_optimized(&query3, "hi there");
+        let score3 =
+            engine.calculate_text_score_optimized(&query3, "hi there", "other", "src/lib.rs");
         assert_eq!(score3, 0.0);
     }
 
@@ -1609,15 +1689,18 @@ mod tests {
         let mut engine = SearchEngine::new();
 
         // Should work within limits
-        let valid_nodes = (0..MAX_NODES).map(|i| NodeInfo {
-            node_id: format!("node{}", i),
-            file_path: "test.rs".to_string(),
-            symbol_name: format!("func{}", i),
-            content: String::new(),
-            byte_range: (0, 0),
-            embedding: None,
-            complexity: 1,
-        }).collect::<Vec<_>>();
+        let valid_nodes = (0..MAX_NODES)
+            .map(|i| NodeInfo {
+                node_id: format!("node{}", i),
+                file_path: "test.rs".to_string(),
+                symbol_name: format!("func{}", i),
+                language: "rust".to_string(),
+                content: String::new(),
+                byte_range: (0, 0),
+                embedding: None,
+                complexity: 1,
+            })
+            .collect::<Vec<_>>();
 
         engine.index_nodes(valid_nodes);
         assert_eq!(engine.node_count(), MAX_NODES);
@@ -1626,7 +1709,8 @@ mod tests {
         let too_many_nodes = vec![NodeInfo {
             node_id: "extra".to_string(),
             file_path: "test.rs".to_string(),
-            symbol_name: "extra".to_string(), language: "rust".to_string(),
+            symbol_name: "extra".to_string(),
+            language: "rust".to_string(),
             content: String::new(),
             byte_range: (0, 0),
             embedding: None,
@@ -1646,7 +1730,8 @@ mod tests {
             NodeInfo {
                 node_id: "node1".to_string(),
                 file_path: "test.rs".to_string(),
-                symbol_name: "func1".to_string(), language: "rust".to_string(),
+                symbol_name: "func1".to_string(),
+                language: "rust".to_string(),
                 content: "fn func1() {}".to_string(),
                 byte_range: (0, 10),
                 embedding: None,
@@ -1655,7 +1740,8 @@ mod tests {
             NodeInfo {
                 node_id: "node2".to_string(),
                 file_path: "test.rs".to_string(),
-                symbol_name: "func2".to_string(), language: "rust".to_string(),
+                symbol_name: "func2".to_string(),
+                language: "rust".to_string(),
                 content: "fn func2() {}".to_string(),
                 byte_range: (10, 20),
                 embedding: None,
@@ -1678,7 +1764,8 @@ mod tests {
         let nodes = vec![NodeInfo {
             node_id: "test".to_string(),
             file_path: "test.rs".to_string(),
-            symbol_name: "test".to_string(), language: "rust".to_string(),
+            symbol_name: "test".to_string(),
+            language: "rust".to_string(),
             content: "test".to_string(),
             byte_range: (0, 4),
             embedding: Some(vec![0.0; 768]), // 768-dim embedding
@@ -1691,23 +1778,25 @@ mod tests {
         let results = engine.semantic_search(&query, 10);
 
         assert!(results.is_err());
-        assert!(results.unwrap_err().to_string().contains("dimension mismatch"));
+        assert!(results
+            .unwrap_err()
+            .to_string()
+            .contains("dimension mismatch"));
     }
 
     #[test]
     fn test_no_results_returns_empty() {
         let mut engine = SearchEngine::new();
-        let nodes = vec![
-            NodeInfo {
-                node_id: "test".to_string(),
-                file_path: "test.rs".to_string(),
-                symbol_name: "test".to_string(), language: "rust".to_string(),
-                content: "fn test() {}".to_string(),
-                byte_range: (0, 10),
-                embedding: None,
-                complexity: 1,
-            },
-        ];
+        let nodes = vec![NodeInfo {
+            node_id: "test".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "test".to_string(),
+            language: "rust".to_string(),
+            content: "fn test() {}".to_string(),
+            byte_range: (0, 10),
+            embedding: None,
+            complexity: 1,
+        }];
         engine.index_nodes(nodes);
 
         let query = SearchQuery {
@@ -1715,7 +1804,9 @@ mod tests {
             top_k: 10,
             token_budget: None,
             semantic: false,
-            expand_context: false, query_embedding: None, threshold: None,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
         };
 
         let results = engine.search(query).unwrap();

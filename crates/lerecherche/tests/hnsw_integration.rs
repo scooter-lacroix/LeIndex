@@ -6,10 +6,7 @@
 
 #[cfg(test)]
 mod tests {
-    use lerecherche::{
-        SearchEngine, NodeInfo, HNSWParams, HNSWIndex,
-        vector::VectorIndex,
-    };
+    use lerecherche::{vector::VectorIndex, HNSWIndex, HNSWParams, NodeInfo, SearchEngine};
     use std::time::Instant;
 
     /// Helper: Create test NodeInfo with embeddings
@@ -28,6 +25,7 @@ mod tests {
                 node_id: format!("node_{}", i),
                 file_path: format!("test_{}.rs", i),
                 symbol_name: format!("func_{}", i),
+                language: "rust".to_string(),
                 content: format!("fn func_{}() {{ }}", i),
                 byte_range: (0, 20),
                 embedding: Some(embedding),
@@ -65,7 +63,11 @@ mod tests {
                     .map(|j| {
                         let val = ((i * dimension + j) % 100) as f32 / 100.0;
                         // Add small epsilon to avoid zero vectors
-                        if val == 0.0 { 0.01 } else { val }
+                        if val == 0.0 {
+                            0.01
+                        } else {
+                            val
+                        }
                     })
                     .collect();
                 (format!("node_{}", i), embedding)
@@ -92,8 +94,10 @@ mod tests {
         let hnsw_results = hnsw_index.search(query, top_k);
 
         // Calculate overlap
-        let brute_ids: std::collections::HashSet<_> = brute_results.iter().map(|(id, _)| id).collect();
-        let hnsw_ids: std::collections::HashSet<_> = hnsw_results.iter().map(|(id, _)| id).collect();
+        let brute_ids: std::collections::HashSet<_> =
+            brute_results.iter().map(|(id, _)| id).collect();
+        let hnsw_ids: std::collections::HashSet<_> =
+            hnsw_results.iter().map(|(id, _)| id).collect();
 
         let overlap = brute_ids.intersection(&hnsw_ids).count();
 
@@ -120,7 +124,11 @@ mod tests {
                 let embedding: Vec<f32> = (0..dimension)
                     .map(|j| {
                         let val = ((i * dimension + j) % 100) as f32 / 100.0;
-                        if val == 0.0 { 0.01 } else { val }
+                        if val == 0.0 {
+                            0.01
+                        } else {
+                            val
+                        }
                     })
                     .collect();
                 (format!("node_{}", i), embedding)
@@ -152,7 +160,11 @@ mod tests {
                 (0..dimension)
                     .map(|j| {
                         let val = ((i * dimension + j) % 100) as f32 / 100.0;
-                        if val == 0.0 { 0.01 } else { val }
+                        if val == 0.0 {
+                            0.01
+                        } else {
+                            val
+                        }
                     })
                     .collect()
             })
@@ -171,7 +183,10 @@ mod tests {
         }
         let hnsw_search_time = start.elapsed();
 
-        println!("Brute-force search time (10 queries): {:?}", brute_search_time);
+        println!(
+            "Brute-force search time (10 queries): {:?}",
+            brute_search_time
+        );
         println!("HNSW search time (10 queries): {:?}", hnsw_search_time);
 
         // Both should complete successfully
@@ -196,7 +211,11 @@ mod tests {
             let embedding: Vec<f32> = (0..dimension)
                 .map(|j| {
                     let val = ((i * dimension + j) % 100) as f32 / 100.0;
-                    if val == 0.0 { 0.01 } else { val }
+                    if val == 0.0 {
+                        0.01
+                    } else {
+                        val
+                    }
                 })
                 .collect();
 
@@ -204,6 +223,7 @@ mod tests {
                 node_id: format!("node_{}", i),
                 file_path: format!("test_{}.rs", i),
                 symbol_name: format!("func_{}", i),
+                language: "rust".to_string(),
                 content: format!("fn func_{}() {{ }}", i),
                 byte_range: (0, 20),
                 embedding: Some(embedding),
@@ -253,6 +273,7 @@ mod tests {
                 node_id: format!("node_{}", i),
                 file_path: format!("test_{}.rs", i),
                 symbol_name: format!("func_{}", i),
+                language: "rust".to_string(),
                 content: format!("fn func_{}() {{ }}", i),
                 byte_range: (0, 20),
                 embedding: Some(embedding),
@@ -372,7 +393,11 @@ mod tests {
         let query: Vec<f32> = (0..dimension)
             .map(|j| {
                 let val = (j % 100) as f32 / 100.0;
-                if val == 0.0 { 0.01 } else { val }
+                if val == 0.0 {
+                    0.01
+                } else {
+                    val
+                }
             })
             .collect();
 
@@ -384,7 +409,11 @@ mod tests {
         let embedding: Vec<f32> = (0..dimension)
             .map(|j| {
                 let val = (j % 100) as f32 / 100.0;
-                if val == 0.0 { 0.01 } else { val }
+                if val == 0.0 {
+                    0.01
+                } else {
+                    val
+                }
             })
             .collect();
         hnsw_index.insert("test".to_string(), embedding).unwrap();
@@ -406,7 +435,11 @@ mod tests {
                 let embedding: Vec<f32> = (0..dimension)
                     .map(|j| {
                         let val = ((i * dimension + j) % 100) as f32 / 100.0;
-                        if val == 0.0 { 0.01 } else { val }
+                        if val == 0.0 {
+                            0.01
+                        } else {
+                            val
+                        }
                     })
                     .collect();
                 hnsw_index.insert(format!("node_{}", i), embedding).unwrap();
@@ -420,7 +453,11 @@ mod tests {
             let query: Vec<f32> = (0..dimension)
                 .map(|j| {
                     let val = (j % 100) as f32 / 100.0;
-                    if val == 0.0 { 0.01 } else { val }
+                    if val == 0.0 {
+                        0.01
+                    } else {
+                        val
+                    }
                 })
                 .collect();
             let results = hnsw_index.search(&query, 3);
@@ -440,7 +477,11 @@ mod tests {
                 let embedding: Vec<f32> = (0..dimension)
                     .map(|j| {
                         let val = ((i * dimension + j) % 100) as f32 / 100.0;
-                        if val == 0.0 { 0.01 } else { val }
+                        if val == 0.0 {
+                            0.01
+                        } else {
+                            val
+                        }
                     })
                     .collect();
                 (format!("node_{}", i), embedding)
@@ -485,15 +526,27 @@ mod tests {
             .map(|i| if i == 0 { 1.0 } else { 0.0 })
             .collect();
         let embedding1: Vec<f32> = (0..dimension)
-            .map(|i| if i == 0 { 0.9 } else if i == 1 { 0.1 } else { 0.0 })
+            .map(|i| {
+                if i == 0 {
+                    0.9
+                } else if i == 1 {
+                    0.1
+                } else {
+                    0.0
+                }
+            })
             .collect();
         let embedding2: Vec<f32> = (0..dimension)
             .map(|i| if i == 1 { 1.0 } else { 0.0 })
             .collect();
 
         hnsw_index.insert("exact".to_string(), embedding0).unwrap();
-        hnsw_index.insert("similar".to_string(), embedding1).unwrap();
-        hnsw_index.insert("different".to_string(), embedding2).unwrap();
+        hnsw_index
+            .insert("similar".to_string(), embedding1)
+            .unwrap();
+        hnsw_index
+            .insert("different".to_string(), embedding2)
+            .unwrap();
 
         // Search for vector similar to embedding0
         let query: Vec<f32> = (0..dimension)
@@ -523,7 +576,11 @@ mod tests {
             let embedding: Vec<f32> = (0..dimension)
                 .map(|j| {
                     let val = ((i * dimension + j) % 100) as f32 / 100.0;
-                    if val == 0.0 { 0.01 } else { val }
+                    if val == 0.0 {
+                        0.01
+                    } else {
+                        val
+                    }
                 })
                 .collect();
             hnsw_index.insert(format!("node_{}", i), embedding).unwrap();
@@ -536,7 +593,11 @@ mod tests {
         let query: Vec<f32> = (0..dimension)
             .map(|j| {
                 let val = (j % 100) as f32 / 100.0;
-                if val == 0.0 { 0.01 } else { val }
+                if val == 0.0 {
+                    0.01
+                } else {
+                    val
+                }
             })
             .collect();
 

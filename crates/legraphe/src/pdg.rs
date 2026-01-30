@@ -136,7 +136,8 @@ impl SerializablePDG {
     /// Convert a ProgramDependenceGraph to its serializable form
     fn from_pdg(pdg: &ProgramDependenceGraph) -> Self {
         // Collect all nodes with their indices
-        let nodes: Vec<SerializableNode> = pdg.graph
+        let nodes: Vec<SerializableNode> = pdg
+            .graph
             .node_indices()
             .map(|idx| SerializableNode {
                 index: idx.index() as u32,
@@ -145,10 +146,13 @@ impl SerializablePDG {
             .collect();
 
         // Collect all edges with their source and target indices
-        let edges: Vec<SerializableEdge> = pdg.graph
+        let edges: Vec<SerializableEdge> = pdg
+            .graph
             .edge_indices()
             .map(|eidx| {
-                let (source, target) = pdg.graph.edge_endpoints(eidx)
+                let (source, target) = pdg
+                    .graph
+                    .edge_endpoints(eidx)
                     .expect("Edge should have valid endpoints");
                 SerializableEdge {
                     source: source.index() as u32,
@@ -159,17 +163,17 @@ impl SerializablePDG {
             .collect();
 
         // Convert symbol index: NodeId -> u32
-        let symbol_index: HashMap<String, u32> = pdg.symbol_index
+        let symbol_index: HashMap<String, u32> = pdg
+            .symbol_index
             .iter()
             .map(|(k, v)| (k.clone(), v.index() as u32))
             .collect();
 
         // Convert file index: Vec<NodeId> -> Vec<u32>
-        let file_index: HashMap<String, Vec<u32>> = pdg.file_index
+        let file_index: HashMap<String, Vec<u32>> = pdg
+            .file_index
             .iter()
-            .map(|(k, v)| {
-                (k.clone(), v.iter().map(|id| id.index() as u32).collect())
-            })
+            .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
             .collect();
 
         Self {
@@ -218,12 +222,15 @@ impl SerializablePDG {
 
         // Add all edges
         for serializable_edge in &self.edges {
-            let source_id = index_map.get(&serializable_edge.source)
-                .ok_or_else(|| format!("Missing source node index: {}", serializable_edge.source))?;
-            let target_id = index_map.get(&serializable_edge.target)
-                .ok_or_else(|| format!("Missing target node index: {}", serializable_edge.target))?;
+            let source_id = index_map.get(&serializable_edge.source).ok_or_else(|| {
+                format!("Missing source node index: {}", serializable_edge.source)
+            })?;
+            let target_id = index_map.get(&serializable_edge.target).ok_or_else(|| {
+                format!("Missing target node index: {}", serializable_edge.target)
+            })?;
 
-            pdg.graph.add_edge(*source_id, *target_id, serializable_edge.edge.clone());
+            pdg.graph
+                .add_edge(*source_id, *target_id, serializable_edge.edge.clone());
         }
 
         Ok(pdg)
@@ -469,8 +476,7 @@ impl ProgramDependenceGraph {
         let serializable = SerializablePDG::from_pdg(self);
 
         // Use bincode for efficient binary serialization
-        bincode::serialize(&serializable)
-            .map_err(|e| format!("Failed to serialize PDG: {}", e))
+        bincode::serialize(&serializable).map_err(|e| format!("Failed to serialize PDG: {}", e))
     }
 
     /// Deserialize a graph from a byte vector
@@ -498,8 +504,8 @@ impl ProgramDependenceGraph {
     /// ```
     pub fn deserialize(data: &[u8]) -> Result<Self, String> {
         // Deserialize the serializable representation
-        let serializable: SerializablePDG = bincode::deserialize(data)
-            .map_err(|e| format!("Failed to deserialize PDG: {}", e))?;
+        let serializable: SerializablePDG =
+            bincode::deserialize(data).map_err(|e| format!("Failed to deserialize PDG: {}", e))?;
 
         // Convert back to ProgramDependenceGraph
         serializable.to_pdg()
@@ -533,6 +539,7 @@ mod tests {
             file_path: "test.py".to_string(),
             byte_range: (0, 100),
             complexity: 5,
+            language: "python".to_string(),
             embedding: None,
         };
 
@@ -551,6 +558,7 @@ mod tests {
             file_path: "test.py".to_string(),
             byte_range: (0, 100),
             complexity: 5,
+            language: "python".to_string(),
             embedding: None,
         };
 
@@ -569,6 +577,7 @@ mod tests {
             file_path: "f1.py".to_string(),
             byte_range: (0, 10),
             complexity: 1,
+            language: "python".to_string(),
             embedding: None,
         });
         let n2 = pdg.add_node(Node {
@@ -578,6 +587,7 @@ mod tests {
             file_path: "f1.py".to_string(),
             byte_range: (20, 30),
             complexity: 1,
+            language: "python".to_string(),
             embedding: None,
         });
         let n3 = pdg.add_node(Node {
@@ -587,6 +597,7 @@ mod tests {
             file_path: "f1.py".to_string(),
             byte_range: (40, 50),
             complexity: 1,
+            language: "python".to_string(),
             embedding: None,
         });
 
@@ -625,6 +636,7 @@ mod tests {
             file_path: "test.py".to_string(),
             byte_range: (0, 100),
             complexity: 5,
+            language: "python".to_string(),
             embedding: None,
         };
         pdg.add_node(node);
@@ -636,7 +648,9 @@ mod tests {
         assert_eq!(deserialized.node_count(), 1);
         assert_eq!(deserialized.edge_count(), 0);
 
-        let node_id = deserialized.find_by_symbol("test_func").expect("Node should be found");
+        let node_id = deserialized
+            .find_by_symbol("test_func")
+            .expect("Node should be found");
         let retrieved_node = deserialized.get_node(node_id).expect("Node should exist");
         assert_eq!(retrieved_node.name, "test_func");
         assert_eq!(retrieved_node.complexity, 5);
@@ -653,6 +667,7 @@ mod tests {
             file_path: "f1.py".to_string(),
             byte_range: (0, 10),
             complexity: 1,
+            language: "python".to_string(),
             embedding: None,
         });
         let n2 = pdg.add_node(Node {
@@ -662,6 +677,7 @@ mod tests {
             file_path: "f1.py".to_string(),
             byte_range: (20, 30),
             complexity: 1,
+            language: "python".to_string(),
             embedding: None,
         });
 
@@ -685,6 +701,7 @@ mod tests {
             file_path: "a.py".to_string(),
             byte_range: (0, 10),
             complexity: 1,
+            language: "python".to_string(),
             embedding: None,
         });
         pdg.add_node(Node {
@@ -694,6 +711,7 @@ mod tests {
             file_path: "b.py".to_string(),
             byte_range: (0, 10),
             complexity: 1,
+            language: "python".to_string(),
             embedding: None,
         });
 
@@ -716,6 +734,7 @@ mod tests {
             file_path: "file1.py".to_string(),
             byte_range: (0, 10),
             complexity: 1,
+            language: "python".to_string(),
             embedding: None,
         });
         pdg.add_node(Node {
@@ -725,6 +744,7 @@ mod tests {
             file_path: "file1.py".to_string(),
             byte_range: (20, 30),
             complexity: 1,
+            language: "python".to_string(),
             embedding: None,
         });
         pdg.add_node(Node {
@@ -734,6 +754,7 @@ mod tests {
             file_path: "file2.py".to_string(),
             byte_range: (0, 10),
             complexity: 1,
+            language: "python".to_string(),
             embedding: None,
         });
 
@@ -758,6 +779,7 @@ mod tests {
             file_path: "test.py".to_string(),
             byte_range: (0, 10),
             complexity: 1,
+            language: "python".to_string(),
             embedding: None,
         });
         let n2 = pdg.add_node(Node {
@@ -767,6 +789,7 @@ mod tests {
             file_path: "test.py".to_string(),
             byte_range: (20, 30),
             complexity: 1,
+            language: "python".to_string(),
             embedding: None,
         });
 
@@ -790,6 +813,7 @@ mod tests {
             file_path: "test.py".to_string(),
             byte_range: (0, 1000),
             complexity: 42,
+            language: "python".to_string(),
             embedding: Some(vec![0.1, 0.2, 0.3]),
         };
         pdg.add_node(node);

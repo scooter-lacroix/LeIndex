@@ -1,8 +1,8 @@
 // Node persistence operations
 
+use crate::schema::Storage;
 use rusqlite::{params, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
-use crate::schema::Storage;
 
 /// Node record for database storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -165,7 +165,8 @@ impl<'a> NodeStore<'a> {
                 symbol_name: row.get(4)?,
                 qualified_name: row.get(5)?,
                 language: row.get(6)?,
-                node_type: NodeType::from_str_name(&row.get::<_, String>(7)?).unwrap_or(NodeType::Function),
+                node_type: NodeType::from_str_name(&row.get::<_, String>(7)?)
+                    .unwrap_or(NodeType::Function),
                 signature: row.get(8)?,
                 complexity: row.get(9)?,
                 content_hash: row.get(10)?,
@@ -194,7 +195,8 @@ impl<'a> NodeStore<'a> {
                 symbol_name: row.get(4)?,
                 qualified_name: row.get(5)?,
                 language: row.get(6)?,
-                node_type: NodeType::from_str_name(&row.get::<_, String>(7)?).unwrap_or(NodeType::Function),
+                node_type: NodeType::from_str_name(&row.get::<_, String>(7)?)
+                    .unwrap_or(NodeType::Function),
                 signature: row.get(8)?,
                 complexity: row.get(9)?,
                 content_hash: row.get(10)?,
@@ -214,24 +216,27 @@ impl<'a> NodeStore<'a> {
              FROM intel_nodes WHERE file_path = ?1"
         )?;
 
-        let nodes = stmt.query_map(params![file_path], |row| {
-            Ok(NodeRecord {
-                id: Some(row.get(0)?),
-                project_id: row.get(1)?,
-                file_path: row.get(2)?,
-                node_id: row.get(3)?,
-                symbol_name: row.get(4)?,
-                qualified_name: row.get(5)?,
-                language: row.get(6)?,
-                node_type: NodeType::from_str_name(&row.get::<_, String>(7)?).unwrap_or(NodeType::Function),
-                signature: row.get(8)?,
-                complexity: row.get(9)?,
-                content_hash: row.get(10)?,
-                embedding: row.get(11)?,
-                byte_range_start: row.get(12)?,
-                byte_range_end: row.get(13)?,
-            })
-        })?.collect::<SqliteResult<Vec<_>>>()?;
+        let nodes = stmt
+            .query_map(params![file_path], |row| {
+                Ok(NodeRecord {
+                    id: Some(row.get(0)?),
+                    project_id: row.get(1)?,
+                    file_path: row.get(2)?,
+                    node_id: row.get(3)?,
+                    symbol_name: row.get(4)?,
+                    qualified_name: row.get(5)?,
+                    language: row.get(6)?,
+                    node_type: NodeType::from_str_name(&row.get::<_, String>(7)?)
+                        .unwrap_or(NodeType::Function),
+                    signature: row.get(8)?,
+                    complexity: row.get(9)?,
+                    content_hash: row.get(10)?,
+                    embedding: row.get(11)?,
+                    byte_range_start: row.get(12)?,
+                    byte_range_end: row.get(13)?,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
 
         Ok(nodes)
     }
@@ -253,12 +258,17 @@ mod tests {
             id: None,
             project_id: "test_project".to_string(),
             file_path: "test.py".to_string(),
+            node_id: "test_project:test_func".to_string(),
             symbol_name: "test_func".to_string(),
+            qualified_name: "test_func".to_string(),
+            language: "python".to_string(),
             node_type: NodeType::Function,
             signature: Some("def test_func()".to_string()),
             complexity: Some(5),
             content_hash: "abc123".to_string(),
             embedding: None,
+            byte_range_start: Some(0),
+            byte_range_end: Some(100),
         };
 
         let id = store.insert(&record).unwrap();
@@ -278,12 +288,17 @@ mod tests {
             id: None,
             project_id: "test_project".to_string(),
             file_path: "test.py".to_string(),
+            node_id: "test_project:test_func".to_string(),
             symbol_name: "test_func".to_string(),
+            qualified_name: "test_func".to_string(),
+            language: "python".to_string(),
             node_type: NodeType::Function,
             signature: None,
             complexity: None,
             content_hash: "hash123".to_string(),
             embedding: None,
+            byte_range_start: Some(0),
+            byte_range_end: Some(100),
         };
 
         store.insert(&record).unwrap();

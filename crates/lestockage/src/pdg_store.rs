@@ -2,19 +2,31 @@
 //
 // *Le Pont* (The Bridge) - Converts between legraphe PDG and lestockage records
 
-use crate::edges::{EdgeType as StorageEdgeType, EdgeMetadata as StorageEdgeMetadata};
+use crate::edges::{EdgeMetadata as StorageEdgeMetadata, EdgeType as StorageEdgeType};
 use crate::nodes::{NodeRecord, NodeType as StorageNodeType};
 use crate::schema::Storage;
 use legraphe::pdg::{
-    ProgramDependenceGraph, Node as PDGNode, Edge as PDGEdge,
-    NodeType as PDGNodeType, EdgeType as PDGEdgeType, EdgeMetadata as PDGEdgeMetadata,
-    NodeId,
+    Edge as PDGEdge, EdgeMetadata as PDGEdgeMetadata, EdgeType as PDGEdgeType, Node as PDGNode,
+    NodeId, NodeType as PDGNodeType, ProgramDependenceGraph,
 };
 use rusqlite::{params, Result as SqliteResult};
 use std::collections::HashMap;
 
 /// Type alias for node database rows to reduce type complexity
-type NodeDbRow = (i64, String, String, String, String, String, String, Option<i32>, String, Option<Vec<u8>>, Option<i64>, Option<i64>);
+type NodeDbRow = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<i32>,
+    String,
+    Option<Vec<u8>>,
+    Option<i64>,
+    Option<i64>,
+);
 
 /// Errors that can occur during PDG persistence
 #[derive(Debug, thiserror::Error)]
@@ -151,7 +163,8 @@ pub fn save_pdg(
     let mut node_id_map: HashMap<NodeId, i64> = HashMap::new();
 
     for node_idx in pdg.node_indices() {
-        let pdg_node = pdg.get_node(node_idx)
+        let pdg_node = pdg
+            .get_node(node_idx)
             .ok_or_else(|| PdgStoreError::Serialization("Missing node data".to_string()))?;
 
         // Convert embedding to BLOB
@@ -169,7 +182,12 @@ pub fn save_pdg(
             file_path: pdg_node.file_path.clone(),
             node_id: pdg_node.id.clone(),
             symbol_name: pdg_node.name.clone(),
-            qualified_name: pdg_node.id.split(':').last().unwrap_or(&pdg_node.id).to_string(),
+            qualified_name: pdg_node
+                .id
+                .split(':')
+                .last()
+                .unwrap_or(&pdg_node.id)
+                .to_string(),
             language: pdg_node.language.clone(),
             node_type: convert_node_type(&pdg_node.node_type),
             signature: None, // Could be populated from node content
@@ -209,23 +227,29 @@ pub fn save_pdg(
 
     // Insert all edges
     for edge_idx in pdg.edge_indices() {
-        let (source, target) = pdg.edge_endpoints(edge_idx)
+        let (source, target) = pdg
+            .edge_endpoints(edge_idx)
             .ok_or_else(|| PdgStoreError::Serialization("Edge has no endpoints".to_string()))?;
 
-        let pdg_edge = pdg.get_edge(edge_idx)
+        let pdg_edge = pdg
+            .get_edge(edge_idx)
             .ok_or_else(|| PdgStoreError::Serialization("Missing edge data".to_string()))?;
 
-        let caller_id = *node_id_map.get(&source)
-            .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
-                caller: source.index() as i64,
-                callee: target.index() as i64,
-            })?;
+        let caller_id =
+            *node_id_map
+                .get(&source)
+                .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
+                    caller: source.index() as i64,
+                    callee: target.index() as i64,
+                })?;
 
-        let callee_id = *node_id_map.get(&target)
-            .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
-                caller: source.index() as i64,
-                callee: target.index() as i64,
-            })?;
+        let callee_id =
+            *node_id_map
+                .get(&target)
+                .ok_or_else(|| PdgStoreError::EdgeNodeMissing {
+                    caller: source.index() as i64,
+                    callee: target.index() as i64,
+                })?;
 
         let metadata = convert_edge_metadata(&pdg_edge.metadata);
         let metadata_json = serde_json::to_string(&metadata)
@@ -279,26 +303,43 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
          FROM intel_nodes WHERE project_id = ?1"
     )?;
 
-    let node_rows: Vec<NodeDbRow> = nodes_stmt.query_map(params![project_id], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,           // id
-            row.get::<_, String>(1)?,         // file_path
-            row.get::<_, String>(2)?,         // node_id
-            row.get::<_, String>(3)?,         // symbol_name
-            row.get::<_, String>(4)?,         // qualified_name
-            row.get::<_, String>(5)?,         // language
-            row.get::<_, String>(6)?,         // node_type
-            row.get::<_, Option<i32>>(7)?,    // complexity
-            row.get::<_, String>(8)?,         // content_hash
-            row.get::<_, Option<Vec<u8>>>(9)?, // embedding
-            row.get::<_, Option<i64>>(10)?,    // byte_range_start
-            row.get::<_, Option<i64>>(11)?,    // byte_range_end
-        ))
-    })?.collect::<SqliteResult<Vec<_>>>()?;
+    let node_rows: Vec<NodeDbRow> = nodes_stmt
+        .query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,             // id
+                row.get::<_, String>(1)?,          // file_path
+                row.get::<_, String>(2)?,          // node_id
+                row.get::<_, String>(3)?,          // symbol_name
+                row.get::<_, String>(4)?,          // qualified_name
+                row.get::<_, String>(5)?,          // language
+                row.get::<_, String>(6)?,          // node_type
+                row.get::<_, Option<i32>>(7)?,     // complexity
+                row.get::<_, String>(8)?,          // content_hash
+                row.get::<_, Option<Vec<u8>>>(9)?, // embedding
+                row.get::<_, Option<i64>>(10)?,    // byte_range_start
+                row.get::<_, Option<i64>>(11)?,    // byte_range_end
+            ))
+        })?
+        .collect::<SqliteResult<Vec<_>>>()?;
 
-    for (db_id, file_path, node_id_str, symbol_name, _qualified_name, language, node_type_str, complexity, _content_hash, embedding_blob, start, end) in node_rows {
-        let node_type = StorageNodeType::from_str_name(&node_type_str)
-            .ok_or_else(|| PdgStoreError::Deserialization(format!("Invalid node type: {}", node_type_str)))?;
+    for (
+        db_id,
+        file_path,
+        node_id_str,
+        symbol_name,
+        _qualified_name,
+        language,
+        node_type_str,
+        complexity,
+        _content_hash,
+        embedding_blob,
+        start,
+        end,
+    ) in node_rows
+    {
+        let node_type = StorageNodeType::from_str_name(&node_type_str).ok_or_else(|| {
+            PdgStoreError::Deserialization(format!("Invalid node type: {}", node_type_str))
+        })?;
 
         // Convert embedding BLOB back to Vec<f32>
         let embedding = embedding_blob.and_then(|blob| {
@@ -334,35 +375,41 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
          FROM intel_edges e
          INNER JOIN intel_nodes n1 ON e.caller_id = n1.id
          INNER JOIN intel_nodes n2 ON e.callee_id = n2.id
-         WHERE n1.project_id = ?1 AND n2.project_id = ?1"
+         WHERE n1.project_id = ?1 AND n2.project_id = ?1",
     )?;
 
-    let edge_rows: Vec<(i64, i64, String, Option<String>)> = edges_stmt.query_map(params![project_id], |row| {
-        Ok((
-            row.get::<_, i64>(0)?,           // caller_id
-            row.get::<_, i64>(1)?,           // callee_id
-            row.get::<_, String>(2)?,         // edge_type
-            row.get::<_, Option<String>>(3)?, // metadata
-        ))
-    })?.collect::<SqliteResult<Vec<_>>>()?;
+    let edge_rows: Vec<(i64, i64, String, Option<String>)> = edges_stmt
+        .query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,            // caller_id
+                row.get::<_, i64>(1)?,            // callee_id
+                row.get::<_, String>(2)?,         // edge_type
+                row.get::<_, Option<String>>(3)?, // metadata
+            ))
+        })?
+        .collect::<SqliteResult<Vec<_>>>()?;
 
     for (caller_id, callee_id, edge_type_str, metadata_json) in edge_rows {
-        let caller_node_id = *db_id_to_node_id.get(&caller_id)
+        let caller_node_id = *db_id_to_node_id
+            .get(&caller_id)
             .ok_or_else(|| PdgStoreError::NodeNotFound(caller_id))?;
 
-        let callee_node_id = *db_id_to_node_id.get(&callee_id)
+        let callee_node_id = *db_id_to_node_id
+            .get(&callee_id)
             .ok_or_else(|| PdgStoreError::NodeNotFound(callee_id))?;
 
-        let edge_type = StorageEdgeType::from_str_name(&edge_type_str)
-            .ok_or_else(|| PdgStoreError::Deserialization(format!("Invalid edge type: {}", edge_type_str)))?;
+        let edge_type = StorageEdgeType::from_str_name(&edge_type_str).ok_or_else(|| {
+            PdgStoreError::Deserialization(format!("Invalid edge type: {}", edge_type_str))
+        })?;
 
         let metadata = match metadata_json.as_deref() {
-            Some(json) => serde_json::from_str(json)
-                .map_err(|e| PdgStoreError::Deserialization(format!("Invalid edge metadata: {}", e)))?,
+            Some(json) => serde_json::from_str(json).map_err(|e| {
+                PdgStoreError::Deserialization(format!("Invalid edge metadata: {}", e))
+            })?,
             None => StorageEdgeMetadata {
                 call_count: None,
                 variable_name: None,
-            }
+            },
         };
 
         let pdg_edge = PDGEdge {
@@ -419,7 +466,11 @@ pub fn delete_pdg(storage: &mut Storage, project_id: &str) -> SqliteResult<()> {
 }
 
 /// Delete nodes and edges for a specific file in a project
-pub fn delete_file_data(storage: &mut Storage, project_id: &str, file_path: &str) -> SqliteResult<()> {
+pub fn delete_file_data(
+    storage: &mut Storage,
+    project_id: &str,
+    file_path: &str,
+) -> SqliteResult<()> {
     // Delete edges where caller or callee belongs to this file
     storage.conn().execute(
         "DELETE FROM intel_edges WHERE 
@@ -444,10 +495,13 @@ pub fn delete_file_data(storage: &mut Storage, project_id: &str, file_path: &str
 }
 
 /// Get all indexed files for a project with their hashes
-pub fn get_indexed_files(storage: &Storage, project_id: &str) -> SqliteResult<HashMap<String, String>> {
-    let mut stmt = storage.conn().prepare(
-        "SELECT file_path, file_hash FROM indexed_files WHERE project_id = ?1"
-    )?;
+pub fn get_indexed_files(
+    storage: &Storage,
+    project_id: &str,
+) -> SqliteResult<HashMap<String, String>> {
+    let mut stmt = storage
+        .conn()
+        .prepare("SELECT file_path, file_hash FROM indexed_files WHERE project_id = ?1")?;
 
     let rows = stmt.query_map(params![project_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -463,7 +517,12 @@ pub fn get_indexed_files(storage: &Storage, project_id: &str) -> SqliteResult<Ha
 }
 
 /// Update indexed file record
-pub fn update_indexed_file(storage: &mut Storage, project_id: &str, file_path: &str, hash: &str) -> SqliteResult<()> {
+pub fn update_indexed_file(
+    storage: &mut Storage,
+    project_id: &str,
+    file_path: &str,
+    hash: &str,
+) -> SqliteResult<()> {
     storage.conn().execute(
         "INSERT INTO indexed_files (file_path, project_id, file_hash, last_indexed)
          VALUES (?1, ?2, ?3, ?4)
@@ -488,6 +547,7 @@ mod tests {
             file_path: "test.rs".to_string(),
             byte_range: (0, 100),
             complexity: 5,
+            language: "rust".to_string(),
             embedding: Some(vec![0.1, 0.2, 0.3]),
         });
 
@@ -498,16 +558,21 @@ mod tests {
             file_path: "test.rs".to_string(),
             byte_range: (100, 200),
             complexity: 3,
+            language: "rust".to_string(),
             embedding: None,
         });
 
-        pdg.add_edge(n1, n2, PDGEdge {
-            edge_type: PDGEdgeType::Call,
-            metadata: PDGEdgeMetadata {
-                call_count: Some(5),
-                variable_name: None,
+        pdg.add_edge(
+            n1,
+            n2,
+            PDGEdge {
+                edge_type: PDGEdgeType::Call,
+                metadata: PDGEdgeMetadata {
+                    call_count: Some(5),
+                    variable_name: None,
+                },
             },
-        });
+        );
 
         pdg
     }
@@ -550,6 +615,7 @@ mod tests {
             file_path: "new.rs".to_string(),
             byte_range: (0, 50),
             complexity: 1,
+            language: "rust".to_string(),
             embedding: None,
         });
 
@@ -582,30 +648,81 @@ mod tests {
 
     #[test]
     fn test_convert_node_types() {
-        assert_eq!(convert_node_type(&PDGNodeType::Function), StorageNodeType::Function);
-        assert_eq!(convert_node_type(&PDGNodeType::Class), StorageNodeType::Class);
-        assert_eq!(convert_node_type(&PDGNodeType::Method), StorageNodeType::Method);
-        assert_eq!(convert_node_type(&PDGNodeType::Variable), StorageNodeType::Variable);
-        assert_eq!(convert_node_type(&PDGNodeType::Module), StorageNodeType::Module);
+        assert_eq!(
+            convert_node_type(&PDGNodeType::Function),
+            StorageNodeType::Function
+        );
+        assert_eq!(
+            convert_node_type(&PDGNodeType::Class),
+            StorageNodeType::Class
+        );
+        assert_eq!(
+            convert_node_type(&PDGNodeType::Method),
+            StorageNodeType::Method
+        );
+        assert_eq!(
+            convert_node_type(&PDGNodeType::Variable),
+            StorageNodeType::Variable
+        );
+        assert_eq!(
+            convert_node_type(&PDGNodeType::Module),
+            StorageNodeType::Module
+        );
 
-        assert_eq!(convert_storage_node_type(&StorageNodeType::Function), PDGNodeType::Function);
-        assert_eq!(convert_storage_node_type(&StorageNodeType::Class), PDGNodeType::Class);
-        assert_eq!(convert_storage_node_type(&StorageNodeType::Method), PDGNodeType::Method);
-        assert_eq!(convert_storage_node_type(&StorageNodeType::Variable), PDGNodeType::Variable);
-        assert_eq!(convert_storage_node_type(&StorageNodeType::Module), PDGNodeType::Module);
+        assert_eq!(
+            convert_storage_node_type(&StorageNodeType::Function),
+            PDGNodeType::Function
+        );
+        assert_eq!(
+            convert_storage_node_type(&StorageNodeType::Class),
+            PDGNodeType::Class
+        );
+        assert_eq!(
+            convert_storage_node_type(&StorageNodeType::Method),
+            PDGNodeType::Method
+        );
+        assert_eq!(
+            convert_storage_node_type(&StorageNodeType::Variable),
+            PDGNodeType::Variable
+        );
+        assert_eq!(
+            convert_storage_node_type(&StorageNodeType::Module),
+            PDGNodeType::Module
+        );
     }
 
     #[test]
     fn test_convert_edge_types() {
         assert_eq!(convert_edge_type(&PDGEdgeType::Call), StorageEdgeType::Call);
-        assert_eq!(convert_edge_type(&PDGEdgeType::DataDependency), StorageEdgeType::DataDependency);
-        assert_eq!(convert_edge_type(&PDGEdgeType::Inheritance), StorageEdgeType::Inheritance);
-        assert_eq!(convert_edge_type(&PDGEdgeType::Import), StorageEdgeType::Import);
+        assert_eq!(
+            convert_edge_type(&PDGEdgeType::DataDependency),
+            StorageEdgeType::DataDependency
+        );
+        assert_eq!(
+            convert_edge_type(&PDGEdgeType::Inheritance),
+            StorageEdgeType::Inheritance
+        );
+        assert_eq!(
+            convert_edge_type(&PDGEdgeType::Import),
+            StorageEdgeType::Import
+        );
 
-        assert_eq!(convert_storage_edge_type(&StorageEdgeType::Call), PDGEdgeType::Call);
-        assert_eq!(convert_storage_edge_type(&StorageEdgeType::DataDependency), PDGEdgeType::DataDependency);
-        assert_eq!(convert_storage_edge_type(&StorageEdgeType::Inheritance), PDGEdgeType::Inheritance);
-        assert_eq!(convert_storage_edge_type(&StorageEdgeType::Import), PDGEdgeType::Import);
+        assert_eq!(
+            convert_storage_edge_type(&StorageEdgeType::Call),
+            PDGEdgeType::Call
+        );
+        assert_eq!(
+            convert_storage_edge_type(&StorageEdgeType::DataDependency),
+            PDGEdgeType::DataDependency
+        );
+        assert_eq!(
+            convert_storage_edge_type(&StorageEdgeType::Inheritance),
+            PDGEdgeType::Inheritance
+        );
+        assert_eq!(
+            convert_storage_edge_type(&StorageEdgeType::Import),
+            PDGEdgeType::Import
+        );
     }
 
     #[test]
@@ -638,6 +755,7 @@ mod tests {
             file_path: "test.rs".to_string(),
             byte_range: (0, 50),
             complexity: 1,
+            language: "rust".to_string(),
             embedding: None,
         });
 
@@ -648,6 +766,7 @@ mod tests {
             file_path: "test.rs".to_string(),
             byte_range: (50, 100),
             complexity: 1,
+            language: "rust".to_string(),
             embedding: None,
         });
 
@@ -658,24 +777,33 @@ mod tests {
             file_path: "test.rs".to_string(),
             byte_range: (100, 150),
             complexity: 1,
+            language: "rust".to_string(),
             embedding: None,
         });
 
-        pdg.add_edge(n1, n2, PDGEdge {
-            edge_type: PDGEdgeType::Inheritance,
-            metadata: PDGEdgeMetadata {
-                call_count: None,
-                variable_name: None,
+        pdg.add_edge(
+            n1,
+            n2,
+            PDGEdge {
+                edge_type: PDGEdgeType::Inheritance,
+                metadata: PDGEdgeMetadata {
+                    call_count: None,
+                    variable_name: None,
+                },
             },
-        });
+        );
 
-        pdg.add_edge(n3, n1, PDGEdge {
-            edge_type: PDGEdgeType::DataDependency,
-            metadata: PDGEdgeMetadata {
-                call_count: None,
-                variable_name: Some("child_instance".to_string()),
+        pdg.add_edge(
+            n3,
+            n1,
+            PDGEdge {
+                edge_type: PDGEdgeType::DataDependency,
+                metadata: PDGEdgeMetadata {
+                    call_count: None,
+                    variable_name: Some("child_instance".to_string()),
+                },
             },
-        });
+        );
 
         save_pdg(&mut storage, "test_project", &pdg).unwrap();
 
@@ -684,8 +812,8 @@ mod tests {
         assert_eq!(loaded.edge_count(), 2);
 
         // Verify edges by checking connectivity
-        let child_id = loaded.find_by_symbol("Child").unwrap();
-        let parent_id = loaded.find_by_symbol("Parent").unwrap();
+        let child_id = loaded.find_by_symbol("child").unwrap();
+        let parent_id = loaded.find_by_symbol("parent").unwrap();
         let data_user_id = loaded.find_by_symbol("data_user").unwrap();
 
         // Child should have Parent as neighbor (inheritance)
@@ -712,6 +840,7 @@ mod tests {
             file_path: "test.rs".to_string(),
             byte_range: (0, 50),
             complexity: 1,
+            language: "rust".to_string(),
             embedding: Some(embedding.clone()),
         });
 

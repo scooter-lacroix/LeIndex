@@ -210,7 +210,7 @@ impl ParallelParser {
                 return ParsingResult::failure(
                     file_path,
                     format!("Unsupported file extension: {}", ext),
-                )
+                );
             }
         };
 
@@ -221,10 +221,7 @@ impl ParallelParser {
         let source = match std::fs::read(&file_path) {
             Ok(contents) => contents,
             Err(e) => {
-                return ParsingResult::failure(
-                    file_path,
-                    format!("Failed to read file: {}", e),
-                )
+                return ParsingResult::failure(file_path, format!("Failed to read file: {}", e))
             }
         };
 
@@ -249,7 +246,9 @@ impl ParallelParser {
         let parse_time_ms = start_time.elapsed().as_millis() as u64;
 
         match result {
-            Ok(signatures) => ParsingResult::success(file_path, language_name, signatures, parse_time_ms),
+            Ok(signatures) => {
+                ParsingResult::success(file_path, language_name, signatures, parse_time_ms)
+            }
             Err(e) => ParsingResult::failure(file_path, format!("Parse error: {}", e)),
         }
     }
@@ -316,7 +315,7 @@ mod tests {
 
         assert_eq!(stats.total_files, 1);
         assert_eq!(stats.successful_files, 1);
-        // total_time_ms can be 0 for very fast parsing, just check it completed
-        assert!(stats.total_time_ms >= 0);
+        // total_time_ms is a u64 so just verify it exists (the parsing completed)
+        let _ = stats.total_time_ms;
     }
 }

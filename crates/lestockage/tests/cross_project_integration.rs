@@ -5,11 +5,11 @@
 
 #[cfg(test)]
 mod tests {
-    use tempfile::NamedTempFile;
-    use lestockage::{Storage, GlobalSymbolTable, GlobalSymbol, CrossProjectResolver};
-    use lestockage::global_symbols::{ExternalRef, ProjectDep, SymbolType, RefType, DepType};
-    use legraphe::pdg::{ProgramDependenceGraph, Node, NodeType, Edge, EdgeType, EdgeMetadata};
+    use legraphe::pdg::{Edge, EdgeMetadata, EdgeType, Node, NodeType, ProgramDependenceGraph};
+    use lestockage::global_symbols::{DepType, ExternalRef, ProjectDep, RefType, SymbolType};
     use lestockage::pdg_store::save_pdg;
+    use lestockage::{CrossProjectResolver, GlobalSymbol, GlobalSymbolTable, Storage};
+    use tempfile::NamedTempFile;
 
     /// Helper: Create a test storage with temp file
     fn create_test_storage() -> Storage {
@@ -28,6 +28,7 @@ mod tests {
                 file_path: format!("src/{}.rs", func_name),
                 byte_range: (0, 100),
                 complexity: 5,
+                language: "rust".to_string(),
                 embedding: None,
             };
             pdg.add_node(node);
@@ -235,6 +236,7 @@ mod tests {
             file_path: "src/func_a.rs".to_string(),
             byte_range: (0, 100),
             complexity: 5,
+            language: "rust".to_string(),
             embedding: None,
         };
         let id_a = root_pdg.add_node(node_a);
@@ -246,6 +248,7 @@ mod tests {
             file_path: "src/func_b.rs".to_string(),
             byte_range: (0, 100),
             complexity: 3,
+            language: "rust".to_string(),
             embedding: None,
         };
         let id_b = root_pdg.add_node(node_b);
@@ -275,6 +278,7 @@ mod tests {
             file_path: "src/func_x.rs".to_string(),
             byte_range: (0, 100),
             complexity: 4,
+            language: "rust".to_string(),
             embedding: None,
         };
         let id_x = ext_pdg.add_node(node_x);
@@ -286,6 +290,7 @@ mod tests {
             file_path: "src/func_y.rs".to_string(),
             byte_range: (0, 100),
             complexity: 2,
+            language: "rust".to_string(),
             embedding: None,
         };
         let id_y = ext_pdg.add_node(node_y);
@@ -361,9 +366,7 @@ mod tests {
         // Create resolver using the same storage file
         let resolver = CrossProjectResolver::new(storage);
 
-        let dependents = resolver
-            .find_dependents(&shared_sym.symbol_id)
-            .unwrap();
+        let dependents = resolver.find_dependents(&shared_sym.symbol_id).unwrap();
 
         assert_eq!(dependents.len(), 2);
         assert!(dependents.contains(&"project_a".to_string()));
@@ -474,7 +477,7 @@ mod tests {
                 symbol_id: GlobalSymbolTable::generate_symbol_id(
                     "test_project",
                     &format!("func_{}", i),
-                    None
+                    None,
                 ),
                 project_id: "test_project".to_string(),
                 symbol_name: format!("func_{}", i),

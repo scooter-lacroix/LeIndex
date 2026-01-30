@@ -181,11 +181,17 @@ fn extract_call_edges(
         }
     }
 
-    let imports = signatures.first().map(|s| s.imports.clone()).unwrap_or_default();
+    let imports = signatures
+        .first()
+        .map(|s| s.imports.clone())
+        .unwrap_or_default();
     let mut alias_map: HashMap<String, String> = HashMap::new();
     for import in &imports {
         let alias = import.alias.clone().or_else(|| {
-            import.path.split(|c| c == '.' || c == ':' || c == '\\' || c == '/').last()
+            import
+                .path
+                .split(|c| c == '.' || c == ':' || c == '\\' || c == '/')
+                .last()
                 .map(|s| s.to_string())
         });
         if let Some(alias) = alias {
@@ -244,7 +250,12 @@ fn extract_call_edges(
             if let Some(namespace) = &caller_namespace {
                 if let Some(first) = segments.first() {
                     if matches!(first.as_str(), "self" | "this" | "super" | "Self" | "crate") {
-                        let rest = segments.iter().skip(1).cloned().collect::<Vec<_>>().join(".");
+                        let rest = segments
+                            .iter()
+                            .skip(1)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join(".");
                         if !rest.is_empty() {
                             candidates.push(format!("{}.{}", namespace, rest));
                         }
@@ -457,10 +468,9 @@ fn extract_inheritance_edges(
                         // Connect first method from each class as representative
                         if let Some(child_method) = child_methods.first() {
                             if let Some(parent_method) = parent_methods.first() {
-                                if let (Some(&child_id), Some(&parent_id)) = (
-                                    node_ids.get(child_method),
-                                    node_ids.get(parent_method),
-                                ) {
+                                if let (Some(&child_id), Some(&parent_id)) =
+                                    (node_ids.get(child_method), node_ids.get(parent_method))
+                                {
                                     edges.push((child_id, parent_id));
                                 }
                             }
@@ -524,15 +534,9 @@ fn classes_share_methods(
     match (methods_a, methods_b) {
         (Some(a), Some(b)) => {
             // Extract just the method names (last part after ::)
-            let names_a: HashSet<_> = a
-                .iter()
-                .filter_map(|q| q.split("::").last())
-                .collect();
+            let names_a: HashSet<_> = a.iter().filter_map(|q| q.split("::").last()).collect();
 
-            let names_b: HashSet<_> = b
-                .iter()
-                .filter_map(|q| q.split("::").last())
-                .collect();
+            let names_b: HashSet<_> = b.iter().filter_map(|q| q.split("::").last()).collect();
 
             // Check for intersection
             !names_a.is_disjoint(&names_b)
@@ -561,6 +565,8 @@ mod tests {
             is_async: false,
             is_method,
             docstring: None,
+            calls: Vec::new(),
+            imports: Vec::new(),
             byte_range: (0, 0),
         }
     }
@@ -568,7 +574,7 @@ mod tests {
     #[test]
     fn test_extract_pdg_from_signatures_empty() {
         let signatures = vec![];
-        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py");
+        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py", "python");
 
         assert_eq!(pdg.node_count(), 0);
         assert_eq!(pdg.edge_count(), 0);
@@ -576,19 +582,16 @@ mod tests {
 
     #[test]
     fn test_extract_pdg_from_signatures_single_function() {
-        let signatures = vec![create_test_signature(
-            "my_func",
-            "my_func",
-            vec![],
-            false,
-        )];
+        let signatures = vec![create_test_signature("my_func", "my_func", vec![], false)];
 
-        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py");
+        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py", "python");
 
         assert_eq!(pdg.node_count(), 1);
         assert_eq!(pdg.edge_count(), 0);
 
-        let node_id = pdg.find_by_symbol("my_func").expect("Node not found");
+        let node_id = pdg
+            .find_by_symbol("test.py:my_func")
+            .expect("Node not found");
         let node = pdg.get_node(node_id).expect("Node weight not found");
 
         assert_eq!(node.name, "my_func");
@@ -606,11 +609,13 @@ mod tests {
             true,
         )];
 
-        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py");
+        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py", "python");
 
         assert_eq!(pdg.node_count(), 1);
 
-        let node_id = pdg.find_by_symbol("MyClass::process").expect("Node not found");
+        let node_id = pdg
+            .find_by_symbol("test.py:MyClass::process")
+            .expect("Node not found");
         let node = pdg.get_node(node_id).expect("Node weight not found");
 
         assert_eq!(node.node_type, NodeType::Method);
@@ -637,9 +642,11 @@ mod tests {
             false,
         )];
 
-        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py");
+        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py", "python");
 
-        let node_id = pdg.find_by_symbol("complex_func").expect("Node not found");
+        let node_id = pdg
+            .find_by_symbol("test.py:complex_func")
+            .expect("Node not found");
         let node = pdg.get_node(node_id).expect("Node weight not found");
 
         // Complexity = base (1) + param count (2) = 3
@@ -671,7 +678,7 @@ mod tests {
             ),
         ];
 
-        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py");
+        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py", "python");
 
         // Should have 2 nodes and 1 data dependency edge
         assert_eq!(pdg.node_count(), 2);
@@ -720,7 +727,7 @@ mod tests {
             ),
         ];
 
-        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py");
+        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py", "python");
 
         // Should have 3 nodes
         assert_eq!(pdg.node_count(), 3);
@@ -750,21 +757,11 @@ mod tests {
     #[test]
     fn test_extract_inheritance_edges() {
         let signatures = vec![
-            create_test_signature(
-                "process",
-                "Base::process",
-                vec![],
-                true,
-            ),
-            create_test_signature(
-                "process",
-                "DerivedClass::process",
-                vec![],
-                true,
-            ),
+            create_test_signature("process", "Base::process", vec![], true),
+            create_test_signature("process", "DerivedClass::process", vec![], true),
         ];
 
-        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py");
+        let pdg = extract_pdg_from_signatures(signatures, b"", "test.py", "python");
 
         // Should have 2 nodes and 1 inheritance edge
         assert_eq!(pdg.node_count(), 2);
@@ -772,12 +769,12 @@ mod tests {
 
         // Verify edge exists from DerivedClass to Base (longer name → shorter name)
         // The heuristic assumes shorter names are base classes
-        let derived_id = pdg.find_by_symbol("DerivedClass::process").unwrap();
+        let derived_id = pdg.find_by_symbol("test.py:DerivedClass::process").unwrap();
         let neighbors = pdg.neighbors(derived_id);
         assert_eq!(neighbors.len(), 1);
 
         // Verify the neighbor is Base
-        let base_id = pdg.find_by_symbol("Base::process").unwrap();
+        let base_id = pdg.find_by_symbol("test.py:Base::process").unwrap();
         assert_eq!(neighbors[0], base_id);
     }
 
@@ -789,7 +786,7 @@ mod tests {
             create_test_signature("func3", "func3", vec![], false),
         ];
 
-        let pdg = extract_pdg_from_signatures(signatures, b"", "src/my_file.rs");
+        let pdg = extract_pdg_from_signatures(signatures, b"", "src/my_file.rs", "rust");
 
         assert_eq!(pdg.node_count(), 3);
 
@@ -805,20 +802,20 @@ mod tests {
     #[test]
     fn test_signature_to_node_function_type() {
         let sig = create_test_signature("my_func", "my_func", vec![], false);
-        let node = signature_to_node(&sig, "test.py");
+        let node = signature_to_node(&sig, "test.py", "python");
 
         assert_eq!(node.node_type, NodeType::Function);
-        assert_eq!(node.id, "my_func");
+        assert_eq!(node.id, "test.py:my_func");
         assert_eq!(node.name, "my_func");
     }
 
     #[test]
     fn test_signature_to_node_method_type() {
         let sig = create_test_signature("my_method", "Class::my_method", vec![], true);
-        let node = signature_to_node(&sig, "test.py");
+        let node = signature_to_node(&sig, "test.py", "python");
 
         assert_eq!(node.node_type, NodeType::Method);
-        assert_eq!(node.id, "Class::my_method");
+        assert_eq!(node.id, "test.py:Class::my_method");
         assert_eq!(node.name, "my_method");
     }
 
@@ -847,7 +844,7 @@ mod tests {
             false,
         );
 
-        let node = signature_to_node(&sig_with_params, "test.py");
+        let node = signature_to_node(&sig_with_params, "test.py", "python");
 
         // Base complexity (1) + 3 parameters = 4
         assert_eq!(node.complexity, 4);

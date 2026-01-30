@@ -4,7 +4,7 @@
 // enabling tracking of external node references and merging graphs
 // from multiple projects.
 
-use crate::pdg::{ProgramDependenceGraph, NodeId, EdgeId, NodeType};
+use crate::pdg::{EdgeId, NodeId, NodeType, ProgramDependenceGraph};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -24,7 +24,7 @@ pub struct CrossProjectPDG {
     pub node_origins: HashMap<NodeId, String>,
 
     /// External project references (lazy load)
-    pub external_refs: HashMap<String, Vec<NodeId>>,  // project_id -> nodes
+    pub external_refs: HashMap<String, Vec<NodeId>>, // project_id -> nodes
 
     /// Max depth of external loading
     pub max_depth: usize,
@@ -88,7 +88,8 @@ impl CrossProjectPDG {
                 node_id_map.insert(old_node_id, new_node_id);
 
                 // Track origin
-                self.node_origins.insert(new_node_id, project_id.to_string());
+                self.node_origins
+                    .insert(new_node_id, project_id.to_string());
                 added_nodes.push(new_node_id);
             }
         }
@@ -109,13 +110,15 @@ impl CrossProjectPDG {
                     };
 
                     // Add the edge with remapped endpoints
-                    self.merged_pdg.add_edge(new_source, new_target, edge.clone());
+                    self.merged_pdg
+                        .add_edge(new_source, new_target, edge.clone());
                 }
             }
         }
 
         // Record external reference
-        self.external_refs.insert(project_id.to_string(), added_nodes);
+        self.external_refs
+            .insert(project_id.to_string(), added_nodes);
 
         Ok(())
     }
@@ -234,12 +237,14 @@ impl CrossProjectPDG {
                 let refs: Vec<ExternalNodeRef> = nodes
                     .iter()
                     .filter_map(|node_id| {
-                        self.merged_pdg.get_node(*node_id).map(|node| ExternalNodeRef {
-                            node_id: node_id.index() as u32,
-                            project_id: project.clone(),
-                            symbol_name: node.name.clone(),
-                            node_type: node.node_type.clone(),
-                        })
+                        self.merged_pdg
+                            .get_node(*node_id)
+                            .map(|node| ExternalNodeRef {
+                                node_id: node_id.index() as u32,
+                                project_id: project.clone(),
+                                symbol_name: node.name.clone(),
+                                node_type: node.node_type.clone(),
+                            })
                     })
                     .collect();
                 (project.clone(), refs)
@@ -309,6 +314,7 @@ mod tests {
             file_path: format!("src/{}.rs", name),
             byte_range: (0, 100),
             complexity: 5,
+            language: "rust".to_string(),
             embedding: None,
         }
     }
