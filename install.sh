@@ -320,14 +320,44 @@ verify_installation() {
         return 1
     fi
 
-    if $binary --version &> /dev/null; then
-        local version=$($binary --version 2>&1 || echo "unknown")
-        log_success "Installation verified: $version"
-        return 0
-    else
+    if ! $binary --version &> /dev/null; then
         log_error "Installation verification failed"
         return 1
     fi
+
+    local version=$($binary --version 2>&1 || echo "unknown")
+    log_success "Binary check passed: $version"
+
+    # Ensure additive lephase and MCP command surfaces are present.
+    if ! $binary phase --help &> /dev/null; then
+        log_error "Installed binary does not expose 'phase' command"
+        return 1
+    fi
+    print_bullet "Phase command detected"
+
+    if ! $binary mcp --help &> /dev/null; then
+        log_error "Installed binary does not expose 'mcp' command"
+        return 1
+    fi
+    print_bullet "MCP command detected"
+
+    # Smoke-test phase analysis against a tiny temporary project.
+    local tmp_project
+    tmp_project=$(mktemp -d)
+    mkdir -p "$tmp_project/src"
+    printf "pub fn installer_smoke()->i32{1}\n" > "$tmp_project/src/lib.rs"
+
+    if $binary phase --phase 1 --path "$tmp_project" --max-files 10 --max-chars 800 > /dev/null 2>&1; then
+        print_bullet "Phase-analysis smoke test passed"
+    else
+        log_error "Phase-analysis smoke test failed"
+        rm -rf "$tmp_project"
+        return 1
+    fi
+
+    rm -rf "$tmp_project"
+    log_success "Installation verified with feature smoke checks"
+    return 0
 }
 
 setup_directories() {

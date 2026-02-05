@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 // Re-export HNSW types from hnsw_rs
-pub use hnsw_rs::prelude::{Hnsw, DistCosine, Neighbour};
+pub use hnsw_rs::prelude::{DistCosine, Hnsw, Neighbour};
 
 /// HNSW-based approximate nearest neighbor index
 ///
@@ -155,13 +155,19 @@ impl HNSWParams {
             ));
         }
         if self.ef_search == 0 {
-            return Err(IndexError::InvalidParameter("ef_search must be > 0".to_string()));
+            return Err(IndexError::InvalidParameter(
+                "ef_search must be > 0".to_string(),
+            ));
         }
         if self.max_elements == 0 {
-            return Err(IndexError::InvalidParameter("max_elements must be > 0".to_string()));
+            return Err(IndexError::InvalidParameter(
+                "max_elements must be > 0".to_string(),
+            ));
         }
         if self.max_layer == 0 {
-            return Err(IndexError::InvalidParameter("max_layer must be > 0".to_string()));
+            return Err(IndexError::InvalidParameter(
+                "max_layer must be > 0".to_string(),
+            ));
         }
         Ok(())
     }
@@ -285,10 +291,7 @@ impl HNSWIndex {
     /// # Returns
     ///
     /// Number of successfully inserted vectors
-    pub fn insert_batch(
-        &mut self,
-        vectors: impl IntoIterator<Item = (String, Vec<f32>)>,
-    ) -> usize {
+    pub fn insert_batch(&mut self, vectors: impl IntoIterator<Item = (String, Vec<f32>)>) -> usize {
         let mut inserted = 0;
         for (node_id, embedding) in vectors {
             if self.insert(node_id, embedding).is_ok() {
@@ -575,7 +578,6 @@ pub enum IndexError {
 mod tests {
     use super::*;
 
-
     #[test]
     fn test_hnsw_index_creation() {
         let index = HNSWIndex::new(3);
@@ -607,7 +609,9 @@ mod tests {
     #[test]
     fn test_hnsw_index_duplicate_insert() {
         let mut index = HNSWIndex::new(3);
-        index.insert("test".to_string(), vec![0.1, 0.2, 0.3]).unwrap();
+        index
+            .insert("test".to_string(), vec![0.1, 0.2, 0.3])
+            .unwrap();
         let result = index.insert("test".to_string(), vec![0.4, 0.5, 0.6]);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), IndexError::NodeExists(_)));
@@ -661,7 +665,9 @@ mod tests {
     #[test]
     fn test_hnsw_remove() {
         let mut index = HNSWIndex::new(3);
-        index.insert("test".to_string(), vec![0.1, 0.2, 0.3]).unwrap();
+        index
+            .insert("test".to_string(), vec![0.1, 0.2, 0.3])
+            .unwrap();
         assert_eq!(index.len(), 1);
 
         assert!(index.remove("test"));
@@ -708,7 +714,10 @@ mod tests {
         assert!(params.validate().is_ok());
 
         // Invalid m
-        let params = HNSWParams { m: 0, ..Default::default() };
+        let params = HNSWParams {
+            m: 0,
+            ..Default::default()
+        };
         assert!(params.validate().is_err());
 
         // Invalid ef_construction
@@ -751,9 +760,7 @@ mod tests {
 
         // Insert 1000 random vectors
         for i in 0..1000 {
-            let vector: Vec<f32> = (0..128)
-                .map(|_| rand::random::<f32>())
-                .collect();
+            let vector: Vec<f32> = (0..128).map(|_| rand::random::<f32>()).collect();
             index.insert(format!("node_{}", i), vector).unwrap();
         }
 
@@ -768,7 +775,9 @@ mod tests {
     #[test]
     fn test_hnsw_get_returns_none() {
         let mut index = HNSWIndex::new(3);
-        index.insert("test".to_string(), vec![0.1, 0.2, 0.3]).unwrap();
+        index
+            .insert("test".to_string(), vec![0.1, 0.2, 0.3])
+            .unwrap();
 
         // HNSW doesn't support vector retrieval
         assert!(index.get("test").is_none());
@@ -777,7 +786,9 @@ mod tests {
     #[test]
     fn test_hnsw_rebuild() {
         let mut index = HNSWIndex::new(3);
-        index.insert("test".to_string(), vec![0.1, 0.2, 0.3]).unwrap();
+        index
+            .insert("test".to_string(), vec![0.1, 0.2, 0.3])
+            .unwrap();
 
         // Rebuild should succeed
         assert!(index.rebuild().is_ok());

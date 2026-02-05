@@ -1,27 +1,35 @@
 // Scala language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
 use tree_sitter::Parser;
 
 /// Scala language parser with full CodeIntelligence implementation
 pub struct ScalaParser;
 
 impl Default for ScalaParser {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ScalaParser {
     /// Create a new instance of the Scala parser.
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl CodeIntelligence for ScalaParser {
     fn get_signatures(&self, source: &[u8]) -> Result<Vec<SignatureInfo>> {
         let mut parser = Parser::new();
-        parser.set_language(&crate::traits::languages::scala::language())
+        parser
+            .set_language(&crate::traits::languages::scala::language())
             .map_err(|e| Error::ParseFailed(e.to_string()))?;
-        let tree = parser.parse(source, None)
+        let tree = parser
+            .parse(source, None)
             .ok_or_else(|| Error::ParseFailed("Failed to parse Scala source".to_string()))?;
         let root_node = tree.root_node();
         let imports = extract_scala_imports(root_node, source);
@@ -35,9 +43,11 @@ impl CodeIntelligence for ScalaParser {
 
     fn compute_cfg(&self, source: &[u8], node_id: usize) -> Result<Graph<Block, Edge>> {
         let mut parser = Parser::new();
-        parser.set_language(&crate::traits::languages::scala::language())
+        parser
+            .set_language(&crate::traits::languages::scala::language())
             .map_err(|e| Error::ParseFailed(e.to_string()))?;
-        let tree = parser.parse(source, None)
+        let tree = parser
+            .parse(source, None)
             .ok_or_else(|| Error::ParseFailed("Failed to parse Scala source".to_string()))?;
 
         let root_node = tree.root_node();
@@ -69,7 +79,10 @@ fn visit(
 ) {
     match node.kind() {
         "function_definition" => {
-            if let Some(name) = node.child_by_field_name("name").and_then(|n| n.utf8_text(source).ok()) {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+            {
                 // Extract parameters
                 let parameters = node
                     .child_by_field_name("parameters")
@@ -99,13 +112,17 @@ fn visit(
                     is_method: !parent_path.is_empty(),
                     docstring: extract_docstring(node, source),
                     calls,
-                    
-        imports: vec![], byte_range: (0, 0)
+
+                    imports: vec![],
+                    byte_range: (0, 0),
                 });
             }
         }
         "class_definition" | "trait_definition" | "object_definition" => {
-            if let Some(name) = node.child_by_field_name("name").and_then(|n| n.utf8_text(source).ok()) {
+            if let Some(name) = node
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(source).ok())
+            {
                 let entity_type = match node.kind() {
                     "trait_definition" => "trait",
                     "object_definition" => "object",
@@ -124,7 +141,11 @@ fn visit(
                     visibility: Visibility::Public,
                     is_async: false,
                     is_method: false,
-                    docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (0, 0) });
+                    docstring: extract_docstring(node, source),
+                    calls: vec![],
+                    imports: vec![],
+                    byte_range: (0, 0),
+                });
 
                 // Recurse into the body to find nested members
                 let mut c = node.walk();
@@ -158,7 +179,10 @@ fn extract_scala_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportIn
     }
 
     fn parse_import_text(imports: &mut Vec<ImportInfo>, text: &str) {
-        let text = text.trim().trim_end_matches(';').trim_start_matches("import ");
+        let text = text
+            .trim()
+            .trim_end_matches(';')
+            .trim_start_matches("import ");
         if text.contains("=>") {
             for part in text.split(',') {
                 let part = part.trim().trim_matches('{').trim_matches('}');
@@ -199,18 +223,16 @@ fn extract_scala_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
 
     fn clean_call_text(raw: &str) -> String {
-        raw.split('(')
-            .next()
-            .unwrap_or(raw)
-            .trim()
-            .to_string()
+        raw.split('(').next().unwrap_or(raw).trim().to_string()
     }
 
     fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
         match node.kind() {
             "call_expression" | "method_call" | "function_call" => {
-                if let Some(func) = node.child_by_field_name("function")
-                    .or_else(|| node.child_by_field_name("name")) {
+                if let Some(func) = node
+                    .child_by_field_name("function")
+                    .or_else(|| node.child_by_field_name("name"))
+                {
                     if let Ok(text) = func.utf8_text(source) {
                         let name = clean_call_text(text);
                         if !name.is_empty() {
@@ -307,10 +329,7 @@ fn calculate_complexity(node: &tree_sitter::Node, metrics: &mut ComplexityMetric
 
     // Scala control flow structures
     match node.kind() {
-        "if_expression"
-        | "while_expression"
-        | "for_expression"
-        | "match_expression"
+        "if_expression" | "while_expression" | "for_expression" | "match_expression"
         | "try_expression" => {
             metrics.cyclomatic += 1;
         }
@@ -352,7 +371,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn build_cfg_recursive(&mut self, node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn build_cfg_recursive(
+        &mut self,
+        node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         match node.kind() {
             "if_expression" => {
                 self.handle_if_statement(node, current_block)?;
@@ -381,7 +404,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_if_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_if_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let true_block = self.create_block();
         let false_block = self.create_block();
         let merge_block = self.create_block();
@@ -410,7 +437,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_while_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_while_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let body_block = self.create_block();
 
         self.edges.push(Edge {
@@ -427,7 +458,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_for_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_for_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let body_block = self.create_block();
 
         self.edges.push(Edge {
@@ -444,7 +479,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_match_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_match_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let merge_block = self.create_block();
 
         // For each case clause, create an edge

@@ -1,7 +1,9 @@
 // Rust language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
 use tree_sitter::Parser;
 
 /// Rust language parser with full CodeIntelligence implementation
@@ -63,14 +65,18 @@ impl RustParser {
                             let mut dcursor = child.walk();
                             for dc in child.children(&mut dcursor) {
                                 if dc.kind() == "function_item" {
-                                    if let Some(sig) = extract_function_signature(&dc, source, parent_path) {
+                                    if let Some(sig) =
+                                        extract_function_signature(&dc, source, parent_path)
+                                    {
                                         signatures.push(sig);
                                     }
                                 }
                             }
                         } else if child.kind() == "function_item" {
                             // Direct function_item (shouldn't happen but handle it)
-                            if let Some(sig) = extract_function_signature(&child, source, parent_path) {
+                            if let Some(sig) =
+                                extract_function_signature(&child, source, parent_path)
+                            {
                                 signatures.push(sig);
                             }
                         }
@@ -96,8 +102,10 @@ impl RustParser {
                             is_async: false,
                             is_method: false,
                             docstring: extract_docstring(node, source),
-                            calls: vec![], imports: vec![], 
-                            byte_range: (node.start_byte(), node.end_byte()) });
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                        });
                     }
 
                     // Recurse to extract trait methods
@@ -138,8 +146,10 @@ impl RustParser {
                             is_async: false,
                             is_method: false,
                             docstring: extract_docstring(node, source),
-                            calls: vec![], imports: vec![], 
-                            byte_range: (node.start_byte(), node.end_byte()) });
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                        });
                     }
                 }
                 "enum_item" => {
@@ -162,8 +172,10 @@ impl RustParser {
                             is_async: false,
                             is_method: false,
                             docstring: extract_docstring(node, source),
-                            calls: vec![], imports: vec![], 
-                            byte_range: (node.start_byte(), node.end_byte()) });
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                        });
                     }
                 }
                 "use_declaration" => {
@@ -345,12 +357,9 @@ fn extract_function_signature(
         .and_then(|r| r.utf8_text(source).ok())
         .map(|s| s.trim().to_string());
 
-    let is_async = node
-        .children(&mut node.walk())
-        .any(|c| {
-            c.kind() == "function_modifiers"
-                && c.children(&mut c.walk()).any(|cc| cc.kind() == "async")
-        });
+    let is_async = node.children(&mut node.walk()).any(|c| {
+        c.kind() == "function_modifiers" && c.children(&mut c.walk()).any(|cc| cc.kind() == "async")
+    });
 
     let visibility = extract_visibility(node, source);
 
@@ -372,8 +381,10 @@ fn extract_function_signature(
         is_method,
         docstring: extract_docstring(node, source),
         calls,
-        
-        imports: vec![], byte_range: (node.start_byte(), node.end_byte()) })
+
+        imports: vec![],
+        byte_range: (node.start_byte(), node.end_byte()),
+    })
 }
 
 /// Extract function calls from a Rust node
@@ -389,7 +400,7 @@ fn extract_rust_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
             .trim_end_matches('!')
             .to_string()
     }
-    
+
     fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
         match node.kind() {
             "call_expression" => {
@@ -403,10 +414,12 @@ fn extract_rust_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
                 }
             }
             "method_call_expression" => {
-                let receiver = node.child_by_field_name("receiver")
+                let receiver = node
+                    .child_by_field_name("receiver")
                     .and_then(|r| r.utf8_text(source).ok())
                     .map(|s| clean_call_text(s));
-                let method = node.child_by_field_name("method")
+                let method = node
+                    .child_by_field_name("method")
                     .and_then(|m| m.utf8_text(source).ok())
                     .map(|s| clean_call_text(s));
 
@@ -421,8 +434,10 @@ fn extract_rust_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
                 }
             }
             "macro_invocation" => {
-                if let Some(name_node) = node.child_by_field_name("macro")
-                    .or_else(|| node.child_by_field_name("name")) {
+                if let Some(name_node) = node
+                    .child_by_field_name("macro")
+                    .or_else(|| node.child_by_field_name("name"))
+                {
                     if let Ok(text) = name_node.utf8_text(source) {
                         let name = clean_call_text(text);
                         if !name.is_empty() {
@@ -433,13 +448,13 @@ fn extract_rust_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
             }
             _ => {}
         }
-        
+
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             find_calls(&child, source, calls);
         }
     }
-    
+
     find_calls(node, source, &mut calls);
     calls
 }
@@ -477,8 +492,10 @@ fn extract_import_signature(
         is_async: false,
         is_method: false,
         docstring: None,
-        calls: vec![], imports: vec![], 
-        byte_range: (0, 0) })
+        calls: vec![],
+        imports: vec![],
+        byte_range: (0, 0),
+    })
 }
 
 /// Extract visibility modifier from a node
@@ -487,7 +504,10 @@ fn extract_visibility(node: &tree_sitter::Node, source: &[u8]) -> Visibility {
     for child in node.children(&mut cursor) {
         if child.kind() == "visibility_modifier" {
             if let Ok(text) = child.utf8_text(source) {
-                if text.contains("pub") && !text.contains("pub(crate)") && !text.contains("pub(super)") {
+                if text.contains("pub")
+                    && !text.contains("pub(crate)")
+                    && !text.contains("pub(super)")
+                {
                     return Visibility::Public;
                 } else if text.contains("pub(crate)") || text.contains("pub(super)") {
                     return Visibility::Protected; // Use protected for restricted visibility
@@ -566,8 +586,10 @@ fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> 
     if let Some(sibling) = prev_sibling {
         if sibling.kind() == "line_comment" || sibling.kind() == "block_comment" {
             if let Ok(text) = sibling.utf8_text(source) {
-                let is_doc = text.starts_with("///") || text.starts_with("//!")
-                    || text.starts_with("/**") || text.starts_with("/*!");
+                let is_doc = text.starts_with("///")
+                    || text.starts_with("//!")
+                    || text.starts_with("/**")
+                    || text.starts_with("/*!");
                 if is_doc {
                     return Some(
                         text.trim()
@@ -664,10 +686,7 @@ impl<'a> CfgBuilder<'a> {
             "if_expression" | "if_let_expression" => {
                 self.handle_if_statement(node, current_block)?;
             }
-            "while_expression"
-            | "while_let_expression"
-            | "for_expression"
-            | "loop_expression" => {
+            "while_expression" | "while_let_expression" | "for_expression" | "loop_expression" => {
                 self.handle_loop_statement(node, current_block)?;
             }
             "match_expression" => {
@@ -688,7 +707,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_if_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_if_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let true_block = self.create_block();
         let false_block = self.create_block();
         let merge_block = self.create_block();
@@ -717,7 +740,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_loop_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_loop_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let body_block = self.create_block();
 
         self.edges.push(Edge {
@@ -734,7 +761,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_match_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_match_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let merge_block = self.create_block();
 
         // Create a block for each match arm
@@ -1005,7 +1036,9 @@ fn main() {}";
 }";
 
         let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_rust::LANGUAGE.into()).unwrap();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let root = tree.root_node();
 

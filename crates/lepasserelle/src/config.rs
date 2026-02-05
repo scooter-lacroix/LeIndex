@@ -5,15 +5,14 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::Path;
 use std::fs;
+use std::path::Path;
 
 /// Default configuration file name
 pub const DEFAULT_CONFIG_FILE: &str = ".leindex/config.toml";
 
 /// Project configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProjectConfig {
     /// Language filtering settings
     pub languages: LanguageConfig,
@@ -30,7 +29,6 @@ pub struct ProjectConfig {
     /// Memory management settings
     pub memory: MemoryConfig,
 }
-
 
 impl ProjectConfig {
     /// Load configuration from a directory
@@ -81,8 +79,8 @@ impl ProjectConfig {
 
         let config_path = config_dir.join("config.toml");
 
-        let toml_string = toml::to_string_pretty(self)
-            .context("Failed to serialize configuration")?;
+        let toml_string =
+            toml::to_string_pretty(self).context("Failed to serialize configuration")?;
 
         fs::write(&config_path, toml_string)
             .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
@@ -173,9 +171,9 @@ impl LanguageConfig {
 
         // All supported extensions
         let all_extensions = [
-            "rs", "py", "js", "ts", "tsx", "jsx",  // Main languages
-            "go", "java", "cpp", "c", "h", "hpp",    // Systems languages
-            "rb", "php", "lua", "scala",             // Scripting languages
+            "rs", "py", "js", "ts", "tsx", "jsx", // Main languages
+            "go", "java", "cpp", "c", "h", "hpp", // Systems languages
+            "rb", "php", "lua", "scala", // Scripting languages
         ];
 
         if self.enable_all {
@@ -261,13 +259,10 @@ impl Default for ExclusionConfig {
             file_patterns: vec![
                 "*.min.js".into(),
                 "*.min.css".into(),
-                "*.pb.go".into(),  // Generated protobuf files
+                "*.pb.go".into(), // Generated protobuf files
                 "*.generated.rs".into(),
             ],
-            path_patterns: vec![
-                "*/target/*".into(),
-                "*/node_modules/*".into(),
-            ],
+            path_patterns: vec!["*/target/*".into(), "*/node_modules/*".into()],
         }
     }
 }
@@ -313,7 +308,9 @@ pub struct StringPattern {
 
 impl From<&str> for StringPattern {
     fn from(s: &str) -> Self {
-        Self { pattern: s.to_string() }
+        Self {
+            pattern: s.to_string(),
+        }
     }
 }
 

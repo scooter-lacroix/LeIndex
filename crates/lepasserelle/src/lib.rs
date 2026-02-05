@@ -92,13 +92,15 @@ pub mod memory;
 pub mod mcp;
 
 pub use cli::{Cli, Commands};
-pub use config::{ProjectConfig, LanguageConfig, TokenConfig, StorageConfig};
-pub use errors::{LeIndexError, Result as LeIndexResult, RecoveryStrategy, ErrorContext};
-pub use leindex::{LeIndex, IndexStats, AnalysisResult as LeIndexAnalysisResult, Diagnostics};
-pub use memory::{MemoryManager, MemoryConfig as MemoryManagementConfig};
+pub use config::{LanguageConfig, ProjectConfig, StorageConfig, TokenConfig};
+pub use errors::{ErrorContext, LeIndexError, RecoveryStrategy, Result as LeIndexResult};
+pub use leindex::{AnalysisResult as LeIndexAnalysisResult, Diagnostics, IndexStats, LeIndex};
+pub use memory::{MemoryConfig as MemoryManagementConfig, MemoryManager};
 
 #[cfg(feature = "mcp-server")]
-pub use mcp::{McpServer, McpServerConfig, JsonRpcRequest, JsonRpcResponse, JsonRpcError, error_codes};
+pub use mcp::{
+    error_codes, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpServer, McpServerConfig,
+};
 
 /// Library initialization
 pub fn init() {

@@ -81,16 +81,11 @@ use std::collections::{HashMap, HashSet};
 /// - **Default Metadata**: byte_range and complexity use estimated values
 pub fn extract_pdg_from_signatures(
     signatures: Vec<SignatureInfo>,
-    _source_code: &[u8],
+    source_code: &[u8],
     file_path: &str,
     language: &str,
 ) -> ProgramDependenceGraph {
     let mut pdg = ProgramDependenceGraph::new();
-
-    // Return empty PDG for empty input (graceful degradation)
-    if signatures.is_empty() {
-        return pdg;
-    }
 
     // Track node IDs for edge creation
     let mut node_ids: HashMap<String, crate::pdg::NodeId> = HashMap::new();
@@ -123,7 +118,33 @@ pub fn extract_pdg_from_signatures(
     let call_edges = extract_call_edges(&signatures, &node_ids);
     pdg.add_call_graph_edges(call_edges);
 
+    // Phase 5: Extract and add import edges (with external module fallback)
+    let import_edges = extract_import_edges(
+        &signatures,
+        &node_ids,
+        &mut pdg,
+        file_path,
+        language,
+        source_code,
+    );
+    pdg.add_import_edges(import_edges);
+
     pdg
+}
+
+/// Normalize symbols/import paths into a dotted comparable form used by extraction and relinking.
+pub fn normalize_symbol(raw: &str) -> String {
+    let trimmed = raw.split('(').next().unwrap_or(raw).trim();
+    trimmed
+        .replace("?.", ".")
+        .replace("::", ".")
+        .replace("->", ".")
+        .replace('\\', ".")
+        .replace('/', ".")
+        .replace(':', ".")
+        .replace("..", ".")
+        .trim_matches('.')
+        .to_string()
 }
 
 /// Extract call edges from signatures
@@ -133,20 +154,6 @@ fn extract_call_edges(
 ) -> Vec<(crate::pdg::NodeId, crate::pdg::NodeId)> {
     let mut edges = Vec::new();
     let mut seen_edges: HashSet<(crate::pdg::NodeId, crate::pdg::NodeId)> = HashSet::new();
-
-    fn normalize_symbol(raw: &str) -> String {
-        let trimmed = raw.split('(').next().unwrap_or(raw).trim();
-        trimmed
-            .replace("?.", ".")
-            .replace("::", ".")
-            .replace("->", ".")
-            .replace('\\', ".")
-            .replace('/', ".")
-            .replace(':', ".")
-            .replace("..", ".")
-            .trim_matches('.')
-            .to_string()
-    }
 
     fn symbol_segments(raw: &str) -> Vec<String> {
         normalize_symbol(raw)
@@ -181,21 +188,21 @@ fn extract_call_edges(
         }
     }
 
-    let imports = signatures
-        .first()
-        .map(|s| s.imports.clone())
-        .unwrap_or_default();
     let mut alias_map: HashMap<String, String> = HashMap::new();
-    for import in &imports {
-        let alias = import.alias.clone().or_else(|| {
-            import
-                .path
-                .split(|c| c == '.' || c == ':' || c == '\\' || c == '/')
-                .last()
-                .map(|s| s.to_string())
-        });
-        if let Some(alias) = alias {
-            alias_map.insert(alias, import.path.clone());
+    for signature in signatures {
+        for import in &signature.imports {
+            let alias = import.alias.clone().or_else(|| {
+                import
+                    .path
+                    .split(|c| c == '.' || c == ':' || c == '\\' || c == '/')
+                    .last()
+                    .map(|s| s.to_string())
+            });
+            if let Some(alias) = alias {
+                alias_map
+                    .entry(alias)
+                    .or_insert_with(|| import.path.clone());
+            }
         }
     }
 
@@ -305,6 +312,237 @@ fn extract_call_edges(
     }
 
     edges
+}
+
+/// Extract import edges from signatures.
+fn extract_import_edges(
+    signatures: &[SignatureInfo],
+    node_ids: &HashMap<String, crate::pdg::NodeId>,
+    pdg: &mut ProgramDependenceGraph,
+    file_path: &str,
+    language: &str,
+    source_code: &[u8],
+) -> Vec<(crate::pdg::NodeId, crate::pdg::NodeId)> {
+    let mut edges = Vec::new();
+    let mut seen_edges: HashSet<(crate::pdg::NodeId, crate::pdg::NodeId)> = HashSet::new();
+
+    let mut unique_import_paths = signatures
+        .iter()
+        .flat_map(|signature| signature.imports.iter().map(|import| import.path.clone()))
+        .collect::<HashSet<_>>();
+
+    unique_import_paths.extend(extract_import_paths_from_source(source_code, language));
+
+    if unique_import_paths.is_empty() {
+        return edges;
+    }
+
+    let importer_module_id = pdg
+        .find_by_symbol(&format!("{}:__module__", file_path))
+        .unwrap_or_else(|| {
+            pdg.add_node(Node {
+                id: format!("{}:__module__", file_path),
+                node_type: NodeType::Module,
+                name: "__module__".to_string(),
+                file_path: file_path.to_string(),
+                byte_range: (0, 0),
+                complexity: 1,
+                language: language.to_string(),
+                embedding: None,
+            })
+        });
+
+    let mut symbol_map: HashMap<String, Vec<crate::pdg::NodeId>> = HashMap::new();
+    for signature in signatures {
+        if let Some(node_id) = node_ids.get(&signature.qualified_name) {
+            let normalized = normalize_import_symbol(&signature.qualified_name);
+            if !normalized.is_empty() {
+                symbol_map
+                    .entry(normalized.clone())
+                    .or_default()
+                    .push(*node_id);
+            }
+
+            if let Some(last) = normalized.split('.').last() {
+                symbol_map
+                    .entry(last.to_string())
+                    .or_default()
+                    .push(*node_id);
+            }
+        }
+    }
+
+    let mut external_nodes: HashMap<String, crate::pdg::NodeId> = HashMap::new();
+
+    for import_path in unique_import_paths {
+        let mut targets = resolve_import_targets(&import_path, &symbol_map);
+
+        if targets.is_empty() {
+            let external_id = external_nodes
+                .entry(import_path.clone())
+                .or_insert_with(|| {
+                    pdg.add_node(Node {
+                        id: format!("{}:__external__:{}", file_path, import_path),
+                        node_type: NodeType::Module,
+                        name: import_path.clone(),
+                        file_path: file_path.to_string(),
+                        byte_range: (0, 0),
+                        complexity: 1,
+                        language: "external".to_string(),
+                        embedding: None,
+                    })
+                });
+            targets.push(*external_id);
+        }
+
+        for target in &targets {
+            if importer_module_id == *target {
+                continue;
+            }
+            if seen_edges.insert((importer_module_id, *target)) {
+                edges.push((importer_module_id, *target));
+            }
+        }
+    }
+
+    edges
+}
+
+fn normalize_import_symbol(raw: &str) -> String {
+    normalize_symbol(raw)
+}
+
+fn resolve_import_targets(
+    import_path: &str,
+    symbol_map: &HashMap<String, Vec<crate::pdg::NodeId>>,
+) -> Vec<crate::pdg::NodeId> {
+    let mut targets = Vec::new();
+    let normalized = normalize_import_symbol(import_path);
+
+    if let Some(ids) = symbol_map.get(&normalized) {
+        targets.extend(ids.iter().copied());
+    }
+
+    if normalized.contains('.') {
+        for suffix in suffix_candidates(&normalized, 3) {
+            if let Some(ids) = symbol_map.get(&suffix) {
+                targets.extend(ids.iter().copied());
+            }
+        }
+    }
+
+    if targets.is_empty() {
+        if let Some(last) = normalized.split('.').last() {
+            if let Some(ids) = symbol_map.get(last) {
+                targets.extend(ids.iter().copied());
+            }
+        }
+    }
+
+    targets.sort_by_key(|id| id.index());
+    targets.dedup();
+    targets
+}
+
+fn suffix_candidates(value: &str, max_len: usize) -> Vec<String> {
+    let segments = value.split('.').collect::<Vec<_>>();
+    let mut out = Vec::new();
+
+    for len in 2..=segments.len().min(max_len) {
+        let start = segments.len() - len;
+        out.push(segments[start..].join("."));
+    }
+
+    out
+}
+
+fn extract_import_paths_from_source(source_code: &[u8], language: &str) -> HashSet<String> {
+    let mut imports = HashSet::new();
+    let Ok(source_text) = std::str::from_utf8(source_code) else {
+        return imports;
+    };
+
+    let lang = language.to_ascii_lowercase();
+
+    for raw_line in source_text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with("//") || line.starts_with('#') {
+            continue;
+        }
+
+        if lang == "python" || lang == "py" {
+            if let Some(rest) = line.strip_prefix("import ") {
+                for segment in rest.split(',') {
+                    let name = segment
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .trim_matches(',');
+                    if !name.is_empty() {
+                        imports.insert(name.to_string());
+                    }
+                }
+            }
+
+            if let Some(rest) = line.strip_prefix("from ") {
+                let module = rest.split(" import ").next().unwrap_or_default().trim();
+                if !module.is_empty() {
+                    imports.insert(module.to_string());
+                }
+            }
+        }
+
+        if (lang == "javascript"
+            || lang == "typescript"
+            || lang == "js"
+            || lang == "ts"
+            || lang == "jsx"
+            || lang == "tsx")
+            && (line.starts_with("import ") || line.starts_with("export "))
+        {
+            if let Some(path) = extract_quoted_path(line) {
+                imports.insert(path);
+            }
+        }
+
+        if (lang == "rust" || lang == "rs") && line.starts_with("use ") {
+            let use_stmt = line.trim_start_matches("use ").trim_end_matches(';').trim();
+            if let Some((base, rest)) = use_stmt.split_once('{') {
+                let base = base.trim().trim_end_matches("::");
+                let members = rest.trim_end_matches('}');
+                for member in members.split(',') {
+                    let member = member.trim();
+                    if member.is_empty() || member == "self" {
+                        continue;
+                    }
+                    imports.insert(format!("{}.{}", base.replace("::", "."), member));
+                }
+            } else if !use_stmt.is_empty() {
+                imports.insert(use_stmt.replace("::", "."));
+            }
+        }
+
+        if (lang == "go" || lang == "golang") && line.starts_with("import") {
+            if let Some(path) = extract_quoted_path(line) {
+                imports.insert(path);
+            }
+        }
+    }
+
+    imports
+}
+
+fn extract_quoted_path(line: &str) -> Option<String> {
+    let first_quote = line.find(['\'', '"'])?;
+    let quote = line.chars().nth(first_quote)?;
+    let remaining = &line[first_quote + 1..];
+    let second = remaining.find(quote)?;
+    let path = remaining[..second].trim();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
 }
 
 /// Convert a SignatureInfo to a PDG Node
@@ -874,5 +1112,161 @@ mod tests {
 
         // ClassC shares no methods with ClassA
         assert!(!classes_share_methods(&class_methods, "ClassA", "ClassC"));
+    }
+
+    #[test]
+    fn test_extract_import_edges_local_resolution() {
+        let mut signatures = vec![
+            create_test_signature("main", "pkg::main", vec![], false),
+            create_test_signature("helper", "pkg::helper", vec![], false),
+        ];
+        signatures[0].imports.push(leparse::prelude::ImportInfo {
+            path: "pkg.helper".to_string(),
+            alias: None,
+        });
+
+        let pdg = extract_pdg_from_signatures(signatures, b"", "src/main.rs", "rust");
+
+        let import_edges = pdg
+            .edge_indices()
+            .filter_map(|idx| pdg.get_edge(idx))
+            .filter(|edge| edge.edge_type == crate::pdg::EdgeType::Import)
+            .count();
+
+        assert!(import_edges >= 1, "expected at least one import edge");
+    }
+
+    #[test]
+    fn test_import_edges_are_anchored_to_file_module_node() {
+        let mut signatures = vec![
+            create_test_signature("main", "pkg::main", vec![], false),
+            create_test_signature("helper", "pkg::helper", vec![], false),
+        ];
+        signatures[0].imports.push(leparse::prelude::ImportInfo {
+            path: "pkg.helper".to_string(),
+            alias: None,
+        });
+
+        let pdg = extract_pdg_from_signatures(signatures, b"", "src/main.rs", "rust");
+
+        let module_node = pdg
+            .node_indices()
+            .find(|&idx| {
+                pdg.get_node(idx)
+                    .map(|node| {
+                        node.node_type == NodeType::Module
+                            && node.file_path == "src/main.rs"
+                            && node.language == "rust"
+                    })
+                    .unwrap_or(false)
+            })
+            .expect("expected module-level importer node");
+
+        let mut module_import_edges = 0usize;
+        let mut non_module_import_edges = 0usize;
+
+        for edge_idx in pdg.edge_indices() {
+            let Some(edge) = pdg.get_edge(edge_idx) else {
+                continue;
+            };
+            if edge.edge_type != crate::pdg::EdgeType::Import {
+                continue;
+            }
+
+            let Some((from, _)) = pdg.edge_endpoints(edge_idx) else {
+                continue;
+            };
+
+            if from == module_node {
+                module_import_edges += 1;
+            } else {
+                non_module_import_edges += 1;
+            }
+        }
+
+        assert!(
+            module_import_edges >= 1,
+            "expected import edge from module node"
+        );
+        assert_eq!(
+            non_module_import_edges, 0,
+            "function/method nodes should not be direct import sources"
+        );
+    }
+
+    #[test]
+    fn test_extract_import_edges_external_fallback() {
+        let mut signatures = vec![create_test_signature("run", "pkg::run", vec![], false)];
+        signatures[0].imports.push(leparse::prelude::ImportInfo {
+            path: "third.party.lib".to_string(),
+            alias: None,
+        });
+
+        let pdg = extract_pdg_from_signatures(signatures, b"", "src/run.rs", "rust");
+
+        let external_module_exists = pdg.node_indices().any(|idx| {
+            pdg.get_node(idx)
+                .map(|n| n.node_type == NodeType::Module && n.language == "external")
+                .unwrap_or(false)
+        });
+
+        let import_edges = pdg
+            .edge_indices()
+            .filter_map(|idx| pdg.get_edge(idx))
+            .filter(|edge| edge.edge_type == crate::pdg::EdgeType::Import)
+            .count();
+
+        assert!(
+            external_module_exists,
+            "expected synthetic external module node"
+        );
+        assert!(import_edges >= 1, "expected import edge to external module");
+    }
+
+    #[test]
+    fn test_empty_signatures_can_still_emit_import_edges_from_source() {
+        let source = b"import third.party\n";
+        let pdg = extract_pdg_from_signatures(vec![], source, "src/__init__.py", "python");
+
+        let import_edges = pdg
+            .edge_indices()
+            .filter_map(|idx| pdg.get_edge(idx))
+            .filter(|edge| edge.edge_type == crate::pdg::EdgeType::Import)
+            .count();
+
+        let has_module_anchor = pdg.find_by_symbol("src/__init__.py:__module__").is_some();
+
+        assert!(has_module_anchor, "expected module anchor node");
+        assert!(
+            import_edges >= 1,
+            "expected import edge for empty-signature import-only file"
+        );
+    }
+
+    #[test]
+    fn test_call_alias_resolution_unions_imports_from_all_signatures() {
+        let mut first = create_test_signature("first", "pkg::first", vec![], false);
+        first.calls.push("alias.run".to_string());
+
+        let mut second = create_test_signature("run", "real::module::run", vec![], false);
+        second.imports.push(leparse::prelude::ImportInfo {
+            path: "real.module".to_string(),
+            alias: Some("alias".to_string()),
+        });
+
+        let pdg = extract_pdg_from_signatures(vec![first, second], b"", "src/main.rs", "rust");
+
+        let call_edges = pdg
+            .edge_indices()
+            .filter_map(|idx| {
+                let edge = pdg.get_edge(idx)?;
+                (edge.edge_type == crate::pdg::EdgeType::Call).then_some(idx)
+            })
+            .count();
+
+        assert!(
+            call_edges >= 1,
+            "expected alias-based call edge even when alias is only present in non-first signature"
+        );
     }
 }

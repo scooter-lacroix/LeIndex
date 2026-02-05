@@ -197,16 +197,46 @@ function Test-Installation {
 
     try {
         $versionOutput = & $binary --version 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            Write-Success "Installation verified: $versionOutput"
-            return $true
+        if ($LASTEXITCODE -ne 0) {
+            Write-ErrorLog "Installation verification failed"
+            return $false
         }
+
+        Write-Success "Binary check passed: $versionOutput"
+
+        & $binary phase --help *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Write-ErrorLog "Installed binary does not expose 'phase' command"
+            return $false
+        }
+        Write-Success "Phase command detected"
+
+        & $binary mcp --help *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Write-ErrorLog "Installed binary does not expose 'mcp' command"
+            return $false
+        }
+        Write-Success "MCP command detected"
+
+        $tmpProject = Join-Path $env:TEMP ("leindex-smoke-" + [guid]::NewGuid().ToString())
+        $tmpSrc = Join-Path $tmpProject "src"
+        New-Item -ItemType Directory -Path $tmpSrc -Force | Out-Null
+        Set-Content -Path (Join-Path $tmpSrc "lib.rs") -Value "pub fn installer_smoke()->i32{1}`n"
+
+        & $binary phase --phase 1 --path $tmpProject --max-files 10 --max-chars 800 *> $null
+        if ($LASTEXITCODE -ne 0) {
+            Write-ErrorLog "Phase-analysis smoke test failed"
+            Remove-Item -Path $tmpProject -Recurse -Force -ErrorAction SilentlyContinue
+            return $false
+        }
+
+        Remove-Item -Path $tmpProject -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Success "Installation verified with feature smoke checks"
+        return $true
     } catch {
         Write-ErrorLog "Installation verification failed"
         return $false
     }
-
-    return $false
 }
 
 function Initialize-Directories {

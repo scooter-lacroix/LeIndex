@@ -1,7 +1,9 @@
 // JavaScript and TypeScript language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
 use tree_sitter::Parser;
 
 /// JavaScript language parser with full CodeIntelligence implementation
@@ -66,7 +68,11 @@ impl JavaScriptParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),   calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                        });
 
                         let mut cursor = node.walk();
                         for child in node.children(&mut cursor) {
@@ -225,9 +231,7 @@ impl TypeScriptParser {
             parent_path: &[String],
         ) {
             match node.kind() {
-                "function_declaration"
-                | "method_definition"
-                | "generator_function_declaration" => {
+                "function_declaration" | "method_definition" | "generator_function_declaration" => {
                     if let Some(sig) = extract_ts_function_signature(node, source, parent_path) {
                         signatures.push(sig);
                     }
@@ -256,7 +260,11 @@ impl TypeScriptParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),   calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                        });
                     }
 
                     let mut cursor = node.walk();
@@ -286,7 +294,11 @@ impl TypeScriptParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),   calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                        });
 
                         let mut cursor = node.walk();
                         for child in node.children(&mut cursor) {
@@ -428,14 +440,21 @@ fn extract_js_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo>
                         add_import(imports, &path, Some(alias.trim().to_string()));
                     } else {
                         let path = format!("{}.{}", module, part);
-                        add_import(imports, &path, part.split('.').last().map(|s| s.to_string()));
+                        add_import(
+                            imports,
+                            &path,
+                            part.split('.').last().map(|s| s.to_string()),
+                        );
                     }
                 }
                 return;
             }
 
             // default import (possibly with named imports after comma)
-            let mut parts = clause.split(',').map(|s| s.trim()).filter(|s| !s.is_empty());
+            let mut parts = clause
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
             if let Some(default) = parts.next() {
                 if !module.is_empty() {
                     add_import(imports, module, Some(default.to_string()));
@@ -454,7 +473,11 @@ fn extract_js_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo>
                             add_import(imports, &path, Some(alias.trim().to_string()));
                         } else {
                             let path = format!("{}.{}", module, part);
-                            add_import(imports, &path, part.split('.').last().map(|s| s.to_string()));
+                            add_import(
+                                imports,
+                                &path,
+                                part.split('.').last().map(|s| s.to_string()),
+                            );
                         }
                     }
                 }
@@ -516,8 +539,9 @@ fn extract_function_signature(
         is_method,
         docstring: extract_docstring(node, source),
         calls,
-        
-        imports: vec![], byte_range: (node.start_byte(), node.end_byte())
+
+        imports: vec![],
+        byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 
@@ -564,8 +588,9 @@ fn extract_ts_function_signature(
         is_method,
         docstring: extract_docstring(node, source),
         calls,
-        
-        imports: vec![], byte_range: (node.start_byte(), node.end_byte())
+
+        imports: vec![],
+        byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 
@@ -585,10 +610,12 @@ fn extract_js_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     fn extract_callee(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
         match node.kind() {
             "member_expression" | "optional_member_expression" => {
-                let object = node.child_by_field_name("object")
+                let object = node
+                    .child_by_field_name("object")
                     .and_then(|n| n.utf8_text(source).ok())
                     .map(|s| clean_call_text(s));
-                let property = node.child_by_field_name("property")
+                let property = node
+                    .child_by_field_name("property")
                     .or_else(|| node.child_by_field_name("name"))
                     .and_then(|n| n.utf8_text(source).ok())
                     .map(|s| clean_call_text(s));
@@ -697,7 +724,8 @@ fn extract_ts_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Paramet
                     // If no name field found, look for identifier child
                     let param_name = if param_name.is_none() {
                         let mut ccursor = child.walk();
-                        let result = child.children(&mut ccursor)
+                        let result = child
+                            .children(&mut ccursor)
                             .find(|c| c.kind() == "identifier")
                             .and_then(|c| c.utf8_text(source).ok())
                             .map(|s| s.to_string());
@@ -728,7 +756,8 @@ fn extract_ts_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Paramet
                     // If no name field found, look for identifier child
                     let param_name = if param_name.is_none() {
                         let mut ccursor = child.walk();
-                        let result = child.children(&mut ccursor)
+                        let result = child
+                            .children(&mut ccursor)
                             .find(|c| c.kind() == "identifier")
                             .and_then(|c| c.utf8_text(source).ok())
                             .map(|s| s.to_string());
@@ -823,14 +852,8 @@ fn calculate_complexity(node: &tree_sitter::Node, metrics: &mut ComplexityMetric
     metrics.line_count = std::cmp::max(metrics.line_count, 1);
 
     match node.kind() {
-        "if_statement"
-        | "while_statement"
-        | "for_statement"
-        | "for_in_statement"
-        | "for_of_statement"
-        | "try_statement"
-        | "switch_statement"
-        | "catch_clause" => {
+        "if_statement" | "while_statement" | "for_statement" | "for_in_statement"
+        | "for_of_statement" | "try_statement" | "switch_statement" | "catch_clause" => {
             metrics.cyclomatic += 1;
         }
         "else" | "case" => {
@@ -901,7 +924,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_if_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_if_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let true_block = self.create_block();
         let false_block = self.create_block();
         let merge_block = self.create_block();
@@ -951,7 +978,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_try_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_try_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let try_block = self.create_block();
         let catch_block = self.create_block();
         let finally_block = self.create_block();

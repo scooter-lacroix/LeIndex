@@ -1,7 +1,9 @@
 // Java language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
 use tree_sitter::Parser;
 
 /// Java language parser with full CodeIntelligence implementation
@@ -64,7 +66,11 @@ impl JavaParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                        });
                     }
 
                     // Recurse to extract class methods
@@ -92,7 +98,11 @@ impl JavaParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                        });
                     }
 
                     // Recurse to extract interface methods
@@ -120,7 +130,11 @@ impl JavaParser {
                             visibility: extract_visibility(node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                        });
                     }
                 }
                 "field_declaration" => {
@@ -146,7 +160,11 @@ impl JavaParser {
                                     visibility: extract_visibility(node, source),
                                     is_async: false,
                                     is_method: false,
-                                    docstring: None,  calls: vec![], imports: vec![],  byte_range: (0, 0) });
+                                    docstring: None,
+                                    calls: vec![],
+                                    imports: vec![],
+                                    byte_range: (0, 0),
+                                });
                             }
                         }
                     }
@@ -248,7 +266,9 @@ fn extract_java_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInf
         if node.kind() == "import_declaration" {
             if let Ok(text) = node.utf8_text(source) {
                 let text = text.trim().trim_end_matches(';').trim();
-                let text = text.trim_start_matches("import ").trim_start_matches("static ");
+                let text = text
+                    .trim_start_matches("import ")
+                    .trim_start_matches("static ");
                 let alias = text.split('.').last().map(|s| s.to_string());
                 add_import(imports, text, alias);
             }
@@ -301,8 +321,9 @@ fn extract_method_signature(
         is_method: true,
         docstring: extract_docstring(node, source),
         calls,
-        
-        imports: vec![], byte_range: (node.start_byte(), node.end_byte())
+
+        imports: vec![],
+        byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 
@@ -338,8 +359,9 @@ fn extract_constructor_signature(
         is_method: true,
         docstring: extract_docstring(node, source),
         calls,
-        
-        imports: vec![], byte_range: (node.start_byte(), node.end_byte())
+
+        imports: vec![],
+        byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 
@@ -348,28 +370,30 @@ fn extract_java_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
 
     fn clean_call_text(raw: &str) -> String {
-        raw.split('(')
-            .next()
-            .unwrap_or(raw)
-            .trim()
-            .to_string()
+        raw.split('(').next().unwrap_or(raw).trim().to_string()
     }
 
     fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
         match node.kind() {
             "method_invocation" => {
-                let object = node.child_by_field_name("object")
+                let object = node
+                    .child_by_field_name("object")
                     .or_else(|| node.child_by_field_name("scope"))
                     .and_then(|n| n.utf8_text(source).ok())
                     .map(|s| clean_call_text(s));
-                let name = node.child_by_field_name("name")
+                let name = node
+                    .child_by_field_name("name")
                     .and_then(|n| n.utf8_text(source).ok())
                     .map(|s| clean_call_text(s));
 
                 let call_name = match (object, name) {
                     (Some(obj), Some(method)) => format!("{}.{}", obj, method),
                     (_, Some(method)) => method,
-                    _ => node.utf8_text(source).ok().map(|s| clean_call_text(s)).unwrap_or_default(),
+                    _ => node
+                        .utf8_text(source)
+                        .ok()
+                        .map(|s| clean_call_text(s))
+                        .unwrap_or_default(),
                 };
 
                 if !call_name.is_empty() {
@@ -585,7 +609,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_if_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_if_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let true_block = self.create_block();
         let false_block = self.create_block();
         let merge_block = self.create_block();
@@ -614,7 +642,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_loop_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_loop_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let body_block = self.create_block();
 
         self.edges.push(Edge {
@@ -631,7 +663,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_switch_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_switch_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let merge_block = self.create_block();
 
         let mut cursor = _node.walk();
@@ -812,7 +848,9 @@ mod tests {
 }";
 
         let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_java::LANGUAGE.into()).unwrap();
+        parser
+            .set_language(&tree_sitter_java::LANGUAGE.into())
+            .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let root = tree.root_node();
 

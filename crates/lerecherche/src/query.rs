@@ -91,12 +91,11 @@ static COMPLEXITY_PATTERN: Lazy<Regex> = Lazy::new(|| {
 /// Using a static array instead of HashSet for better performance and memory efficiency.
 static STOP_WORDS: Lazy<HashSet<&'static str>> = Lazy::new(|| {
     [
-        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for",
-        "of", "with", "by", "from", "as", "is", "was", "are", "were", "been",
-        "be", "have", "has", "had", "do", "does", "did", "will", "would",
-        "could", "should", "may", "might", "must", "shall", "can", "need",
-        "show", "me", "tell", "explain", "describe", "how", "what", "where",
-        "when", "why", "which", "that", "this", "these", "those",
+        "the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
+        "from", "as", "is", "was", "are", "were", "been", "be", "have", "has", "had", "do", "does",
+        "did", "will", "would", "could", "should", "may", "might", "must", "shall", "can", "need",
+        "show", "me", "tell", "explain", "describe", "how", "what", "where", "when", "why",
+        "which", "that", "this", "these", "those",
     ]
     .iter()
     .cloned()
@@ -276,10 +275,7 @@ impl QueryParser {
         let query_type = self.classify_query(&intent);
 
         // Step 7: Determine if we should expand context
-        let expand_context = matches!(
-            intent,
-            QueryIntent::HowWorks | QueryIntent::WhereHandled
-        );
+        let expand_context = matches!(intent, QueryIntent::HowWorks | QueryIntent::WhereHandled);
 
         // Step 8: Set token budget for context expansion
         let token_budget = if expand_context {
@@ -399,9 +395,12 @@ impl QueryParser {
 
         // Check if query contains question words (likely semantic)
         let query_lower = query.to_lowercase();
-        if query_lower.contains("how") || query_lower.contains("what")
-            || query_lower.contains("why") || query_lower.contains("where")
-            || query_lower.contains("when") || query_lower.contains("which")
+        if query_lower.contains("how")
+            || query_lower.contains("what")
+            || query_lower.contains("why")
+            || query_lower.contains("where")
+            || query_lower.contains("when")
+            || query_lower.contains("which")
         {
             return QueryIntent::Semantic;
         }
@@ -500,7 +499,10 @@ impl QueryParser {
     fn tokenize(&self, text: &str) -> Vec<String> {
         text.split_whitespace()
             .map(|s| s.to_lowercase())
-            .map(|s| s.trim_end_matches(|c: char| !c.is_alphanumeric()).to_string())
+            .map(|s| {
+                s.trim_end_matches(|c: char| !c.is_alphanumeric())
+                    .to_string()
+            })
             .filter(|s| s.len() >= 3)
             .collect()
     }
@@ -663,7 +665,9 @@ mod tests {
     #[test]
     fn test_parse_how_works_query() {
         let parser = QueryParser::new().unwrap();
-        let parsed = parser.parse("show me how authentication works", 10).unwrap();
+        let parsed = parser
+            .parse("show me how authentication works", 10)
+            .unwrap();
 
         assert_eq!(parsed.intent, QueryIntent::HowWorks);
         assert_eq!(parsed.query_type, QueryType::Semantic);
@@ -747,7 +751,9 @@ mod tests {
     #[test]
     fn test_stop_words_filtering() {
         let parser = QueryParser::new().unwrap();
-        let parsed = parser.parse("show me how the authentication system works", 10).unwrap();
+        let parsed = parser
+            .parse("show me how the authentication system works", 10)
+            .unwrap();
 
         // Should not contain stop words like "show", "me", "the"
         assert!(!parsed.terms.contains(&"show".to_string()));
@@ -863,7 +869,10 @@ mod tests {
         // Verify that regex patterns are pre-compiled
         let addr1 = &*HOW_WORKS_PATTERN as *const _ as usize;
         let addr2 = &*HOW_WORKS_PATTERN as *const _ as usize;
-        assert_eq!(addr1, addr2, "HOW_WORKS_PATTERN should be statically allocated");
+        assert_eq!(
+            addr1, addr2,
+            "HOW_WORKS_PATTERN should be statically allocated"
+        );
     }
 
     // ===== Edge Case Tests =====
@@ -889,21 +898,27 @@ mod tests {
     #[test]
     fn test_mixed_case_normalization() {
         let parser = QueryParser::new().unwrap();
-        let parsed = parser.parse("SHOW ME How AUTHENTICATION Works", 10).unwrap();
+        let parsed = parser
+            .parse("SHOW ME How AUTHENTICATION Works", 10)
+            .unwrap();
         assert!(parsed.terms.contains(&"authentication".to_string()));
     }
 
     #[test]
     fn test_multiple_spaces() {
         let parser = QueryParser::new().unwrap();
-        let parsed = parser.parse("show    me    how    authentication    works", 10).unwrap();
+        let parsed = parser
+            .parse("show    me    how    authentication    works", 10)
+            .unwrap();
         assert!(parsed.terms.contains(&"authentication".to_string()));
     }
 
     #[test]
     fn test_trailing_punctuation() {
         let parser = QueryParser::new().unwrap();
-        let parsed = parser.parse("show me how authentication works.", 10).unwrap();
+        let parsed = parser
+            .parse("show me how authentication works.", 10)
+            .unwrap();
         assert!(parsed.terms.contains(&"authentication".to_string()));
     }
 }

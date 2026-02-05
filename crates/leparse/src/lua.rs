@@ -1,27 +1,35 @@
 // Lua language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
 use tree_sitter::Parser;
 
 /// Lua language parser with full CodeIntelligence implementation
 pub struct LuaParser;
 
 impl Default for LuaParser {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LuaParser {
     /// Create a new instance of the Lua parser.
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl CodeIntelligence for LuaParser {
     fn get_signatures(&self, source: &[u8]) -> Result<Vec<SignatureInfo>> {
         let mut parser = Parser::new();
-        parser.set_language(&crate::traits::languages::lua::language())
+        parser
+            .set_language(&crate::traits::languages::lua::language())
             .map_err(|e| Error::ParseFailed(e.to_string()))?;
-        let tree = parser.parse(source, None)
+        let tree = parser
+            .parse(source, None)
             .ok_or_else(|| Error::ParseFailed("Failed to parse Lua source".to_string()))?;
         let root_node = tree.root_node();
         let imports = extract_lua_imports(root_node, source);
@@ -35,9 +43,11 @@ impl CodeIntelligence for LuaParser {
 
     fn compute_cfg(&self, source: &[u8], node_id: usize) -> Result<Graph<Block, Edge>> {
         let mut parser = Parser::new();
-        parser.set_language(&crate::traits::languages::lua::language())
+        parser
+            .set_language(&crate::traits::languages::lua::language())
             .map_err(|e| Error::ParseFailed(e.to_string()))?;
-        let tree = parser.parse(source, None)
+        let tree = parser
+            .parse(source, None)
             .ok_or_else(|| Error::ParseFailed("Failed to parse Lua source".to_string()))?;
 
         let root_node = tree.root_node();
@@ -70,7 +80,8 @@ fn visit(
     match node.kind() {
         "function_declaration" => {
             // Lua function name is in an identifier child, not a "name" field
-            let name = node.children(&mut node.walk())
+            let name = node
+                .children(&mut node.walk())
                 .find(|c| c.kind() == "identifier")
                 .and_then(|n| n.utf8_text(source).ok())
                 .map(|s| s.to_string());
@@ -99,8 +110,9 @@ fn visit(
                     is_method: !parent_path.is_empty(),
                     docstring: extract_docstring(node, source),
                     calls,
-                    
-        imports: vec![], byte_range: (0, 0)
+
+                    imports: vec![],
+                    byte_range: (0, 0),
                 });
             }
         }
@@ -130,9 +142,11 @@ fn extract_lua_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo
 
     fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
         if node.kind() == "function_call" || node.kind() == "method_call" {
-            if let Some(name) = node.child_by_field_name("name")
+            if let Some(name) = node
+                .child_by_field_name("name")
                 .or_else(|| node.child_by_field_name("function"))
-                .and_then(|n| n.utf8_text(source).ok()) {
+                .and_then(|n| n.utf8_text(source).ok())
+            {
                 if name == "require" {
                     if let Some(args) = node.child_by_field_name("arguments") {
                         if let Ok(text) = args.utf8_text(source) {
@@ -158,18 +172,16 @@ fn extract_lua_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
 
     fn clean_call_text(raw: &str) -> String {
-        raw.split('(')
-            .next()
-            .unwrap_or(raw)
-            .trim()
-            .to_string()
+        raw.split('(').next().unwrap_or(raw).trim().to_string()
     }
 
     fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
         match node.kind() {
             "function_call" | "method_call" => {
-                if let Some(func) = node.child_by_field_name("name")
-                    .or_else(|| node.child_by_field_name("function")) {
+                if let Some(func) = node
+                    .child_by_field_name("name")
+                    .or_else(|| node.child_by_field_name("function"))
+                {
                     if let Ok(text) = func.utf8_text(source) {
                         let name = clean_call_text(text);
                         if !name.is_empty() {
@@ -261,11 +273,7 @@ fn calculate_complexity(node: &tree_sitter::Node, metrics: &mut ComplexityMetric
 
     // Count control flow structures (increase cyclomatic complexity)
     match node.kind() {
-        "if_statement"
-        | "while_statement"
-        | "for_statement"
-        | "repeat_statement"
-        | "elseif" => {
+        "if_statement" | "while_statement" | "for_statement" | "repeat_statement" | "elseif" => {
             metrics.cyclomatic += 1;
         }
         _ => {}
@@ -305,7 +313,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn build_cfg_recursive(&mut self, node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn build_cfg_recursive(
+        &mut self,
+        node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         match node.kind() {
             "if_statement" => {
                 self.handle_if_statement(node, current_block)?;
@@ -336,7 +348,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_if_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_if_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let true_block = self.create_block();
         let false_block = self.create_block();
         let merge_block = self.create_block();
@@ -365,7 +381,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_while_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_while_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let body_block = self.create_block();
 
         self.edges.push(Edge {
@@ -382,7 +402,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_for_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_for_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let body_block = self.create_block();
 
         self.edges.push(Edge {
@@ -399,7 +423,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_repeat_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_repeat_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let body_block = self.create_block();
 
         self.edges.push(Edge {
@@ -471,7 +499,9 @@ function complex(x)
     return x
 end";
         let mut parser = Parser::new();
-        parser.set_language(&crate::traits::languages::lua::language()).unwrap();
+        parser
+            .set_language(&crate::traits::languages::lua::language())
+            .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let root = tree.root_node();
 

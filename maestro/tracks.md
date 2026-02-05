@@ -179,6 +179,44 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
+## [ ] Track: lephase - 5-Phase Analysis System Integration 🆕 NEW
+*Link: [./maestro/tracks/lephase_5phase_20260205/](./maestro/tracks/lephase_5phase_20260205/)*
+
+**Description:** Integrate Maestro's 5-phase code analysis system into LeIndexer as a new `lephase` crate, leveraging LeIndexer's superior parsing infrastructure while adopting Maestro's token-efficient, LLM-oriented output architecture.
+
+**Status:** NOT STARTED
+
+**Created:** 2026-02-05
+
+**Type:** Feature Track (New Crate)
+
+**Parent Track:** `leindex_rust_refactor_20250125`
+
+**Phases:**
+1. Foundation - Crate Setup (4 tasks)
+2. Core Phases 1-3 (5 tasks)
+3. Core Phases 4-5 (4 tasks)
+4. CLI Integration (4 tasks)
+5. MCP Server Integration (3 tasks)
+6. Orchestration Engine (5 tasks)
+7. Testing & Polish (3 tasks)
+
+**Key Deliverables:**
+- New `crates/lephase/` crate with 5-phase analysis
+- TokenFormatter with Ultra/Balanced/Verbose modes
+- CLI commands: `leindex phase1-5`, `leindex analyze`
+- MCP tool: `phase_analysis`
+- Orchestration engine with GravityTraversal context
+
+**Reference Documents:**
+- [Integration Plan](../docs/5PHASE_INTEGRATION_PLAN.md)
+- [Spec](./maestro/tracks/lephase_5phase_20260205/spec.md)
+- [Plan](./maestro/tracks/lephase_5phase_20260205/plan.md)
+
+**Estimated Duration:** 9 weeks
+
+---
+
 ## [~] Track: LeIndex Rust Renaissance 🦀 MASTER TRACK
 *Link: [./maestro/tracks/leindex_rust_refactor_20250125/](./maestro/tracks/leindex_rust_refactor_20250125/)*
 

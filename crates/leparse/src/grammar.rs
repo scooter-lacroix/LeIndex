@@ -48,9 +48,9 @@ impl GrammarCache {
     {
         // Try to read from cache first (optimistic read path)
         {
-            let read_guard = self.grammars
-                .read()
-                .map_err(|e| crate::traits::Error::ParseFailed(format!("Cache lock poisoned: {}", e)))?;
+            let read_guard = self.grammars.read().map_err(|e| {
+                crate::traits::Error::ParseFailed(format!("Cache lock poisoned: {}", e))
+            })?;
 
             // Ensure the vector is large enough
             if read_guard.len() > index {
@@ -61,9 +61,9 @@ impl GrammarCache {
         }
 
         // Need to load the grammar (write path)
-        let mut write_guard = self.grammars
-            .write()
-            .map_err(|e| crate::traits::Error::ParseFailed(format!("Cache lock poisoned: {}", e)))?;
+        let mut write_guard = self.grammars.write().map_err(|e| {
+            crate::traits::Error::ParseFailed(format!("Cache lock poisoned: {}", e))
+        })?;
 
         // Double-check: another thread might have loaded it while we waited
         if write_guard.len() > index {
@@ -79,7 +79,9 @@ impl GrammarCache {
 
         // Load and cache the grammar
         let language = loader();
-        let entry = GrammarCacheEntry { language: language.clone() };
+        let entry = GrammarCacheEntry {
+            language: language.clone(),
+        };
         write_guard[index] = Some(entry);
 
         Ok(language)
@@ -279,8 +281,14 @@ mod tests {
     #[test]
     fn test_language_id_from_extension() {
         assert_eq!(LanguageId::from_extension("py"), Some(LanguageId::Python));
-        assert_eq!(LanguageId::from_extension("js"), Some(LanguageId::JavaScript));
-        assert_eq!(LanguageId::from_extension("jsx"), Some(LanguageId::JavaScript));
+        assert_eq!(
+            LanguageId::from_extension("js"),
+            Some(LanguageId::JavaScript)
+        );
+        assert_eq!(
+            LanguageId::from_extension("jsx"),
+            Some(LanguageId::JavaScript)
+        );
         assert_eq!(LanguageId::from_extension("rs"), Some(LanguageId::Rust));
         assert_eq!(LanguageId::from_extension("unknown"), None);
     }

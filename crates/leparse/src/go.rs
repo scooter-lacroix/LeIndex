@@ -1,7 +1,9 @@
 // Go language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
 use tree_sitter::Parser;
 
 /// Go language parser with full CodeIntelligence implementation
@@ -67,7 +69,8 @@ impl GoParser {
                                     };
 
                                     // Determine the kind of type
-                                    let type_kind = child.child_by_field_name("type").map(|t| t.kind());
+                                    let type_kind =
+                                        child.child_by_field_name("type").map(|t| t.kind());
 
                                     signatures.push(SignatureInfo {
                                         name: name.to_string(),
@@ -77,8 +80,10 @@ impl GoParser {
                                         visibility: Visibility::Public,
                                         is_async: false,
                                         is_method: false,
-                                        docstring: extract_docstring(&child, source), 
-                                         calls: vec![], imports: vec![],  byte_range: (child.start_byte(), child.end_byte()),
+                                        docstring: extract_docstring(&child, source),
+                                        calls: vec![],
+                                        imports: vec![],
+                                        byte_range: (child.start_byte(), child.end_byte()),
                                     });
                                 }
                             }
@@ -186,10 +191,12 @@ fn extract_go_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo>
 
     fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
         if node.kind() == "import_spec" {
-            let alias = node.child_by_field_name("name")
+            let alias = node
+                .child_by_field_name("name")
                 .and_then(|n| n.utf8_text(source).ok())
                 .map(|s| s.to_string());
-            let path = node.child_by_field_name("path")
+            let path = node
+                .child_by_field_name("path")
                 .and_then(|n| n.utf8_text(source).ok())
                 .unwrap_or_default();
             let cleaned_path = path.trim_matches('"').trim_matches('`');
@@ -243,8 +250,9 @@ fn extract_function_signature(
         is_method: false,
         docstring: extract_docstring(node, source),
         calls,
-        
-        imports: vec![], byte_range: (node.start_byte(), node.end_byte()),
+
+        imports: vec![],
+        byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 
@@ -300,8 +308,9 @@ fn extract_method_signature(
         is_method: true,
         docstring: extract_docstring(node, source),
         calls,
-        
-        imports: vec![], byte_range: (node.start_byte(), node.end_byte()),
+
+        imports: vec![],
+        byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 
@@ -310,11 +319,7 @@ fn extract_go_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
 
     fn clean_call_text(raw: &str) -> String {
-        raw.split('(')
-            .next()
-            .unwrap_or(raw)
-            .trim()
-            .to_string()
+        raw.split('(').next().unwrap_or(raw).trim().to_string()
     }
 
     fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
@@ -361,7 +366,10 @@ fn extract_go_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Paramet
                             }
                         }
                         "type_identifier" | "pointer_type" | "slice_type" | "array_type" => {
-                            type_annotation = param_child.utf8_text(source).ok().map(|s| s.trim().to_string());
+                            type_annotation = param_child
+                                .utf8_text(source)
+                                .ok()
+                                .map(|s| s.trim().to_string());
                         }
                         _ => {}
                     }
@@ -544,7 +552,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_if_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_if_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let true_block = self.create_block();
         let false_block = self.create_block();
         let merge_block = self.create_block();
@@ -573,7 +585,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_for_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_for_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let body_block = self.create_block();
 
         self.edges.push(Edge {
@@ -590,7 +606,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_select_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_select_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let default_block = self.create_block();
         let merge_block = self.create_block();
 
@@ -785,7 +805,9 @@ func multiply(x, y int) int {
 }";
 
         let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_go::LANGUAGE.into()).unwrap();
+        parser
+            .set_language(&tree_sitter_go::LANGUAGE.into())
+            .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let root = tree.root_node();
 

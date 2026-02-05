@@ -3,18 +3,17 @@
 // This module implements the MCP (Model Context Protocol) JSON-RPC server
 // using axum for HTTP handling.
 
-use anyhow::Context;
 use super::handlers::{
-    DeepAnalyzeHandler, DiagnosticsHandler, IndexHandler, ContextHandler, SearchHandler,
-    ToolHandler,
+    ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, IndexHandler,
+    PhaseAnalysisAliasHandler, PhaseAnalysisHandler, SearchHandler, ToolHandler,
 };
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::leindex::LeIndex;
+use anyhow::Context;
 use axum::{
-    routing::{get, post},
-    Router,
-    Server,
     response::Json,
+    routing::{get, post},
+    Router, Server,
 };
 use serde_json::Value;
 use std::net::SocketAddr;
@@ -84,7 +83,8 @@ impl McpServer {
     pub fn new(config: McpServerConfig, leindex: LeIndex) -> anyhow::Result<Self> {
         // Initialize global state
         let state = Arc::new(Mutex::new(leindex));
-        SERVER_STATE.set(state.clone())
+        SERVER_STATE
+            .set(state.clone())
             .map_err(|_| anyhow::anyhow!("Server state already initialized"))?;
 
         // Initialize handlers
@@ -94,13 +94,19 @@ impl McpServer {
             ToolHandler::Index(IndexHandler),
             ToolHandler::Context(ContextHandler),
             ToolHandler::Search(SearchHandler),
+            ToolHandler::PhaseAnalysis(PhaseAnalysisHandler),
+            ToolHandler::PhaseAnalysisAlias(PhaseAnalysisAliasHandler),
         ];
-        HANDLERS.set(handlers)
+        HANDLERS
+            .set(handlers)
             .map_err(|_| anyhow::anyhow!("Handlers already initialized"))?;
 
         info!("MCP server initialized");
 
-        Ok(Self { config, _state: state })
+        Ok(Self {
+            config,
+            _state: state,
+        })
     }
 
     /// Create MCP server with custom configuration
@@ -246,7 +252,8 @@ pub async fn handle_tool_call(
     let tool_call = req.extract_tool_call()?;
     debug!("Tool call: name={}", tool_call.name);
 
-    let handler = handlers.iter()
+    let handler = handlers
+        .iter()
         .find(|h| h.name() == tool_call.name)
         .ok_or_else(|| JsonRpcError::method_not_found(tool_call.name.clone()))?;
 
@@ -284,7 +291,8 @@ pub async fn handle_tool_call(
 
 /// List tools as JSON
 pub fn list_tools_json(handlers: &[ToolHandler]) -> Value {
-    let tools: Vec<_> = handlers.iter()
+    let tools: Vec<_> = handlers
+        .iter()
         .map(|handler| {
             serde_json::json!({
                 "name": handler.name(),
@@ -327,6 +335,9 @@ mod tests {
     #[test]
     fn test_server_config_default() {
         let config = McpServerConfig::default();
-        assert_eq!(config.bind_address, SocketAddr::from(([127, 0, 0, 1], 3000)));
+        assert_eq!(
+            config.bind_address,
+            SocketAddr::from(([127, 0, 0, 1], 3000))
+        );
     }
 }

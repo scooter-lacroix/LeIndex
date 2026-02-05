@@ -63,6 +63,7 @@ leparse = { path = "../leparse" }
 legraphe = { path = "../legraphe" }
 lerecherche = { path = "../lerecherche" }
 lestockage = { path = "../lestockage" }
+lephase = { path = "../lephase" }
 
 [dev-dependencies]
 rstest.workspace = true

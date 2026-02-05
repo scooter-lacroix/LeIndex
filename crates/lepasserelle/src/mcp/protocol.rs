@@ -31,9 +31,10 @@ impl JsonRpcRequest {
     /// Validate the request conforms to JSON-RPC 2.0
     pub fn validate(&self) -> Result<(), JsonRpcError> {
         if self.jsonrpc != JSONRPC_VERSION {
-            return Err(JsonRpcError::invalid_request(
-                format!("Unsupported JSON-RPC version: {}", self.jsonrpc)
-            ));
+            return Err(JsonRpcError::invalid_request(format!(
+                "Unsupported JSON-RPC version: {}",
+                self.jsonrpc
+            )));
         }
         Ok(())
     }
@@ -42,14 +43,18 @@ impl JsonRpcRequest {
     ///
     /// Expects params to contain: {name: string, arguments: object}
     pub fn extract_tool_call(&self) -> Result<ToolCallParams, JsonRpcError> {
-        let params = self.params.as_ref()
+        let params = self
+            .params
+            .as_ref()
             .ok_or_else(|| JsonRpcError::invalid_params("Missing params"))?;
 
-        let name = params.get("name")
+        let name = params
+            .get("name")
             .and_then(|v| v.as_str())
             .ok_or_else(|| JsonRpcError::invalid_params("Missing or invalid 'name' field"))?;
 
-        let arguments = params.get("arguments")
+        let arguments = params
+            .get("arguments")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
 
@@ -153,7 +158,7 @@ impl JsonRpcError {
         Self::with_data(
             error_codes::METHOD_NOT_FOUND,
             "Method not found",
-            serde_json::json!({ "method": method })
+            serde_json::json!({ "method": method }),
         )
     }
 
@@ -163,11 +168,14 @@ impl JsonRpcError {
     }
 
     /// Create an invalid params error with a suggestion
-    pub fn invalid_params_with_suggestion(msg: impl Into<String>, suggestion: impl Into<String>) -> Self {
+    pub fn invalid_params_with_suggestion(
+        msg: impl Into<String>,
+        suggestion: impl Into<String>,
+    ) -> Self {
         Self::with_data(
             error_codes::INVALID_PARAMS,
             msg,
-            serde_json::json!({ "suggestion": suggestion.into() })
+            serde_json::json!({ "suggestion": suggestion.into() }),
         )
     }
 
@@ -181,7 +189,7 @@ impl JsonRpcError {
         Self::with_data(
             error_codes::PROJECT_NOT_FOUND,
             "Project not found",
-            serde_json::json!({ "project": project })
+            serde_json::json!({ "project": project }),
         )
     }
 
@@ -190,7 +198,7 @@ impl JsonRpcError {
         Self::with_data(
             error_codes::PROJECT_NOT_INDEXED,
             "Project not indexed",
-            serde_json::json!({ "project": project, "suggestion": "Run leindex_index first" })
+            serde_json::json!({ "project": project, "suggestion": "Run leindex_index first" }),
         )
     }
 
@@ -214,7 +222,7 @@ impl JsonRpcError {
         Self::with_data(
             error_codes::MEMORY_LIMIT_EXCEEDED,
             "Memory limit exceeded",
-            serde_json::json!({ "suggestion": "Try a smaller operation or increase memory budget" })
+            serde_json::json!({ "suggestion": "Try a smaller operation or increase memory budget" }),
         )
     }
 }
@@ -309,10 +317,8 @@ mod tests {
 
     #[test]
     fn test_jsonrpc_response_success() {
-        let response = JsonRpcResponse::success(
-            serde_json::json!(1),
-            serde_json::json!({"result": "ok"})
-        );
+        let response =
+            JsonRpcResponse::success(serde_json::json!(1), serde_json::json!({"result": "ok"}));
 
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"result\""));

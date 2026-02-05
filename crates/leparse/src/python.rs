@@ -1,7 +1,9 @@
 // Python language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
 use tree_sitter::Parser;
 
 /// Python language parser with full CodeIntelligence implementation
@@ -56,7 +58,9 @@ impl PythonParser {
                         let qualified_name = qualified_path.join(".");
 
                         // Extract function signature with full qualified name
-                        if let Some(sig) = extract_function_signature_with_path(node, source, &qualified_name) {
+                        if let Some(sig) =
+                            extract_function_signature_with_path(node, source, &qualified_name)
+                        {
                             signatures.push(sig);
                         }
 
@@ -226,7 +230,11 @@ fn extract_python_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportI
                         add_import(imports, &path, Some(alias.trim().to_string()));
                     } else {
                         let path = format!("{}.{}", module, item);
-                        add_import(imports, &path, item.split('.').last().map(|s| s.to_string()));
+                        add_import(
+                            imports,
+                            &path,
+                            item.split('.').last().map(|s| s.to_string()),
+                        );
                     }
                 }
             }
@@ -286,7 +294,11 @@ fn extract_function_signature_with_path(
     qualified_name: &str,
 ) -> Option<SignatureInfo> {
     // Extract function name (the last component of the qualified name)
-    let name = qualified_name.split('.').next_back().unwrap_or(qualified_name).to_string();
+    let name = qualified_name
+        .split('.')
+        .next_back()
+        .unwrap_or(qualified_name)
+        .to_string();
 
     // Extract parameters
     let parameters_node = node.child_by_field_name("parameters")?;
@@ -322,15 +334,16 @@ fn extract_function_signature_with_path(
         is_method,
         docstring,
         calls,
-        
-        imports: vec![], byte_range: (node.start_byte(), node.end_byte()),
+
+        imports: vec![],
+        byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 
 /// Extract function calls from a Python node
 fn extract_python_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
-    
+
     fn clean_call_text(raw: &str) -> String {
         raw.split('(')
             .next()
@@ -351,13 +364,13 @@ fn extract_python_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> 
                 }
             }
         }
-        
+
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             find_calls(&child, source, calls);
         }
     }
-    
+
     find_calls(node, source, &mut calls);
     calls
 }
@@ -471,10 +484,7 @@ fn calculate_complexity(node: &tree_sitter::Node, metrics: &mut ComplexityMetric
 
     // Count control flow structures (increase cyclomatic complexity)
     match node.kind() {
-        "if_statement"
-        | "while_statement"
-        | "for_statement"
-        | "match_statement"
+        "if_statement" | "while_statement" | "for_statement" | "match_statement"
         | "try_statement" => {
             metrics.cyclomatic += 1;
         }
@@ -522,7 +532,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn build_cfg_recursive(&mut self, node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn build_cfg_recursive(
+        &mut self,
+        node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         match node.kind() {
             "if_statement" => {
                 self.handle_if_statement(node, current_block)?;
@@ -550,7 +564,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_if_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_if_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         // Create true and false branches
         let true_block = self.create_block();
         let false_block = self.create_block();
@@ -581,7 +599,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_while_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_while_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         // Create loop body block
         let body_block = self.create_block();
 
@@ -600,7 +622,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_for_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_for_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         // Create loop body block
         let body_block = self.create_block();
 

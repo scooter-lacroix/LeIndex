@@ -287,6 +287,11 @@ impl ProgramDependenceGraph {
         self.graph.edge_weight(id)
     }
 
+    /// Remove an edge by ID.
+    pub fn remove_edge(&mut self, id: EdgeId) -> Option<Edge> {
+        self.graph.remove_edge(id)
+    }
+
     /// Find node by symbol name
     pub fn find_by_symbol(&self, symbol: &str) -> Option<NodeId> {
         self.symbol_index.get(symbol).copied()
@@ -406,6 +411,26 @@ impl ProgramDependenceGraph {
                 parent,
                 Edge {
                     edge_type: EdgeType::Inheritance,
+                    metadata: EdgeMetadata {
+                        call_count: None,
+                        variable_name: None,
+                    },
+                },
+            );
+        }
+    }
+
+    /// Add multiple import edges.
+    ///
+    /// # Arguments
+    /// * `imports` - Vector of (importer_id, imported_id) tuples
+    pub fn add_import_edges(&mut self, imports: Vec<(NodeId, NodeId)>) {
+        for (importer, imported) in imports {
+            self.add_edge(
+                importer,
+                imported,
+                Edge {
+                    edge_type: EdgeType::Import,
                     metadata: EdgeMetadata {
                         call_count: None,
                         variable_name: None,

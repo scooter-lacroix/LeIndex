@@ -12,15 +12,19 @@ mod tests {
         let source = b"function greet(name)\n  return \"Hello, \" .. name\nend";
 
         let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_lua::LANGUAGE.into()).unwrap();
+        parser
+            .set_language(&tree_sitter_lua::LANGUAGE.into())
+            .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let root = tree.root_node();
 
         fn print_tree(node: &tree_sitter::Node, source: &[u8], indent: usize) {
-            println!("{}{:?} {:?}",
-                     " ".repeat(indent),
-                     node.kind(),
-                     node.utf8_text(source).unwrap_or(""));
+            println!(
+                "{}{:?} {:?}",
+                " ".repeat(indent),
+                node.kind(),
+                node.utf8_text(source).unwrap_or("")
+            );
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 print_tree(&child, source, indent + 2);

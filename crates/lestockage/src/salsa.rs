@@ -1,8 +1,8 @@
 // Salsa incremental computation
 
+use crate::schema::Storage;
 use rusqlite::{params, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
-use crate::schema::Storage;
 
 /// Node hash for incremental computation
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -43,9 +43,10 @@ impl IncrementalCache {
 
     /// Check if a node's computation is cached
     pub fn is_cached(&self, hash: &NodeHash) -> SqliteResult<bool> {
-        let mut stmt = self.storage.conn().prepare(
-            "SELECT COUNT(*) FROM analysis_cache WHERE node_hash = ?1"
-        )?;
+        let mut stmt = self
+            .storage
+            .conn()
+            .prepare("SELECT COUNT(*) FROM analysis_cache WHERE node_hash = ?1")?;
 
         let count: i64 = stmt.query_row(params![hash.as_str()], |row| row.get(0))?;
         Ok(count > 0)
@@ -98,7 +99,10 @@ impl IncrementalCache {
 
     /// Clear all cached entries
     pub fn clear(&mut self) -> SqliteResult<usize> {
-        let result = self.storage.conn().execute("DELETE FROM analysis_cache", [])?;
+        let result = self
+            .storage
+            .conn()
+            .execute("DELETE FROM analysis_cache", [])?;
         Ok(result)
     }
 }
@@ -151,13 +155,14 @@ impl QueryInvalidation {
     /// # Returns
     /// Vector of content hashes for the affected nodes
     pub fn get_affected_nodes(&self, file_path: &str) -> SqliteResult<Vec<String>> {
-        let mut stmt = self.storage.conn().prepare(
-            "SELECT content_hash FROM intel_nodes WHERE file_path = ?1"
-        )?;
+        let mut stmt = self
+            .storage
+            .conn()
+            .prepare("SELECT content_hash FROM intel_nodes WHERE file_path = ?1")?;
 
-        let hashes = stmt.query_map(params![file_path], |row| {
-            row.get::<_, String>(0)
-        })?.collect::<SqliteResult<Vec<_>>>()?;
+        let hashes = stmt
+            .query_map(params![file_path], |row| row.get::<_, String>(0))?
+            .collect::<SqliteResult<Vec<_>>>()?;
 
         Ok(hashes)
     }

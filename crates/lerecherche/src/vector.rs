@@ -91,10 +91,7 @@ impl VectorIndex {
     /// ];
     /// let inserted = index.insert_batch(vectors);
     /// ```
-    pub fn insert_batch(
-        &mut self,
-        vectors: impl IntoIterator<Item = (String, Vec<f32>)>,
-    ) -> usize {
+    pub fn insert_batch(&mut self, vectors: impl IntoIterator<Item = (String, Vec<f32>)>) -> usize {
         let mut inserted = 0;
         for (node_id, embedding) in vectors {
             if self.insert(node_id, embedding).is_ok() {
@@ -339,7 +336,9 @@ mod tests {
     #[test]
     fn test_vector_index_remove() {
         let mut index = VectorIndex::new(3);
-        index.insert("test".to_string(), vec![0.1, 0.2, 0.3]).unwrap();
+        index
+            .insert("test".to_string(), vec![0.1, 0.2, 0.3])
+            .unwrap();
         assert_eq!(index.len(), 1);
 
         assert!(index.remove("test"));
@@ -389,7 +388,9 @@ mod tests {
     #[test]
     fn test_search_with_zero_query() {
         let mut index = VectorIndex::new(3);
-        index.insert("test".to_string(), vec![0.1, 0.2, 0.3]).unwrap();
+        index
+            .insert("test".to_string(), vec![0.1, 0.2, 0.3])
+            .unwrap();
 
         let results = index.search(&[0.0, 0.0, 0.0], 10);
         // Should still return results, just with 0.0 similarity

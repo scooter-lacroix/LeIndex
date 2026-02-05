@@ -22,15 +22,15 @@
 // }
 // ```
 
+/// Request handlers for MCP tools.
+pub mod handlers;
 /// MCP protocol definitions and JSON-RPC types.
 pub mod protocol;
 /// MCP server implementation.
 pub mod server;
-/// Request handlers for MCP tools.
-pub mod handlers;
 
+pub use protocol::{error_codes, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use server::{McpServer, McpServerConfig};
-pub use protocol::{JsonRpcRequest, JsonRpcResponse, JsonRpcError, error_codes};
 
 /// MCP server version
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

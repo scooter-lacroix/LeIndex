@@ -1,19 +1,19 @@
 // Language-specific parser implementations
 
-pub use crate::python::PythonParser;
-pub use crate::javascript::{JavaScriptParser, TypeScriptParser};
-pub use crate::rust::RustParser;
-pub use crate::go::GoParser;
-pub use crate::java::JavaParser;
+pub use crate::bash::BashParser;
+pub use crate::c::CParser;
 pub use crate::cpp::CppParser;
 pub use crate::csharp::CSharpParser;
-pub use crate::ruby::RubyParser;
-pub use crate::php::PhpParser;
-pub use crate::lua::LuaParser;
-pub use crate::scala::ScalaParser;
-pub use crate::c::CParser;
-pub use crate::bash::BashParser;
+pub use crate::go::GoParser;
+pub use crate::java::JavaParser;
+pub use crate::javascript::{JavaScriptParser, TypeScriptParser};
 pub use crate::json::JsonParser;
+pub use crate::lua::LuaParser;
+pub use crate::php::PhpParser;
+pub use crate::python::PythonParser;
+pub use crate::ruby::RubyParser;
+pub use crate::rust::RustParser;
+pub use crate::scala::ScalaParser;
 
 /// Type-specific parser factory
 pub fn parser_for_language(language: &str) -> Option<Box<dyn crate::traits::CodeIntelligence>> {

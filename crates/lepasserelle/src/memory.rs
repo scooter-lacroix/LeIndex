@@ -103,27 +103,46 @@ impl CacheEntry {
     /// Get the size in bytes of this cache entry
     pub fn size_bytes(&self) -> usize {
         match self {
-            CacheEntry::PDG { serialized_data, .. } => serialized_data.len(),
-            CacheEntry::SearchIndex { serialized_data, .. } => serialized_data.len(),
-            CacheEntry::Analysis { serialized_data, .. } => serialized_data.len(),
-            CacheEntry::Binary { serialized_data, .. } => serialized_data.len(),
+            CacheEntry::PDG {
+                serialized_data, ..
+            } => serialized_data.len(),
+            CacheEntry::SearchIndex {
+                serialized_data, ..
+            } => serialized_data.len(),
+            CacheEntry::Analysis {
+                serialized_data, ..
+            } => serialized_data.len(),
+            CacheEntry::Binary {
+                serialized_data, ..
+            } => serialized_data.len(),
         }
     }
 
     /// Get a description of this entry
     pub fn description(&self) -> String {
         match self {
-            CacheEntry::PDG { project_id, node_count, .. } => {
+            CacheEntry::PDG {
+                project_id,
+                node_count,
+                ..
+            } => {
                 format!("PDG for {} ({} nodes)", project_id, node_count)
             }
-            CacheEntry::SearchIndex { project_id, entry_count, .. } => {
+            CacheEntry::SearchIndex {
+                project_id,
+                entry_count,
+                ..
+            } => {
                 format!("Search index for {} ({} entries)", project_id, entry_count)
             }
             CacheEntry::Analysis { query, .. } => {
                 format!("Analysis for '{}'", query)
             }
             CacheEntry::Binary { metadata, .. } => {
-                format!("Binary data ({})", metadata.get("type").unwrap_or(&"unknown".to_string()))
+                format!(
+                    "Binary data ({})",
+                    metadata.get("type").unwrap_or(&"unknown".to_string())
+                )
             }
         }
     }
@@ -153,7 +172,10 @@ impl CacheStore {
     pub fn new(config: &MemoryConfig) -> Self {
         // Create cache directory if it doesn't exist
         if let Err(e) = std::fs::create_dir_all(&config.cache_dir) {
-            warn!("Failed to create cache directory {:?}: {}", config.cache_dir, e);
+            warn!(
+                "Failed to create cache directory {:?}: {}",
+                config.cache_dir, e
+            );
         }
 
         // LRU cache capacity is based on number of items, not bytes
@@ -178,7 +200,10 @@ impl CacheStore {
                 let evicted_size = evicted_entry.size_bytes();
                 self.total_bytes = self.total_bytes.saturating_sub(evicted_size);
 
-                debug!("Evicted cache entry '{}' ({} bytes)", evicted_key, evicted_size);
+                debug!(
+                    "Evicted cache entry '{}' ({} bytes)",
+                    evicted_key, evicted_size
+                );
 
                 // Spill to disk if not auto-spill only
                 if let Err(e) = self.spill_to_disk(&evicted_key, &evicted_entry) {
@@ -287,7 +312,11 @@ impl CacheStore {
         std::fs::rename(&temp_file, &cache_file)
             .map_err(|e| Error::SpillFailed(format!("Failed to rename cache file: {}", e)))?;
 
-        debug!("Spilled cache entry '{}' to disk ({} bytes)", key, serialized.len());
+        debug!(
+            "Spilled cache entry '{}' to disk ({} bytes)",
+            key,
+            serialized.len()
+        );
 
         Ok(())
     }
@@ -297,7 +326,10 @@ impl CacheStore {
         let cache_file = self.cache_dir.join(format!("{}.bin", sanitize_key(key)));
 
         if !cache_file.exists() {
-            return Err(Error::CacheNotFound(format!("Cache entry '{}' not found on disk", key)));
+            return Err(Error::CacheNotFound(format!(
+                "Cache entry '{}' not found on disk",
+                key
+            )));
         }
 
         let mut file = std::fs::File::open(&cache_file)
@@ -310,7 +342,11 @@ impl CacheStore {
         let entry: CacheEntry = deserialize(&buffer)
             .map_err(|e| Error::SpillFailed(format!("Deserialization failed: {}", e)))?;
 
-        debug!("Loaded cache entry '{}' from disk ({} bytes)", key, buffer.len());
+        debug!(
+            "Loaded cache entry '{}' from disk ({} bytes)",
+            key,
+            buffer.len()
+        );
 
         Ok(entry)
     }
@@ -326,7 +362,8 @@ impl CacheStore {
         for entry in std::fs::read_dir(&self.cache_dir)
             .map_err(|e| Error::SpillFailed(format!("Failed to read cache directory: {}", e)))?
         {
-            let entry = entry.map_err(|e| Error::SpillFailed(format!("Failed to read dir entry: {}", e)))?;
+            let entry = entry
+                .map_err(|e| Error::SpillFailed(format!("Failed to read dir entry: {}", e)))?;
 
             if let Some(name) = entry.file_name().to_str() {
                 if name.ends_with(".bin") {
@@ -364,10 +401,9 @@ impl CacheStore {
         for entry in std::fs::read_dir(&self.cache_dir)
             .map_err(|e| Error::SpillFailed(format!("Failed to read cache directory: {}", e)))?
         {
-            let entry = entry.map_err(|e| Error::SpillFailed(format!("Failed to read dir entry: {}", e)))?;
-            total += entry.metadata()
-                .map(|m| m.len() as usize)
-                .unwrap_or(0);
+            let entry = entry
+                .map_err(|e| Error::SpillFailed(format!("Failed to read dir entry: {}", e)))?;
+            total += entry.metadata().map(|m| m.len() as usize).unwrap_or(0);
         }
 
         Ok(total)
@@ -443,7 +479,13 @@ impl CacheStore {
 /// Sanitize a cache key for use as a filename
 fn sanitize_key(key: &str) -> String {
     key.chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -650,27 +692,32 @@ impl CacheSpiller {
     }
 
     /// Prioritize keys for warming based on strategy
-    fn prioritize_keys_for_warming(&self, keys: &[String], strategy: WarmStrategy) -> Result<Vec<String>, Error> {
+    fn prioritize_keys_for_warming(
+        &self,
+        keys: &[String],
+        strategy: WarmStrategy,
+    ) -> Result<Vec<String>, Error> {
         match strategy {
             WarmStrategy::All => Ok(keys.to_vec()),
-            WarmStrategy::PDGOnly => {
-                Ok(keys.iter()
-                    .filter(|k| k.starts_with("pdg:"))
-                    .cloned()
-                    .collect())
-            }
-            WarmStrategy::SearchIndexOnly => {
-                Ok(keys.iter()
-                    .filter(|k| k.starts_with("search:"))
-                    .cloned()
-                    .collect())
-            }
+            WarmStrategy::PDGOnly => Ok(keys
+                .iter()
+                .filter(|k| k.starts_with("pdg:"))
+                .cloned()
+                .collect()),
+            WarmStrategy::SearchIndexOnly => Ok(keys
+                .iter()
+                .filter(|k| k.starts_with("search:"))
+                .cloned()
+                .collect()),
             WarmStrategy::RecentFirst => {
                 // Sort by file modification time (most recent first)
                 let mut keyed: Vec<(String, std::time::SystemTime)> = Vec::new();
 
                 for key in keys {
-                    let cache_file = self.store.cache_dir().join(format!("{}.bin", sanitize_key(key)));
+                    let cache_file = self
+                        .store
+                        .cache_dir()
+                        .join(format!("{}.bin", sanitize_key(key)));
                     if let Ok(metadata) = std::fs::metadata(&cache_file) {
                         if let Ok(modified) = metadata.modified() {
                             keyed.push((key.clone(), modified));
@@ -700,7 +747,8 @@ impl CacheSpiller {
         }
 
         // Use recent-first strategy to prioritize recently accessed entries
-        let prioritized = self.prioritize_keys_for_warming(&spilled_keys, WarmStrategy::RecentFirst)?;
+        let prioritized =
+            self.prioritize_keys_for_warming(&spilled_keys, WarmStrategy::RecentFirst)?;
 
         // Only restore entries that fit in available memory
         let current_bytes = self.store.total_bytes();
@@ -758,8 +806,8 @@ pub struct MemoryManager {
 impl MemoryManager {
     /// Create a new memory manager
     pub fn new(config: MemoryConfig) -> Result<Self, Error> {
-        let current_process = Process::current()
-            .map_err(|e| Error::ProcessAccess(e.to_string()))?;
+        let current_process =
+            Process::current().map_err(|e| Error::ProcessAccess(e.to_string()))?;
 
         Ok(Self {
             config,

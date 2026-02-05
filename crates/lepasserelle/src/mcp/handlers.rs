@@ -4,7 +4,9 @@
 
 use super::protocol::JsonRpcError;
 use crate::leindex::LeIndex;
+use lephase::{run_phase_analysis, DocsMode, FormatMode, PhaseOptions, PhaseSelection};
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -24,6 +26,10 @@ pub enum ToolHandler {
     Context(ContextHandler),
     /// Handler for system diagnostics
     Diagnostics(DiagnosticsHandler),
+    /// Handler for additive 5-phase analysis
+    PhaseAnalysis(PhaseAnalysisHandler),
+    /// Optional compatibility alias for phase analysis
+    PhaseAnalysisAlias(PhaseAnalysisAliasHandler),
 }
 
 impl ToolHandler {
@@ -35,6 +41,8 @@ impl ToolHandler {
             ToolHandler::DeepAnalyze(h) => h.name(),
             ToolHandler::Context(h) => h.name(),
             ToolHandler::Diagnostics(h) => h.name(),
+            ToolHandler::PhaseAnalysis(h) => h.name(),
+            ToolHandler::PhaseAnalysisAlias(h) => h.name(),
         }
     }
 
@@ -46,6 +54,8 @@ impl ToolHandler {
             ToolHandler::DeepAnalyze(h) => h.description(),
             ToolHandler::Context(h) => h.description(),
             ToolHandler::Diagnostics(h) => h.description(),
+            ToolHandler::PhaseAnalysis(h) => h.description(),
+            ToolHandler::PhaseAnalysisAlias(h) => h.description(),
         }
     }
 
@@ -57,6 +67,8 @@ impl ToolHandler {
             ToolHandler::DeepAnalyze(h) => h.argument_schema(),
             ToolHandler::Context(h) => h.argument_schema(),
             ToolHandler::Diagnostics(h) => h.argument_schema(),
+            ToolHandler::PhaseAnalysis(h) => h.argument_schema(),
+            ToolHandler::PhaseAnalysisAlias(h) => h.argument_schema(),
         }
     }
 
@@ -72,6 +84,8 @@ impl ToolHandler {
             ToolHandler::DeepAnalyze(h) => h.execute(leindex, args).await,
             ToolHandler::Context(h) => h.execute(leindex, args).await,
             ToolHandler::Diagnostics(h) => h.execute(leindex, args).await,
+            ToolHandler::PhaseAnalysis(h) => h.execute(leindex, args).await,
+            ToolHandler::PhaseAnalysisAlias(h) => h.execute(leindex, args).await,
         }
     }
 }
@@ -81,10 +95,12 @@ fn extract_string(args: &Value, key: &str) -> Result<String, JsonRpcError> {
     args.get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| JsonRpcError::invalid_params_with_suggestion(
-            format!("Missing required argument: {}", key),
-            format!("Add \"{}\": \"<value>\" to arguments", key)
-        ))
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params_with_suggestion(
+                format!("Missing required argument: {}", key),
+                format!("Add \"{}\": \"<value>\" to arguments", key),
+            )
+        })
 }
 
 /// Helper to extract usize argument with default
@@ -94,6 +110,11 @@ fn extract_usize(args: &Value, key: &str, default: usize) -> Result<usize, JsonR
         .map(|v| v as usize)
         .or(Some(default))
         .ok_or_else(|| JsonRpcError::invalid_params(format!("Invalid usize argument: {}", key)))
+}
+
+/// Helper to extract bool argument with default.
+fn extract_bool(args: &Value, key: &str, default: bool) -> bool {
+    args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
 }
 
 /// Handler for leindex_index
@@ -139,7 +160,8 @@ impl IndexHandler {
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let project_path = extract_string(&args, "project_path")?;
-        let force_reindex = args.get("force_reindex")
+        let force_reindex = args
+            .get("force_reindex")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
@@ -147,36 +169,45 @@ impl IndexHandler {
         {
             let index = leindex.lock().await;
             if index.is_indexed() && !force_reindex {
-                return serde_json::to_value(index.get_stats())
-                    .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)));
+                return serde_json::to_value(index.get_stats()).map_err(|e| {
+                    JsonRpcError::internal_error(format!("Serialization error: {}", e))
+                });
             }
         }
 
         // Create new LeIndex instance and index the project in a blocking task
         let project_path_clone = project_path.clone();
         let stats = tokio::task::spawn_blocking(move || {
-            let mut temp_leindex = LeIndex::new(&project_path_clone)
-                .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to create LeIndex: {}", e)))?;
+            let mut temp_leindex = LeIndex::new(&project_path_clone).map_err(|e| {
+                JsonRpcError::indexing_failed(format!("Failed to create LeIndex: {}", e))
+            })?;
 
-            temp_leindex.index_project(force_reindex)
+            temp_leindex
+                .index_project(force_reindex)
                 .map_err(|e| JsonRpcError::indexing_failed(format!("Indexing failed: {}", e)))
-        }).await
+        })
+        .await
         .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))??;
 
         // Update shared state by loading the newly indexed project from storage
         let mut index = leindex.lock().await;
-        
+
         // Ensure path matches (canonicalize to be safe)
-        let path = std::path::Path::new(&project_path).canonicalize()
-            .map_err(|e| JsonRpcError::internal_error(format!("Failed to canonicalize path: {}", e)))?;
-            
+        let path = std::path::Path::new(&project_path)
+            .canonicalize()
+            .map_err(|e| {
+                JsonRpcError::internal_error(format!("Failed to canonicalize path: {}", e))
+            })?;
+
         if index.project_path() != path {
-            *index = LeIndex::new(&path)
-                .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to re-initialize LeIndex: {}", e)))?;
+            *index = LeIndex::new(&path).map_err(|e| {
+                JsonRpcError::indexing_failed(format!("Failed to re-initialize LeIndex: {}", e))
+            })?;
         }
-        
-        index.load_from_storage()
-            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load indexed data: {}", e)))?;
+
+        index.load_from_storage().map_err(|e| {
+            JsonRpcError::indexing_failed(format!("Failed to load indexed data: {}", e))
+        })?;
 
         serde_json::to_value(stats)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
@@ -234,11 +265,12 @@ impl SearchHandler {
 
         if index.search_engine().is_empty() {
             return Err(JsonRpcError::project_not_indexed(
-                index.project_path().display().to_string()
+                index.project_path().display().to_string(),
             ));
         }
 
-        let results = index.search(&query, top_k)
+        let results = index
+            .search(&query, top_k)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
         serde_json::to_value(results)
@@ -297,11 +329,12 @@ impl DeepAnalyzeHandler {
 
         if writer.search_engine().is_empty() {
             return Err(JsonRpcError::project_not_indexed(
-                writer.project_path().display().to_string()
+                writer.project_path().display().to_string(),
             ));
         }
 
-        let result = writer.analyze(&query, token_budget)
+        let result = writer
+            .analyze(&query, token_budget)
             .map_err(|e| JsonRpcError::internal_error(format!("Analysis error: {}", e)))?;
 
         serde_json::to_value(result)
@@ -360,16 +393,199 @@ impl ContextHandler {
 
         if !reader.is_indexed() {
             return Err(JsonRpcError::project_not_indexed(
-                reader.project_path().display().to_string()
+                reader.project_path().display().to_string(),
             ));
         }
 
-        let result = reader.expand_node_context(&node_id, token_budget)
+        let result = reader
+            .expand_node_context(&node_id, token_budget)
             .map_err(|e| JsonRpcError::internal_error(format!("Context expansion error: {}", e)))?;
 
         serde_json::to_value(result)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
     }
+}
+
+/// Handler for leindex_phase_analysis.
+#[derive(Clone)]
+pub struct PhaseAnalysisHandler;
+
+impl PhaseAnalysisHandler {
+    /// Returns the name of this RPC method.
+    pub fn name(&self) -> &str {
+        "leindex_phase_analysis"
+    }
+
+    /// Returns the description of this RPC method.
+    pub fn description(&self) -> &str {
+        "Run additive 5-phase analysis with freshness-aware incremental execution. Supports `phase` (1-5) or `all`."
+    }
+
+    /// Returns the JSON schema for the arguments of this RPC method.
+    pub fn argument_schema(&self) -> Value {
+        phase_analysis_schema()
+    }
+
+    /// Executes the RPC method.
+    pub async fn execute(
+        &self,
+        leindex: &Arc<Mutex<LeIndex>>,
+        args: Value,
+    ) -> Result<Value, JsonRpcError> {
+        execute_phase_analysis(leindex, args).await
+    }
+}
+
+/// Optional compatibility alias for phase analysis.
+#[derive(Clone)]
+pub struct PhaseAnalysisAliasHandler;
+
+impl PhaseAnalysisAliasHandler {
+    /// Returns the alias name.
+    pub fn name(&self) -> &str {
+        "phase_analysis"
+    }
+
+    /// Returns description.
+    pub fn description(&self) -> &str {
+        "Alias for leindex_phase_analysis"
+    }
+
+    /// Returns argument schema.
+    pub fn argument_schema(&self) -> Value {
+        phase_analysis_schema()
+    }
+
+    /// Executes the alias method.
+    pub async fn execute(
+        &self,
+        leindex: &Arc<Mutex<LeIndex>>,
+        args: Value,
+    ) -> Result<Value, JsonRpcError> {
+        execute_phase_analysis(leindex, args).await
+    }
+}
+
+fn phase_analysis_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "phase": {
+                "oneOf": [
+                    { "type": "integer", "minimum": 1, "maximum": 5 },
+                    { "type": "string", "enum": ["all"] }
+                ]
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["ultra", "balanced", "verbose"],
+                "default": "balanced"
+            },
+            "path": {
+                "type": "string"
+            },
+            "max_files": {
+                "type": "integer",
+                "default": 2000
+            },
+            "max_focus_files": {
+                "type": "integer",
+                "default": 20
+            },
+            "top_n": {
+                "type": "integer",
+                "default": 10
+            },
+            "max_chars": {
+                "type": "integer",
+                "default": 12000
+            },
+            "include_docs": {
+                "type": "boolean",
+                "default": false
+            },
+            "docs_mode": {
+                "type": "string",
+                "enum": ["off", "markdown", "text", "all"],
+                "default": "off"
+            }
+        },
+        "required": ["phase", "path"]
+    })
+}
+
+async fn execute_phase_analysis(
+    _leindex: &Arc<Mutex<LeIndex>>,
+    args: Value,
+) -> Result<Value, JsonRpcError> {
+    let selection = match args.get("phase") {
+        Some(Value::String(s)) if s == "all" => PhaseSelection::All,
+        Some(Value::Number(n)) => {
+            let Some(p) = n.as_u64().map(|v| v as u8) else {
+                return Err(JsonRpcError::invalid_params(
+                    "phase must be 1..5 or 'all'".to_string(),
+                ));
+            };
+            PhaseSelection::from_number(p).ok_or_else(|| {
+                JsonRpcError::invalid_params("phase must be in range 1..5".to_string())
+            })?
+        }
+        _ => {
+            return Err(JsonRpcError::invalid_params_with_suggestion(
+                "Missing or invalid 'phase'".to_string(),
+                "Use phase: 1..5 or phase: \"all\"".to_string(),
+            ));
+        }
+    };
+
+    let mode = args
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("balanced");
+    let parsed_mode = FormatMode::parse(mode).ok_or_else(|| {
+        JsonRpcError::invalid_params("mode must be one of ultra|balanced|verbose".to_string())
+    })?;
+
+    let docs_mode_raw = args
+        .get("docs_mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("off");
+    let parsed_docs_mode = DocsMode::parse(docs_mode_raw).ok_or_else(|| {
+        JsonRpcError::invalid_params("docs_mode must be one of off|markdown|text|all".to_string())
+    })?;
+
+    let include_docs = extract_bool(&args, "include_docs", false);
+    let max_files = extract_usize(&args, "max_files", 2000)?;
+    let max_focus_files = extract_usize(&args, "max_focus_files", 20)?;
+    let top_n = extract_usize(&args, "top_n", 10)?;
+    let max_output_chars = extract_usize(&args, "max_chars", 12000)?;
+
+    let root = PathBuf::from(extract_string(&args, "path")?)
+        .canonicalize()
+        .map_err(|e| {
+            JsonRpcError::invalid_params(format!("path must exist and be accessible: {}", e))
+        })?;
+
+    let options = PhaseOptions {
+        root,
+        mode: parsed_mode,
+        max_files,
+        max_focus_files,
+        top_n,
+        max_output_chars,
+        use_incremental_refresh: true,
+        include_docs,
+        docs_mode: parsed_docs_mode,
+        hotspot_keywords: PhaseOptions::default().hotspot_keywords,
+    };
+
+    let report = tokio::task::spawn_blocking(move || run_phase_analysis(options, selection))
+        .await
+        .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))?
+        .map_err(|e| JsonRpcError::internal_error(format!("Phase analysis failed: {}", e)))?;
+
+    serde_json::to_value(report)
+        .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
 }
 
 /// Handler for leindex_diagnostics
@@ -406,8 +622,9 @@ impl DiagnosticsHandler {
     ) -> Result<Value, JsonRpcError> {
         let reader = leindex.lock().await;
 
-        let diagnostics = reader.get_diagnostics()
-            .map_err(|e| JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e)))?;
+        let diagnostics = reader.get_diagnostics().map_err(|e| {
+            JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e))
+        })?;
 
         serde_json::to_value(diagnostics)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
@@ -439,6 +656,8 @@ mod tests {
         assert_eq!(DeepAnalyzeHandler.name(), "leindex_deep_analyze");
         assert_eq!(ContextHandler.name(), "leindex_context");
         assert_eq!(DiagnosticsHandler.name(), "leindex_diagnostics");
+        assert_eq!(PhaseAnalysisHandler.name(), "leindex_phase_analysis");
+        assert_eq!(PhaseAnalysisAliasHandler.name(), "phase_analysis");
     }
 
     #[test]
@@ -453,5 +672,36 @@ mod tests {
             assert!(schema.is_object());
             assert!(schema.get("type").is_some());
         }
+    }
+
+    #[test]
+    fn test_phase_schema_requires_phase_and_path() {
+        let schema = phase_analysis_schema();
+        let required = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .expect("required array");
+
+        let required_strings = required
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(required_strings.contains(&"phase"));
+        assert!(required_strings.contains(&"path"));
+    }
+
+    #[test]
+    fn test_phase_schema_path_has_no_default() {
+        let schema = phase_analysis_schema();
+        let path = schema
+            .get("properties")
+            .and_then(|v| v.get("path"))
+            .expect("path schema");
+
+        assert!(
+            path.get("default").is_none(),
+            "required path must not advertise default"
+        );
     }
 }

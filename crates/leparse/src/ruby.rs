@@ -1,7 +1,9 @@
 // Ruby language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
 use tree_sitter::Parser;
 
 /// Ruby language parser with full CodeIntelligence implementation
@@ -19,7 +21,11 @@ impl RubyParser {
         Self
     }
 
-    fn extract_all_definitions(&self, source: &[u8], root: tree_sitter::Node) -> Vec<SignatureInfo> {
+    fn extract_all_definitions(
+        &self,
+        source: &[u8],
+        root: tree_sitter::Node,
+    ) -> Vec<SignatureInfo> {
         let mut signatures = Vec::new();
 
         fn visit_node(
@@ -53,7 +59,11 @@ impl RubyParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: None,  calls: vec![], imports: vec![],  byte_range: (0, 0) });
+                            docstring: None,
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (0, 0),
+                        });
                     }
 
                     let mut cursor = node.walk();
@@ -168,8 +178,10 @@ fn extract_ruby_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInf
 
     fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
         if node.kind() == "call" || node.kind() == "method_call" {
-            if let Some(name_node) = node.child_by_field_name("method")
-                .or_else(|| node.child_by_field_name("name")) {
+            if let Some(name_node) = node
+                .child_by_field_name("method")
+                .or_else(|| node.child_by_field_name("name"))
+            {
                 if let Ok(name) = name_node.utf8_text(source) {
                     if name == "require" || name == "require_relative" {
                         if let Some(arg) = node.child_by_field_name("arguments") {
@@ -223,8 +235,9 @@ fn extract_method_signature(
         is_method: true,
         docstring: None,
         calls,
-        
-        imports: vec![], byte_range: (0, 0)
+
+        imports: vec![],
+        byte_range: (0, 0),
     })
 }
 
@@ -232,20 +245,18 @@ fn extract_ruby_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
 
     fn clean_call_text(raw: &str) -> String {
-        raw.split('(')
-            .next()
-            .unwrap_or(raw)
-            .trim()
-            .to_string()
+        raw.split('(').next().unwrap_or(raw).trim().to_string()
     }
 
     fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
         match node.kind() {
             "call" | "method_call" | "command" | "command_call" => {
-                let receiver = node.child_by_field_name("receiver")
+                let receiver = node
+                    .child_by_field_name("receiver")
                     .and_then(|n| n.utf8_text(source).ok())
                     .map(|s| clean_call_text(s));
-                let method = node.child_by_field_name("method")
+                let method = node
+                    .child_by_field_name("method")
                     .or_else(|| node.child_by_field_name("name"))
                     .and_then(|n| n.utf8_text(source).ok())
                     .map(|s| clean_call_text(s));
@@ -253,7 +264,11 @@ fn extract_ruby_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
                 let call_name = match (receiver, method) {
                     (Some(r), Some(m)) => format!("{}.{}", r, m),
                     (_, Some(m)) => m,
-                    _ => node.utf8_text(source).ok().map(|s| clean_call_text(s)).unwrap_or_default(),
+                    _ => node
+                        .utf8_text(source)
+                        .ok()
+                        .map(|s| clean_call_text(s))
+                        .unwrap_or_default(),
                 };
 
                 if !call_name.is_empty() {
@@ -332,7 +347,12 @@ struct CfgBuilder<'a> {
 
 impl<'a> CfgBuilder<'a> {
     fn new(source: &'a [u8]) -> Self {
-        Self { source, blocks: Vec::new(), edges: Vec::new(), next_block_id: 0 }
+        Self {
+            source,
+            blocks: Vec::new(),
+            edges: Vec::new(),
+            next_block_id: 0,
+        }
     }
 
     fn build_from_node(&mut self, node: &tree_sitter::Node) -> Result<()> {
@@ -341,7 +361,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn build_cfg_recursive(&mut self, node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn build_cfg_recursive(
+        &mut self,
+        node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         match node.kind() {
             "if" | "unless" => {
                 self.handle_if_statement(node, current_block)?;
@@ -362,28 +386,63 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_if_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_if_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let true_block = self.create_block();
         let false_block = self.create_block();
         let merge_block = self.create_block();
-        self.edges.push(Edge { from: current_block, to: true_block, edge_type: EdgeType::TrueBranch });
-        self.edges.push(Edge { from: current_block, to: false_block, edge_type: EdgeType::FalseBranch });
-        self.edges.push(Edge { from: true_block, to: merge_block, edge_type: EdgeType::Unconditional });
-        self.edges.push(Edge { from: false_block, to: merge_block, edge_type: EdgeType::Unconditional });
+        self.edges.push(Edge {
+            from: current_block,
+            to: true_block,
+            edge_type: EdgeType::TrueBranch,
+        });
+        self.edges.push(Edge {
+            from: current_block,
+            to: false_block,
+            edge_type: EdgeType::FalseBranch,
+        });
+        self.edges.push(Edge {
+            from: true_block,
+            to: merge_block,
+            edge_type: EdgeType::Unconditional,
+        });
+        self.edges.push(Edge {
+            from: false_block,
+            to: merge_block,
+            edge_type: EdgeType::Unconditional,
+        });
         Ok(())
     }
 
-    fn handle_loop_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_loop_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let body_block = self.create_block();
-        self.edges.push(Edge { from: current_block, to: body_block, edge_type: EdgeType::Unconditional });
-        self.edges.push(Edge { from: body_block, to: current_block, edge_type: EdgeType::Loop });
+        self.edges.push(Edge {
+            from: current_block,
+            to: body_block,
+            edge_type: EdgeType::Unconditional,
+        });
+        self.edges.push(Edge {
+            from: body_block,
+            to: current_block,
+            edge_type: EdgeType::Loop,
+        });
         Ok(())
     }
 
     fn create_block(&mut self) -> usize {
         let id = self.next_block_id;
         self.next_block_id += 1;
-        self.blocks.push(Block { id, statements: Vec::new() });
+        self.blocks.push(Block {
+            id,
+            statements: Vec::new(),
+        });
         id
     }
 
@@ -394,7 +453,12 @@ impl<'a> CfgBuilder<'a> {
     }
 
     fn finish(self) -> Graph<Block, Edge> {
-        Graph { blocks: self.blocks, edges: self.edges, entry_block: 0, exit_blocks: vec![self.next_block_id.saturating_sub(1)] }
+        Graph {
+            blocks: self.blocks,
+            edges: self.edges,
+            entry_block: 0,
+            exit_blocks: vec![self.next_block_id.saturating_sub(1)],
+        }
     }
 }
 
@@ -447,7 +511,9 @@ end";
 end";
 
         let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_ruby::LANGUAGE.into()).unwrap();
+        parser
+            .set_language(&tree_sitter_ruby::LANGUAGE.into())
+            .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let root = tree.root_node();
 

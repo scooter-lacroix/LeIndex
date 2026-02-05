@@ -255,8 +255,7 @@ impl LanguageConfig {
     /// This method delegates to `LanguageId::from_extension` to eliminate
     /// duplicate extension mapping logic and maintain a single source of truth.
     pub fn from_extension(ext: &str) -> Option<&'static LanguageConfig> {
-        crate::grammar::LanguageId::from_extension(ext)
-            .map(|id| id.config())
+        crate::grammar::LanguageId::from_extension(ext).map(|id| id.config())
     }
 
     const fn default_queries() -> QueryPatterns {
@@ -272,12 +271,12 @@ impl LanguageConfig {
 // Language-specific modules
 /// Language-specific configurations and grammar loaders.
 pub mod languages {
-    use tree_sitter::Language;
     use crate::traits::LanguageConfig;
+    use tree_sitter::Language;
 
     /// Python language support.
     pub mod python {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// Python language configuration.
@@ -295,7 +294,7 @@ pub mod languages {
 
     /// JavaScript language support.
     pub mod javascript {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// JavaScript language configuration.
@@ -313,7 +312,7 @@ pub mod languages {
 
     /// TypeScript language support.
     pub mod typescript {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// TypeScript language configuration.
@@ -331,7 +330,7 @@ pub mod languages {
 
     /// Go language support.
     pub mod go {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// Go language configuration.
@@ -349,7 +348,7 @@ pub mod languages {
 
     /// Rust language support.
     pub mod rust {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// Rust language configuration.
@@ -367,7 +366,7 @@ pub mod languages {
 
     /// Java language support.
     pub mod java {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// Java language configuration.
@@ -385,13 +384,19 @@ pub mod languages {
 
     /// C++ language support.
     pub mod cpp {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// C++ language configuration.
         pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
             name: "C++".to_string(),
-            extensions: vec!["cpp".to_string(), "cc".to_string(), "cxx".to_string(), "hpp".to_string(), "h".to_string()],
+            extensions: vec![
+                "cpp".to_string(),
+                "cc".to_string(),
+                "cxx".to_string(),
+                "hpp".to_string(),
+                "h".to_string(),
+            ],
             queries: LanguageConfig::default_queries(),
         });
 
@@ -403,7 +408,7 @@ pub mod languages {
 
     /// C# language support.
     pub mod csharp {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// C# language configuration.
@@ -421,7 +426,7 @@ pub mod languages {
 
     /// Ruby language support.
     pub mod ruby {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// Ruby language configuration.
@@ -439,7 +444,7 @@ pub mod languages {
 
     /// PHP language support.
     pub mod php {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// PHP language configuration.
@@ -507,7 +512,7 @@ pub mod languages {
 
     /// Lua language support.
     pub mod lua {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// Lua language configuration.
@@ -525,7 +530,7 @@ pub mod languages {
 
     /// Scala language support.
     pub mod scala {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// Scala language configuration.
@@ -543,7 +548,7 @@ pub mod languages {
 
     /// C language support.
     pub mod c {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// C language configuration.
@@ -561,7 +566,7 @@ pub mod languages {
 
     /// Bash language support.
     pub mod bash {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// Bash language configuration.
@@ -579,7 +584,7 @@ pub mod languages {
 
     /// JSON language support.
     pub mod json {
-        use super::{LanguageConfig, Language};
+        use super::{Language, LanguageConfig};
         use once_cell::sync::Lazy;
 
         /// JSON language configuration.

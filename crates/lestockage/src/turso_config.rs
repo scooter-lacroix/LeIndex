@@ -211,7 +211,11 @@ impl HybridStorage {
             None
         };
 
-        Ok(Self { local, config, vectors_initialized: false })
+        Ok(Self {
+            local,
+            config,
+            vectors_initialized: false,
+        })
     }
 
     /// Initialize vector extension in Turso
@@ -253,7 +257,13 @@ impl HybridStorage {
                 created_at INTEGER DEFAULT (strftime('%s', 'now'))
             )",
             [],
-        ).map_err(|e| StorageError::LocalStorageError(format!("Failed to create node_metadata table: {:?}", e)))?;
+        )
+        .map_err(|e| {
+            StorageError::LocalStorageError(format!(
+                "Failed to create node_metadata table: {:?}",
+                e
+            ))
+        })?;
 
         // Create embeddings table
         conn.execute(
@@ -264,14 +274,21 @@ impl HybridStorage {
                 FOREIGN KEY (node_id) REFERENCES node_metadata(node_id) ON DELETE CASCADE
             )",
             [],
-        ).map_err(|e| StorageError::LocalStorageError(format!("Failed to create node_embeddings table: {:?}", e)))?;
+        )
+        .map_err(|e| {
+            StorageError::LocalStorageError(format!(
+                "Failed to create node_embeddings table: {:?}",
+                e
+            ))
+        })?;
 
         // Create index for similarity search (using FTS5-style approach)
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_node_embeddings_dimension
              ON node_embeddings(dimension)",
             [],
-        ).map_err(|e| StorageError::LocalStorageError(format!("Failed to create index: {:?}", e)))?;
+        )
+        .map_err(|e| StorageError::LocalStorageError(format!("Failed to create index: {:?}", e)))?;
 
         Ok(())
     }
@@ -301,10 +318,19 @@ impl HybridStorage {
             return Err(StorageError::VectorExtensionNotAvailable);
         }
 
-        let storage = self.local.as_ref()
+        let storage = self
+            .local
+            .as_ref()
             .ok_or_else(|| StorageError::VectorExtensionNotAvailable)?;
 
-        self.store_local_embedding(storage, node_id, symbol_name, file_path, node_type, embedding)
+        self.store_local_embedding(
+            storage,
+            node_id,
+            symbol_name,
+            file_path,
+            node_type,
+            embedding,
+        )
     }
 
     /// Store embedding in local SQLite
@@ -321,9 +347,10 @@ impl HybridStorage {
 
         // Check embedding dimension
         if embedding.len() != 768 {
-            return Err(StorageError::LocalStorageError(
-                format!("Invalid embedding dimension: {}, expected 768", embedding.len())
-            ));
+            return Err(StorageError::LocalStorageError(format!(
+                "Invalid embedding dimension: {}, expected 768",
+                embedding.len()
+            )));
         }
 
         let conn = storage.conn();
@@ -333,19 +360,23 @@ impl HybridStorage {
             "INSERT OR REPLACE INTO node_metadata (node_id, symbol_name, file_path, node_type)
              VALUES (?1, ?2, ?3, ?4)",
             params![node_id, symbol_name, file_path, node_type],
-        ).map_err(|e| StorageError::LocalStorageError(format!("Failed to insert metadata: {:?}", e)))?;
+        )
+        .map_err(|e| {
+            StorageError::LocalStorageError(format!("Failed to insert metadata: {:?}", e))
+        })?;
 
         // Convert embedding to bytes for storage
-        let embedding_bytes: Vec<u8> = embedding.iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
+        let embedding_bytes: Vec<u8> = embedding.iter().flat_map(|v| v.to_le_bytes()).collect();
 
         // Insert embedding
         conn.execute(
             "INSERT OR REPLACE INTO node_embeddings (node_id, embedding, dimension)
              VALUES (?1, ?2, ?3)",
             params![node_id, embedding_bytes, embedding.len() as i32],
-        ).map_err(|e| StorageError::LocalStorageError(format!("Failed to insert embedding: {:?}", e)))?;
+        )
+        .map_err(|e| {
+            StorageError::LocalStorageError(format!("Failed to insert embedding: {:?}", e))
+        })?;
 
         Ok(())
     }
@@ -369,7 +400,9 @@ impl HybridStorage {
             return Err(StorageError::VectorExtensionNotAvailable);
         }
 
-        let storage = self.local.as_ref()
+        let storage = self
+            .local
+            .as_ref()
             .ok_or_else(|| StorageError::VectorExtensionNotAvailable)?;
 
         self.search_local_similar(storage, query_embedding, k)
@@ -385,32 +418,42 @@ impl HybridStorage {
         use rusqlite::Row;
 
         if query_embedding.len() != 768 {
-            return Err(StorageError::LocalStorageError(
-                format!("Invalid query embedding dimension: {}, expected 768", query_embedding.len())
-            ));
+            return Err(StorageError::LocalStorageError(format!(
+                "Invalid query embedding dimension: {}, expected 768",
+                query_embedding.len()
+            )));
         }
 
         let conn = storage.conn();
 
         // Get all embeddings
-        let mut stmt = conn.prepare(
-            "SELECT n.node_id, e.embedding
+        let mut stmt = conn
+            .prepare(
+                "SELECT n.node_id, e.embedding
              FROM node_embeddings e
              JOIN node_metadata n ON e.node_id = n.node_id
-             WHERE e.dimension = 768"
-        ).map_err(|e| StorageError::LocalStorageError(format!("Failed to prepare query: {:?}", e)))?;
+             WHERE e.dimension = 768",
+            )
+            .map_err(|e| {
+                StorageError::LocalStorageError(format!("Failed to prepare query: {:?}", e))
+            })?;
 
-        let rows = stmt.query_map([], |row: &Row| {
-            let node_id: String = row.get(0)?;
-            let embedding_bytes: Vec<u8> = row.get(1)?;
-            Ok((node_id, embedding_bytes))
-        }).map_err(|e| StorageError::LocalStorageError(format!("Failed to execute query: {:?}", e)))?;
+        let rows = stmt
+            .query_map([], |row: &Row| {
+                let node_id: String = row.get(0)?;
+                let embedding_bytes: Vec<u8> = row.get(1)?;
+                Ok((node_id, embedding_bytes))
+            })
+            .map_err(|e| {
+                StorageError::LocalStorageError(format!("Failed to execute query: {:?}", e))
+            })?;
 
         // Calculate cosine similarities
         let mut results: Vec<(String, f32)> = Vec::new();
         for row in rows {
-            let (node_id, embedding_bytes) = row
-                .map_err(|e| StorageError::LocalStorageError(format!("Failed to read row: {:?}", e)))?;
+            let (node_id, embedding_bytes) = row.map_err(|e| {
+                StorageError::LocalStorageError(format!("Failed to read row: {:?}", e))
+            })?;
 
             // Convert bytes back to f32 vector
             let stored_embedding: Vec<f32> = embedding_bytes
@@ -447,12 +490,24 @@ impl HybridStorage {
             return Err(StorageError::VectorExtensionNotAvailable);
         }
 
-        let storage = self.local.as_ref()
+        let storage = self
+            .local
+            .as_ref()
             .ok_or_else(|| StorageError::VectorExtensionNotAvailable)?;
 
         let mut stored = 0;
         for (node_id, symbol_name, file_path, node_type, embedding) in embeddings {
-            if self.store_local_embedding(storage, node_id, symbol_name, file_path, node_type, embedding).is_ok() {
+            if self
+                .store_local_embedding(
+                    storage,
+                    node_id,
+                    symbol_name,
+                    file_path,
+                    node_type,
+                    embedding,
+                )
+                .is_ok()
+            {
                 stored += 1;
             }
         }
@@ -530,10 +585,7 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
 
-    let dot_product: f32 = a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| x * y)
-        .sum();
+    let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
 
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();

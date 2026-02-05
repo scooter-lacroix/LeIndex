@@ -3,18 +3,17 @@
 // *L'Index* (The Index) - Unified API that brings together all LeIndex crates
 
 use crate::memory::{
-    CacheSpiller, MemoryConfig, pdg_cache_key, search_cache_key,
-    WarmStrategy, CacheEntry,
+    pdg_cache_key, search_cache_key, CacheEntry, CacheSpiller, MemoryConfig, WarmStrategy,
 };
 use anyhow::{Context, Result};
 use legraphe::{
-    pdg::ProgramDependenceGraph,
     extract_pdg_from_signatures,
+    pdg::ProgramDependenceGraph,
     traversal::{GravityTraversal, TraversalConfig},
 };
 use leparse::parallel::ParallelParser;
 use leparse::traits::SignatureInfo;
-use lerecherche::search::{NodeInfo, SearchEngine, SearchResult, SearchQuery};
+use lerecherche::search::{NodeInfo, SearchEngine, SearchQuery, SearchResult};
 use lestockage::{pdg_store, schema::Storage};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -159,7 +158,9 @@ impl LeIndex {
     /// let leindex = LeIndex::new("/path/to/project")?;
     /// ```
     pub fn new<P: AsRef<Path>>(project_path: P) -> Result<Self> {
-        let project_path = project_path.as_ref().canonicalize()
+        let project_path = project_path
+            .as_ref()
+            .canonicalize()
             .context("Failed to canonicalize project path")?;
 
         let project_id = project_path
@@ -168,16 +169,17 @@ impl LeIndex {
             .unwrap_or("unknown")
             .to_string();
 
-        info!("Creating LeIndex for project: {} at {:?}", project_id, project_path);
+        info!(
+            "Creating LeIndex for project: {} at {:?}",
+            project_id, project_path
+        );
 
         // Initialize storage
         let storage_path = project_path.join(".leindex");
-        std::fs::create_dir_all(&storage_path)
-            .context("Failed to create .leindex directory")?;
+        std::fs::create_dir_all(&storage_path).context("Failed to create .leindex directory")?;
 
         let db_path = storage_path.join("leindex.db");
-        let storage = Storage::open(&db_path)
-            .context("Failed to initialize storage")?;
+        let storage = Storage::open(&db_path).context("Failed to initialize storage")?;
 
         // Initialize search engine
         let search_engine = SearchEngine::new();
@@ -188,8 +190,8 @@ impl LeIndex {
             cache_dir,
             ..Default::default()
         };
-        let cache_spiller = CacheSpiller::new(memory_config)
-            .context("Failed to initialize cache spiller")?;
+        let cache_spiller =
+            CacheSpiller::new(memory_config).context("Failed to initialize cache spiller")?;
 
         Ok(Self {
             project_path,
@@ -248,11 +250,15 @@ impl LeIndex {
     pub fn index_project(&mut self, force: bool) -> Result<IndexStats> {
         let start_time = std::time::Instant::now();
 
-        info!("Starting project indexing for: {} (force={})", self.project_id, force);
+        info!(
+            "Starting project indexing for: {} (force={})",
+            self.project_id, force
+        );
 
         // Step 1: Get currently indexed files from storage
-        let indexed_files = lestockage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
-            .unwrap_or_default();
+        let indexed_files =
+            lestockage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
+                .unwrap_or_default();
 
         // Step 2: Collect all source files and compute hashes
         let source_files_with_hashes = self.collect_source_files_with_hashes()?;
@@ -261,27 +267,36 @@ impl LeIndex {
         // Step 3: Identify changed/new/deleted files
         let mut files_to_parse = Vec::new();
         let mut unchanged_files = Vec::new();
-        
-        let current_file_paths: std::collections::HashSet<String> = source_files_with_hashes.iter()
+
+        let current_file_paths: std::collections::HashSet<String> = source_files_with_hashes
+            .iter()
             .map(|(p, _)| p.display().to_string())
             .collect();
 
         for (path, hash) in &source_files_with_hashes {
             let path_str = path.display().to_string();
-            if force || !indexed_files.contains_key(&path_str) || indexed_files.get(&path_str) != Some(hash) {
+            if force
+                || !indexed_files.contains_key(&path_str)
+                || indexed_files.get(&path_str) != Some(hash)
+            {
                 files_to_parse.push(path.clone());
             } else {
                 unchanged_files.push(path_str);
             }
         }
 
-        let deleted_files: Vec<String> = indexed_files.keys()
+        let deleted_files: Vec<String> = indexed_files
+            .keys()
             .filter(|p| !current_file_paths.contains(*p))
             .cloned()
             .collect();
 
-        info!("Incremental analysis: {} to parse, {} unchanged, {} deleted", 
-              files_to_parse.len(), unchanged_files.len(), deleted_files.len());
+        info!(
+            "Incremental analysis: {} to parse, {} unchanged, {} deleted",
+            files_to_parse.len(),
+            unchanged_files.len(),
+            deleted_files.len()
+        );
 
         if files_to_parse.is_empty() && deleted_files.is_empty() && self.is_indexed() {
             info!("No changes detected, skipping indexing");
@@ -313,38 +328,53 @@ impl LeIndex {
         }
         for path in &deleted_files {
             self.remove_file_from_pdg(&mut pdg, path)?;
-            let _ = lestockage::pdg_store::delete_file_data(&mut self.storage, &self.project_id, path);
+            let _ =
+                lestockage::pdg_store::delete_file_data(&mut self.storage, &self.project_id, path);
         }
 
         // Extract signatures from successful parses
         let signatures_by_file: std::collections::HashMap<String, (String, Vec<SignatureInfo>)> =
             parsing_results
-            .iter()
-            .filter_map(|r| {
-                if r.is_success() {
-                    let lang = r.language.clone().unwrap_or_else(|| "unknown".to_string());
-                    Some((r.file_path.display().to_string(), (lang, r.signatures.clone())))
-                } else {
-                    None
-                }
-            })
-            .collect();
+                .iter()
+                .filter_map(|r| {
+                    if r.is_success() {
+                        let lang = r.language.clone().unwrap_or_else(|| "unknown".to_string());
+                        Some((
+                            r.file_path.display().to_string(),
+                            (lang, r.signatures.clone()),
+                        ))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
 
         // Build partial PDG and merge
         for (file_path, (language, signatures)) in signatures_by_file {
             let file_pdg = extract_pdg_from_signatures(signatures, &[], &file_path, &language);
             self.merge_pdgs(&mut pdg, file_pdg);
-            
+
             // Update hash in storage
-            if let Some((_, hash)) = source_files_with_hashes.iter().find(|(p, _)| p.display().to_string() == file_path) {
-                let _ = lestockage::pdg_store::update_indexed_file(&mut self.storage, &self.project_id, &file_path, hash);
+            if let Some((_, hash)) = source_files_with_hashes
+                .iter()
+                .find(|(p, _)| p.display().to_string() == file_path)
+            {
+                let _ = lestockage::pdg_store::update_indexed_file(
+                    &mut self.storage,
+                    &self.project_id,
+                    &file_path,
+                    hash,
+                );
             }
         }
 
         let pdg_node_count = pdg.node_count();
         let pdg_edge_count = pdg.edge_count();
 
-        info!("Updated PDG has {} nodes and {} edges", pdg_node_count, pdg_edge_count);
+        info!(
+            "Updated PDG has {} nodes and {} edges",
+            pdg_node_count, pdg_edge_count
+        );
 
         // Step 6: Re-index nodes for search (full re-index for simplicity, search engine is fast)
         self.index_nodes(&pdg)?;
@@ -380,7 +410,11 @@ impl LeIndex {
         Ok(self.stats.clone())
     }
 
-    fn remove_file_from_pdg(&self, pdg: &mut ProgramDependenceGraph, file_path: &str) -> Result<()> {
+    fn remove_file_from_pdg(
+        &self,
+        pdg: &mut ProgramDependenceGraph,
+        file_path: &str,
+    ) -> Result<()> {
         pdg.remove_file(file_path);
         Ok(())
     }
@@ -390,9 +424,9 @@ impl LeIndex {
 
         // Common source file extensions
         let extensions = [
-            "rs", "py", "js", "ts", "tsx", "jsx",  // Main languages
-            "go", "java", "cpp", "c", "h", "hpp",    // Systems languages
-            "rb", "php", "lua", "scala",              // Scripting languages
+            "rs", "py", "js", "ts", "tsx", "jsx", // Main languages
+            "go", "java", "cpp", "c", "h", "hpp", // Systems languages
+            "rb", "php", "lua", "scala", // Scripting languages
         ];
 
         // Walk the project directory efficiently
@@ -417,8 +451,11 @@ impl LeIndex {
 
             // Skip common non-source directories
             if entry.file_type().is_dir() {
-                if file_name == "target" || file_name == "node_modules"
-                    || file_name == "vendor" || file_name == ".git" {
+                if file_name == "target"
+                    || file_name == "node_modules"
+                    || file_name == "vendor"
+                    || file_name == ".git"
+                {
                     walker.skip_current_dir();
                     continue;
                 }
@@ -450,12 +487,14 @@ impl LeIndex {
                 target.add_node(node.clone());
             }
         }
-        
+
         for edge_idx in source.edge_indices() {
             if let Some(edge) = source.get_edge(edge_idx) {
                 if let Some((s, t)) = source.edge_endpoints(edge_idx) {
                     if let (Some(sn), Some(tn)) = (source.get_node(s), source.get_node(t)) {
-                        if let (Some(si), Some(ti)) = (target.find_by_symbol(&sn.id), target.find_by_symbol(&tn.id)) {
+                        if let (Some(si), Some(ti)) =
+                            (target.find_by_symbol(&sn.id), target.find_by_symbol(&tn.id))
+                        {
                             target.add_edge(si, ti, edge.clone());
                         }
                     }
@@ -499,7 +538,9 @@ impl LeIndex {
             threshold: Some(0.1), // Added default threshold for better quality
         };
 
-        let results = self.search_engine.search(search_query)
+        let results = self
+            .search_engine
+            .search(search_query)
             .context("Search operation failed")?;
 
         debug!("Search for '{}' returned {} results", query, results.len());
@@ -542,7 +583,9 @@ impl LeIndex {
             threshold: Some(0.1), // Added threshold for better quality
         };
 
-        let results = self.search_engine.search(search_query)
+        let results = self
+            .search_engine
+            .search(search_query)
             .context("Search for analysis failed")?;
 
         // Step 2: Expand context using PDG traversal
@@ -578,12 +621,13 @@ impl LeIndex {
     /// println!("Memory usage: {:.1}%", diag.memory_usage_percent);
     /// ```
     pub fn get_diagnostics(&self) -> Result<Diagnostics> {
-        let memory_stats = self.cache_spiller.memory_stats()
+        let memory_stats = self
+            .cache_spiller
+            .memory_stats()
             .context("Failed to get memory stats")?;
         let memory_percent = memory_stats.memory_percent();
         let threshold_exceeded = self.cache_spiller.store().total_bytes() > 0
-            && self.cache_spiller.is_threshold_exceeded()
-                .unwrap_or(false);
+            && self.cache_spiller.is_threshold_exceeded().unwrap_or(false);
 
         Ok(Diagnostics {
             project_path: self.project_path.display().to_string(),
@@ -622,7 +666,10 @@ impl LeIndex {
         let pdg_node_count = pdg.node_count();
         let pdg_edge_count = pdg.edge_count();
 
-        info!("Loaded PDG with {} nodes and {} edges", pdg_node_count, pdg_edge_count);
+        info!(
+            "Loaded PDG with {} nodes and {} edges",
+            pdg_node_count, pdg_edge_count
+        );
 
         // Rebuild search index from PDG
         self.index_nodes(&pdg)?;
@@ -666,14 +713,19 @@ impl LeIndex {
     }
 
     /// Expand context around a specific node
-    pub fn expand_node_context(&self, node_id: &str, token_budget: usize) -> Result<AnalysisResult> {
+    pub fn expand_node_context(
+        &self,
+        node_id: &str,
+        token_budget: usize,
+    ) -> Result<AnalysisResult> {
         let start_time = std::time::Instant::now();
 
         let pdg = self.pdg.as_ref().ok_or_else(|| {
             anyhow::anyhow!("No PDG available for context expansion. Has the project been indexed?")
         })?;
 
-        let language = pdg.find_by_symbol(node_id)
+        let language = pdg
+            .find_by_symbol(node_id)
             .and_then(|id| pdg.get_node(id))
             .map(|n| n.language.clone())
             .unwrap_or_else(|| "unknown".to_string());
@@ -722,8 +774,10 @@ impl LeIndex {
         if self.cache_spiller.is_threshold_exceeded()? {
             info!("Memory threshold exceeded, initiating cache spilling");
             let result = self.cache_spiller.check_and_spill()?;
-            info!("Spilled {} entries, freed {} bytes",
-                  result.entries_spilled, result.memory_freed);
+            info!(
+                "Spilled {} entries, freed {} bytes",
+                result.entries_spilled, result.memory_freed
+            );
             Ok(true)
         } else {
             Ok(false)
@@ -740,9 +794,10 @@ impl LeIndex {
     ///
     /// `Result<()>` - Success or error
     pub fn spill_pdg_cache(&mut self) -> Result<()> {
-        let pdg = self.pdg.take().ok_or_else(|| {
-            anyhow::anyhow!("No PDG in memory to spill")
-        })?;
+        let pdg = self
+            .pdg
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("No PDG in memory to spill"))?;
 
         let node_count = pdg.node_count();
         let edge_count = pdg.edge_count();
@@ -758,12 +813,15 @@ impl LeIndex {
         };
 
         // Store marker in cache spiller
-        self.cache_spiller.store_mut()
+        self.cache_spiller
+            .store_mut()
             .insert(cache_key, entry)
             .context("Failed to create PDG spill marker")?;
 
-        info!("Spilled PDG from memory: {} nodes, {} edges (persisted to lestockage)",
-              node_count, edge_count);
+        info!(
+            "Spilled PDG from memory: {} nodes, {} edges (persisted to lestockage)",
+            node_count, edge_count
+        );
 
         Ok(())
     }
@@ -791,7 +849,8 @@ impl LeIndex {
             serialized_data: vec![], // Empty - vectors would be re-indexed from PDG
         };
 
-        self.cache_spiller.store_mut()
+        self.cache_spiller
+            .store_mut()
             .insert(cache_key, entry)
             .context("Failed to spill vector cache marker")?;
 
@@ -821,8 +880,10 @@ impl LeIndex {
         self.spill_vector_cache()?;
         let vector_bytes = self.cache_spiller.store().total_bytes() - pdg_bytes;
 
-        info!("Spilled all caches: PDG ({} bytes), Vector ({} bytes)",
-              pdg_bytes, vector_bytes);
+        info!(
+            "Spilled all caches: PDG ({} bytes), Vector ({} bytes)",
+            pdg_bytes, vector_bytes
+        );
 
         Ok((pdg_bytes, vector_bytes))
     }
@@ -861,7 +922,9 @@ impl LeIndex {
     /// `Result<usize>` - Number of nodes indexed
     pub fn reload_vector_from_pdg(&mut self) -> Result<usize> {
         // Take PDG temporarily to avoid borrow checker issues
-        let pdg = self.pdg.take()
+        let pdg = self
+            .pdg
+            .take()
             .ok_or_else(|| anyhow::anyhow!("No PDG available for vector rebuild"))?;
 
         // Re-use the index_nodes logic to ensure consistent embedding generation
@@ -914,12 +977,12 @@ impl LeIndex {
     ///
     /// `Result<MemoryStats>` - Cache statistics
     pub fn get_cache_stats(&self) -> Result<crate::memory::MemoryStats> {
-        self.cache_spiller.memory_stats()
+        self.cache_spiller
+            .memory_stats()
             .map_err(|e| anyhow::anyhow!("Failed to get cache stats: {}", e))
     }
 
     // ========================================================================
-
 
     /// Generate a deterministic embedding for a query string
     pub fn generate_query_embedding(&self, query: &str) -> Vec<f32> {
@@ -939,8 +1002,8 @@ impl LeIndex {
         _file_path: &str,
         _content: &str,
     ) -> Vec<f32> {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut embedding = Vec::with_capacity(768);
 
@@ -956,7 +1019,7 @@ impl LeIndex {
             base_hash.hash(&mut hasher);
             i.hash(&mut hasher);
             let hash_val = hasher.finish();
-            
+
             // Map 64-bit hash to f32 in [-1.0, 1.0]
             let val = (hash_val as f64 / u64::MAX as f64) * 2.0 - 1.0;
             embedding.push(val as f32);
@@ -970,7 +1033,8 @@ impl LeIndex {
         let mut nodes = Vec::new();
 
         // Read file contents once per file to avoid repeated I/O
-        let mut file_cache: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut file_cache: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
 
         // Convert PDG nodes to NodeInfo for indexing
         for node_idx in pdg.node_indices() {
@@ -990,14 +1054,26 @@ impl LeIndex {
                 let node_content = if !content.is_empty() && node.byte_range.1 > node.byte_range.0 {
                     let start = node.byte_range.0;
                     let end = node.byte_range.1.min(content.len());
-                    format!("// {} in {}\n{}", node.name, node.file_path, &content[start..end])
+                    format!(
+                        "// {} in {}\n{}",
+                        node.name,
+                        node.file_path,
+                        &content[start..end]
+                    )
                 } else {
-                    format!("// {} in {}\n{}", node.name, node.file_path, "// [No source code available]")
+                    format!(
+                        "// {} in {}\n{}",
+                        node.name, node.file_path, "// [No source code available]"
+                    )
                 };
-                
+
                 // Use existing embedding if present, otherwise generate a deterministic one
                 let embedding = node.embedding.clone().unwrap_or_else(|| {
-                    self.generate_deterministic_embedding(&node.name, &node.file_path, &node_content)
+                    self.generate_deterministic_embedding(
+                        &node.name,
+                        &node.file_path,
+                        &node_content,
+                    )
                 });
 
                 let node_info = NodeInfo {
@@ -1049,7 +1125,7 @@ impl LeIndex {
                 context.push_str(&format!("\n// Symbol: {}\n", node.name));
                 context.push_str(&format!("// File: {}\n", node.file_path));
                 context.push_str(&format!("// Type: {:?}\n", node.node_type));
-                
+
                 // Retrieve actual source code if byte_range is valid
                 if node.byte_range.1 > node.byte_range.0 {
                     if let Ok(content) = std::fs::read(&node.file_path) {
@@ -1062,7 +1138,10 @@ impl LeIndex {
                             context.push_str("// [Error: Source code is not valid UTF-8]\n");
                         }
                     } else {
-                        context.push_str(&format!("// [Error: Could not read file: {}]\n", node.file_path));
+                        context.push_str(&format!(
+                            "// [Error: Could not read file: {}]\n",
+                            node.file_path
+                        ));
                     }
                 } else {
                     context.push_str("// [No source code range available for this node]\n");

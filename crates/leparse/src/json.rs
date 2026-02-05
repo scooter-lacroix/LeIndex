@@ -1,6 +1,8 @@
 // JSON data format parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Block, Edge, Error, Graph, Result, SignatureInfo};
+use crate::traits::{
+    Block, CodeIntelligence, ComplexityMetrics, Edge, Error, Graph, Result, SignatureInfo,
+};
 
 /// JSON parser with full CodeIntelligence implementation
 pub struct JsonParser;

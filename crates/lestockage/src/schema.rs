@@ -99,27 +99,50 @@ impl Storage {
         )?;
 
         // Migration: Ensure new columns exist for existing databases
-        let columns: Vec<String> = self.conn.prepare("PRAGMA table_info(intel_nodes)")?
+        let columns: Vec<String> = self
+            .conn
+            .prepare("PRAGMA table_info(intel_nodes)")?
             .query_map([], |row| row.get::<_, String>(1))?
             .collect::<SqliteResult<Vec<_>>>()?;
 
         if !columns.iter().any(|c| c == "node_id") {
-            self.conn.execute("ALTER TABLE intel_nodes ADD COLUMN node_id TEXT DEFAULT ''", [])?;
+            self.conn.execute(
+                "ALTER TABLE intel_nodes ADD COLUMN node_id TEXT DEFAULT ''",
+                [],
+            )?;
             // Update node_id with symbol_name for existing records
-            self.conn.execute("UPDATE intel_nodes SET node_id = symbol_name WHERE node_id = ''", [])?;
+            self.conn.execute(
+                "UPDATE intel_nodes SET node_id = symbol_name WHERE node_id = ''",
+                [],
+            )?;
         }
         if !columns.iter().any(|c| c == "qualified_name") {
-            self.conn.execute("ALTER TABLE intel_nodes ADD COLUMN qualified_name TEXT DEFAULT ''", [])?;
-            self.conn.execute("UPDATE intel_nodes SET qualified_name = symbol_name WHERE qualified_name = ''", [])?;
+            self.conn.execute(
+                "ALTER TABLE intel_nodes ADD COLUMN qualified_name TEXT DEFAULT ''",
+                [],
+            )?;
+            self.conn.execute(
+                "UPDATE intel_nodes SET qualified_name = symbol_name WHERE qualified_name = ''",
+                [],
+            )?;
         }
         if !columns.iter().any(|c| c == "language") {
-            self.conn.execute("ALTER TABLE intel_nodes ADD COLUMN language TEXT DEFAULT 'unknown'", [])?;
+            self.conn.execute(
+                "ALTER TABLE intel_nodes ADD COLUMN language TEXT DEFAULT 'unknown'",
+                [],
+            )?;
         }
         if !columns.iter().any(|c| c == "byte_range_start") {
-            self.conn.execute("ALTER TABLE intel_nodes ADD COLUMN byte_range_start INTEGER", [])?;
+            self.conn.execute(
+                "ALTER TABLE intel_nodes ADD COLUMN byte_range_start INTEGER",
+                [],
+            )?;
         }
         if !columns.iter().any(|c| c == "byte_range_end") {
-            self.conn.execute("ALTER TABLE intel_nodes ADD COLUMN byte_range_end INTEGER", [])?;
+            self.conn.execute(
+                "ALTER TABLE intel_nodes ADD COLUMN byte_range_end INTEGER",
+                [],
+            )?;
         }
 
         // Create intel_edges table

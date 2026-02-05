@@ -152,12 +152,14 @@ impl LeIndexError {
             LeIndexError::Config { suggestion, .. } => suggestion.clone(),
             LeIndexError::Memory { suggestion, .. } => suggestion.clone(),
             LeIndexError::Validation { suggestion, .. } => suggestion.clone(),
-            LeIndexError::Index { recoverable: true, .. } => {
+            LeIndexError::Index {
+                recoverable: true, ..
+            } => {
                 Some("Try re-indexing with a smaller token budget or fewer languages.".to_string())
             }
-            LeIndexError::Storage { recoverable: true, .. } => {
-                Some("Try deleting .leindex directory and re-indexing.".to_string())
-            }
+            LeIndexError::Storage {
+                recoverable: true, ..
+            } => Some("Try deleting .leindex directory and re-indexing.".to_string()),
             _ => None,
         }
     }
@@ -283,8 +285,7 @@ impl ErrorContext {
 
     /// Check if we should abort based on error count
     pub fn should_abort(&self) -> bool {
-        self.error_count >= self.max_errors
-            || !self.error.is_recoverable()
+        self.error_count >= self.max_errors || !self.error.is_recoverable()
     }
 }
 
@@ -406,7 +407,10 @@ impl CorruptionStatus {
                 format!("Major corruption: {}", description)
             }
             CorruptionStatus::Severe { description } => {
-                format!("Severe corruption: {}. Index rebuild required.", description)
+                format!(
+                    "Severe corruption: {}. Index rebuild required.",
+                    description
+                )
             }
         }
     }
@@ -432,9 +436,7 @@ pub fn detect_corruption<P: AsRef<Path>>(project_path: P) -> Result<CorruptionSt
     // Check if database exists
     let db_path = leindex_dir.join("leindex.db");
     if !db_path.exists() {
-        return Ok(CorruptionStatus::Minor {
-            missing_files: 1,
-        });
+        return Ok(CorruptionStatus::Minor { missing_files: 1 });
     }
 
     // Try to open and validate the database
@@ -531,8 +533,8 @@ mod tests {
 
     #[test]
     fn test_recovery_strategy() {
-        let ctx = ErrorContext::new("test")
-            .with_error(LeIndexError::parse_error("test", "/test/path"));
+        let ctx =
+            ErrorContext::new("test").with_error(LeIndexError::parse_error("test", "/test/path"));
 
         let strategy = ctx.recovery_strategy();
         assert_eq!(strategy, RecoveryStrategy::Skip);

@@ -5,42 +5,39 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
-/// Database schema and connection management.
-pub mod schema;
-/// Storage and retrieval of code nodes.
-pub mod nodes;
-/// Storage and retrieval of graph edges.
-pub mod edges;
-/// Salsa-inspired incremental computation and caching.
-pub mod salsa;
 /// Storage analytics and metrics.
 pub mod analytics;
-/// Persistent storage for Program Dependence Graphs.
-pub mod pdg_store;
-/// Global symbol table for cross-project indexing.
-pub mod global_symbols;
 /// Cross-project reference resolution and graph merging.
 pub mod cross_project;
+/// Storage and retrieval of graph edges.
+pub mod edges;
+/// Global symbol table for cross-project indexing.
+pub mod global_symbols;
+/// Storage and retrieval of code nodes.
+pub mod nodes;
+/// Persistent storage for Program Dependence Graphs.
+pub mod pdg_store;
+/// Salsa-inspired incremental computation and caching.
+pub mod salsa;
+/// Database schema and connection management.
+pub mod schema;
 /// Configuration for Turso and hybrid storage backends.
 pub mod turso_config;
 
-pub use schema::{Storage, StorageConfig};
-pub use nodes::{NodeStore, NodeRecord};
-pub use edges::{EdgeStore, EdgeRecord};
-pub use salsa::{IncrementalCache, NodeHash};
 pub use analytics::Analytics;
-pub use pdg_store::{save_pdg, load_pdg, pdg_exists, delete_pdg, PdgStoreError, Result as PdgStoreResult};
+pub use cross_project::{CrossProjectResolver, MergeError, ResolutionError, ResolvedSymbol};
+pub use edges::{EdgeRecord, EdgeStore};
 pub use global_symbols::{
-    GlobalSymbolTable, GlobalSymbol, GlobalSymbolId, SymbolType,
-    ExternalRef, RefType, ProjectDep, DepType, GlobalSymbolError
+    DepType, ExternalRef, GlobalSymbol, GlobalSymbolError, GlobalSymbolId, GlobalSymbolTable,
+    ProjectDep, RefType, SymbolType,
 };
-pub use cross_project::{
-    CrossProjectResolver, ResolvedSymbol, ResolutionError,
-    MergeError
+pub use nodes::{NodeRecord, NodeStore};
+pub use pdg_store::{
+    delete_pdg, load_pdg, pdg_exists, save_pdg, PdgStoreError, Result as PdgStoreResult,
 };
-pub use turso_config::{
-    TursoConfig, HybridStorage, StorageMode, MigrationStats, StorageError
-};
+pub use salsa::{IncrementalCache, NodeHash};
+pub use schema::{Storage, StorageConfig};
+pub use turso_config::{HybridStorage, MigrationStats, StorageError, StorageMode, TursoConfig};
 
 /// Storage library initialization
 pub fn init() {

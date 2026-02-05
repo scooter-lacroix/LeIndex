@@ -1,7 +1,9 @@
 // PHP language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
 use tree_sitter::Parser;
 
 /// PHP language parser with full CodeIntelligence implementation
@@ -19,7 +21,11 @@ impl PhpParser {
         Self
     }
 
-    fn extract_all_definitions(&self, source: &[u8], root: tree_sitter::Node) -> Vec<SignatureInfo> {
+    fn extract_all_definitions(
+        &self,
+        source: &[u8],
+        root: tree_sitter::Node,
+    ) -> Vec<SignatureInfo> {
         let mut signatures = Vec::new();
 
         fn visit_node(
@@ -53,7 +59,11 @@ impl PhpParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: None,  calls: vec![], imports: vec![],  byte_range: (0, 0) });
+                            docstring: None,
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (0, 0),
+                        });
                     }
 
                     let mut cursor = node.walk();
@@ -80,7 +90,11 @@ impl PhpParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: None,  calls: vec![], imports: vec![],  byte_range: (0, 0) });
+                            docstring: None,
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (0, 0),
+                        });
                     }
                 }
                 "namespace_definition" => {
@@ -182,7 +196,10 @@ fn extract_php_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo
 
     fn parse_use_text(imports: &mut Vec<ImportInfo>, text: &str) {
         let text = text.trim().trim_end_matches(';');
-        let text = text.trim_start_matches("use ").trim_start_matches("use function ").trim_start_matches("use const ");
+        let text = text
+            .trim_start_matches("use ")
+            .trim_start_matches("use function ")
+            .trim_start_matches("use const ");
         for part in text.split(',') {
             let part = part.trim();
             if part.is_empty() {
@@ -191,7 +208,11 @@ fn extract_php_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo
             if let Some((path, alias)) = part.split_once(" as ") {
                 add_import(imports, path.trim(), Some(alias.trim().to_string()));
             } else {
-                add_import(imports, part, part.split('\\').last().map(|s| s.to_string()));
+                add_import(
+                    imports,
+                    part,
+                    part.split('\\').last().map(|s| s.to_string()),
+                );
             }
         }
     }
@@ -248,8 +269,9 @@ fn extract_function_signature(
         is_method: node.kind() == "method_declaration",
         docstring: extract_docstring(node, source),
         calls,
-        
-        imports: vec![], byte_range: (0, 0)
+
+        imports: vec![],
+        byte_range: (0, 0),
     })
 }
 
@@ -257,18 +279,16 @@ fn extract_php_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
 
     fn clean_call_text(raw: &str) -> String {
-        raw.split('(')
-            .next()
-            .unwrap_or(raw)
-            .trim()
-            .to_string()
+        raw.split('(').next().unwrap_or(raw).trim().to_string()
     }
 
     fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
         match node.kind() {
             "function_call_expression" | "method_call_expression" | "scoped_call_expression" => {
-                if let Some(name_node) = node.child_by_field_name("name")
-                    .or_else(|| node.child_by_field_name("function")) {
+                if let Some(name_node) = node
+                    .child_by_field_name("name")
+                    .or_else(|| node.child_by_field_name("function"))
+                {
                     if let Ok(text) = name_node.utf8_text(source) {
                         let name = clean_call_text(text);
                         if !name.is_empty() {
@@ -278,8 +298,10 @@ fn extract_php_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
                 }
             }
             "object_creation_expression" => {
-                if let Some(name_node) = node.child_by_field_name("class")
-                    .or_else(|| node.child_by_field_name("type")) {
+                if let Some(name_node) = node
+                    .child_by_field_name("class")
+                    .or_else(|| node.child_by_field_name("type"))
+                {
                     if let Ok(text) = name_node.utf8_text(source) {
                         let name = clean_call_text(text);
                         if !name.is_empty() {
@@ -415,7 +437,8 @@ fn calculate_complexity(node: &tree_sitter::Node, metrics: &mut ComplexityMetric
     metrics.nesting_depth = metrics.nesting_depth.max(depth);
     metrics.line_count = std::cmp::max(metrics.line_count, 1);
     match node.kind() {
-        "if_statement" | "for_statement" | "foreach_statement" | "while_statement" | "switch_statement" => {
+        "if_statement" | "for_statement" | "foreach_statement" | "while_statement"
+        | "switch_statement" => {
             metrics.cyclomatic += 1;
         }
         _ => {}
@@ -436,7 +459,12 @@ struct CfgBuilder<'a> {
 
 impl<'a> CfgBuilder<'a> {
     fn new(source: &'a [u8]) -> Self {
-        Self { source, blocks: Vec::new(), edges: Vec::new(), next_block_id: 0 }
+        Self {
+            source,
+            blocks: Vec::new(),
+            edges: Vec::new(),
+            next_block_id: 0,
+        }
     }
 
     fn build_from_node(&mut self, node: &tree_sitter::Node) -> Result<()> {
@@ -445,7 +473,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn build_cfg_recursive(&mut self, node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn build_cfg_recursive(
+        &mut self,
+        node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         match node.kind() {
             "if_statement" => {
                 self.handle_if_statement(node, current_block)?;
@@ -466,28 +498,63 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_if_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_if_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let true_block = self.create_block();
         let false_block = self.create_block();
         let merge_block = self.create_block();
-        self.edges.push(Edge { from: current_block, to: true_block, edge_type: EdgeType::TrueBranch });
-        self.edges.push(Edge { from: current_block, to: false_block, edge_type: EdgeType::FalseBranch });
-        self.edges.push(Edge { from: true_block, to: merge_block, edge_type: EdgeType::Unconditional });
-        self.edges.push(Edge { from: false_block, to: merge_block, edge_type: EdgeType::Unconditional });
+        self.edges.push(Edge {
+            from: current_block,
+            to: true_block,
+            edge_type: EdgeType::TrueBranch,
+        });
+        self.edges.push(Edge {
+            from: current_block,
+            to: false_block,
+            edge_type: EdgeType::FalseBranch,
+        });
+        self.edges.push(Edge {
+            from: true_block,
+            to: merge_block,
+            edge_type: EdgeType::Unconditional,
+        });
+        self.edges.push(Edge {
+            from: false_block,
+            to: merge_block,
+            edge_type: EdgeType::Unconditional,
+        });
         Ok(())
     }
 
-    fn handle_loop_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_loop_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let body_block = self.create_block();
-        self.edges.push(Edge { from: current_block, to: body_block, edge_type: EdgeType::Unconditional });
-        self.edges.push(Edge { from: body_block, to: current_block, edge_type: EdgeType::Loop });
+        self.edges.push(Edge {
+            from: current_block,
+            to: body_block,
+            edge_type: EdgeType::Unconditional,
+        });
+        self.edges.push(Edge {
+            from: body_block,
+            to: current_block,
+            edge_type: EdgeType::Loop,
+        });
         Ok(())
     }
 
     fn create_block(&mut self) -> usize {
         let id = self.next_block_id;
         self.next_block_id += 1;
-        self.blocks.push(Block { id, statements: Vec::new() });
+        self.blocks.push(Block {
+            id,
+            statements: Vec::new(),
+        });
         id
     }
 
@@ -498,7 +565,12 @@ impl<'a> CfgBuilder<'a> {
     }
 
     fn finish(self) -> Graph<Block, Edge> {
-        Graph { blocks: self.blocks, edges: self.edges, entry_block: 0, exit_blocks: vec![self.next_block_id.saturating_sub(1)] }
+        Graph {
+            blocks: self.blocks,
+            edges: self.edges,
+            entry_block: 0,
+            exit_blocks: vec![self.next_block_id.saturating_sub(1)],
+        }
     }
 }
 
@@ -555,7 +627,9 @@ function complex($x) {
 
         let mut parser = Parser::new();
         // Use the language function from traits
-        parser.set_language(&crate::traits::languages::php::language()).unwrap();
+        parser
+            .set_language(&crate::traits::languages::php::language())
+            .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let root = tree.root_node();
 

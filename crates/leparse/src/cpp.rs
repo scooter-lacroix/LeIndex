@@ -1,7 +1,9 @@
 // C++ language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
 use tree_sitter::Parser;
 
 /// C++ language parser with full CodeIntelligence implementation
@@ -59,7 +61,11 @@ impl CppParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                        });
                     }
 
                     // Recurse to extract class methods
@@ -87,7 +93,11 @@ impl CppParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                        });
                     }
                 }
                 "enum_specifier" => {
@@ -109,7 +119,11 @@ impl CppParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),  calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()) });
+                            docstring: extract_docstring(node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                        });
                     }
                 }
                 "namespace_definition" => {
@@ -249,8 +263,9 @@ fn extract_function_signature(
         is_method: false,
         docstring: extract_docstring(node, source),
         calls,
-        
-        imports: vec![], byte_range: (node.start_byte(), node.end_byte())
+
+        imports: vec![],
+        byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 
@@ -259,7 +274,12 @@ fn extract_cpp_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo
     let mut imports = Vec::new();
 
     fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
-        let path = path.trim().trim_matches('"').trim_matches('<').trim_matches('>').trim();
+        let path = path
+            .trim()
+            .trim_matches('"')
+            .trim_matches('<')
+            .trim_matches('>')
+            .trim();
         if path.is_empty() {
             return;
         }
@@ -294,11 +314,7 @@ fn extract_cpp_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
 
     fn clean_call_text(raw: &str) -> String {
-        raw.split('(')
-            .next()
-            .unwrap_or(raw)
-            .trim()
-            .to_string()
+        raw.split('(').next().unwrap_or(raw).trim().to_string()
     }
 
     fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
@@ -437,12 +453,8 @@ fn calculate_complexity(node: &tree_sitter::Node, metrics: &mut ComplexityMetric
     metrics.line_count = std::cmp::max(metrics.line_count, 1);
 
     match node.kind() {
-        "if_statement"
-        | "for_statement"
-        | "while_statement"
-        | "do_statement"
-        | "switch_statement"
-        | "case_statement" => {
+        "if_statement" | "for_statement" | "while_statement" | "do_statement"
+        | "switch_statement" | "case_statement" => {
             metrics.cyclomatic += 1;
         }
         _ => {}
@@ -510,7 +522,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_if_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_if_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let true_block = self.create_block();
         let false_block = self.create_block();
         let merge_block = self.create_block();
@@ -539,7 +555,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_loop_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_loop_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let body_block = self.create_block();
 
         self.edges.push(Edge {
@@ -556,7 +576,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_switch_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_switch_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let merge_block = self.create_block();
 
         let mut cursor = _node.walk();
@@ -663,7 +687,9 @@ private:
         let parser = CppParser::new();
         let signatures = parser.get_signatures(source).unwrap();
 
-        let func = signatures.iter().find(|s| s.qualified_name.contains("MyNamespace"));
+        let func = signatures
+            .iter()
+            .find(|s| s.qualified_name.contains("MyNamespace"));
         assert!(func.is_some());
     }
 
@@ -680,7 +706,9 @@ private:
 }";
 
         let mut parser = Parser::new();
-        parser.set_language(&tree_sitter_cpp::LANGUAGE.into()).unwrap();
+        parser
+            .set_language(&tree_sitter_cpp::LANGUAGE.into())
+            .unwrap();
         let tree = parser.parse(source, None).unwrap();
         let root = tree.root_node();
 

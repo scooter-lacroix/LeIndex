@@ -5,22 +5,22 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
-/// Program Dependence Graph implementation.
-pub mod pdg;
-/// Gravity-based graph traversal algorithms.
-pub mod traversal;
+/// Multi-project graph integration and cross-referencing.
+pub mod cross_project;
 /// Graph node embedding and vector representation.
 pub mod embedding;
 /// Extraction logic for building PDGs from signatures.
 pub mod extraction;
-/// Multi-project graph integration and cross-referencing.
-pub mod cross_project;
+/// Program Dependence Graph implementation.
+pub mod pdg;
+/// Gravity-based graph traversal algorithms.
+pub mod traversal;
 
-pub use pdg::{ProgramDependenceGraph, Node, Edge};
-pub use traversal::{GravityTraversal, TraversalConfig};
+pub use cross_project::{CrossProjectPDG, ExternalNodeRef, MergeError};
 pub use embedding::NodeEmbedding;
 pub use extraction::extract_pdg_from_signatures;
-pub use cross_project::{CrossProjectPDG, ExternalNodeRef, MergeError};
+pub use pdg::{Edge, Node, ProgramDependenceGraph};
+pub use traversal::{GravityTraversal, TraversalConfig};
 
 /// Graph library initialization
 pub fn init() {

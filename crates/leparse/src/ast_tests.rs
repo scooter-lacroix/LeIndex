@@ -129,7 +129,8 @@ mod zero_copy_tests {
 
         // Find the actual position of "function inner" in the source
         let inner_text = b"function inner() {}";
-        let inner_start = source.windows(inner_text.len())
+        let inner_start = source
+            .windows(inner_text.len())
             .position(|w| w == inner_text.as_slice())
             .unwrap();
         let inner_range = inner_start..(inner_start + inner_text.len());
@@ -140,8 +141,14 @@ mod zero_copy_tests {
         outer.add_child(inner);
 
         // Both nodes store byte ranges, not text
-        assert_eq!(outer.text(source).unwrap(), "function outer() { function inner() {} }");
-        assert_eq!(outer.children[0].text(source).unwrap(), "function inner() {}");
+        assert_eq!(
+            outer.text(source).unwrap(),
+            "function outer() { function inner() {} }"
+        );
+        assert_eq!(
+            outer.children[0].text(source).unwrap(),
+            "function inner() {}"
+        );
 
         // Can get names via byte ranges
         let outer_name = outer.name(source).unwrap();
@@ -290,7 +297,10 @@ mod benchmark_style_tests {
 
         // The node size is constant regardless of source size
         // This proves zero-copy - we don't store the source text
-        assert!(node_size < 1000, "AstNode should be small (fixed size, not storing source)");
+        assert!(
+            node_size < 1000,
+            "AstNode should be small (fixed size, not storing source)"
+        );
 
         // Yet we can still access the full source text
         let text = node.text(&large_source).unwrap();

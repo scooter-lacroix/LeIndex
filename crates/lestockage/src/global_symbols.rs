@@ -231,8 +231,10 @@ impl<'a> GlobalSymbolTable<'a> {
         let byte_end = symbol.byte_range.1 as i64;
         let is_public = if symbol.is_public { 1 } else { 0 };
 
-        self.db.conn().execute(
-            "INSERT INTO global_symbols (
+        self.db
+            .conn()
+            .execute(
+                "INSERT INTO global_symbols (
                 symbol_id, project_id, symbol_name, symbol_type,
                 signature, file_path, byte_range_start, byte_range_end,
                 complexity, is_public
@@ -243,28 +245,26 @@ impl<'a> GlobalSymbolTable<'a> {
                 byte_range_end = excluded.byte_range_end,
                 complexity = excluded.complexity,
                 is_public = excluded.is_public",
-            params![
-                &symbol.symbol_id,
-                &symbol.project_id,
-                &symbol.symbol_name,
-                symbol.symbol_type.as_str(),
-                &symbol.signature,
-                &symbol.file_path,
-                byte_start,
-                byte_end,
-                symbol.complexity as i64,
-                is_public,
-            ],
-        ).map_err(GlobalSymbolError::from)?;
+                params![
+                    &symbol.symbol_id,
+                    &symbol.project_id,
+                    &symbol.symbol_name,
+                    symbol.symbol_type.as_str(),
+                    &symbol.signature,
+                    &symbol.file_path,
+                    byte_start,
+                    byte_end,
+                    symbol.complexity as i64,
+                    is_public,
+                ],
+            )
+            .map_err(GlobalSymbolError::from)?;
 
         Ok(())
     }
 
     /// Batch insert symbols
-    pub fn upsert_symbols_batch(
-        &self,
-        symbols: &[GlobalSymbol],
-    ) -> Result<(), GlobalSymbolError> {
+    pub fn upsert_symbols_batch(&self, symbols: &[GlobalSymbol]) -> Result<(), GlobalSymbolError> {
         // Use rusqlite's transaction method which can be called on &Connection
         self.db.conn().execute("BEGIN IMMEDIATE TRANSACTION", [])?;
 
@@ -310,22 +310,31 @@ impl<'a> GlobalSymbolTable<'a> {
             Ok(inner) => inner.map_err(GlobalSymbolError::from),
             Err(_) => {
                 self.db.conn().execute("ROLLBACK", []).ok();
-                Err(GlobalSymbolError::Sqlite(rusqlite::Error::ExecuteReturnedResults))
+                Err(GlobalSymbolError::Sqlite(
+                    rusqlite::Error::ExecuteReturnedResults,
+                ))
             }
         }?;
 
-        self.db.conn().execute("COMMIT", []).map_err(GlobalSymbolError::from)?;
+        self.db
+            .conn()
+            .execute("COMMIT", [])
+            .map_err(GlobalSymbolError::from)?;
         Ok(())
     }
 
     /// Resolve symbol by name (returns all matches across projects)
     pub fn resolve_by_name(&self, name: &str) -> Result<Vec<GlobalSymbol>, GlobalSymbolError> {
-        let mut stmt = self.db.conn().prepare(
-            "SELECT symbol_id, project_id, symbol_name, symbol_type, signature,
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare(
+                "SELECT symbol_id, project_id, symbol_name, symbol_type, signature,
                     file_path, byte_range_start, byte_range_end, complexity, is_public
              FROM global_symbols
-             WHERE symbol_name = ?1"
-        ).map_err(GlobalSymbolError::from)?;
+             WHERE symbol_name = ?1",
+            )
+            .map_err(GlobalSymbolError::from)?;
 
         let symbols = stmt
             .query_map(params![name], |row| {
@@ -337,7 +346,10 @@ impl<'a> GlobalSymbolTable<'a> {
                         .unwrap_or(SymbolType::Function),
                     signature: row.get(4)?,
                     file_path: row.get(5)?,
-                    byte_range: (row.get::<_, i64>(6)? as usize, row.get::<_, i64>(7)? as usize),
+                    byte_range: (
+                        row.get::<_, i64>(6)? as usize,
+                        row.get::<_, i64>(7)? as usize,
+                    ),
                     complexity: row.get::<_, i64>(8)? as u32,
                     is_public: row.get::<_, i64>(9)? == 1,
                 })
@@ -355,12 +367,16 @@ impl<'a> GlobalSymbolTable<'a> {
         name: &str,
         symbol_type: SymbolType,
     ) -> Result<Vec<GlobalSymbol>, GlobalSymbolError> {
-        let mut stmt = self.db.conn().prepare(
-            "SELECT symbol_id, project_id, symbol_name, symbol_type, signature,
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare(
+                "SELECT symbol_id, project_id, symbol_name, symbol_type, signature,
                     file_path, byte_range_start, byte_range_end, complexity, is_public
              FROM global_symbols
-             WHERE symbol_name = ?1 AND symbol_type = ?2"
-        ).map_err(GlobalSymbolError::from)?;
+             WHERE symbol_name = ?1 AND symbol_type = ?2",
+            )
+            .map_err(GlobalSymbolError::from)?;
 
         let symbols = stmt
             .query_map(params![name, symbol_type.as_str()], |row| {
@@ -372,7 +388,10 @@ impl<'a> GlobalSymbolTable<'a> {
                         .unwrap_or(SymbolType::Function),
                     signature: row.get(4)?,
                     file_path: row.get(5)?,
-                    byte_range: (row.get::<_, i64>(6)? as usize, row.get::<_, i64>(7)? as usize),
+                    byte_range: (
+                        row.get::<_, i64>(6)? as usize,
+                        row.get::<_, i64>(7)? as usize,
+                    ),
                     complexity: row.get::<_, i64>(8)? as u32,
                     is_public: row.get::<_, i64>(9)? == 1,
                 })
@@ -385,13 +404,20 @@ impl<'a> GlobalSymbolTable<'a> {
     }
 
     /// Get symbol by ID
-    pub fn get_symbol(&self, symbol_id: &GlobalSymbolId) -> Result<Option<GlobalSymbol>, GlobalSymbolError> {
-        let mut stmt = self.db.conn().prepare(
-            "SELECT symbol_id, project_id, symbol_name, symbol_type, signature,
+    pub fn get_symbol(
+        &self,
+        symbol_id: &GlobalSymbolId,
+    ) -> Result<Option<GlobalSymbol>, GlobalSymbolError> {
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare(
+                "SELECT symbol_id, project_id, symbol_name, symbol_type, signature,
                     file_path, byte_range_start, byte_range_end, complexity, is_public
              FROM global_symbols
-             WHERE symbol_id = ?1"
-        ).map_err(GlobalSymbolError::from)?;
+             WHERE symbol_id = ?1",
+            )
+            .map_err(GlobalSymbolError::from)?;
 
         let result = stmt
             .query_row(params![symbol_id], |row| {
@@ -403,7 +429,10 @@ impl<'a> GlobalSymbolTable<'a> {
                         .unwrap_or(SymbolType::Function),
                     signature: row.get(4)?,
                     file_path: row.get(5)?,
-                    byte_range: (row.get::<_, i64>(6)? as usize, row.get::<_, i64>(7)? as usize),
+                    byte_range: (
+                        row.get::<_, i64>(6)? as usize,
+                        row.get::<_, i64>(7)? as usize,
+                    ),
                     complexity: row.get::<_, i64>(8)? as u32,
                     is_public: row.get::<_, i64>(9)? == 1,
                 })
@@ -415,13 +444,20 @@ impl<'a> GlobalSymbolTable<'a> {
     }
 
     /// Get all symbols for a project
-    pub fn get_project_symbols(&self, project_id: &str) -> Result<Vec<GlobalSymbol>, GlobalSymbolError> {
-        let mut stmt = self.db.conn().prepare(
-            "SELECT symbol_id, project_id, symbol_name, symbol_type, signature,
+    pub fn get_project_symbols(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<GlobalSymbol>, GlobalSymbolError> {
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare(
+                "SELECT symbol_id, project_id, symbol_name, symbol_type, signature,
                     file_path, byte_range_start, byte_range_end, complexity, is_public
              FROM global_symbols
-             WHERE project_id = ?1"
-        ).map_err(GlobalSymbolError::from)?;
+             WHERE project_id = ?1",
+            )
+            .map_err(GlobalSymbolError::from)?;
 
         let symbols = stmt
             .query_map(params![project_id], |row| {
@@ -433,7 +469,10 @@ impl<'a> GlobalSymbolTable<'a> {
                         .unwrap_or(SymbolType::Function),
                     signature: row.get(4)?,
                     file_path: row.get(5)?,
-                    byte_range: (row.get::<_, i64>(6)? as usize, row.get::<_, i64>(7)? as usize),
+                    byte_range: (
+                        row.get::<_, i64>(6)? as usize,
+                        row.get::<_, i64>(7)? as usize,
+                    ),
                     complexity: row.get::<_, i64>(8)? as u32,
                     is_public: row.get::<_, i64>(9)? == 1,
                 })
@@ -447,32 +486,42 @@ impl<'a> GlobalSymbolTable<'a> {
 
     /// Add external reference
     pub fn add_external_ref(&self, reference: &ExternalRef) -> Result<(), GlobalSymbolError> {
-        self.db.conn().execute(
-            "INSERT INTO external_refs (
+        self.db
+            .conn()
+            .execute(
+                "INSERT INTO external_refs (
                 ref_id, source_project_id, source_symbol_id,
                 target_project_id, target_symbol_id, ref_type
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                &reference.ref_id,
-                &reference.source_project_id,
-                &reference.source_symbol_id,
-                &reference.target_project_id,
-                &reference.target_symbol_id,
-                reference.ref_type.as_str(),
-            ],
-        ).map_err(GlobalSymbolError::from)?;
+                params![
+                    &reference.ref_id,
+                    &reference.source_project_id,
+                    &reference.source_symbol_id,
+                    &reference.target_project_id,
+                    &reference.target_symbol_id,
+                    reference.ref_type.as_str(),
+                ],
+            )
+            .map_err(GlobalSymbolError::from)?;
 
         Ok(())
     }
 
     /// Get all outgoing references from a symbol
-    pub fn get_outgoing_refs(&self, symbol_id: &GlobalSymbolId) -> Result<Vec<ExternalRef>, GlobalSymbolError> {
-        let mut stmt = self.db.conn().prepare(
-            "SELECT ref_id, source_project_id, source_symbol_id,
+    pub fn get_outgoing_refs(
+        &self,
+        symbol_id: &GlobalSymbolId,
+    ) -> Result<Vec<ExternalRef>, GlobalSymbolError> {
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare(
+                "SELECT ref_id, source_project_id, source_symbol_id,
                     target_project_id, target_symbol_id, ref_type
              FROM external_refs
-             WHERE source_symbol_id = ?1"
-        ).map_err(GlobalSymbolError::from)?;
+             WHERE source_symbol_id = ?1",
+            )
+            .map_err(GlobalSymbolError::from)?;
 
         let refs = stmt
             .query_map(params![symbol_id], |row| {
@@ -494,13 +543,20 @@ impl<'a> GlobalSymbolTable<'a> {
     }
 
     /// Get all incoming references to a symbol
-    pub fn get_incoming_refs(&self, symbol_id: &GlobalSymbolId) -> Result<Vec<ExternalRef>, GlobalSymbolError> {
-        let mut stmt = self.db.conn().prepare(
-            "SELECT ref_id, source_project_id, source_symbol_id,
+    pub fn get_incoming_refs(
+        &self,
+        symbol_id: &GlobalSymbolId,
+    ) -> Result<Vec<ExternalRef>, GlobalSymbolError> {
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare(
+                "SELECT ref_id, source_project_id, source_symbol_id,
                     target_project_id, target_symbol_id, ref_type
              FROM external_refs
-             WHERE target_symbol_id = ?1"
-        ).map_err(GlobalSymbolError::from)?;
+             WHERE target_symbol_id = ?1",
+            )
+            .map_err(GlobalSymbolError::from)?;
 
         let refs = stmt
             .query_map(params![symbol_id], |row| {
@@ -539,11 +595,15 @@ impl<'a> GlobalSymbolTable<'a> {
 
     /// Get all dependencies for a project
     pub fn get_project_deps(&self, project_id: &str) -> Result<Vec<ProjectDep>, GlobalSymbolError> {
-        let mut stmt = self.db.conn().prepare(
-            "SELECT dep_id, project_id, depends_on_project_id, dependency_type
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare(
+                "SELECT dep_id, project_id, depends_on_project_id, dependency_type
              FROM project_deps
-             WHERE project_id = ?1"
-        ).map_err(GlobalSymbolError::from)?;
+             WHERE project_id = ?1",
+            )
+            .map_err(GlobalSymbolError::from)?;
 
         let deps = stmt
             .query_map(params![project_id], |row| {
@@ -566,12 +626,19 @@ impl<'a> GlobalSymbolTable<'a> {
     ///
     /// This is used for change propagation - when a project changes,
     /// we need to find all projects that depend on it.
-    pub fn get_reverse_project_deps(&self, depends_on_project_id: &str) -> Result<Vec<ProjectDep>, GlobalSymbolError> {
-        let mut stmt = self.db.conn().prepare(
-            "SELECT dep_id, project_id, depends_on_project_id, dependency_type
+    pub fn get_reverse_project_deps(
+        &self,
+        depends_on_project_id: &str,
+    ) -> Result<Vec<ProjectDep>, GlobalSymbolError> {
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare(
+                "SELECT dep_id, project_id, depends_on_project_id, dependency_type
              FROM project_deps
-             WHERE depends_on_project_id = ?1"
-        ).map_err(GlobalSymbolError::from)?;
+             WHERE depends_on_project_id = ?1",
+            )
+            .map_err(GlobalSymbolError::from)?;
 
         let deps = stmt
             .query_map(params![depends_on_project_id], |row| {
@@ -591,13 +658,20 @@ impl<'a> GlobalSymbolTable<'a> {
     }
 
     /// Find public symbols (exported API)
-    pub fn find_public_symbols(&self, project_id: &str) -> Result<Vec<GlobalSymbol>, GlobalSymbolError> {
-        let mut stmt = self.db.conn().prepare(
-            "SELECT symbol_id, project_id, symbol_name, symbol_type, signature,
+    pub fn find_public_symbols(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<GlobalSymbol>, GlobalSymbolError> {
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare(
+                "SELECT symbol_id, project_id, symbol_name, symbol_type, signature,
                     file_path, byte_range_start, byte_range_end, complexity, is_public
              FROM global_symbols
-             WHERE project_id = ?1 AND is_public = 1"
-        ).map_err(GlobalSymbolError::from)?;
+             WHERE project_id = ?1 AND is_public = 1",
+            )
+            .map_err(GlobalSymbolError::from)?;
 
         let symbols = stmt
             .query_map(params![project_id], |row| {
@@ -609,7 +683,10 @@ impl<'a> GlobalSymbolTable<'a> {
                         .unwrap_or(SymbolType::Function),
                     signature: row.get(4)?,
                     file_path: row.get(5)?,
-                    byte_range: (row.get::<_, i64>(6)? as usize, row.get::<_, i64>(7)? as usize),
+                    byte_range: (
+                        row.get::<_, i64>(6)? as usize,
+                        row.get::<_, i64>(7)? as usize,
+                    ),
                     complexity: row.get::<_, i64>(8)? as u32,
                     is_public: row.get::<_, i64>(9)? == 1,
                 })
@@ -622,7 +699,10 @@ impl<'a> GlobalSymbolTable<'a> {
     }
 
     /// Detect symbol name conflicts
-    pub fn detect_conflicts(&self, symbol_name: &str) -> Result<Vec<GlobalSymbol>, GlobalSymbolError> {
+    pub fn detect_conflicts(
+        &self,
+        symbol_name: &str,
+    ) -> Result<Vec<GlobalSymbol>, GlobalSymbolError> {
         // This returns all symbols with the given name across all projects
         // If there are multiple, we have a potential conflict
         self.resolve_by_name(symbol_name)

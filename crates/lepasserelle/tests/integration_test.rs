@@ -21,17 +21,15 @@ mod cli_workflow_tests {
     fn test_cli_index_command_parsing() {
         use lepasserelle::cli::Cli;
 
-        let cli = Cli::parse_from([
-            "leindex",
-            "index",
-            "/test/project",
-            "--force",
-            "--progress",
-        ]);
+        let cli = Cli::parse_from(["leindex", "index", "/test/project", "--force", "--progress"]);
 
         use lepasserelle::cli::Commands;
         match cli.command {
-            Some(Commands::Index { path, force, progress }) => {
+            Some(Commands::Index {
+                path,
+                force,
+                progress,
+            }) => {
                 assert_eq!(path, PathBuf::from("/test/project"));
                 assert!(force);
                 assert!(progress);
@@ -44,13 +42,7 @@ mod cli_workflow_tests {
     fn test_cli_search_command_parsing() {
         use lepasserelle::cli::Cli;
 
-        let cli = Cli::parse_from([
-            "leindex",
-            "search",
-            "authentication",
-            "--top-k",
-            "20",
-        ]);
+        let cli = Cli::parse_from(["leindex", "search", "authentication", "--top-k", "20"]);
 
         use lepasserelle::cli::Commands;
         match cli.command {
@@ -76,7 +68,10 @@ mod cli_workflow_tests {
 
         use lepasserelle::cli::Commands;
         match cli.command {
-            Some(Commands::Analyze { query, token_budget }) => {
+            Some(Commands::Analyze {
+                query,
+                token_budget,
+            }) => {
                 assert_eq!(query, "How does auth work?");
                 assert_eq!(token_budget, 5000);
             }
@@ -88,10 +83,7 @@ mod cli_workflow_tests {
     fn test_cli_diagnostics_command_parsing() {
         use lepasserelle::cli::Cli;
 
-        let cli = Cli::parse_from([
-            "leindex",
-            "diagnostics",
-        ]);
+        let cli = Cli::parse_from(["leindex", "diagnostics"]);
 
         use lepasserelle::cli::Commands;
         match cli.command {
@@ -119,8 +111,7 @@ mod cli_workflow_tests {
 mod cache_management_tests {
     use super::*;
     use lepasserelle::memory::{
-        create_pdg_entry, create_search_entry, CacheEntry, CacheSpiller, MemoryConfig,
-        WarmStrategy,
+        create_pdg_entry, create_search_entry, CacheEntry, CacheSpiller, MemoryConfig, WarmStrategy,
     };
     use std::collections::HashMap;
 
@@ -130,7 +121,12 @@ mod cache_management_tests {
         let pdg_entry = create_pdg_entry("test_project".to_string(), 100, 200, &pdg_data);
 
         match pdg_entry {
-            CacheEntry::PDG { project_id, node_count, edge_count, .. } => {
+            CacheEntry::PDG {
+                project_id,
+                node_count,
+                edge_count,
+                ..
+            } => {
                 assert_eq!(project_id, "test_project");
                 assert_eq!(node_count, 100);
                 assert_eq!(edge_count, 200);
@@ -142,7 +138,11 @@ mod cache_management_tests {
         let search_entry = create_search_entry("test_project".to_string(), 50, &search_data);
 
         match search_entry {
-            CacheEntry::SearchIndex { project_id, entry_count, .. } => {
+            CacheEntry::SearchIndex {
+                project_id,
+                entry_count,
+                ..
+            } => {
                 assert_eq!(project_id, "test_project");
                 assert_eq!(entry_count, 50);
             }
@@ -405,8 +405,8 @@ mod e2e_workflow_tests {
 
 mod cache_spill_reload_tests {
     use super::*;
-    use lepasserelle::LeIndex;
     use lepasserelle::memory::WarmStrategy;
+    use lepasserelle::LeIndex;
 
     /// Helper function to create a test project with some code
     fn create_test_project(temp_dir: &TempDir) -> PathBuf {
@@ -477,7 +477,7 @@ fn greet() {
         let (pdg_bytes, vector_bytes) = result.unwrap();
         // Vector cache should have been spilled
         assert_eq!(vector_bytes, vector_bytes); // usize is non-negative
-        // PDG bytes should be 0 since PDG wasn't loaded
+                                                // PDG bytes should be 0 since PDG wasn't loaded
         assert_eq!(pdg_bytes, 0);
     }
 

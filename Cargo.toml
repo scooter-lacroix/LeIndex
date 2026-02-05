@@ -5,6 +5,7 @@ members = [
     "crates/legraphe",
     "crates/lerecherche",
     "crates/lestockage",
+    "crates/lephase",
     "crates/lepasserelle",
 ]
 

@@ -87,6 +87,9 @@ mod debug_go_params;
 #[cfg(test)]
 mod debug_rust;
 
+/// Parser completeness scoring helpers.
+pub mod completeness;
+
 /// Re-exports of commonly used types.
 pub mod prelude;
 
@@ -103,7 +106,5 @@ pub fn init() {
 #[cfg(test)]
 mod debug_csharp_ast;
 
-
 #[cfg(test)]
 mod debug_lua_ast;
-

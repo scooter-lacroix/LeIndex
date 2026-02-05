@@ -1,6 +1,6 @@
 // Semantic search and processing
 
-use crate::search::{SemanticEntry, NodeInfo};
+use crate::search::{NodeInfo, SemanticEntry};
 use legraphe::pdg::ProgramDependenceGraph;
 use legraphe::traversal::{GravityTraversal, TraversalConfig};
 use std::collections::HashMap;
@@ -28,20 +28,20 @@ impl SemanticProcessor {
         };
 
         let traversal = GravityTraversal::with_config(config);
-        
+
         // Map node_id string to graph NodeId
-        let entry_node_id = pdg.find_by_symbol(&entry.node_id)
-            .ok_or_else(|| Error::ContextExpansionFailed(format!("Entry node {} not found in PDG", entry.node_id)))?;
-            
+        let entry_node_id = pdg.find_by_symbol(&entry.node_id).ok_or_else(|| {
+            Error::ContextExpansionFailed(format!("Entry node {} not found in PDG", entry.node_id))
+        })?;
+
         let expanded_ids = traversal.expand_context(pdg, vec![entry_node_id]);
-        
+
         // Create a lookup for node content
-        let content_lookup: HashMap<String, &NodeInfo> = nodes.iter()
-            .map(|n| (n.node_id.clone(), n))
-            .collect();
-            
+        let content_lookup: HashMap<String, &NodeInfo> =
+            nodes.iter().map(|n| (n.node_id.clone(), n)).collect();
+
         let mut formatted_context = String::new();
-        
+
         for id in expanded_ids {
             if let Some(graph_node) = pdg.get_node(id) {
                 if let Some(node_info) = content_lookup.get(&graph_node.id) {
@@ -52,7 +52,7 @@ impl SemanticProcessor {
                 }
             }
         }
-        
+
         Ok(formatted_context)
     }
 }
@@ -85,7 +85,7 @@ mod tests {
     async fn test_semantic_context_expansion() {
         let mut pdg = ProgramDependenceGraph::new();
         let processor = SemanticProcessor::new();
-        
+
         // Add some nodes to PDG
         let n1 = pdg.add_node(GraphNode {
             id: "func1".to_string(),
@@ -93,7 +93,8 @@ mod tests {
             name: "func1".to_string(),
             file_path: "test.rs".to_string(),
             byte_range: (0, 50),
-            complexity: 2, language: "rust".to_string(),
+            complexity: 2,
+            language: "rust".to_string(),
             embedding: None,
         });
         let n2 = pdg.add_node(GraphNode {
@@ -102,17 +103,19 @@ mod tests {
             name: "func2".to_string(),
             file_path: "test.rs".to_string(),
             byte_range: (60, 100),
-            complexity: 3, language: "rust".to_string(),
+            complexity: 3,
+            language: "rust".to_string(),
             embedding: None,
         });
-        
+
         pdg.add_call_graph_edges(vec![(n1, n2)]);
-        
+
         let nodes = vec![
             NodeInfo {
                 node_id: "func1".to_string(),
                 file_path: "test.rs".to_string(),
-                symbol_name: "func1".to_string(), language: "rust".to_string(),
+                symbol_name: "func1".to_string(),
+                language: "rust".to_string(),
                 content: "fn func1() { func2(); }".to_string(),
                 byte_range: (0, 50),
                 embedding: None,
@@ -121,22 +124,26 @@ mod tests {
             NodeInfo {
                 node_id: "func2".to_string(),
                 file_path: "test.rs".to_string(),
-                symbol_name: "func2".to_string(), language: "rust".to_string(),
+                symbol_name: "func2".to_string(),
+                language: "rust".to_string(),
                 content: "fn func2() { println!(\"world\"); }".to_string(),
                 byte_range: (60, 100),
                 embedding: None,
                 complexity: 3,
             },
         ];
-        
+
         let entry = SemanticEntry {
             node_id: "func1".to_string(),
             relevance: 1.0,
             entry_type: EntryType::Function,
         };
-        
-        let context = processor.process_entry(&pdg, &nodes, entry, 1000).await.unwrap();
-        
+
+        let context = processor
+            .process_entry(&pdg, &nodes, entry, 1000)
+            .await
+            .unwrap();
+
         assert!(context.contains("func1"));
         assert!(context.contains("func2"));
     }

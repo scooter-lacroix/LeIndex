@@ -1,7 +1,9 @@
 // C language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
 use tree_sitter::Parser;
 
 /// C language parser with full CodeIntelligence implementation
@@ -62,8 +64,10 @@ impl CParser {
                                 visibility: Visibility::Public,
                                 is_async: false,
                                 is_method: false,
-                                docstring: extract_docstring(node, source), 
-                                 calls: vec![], imports: vec![],  byte_range: (node.start_byte(), node.end_byte()),
+                                docstring: extract_docstring(node, source),
+                                calls: vec![],
+                                imports: vec![],
+                                byte_range: (node.start_byte(), node.end_byte()),
                             });
                         }
                     }
@@ -141,13 +145,8 @@ fn calculate_complexity(node: &tree_sitter::Node, metrics: &mut ComplexityMetric
     metrics.line_count = std::cmp::max(metrics.line_count, 1);
 
     match node.kind() {
-        "if_statement"
-        | "while_statement"
-        | "for_statement"
-        | "do_statement"
-        | "switch_statement"
-        | "case_statement"
-        | "goto_statement" => {
+        "if_statement" | "while_statement" | "for_statement" | "do_statement"
+        | "switch_statement" | "case_statement" | "goto_statement" => {
             metrics.cyclomatic += 1;
         }
         _ => {}
@@ -167,7 +166,7 @@ fn extract_function_signature(
     parent_path: &[String],
 ) -> Option<SignatureInfo> {
     let declarator = node.child_by_field_name("declarator")?;
-    
+
     // Find the function_declarator within the declarator
     let mut func_decl = declarator;
     while func_decl.kind() != "function_declarator" && func_decl.child_count() > 0 {
@@ -208,8 +207,9 @@ fn extract_function_signature(
         is_method: false,
         docstring: extract_docstring(node, source),
         calls,
-        
-        imports: vec![], byte_range: (node.start_byte(), node.end_byte()),
+
+        imports: vec![],
+        byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 
@@ -217,7 +217,12 @@ fn extract_c_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo> 
     let mut imports = Vec::new();
 
     fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
-        let path = path.trim().trim_matches('"').trim_matches('<').trim_matches('>').trim();
+        let path = path
+            .trim()
+            .trim_matches('"')
+            .trim_matches('<')
+            .trim_matches('>')
+            .trim();
         if path.is_empty() {
             return;
         }
@@ -252,11 +257,7 @@ fn extract_c_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
 
     fn clean_call_text(raw: &str) -> String {
-        raw.split('(')
-            .next()
-            .unwrap_or(raw)
-            .trim()
-            .to_string()
+        raw.split('(').next().unwrap_or(raw).trim().to_string()
     }
 
     fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {

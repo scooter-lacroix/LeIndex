@@ -1,7 +1,9 @@
 // Bash language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo};
 use crate::traits::{Block, Edge, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
 use tree_sitter::Parser;
 
 /// Bash language parser with full CodeIntelligence implementation
@@ -48,8 +50,9 @@ impl BashParser {
                                 is_method: false,
                                 docstring: extract_docstring(node, source),
                                 calls,
-                                
-        imports: vec![], byte_range: (node.start_byte(), node.end_byte()),
+
+                                imports: vec![],
+                                byte_range: (node.start_byte(), node.end_byte()),
                             });
                         }
                     }
@@ -126,12 +129,8 @@ fn calculate_complexity(node: &tree_sitter::Node, metrics: &mut ComplexityMetric
     metrics.line_count = std::cmp::max(metrics.line_count, 1);
 
     match node.kind() {
-        "if_statement"
-        | "while_statement"
-        | "until_statement"
-        | "for_statement"
-        | "case_statement"
-        | "elif_clause" => {
+        "if_statement" | "while_statement" | "until_statement" | "for_statement"
+        | "case_statement" | "elif_clause" => {
             metrics.cyclomatic += 1;
         }
         _ => {}
@@ -161,13 +160,17 @@ fn extract_bash_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInf
 
     fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
         if node.kind() == "command" || node.kind() == "simple_command" {
-            if let Some(name_node) = node.child_by_field_name("name")
+            if let Some(name_node) = node
+                .child_by_field_name("name")
                 .or_else(|| node.child_by_field_name("command"))
-                .or_else(|| node.child_by_field_name("command_name")) {
+                .or_else(|| node.child_by_field_name("command_name"))
+            {
                 if let Ok(name) = name_node.utf8_text(source) {
                     if name == "source" || name == "." {
-                        if let Some(arg) = node.child_by_field_name("argument")
-                            .or_else(|| node.child_by_field_name("arguments")) {
+                        if let Some(arg) = node
+                            .child_by_field_name("argument")
+                            .or_else(|| node.child_by_field_name("arguments"))
+                        {
                             if let Ok(text) = arg.utf8_text(source) {
                                 add_import(imports, text);
                             }
@@ -193,9 +196,11 @@ fn extract_bash_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
     fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
         match node.kind() {
             "command" | "simple_command" => {
-                if let Some(name_node) = node.child_by_field_name("name")
+                if let Some(name_node) = node
+                    .child_by_field_name("name")
                     .or_else(|| node.child_by_field_name("command"))
-                    .or_else(|| node.child_by_field_name("command_name")) {
+                    .or_else(|| node.child_by_field_name("command_name"))
+                {
                     if let Ok(text) = name_node.utf8_text(source) {
                         let name = text.trim().to_string();
                         if !name.is_empty() {
@@ -222,12 +227,7 @@ fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> 
     if let Some(sibling) = prev_sibling {
         if sibling.kind() == "comment" {
             if let Ok(text) = sibling.utf8_text(source) {
-                return Some(
-                    text.trim()
-                        .trim_start_matches('#')
-                        .trim()
-                        .to_string(),
-                );
+                return Some(text.trim().trim_start_matches('#').trim().to_string());
             }
         }
     }
