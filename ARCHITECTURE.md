@@ -18,34 +18,34 @@ Pure Rust implementation of an intelligent code search and analysis engine.
 
 ## Overview
 
-LeIndex v0.1.0 is a **pure Rust** implementation organized as a Cargo workspace with 5 specialized crates:
+LeIndex v0.1.0 is a **pure Rust** codebase indexing and analysis system with 5 specialized crates:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│           LeIndex Rust Architecture                      │
+│           LeIndex Rust Architecture                     │
 ├─────────────────────────────────────────────────────────┤
 │                                                         │
-│  ┌──────────┐  ┌──────────┐  ┌─────────┐  ┌─────────┐ │
-│  │   MCP    │  │   CLI    │  │  lepass │  │ lestock │ │
-│  │  Server  │  │   Tool   │  │  erille │  │   age   │ │
-│  │  (axum)  │  │  (clap)  │  │         │  │(SQLite) │ │
-│  └────┬─────┘  └────┬─────┘  └────┬────┘  └────┬────┘ │
-│       │             │            │            │      │
-│  ┌────▼─────────────▼────────────▼────────────▼───┐  │
-│  │              lepasserelle crate                 │  │
-│  │         (orchestration & config)               │  │
-│  └────┬──────────────┬──────────────┬────────────┘  │
-│       │              │              │               │
-│  ┌────▼───┐   ┌─────▼─────┐   ┌────▼────┐  ┌─────▼──┐│
-│  │leparse │   │ legraphe  │   │ lerech  │  │ Turso  ││
-│  │Parsing │   │    PDG    │   │  HNSW   │  │Vectors ││
-│  │(tree-  │   │  (petgraph│   │(hnsw_rs)│  │(libsql)││
-│  │ sitter) │   │   embed)  │   │ IN-MEM  │  │Future ││
-│  └────────┘   └───────────┘   └─────────┘  └─────────┘│
+│  ┌──────────┐  ┌──────────┐  ┌─────────┐  ┌─────────┐   │
+│  │   MCP    │  │   CLI    │  │  lepass │  │ lestock │   │
+│  │  Server  │  │   Tool   │  │  erille │  │   age   │   │
+│  │  (axum)  │  │  (clap)  │  │         │  │(SQLite) │   │
+│  └────┬─────┘  └────┬─────┘  └────┬────┘  └────┬────┘   │
+│       │             │             │            │        │
+│  ┌────▼─────────────▼─────────────▼────────────▼────┐   │
+│  │              lepasserelle crate                  │   │
+│  │         (orchestration & config)                 │   │
+│  └────┬──────────────┬──────────────┬─────────────┬─┘   │
+│       │              │              │             │     │
+│  ┌────▼───┐    ┌─────▼─────┐   ┌────▼────┐  ┌─────▼───┐ │
+│  │leparse │    │ legraphe  │   │ lerech  │  │ Turso   │ │
+│  │Parsing │    │    PDG    │   │  HNSW   │  │Vectors  │ │
+│  │(tree-  │    │  (petgraph│   │(hnsw_rs)│  │(libsql) │ │
+│  │ sitter)│    │   embed)  │   │ IN-MEM  │  │Future   │ │
+│  └────────┘    └───────────┘   └─────────┘  └─────────┘ │
 │                                                         │
-│  Vector Search: HNSW (in-memory, temporary)            │
-│  Unified Storage: Turso/libsql (vectors + metadata)    │
-│  Current State: Turso configured but not implemented   │
+│  Vector Search: HNSW (in-memory, temporary)             │
+│  Unified Storage: Turso/libsql (vectors + metadata)     │
+│  Current State: Turso configured but not implemented    │
 └─────────────────────────────────────────────────────────┘
 ```
 
