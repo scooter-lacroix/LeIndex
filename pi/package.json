@@ -1,0 +1,10 @@
+{
+  "name": "leindex-pi",
+  "version": "0.1.0",
+  "description": "LeIndex integration for pi coding agent",
+  "type": "module",
+  "pi": {
+    "extensions": ["./src/index.ts"],
+    "skills": ["./skills/leindex/"]
+  }
+}

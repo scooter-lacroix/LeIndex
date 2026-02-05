@@ -1,0 +1,258 @@
+// Edge persistence operations
+
+use crate::schema::Storage;
+use rusqlite::{params, Result as SqliteResult};
+use serde::{Deserialize, Serialize};
+
+/// Edge record for database storage
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeRecord {
+    /// ID of the caller (source) node
+    pub caller_id: i64,
+    /// ID of the callee (target) node
+    pub callee_id: i64,
+    /// Type of the edge (call, dependency, etc.)
+    pub edge_type: EdgeType,
+    /// Optional metadata for the edge
+    pub metadata: Option<EdgeMetadata>,
+}
+
+/// Edge type
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EdgeType {
+    /// Function or method call
+    Call,
+    /// Data dependency (e.g., variable usage)
+    DataDependency,
+    /// Class or interface inheritance
+    Inheritance,
+    /// Import or dependency relationship
+    Import,
+}
+
+impl EdgeType {
+    /// Return the string representation of the edge type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            EdgeType::Call => "call",
+            EdgeType::DataDependency => "data_dependency",
+            EdgeType::Inheritance => "inheritance",
+            EdgeType::Import => "import",
+        }
+    }
+
+    /// Create an edge type from its string representation.
+    pub fn from_str_name(s: &str) -> Option<Self> {
+        match s {
+            "call" => Some(EdgeType::Call),
+            "data_dependency" => Some(EdgeType::DataDependency),
+            "inheritance" => Some(EdgeType::Inheritance),
+            "import" => Some(EdgeType::Import),
+            _ => None,
+        }
+    }
+}
+
+/// Edge metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeMetadata {
+    /// Number of times the call occurs (for call edges)
+    pub call_count: Option<usize>,
+    /// Name of the variable (for data dependency)
+    pub variable_name: Option<String>,
+}
+
+/// Edge store for CRUD operations
+pub struct EdgeStore<'a> {
+    storage: &'a mut Storage,
+}
+
+impl<'a> EdgeStore<'a> {
+    /// Create a new edge store
+    pub fn new(storage: &'a mut Storage) -> Self {
+        Self { storage }
+    }
+
+    /// Insert an edge record
+    pub fn insert(&mut self, record: &EdgeRecord) -> SqliteResult<()> {
+        let metadata_json = serde_json::to_string(&record.metadata).ok();
+        self.storage.conn().execute(
+            "INSERT INTO intel_edges (caller_id, callee_id, edge_type, metadata)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT DO UPDATE SET metadata = excluded.metadata",
+            params![
+                record.caller_id,
+                record.callee_id,
+                record.edge_type.as_str(),
+                metadata_json,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Batch insert edges
+    pub fn batch_insert(&mut self, records: &[EdgeRecord]) -> SqliteResult<()> {
+        let tx = self.storage.conn_mut().transaction()?;
+
+        for record in records {
+            let metadata_json = serde_json::to_string(&record.metadata).ok();
+            tx.execute(
+                "INSERT INTO intel_edges (caller_id, callee_id, edge_type, metadata)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT DO UPDATE SET metadata = excluded.metadata",
+                params![
+                    record.caller_id,
+                    record.callee_id,
+                    record.edge_type.as_str(),
+                    metadata_json,
+                ],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get edges by caller ID
+    pub fn get_by_caller(&self, caller_id: i64) -> SqliteResult<Vec<EdgeRecord>> {
+        let mut stmt = self.storage.conn().prepare(
+            "SELECT caller_id, callee_id, edge_type, metadata
+             FROM intel_edges WHERE caller_id = ?1",
+        )?;
+
+        let edges = stmt
+            .query_map(params![caller_id], |row| {
+                let edge_type_str: String = row.get(2)?;
+                let metadata_json: Option<String> = row.get(3)?;
+                let metadata = metadata_json.and_then(|json| serde_json::from_str(&json).ok());
+
+                Ok(EdgeRecord {
+                    caller_id: row.get(0)?,
+                    callee_id: row.get(1)?,
+                    edge_type: EdgeType::from_str_name(&edge_type_str).unwrap_or(EdgeType::Call),
+                    metadata,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(edges)
+    }
+
+    /// Get edges by callee ID (incoming edges)
+    pub fn get_by_callee(&self, callee_id: i64) -> SqliteResult<Vec<EdgeRecord>> {
+        let mut stmt = self.storage.conn().prepare(
+            "SELECT caller_id, callee_id, edge_type, metadata
+             FROM intel_edges WHERE callee_id = ?1",
+        )?;
+
+        let edges = stmt
+            .query_map(params![callee_id], |row| {
+                let edge_type_str: String = row.get(2)?;
+                let metadata_json: Option<String> = row.get(3)?;
+                let metadata = metadata_json.and_then(|json| serde_json::from_str(&json).ok());
+
+                Ok(EdgeRecord {
+                    caller_id: row.get(0)?,
+                    callee_id: row.get(1)?,
+                    edge_type: EdgeType::from_str_name(&edge_type_str).unwrap_or(EdgeType::Call),
+                    metadata,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(edges)
+    }
+
+    /// Get edges by type
+    pub fn get_by_type(&self, edge_type: EdgeType) -> SqliteResult<Vec<EdgeRecord>> {
+        let mut stmt = self.storage.conn().prepare(
+            "SELECT caller_id, callee_id, edge_type, metadata
+             FROM intel_edges WHERE edge_type = ?1",
+        )?;
+
+        let edges = stmt
+            .query_map(params![edge_type.as_str()], |row| {
+                let edge_type_str: String = row.get(2)?;
+                let metadata_json: Option<String> = row.get(3)?;
+                let metadata = metadata_json.and_then(|json| serde_json::from_str(&json).ok());
+
+                Ok(EdgeRecord {
+                    caller_id: row.get(0)?,
+                    callee_id: row.get(1)?,
+                    edge_type: EdgeType::from_str_name(&edge_type_str).unwrap_or(EdgeType::Call),
+                    metadata,
+                })
+            })?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        Ok(edges)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::Storage;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_edge_insert_and_get() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+
+        // Insert nodes first to satisfy foreign key constraints
+        let mut node_store = crate::nodes::NodeStore::new(&mut storage);
+        let node1 = crate::nodes::NodeRecord {
+            id: None,
+            project_id: "p1".to_string(),
+            file_path: "f1.py".to_string(),
+            node_id: "p1:s1".to_string(),
+            symbol_name: "s1".to_string(),
+            qualified_name: "s1".to_string(),
+            language: "python".to_string(),
+            node_type: crate::nodes::NodeType::Function,
+            signature: None,
+            complexity: None,
+            content_hash: "h1".to_string(),
+            embedding: None,
+            byte_range_start: Some(0),
+            byte_range_end: Some(100),
+        };
+        let node2 = crate::nodes::NodeRecord {
+            id: None,
+            project_id: "p1".to_string(),
+            file_path: "f2.py".to_string(),
+            node_id: "p1:s2".to_string(),
+            symbol_name: "s2".to_string(),
+            qualified_name: "s2".to_string(),
+            language: "python".to_string(),
+            node_type: crate::nodes::NodeType::Function,
+            signature: None,
+            complexity: None,
+            content_hash: "h2".to_string(),
+            embedding: None,
+            byte_range_start: Some(0),
+            byte_range_end: Some(100),
+        };
+        let id1 = node_store.insert(&node1).unwrap();
+        let id2 = node_store.insert(&node2).unwrap();
+
+        let mut store = EdgeStore::new(&mut storage);
+
+        let record = EdgeRecord {
+            caller_id: id1,
+            callee_id: id2,
+            edge_type: EdgeType::Call,
+            metadata: Some(EdgeMetadata {
+                call_count: Some(5),
+                variable_name: None,
+            }),
+        };
+
+        store.insert(&record).unwrap();
+        let edges = store.get_by_caller(id1).unwrap();
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].callee_id, id2);
+    }
+}

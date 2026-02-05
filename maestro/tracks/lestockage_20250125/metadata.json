@@ -1,0 +1,15 @@
+{
+  "track_id": "lestockage_20250125",
+  "type": "standard_track",
+  "status": "new",
+  "created_at": "2025-01-25T00:00:00Z",
+  "updated_at": "2025-01-25T00:00:00Z",
+  "description": "Persistent Storage Layer - Extended SQLite schema with Salsa incremental computation. Part of LeIndex Rust Renaissance master track.",
+  "dependencies": ["legraphe_20250125"],
+  "performance_targets": {
+    "incremental_rebuild": "Node-level incrementalism via Salsa",
+    "query_performance": "Fast graph queries via SQLite",
+    "cross_project": "Global symbol resolution across projects"
+  },
+  "parent_track": "leindex_rust_refactor_20250125"
+}

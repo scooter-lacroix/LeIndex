@@ -2,7 +2,211 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
-## 2026-01-08 - LeIndex v2.0.0 - Global Index & Advanced Memory Management Release
+## [0.1.0] - 2025-01-26 - Rust Rewrite Release
+
+### 🦀 **Major Release: Complete Rewrite in Pure Rust**
+
+This release represents a complete rewrite of LeIndex from Python to Rust, delivering a modern, memory-safe implementation with zero-copy AST extraction, advanced PDG analysis, and first-class MCP server integration.
+
+### ✨ **What's New**
+
+#### **Pure Rust Implementation**
+- **Zero-Copy AST Extraction**: Tree-sitter based parsing with 11+ language support
+- **Program Dependence Graph (PDG)**: Advanced code relationship analysis via petgraph
+- **HNSW Vector Search**: In-memory semantic similarity search (temporary implementation)
+- **MCP Server**: Built-in MCP server with axum-based HTTP transport
+- **Memory Efficient**: Smart cache management with automatic spilling
+- **Project Configuration**: TOML-based per-project settings
+
+#### **Workspace Architecture**
+Five specialized crates:
+- **leparse** - AST extraction (Tree-sitter)
+- **legraphe** - PDG analysis (petgraph)
+- **lerecherche** - Vector search (HNSW)
+- **lestockage** - Storage layer (Turso/libsql planned)
+- **lepasserelle** - CLI & MCP server
+
+### 🔧 **Breaking Changes**
+
+⚠️ **Complete Rewrite**: This is a breaking change with no backward compatibility.
+
+- **Language Changed**: Python → Rust
+- **Installation Method**: `pip install leindex` → `cargo build --release`
+- **Configuration Format**: YAML → TOML
+- **Binary**: Now compiled Rust binary (same name: `leindex`)
+- **Vector Search**: LEANN (file-based) → HNSW (in-memory, temporary)
+- **Storage Architecture**: Turso/libsql unified storage planned (vectors + metadata)
+
+### 📊 **Feature Parity Status**
+
+| Feature | Python v2.0.2 | Rust v0.1.0 | Status |
+|---------|---------------|-------------|--------|
+| **CLI Commands** | ✅ | ✅ | Complete |
+| **MCP Server** | ✅ | ✅ | Complete |
+| **Tree-sitter Parsing** | ✅ | ✅ | Complete (11+ languages) |
+| **Memory Management** | ✅ | ✅ | Complete |
+| **Project Configuration** | ✅ | ✅ | Complete (TOML) |
+| **Vector Search** | ✅ | ⚠️ | HNSW in-memory (temporary) |
+| **Full-Text Search** | ✅ | ❌ | Not yet implemented |
+| **Analytics** | ✅ | ❌ | Not yet implemented |
+| **Cross-Project Search** | ✅ | ❌ | Planned for v0.3.0 |
+
+### 🔧 **Technical Changes**
+
+#### **Removed Dependencies**
+- All Python dependencies (LEANN, Tantivy, DuckDB, etc.)
+- PyO3 bindings (vestigial dependency removed)
+- PyProject configuration
+
+#### **New Dependencies**
+- `tree-sitter` - Parser runtime
+- `petgraph` - Graph data structures
+- `hnsw_rs` - HNSW algorithm
+- `axum` - HTTP server for MCP
+- `clap` - CLI argument parsing
+- `rayon` - Parallel processing
+- `tokio` - Async runtime (future use)
+
+#### **Language Support**
+- ✅ Python, Rust, JavaScript/TypeScript, Go, C/C++, Java, Ruby, PHP
+- ⚠️ Swift, Kotlin, Dart (temporarily disabled due to tree-sitter version conflicts)
+
+### 🔄 **Migration Notes**
+
+#### **From Python v2.0.2 to Rust v0.1.0**
+
+**Steps to migrate:**
+
+1. **Uninstall Python version**:
+   ```bash
+   pip uninstall leindex
+   ```
+
+2. **Install Rust** (if not already installed):
+   ```bash
+   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+   ```
+
+3. **Build LeIndex**:
+   ```bash
+   git clone https://github.com/scooter-lacroix/leindex.git
+   cd leindex
+   cargo build --release --bins
+   ```
+
+4. **Update PATH**:
+   ```bash
+   export PATH="$HOME/.leindex/bin:$PATH"
+   ```
+
+5. **Re-index projects**:
+   ```bash
+   leindex index /path/to/project
+   ```
+
+**Configuration Migration:**
+
+Convert YAML config to TOML:
+
+```toml
+# leindex.toml (Rust)
+[memory]
+total_budget_mb = 3072
+soft_limit_percent = 0.80
+hard_limit_percent = 0.93
+emergency_percent = 0.98
+
+[file_filtering]
+max_file_size = 1073741824
+exclude_patterns = [
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/target/**"
+]
+
+[parsing]
+batch_size = 100
+parallel_parsers = 4
+```
+
+### 📝 **Documentation Updates**
+
+- **[README.md](README.md)** - Complete rewrite for Rust implementation
+- **[ARCHITECTURE.md](ARCHITECTURE.md)** - Rust architecture documentation
+- **[INSTALLATION_RUST.md](INSTALLATION_RUST.md)** - Rust installation guide
+- **[MIGRATION.md](MIGRATION.md)** - Python to Rust migration guide
+- **[MCP_COMPATIBILITY.md](MCP_COMPATIBILITY.md)** - MCP server documentation
+- **[RUST_ARCHITECTURE.md](RUST_ARCHITECTURE.md)** - Detailed crate documentation
+
+### 🏗️ **New Architecture**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│           LeIndex Rust Architecture                      │
+├─────────────────────────────────────────────────────────┤
+│  ┌──────────┐  ┌──────────┐  ┌─────────┐  ┌─────────┐ │
+│  │   MCP    │  │   CLI    │  │  lepass │  │ lestock │ │
+│  │  Server  │  │   Tool   │  │  erille │  │   age   │ │
+│  │  (axum)  │  │  (clap)  │  │         │  │(SQLite) │ │
+│  └────┬─────┘  └────┬─────┘  └────┬────┘  └────┬────┘ │
+│       │             │            │            │      │
+│  ┌────▼─────────────▼────────────▼────────────▼───┐  │
+│  │              lepasserelle crate                 │  │
+│  └────┬──────────────┬──────────────┬────────────┘  │
+│       │              │              │               │
+│  ┌────▼───┐   ┌─────▼─────┐   ┌────▼────┐  ┌─────▼──┐│
+│  │leparse │   │ legraphe  │   │ lerech  │  │ Turso  ││
+│  │Parsing │   │    PDG    │   │  HNSW   │  │Vectors ││
+│  │(tree-  │   │  (petgraph│   │(hnsw_rs)│  │(libsql)││
+│  │ sitter) │   │   embed)  │   │ IN-MEM  │  │Future ││
+│  └────────┘   └───────────┘   └─────────┘  └─────────┘│
+└─────────────────────────────────────────────────────────┘
+```
+
+### 🐛 **Technical Notes**
+
+**Turso/libsql Integration Status:**
+- Configured but not yet implemented
+- Planned for v0.2.0
+- Will provide:
+  - Persistent vector storage (vec0 extension)
+  - F32_BLOB columns for vectors
+  - Unified storage for vectors AND metadata
+  - Remote Turso database support
+
+**Current Limitations:**
+- Vectors stored in-memory only (requires re-indexing after restart)
+- No full-text search (Tantivy integration planned)
+- Swift/Kotlin/Dart parsers disabled (tree-sitter conflicts)
+
+### 🔮 **Future Roadmap**
+
+#### **v0.2.0 - Turso/libsql Integration** (Planned)
+- [ ] Implement lestockage with libsql
+- [ ] Add vec0 extension support
+- [ ] F32_BLOB columns for vectors
+- [ ] Remote Turso database support
+- [ ] Persistent metadata storage
+
+#### **v0.3.0 - Advanced Features** (Planned)
+- [ ] Re-enable Swift/Kotlin/Dart parsers
+- [ ] Cross-project search
+- [ ] Global index dashboard
+- [ ] Advanced memory management
+- [ ] Full-text search (Tantivy)
+
+### 🙏 **Acknowledgments**
+
+Rust implementation built on excellent open-source projects:
+- [Tree-sitter](https://tree-sitter.github.io/tree-sitter/) - Incremental parsing system
+- [petgraph](https://github.com/petgraph/petgraph) - Graph data structures
+- [hnsw_rs](https://github.com/jorgecarleitao/hnsw_rs) - HNSW algorithm
+- [axum](https://github.com/tokio-rs/axum) - Web framework
+- [Model Context Protocol](https://modelcontextprotocol.io) - AI integration
+
+---
+
+## [2.0.0] - 2026-01-08 - Python v2.0.0 - Global Index & Advanced Memory Management Release (Legacy)
 
 ### 🌟 **Major Feature Release: Cross-Project Search & Intelligent Memory Management**
 
