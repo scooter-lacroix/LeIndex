@@ -18,7 +18,7 @@ Pure Rust implementation of an intelligent code search and analysis engine.
 
 ## Overview
 
-LeIndex v0.1.0 is a **pure Rust** codebase indexing and analysis system with 5 specialized crates:
+LeIndex v0.1.0 is a **purely Rust** based codebase indexing and analysis system with 5 specialized crates:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
