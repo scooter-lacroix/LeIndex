@@ -1,72 +1,91 @@
-# Quick Start - Performance Fix
+# LeIndex Quick Start (5-Phase First)
 
-## TL;DR
-
-LeIndex was timing out after 5+ minutes. Fixed by replacing ParallelScanner with FastParallelScanner. Expected **24x+ speedup**.
-
-## What Changed
-
-- **Before**: ParallelScanner created 6761 asyncio tasks for 6761 directories
-- **After**: FastParallelScanner uses 4 worker tasks for any number of directories
-- **Result**: salsa-store scan time reduced from >120s to <5s
-
-## How to Test
-
-```bash
-# 1. Reinstall LeIndex
-cd /mnt/e0f7c1a8-b834-4827-b579-0251b006bc1f/code_index_update/LeIndexer
-pip install -e .
-
-# 2. Compare old vs new scanner
-python3 compare_scanners.py /home/stan/Documents/salsa-store
-
-# 3. Expected output:
-#    Old scanner: TIMEOUT (>120s)
-#    New scanner: <5s (24x+ speedup!)
-```
-
-## Files Modified
-
-1. `src/leindex/server.py` - Now uses FastParallelScanner
-2. `src/leindex/parallel_scanner.py` - Added performance debugging
-3. `src/leindex/fast_scanner.py` - NEW: High-performance scanner
-
-## Expected Performance
-
-| Project | Directories | Old Time | New Time |
-|---------|-----------|----------|----------|
-| Twt | ~100 | 0.046s | ~0.02s |
-| etl_pipeline | ~500 | 5-10s | <1s |
-| salsa-store | 6761 | >120s | **<5s** |
-
-## API Compatibility
-
-100% compatible - drop-in replacement:
-
-```python
-# Same API
-scanner = FastParallelScanner(max_workers=4, ignore_matcher=matcher)
-results = await scanner.scan('/path/to/project')
-```
-
-## Documentation
-
-- `DEBUGGING_COMPLETE.md` - Full summary
-- `PERFORMANCE_DEBUG.md` - Detailed analysis
-- `PERFORMANCE_FIX_SUMMARY.md` - Technical details
-
-## Test Scripts
-
-- `debug_scan_test.py` - Test single scanner
-- `compare_scanners.py` - Compare both scanners
-
-## Next Steps
-
-1. Run `compare_scanners.py` on your test projects
-2. Verify <5s performance for salsa-store
-3. Report any issues
+If you only read one page, read this one.
 
 ---
 
-**Status**: ✅ Fix implemented and integrated
-**Action Required**: Test and verify performance
+## 1) Install
+
+```bash
+curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+```
+
+Verify:
+
+```bash
+leindex --version
+leindex phase --help
+```
+
+---
+
+## 2) Index your project
+
+```bash
+leindex index /path/to/project
+```
+
+---
+
+## 3) Run 5-phase analysis (recommended first step)
+
+```bash
+leindex phase --all --path /path/to/project
+```
+
+This gives a compact map of:
+- structural health,
+- dependency map,
+- impact flow,
+- hotspot risk,
+- prioritized recommendations.
+
+---
+
+## 4) Then do targeted follow-up
+
+```bash
+leindex search "where auth decisions are enforced"
+leindex analyze "how user-session invalidation works"
+```
+
+---
+
+## 5) Why this order matters
+
+Starting with phase analysis drastically reduces token-heavy blind exploration.
+
+### Measured snapshot
+
+On a 1,974-file repository:
+- Phase summary: ~118 tokens
+- Grep/manual triage sample: ~26,272 tokens
+- Reduction: ~99.55%
+
+Use phase analysis to narrow scope first; manually read only the focus files after.
+
+---
+
+## 6) MCP mode (AI assistants)
+
+```bash
+leindex mcp
+# or
+leindex serve --host 127.0.0.1 --port 47268
+```
+
+Available phase MCP tools:
+- `leindex_phase_analysis`
+- `phase_analysis` alias
+
+---
+
+## 7) One command cheat sheet
+
+```bash
+leindex index /path/to/project
+leindex phase --all --path /path/to/project
+leindex search "my question"
+leindex analyze "deeper question"
+leindex diagnostics
+```
