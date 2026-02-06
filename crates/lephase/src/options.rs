@@ -49,6 +49,11 @@ impl DocsMode {
 pub struct PhaseOptions {
     /// Project root path.
     pub root: PathBuf,
+    /// Optional explicit file focus list (absolute or root-relative paths).
+    ///
+    /// When non-empty, phase collection prioritizes these files instead of walking the full tree.
+    #[serde(default)]
+    pub focus_files: Vec<PathBuf>,
     /// Output mode.
     pub mode: FormatMode,
     /// Max number of source files to consider.
@@ -74,6 +79,7 @@ impl Default for PhaseOptions {
     fn default() -> Self {
         Self {
             root: PathBuf::new(),
+            focus_files: Vec::new(),
             mode: FormatMode::Balanced,
             max_files: 2_000,
             max_focus_files: 20,
@@ -108,6 +114,11 @@ impl PhaseOptions {
 
         if self.hotspot_keywords.is_empty() {
             self.hotspot_keywords = PhaseOptions::default().hotspot_keywords;
+        }
+
+        if !self.focus_files.is_empty() {
+            self.focus_files.sort();
+            self.focus_files.dedup();
         }
 
         self

@@ -396,6 +396,16 @@ async fn cmd_phase_impl(
         .canonicalize()
         .context("Failed to canonicalize phase analysis path")?;
 
+    let (root, focus_files) = if canonical_path.is_file() {
+        let parent = canonical_path
+            .parent()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("phase analysis file path has no parent directory"))?;
+        (parent, vec![canonical_path.clone()])
+    } else {
+        (canonical_path, Vec::new())
+    };
+
     let parsed_mode = FormatMode::parse(&mode)
         .ok_or_else(|| anyhow::anyhow!("Invalid mode '{}'. Use ultra|balanced|verbose", mode))?;
 
@@ -415,7 +425,8 @@ async fn cmd_phase_impl(
     };
 
     let options = PhaseOptions {
-        root: canonical_path,
+        root,
+        focus_files,
         mode: parsed_mode,
         max_files,
         max_focus_files,

@@ -418,7 +418,7 @@ impl PhaseAnalysisHandler {
 
     /// Returns the description of this RPC method.
     pub fn description(&self) -> &str {
-        "Run additive 5-phase analysis with freshness-aware incremental execution. Supports `phase` (1-5) or `all`."
+        "Run additive 5-phase analysis with freshness-aware incremental execution. Defaults to all 5 phases when `phase` is omitted."
     }
 
     /// Returns the JSON schema for the arguments of this RPC method.
@@ -473,8 +473,9 @@ fn phase_analysis_schema() -> Value {
             "phase": {
                 "oneOf": [
                     { "type": "integer", "minimum": 1, "maximum": 5 },
-                    { "type": "string", "enum": ["all"] }
-                ]
+                    { "type": "string", "enum": ["all", "1", "2", "3", "4", "5"] }
+                ],
+                "default": "all"
             },
             "mode": {
                 "type": "string",
@@ -510,16 +511,27 @@ fn phase_analysis_schema() -> Value {
                 "default": "off"
             }
         },
-        "required": ["phase", "path"]
+        "required": []
     })
 }
 
 async fn execute_phase_analysis(
-    _leindex: &Arc<Mutex<LeIndex>>,
+    leindex: &Arc<Mutex<LeIndex>>,
     args: Value,
 ) -> Result<Value, JsonRpcError> {
     let selection = match args.get("phase") {
-        Some(Value::String(s)) if s == "all" => PhaseSelection::All,
+        None => PhaseSelection::All,
+        Some(Value::String(s)) if s.eq_ignore_ascii_case("all") => PhaseSelection::All,
+        Some(Value::String(s)) => {
+            let parsed = s.parse::<u8>().map_err(|_| {
+                JsonRpcError::invalid_params(
+                    "phase must be 1..5, \"1\"..\"5\", or 'all'".to_string(),
+                )
+            })?;
+            PhaseSelection::from_number(parsed).ok_or_else(|| {
+                JsonRpcError::invalid_params("phase must be in range 1..5".to_string())
+            })?
+        }
         Some(Value::Number(n)) => {
             let Some(p) = n.as_u64().map(|v| v as u8) else {
                 return Err(JsonRpcError::invalid_params(
@@ -532,8 +544,9 @@ async fn execute_phase_analysis(
         }
         _ => {
             return Err(JsonRpcError::invalid_params_with_suggestion(
-                "Missing or invalid 'phase'".to_string(),
-                "Use phase: 1..5 or phase: \"all\"".to_string(),
+                "Invalid 'phase'".to_string(),
+                "Use phase: 1..5, phase: \"1\"..\"5\", or phase: \"all\" (default)"
+                    .to_string(),
             ));
         }
     };
@@ -555,19 +568,42 @@ async fn execute_phase_analysis(
     })?;
 
     let include_docs = extract_bool(&args, "include_docs", false);
-    let max_files = extract_usize(&args, "max_files", 2000)?;
+
+    let base_project_root = {
+        let reader = leindex.lock().await;
+        reader.project_path().to_path_buf()
+    };
+
+    let canonical_target = match args.get("path").and_then(|v| v.as_str()) {
+        Some(path) => PathBuf::from(path).canonicalize().map_err(|e| {
+            JsonRpcError::invalid_params(format!("path must exist and be accessible: {}", e))
+        })?,
+        None => base_project_root.clone(),
+    };
+
+    let (root, focus_files) = if canonical_target.is_file() {
+        let file_root = canonical_target
+            .parent()
+            .map(PathBuf::from)
+            .ok_or_else(|| JsonRpcError::invalid_params("file path has no parent".to_string()))?;
+        (file_root, vec![canonical_target.clone()])
+    } else {
+        (canonical_target, Vec::new())
+    };
+
+    let default_max_files = if focus_files.is_empty() { 2000 } else { 1 };
+    let mut max_files = extract_usize(&args, "max_files", default_max_files)?;
+    if !focus_files.is_empty() {
+        max_files = max_files.max(1);
+    }
+
     let max_focus_files = extract_usize(&args, "max_focus_files", 20)?;
     let top_n = extract_usize(&args, "top_n", 10)?;
     let max_output_chars = extract_usize(&args, "max_chars", 12000)?;
 
-    let root = PathBuf::from(extract_string(&args, "path")?)
-        .canonicalize()
-        .map_err(|e| {
-            JsonRpcError::invalid_params(format!("path must exist and be accessible: {}", e))
-        })?;
-
     let options = PhaseOptions {
         root,
+        focus_files,
         mode: parsed_mode,
         max_files,
         max_focus_files,
@@ -634,6 +670,7 @@ impl DiagnosticsHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_extract_string() {
@@ -675,33 +712,88 @@ mod tests {
     }
 
     #[test]
-    fn test_phase_schema_requires_phase_and_path() {
+    fn test_phase_schema_phase_and_path_are_optional() {
         let schema = phase_analysis_schema();
         let required = schema
             .get("required")
             .and_then(|v| v.as_array())
             .expect("required array");
 
-        let required_strings = required
-            .iter()
-            .filter_map(|v| v.as_str())
-            .collect::<Vec<_>>();
-
-        assert!(required_strings.contains(&"phase"));
-        assert!(required_strings.contains(&"path"));
+        assert!(
+            required.is_empty(),
+            "phase analysis schema should not require explicit phase or path"
+        );
     }
 
     #[test]
-    fn test_phase_schema_path_has_no_default() {
+    fn test_phase_schema_defaults_phase_to_all() {
         let schema = phase_analysis_schema();
-        let path = schema
+        let phase = schema
             .get("properties")
-            .and_then(|v| v.get("path"))
-            .expect("path schema");
+            .and_then(|v| v.get("phase"))
+            .expect("phase schema");
 
-        assert!(
-            path.get("default").is_none(),
-            "required path must not advertise default"
-        );
+        assert_eq!(phase.get("default").and_then(|v| v.as_str()), Some("all"));
+    }
+
+    #[tokio::test]
+    async fn test_phase_analysis_defaults_to_all_when_phase_missing() {
+        let dir = tempdir().expect("tempdir");
+        let src = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(src.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&src, "pub fn ping()->bool{true}\n").expect("write source");
+
+        let leindex = Arc::new(Mutex::new(LeIndex::new(dir.path()).expect("leindex")));
+        let args = serde_json::json!({
+            "path": src.display().to_string(),
+            "mode": "balanced",
+            "max_files": 1
+        });
+
+        let value = execute_phase_analysis(&leindex, args)
+            .await
+            .expect("phase analysis");
+        let phases = value
+            .get("executed_phases")
+            .and_then(|v| v.as_array())
+            .expect("executed phases");
+
+        let as_u8 = phases
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .map(|v| v as u8)
+            .collect::<Vec<_>>();
+        assert_eq!(as_u8, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_phase_analysis_accepts_string_phase_number() {
+        let dir = tempdir().expect("tempdir");
+        let src = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(src.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&src, "pub fn ping()->bool{true}\n").expect("write source");
+
+        let leindex = Arc::new(Mutex::new(LeIndex::new(dir.path()).expect("leindex")));
+        let args = serde_json::json!({
+            "path": src.display().to_string(),
+            "phase": "1",
+            "mode": "balanced",
+            "max_files": 1
+        });
+
+        let value = execute_phase_analysis(&leindex, args)
+            .await
+            .expect("phase analysis");
+        let phases = value
+            .get("executed_phases")
+            .and_then(|v| v.as_array())
+            .expect("executed phases");
+
+        let as_u8 = phases
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .map(|v| v as u8)
+            .collect::<Vec<_>>();
+        assert_eq!(as_u8, vec![1]);
     }
 }
