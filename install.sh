@@ -7,6 +7,9 @@
 # One-line installer:
 #   curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
 #
+# Cargo install alternative:
+#   cargo install leindex
+#
 # Or with wget:
 #   wget -qO- https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
 #

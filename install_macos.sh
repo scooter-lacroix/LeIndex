@@ -2,7 +2,13 @@
 #############################################
 # LeIndex Universal Installer
 # Version: 5.0.0 - Rust Edition
-# Platform: Linux/Unix
+# Platform: macOS
+#
+# One-line installer:
+#   curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install_macos.sh | bash
+#
+# Cargo install alternative:
+#   cargo install leindex
 #############################################
 
 set -euo pipefail

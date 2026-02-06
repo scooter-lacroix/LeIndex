@@ -117,11 +117,21 @@ LeIndex consists of 5 production-ready Rust crates:
 
 ### Installation
 
-#### One-Line Installer (Recommended)
+#### Recommended install methods (side-by-side)
 
-**Linux/macOS:**
+**One-Line Installer (Linux/macOS):**
 ```bash
 curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+```
+
+**Cargo (crates.io):**
+```bash
+cargo install leindex
+```
+
+**Cargo (Git source):**
+```bash
+cargo install --git https://github.com/scooter-lacroix/LeIndex.git --locked --bin leindex
 ```
 
 Or with wget:
