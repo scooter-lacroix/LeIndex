@@ -68,9 +68,9 @@ LeIndex consists of 5 production-ready Rust crates:
 │  │              (lepasserelle - 675 lines)                        │                     │
 │  │  • Project indexing • Search • Analysis • Diagnostics          │                     │
 │  │  • Cache spilling/reloading/warming • Memory monitoring        │                     │
-│  └─────┬─────────┬─────────┬─────────────┬────────────┬───────────┘                     │
-│        │         │         │             │            │                                 │
-│  ┌─────▼───┐ ┌──▼────┐  ┌──▼──────┐ ┌────▼────┐ ┌─────▼───────┐                         │
+│  └─────┬─────────┬───────────┬───────────┬────────────┬───────────┘                     │
+│        │         │           │           │            │                                 │
+│  ┌─────▼───┐ ┌───▼────┐ ┌────▼────┐ ┌────▼────┐ ┌─────▼───────┐                         │
 │  │ leparse │ │legraphe│ │lerech   │ │lestock  │ │   Cache     │                         │
 │  │         │ │        │ │ erche   │ │ age     │ │ Management  │                         │
 │  │12 langs │ │  PDG   │ │ HNSW    │ │ SQLite  │ │ RSS Monitor │                         │
