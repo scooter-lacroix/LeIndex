@@ -87,10 +87,24 @@ Use **5-phase first** to shrink scope, then manually read only the ranked focus 
 
 ## Quick start
 
-### Install
+### Install (choose one)
+
+**One-line installer**
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+```
+
+**Cargo install (Git source)**
+
+```bash
+cargo install --git https://github.com/scooter-lacroix/LeIndex.git --locked --bin leindex
+```
+
+**Cargo install (crates.io)**
+
+```bash
+cargo install leindex
 ```
 
 ### Verify
@@ -98,12 +112,6 @@ curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install
 ```bash
 leindex --version
 leindex phase --help
-```
-
-### Cargo alternative
-
-```bash
-cargo install --git https://github.com/scooter-lacroix/LeIndex.git --locked --bin leindex
 ```
 
 ### Use

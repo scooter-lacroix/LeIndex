@@ -8,7 +8,31 @@ Default behavior remains plug-and-play local. Remote Turso usage is optional/opt
 
 ---
 
-## Fast install (recommended)
+## Primary install commands (recommended)
+
+Use either the one-line installer or Cargo.
+
+### One-line installer
+
+```bash
+curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+```
+
+### Cargo install (Git source)
+
+```bash
+cargo install --git https://github.com/scooter-lacroix/LeIndex.git --locked --bin leindex
+```
+
+### Cargo install (crates.io)
+
+```bash
+cargo install leindex
+```
+
+---
+
+## Fast install (platform-specific)
 
 ### Linux
 
@@ -43,7 +67,7 @@ This ensures your live install actually includes 5-phase analysis capabilities.
 
 ---
 
-## Cargo install options
+## Cargo install details (same options as above)
 
 ### Install from Git (works now)
 
