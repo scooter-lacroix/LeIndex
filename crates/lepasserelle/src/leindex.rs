@@ -1050,16 +1050,22 @@ impl LeIndex {
                     String::new()
                 };
 
-                // Extract node-specific content for better text matching
+                // Extract node-specific content for better text matching.
+                // Use byte-safe slicing to avoid panics on invalid UTF-8 char boundaries.
                 let node_content = if !content.is_empty() && node.byte_range.1 > node.byte_range.0 {
-                    let start = node.byte_range.0;
-                    let end = node.byte_range.1.min(content.len());
-                    format!(
-                        "// {} in {}\n{}",
-                        node.name,
-                        node.file_path,
-                        &content[start..end]
-                    )
+                    let content_bytes = content.as_bytes();
+                    let start = node.byte_range.0.min(content_bytes.len());
+                    let end = node.byte_range.1.min(content_bytes.len());
+
+                    if start < end {
+                        let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
+                        format!("// {} in {}\n{}", node.name, node.file_path, snippet)
+                    } else {
+                        format!(
+                            "// {} in {}\n{}",
+                            node.name, node.file_path, "// [No source code available]"
+                        )
+                    }
                 } else {
                     format!(
                         "// {} in {}\n{}",
