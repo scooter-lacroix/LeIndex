@@ -48,9 +48,9 @@ impl GrammarCache {
     {
         // Try to read from cache first (optimistic read path)
         {
-            let read_guard = self.grammars
-                .read()
-                .map_err(|e| crate::traits::Error::ParseFailed(format!("Cache lock poisoned: {}", e)))?;
+            let read_guard = self.grammars.read().map_err(|e| {
+                crate::traits::Error::ParseFailed(format!("Cache lock poisoned: {}", e))
+            })?;
 
             // Ensure the vector is large enough
             if read_guard.len() > index {
@@ -61,9 +61,9 @@ impl GrammarCache {
         }
 
         // Need to load the grammar (write path)
-        let mut write_guard = self.grammars
-            .write()
-            .map_err(|e| crate::traits::Error::ParseFailed(format!("Cache lock poisoned: {}", e)))?;
+        let mut write_guard = self.grammars.write().map_err(|e| {
+            crate::traits::Error::ParseFailed(format!("Cache lock poisoned: {}", e))
+        })?;
 
         // Double-check: another thread might have loaded it while we waited
         if write_guard.len() > index {
@@ -79,18 +79,28 @@ impl GrammarCache {
 
         // Load and cache the grammar
         let language = loader();
-        let entry = GrammarCacheEntry { language: language.clone() };
+        let entry = GrammarCacheEntry {
+            language: language.clone(),
+        };
         write_guard[index] = Some(entry);
 
         Ok(language)
     }
 
     /// Get the number of cached grammars
+    ///
+    /// Returns 0 if the cache lock is poisoned (indicating a serious bug).
+    /// The poisoning error is logged via expect() for debugging purposes.
     pub fn len(&self) -> usize {
         self.grammars
             .read()
             .map(|g| g.len())
-            .unwrap_or(0)
+            .unwrap_or_else(|e| {
+                // Use expect with context to make debugging easier
+                // This will panic with the poisoning error, which is appropriate
+                // for a RwLock poisoning (indicates a serious bug)
+                panic!("Grammar cache lock poisoned: {}. This indicates a serious bug in concurrent access.", e)
+            })
     }
 
     /// Check if the cache is empty
@@ -109,14 +119,42 @@ pub static GLOBAL_GRAMMAR_CACHE: Lazy<GrammarCache> = Lazy::new(GrammarCache::ne
 ///
 /// This enum provides a single source of truth for language identification,
 /// combining the previous LanguageId with LanguageConfig integration.
-/// The discriminants (0, 1, 2, 3, 4) correspond to cache indices.
+/// The discriminants correspond to cache indices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LanguageId {
+    /// Python programming language
     Python = 0,
+    /// JavaScript programming language
     JavaScript = 1,
+    /// TypeScript programming language
     TypeScript = 2,
+    /// Go programming language
     Go = 3,
+    /// Rust programming language
     Rust = 4,
+    /// Java programming language
+    Java = 5,
+    /// C++ programming language
+    Cpp = 6,
+    /// C# programming language
+    CSharp = 7,
+    /// Ruby programming language
+    Ruby = 8,
+    /// PHP programming language
+    Php = 9,
+    // Swift = 10, // TODO: Disabled due to tree-sitter version incompatibility (grammar v15 vs library v13-14)
+    // Kotlin = 11, // TODO: Disabled due to tree-sitter version incompatibility (0.20.10 vs 0.24.7)
+    // Dart = 11, // TODO: Disabled due to parsing issues
+    /// Lua programming language
+    Lua = 10,
+    /// Scala programming language
+    Scala = 11,
+    /// C programming language
+    C = 12,
+    /// Bash programming language
+    Bash = 13,
+    /// JSON data format
+    Json = 14,
 }
 
 impl LanguageId {
@@ -131,6 +169,20 @@ impl LanguageId {
             "ts" | "tsx" => Some(LanguageId::TypeScript),
             "go" => Some(LanguageId::Go),
             "rs" => Some(LanguageId::Rust),
+            "java" => Some(LanguageId::Java),
+            "cpp" | "cc" | "cxx" | "hpp" => Some(LanguageId::Cpp),
+            "h" => Some(LanguageId::C), // Default .h to C (Cpp override handles .hpp)
+            "c" => Some(LanguageId::C),
+            "cs" => Some(LanguageId::CSharp),
+            "rb" => Some(LanguageId::Ruby),
+            "php" => Some(LanguageId::Php),
+            // "swift" => Some(LanguageId::Swift), // TODO: Disabled
+            // "kt" | "kts" => Some(LanguageId::Kotlin), // TODO: Disabled
+            // "dart" => Some(LanguageId::Dart), // TODO: Disabled
+            "lua" => Some(LanguageId::Lua),
+            "scala" | "sc" => Some(LanguageId::Scala),
+            "sh" | "bash" => Some(LanguageId::Bash),
+            "json" => Some(LanguageId::Json),
             _ => None,
         }
     }
@@ -146,6 +198,19 @@ impl LanguageId {
             LanguageId::TypeScript => &crate::traits::languages::typescript::CONFIG,
             LanguageId::Go => &crate::traits::languages::go::CONFIG,
             LanguageId::Rust => &crate::traits::languages::rust::CONFIG,
+            LanguageId::Java => &crate::traits::languages::java::CONFIG,
+            LanguageId::Cpp => &crate::traits::languages::cpp::CONFIG,
+            LanguageId::CSharp => &crate::traits::languages::csharp::CONFIG,
+            LanguageId::Ruby => &crate::traits::languages::ruby::CONFIG,
+            LanguageId::Php => &crate::traits::languages::php::CONFIG,
+            // LanguageId::Swift => &crate::traits::languages::swift::CONFIG, // TODO: Disabled
+            // LanguageId::Kotlin => &crate::traits::languages::kotlin::CONFIG, // TODO: Disabled
+            // LanguageId::Dart => &crate::traits::languages::dart::CONFIG, // TODO: Disabled
+            LanguageId::Lua => &crate::traits::languages::lua::CONFIG,
+            LanguageId::Scala => &crate::traits::languages::scala::CONFIG,
+            LanguageId::C => &crate::traits::languages::c::CONFIG,
+            LanguageId::Bash => &crate::traits::languages::bash::CONFIG,
+            LanguageId::Json => &crate::traits::languages::json::CONFIG,
         }
     }
 
@@ -160,6 +225,19 @@ impl LanguageId {
             LanguageId::TypeScript => crate::traits::languages::typescript::language(),
             LanguageId::Go => crate::traits::languages::go::language(),
             LanguageId::Rust => crate::traits::languages::rust::language(),
+            LanguageId::Java => crate::traits::languages::java::language(),
+            LanguageId::Cpp => crate::traits::languages::cpp::language(),
+            LanguageId::CSharp => crate::traits::languages::csharp::language(),
+            LanguageId::Ruby => crate::traits::languages::ruby::language(),
+            LanguageId::Php => crate::traits::languages::php::language(),
+            // LanguageId::Swift => crate::traits::languages::swift::language(), // TODO: Disabled
+            // LanguageId::Kotlin => crate::traits::languages::kotlin::language(), // TODO: Disabled
+            // LanguageId::Dart => crate::traits::languages::dart::language(), // TODO: Disabled
+            LanguageId::Lua => crate::traits::languages::lua::language(),
+            LanguageId::Scala => crate::traits::languages::scala::language(),
+            LanguageId::C => crate::traits::languages::c::language(),
+            LanguageId::Bash => crate::traits::languages::bash::language(),
+            LanguageId::Json => crate::traits::languages::json::language(),
         }
     }
 
@@ -188,7 +266,7 @@ mod tests {
         let cache = GrammarCache::new();
 
         // Load grammar for Python (index 0)
-        let lang = cache.get_or_load(0, || crate::traits::languages::python::language());
+        let lang = cache.get_or_load(0, crate::traits::languages::python::language);
         assert!(lang.is_ok());
         assert_eq!(cache.len(), 1);
 
@@ -203,8 +281,14 @@ mod tests {
     #[test]
     fn test_language_id_from_extension() {
         assert_eq!(LanguageId::from_extension("py"), Some(LanguageId::Python));
-        assert_eq!(LanguageId::from_extension("js"), Some(LanguageId::JavaScript));
-        assert_eq!(LanguageId::from_extension("jsx"), Some(LanguageId::JavaScript));
+        assert_eq!(
+            LanguageId::from_extension("js"),
+            Some(LanguageId::JavaScript)
+        );
+        assert_eq!(
+            LanguageId::from_extension("jsx"),
+            Some(LanguageId::JavaScript)
+        );
         assert_eq!(LanguageId::from_extension("rs"), Some(LanguageId::Rust));
         assert_eq!(LanguageId::from_extension("unknown"), None);
     }

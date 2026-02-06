@@ -289,7 +289,7 @@ python tests/benchmark/compare_results.py \
 ## Notes
 
 - All benchmarks run on Linux 6.12.57+deb13-rt-amd64
-- Python 3.11 interpreter
+- Rust 1.75+ toolchain (`cargo` runtime)
 - SSD storage (recommended for optimal performance)
 - 4-worker parallel configuration
 - Results may vary based on hardware and filesystem

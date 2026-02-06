@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "Multi-language parsing and signature extraction for LeIndex"
+keywords = ["parser", "ast", "tree-sitter", "code-intelligence"]
+categories = ["development-tools"]
 
 [dependencies]
 # Workspace dependencies
@@ -28,9 +31,12 @@ tree-sitter-cpp = "0.23"
 tree-sitter-c-sharp = "0.23"
 tree-sitter-ruby = "0.23"
 tree-sitter-php = "0.23"
-tree-sitter-swift = "0.7"
-tree-sitter-kotlin = "0.3"
-tree-sitter-dart = "0.0.4"
+tree-sitter-c = "0.23"
+tree-sitter-bash = "0.23"
+tree-sitter-json = "0.23"
+# tree-sitter-swift = "0.7.1"
+# tree-sitter-kotlin = "0.3.8"
+# tree-sitter-dart = "0.0.4"
 tree-sitter-lua = "0.2"
 tree-sitter-scala = "0.24"
 # Additional grammars for future expansion
@@ -39,6 +45,7 @@ tree-sitter-scala = "0.24"
 
 [dev-dependencies]
 rstest.workspace = true
+tempfile = "3.13"
 
 [lib]
 name = "leparse"

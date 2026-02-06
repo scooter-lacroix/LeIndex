@@ -1,33 +1,108 @@
-// lepasserelle - Bridge & Integration
+// lepasserelle - Integration & API Layer
 //
-// *La Passerelle* (The Bridge) - PyO3 FFI bindings and unified MCP tool
+// *La Passerelle* (The Bridge) - Pure Rust orchestration, CLI, and MCP server
+//
+// This crate provides the integration and API layer for LeIndex, offering:
+//
+// - **LeIndex Orchestration**: Unified API for parsing, indexing, searching, and analysis
+// - **CLI Interface**: Command-line tool for project indexing, search, and diagnostics
+// - **MCP Server**: Model Context Protocol server for LLM tool integration
+// - **Memory Management**: Automatic cache spilling and restoration with LRU eviction
+//
+// ## Features
+//
+// - `mcp-server` (default): MCP JSON-RPC server functionality
+//
+// ## Example
+//
+// ```no_run
+// use lepasserelle::LeIndex;
+//
+// let leindex = LeIndex::new("/path/to/project")?;
+// let stats = leindex.index_project()?;
+// println!("Indexed {} files", stats.files_parsed);
+//
+// let results = leindex.search("authentication", 10)?;
+// ```
+//!
+//! # LePasserelle - Integration & API Layer
+//!
+//! This crate provides the integration and API layer for LeIndex, offering:
+//!
+//! - **LeIndex Orchestration**: Unified API for parsing, indexing, searching, and analysis
+//! - **CLI Interface**: Command-line tool for project indexing, search, and diagnostics
+//! - **MCP Server**: Model Context Protocol server for LLM tool integration
+//! - **Memory Management**: Automatic cache spilling and restoration with LRU eviction
+//!
+//! ## Features
+//!
+//! - `mcp-server` (default): MCP JSON-RPC server functionality
+//!
+//! ## Quick Start
+//!
+//! ```text
+//! use lepasserelle::LeIndex;
+//!
+//! // Create a LeIndex instance for a project
+//! let leindex = LeIndex::new("/path/to/project")?;
+//!
+//! // Index the project
+//! let stats = leindex.index_project()?;
+//! println!("Indexed {} files", stats.files_parsed);
+//!
+//! // Search for code
+//! let results = leindex.search("authentication", 10)?;
+//! for result in results {
+//!     println!("{}: {}", result.symbol_name, result.file_path);
+//! }
+//! ```
+//!
+//! ## CLI Usage
+//!
+//! ```bash
+//! # Index a project
+//! leindex index /path/to/project
+//!
+//! # Search for code
+//! leindex search "authentication"
+//!
+//! # Deep analysis
+//! leindex analyze "How does authentication work?"
+//!
+//! # System diagnostics
+//! leindex diagnostics
+//! ```
 
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
-pub mod bridge;
+/// Command-line interface definitions and handling.
+pub mod cli;
+/// Configuration for projects, languages, and storage.
+pub mod config;
+/// Error types and error handling logic.
+pub mod errors;
+/// Core orchestration logic for indexing and search.
+pub mod leindex;
+/// Memory management and cache orchestration.
 pub mod memory;
+
+/// Model Context Protocol (MCP) server implementation.
+#[cfg(feature = "mcp-server")]
 pub mod mcp;
 
-pub use bridge::{RustAnalyzer, build_weighted_context};
-pub use memory::{MemoryManager, MemoryConfig};
-pub use mcp::{LeIndexDeepAnalyze, AnalysisResult};
+pub use cli::{Cli, Commands};
+pub use config::{LanguageConfig, ProjectConfig, StorageConfig, TokenConfig};
+pub use errors::{ErrorContext, LeIndexError, RecoveryStrategy, Result as LeIndexResult};
+pub use leindex::{AnalysisResult as LeIndexAnalysisResult, Diagnostics, IndexStats, LeIndex};
+pub use memory::{MemoryConfig as MemoryManagementConfig, MemoryManager};
 
-/// Bridge library initialization
+#[cfg(feature = "mcp-server")]
+pub use mcp::{
+    error_codes, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpServer, McpServerConfig,
+};
+
+/// Library initialization
 pub fn init() {
     let _ = tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
-}
-
-// Python module (only when building as extension module)
-#[cfg(feature = "python-bindings")]
-use pyo3::prelude::*;
-
-/// Python module definition
-#[cfg(feature = "python-bindings")]
-#[pymodule]
-fn leindex_rust(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_class::<RustAnalyzer>()?;
-    m.add_function(wrap_pyfunction!(build_weighted_context, m)?)?;
-    m.add_class::<MemoryManager>()?;
-    Ok(())
 }

@@ -1,45 +1,42 @@
-# LeIndex API Reference (CLI + MCP)
+# LeIndex API Reference (Current Rust Runtime)
 
 Last updated: 2026-02-05
 
-This is the user-facing API for LeIndex’s Rust runtime, including the new **5-phase analysis system**.
+This reference covers the full LeIndex surface: indexing, search, deep analysis, diagnostics, MCP integration, and additive 5-phase triage.
 
 ---
 
-## 1) CLI commands
+## 1) CLI surface
 
 ## `leindex index <path>`
-Index a project.
+Index a project for search/analysis.
 
 ```bash
 leindex index /path/to/project
 ```
 
-Options (common in current builds):
-- `--force` reindex from scratch
-
 ---
 
 ## `leindex search <query>`
-Semantic search.
+Semantic search across indexed code.
 
 ```bash
-leindex search "where is request validation done"
+leindex search "where retries are handled"
 ```
 
 ---
 
 ## `leindex analyze <query>`
-Deep analysis with context expansion.
+Deep analysis with expanded context.
 
 ```bash
-leindex analyze "how does auth token refresh work"
+leindex analyze "how connection pooling works"
 ```
 
 ---
 
 ## `leindex diagnostics`
-Runtime/index health and statistics.
+Inspect runtime/index health.
 
 ```bash
 leindex diagnostics
@@ -47,20 +44,18 @@ leindex diagnostics
 
 ---
 
-## `leindex phase` (new)
-Run additive 5-phase analysis.
+## `leindex phase` (additive triage mode)
+Run structured 5-phase analysis for scoped impact mapping.
 
-### Full analysis
 ```bash
+# Full run
 leindex phase --all --path /path/to/project
+
+# Single phase
+leindex phase --phase 4 --path /path/to/project
 ```
 
-### Single phase
-```bash
-leindex phase --phase 2 --path /path/to/project
-```
-
-### Important options
+Common options:
 - `--mode ultra|balanced|verbose`
 - `--max-files <n>`
 - `--max-focus-files <n>`
@@ -72,7 +67,7 @@ leindex phase --phase 2 --path /path/to/project
 ---
 
 ## `leindex mcp` / `leindex serve`
-Run MCP server interfaces.
+Run MCP interfaces.
 
 ```bash
 leindex mcp
@@ -84,31 +79,29 @@ leindex serve --host 127.0.0.1 --port 47268
 
 ## 2) MCP tools
 
-Core tools:
+Primary tools:
 - `leindex_index`
 - `leindex_search`
 - `leindex_deep_analyze`
 - `leindex_context`
 - `leindex_diagnostics`
 
-5-phase tools:
+Additive phase tools:
 - `leindex_phase_analysis`
-- `phase_analysis` (alias)
+- `phase_analysis` alias
 
 ---
 
-## 3) MCP phase-analysis schema
-
-Request shape (conceptual):
+## 3) Phase-analysis MCP request shape
 
 ```json
 {
-  "phase": 1,
-  "path": "/abs/or/relative/project/path",
+  "phase": "all",
+  "path": "/path/to/project",
   "mode": "balanced",
+  "top_n": 10,
   "max_files": 2000,
   "max_focus_files": 20,
-  "top_n": 10,
   "max_chars": 12000,
   "include_docs": false,
   "docs_mode": "off"
@@ -119,35 +112,23 @@ Request shape (conceptual):
 
 ---
 
-## 4) 5-phase report semantics
+## 4) Runtime vector-tier configuration
 
-Response includes:
-- project id + generation hash
-- executed phases
-- cache-hit indicator
-- changed/deleted counts
-- per-phase summaries
-- compact human-readable `formatted_output`
+Vector indexing uses tiered HNSW (hot memory) + Turso-backed cold spill.
 
-Designed for LLM-friendly triage: concise, structured, and low-token.
+Defaults:
+- local-only mode (no remote requirement)
+- hot-tier memory budget: 256 MiB
 
----
-
-## 5) Token efficiency benchmark snapshot
-
-Measured on a 1,974-file repository:
-
-- `leindex phase --all` output: **473 chars (~118 tokens)**
-- Typical grep/manual triage sample: **105,089 chars (~26,272 tokens)**
-
-Approx reduction: **~99.55%** before deep manual review.
+Optional env vars:
+- `LEINDEX_HNSW_HOT_MB`
+- `LEINDEX_TURSO_URL`
+- `LEINDEX_TURSO_AUTH_TOKEN`
 
 ---
 
-## 6) Practical guidance
+## 5) Output guidance
 
-- Use `phase --all` first when starting analysis.
-- Use `search` and `analyze` for targeted deep dives.
-- Use manual file reading for final correctness decisions.
-
-LeIndex is best used as a **scope compressor** before expensive LLM context expansion.
+- Use `search` / `analyze` for targeted technical questions.
+- Use `phase` when you need broad triage in low-token form before deeper reading.
+- Keep manual file reading for final correctness and design decisions.

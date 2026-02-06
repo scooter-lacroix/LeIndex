@@ -4,6 +4,7 @@ Date: 2026-02-05
 
 This benchmark is intended for non-technical decision-makers who need to understand practical cost/latency impact.
 
+> Note: this document benchmarks one LeIndex mode (5-phase triage). It does not replace core LeIndex capabilities (index/search/analyze/diagnostics/MCP).
 ---
 
 ## Scenario

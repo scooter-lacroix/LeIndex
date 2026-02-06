@@ -4,6 +4,8 @@ Last updated: 2026-02-05
 
 This is the **current** installation path for LeIndex.
 
+Default behavior remains plug-and-play local. Remote Turso usage is optional/opt-in.
+
 ---
 
 ## Fast install (recommended)
@@ -41,6 +43,22 @@ This ensures your live install actually includes 5-phase analysis capabilities.
 
 ---
 
+## Cargo install options
+
+### Install from Git (works now)
+
+```bash
+cargo install --git https://github.com/scooter-lacroix/LeIndex.git --locked --bin leindex
+```
+
+### Install from crates.io (after publish)
+
+```bash
+cargo install leindex
+```
+
+Release/binary publishing process: `docs/RELEASE_BINARY_WORKFLOW.md`
+
 ## Manual build (from source)
 
 ```bash
@@ -61,6 +79,19 @@ leindex --version
 leindex phase --help
 leindex index /path/to/project
 leindex phase --all --path /path/to/project
+```
+
+## Optional Turso remote configuration (opt-in)
+
+Default is local-only tiered vector storage (plug-and-play).
+
+Set these only if you want remote Turso:
+
+```bash
+export LEINDEX_TURSO_URL="libsql://<db>.turso.io"
+export LEINDEX_TURSO_AUTH_TOKEN="..."
+# Optional hot-tier budget in MiB (default 256)
+export LEINDEX_HNSW_HOT_MB=256
 ```
 
 ---

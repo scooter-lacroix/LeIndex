@@ -6,6 +6,9 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "Persistent storage, schema, and PDG data services for LeIndex"
+keywords = ["sqlite", "storage", "pdg", "indexing"]
+categories = ["database", "development-tools"]
 
 [dependencies]
 # Workspace dependencies
@@ -15,14 +18,19 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 chrono.workspace = true
+tokio.workspace = true
 
 # Storage dependencies
 rusqlite = { version = "0.32", features = ["bundled"] }
 blake3.workspace = true
 
+# Turso/libsql for vector store
+libsql = "0.5.0"
+rusqlite_migration = "1.0.0"
+
 # Internal dependencies
-leparse = { path = "../leparse" }
-legraphe = { path = "../legraphe" }
+leparse = { path = "../leparse", version = "0.1.0" }
+legraphe = { path = "../legraphe", version = "0.1.0" }
 
 [dev-dependencies]
 rstest.workspace = true

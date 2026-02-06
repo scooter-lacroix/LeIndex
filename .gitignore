@@ -1,143 +1,81 @@
-# Python cache files
+# Rust
+/target/
+**/*.rs.bk
+
+# Python/legacy artifacts (for mixed repos)
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
 *.egg-info/
-.installed.cfg
-*.egg
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
 
 # Virtual environments
+.venv/
 venv/
 env/
 ENV/
-.venv/
 
-# IDE files
+# Build/package outputs
+/build/
+/dist/
+/site/
+docs/_build/
+docs/.doctrees/
+
+# IDE/editor
 .idea/
 .vscode/
 *.swp
 *.swo
 
-# OS specific files
+# OS files
 .DS_Store
 Thumbs.db
 
-# LeIndex specific files
-.leindex/
-.leindex_data/
-
-# Test and benchmark files
-.benchmarks/
-.pytest_cache/
-.coverage
-coverage.xml
-htmlcov/
-*.cover
-.hypothesis/
-
-# Agent and AI tool files
-.gemini/
-.qwen/
-.kiro/
-.roo/
-CLAUDE.md
-
-# Kilocode files (keep memory-bank but ignore temp files)
-.kilocode/*.tmp
-.kilocode/cache/
-
-# Data and cache files
-data/
-faiss_index/
-file_content_cache.json.tmp
-leann_index/
-
-# Test files
-test_*.py
-test_*.txt
-debug_*.py
-simple_search_test.py
-mcp_test_file.py
-
-# Backup files
-*.backup
-backups/
-
-# Temporary files
+# Logs and temp
+logs/
+*.log
 *.tmp
 *.temp
 
-# Migration and fix scripts (development only)
-apply_migrations.py
-fix_postgresql_schema.py
-
-# Logs
-logs/
-*.log
-
-# Database files
+# Databases / local indexes
 *.db
 *.db-journal
 *.sqlite
 *.sqlite3
+.leindex/
+.leindex_data/
+faiss_index/
+leann_index/
 
-# Model files
-models/
-*.bin
-*.pt
-*.pth
-*.onnx
-
-# Documentation build
-docs/_build/
-docs/.doctrees/
-site/
-
-# Package manager files
-uv.lock
-poetry.lock
-Pipfile.lock
-
-# MyPy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Ruff
-.ruff_cache/
-
-# Profiling
+# Coverage/profiling
+.coverage
+coverage.xml
+htmlcov/
 *.prof
 *.pstats
 
-# Archive folder
+# Agent/tool local state
+.gemini/
+.qwen/
+.kiro/
+.roo/
+.kilocode/cache/
+.kilocode/*.tmp
+
+# Internal-only planning/review artifacts (never publish)
+docs/LEPHASE_*
+docs/5PHASE_INTEGRATION_PLAN.md
+docs/phase-3-tzar-review.md
+maestro/tracks/lephase_5phase_20260205/
+
+# Local workspace artifacts
 .archive/
-
-# Hidden folders (folders starting with ".")
-.**/
-.github
-.git
-
-# Legacy architecture folders
-/alembic/
-/benchmarks/
-/conductor/
-/faiss_index/
-/maestro/
-/test_check/
-/tests/
-/logs/
+.pi/
+Rust_ref(DO_NOT_DIRECTLY_USE)/
+data/
+src/data/
+archive/test_*.py

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Combined score from multiple signals
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 pub struct Score {
     /// Overall score (0-1)
     pub overall: f32,
@@ -54,8 +54,8 @@ impl HybridScorer {
     pub fn new() -> Self {
         Self {
             semantic_weight: 0.5,
-            structural_weight: 0.3,
-            text_weight: 0.2,
+            structural_weight: 0.1,
+            text_weight: 0.4,
         }
     }
 
@@ -68,12 +68,7 @@ impl HybridScorer {
     }
 
     /// Calculate combined score
-    pub fn score(
-        &self,
-        semantic: f32,
-        structural: f32,
-        text_match: f32,
-    ) -> Score {
+    pub fn score(&self, semantic: f32, structural: f32, text_match: f32) -> Score {
         let overall = semantic * self.semantic_weight
             + structural * self.structural_weight
             + text_match * self.text_weight;
@@ -185,6 +180,6 @@ mod tests {
     fn test_custom_weights() {
         let scorer = HybridScorer::new().with_weights(0.3, 0.5, 0.2);
         let score = scorer.score(0.8, 0.6, 0.4);
-        assert!((score.overall - 0.58).abs() < 0.01);
+        assert!((score.overall - 0.62).abs() < 0.01);
     }
 }

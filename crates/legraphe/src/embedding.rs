@@ -33,7 +33,9 @@ impl NodeEmbedding {
             return 0.0;
         }
 
-        let dot_product: f32 = self.vector.iter()
+        let dot_product: f32 = self
+            .vector
+            .iter()
             .zip(other.vector.iter())
             .map(|(a, b)| a * b)
             .sum();
@@ -89,7 +91,8 @@ impl EmbeddingCache {
 
     /// Find similar embeddings
     pub fn find_similar(&self, embedding: &NodeEmbedding, top_k: usize) -> Vec<(String, f32)> {
-        let mut similarities: Vec<_> = self.embeddings
+        let mut similarities: Vec<_> = self
+            .embeddings
             .iter()
             .map(|e| (e.node_id.clone(), embedding.similarity(e)))
             .filter(|(_, s)| *s > 0.0)

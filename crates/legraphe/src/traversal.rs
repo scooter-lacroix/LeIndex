@@ -1,8 +1,8 @@
 // Gravity-based traversal algorithm
 
-use crate::pdg::{NodeId, ProgramDependenceGraph, EdgeType};
-use std::collections::BinaryHeap;
+use crate::pdg::{NodeId, ProgramDependenceGraph};
 use serde::{Deserialize, Serialize};
+use std::collections::BinaryHeap;
 
 /// Configuration for gravity traversal
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,11 +97,8 @@ impl GravityTraversal {
                         let new_distance = wnode.distance + 1;
                         if let Some(nnode) = pdg.get_node(neighbor) {
                             let semantic = 1.0; // Would come from embedding
-                            let weight = self.calculate_relevance(
-                                nnode,
-                                new_distance as f64,
-                                semantic,
-                            );
+                            let weight =
+                                self.calculate_relevance(nnode, new_distance as f64, semantic);
                             pq.push(WeightedNode {
                                 id: neighbor,
                                 weight,
@@ -126,26 +123,20 @@ impl GravityTraversal {
         let complexity = node.complexity as f64;
         let distance_factor = distance.powf(self.config.distance_decay);
 
-        (semantic_score * self.config.semantic_weight
-            + complexity * self.config.complexity_weight)
+        (semantic_score * self.config.semantic_weight + complexity * self.config.complexity_weight)
             / distance_factor.max(1.0)
     }
 
     /// Estimate token count for a node
     fn estimate_tokens(&self, node: &crate::pdg::Node) -> usize {
-        let range = node.byte_range.1 - node.byte_range.0;
-        // Rough estimate: ~4 characters per token
-        range / 4
+        let range = node.byte_range.1.saturating_sub(node.byte_range.0);
+        // Rough estimate: ~4 characters per token. Ensure at least 10 tokens per node.
+        (range / 4).max(10)
     }
 
     /// Get neighboring nodes
-    fn get_neighbors(
-        &self,
-        pdg: &ProgramDependenceGraph,
-        node_id: NodeId,
-    ) -> Vec<NodeId> {
-        // Placeholder - will use petgraph neighbors in full implementation
-        Vec::new()
+    fn get_neighbors(&self, pdg: &ProgramDependenceGraph, node_id: NodeId) -> Vec<NodeId> {
+        pdg.neighbors(node_id)
     }
 }
 
@@ -180,8 +171,10 @@ impl PartialOrd for WeightedNode {
 
 impl Ord for WeightedNode {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // Reverse for max-heap
-        other.weight.partial_cmp(&self.weight).unwrap_or(std::cmp::Ordering::Equal)
+        // Max-heap behavior: higher weight comes first
+        self.weight
+            .partial_cmp(&other.weight)
+            .unwrap_or(std::cmp::Ordering::Equal)
     }
 }
 

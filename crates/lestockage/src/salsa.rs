@@ -1,9 +1,8 @@
 // Salsa incremental computation
 
-use blake3::Hash;
+use crate::schema::Storage;
 use rusqlite::{params, OptionalExtension, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
-use crate::schema::Storage;
 
 /// Node hash for incremental computation
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -21,8 +20,8 @@ impl NodeHash {
         &self.0
     }
 
-    /// Parse from string
-    pub fn from_str(s: &str) -> Option<Self> {
+    /// Parse from hex string
+    pub fn from_str_name(s: &str) -> Option<Self> {
         if s.len() == 64 {
             Some(Self(s.to_string()))
         } else {
@@ -44,9 +43,10 @@ impl IncrementalCache {
 
     /// Check if a node's computation is cached
     pub fn is_cached(&self, hash: &NodeHash) -> SqliteResult<bool> {
-        let mut stmt = self.storage.conn().prepare(
-            "SELECT COUNT(*) FROM analysis_cache WHERE node_hash = ?1"
-        )?;
+        let mut stmt = self
+            .storage
+            .conn()
+            .prepare("SELECT COUNT(*) FROM analysis_cache WHERE node_hash = ?1")?;
 
         let count: i64 = stmt.query_row(params![hash.as_str()], |row| row.get(0))?;
         Ok(count > 0)
@@ -99,7 +99,10 @@ impl IncrementalCache {
 
     /// Clear all cached entries
     pub fn clear(&mut self) -> SqliteResult<usize> {
-        let result = self.storage.conn().execute("DELETE FROM analysis_cache", [])?;
+        let result = self
+            .storage
+            .conn()
+            .execute("DELETE FROM analysis_cache", [])?;
         Ok(result)
     }
 }
@@ -118,6 +121,9 @@ pub struct CachedComputation {
 }
 
 /// Query-based invalidation system
+///
+/// This system tracks dependencies between nodes and allows for
+/// targeted invalidation of cached analysis results when source code changes.
 pub struct QueryInvalidation {
     storage: Storage,
 }
@@ -129,6 +135,9 @@ impl QueryInvalidation {
     }
 
     /// Invalidate a node and its dependents
+    ///
+    /// # Arguments
+    /// * `node_hash` - The hash of the node to invalidate
     pub fn invalidate_node(&mut self, node_hash: &NodeHash) -> SqliteResult<()> {
         // Remove from cache
         self.storage.conn().execute(
@@ -138,15 +147,22 @@ impl QueryInvalidation {
         Ok(())
     }
 
-    /// Get affected nodes for a change
+    /// Get affected nodes for a change in a file
+    ///
+    /// # Arguments
+    /// * `file_path` - The path to the changed file
+    ///
+    /// # Returns
+    /// Vector of content hashes for the affected nodes
     pub fn get_affected_nodes(&self, file_path: &str) -> SqliteResult<Vec<String>> {
-        let mut stmt = self.storage.conn().prepare(
-            "SELECT content_hash FROM intel_nodes WHERE file_path = ?1"
-        )?;
+        let mut stmt = self
+            .storage
+            .conn()
+            .prepare("SELECT content_hash FROM intel_nodes WHERE file_path = ?1")?;
 
-        let hashes = stmt.query_map(params![file_path], |row| {
-            Ok(row.get::<_, String>(0)?)
-        })?.collect::<SqliteResult<Vec<_>>>()?;
+        let hashes = stmt
+            .query_map(params![file_path], |row| row.get::<_, String>(0))?
+            .collect::<SqliteResult<Vec<_>>>()?;
 
         Ok(hashes)
     }

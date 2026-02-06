@@ -1,7 +1,7 @@
 // AST node types for zero-copy parsing
 
+use crate::traits::{Parameter, Visibility};
 use serde::{Deserialize, Serialize};
-use crate::traits::{Visibility, Parameter};
 
 /// AST node with byte range reference
 ///
@@ -109,7 +109,10 @@ impl AstNode {
     /// Get the source text for this node (with bounds checking)
     ///
     /// Returns an error if the byte range is out of bounds
-    pub fn text<'source>(&self, source: &'source [u8]) -> Result<&'source str, crate::traits::Error> {
+    pub fn text<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<&'source str, crate::traits::Error> {
         if self.byte_range.end > source.len() {
             return Err(crate::traits::Error::ParseFailed(format!(
                 "Byte range {}..{} out of bounds for source of length {}",
@@ -118,12 +121,14 @@ impl AstNode {
                 source.len()
             )));
         }
-        std::str::from_utf8(&source[self.byte_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))
+        std::str::from_utf8(&source[self.byte_range.clone()]).map_err(crate::traits::Error::Utf8)
     }
 
     /// Get the name text for this node (if available)
-    pub fn name<'source>(&self, source: &'source [u8]) -> Result<&'source str, crate::traits::Error> {
+    pub fn name<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<&'source str, crate::traits::Error> {
         if let Some(ref range) = self.metadata.name_range {
             if range.end > source.len() {
                 return Err(crate::traits::Error::ParseFailed(format!(
@@ -133,14 +138,18 @@ impl AstNode {
                     source.len()
                 )));
             }
-            return std::str::from_utf8(&source[range.clone()])
-                .map_err(|e| crate::traits::Error::Utf8(e));
+            return std::str::from_utf8(&source[range.clone()]).map_err(crate::traits::Error::Utf8);
         }
-        Err(crate::traits::Error::ParseFailed("No name range set".to_string()))
+        Err(crate::traits::Error::ParseFailed(
+            "No name range set".to_string(),
+        ))
     }
 
     /// Get the docstring text for this node (if available)
-    pub fn docstring<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
+    pub fn docstring<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<Option<&'source str>, crate::traits::Error> {
         if let Some(ref range) = self.metadata.docstring_range {
             if range.end > source.len() {
                 return Err(crate::traits::Error::ParseFailed(format!(
@@ -150,8 +159,8 @@ impl AstNode {
                     source.len()
                 )));
             }
-            let text = std::str::from_utf8(&source[range.clone()])
-                .map_err(|e| crate::traits::Error::Utf8(e))?;
+            let text =
+                std::str::from_utf8(&source[range.clone()]).map_err(crate::traits::Error::Utf8)?;
             Ok(Some(text))
         } else {
             Ok(None)
@@ -259,69 +268,99 @@ pub struct Import {
 /// without allocating new strings.
 pub trait ZeroCopyText {
     /// Get text from byte range
-    fn get_text<'source>(&self, source: &'source [u8]) -> Result<&'source str, crate::traits::Error>;
+    fn get_text<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<&'source str, crate::traits::Error>;
 
     /// Get name text from byte range
-    fn get_name<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error>;
+    fn get_name<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<Option<&'source str>, crate::traits::Error>;
 
     /// Get docstring text from byte range
-    fn get_docstring<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error>;
+    fn get_docstring<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<Option<&'source str>, crate::traits::Error>;
 }
 
 impl ZeroCopyText for AstNode {
-    fn get_text<'source>(&self, source: &'source [u8]) -> Result<&'source str, crate::traits::Error> {
+    fn get_text<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<&'source str, crate::traits::Error> {
         self.text(source)
     }
 
-    fn get_name<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
+    fn get_name<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<Option<&'source str>, crate::traits::Error> {
         if let Some(ref range) = self.metadata.name_range {
             if range.end > source.len() {
                 return Err(crate::traits::Error::ParseFailed(
-                    "Name range out of bounds".to_string()
+                    "Name range out of bounds".to_string(),
                 ));
             }
-            Ok(Some(std::str::from_utf8(&source[range.clone()])
-                .map_err(|e| crate::traits::Error::Utf8(e))?))
+            Ok(Some(
+                std::str::from_utf8(&source[range.clone()]).map_err(crate::traits::Error::Utf8)?,
+            ))
         } else {
             Ok(None)
         }
     }
 
-    fn get_docstring<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
+    fn get_docstring<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<Option<&'source str>, crate::traits::Error> {
         self.docstring(source)
     }
 }
 
 impl ZeroCopyText for FunctionElement {
-    fn get_text<'source>(&self, source: &'source [u8]) -> Result<&'source str, crate::traits::Error> {
+    fn get_text<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<&'source str, crate::traits::Error> {
         if self.byte_range.end > source.len() {
             return Err(crate::traits::Error::ParseFailed(
-                "Function byte range out of bounds".to_string()
+                "Function byte range out of bounds".to_string(),
             ));
         }
-        std::str::from_utf8(&source[self.byte_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))
+        std::str::from_utf8(&source[self.byte_range.clone()]).map_err(crate::traits::Error::Utf8)
     }
 
-    fn get_name<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
+    fn get_name<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<Option<&'source str>, crate::traits::Error> {
         if self.name_range.end > source.len() {
             return Err(crate::traits::Error::ParseFailed(
-                "Function name range out of bounds".to_string()
+                "Function name range out of bounds".to_string(),
             ));
         }
-        Ok(Some(std::str::from_utf8(&source[self.name_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))?))
+        Ok(Some(
+            std::str::from_utf8(&source[self.name_range.clone()])
+                .map_err(crate::traits::Error::Utf8)?,
+        ))
     }
 
-    fn get_docstring<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
+    fn get_docstring<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<Option<&'source str>, crate::traits::Error> {
         if let Some(ref range) = self.docstring_range {
             if range.end > source.len() {
                 return Err(crate::traits::Error::ParseFailed(
-                    "Docstring range out of bounds".to_string()
+                    "Docstring range out of bounds".to_string(),
                 ));
             }
-            Ok(Some(std::str::from_utf8(&source[range.clone()])
-                .map_err(|e| crate::traits::Error::Utf8(e))?))
+            Ok(Some(
+                std::str::from_utf8(&source[range.clone()]).map_err(crate::traits::Error::Utf8)?,
+            ))
         } else {
             Ok(None)
         }
@@ -329,35 +368,46 @@ impl ZeroCopyText for FunctionElement {
 }
 
 impl ZeroCopyText for ClassElement {
-    fn get_text<'source>(&self, source: &'source [u8]) -> Result<&'source str, crate::traits::Error> {
+    fn get_text<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<&'source str, crate::traits::Error> {
         if self.byte_range.end > source.len() {
             return Err(crate::traits::Error::ParseFailed(
-                "Class byte range out of bounds".to_string()
+                "Class byte range out of bounds".to_string(),
             ));
         }
-        std::str::from_utf8(&source[self.byte_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))
+        std::str::from_utf8(&source[self.byte_range.clone()]).map_err(crate::traits::Error::Utf8)
     }
 
-    fn get_name<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
+    fn get_name<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<Option<&'source str>, crate::traits::Error> {
         if self.name_range.end > source.len() {
             return Err(crate::traits::Error::ParseFailed(
-                "Class name range out of bounds".to_string()
+                "Class name range out of bounds".to_string(),
             ));
         }
-        Ok(Some(std::str::from_utf8(&source[self.name_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))?))
+        Ok(Some(
+            std::str::from_utf8(&source[self.name_range.clone()])
+                .map_err(crate::traits::Error::Utf8)?,
+        ))
     }
 
-    fn get_docstring<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
+    fn get_docstring<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<Option<&'source str>, crate::traits::Error> {
         if let Some(ref range) = self.docstring_range {
             if range.end > source.len() {
                 return Err(crate::traits::Error::ParseFailed(
-                    "Docstring range out of bounds".to_string()
+                    "Docstring range out of bounds".to_string(),
                 ));
             }
-            Ok(Some(std::str::from_utf8(&source[range.clone()])
-                .map_err(|e| crate::traits::Error::Utf8(e))?))
+            Ok(Some(
+                std::str::from_utf8(&source[range.clone()]).map_err(crate::traits::Error::Utf8)?,
+            ))
         } else {
             Ok(None)
         }
@@ -365,27 +415,37 @@ impl ZeroCopyText for ClassElement {
 }
 
 impl ZeroCopyText for ModuleElement {
-    fn get_text<'source>(&self, source: &'source [u8]) -> Result<&'source str, crate::traits::Error> {
+    fn get_text<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<&'source str, crate::traits::Error> {
         if self.byte_range.end > source.len() {
             return Err(crate::traits::Error::ParseFailed(
-                "Module byte range out of bounds".to_string()
+                "Module byte range out of bounds".to_string(),
             ));
         }
-        std::str::from_utf8(&source[self.byte_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))
+        std::str::from_utf8(&source[self.byte_range.clone()]).map_err(crate::traits::Error::Utf8)
     }
 
-    fn get_name<'source>(&self, source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
+    fn get_name<'source>(
+        &self,
+        source: &'source [u8],
+    ) -> Result<Option<&'source str>, crate::traits::Error> {
         if self.name_range.end > source.len() {
             return Err(crate::traits::Error::ParseFailed(
-                "Module name range out of bounds".to_string()
+                "Module name range out of bounds".to_string(),
             ));
         }
-        Ok(Some(std::str::from_utf8(&source[self.name_range.clone()])
-            .map_err(|e| crate::traits::Error::Utf8(e))?))
+        Ok(Some(
+            std::str::from_utf8(&source[self.name_range.clone()])
+                .map_err(crate::traits::Error::Utf8)?,
+        ))
     }
 
-    fn get_docstring<'source>(&self, _source: &'source [u8]) -> Result<Option<&'source str>, crate::traits::Error> {
+    fn get_docstring<'source>(
+        &self,
+        _source: &'source [u8],
+    ) -> Result<Option<&'source str>, crate::traits::Error> {
         // Module elements don't have docstrings in the same way
         Ok(None)
     }

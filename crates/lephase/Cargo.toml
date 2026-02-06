@@ -1,0 +1,36 @@
+[package]
+name = "lephase"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Structured 5-phase triage analysis subsystem for LeIndex"
+keywords = ["analysis", "triage", "pdg", "mcp"]
+categories = ["development-tools"]
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+blake3.workspace = true
+walkdir = "2.5"
+
+leparse = { path = "../leparse", version = "0.1.0" }
+legraphe = { path = "../legraphe", version = "0.1.0" }
+lerecherche = { path = "../lerecherche", version = "0.1.0" }
+lestockage = { path = "../lestockage", version = "0.1.0" }
+
+[dev-dependencies]
+tempfile.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "phase_bench"
+harness = false
+
+[lib]
+name = "lephase"
+crate-type = ["rlib"]

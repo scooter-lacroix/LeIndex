@@ -1,80 +1,38 @@
-# LeIndex MCP Quick Start
+# Quick Start MCP (Rust)
 
-## ✅ Good News: Your MCP Server is Already Working!
-
-The LeIndex MCP server is installed and configured via your anaconda3 environment.
-
----
-
-## 🚀 Start Using LeIndex MCP Tools Right Now
-
-In Claude Code, try these commands:
-
-### Get System Status
-```
-mcp__leindex__get_global_stats
-mcp__leindex__get_memory_status
-mcp__leindex__list_projects
-```
-
-### Manage Your Project
-```
-mcp__leindex__manage_project action="set_path" path="/path/to/your/project"
-mcp__leindex__manage_project action="refresh"
-mcp__leindex__manage_project action="reindex"
-```
-
-### Search Code
-```
-mcp__leindex__search_content action="search" pattern="your_search_term"
-mcp__leindex__search_content action="find" pattern="*.py"
-```
-
-### Read Files
-```
-mcp__leindex__read_file mode="smart" file_path="/path/to/file.py"
-```
-
----
-
-## 🔧 If You Want to Use Python 3.14.0 Instead
+## Start MCP server
 
 ```bash
-cd /mnt/e0f7c1a8-b834-4827-b579-0251b006bc1f/code_index_update/LeIndexer
-source .venv/bin/activate
-pip install -e .
+leindex mcp
 ```
 
-The Python version constraint has been fixed to support 3.14.0.
-
----
-
-## ✨ Verification
-
-Run this to verify everything is working:
+Or HTTP mode:
 
 ```bash
-./verify_mcp_connection.sh
+leindex serve --host 127.0.0.1 --port 47268
 ```
 
----
+## Core MCP tools
 
-## 📚 Documentation
+- `leindex_index`
+- `leindex_search`
+- `leindex_deep_analyze`
+- `leindex_context`
+- `leindex_diagnostics`
+- `leindex_phase_analysis` (alias: `phase_analysis`)
 
-- **Quick Start:** This file
-- **Full Analysis:** `MCP_FIX_REPORT.md`
-- **Summary:** `MCP_FIX_SUMMARY.md`
+## Minimal assistant request for 5-phase
 
----
+```json
+{
+  "phase": "all",
+  "path": "/path/to/project",
+  "mode": "balanced"
+}
+```
 
-## 🎯 What Was Fixed
+## Install via cargo
 
-**Problem:** Python 3.14.0 was blocked by version constraint
-**Solution:** Updated `pyproject.toml` to allow Python 3.14
-**Result:** You can now install and use LeIndex with Python 3.14.0
-
-**Status:** ✅ Complete and committed to git
-
----
-
-**Need Help?** Check `MCP_FIX_REPORT.md` for detailed troubleshooting steps.
+```bash
+cargo install --git https://github.com/scooter-lacroix/LeIndex.git --locked --bin leindex
+```

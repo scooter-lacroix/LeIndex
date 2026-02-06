@@ -1,7 +1,9 @@
 // JavaScript and TypeScript language parser implementation
 
-use crate::traits::{CodeIntelligence, ComplexityMetrics, Error, Graph, Result, SignatureInfo};
 use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
 use tree_sitter::Parser;
 
 /// JavaScript language parser with full CodeIntelligence implementation
@@ -67,6 +69,9 @@ impl JavaScriptParser {
                             is_async: false,
                             is_method: false,
                             docstring: extract_docstring(node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
                         });
 
                         let mut cursor = node.walk();
@@ -134,6 +139,14 @@ impl JavaScriptParser {
 impl CodeIntelligence for JavaScriptParser {
     fn get_signatures(&self, source: &[u8]) -> Result<Vec<SignatureInfo>> {
         let mut parser = Parser::new();
+        self.get_signatures_with_parser(source, &mut parser)
+    }
+
+    fn get_signatures_with_parser(
+        &self,
+        source: &[u8],
+        parser: &mut tree_sitter::Parser,
+    ) -> Result<Vec<SignatureInfo>> {
         parser
             .set_language(&crate::traits::languages::javascript::language())
             .map_err(|e| Error::ParseFailed(e.to_string()))?;
@@ -144,7 +157,12 @@ impl CodeIntelligence for JavaScriptParser {
 
         let root_node = tree.root_node();
 
-        let signatures = self.extract_all_definitions(source, root_node);
+        let imports = extract_js_imports(root_node, source);
+        let mut signatures = self.extract_all_definitions(source, root_node);
+
+        for sig in &mut signatures {
+            sig.imports = imports.clone();
+        }
 
         Ok(signatures)
     }
@@ -213,9 +231,7 @@ impl TypeScriptParser {
             parent_path: &[String],
         ) {
             match node.kind() {
-                "function_declaration"
-                | "method_definition"
-                | "generator_function_declaration" => {
+                "function_declaration" | "method_definition" | "generator_function_declaration" => {
                     if let Some(sig) = extract_ts_function_signature(node, source, parent_path) {
                         signatures.push(sig);
                     }
@@ -245,6 +261,9 @@ impl TypeScriptParser {
                             is_async: false,
                             is_method: false,
                             docstring: extract_docstring(node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
                         });
                     }
 
@@ -276,6 +295,9 @@ impl TypeScriptParser {
                             is_async: false,
                             is_method: false,
                             docstring: extract_docstring(node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
                         });
 
                         let mut cursor = node.walk();
@@ -306,6 +328,14 @@ impl TypeScriptParser {
 impl CodeIntelligence for TypeScriptParser {
     fn get_signatures(&self, source: &[u8]) -> Result<Vec<SignatureInfo>> {
         let mut parser = Parser::new();
+        self.get_signatures_with_parser(source, &mut parser)
+    }
+
+    fn get_signatures_with_parser(
+        &self,
+        source: &[u8],
+        parser: &mut tree_sitter::Parser,
+    ) -> Result<Vec<SignatureInfo>> {
         parser
             .set_language(&crate::traits::languages::typescript::language())
             .map_err(|e| Error::ParseFailed(e.to_string()))?;
@@ -316,7 +346,12 @@ impl CodeIntelligence for TypeScriptParser {
 
         let root_node = tree.root_node();
 
-        let signatures = self.extract_all_definitions(source, root_node);
+        let imports = extract_js_imports(root_node, source);
+        let mut signatures = self.extract_all_definitions(source, root_node);
+
+        for sig in &mut signatures {
+            sig.imports = imports.clone();
+        }
 
         Ok(signatures)
     }
@@ -355,6 +390,118 @@ impl CodeIntelligence for TypeScriptParser {
     }
 }
 
+fn extract_js_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+
+    fn add_import(imports: &mut Vec<ImportInfo>, path: &str, alias: Option<String>) {
+        let path = path.trim().trim_end_matches(';').trim();
+        if path.is_empty() {
+            return;
+        }
+        imports.push(ImportInfo {
+            path: path.to_string(),
+            alias,
+        });
+    }
+
+    fn parse_import_text(imports: &mut Vec<ImportInfo>, text: &str) {
+        let text = text.trim().trim_end_matches(';');
+        if text.starts_with("import ") {
+            let rest = text.trim_start_matches("import ").trim();
+            if rest.starts_with('"') || rest.starts_with('\'') {
+                let module = rest.trim_matches('"').trim_matches('\'');
+                add_import(imports, module, None);
+                return;
+            }
+
+            let (clause, module) = if let Some((left, right)) = rest.split_once(" from ") {
+                (left.trim(), right.trim())
+            } else {
+                (rest, "")
+            };
+
+            let module = module.trim_matches('"').trim_matches('\'');
+            if clause.starts_with("*") {
+                if let Some(alias) = clause.split(" as ").nth(1) {
+                    add_import(imports, module, Some(alias.trim().to_string()));
+                }
+                return;
+            }
+
+            if clause.starts_with('{') {
+                let inner = clause.trim_matches('{').trim_matches('}');
+                for part in inner.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    if let Some((name, alias)) = part.split_once(" as ") {
+                        let path = format!("{}.{}", module, name.trim());
+                        add_import(imports, &path, Some(alias.trim().to_string()));
+                    } else {
+                        let path = format!("{}.{}", module, part);
+                        add_import(
+                            imports,
+                            &path,
+                            part.split('.').last().map(|s| s.to_string()),
+                        );
+                    }
+                }
+                return;
+            }
+
+            // default import (possibly with named imports after comma)
+            let mut parts = clause
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty());
+            if let Some(default) = parts.next() {
+                if !module.is_empty() {
+                    add_import(imports, module, Some(default.to_string()));
+                }
+            }
+            if let Some(named) = parts.next() {
+                if named.starts_with('{') {
+                    let inner = named.trim_matches('{').trim_matches('}');
+                    for part in inner.split(',') {
+                        let part = part.trim();
+                        if part.is_empty() {
+                            continue;
+                        }
+                        if let Some((name, alias)) = part.split_once(" as ") {
+                            let path = format!("{}.{}", module, name.trim());
+                            add_import(imports, &path, Some(alias.trim().to_string()));
+                        } else {
+                            let path = format!("{}.{}", module, part);
+                            add_import(
+                                imports,
+                                &path,
+                                part.split('.').last().map(|s| s.to_string()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
+        if node.kind() == "import_statement" {
+            if let Ok(text) = node.utf8_text(source) {
+                parse_import_text(imports, text);
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(&child, source, imports);
+        }
+    }
+
+    visit(&root, source, &mut imports);
+    imports
+}
+
 /// Extract function signature for JavaScript
 fn extract_function_signature(
     node: &tree_sitter::Node,
@@ -380,6 +527,7 @@ fn extract_function_signature(
         .any(|child| child.kind() == "async");
 
     let is_method = node.kind() == "method_definition" || !parent_path.is_empty();
+    let calls = extract_js_calls(node, source);
 
     Some(SignatureInfo {
         name,
@@ -390,6 +538,10 @@ fn extract_function_signature(
         is_async,
         is_method,
         docstring: extract_docstring(node, source),
+        calls,
+
+        imports: vec![],
+        byte_range: (node.start_byte(), node.end_byte()),
     })
 }
 
@@ -424,6 +576,7 @@ fn extract_ts_function_signature(
         .any(|child| child.kind() == "async");
 
     let is_method = node.kind() == "method_definition" || !parent_path.is_empty();
+    let calls = extract_js_calls(node, source);
 
     Some(SignatureInfo {
         name,
@@ -434,7 +587,82 @@ fn extract_ts_function_signature(
         is_async,
         is_method,
         docstring: extract_docstring(node, source),
+        calls,
+
+        imports: vec![],
+        byte_range: (node.start_byte(), node.end_byte()),
     })
+}
+
+/// Extract function calls from a JavaScript/TypeScript node
+fn extract_js_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut calls = Vec::new();
+
+    fn clean_call_text(raw: &str) -> String {
+        raw.split('(')
+            .next()
+            .unwrap_or(raw)
+            .replace("?.", ".")
+            .trim()
+            .to_string()
+    }
+
+    fn extract_callee(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
+        match node.kind() {
+            "member_expression" | "optional_member_expression" => {
+                let object = node
+                    .child_by_field_name("object")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| clean_call_text(s));
+                let property = node
+                    .child_by_field_name("property")
+                    .or_else(|| node.child_by_field_name("name"))
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| clean_call_text(s));
+
+                match (object, property) {
+                    (Some(obj), Some(prop)) => Some(format!("{}.{}", obj, prop)),
+                    _ => node.utf8_text(source).ok().map(|s| clean_call_text(s)),
+                }
+            }
+            "call_expression" | "optional_call_expression" => node
+                .child_by_field_name("function")
+                .and_then(|n| extract_callee(&n, source)),
+            _ => node.utf8_text(source).ok().map(|s| clean_call_text(s)),
+        }
+    }
+
+    fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
+        match node.kind() {
+            "call_expression" | "optional_call_expression" => {
+                if let Some(func) = node.child_by_field_name("function") {
+                    if let Some(name) = extract_callee(&func, source) {
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
+                    }
+                }
+            }
+            "new_expression" => {
+                if let Some(ctor) = node.child_by_field_name("constructor") {
+                    if let Some(name) = extract_callee(&ctor, source) {
+                        if !name.is_empty() {
+                            calls.push(name);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            find_calls(&child, source, calls);
+        }
+    }
+
+    find_calls(node, source, &mut calls);
+    calls
 }
 
 /// Extract parameters from a JavaScript function
@@ -496,7 +724,8 @@ fn extract_ts_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Paramet
                     // If no name field found, look for identifier child
                     let param_name = if param_name.is_none() {
                         let mut ccursor = child.walk();
-                        let result = child.children(&mut ccursor)
+                        let result = child
+                            .children(&mut ccursor)
                             .find(|c| c.kind() == "identifier")
                             .and_then(|c| c.utf8_text(source).ok())
                             .map(|s| s.to_string());
@@ -527,7 +756,8 @@ fn extract_ts_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Paramet
                     // If no name field found, look for identifier child
                     let param_name = if param_name.is_none() {
                         let mut ccursor = child.walk();
-                        let result = child.children(&mut ccursor)
+                        let result = child
+                            .children(&mut ccursor)
                             .find(|c| c.kind() == "identifier")
                             .and_then(|c| c.utf8_text(source).ok())
                             .map(|s| s.to_string());
@@ -560,18 +790,7 @@ fn extract_ts_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Paramet
 /// Extract docstring from a node
 fn extract_docstring(node: &tree_sitter::Node, source: &[u8]) -> Option<String> {
     // Look for comment before the node
-    let mut prev_sibling = None;
-
-    // Get the previous sibling or parent's previous child
-    if let Some(parent) = node.parent() {
-        let mut pcursor = parent.walk();
-        for child in parent.children(&mut pcursor) {
-            if child.id() == node.id() {
-                break;
-            }
-            prev_sibling = Some(child);
-        }
-    }
+    let prev_sibling = node.prev_sibling();
 
     // Check for comment_block or comment_line
     if let Some(sibling) = prev_sibling {
@@ -633,14 +852,8 @@ fn calculate_complexity(node: &tree_sitter::Node, metrics: &mut ComplexityMetric
     metrics.line_count = std::cmp::max(metrics.line_count, 1);
 
     match node.kind() {
-        "if_statement"
-        | "while_statement"
-        | "for_statement"
-        | "for_in_statement"
-        | "for_of_statement"
-        | "try_statement"
-        | "switch_statement"
-        | "catch_clause" => {
+        "if_statement" | "while_statement" | "for_statement" | "for_in_statement"
+        | "for_of_statement" | "try_statement" | "switch_statement" | "catch_clause" => {
             metrics.cyclomatic += 1;
         }
         "else" | "case" => {
@@ -711,7 +924,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_if_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_if_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let true_block = self.create_block();
         let false_block = self.create_block();
         let merge_block = self.create_block();
@@ -761,7 +978,11 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_try_statement(&mut self, _node: &tree_sitter::Node, current_block: usize) -> Result<()> {
+    fn handle_try_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
         let try_block = self.create_block();
         let catch_block = self.create_block();
         let finally_block = self.create_block();
@@ -876,7 +1097,7 @@ mod tests {
         let parser = JavaScriptParser::new();
         let signatures = parser.get_signatures(source).unwrap();
 
-        assert!(signatures.len() >= 1);
+        assert!(!signatures.is_empty());
         let add_sig = signatures.iter().find(|s| s.name == "add");
         assert!(add_sig.is_some());
         if let Some(sig) = add_sig {
@@ -948,7 +1169,7 @@ type JsonObject = Record<string, unknown>;";
         let parser = TypeScriptParser::new();
         let signatures = parser.get_signatures(source).unwrap();
 
-        assert!(signatures.len() >= 1);
+        assert!(!signatures.is_empty());
     }
 
     #[test]

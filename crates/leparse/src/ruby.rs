@@ -1,0 +1,526 @@
+// Ruby language parser implementation
+
+use crate::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::traits::{
+    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
+};
+use tree_sitter::Parser;
+
+/// Ruby language parser with full CodeIntelligence implementation
+pub struct RubyParser;
+
+impl Default for RubyParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RubyParser {
+    /// Create a new instance of the Ruby parser.
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn extract_all_definitions(
+        &self,
+        source: &[u8],
+        root: tree_sitter::Node,
+    ) -> Vec<SignatureInfo> {
+        let mut signatures = Vec::new();
+
+        fn visit_node(
+            node: &tree_sitter::Node,
+            source: &[u8],
+            signatures: &mut Vec<SignatureInfo>,
+            parent_path: &[String],
+        ) {
+            match node.kind() {
+                "method" => {
+                    if let Some(sig) = extract_method_signature(node, source, parent_path) {
+                        signatures.push(sig);
+                    }
+                }
+                "class" => {
+                    if let Some(name) = node
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                    {
+                        let qualified_name = if parent_path.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{}::{}", parent_path.join("::"), name)
+                        };
+
+                        signatures.push(SignatureInfo {
+                            name: name.to_string(),
+                            qualified_name,
+                            parameters: vec![],
+                            return_type: Some("class".to_string()),
+                            visibility: Visibility::Public,
+                            is_async: false,
+                            is_method: false,
+                            docstring: None,
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (0, 0),
+                        });
+                    }
+
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        visit_node(&child, source, signatures, parent_path);
+                    }
+                }
+                "module" => {
+                    if let Some(name) = node
+                        .child_by_field_name("name")
+                        .and_then(|n| n.utf8_text(source).ok())
+                    {
+                        let mut new_path = parent_path.to_vec();
+                        new_path.push(name.to_string());
+
+                        let mut cursor = node.walk();
+                        for child in node.children(&mut cursor) {
+                            visit_node(&child, source, signatures, &new_path);
+                        }
+                    }
+                }
+                _ => {
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        visit_node(&child, source, signatures, parent_path);
+                    }
+                }
+            }
+        }
+
+        visit_node(&root, source, &mut signatures, &[]);
+        signatures
+    }
+}
+
+impl CodeIntelligence for RubyParser {
+    fn get_signatures(&self, source: &[u8]) -> Result<Vec<SignatureInfo>> {
+        let mut parser = Parser::new();
+        self.get_signatures_with_parser(source, &mut parser)
+    }
+
+    fn get_signatures_with_parser(
+        &self,
+        source: &[u8],
+        parser: &mut tree_sitter::Parser,
+    ) -> Result<Vec<SignatureInfo>> {
+        parser
+            .set_language(&crate::traits::languages::ruby::language())
+            .map_err(|e| Error::ParseFailed(e.to_string()))?;
+
+        let tree = parser
+            .parse(source, None)
+            .ok_or_else(|| Error::ParseFailed("Failed to parse Ruby source".to_string()))?;
+
+        let root_node = tree.root_node();
+        let imports = extract_ruby_imports(root_node, source);
+        let mut signatures = self.extract_all_definitions(source, root_node);
+
+        for sig in &mut signatures {
+            sig.imports = imports.clone();
+        }
+
+        Ok(signatures)
+    }
+
+    fn compute_cfg(&self, source: &[u8], node_id: usize) -> Result<Graph<Block, Edge>> {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::traits::languages::ruby::language())
+            .map_err(|e| Error::ParseFailed(e.to_string()))?;
+
+        let tree = parser
+            .parse(source, None)
+            .ok_or_else(|| Error::ParseFailed("Failed to parse Ruby source".to_string()))?;
+
+        let root_node = tree.root_node();
+        let node = find_node_by_id(&root_node, node_id)
+            .ok_or_else(|| Error::ParseFailed(format!("Node {} not found", node_id)))?;
+
+        let mut cfg_builder = CfgBuilder::new(source);
+        cfg_builder.build_from_node(&node)?;
+
+        Ok(cfg_builder.finish())
+    }
+
+    fn extract_complexity(&self, node: &tree_sitter::Node) -> ComplexityMetrics {
+        let mut complexity = ComplexityMetrics {
+            cyclomatic: 1,
+            nesting_depth: 0,
+            line_count: 0,
+            token_count: 0,
+        };
+
+        calculate_complexity(node, &mut complexity, 0);
+        complexity
+    }
+}
+
+fn extract_ruby_imports(root: tree_sitter::Node, source: &[u8]) -> Vec<ImportInfo> {
+    let mut imports = Vec::new();
+
+    fn add_import(imports: &mut Vec<ImportInfo>, path: &str) {
+        let path = path.trim().trim_matches('"').trim_matches('\'').trim();
+        if path.is_empty() {
+            return;
+        }
+        imports.push(ImportInfo {
+            path: path.to_string(),
+            alias: None,
+        });
+    }
+
+    fn visit(node: &tree_sitter::Node, source: &[u8], imports: &mut Vec<ImportInfo>) {
+        if node.kind() == "call" || node.kind() == "method_call" {
+            if let Some(name_node) = node
+                .child_by_field_name("method")
+                .or_else(|| node.child_by_field_name("name"))
+            {
+                if let Ok(name) = name_node.utf8_text(source) {
+                    if name == "require" || name == "require_relative" {
+                        if let Some(arg) = node.child_by_field_name("arguments") {
+                            if let Ok(text) = arg.utf8_text(source) {
+                                let cleaned = text.trim().trim_matches('(').trim_matches(')');
+                                add_import(imports, cleaned);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit(&child, source, imports);
+        }
+    }
+
+    visit(&root, source, &mut imports);
+    imports
+}
+
+fn extract_method_signature(
+    node: &tree_sitter::Node,
+    source: &[u8],
+    parent_path: &[String],
+) -> Option<SignatureInfo> {
+    let name = node
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(source).ok())
+        .map(|s| s.to_string())?;
+
+    let qualified_name = if parent_path.is_empty() {
+        name.clone()
+    } else {
+        format!("{}::{}", parent_path.join("::"), name)
+    };
+
+    let parameters = extract_ruby_parameters(node, source);
+
+    let calls = extract_ruby_calls(node, source);
+
+    Some(SignatureInfo {
+        name,
+        qualified_name,
+        parameters,
+        return_type: None,
+        visibility: Visibility::Public,
+        is_async: false,
+        is_method: true,
+        docstring: None,
+        calls,
+
+        imports: vec![],
+        byte_range: (0, 0),
+    })
+}
+
+fn extract_ruby_calls(node: &tree_sitter::Node, source: &[u8]) -> Vec<String> {
+    let mut calls = Vec::new();
+
+    fn clean_call_text(raw: &str) -> String {
+        raw.split('(').next().unwrap_or(raw).trim().to_string()
+    }
+
+    fn find_calls(node: &tree_sitter::Node, source: &[u8], calls: &mut Vec<String>) {
+        match node.kind() {
+            "call" | "method_call" | "command" | "command_call" => {
+                let receiver = node
+                    .child_by_field_name("receiver")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| clean_call_text(s));
+                let method = node
+                    .child_by_field_name("method")
+                    .or_else(|| node.child_by_field_name("name"))
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(|s| clean_call_text(s));
+
+                let call_name = match (receiver, method) {
+                    (Some(r), Some(m)) => format!("{}.{}", r, m),
+                    (_, Some(m)) => m,
+                    _ => node
+                        .utf8_text(source)
+                        .ok()
+                        .map(|s| clean_call_text(s))
+                        .unwrap_or_default(),
+                };
+
+                if !call_name.is_empty() {
+                    calls.push(call_name);
+                }
+            }
+            _ => {}
+        }
+
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            find_calls(&child, source, calls);
+        }
+    }
+
+    find_calls(node, source, &mut calls);
+    calls
+}
+
+fn extract_ruby_parameters(node: &tree_sitter::Node, source: &[u8]) -> Vec<Parameter> {
+    let mut parameters = Vec::new();
+
+    if let Some(params) = node.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for child in params.children(&mut cursor) {
+            if child.kind() == "identifier" {
+                if let Ok(name) = child.utf8_text(source) {
+                    parameters.push(Parameter {
+                        name: name.to_string(),
+                        type_annotation: None,
+                        default_value: None,
+                    });
+                }
+            }
+        }
+    }
+
+    parameters
+}
+
+fn find_node_by_id<'a>(node: &tree_sitter::Node<'a>, id: usize) -> Option<tree_sitter::Node<'a>> {
+    if node.id() == id {
+        return Some(*node);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if let Some(found) = find_node_by_id(&child, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn calculate_complexity(node: &tree_sitter::Node, metrics: &mut ComplexityMetrics, depth: usize) {
+    metrics.nesting_depth = metrics.nesting_depth.max(depth);
+    metrics.line_count = std::cmp::max(metrics.line_count, 1);
+    match node.kind() {
+        "if" | "unless" | "case" | "when" | "while" | "until" | "for" => {
+            metrics.cyclomatic += 1;
+        }
+        _ => {}
+    }
+    metrics.token_count += node.child_count();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        calculate_complexity(&child, metrics, depth + 1);
+    }
+}
+
+struct CfgBuilder<'a> {
+    source: &'a [u8],
+    blocks: Vec<Block>,
+    edges: Vec<Edge>,
+    next_block_id: usize,
+}
+
+impl<'a> CfgBuilder<'a> {
+    fn new(source: &'a [u8]) -> Self {
+        Self {
+            source,
+            blocks: Vec::new(),
+            edges: Vec::new(),
+            next_block_id: 0,
+        }
+    }
+
+    fn build_from_node(&mut self, node: &tree_sitter::Node) -> Result<()> {
+        let entry_id = self.create_block();
+        self.build_cfg_recursive(node, entry_id)?;
+        Ok(())
+    }
+
+    fn build_cfg_recursive(
+        &mut self,
+        node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
+        match node.kind() {
+            "if" | "unless" => {
+                self.handle_if_statement(node, current_block)?;
+            }
+            "while" | "until" | "for" => {
+                self.handle_loop_statement(node, current_block)?;
+            }
+            _ => {
+                if let Ok(text) = node.utf8_text(self.source) {
+                    self.add_statement_to_block(current_block, text.to_string());
+                }
+                let mut cursor = node.walk();
+                for child in node.children(&mut cursor) {
+                    self.build_cfg_recursive(&child, current_block)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_if_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
+        let true_block = self.create_block();
+        let false_block = self.create_block();
+        let merge_block = self.create_block();
+        self.edges.push(Edge {
+            from: current_block,
+            to: true_block,
+            edge_type: EdgeType::TrueBranch,
+        });
+        self.edges.push(Edge {
+            from: current_block,
+            to: false_block,
+            edge_type: EdgeType::FalseBranch,
+        });
+        self.edges.push(Edge {
+            from: true_block,
+            to: merge_block,
+            edge_type: EdgeType::Unconditional,
+        });
+        self.edges.push(Edge {
+            from: false_block,
+            to: merge_block,
+            edge_type: EdgeType::Unconditional,
+        });
+        Ok(())
+    }
+
+    fn handle_loop_statement(
+        &mut self,
+        _node: &tree_sitter::Node,
+        current_block: usize,
+    ) -> Result<()> {
+        let body_block = self.create_block();
+        self.edges.push(Edge {
+            from: current_block,
+            to: body_block,
+            edge_type: EdgeType::Unconditional,
+        });
+        self.edges.push(Edge {
+            from: body_block,
+            to: current_block,
+            edge_type: EdgeType::Loop,
+        });
+        Ok(())
+    }
+
+    fn create_block(&mut self) -> usize {
+        let id = self.next_block_id;
+        self.next_block_id += 1;
+        self.blocks.push(Block {
+            id,
+            statements: Vec::new(),
+        });
+        id
+    }
+
+    fn add_statement_to_block(&mut self, block_id: usize, statement: String) {
+        if let Some(block) = self.blocks.get_mut(block_id) {
+            block.statements.push(statement);
+        }
+    }
+
+    fn finish(self) -> Graph<Block, Edge> {
+        Graph {
+            blocks: self.blocks,
+            edges: self.edges,
+            entry_block: 0,
+            exit_blocks: vec![self.next_block_id.saturating_sub(1)],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ruby_method_extraction() {
+        let source = b"def greet(name)
+  puts \"Hello, #{name}\"
+end";
+
+        let parser = RubyParser::new();
+        let signatures = parser.get_signatures(source).unwrap();
+
+        assert_eq!(signatures.len(), 1);
+        let method = &signatures[0];
+        assert_eq!(method.name, "greet");
+        assert!(method.is_method);
+    }
+
+    #[test]
+    fn test_ruby_class_extraction() {
+        let source = b"class Person
+  def initialize(name)
+    @name = name
+  end
+end";
+
+        let parser = RubyParser::new();
+        let signatures = parser.get_signatures(source).unwrap();
+
+        // Should find class and method
+        assert!(!signatures.is_empty());
+        let class = signatures.iter().find(|s| s.name == "Person");
+        assert!(class.is_some());
+    }
+
+    #[test]
+    fn test_ruby_complexity_calculation() {
+        let source = b"def complex(x)
+  if x > 0
+    (0...x).each do |i|
+      if i.even?
+        puts i
+      end
+    end
+  end
+end";
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_ruby::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        let ruby_parser = RubyParser::new();
+        let metrics = ruby_parser.extract_complexity(&root);
+
+        assert!(metrics.cyclomatic > 1);
+        assert!(metrics.nesting_depth > 0);
+    }
+}

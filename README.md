@@ -8,7 +8,7 @@
 [![MCP](https://img.shields.io/badge/MCP-Ready-blue?style=for-the-badge)](https://modelcontextprotocol.io)
 [![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
 
-**Code analysis that cuts token burn before it cuts your budget.**
+**A full code intelligence system: indexing, graph analysis, semantic search, MCP, and phased triage.**
 
 </div>
 
@@ -72,12 +72,16 @@ Use **5-phase first** to shrink scope, then manually read only the ranked focus 
 
 ## Core capabilities
 
-- Semantic code search (not just keyword matching)
-- Program Dependence Graph (PDG) analysis
-- Incremental freshness-aware refresh
-- Additive CLI + MCP integration
-- 5-phase analysis (single phase or full run)
-- Optional docs analysis (explicit opt-in only)
+- **Fast indexing pipeline** over multi-language source trees
+- **Program Dependence Graph (PDG)** for structural + dependency reasoning
+- **Semantic ranking/search** for intent-driven code discovery
+- **Tiered vector retrieval**: in-memory HNSW hot tier + Turso-backed cold tier spill
+- **Deep analysis/context expansion** for AI-assisted understanding
+- **Persistent storage layer** for indexed files, graph data, and caches
+- **MCP-native integration** for AI tools/workflows
+- **5-phase analysis mode** (single phase or full run) for scoped triage
+- **Incremental freshness-aware refresh** + parse-failure safety
+- **Optional docs analysis** (explicit opt-in only)
 
 ---
 
@@ -96,21 +100,29 @@ leindex --version
 leindex phase --help
 ```
 
+### Cargo alternative
+
+```bash
+cargo install --git https://github.com/scooter-lacroix/LeIndex.git --locked --bin leindex
+```
+
 ### Use
 
 ```bash
 # 1) Build index
 leindex index /path/to/project
 
-# 2) Run full 5-phase analysis
-leindex phase --all --path /path/to/project
-
-# 3) Run a single phase (example: dependency map)
-leindex phase --phase 2 --path /path/to/project
-
-# 4) Run semantic search
+# 2) Run semantic search
 leindex search "where is authentication enforced"
+
+# 3) Run deep analysis
+leindex analyze "how auth token refresh works"
+
+# 4) (Optional) run phased triage for scoped impact mapping
+leindex phase --all --path /path/to/project
 ```
+
+Remote Turso is optional/opt-in; default runtime remains local plug-and-play.
 
 ---
 
@@ -128,6 +140,8 @@ LeIndex exposes MCP tools for indexing/search/context and 5-phase analysis, incl
 ---
 
 ## Architecture (updated)
+
+`lephase` is one analysis subsystem alongside parsing, graph, search, storage, and MCP orchestration.
 
 ```mermaid
 flowchart TB
@@ -159,6 +173,8 @@ flowchart TB
 - [API.md](API.md)
 - [QUICK_START.md](QUICK_START.md)
 - [docs/FIVE_PHASE_TOKEN_EFFICIENCY.md](docs/FIVE_PHASE_TOKEN_EFFICIENCY.md)
+- [docs/COMPONENT_STATUS.md](docs/COMPONENT_STATUS.md)
+- [docs/RELEASE_BINARY_WORKFLOW.md](docs/RELEASE_BINARY_WORKFLOW.md)
 - [INSTALLATION.md](INSTALLATION.md)
 
 ---
