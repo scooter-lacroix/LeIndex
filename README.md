@@ -274,14 +274,22 @@ RUST_LOG=debug cargo run --release -- index .
 
 ## Performance
 
-### Benchmarks (v0.1.0)
+### Per-Query Token Analysis
+
+| Operation | Traditional Reading | LeIndex Analyze | LeIndex Phase | Savings |
+|-----------|-------------------|------------------|----------------|----------|
+| Small file (705 chars) | 176 tokens | 67% of budget* | 147 tokens | **16%** |
+| Medium file (9,248 chars) | 2,312 tokens | 67% of budget* | 147 tokens | **94%** |
+| Large file (13,083 chars) | 3,271 tokens | 67% of budget* | 148 tokens | **95%** |
+| **All 5 files** | **12,917 tokens** | **6,715 tokens** | **736 tokens** | **94%** |
+
+\*LeIndex Analyze uses configurable token budget (default: 2000). Actual usage is 67% of budget on average.
 
 | Metric | Target | Status |
 |--------|--------|--------|
 | **Indexing Speed** | <60s for 50K files | ✅ Achieved |
 | **Search Latency (P95)** | <100ms | ✅ Achieved |
 | **Memory Reduction** | 10x (400→32 bytes/node) | ✅ Achieved |
-| **Token Efficiency** | 20% improvement | ✅ Achieved |
 
 ### Code Quality
 
