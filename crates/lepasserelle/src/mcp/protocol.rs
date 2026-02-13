@@ -244,6 +244,93 @@ pub struct ToolCallParams {
     pub arguments: Value,
 }
 
+/// Progress event for long-running operations
+///
+/// These events are sent via SSE during indexing to provide
+/// real-time feedback without arbitrary timeouts.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProgressEvent {
+    /// Event type: "progress" or "complete"
+    #[serde(rename = "type")]
+    pub event_type: String,
+
+    /// Current stage of indexing
+    pub stage: String,
+
+    /// Current item count
+    pub current: usize,
+
+    /// Total items (0 if unknown)
+    pub total: usize,
+
+    /// Optional message with additional details
+    pub message: Option<String>,
+
+    /// Timestamp in milliseconds
+    pub timestamp_ms: u64,
+}
+
+impl ProgressEvent {
+    /// Create a new progress event
+    pub fn progress(
+        stage: impl Into<String>,
+        current: usize,
+        total: usize,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            event_type: "progress".to_string(),
+            stage: stage.into(),
+            current,
+            total,
+            message: Some(message.into()),
+            timestamp_ms: {
+                let duration = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap();
+                duration.as_millis() as u64
+            },
+        }
+    }
+
+    /// Create a completion event
+    pub fn complete(
+        stage: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            event_type: "complete".to_string(),
+            stage: stage.into(),
+            current: 0,
+            total: 0,
+            message: Some(message.into()),
+            timestamp_ms: {
+                let duration = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap();
+                duration.as_millis() as u64
+            },
+        }
+    }
+
+    /// Create an error event
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            event_type: "error".to_string(),
+            stage: "error".into(),
+            current: 0,
+            total: 0,
+            message: Some(message.into()),
+            timestamp_ms: {
+                let duration = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap();
+                duration.as_millis() as u64
+            },
+        }
+    }
+}
+
 /// JSON-RPC Error Codes
 ///
 /// Standard JSON-RPC 2.0 error codes are in the range -32700 to -32603.

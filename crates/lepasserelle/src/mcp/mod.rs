@@ -28,6 +28,8 @@ pub mod handlers;
 pub mod protocol;
 /// MCP server implementation.
 pub mod server;
+/// SSE streaming support for indexing progress.
+pub mod sse;
 
 pub use protocol::{error_codes, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use server::{McpServer, McpServerConfig};

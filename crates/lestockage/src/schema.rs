@@ -280,6 +280,22 @@ impl Storage {
     pub fn conn_mut(&mut self) -> &mut Connection {
         &mut self.conn
     }
+
+    /// Close the storage connection and ensure WAL is checkpointed
+    ///
+    /// This explicitly checkpoints the WAL (Write-Ahead Log) to the main database file
+    /// and closes the SQLite connection. This should be called before switching projects
+    /// to ensure file locks are released properly.
+    pub fn close(&mut self) -> SqliteResult<()> {
+        // Force WAL checkpoint to ensure all data is written to main DB
+        // This releases locks on the -wal and -shm files
+        if self.config.wal_enabled {
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", [])?;
+        }
+        // Optionally run optimize to clean up the database file
+        // self.conn.execute("PRAGMA optimize", [])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

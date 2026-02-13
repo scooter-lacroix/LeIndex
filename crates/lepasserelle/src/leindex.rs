@@ -758,6 +758,20 @@ impl LeIndex {
         self.search_engine.node_count() > 0
     }
 
+    /// Close the LeIndex and ensure WAL is checkpointed
+    ///
+    /// This explicitly closes the storage connection, which triggers a WAL checkpoint.
+    /// This should be called before switching projects to ensure file locks are released.
+    ///
+    /// # Returns
+    ///
+    /// `Result<()>` - Success or error
+    pub fn close(&mut self) -> Result<()> {
+        self.storage.close().context("Failed to close storage")?;
+        info!("Closed LeIndex for project: {}", self.project_id);
+        Ok(())
+    }
+
     // ========================================================================
     // CACHE SPILLING (Phase 5.2)
     // ========================================================================

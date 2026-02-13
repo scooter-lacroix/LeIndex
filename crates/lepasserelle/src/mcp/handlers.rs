@@ -200,6 +200,7 @@ impl IndexHandler {
             })?;
 
         if index.project_path() != path {
+            let _ = index.close();
             *index = LeIndex::new(&path).map_err(|e| {
                 JsonRpcError::indexing_failed(format!("Failed to re-initialize LeIndex: {}", e))
             })?;
