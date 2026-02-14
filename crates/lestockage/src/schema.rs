@@ -3,6 +3,7 @@
 use rusqlite::{Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use crate::{ProjectMetadata, UniqueProjectId};
 
 /// Storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +65,37 @@ impl Storage {
 
     /// Initialize database schema
     fn initialize_schema(&mut self) -> SqliteResult<()> {
+        // Initialize project_metadata table first
+        // SQL schema for project_metadata table
+        let project_metadata_schema = r#"
+CREATE TABLE IF NOT EXISTS project_metadata (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    unique_project_id TEXT UNIQUE NOT NULL,
+    base_name TEXT NOT NULL,
+    path_hash TEXT NOT NULL,
+    instance INTEGER DEFAULT 0,
+    canonical_path TEXT NOT NULL,
+    display_name TEXT,
+    is_clone BOOLEAN DEFAULT 0,
+    cloned_from TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(canonical_path)
+)
+"#;
+
+        // SQL indexes for project_metadata table
+        let project_metadata_indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_project_metadata_unique_id ON project_metadata(unique_project_id)",
+            "CREATE INDEX IF NOT EXISTS idx_project_metadata_canonical_path ON project_metadata(canonical_path)",
+            "CREATE INDEX IF NOT EXISTS idx_project_metadata_base_hash ON project_metadata(base_name, path_hash)",
+            "CREATE INDEX IF NOT EXISTS idx_project_metadata_base_name ON project_metadata(base_name)",
+        ];
+
+        self.conn.execute(project_metadata_schema, [])?;
+        for index_sql in project_metadata_indexes {
+            self.conn.execute(index_sql, [])?;
+        }
+
         // Create indexed_files table for incremental indexing
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS indexed_files (
@@ -296,6 +328,32 @@ impl Storage {
         // self.conn.execute("PRAGMA optimize", [])?;
         Ok(())
     }
+
+    /// Load existing project IDs for a given base name.
+    ///
+    /// This is used for unique project ID generation to avoid conflicts.
+    pub fn load_existing_ids(&self, base_name: &str) -> SqliteResult<Vec<UniqueProjectId>> {
+        ProjectMetadata::load_existing_ids(&self.conn, base_name)
+            .map_err(|e| rusqlite::Error::InvalidQuery)
+    }
+    
+    /// Store project metadata.
+    ///
+    /// This persists the unique project ID and associated metadata.
+    pub fn store_project_metadata(
+        &self,
+        unique_id: &UniqueProjectId,
+        project_path: &Path,
+    ) -> SqliteResult<()> {
+        let metadata = ProjectMetadata::new(project_path);
+        // Override with the provided unique_id
+        let metadata = ProjectMetadata {
+            unique_project_id: unique_id.clone(),
+            ..metadata
+        };
+        metadata.save(&self.conn).map_err(|e| rusqlite::Error::InvalidQuery)
+    }
+
 }
 
 #[cfg(test)]
@@ -325,6 +383,6 @@ mod tests {
             )
             .unwrap();
 
-        assert_eq!(table_count, 6); // intel_nodes, intel_edges, analysis_cache, global_symbols, external_refs, project_deps
+        assert_eq!(table_count, 7); // intel_nodes, intel_edges, analysis_cache, global_symbols, external_refs, project_deps, project_metadata
     }
 }

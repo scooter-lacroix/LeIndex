@@ -4,13 +4,14 @@
   "status": "completed",
   "created_at": "2025-01-25T00:00:00Z",
   "updated_at": "2026-02-13T00:00:00Z",
-  "description": "Transform LeIndex from Python to Rust-based Deep Code Intelligence Engine with integrated 5-layer code analysis. Complete greenfield rewrite with orchestrate-ready sub-tracks: leparse (AST), legraphe (PDG), lerecherche (search), lestockage (storage), lepasserelle (integration).",
+  "description": "Transform LeIndex from Python to Rust-based Deep Code Intelligence Engine with integrated 5-phase code analysis. Complete greenfield rewrite with orchestrate-ready sub-tracks: leparse (AST), legraphe (PDG), lerecherche (search), lestockage (storage), lepasserelle (integration), lephase (5-phase analysis).",
   "sub_tracks": [
     "leparse_20250125",
     "legraphe_20250125",
     "lerecherche_20250125",
     "lestockage_20250125",
-    "lepasserelle_20250125"
+    "lepasserelle_20250125",
+    "lephase_5phase_20260205"
   ],
   "performance_targets": {
     "memory_reduction": "10x (400→32 bytes/node)",
