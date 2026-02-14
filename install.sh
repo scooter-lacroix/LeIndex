@@ -29,12 +29,19 @@ readonly MIN_RUST_MAJOR=1
 readonly MIN_RUST_MINOR=75
 readonly REPO_URL="https://github.com/scooter-lacroix/leindex"
 NONINTERACTIVE=false
+PRESERVE_BINARY=false
+PRESERVE_CONFIG=false
+PRESERVE_DATA=false
+PRESERVE_LOGS=false
+KEEP_ALL=false
+SELECTIVE_PURGE=false
 
 # Installation paths
 LEINDEX_HOME="${LEINDEX_HOME:-$HOME/.leindex}"
 CONFIG_DIR="${LEINDEX_HOME}/config"
 DATA_DIR="${LEINDEX_HOME}/data"
 LOG_DIR="${LEINDEX_HOME}/logs"
+TEMP_BACKUP_DIR="${HOME}/.leindex.tmp"
 # Install to standard system-wide location (requires sudo)
 # This ensures leindex is accessible to all AI tools regardless of PATH
 INSTALL_BIN_DIR="/usr/local/bin"
@@ -1007,6 +1014,626 @@ offer_start_server() {
             echo ""
             ;;
     esac
+}
+
+# ============================================================================
+# SELECTIVE PURGE SYSTEM
+# ============================================================================
+
+show_selective_purge_menu() {
+    print_header "Selective Purge Menu"
+
+    echo "Select what to preserve:"
+    echo ""
+    echo "  ${CYAN}1)${NC} ${BOLD}Binary only${NC}        Remove config/data/logs, keep binary"
+    echo "  ${CYAN}2)${NC} ${BOLD}Config only${NC}        Remove binary/data/logs, keep config"
+    echo "  ${CYAN}3)${NC} ${BOLD}Data only${NC}          Remove binary/config/logs, keep data"
+    echo "  ${CYAN}4)${NC} ${BOLD}Logs only${NC}          Remove binary/config/data, keep logs"
+    echo "  ${CYAN}5)${NC} ${BOLD}Custom selection${NC}    Interactive menu for each component"
+    echo "  ${CYAN}6)${NC} ${BOLD}Purge all${NC}          Remove everything (default behavior)"
+    echo "  ${CYAN}7)${NC} ${BOLD}Keep all${NC}          Preserve everything"
+    echo "  ${CYAN}0)${NC} ${BOLD}Cancel${NC}            Cancel installation"
+    echo ""
+    read -p "Enter your choice [0-7]: " -n 1 -r
+    echo ""
+
+    case $REPLY in
+        1)
+            # Keep binary only
+            PRESERVE_BINARY=true
+            SELECTIVE_PURGE=true
+            log_info "Selected: Keep binary only"
+            ;;
+        2)
+            # Keep config only
+            PRESERVE_CONFIG=true
+            SELECTIVE_PURGE=true
+            log_info "Selected: Keep config only"
+            ;;
+        3)
+            # Keep data only
+            PRESERVE_DATA=true
+            SELECTIVE_PURGE=true
+            log_info "Selected: Keep data only"
+            ;;
+        4)
+            # Keep logs only
+            PRESERVE_LOGS=true
+            SELECTIVE_PURGE=true
+            log_info "Selected: Keep logs only"
+            ;;
+        5)
+            # Custom selection
+            show_custom_selection_menu
+            ;;
+        6)
+            # Purge all
+            SELECTIVE_PURGE=false
+            log_info "Selected: Purge all"
+            ;;
+        7)
+            # Keep all
+            KEEP_ALL=true
+            log_info "Selected: Keep all"
+            ;;
+        0)
+            log_info "Installation cancelled by user"
+            exit 0
+            ;;
+        *)
+            log_error "Invalid choice"
+            echo ""
+            read -p "Try again? [Y/n] " -n 1 -r
+            echo ""
+            if [[ $REPLY =~ ^[Nn]$ ]]; then
+                log_info "Installation cancelled"
+                exit 0
+            fi
+            show_selective_purge_menu
+            ;;
+    esac
+}
+
+show_custom_selection_menu() {
+    print_header "Custom Component Selection"
+
+    echo "Select components to ${GREEN}PRESERVE${NC}:"
+    echo ""
+
+    # Binary
+    read -p "Preserve ${BOLD}binary${NC}? [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        PRESERVE_BINARY=true
+        print_bullet "Binary will be preserved"
+    else
+        print_bullet "Binary will be removed"
+    fi
+
+    # Config
+    read -p "Preserve ${BOLD}config${NC}? [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        PRESERVE_CONFIG=true
+        print_bullet "Config will be preserved"
+    else
+        print_bullet "Config will be removed"
+    fi
+
+    # Data
+    read -p "Preserve ${BOLD}data${NC}? [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        PRESERVE_DATA=true
+        print_bullet "Data will be preserved"
+    else
+        print_bullet "Data will be removed"
+    fi
+
+    # Logs
+    read -p "Preserve ${BOLD}logs${NC}? [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        PRESERVE_LOGS=true
+        print_bullet "Logs will be preserved"
+    else
+        print_bullet "Logs will be removed"
+    fi
+
+    # Check if at least one component is being preserved
+    if [[ "$PRESERVE_BINARY" == false ]] && [[ "$PRESERVE_CONFIG" == false ]] && \
+       [[ "$PRESERVE_DATA" == false ]] && [[ "$PRESERVE_LOGS" == false ]]; then
+        echo ""
+        log_warn "No components selected for preservation"
+        read -p "Proceed with full purge? [y/N] " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            SELECTIVE_PURGE=false
+        else
+            log_info "Restarting selection..."
+            echo ""
+            show_custom_selection_menu
+        fi
+    else
+        SELECTIVE_PURGE=true
+        echo ""
+        log_success "Custom selection complete"
+    fi
+}
+
+backup_data_to_temp() {
+    local backup_success=false
+
+    print_header "Backing Up Data"
+
+    # Create temp directory
+    if [[ -d "$TEMP_BACKUP_DIR" ]]; then
+        log_warn "Temp backup directory already exists, removing..."
+        rm -rf "$TEMP_BACKUP_DIR"
+    fi
+
+    mkdir -p "$TEMP_BACKUP_DIR"
+    log_info "Created temporary backup directory: $TEMP_BACKUP_DIR"
+    echo ""
+
+    # Backup config if preserving
+    if [[ "$PRESERVE_CONFIG" == true ]] && [[ -d "$CONFIG_DIR" ]]; then
+        log_info "Backing up config..."
+        if cp -r "$CONFIG_DIR" "$TEMP_BACKUP_DIR/config" 2>/dev/null; then
+            log_success "Config backed up"
+            backup_success=true
+        else
+            log_error "Failed to backup config"
+        fi
+    fi
+
+    # Backup data if preserving
+    if [[ "$PRESERVE_DATA" == true ]] && [[ -d "$DATA_DIR" ]]; then
+        log_info "Backing up data..."
+        if cp -r "$DATA_DIR" "$TEMP_BACKUP_DIR/data" 2>/dev/null; then
+            log_success "Data backed up"
+            backup_success=true
+        else
+            log_error "Failed to backup data"
+        fi
+    fi
+
+    # Backup logs if preserving
+    if [[ "$PRESERVE_LOGS" == true ]] && [[ -d "$LOG_DIR" ]]; then
+        log_info "Backing up logs..."
+        if cp -r "$LOG_DIR" "$TEMP_BACKUP_DIR/logs" 2>/dev/null; then
+            log_success "Logs backed up"
+            backup_success=true
+        else
+            log_error "Failed to backup logs"
+        fi
+    fi
+
+    # Backup binary if preserving
+    if [[ "$PRESERVE_BINARY" == true ]] && [[ -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" ]]; then
+        log_info "Backing up binary..."
+        mkdir -p "$TEMP_BACKUP_DIR/binary"
+        if cp "$INSTALL_BIN_DIR/$PROJECT_SLUG" "$TEMP_BACKUP_DIR/binary/" 2>/dev/null; then
+            log_success "Binary backed up"
+            backup_success=true
+        else
+            log_error "Failed to backup binary"
+        fi
+    fi
+
+    echo ""
+    if [[ "$backup_success" == true ]]; then
+        log_success "Backup complete"
+        return 0
+    else
+        log_error "Backup failed"
+        return 1
+    fi
+}
+
+validate_backup_integrity() {
+    print_header "Validating Backup Integrity"
+
+    local validation_failed=false
+
+    # Validate config if backed up
+    if [[ -d "$TEMP_BACKUP_DIR/config" ]]; then
+        log_info "Validating config backup..."
+        local config_files=$(find "$TEMP_BACKUP_DIR/config" -type f 2>/dev/null | wc -l)
+        if [[ $config_files -gt 0 ]]; then
+            log_success "Config backup valid ($config_files files)"
+        else
+            log_error "Config backup validation failed"
+            validation_failed=true
+        fi
+    fi
+
+    # Validate data if backed up
+    if [[ -d "$TEMP_BACKUP_DIR/data" ]]; then
+        log_info "Validating data backup..."
+        local data_files=$(find "$TEMP_BACKUP_DIR/data" -type f 2>/dev/null | wc -l)
+        if [[ $data_files -gt 0 ]]; then
+            log_success "Data backup valid ($data_files files)"
+        else
+            log_error "Data backup validation failed"
+            validation_failed=true
+        fi
+    fi
+
+    # Validate logs if backed up
+    if [[ -d "$TEMP_BACKUP_DIR/logs" ]]; then
+        log_info "Validating logs backup..."
+        local log_files=$(find "$TEMP_BACKUP_DIR/logs" -type f 2>/dev/null | wc -l)
+        if [[ $log_files -gt 0 ]]; then
+            log_success "Logs backup valid ($log_files files)"
+        else
+            log_error "Logs backup validation failed"
+            validation_failed=true
+        fi
+    fi
+
+    # Validate binary if backed up
+    if [[ -f "$TEMP_BACKUP_DIR/binary/$PROJECT_SLUG" ]]; then
+        log_info "Validating binary backup..."
+        if [[ -x "$TEMP_BACKUP_DIR/binary/$PROJECT_SLUG" ]] || chmod +x "$TEMP_BACKUP_DIR/binary/$PROJECT_SLUG" 2>/dev/null; then
+            log_success "Binary backup valid"
+        else
+            log_error "Binary backup validation failed"
+            validation_failed=true
+        fi
+    fi
+
+    echo ""
+    if [[ "$validation_failed" == true ]]; then
+        log_error "Backup validation failed"
+        return 1
+    else
+        log_success "All backups validated successfully"
+        return 0
+    fi
+}
+
+restore_backup_data() {
+    print_header "Restoring Preserved Data"
+
+    local restore_success=false
+
+    # Restore config
+    if [[ -d "$TEMP_BACKUP_DIR/config" ]]; then
+        log_info "Restoring config..."
+        if cp -r "$TEMP_BACKUP_DIR/config"/* "$CONFIG_DIR/" 2>/dev/null; then
+            log_success "Config restored"
+            restore_success=true
+        else
+            log_error "Failed to restore config"
+        fi
+    fi
+
+    # Restore data
+    if [[ -d "$TEMP_BACKUP_DIR/data" ]]; then
+        log_info "Restoring data..."
+        if cp -r "$TEMP_BACKUP_DIR/data"/* "$DATA_DIR/" 2>/dev/null; then
+            log_success "Data restored"
+            restore_success=true
+        else
+            log_error "Failed to restore data"
+        fi
+    fi
+
+    # Restore logs
+    if [[ -d "$TEMP_BACKUP_DIR/logs" ]]; then
+        log_info "Restoring logs..."
+        if cp -r "$TEMP_BACKUP_DIR/logs"/* "$LOG_DIR/" 2>/dev/null; then
+            log_success "Logs restored"
+            restore_success=true
+        else
+            log_error "Failed to restore logs"
+        fi
+    fi
+
+    # Restore binary
+    if [[ -f "$TEMP_BACKUP_DIR/binary/$PROJECT_SLUG" ]]; then
+        log_info "Restoring binary..."
+        if sudo cp "$TEMP_BACKUP_DIR/binary/$PROJECT_SLUG" "$INSTALL_BIN_DIR/" && \
+           sudo chmod +x "$INSTALL_BIN_DIR/$PROJECT_SLUG" 2>/dev/null; then
+            log_success "Binary restored"
+            restore_success=true
+        else
+            log_error "Failed to restore binary"
+        fi
+    fi
+
+    echo ""
+    if [[ "$restore_success" == true ]]; then
+        log_success "Data restoration complete"
+
+        # Clean up temp directory
+        log_info "Cleaning up temporary backup..."
+        rm -rf "$TEMP_BACKUP_DIR"
+        log_success "Temporary backup removed"
+        return 0
+    else
+        log_warn "Some data could not be restored"
+        log_info "Temporary backup preserved at: $TEMP_BACKUP_DIR"
+        return 1
+    fi
+}
+
+handle_validation_failure() {
+    print_header "Validation Failure"
+
+    log_error "Backup validation failed"
+    echo ""
+    echo "Options:"
+    echo "  ${CYAN}1)${NC} Retry backup and validation"
+    echo "  ${CYAN}2)${NC} Abort installation"
+    echo "  ${CYAN}3)${NC} Continue anyway (not recommended)"
+    echo ""
+    read -p "Choose an option [1-3]: " -n 1 -r
+    echo ""
+
+    case $REPLY in
+        1)
+            log_info "Retrying backup..."
+            rm -rf "$TEMP_BACKUP_DIR"
+            if backup_data_to_temp && validate_backup_integrity; then
+                return 0
+            else
+                handle_validation_failure
+            fi
+            ;;
+        2)
+            log_info "Installation aborted by user"
+            # Clean up temp directory
+            rm -rf "$TEMP_BACKUP_DIR"
+            exit 1
+            ;;
+        3)
+            log_warn "Continuing despite validation failure..."
+            return 0
+            ;;
+        *)
+            log_error "Invalid choice"
+            handle_validation_failure
+            ;;
+    esac
+}
+
+selective_purge() {
+    print_header "Selective Purge"
+
+    local has_existing=false
+
+    # Check what exists
+    local has_binary=false
+    local has_config=false
+    local has_data=false
+    local has_logs=false
+
+    if [[ -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" ]]; then
+        has_binary=true
+        has_existing=true
+    fi
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        has_config=true
+        has_existing=true
+    fi
+
+    if [[ -d "$DATA_DIR" ]]; then
+        has_data=true
+        has_existing=true
+    fi
+
+    if [[ -d "$LOG_DIR" ]]; then
+        has_logs=true
+        has_existing=true
+    fi
+
+    if [[ "$has_existing" == false ]]; then
+        log_info "No existing installation found"
+        return 0
+    fi
+
+    # Show what was found
+    echo "Found existing components:"
+    [[ "$has_binary" == true ]] && print_bullet "Binary: $INSTALL_BIN_DIR/$PROJECT_SLUG"
+    [[ "$has_config" == true ]] && print_bullet "Config: $CONFIG_DIR"
+    [[ "$has_data" == true ]] && print_bullet "Data: $DATA_DIR"
+    [[ "$has_logs" == true ]] && print_bullet "Logs: $LOG_DIR"
+    echo ""
+
+    # If keep all flag is set, skip purge
+    if [[ "$KEEP_ALL" == true ]]; then
+        log_info "Keep all flag set - preserving all existing data"
+        return 0
+    fi
+
+    # If selective purge is not enabled and we're not in non-interactive mode, show menu
+    if [[ "$SELECTIVE_PURGE" == false ]] && [[ "$NONINTERACTIVE" != true ]]; then
+        show_selective_purge_menu
+    fi
+
+    # In non-interactive mode without specific flags, default to keep all
+    if [[ "$NONINTERACTIVE" == true ]] && [[ "$SELECTIVE_PURGE" == false ]] && [[ "$KEEP_ALL" == false ]]; then
+        log_info "Non-interactive mode: Defaulting to keep all"
+        KEEP_ALL=true
+        return 0
+    fi
+
+    # If keeping all, return early
+    if [[ "$KEEP_ALL" == true ]]; then
+        log_info "Preserving all existing data"
+        return 0
+    fi
+
+    # If selective purge, backup data first
+    if [[ "$SELECTIVE_PURGE" == true ]]; then
+        if backup_data_to_temp; then
+            if ! validate_backup_integrity; then
+                handle_validation_failure
+            fi
+        else
+            log_error "Backup failed - aborting selective purge"
+            exit 1
+        fi
+    fi
+
+    # Stop running server
+    if pgrep -f "$PROJECT_SLUG serve" > /dev/null; then
+        log_info "Stopping LeIndex server..."
+        if pkill -f "$PROJECT_SLUG serve" 2>/dev/null; then
+            sleep 1
+            log_success "Server stopped"
+        else
+            log_warn "Failed to stop server"
+        fi
+    fi
+
+    # Remove binary if not preserving
+    if [[ "$has_binary" == true ]] && [[ "$PRESERVE_BINARY" == false ]]; then
+        log_info "Removing binary..."
+        if sudo rm -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" 2>/dev/null || \
+           rm -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" 2>/dev/null; then
+            log_success "Binary removed"
+        else
+            log_warn "Failed to remove binary"
+        fi
+    fi
+
+    # Remove config if not preserving
+    if [[ "$has_config" == true ]] && [[ "$PRESERVE_CONFIG" == false ]]; then
+        log_info "Removing config..."
+        if rm -rf "$CONFIG_DIR" 2>/dev/null; then
+            log_success "Config removed"
+        else
+            log_warn "Failed to remove config"
+        fi
+    fi
+
+    # Remove data if not preserving
+    if [[ "$has_data" == true ]] && [[ "$PRESERVE_DATA" == false ]]; then
+        log_info "Removing data..."
+        if rm -rf "$DATA_DIR" 2>/dev/null; then
+            log_success "Data removed"
+        else
+            log_warn "Failed to remove data"
+        fi
+    fi
+
+    # Remove logs if not preserving
+    if [[ "$has_logs" == true ]] && [[ "$PRESERVE_LOGS" == false ]]; then
+        log_info "Removing logs..."
+        # Preserve install log if it exists
+        if [[ -f "$INSTALL_LOG" ]]; then
+            local install_log_name=$(basename "$INSTALL_LOG")
+            cp "$INSTALL_LOG" "/tmp/$install_log_name" 2>/dev/null
+        fi
+        if rm -rf "$LOG_DIR" 2>/dev/null; then
+            # Recreate log directory for new installation
+            mkdir -p "$LOG_DIR"
+            if [[ -f "/tmp/$install_log_name" ]]; then
+                mv "/tmp/$install_log_name" "$INSTALL_LOG"
+            fi
+            log_success "Logs removed"
+        else
+            log_warn "Failed to remove logs"
+        fi
+    fi
+
+    log_success "Selective purge complete"
+    echo ""
+}
+
+# ============================================================================
+# CLEANUP FUNCTIONS
+# ============================================================================
+
+purge_existing_installation() {
+    print_header "Purging Existing Installation"
+
+    local has_existing=false
+
+    # Check if binary exists
+    if [[ -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" ]]; then
+        has_existing=true
+        log_info "Found existing binary: $INSTALL_BIN_DIR/$PROJECT_SLUG"
+    fi
+
+    # Check if LeIndex home directory exists
+    if [[ -d "$LEINDEX_HOME" ]]; then
+        has_existing=true
+        log_info "Found existing data directory: $LEINDEX_HOME"
+    fi
+
+    # Check if server is running
+    if pgrep -f "$PROJECT_SLUG serve" > /dev/null; then
+        has_existing=true
+        log_info "LeIndex server is running"
+    fi
+
+    if [[ "$has_existing" == false ]]; then
+        log_info "No existing installation found"
+        return 0
+    fi
+
+    # Confirm before purging (only in interactive mode)
+    if [[ "$NONINTERACTIVE" != true ]]; then
+        echo ""
+        print_warning "This will remove:"
+        echo "  - Binary: $INSTALL_BIN_DIR/$PROJECT_SLUG"
+        echo "  - Data directory: $LEINDEX_HOME"
+        echo "  - Config directory: $CONFIG_DIR"
+        echo "  - Stop running server (if any)"
+        echo ""
+        read -p "Continue with purge? [y/N] " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Purge cancelled"
+            return 0
+        fi
+    else
+        log_info "Non-interactive mode: Purging existing installation..."
+    fi
+
+    # Stop running server
+    if pgrep -f "$PROJECT_SLUG serve" > /dev/null; then
+        log_info "Stopping LeIndex server..."
+        if pkill -f "$PROJECT_SLUG serve" 2>/dev/null; then
+            sleep 1
+            log_success "Server stopped"
+        else
+            log_warn "Failed to stop server (may require manual intervention)"
+        fi
+    fi
+
+    # Remove binary
+    if [[ -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" ]]; then
+        log_info "Removing binary..."
+        if sudo rm -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" 2>/dev/null; then
+            log_success "Binary removed"
+        elif rm -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" 2>/dev/null; then
+            log_success "Binary removed"
+        else
+            log_warn "Failed to remove binary (may require manual removal)"
+        fi
+    fi
+
+    # Remove config directory (note: DATA_DIR is inside LEINDEX_HOME, so we remove the whole home)
+    if [[ -d "$LEINDEX_HOME" ]]; then
+        log_info "Removing LeIndex home directory..."
+        if rm -rf "$LEINDEX_HOME" 2>/dev/null; then
+            # Recreate log directory immediately after removal so logging continues to work
+            mkdir -p "$LOG_DIR"
+            touch "$INSTALL_LOG"
+            log_success "Data directory removed"
+        else
+            log_warn "Failed to remove data directory (may require manual removal)"
+        fi
+    fi
+
+    log_success "Purge complete"
+    echo ""
 }
 
 # ============================================================================
