@@ -7,6 +7,10 @@ members = [
     "crates/lestockage",
     "crates/lephase",
     "crates/lepasserelle",
+    "crates/leglobal",
+    "crates/leserve",
+    "crates/leedit",
+    "crates/levalidation",
 ]
 
 [workspace.package]

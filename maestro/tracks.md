@@ -275,7 +275,7 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 **Description:** Complete Rust backend implementation for LeIndex Dashboard with HTTP/WebSocket API, unique project IDs, global registry, code editing, and real-time sync. Frontend handled separately via `docs/frontend-plan.md`.
 
-**Status:** NEW
+**Status:** PARTIALLY COMPLETE - 3 of 5 subtracks (60%)
 
 **Created:** 2026-02-13
 
