@@ -217,15 +217,15 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [~] Track: LeIndex Rust Renaissance 🦀 MASTER TRACK
+## [x] Track: LeIndex Rust Renaissance 🦀 MASTER TRACK ✅ COMPLETE
 *Link: [./maestro/tracks/leindex_rust_refactor_20250125/](./maestro/tracks/leindex_rust_refactor_20250125/)*
 
 **Description:** Transform LeIndex from Python to Rust-based Deep Code Intelligence Engine. Complete greenfield rewrite with integrated code analysis capabilities.
 
-**Status:** ~90% COMPLETE - All Core Functionality Production Ready ✅
+**Status:** COMPLETE - All Core Functionality Production Ready + Documentation ✅
 
 **Created:** 2025-01-25
-**Last Updated:** 2026-01-27 (Source Code Verification Complete)
+**Last Updated:** 2026-02-14 (Documentation Complete - README, CLI, MCP, API guides)
 
 **Type:** Master Track (orchestrate-ready with 5 sub-tracks)
 
@@ -238,8 +238,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 1. ✅ `leparse_20250125` - **COMPLETE** (97/97 tests) - Core Parsing Engine (zero-copy AST, tree-sitter, 12 languages)
 2. ✅ `legraphe_20250125` - **COMPLETE** (38/38 tests) - Graph Intelligence Core (PDG, gravity-based traversal, cross-project)
 3. ✅ `lerecherche_20250125` - **COMPLETE** (87/87 tests) - Search & Analysis Fusion (HNSW, semantic search, NL queries)
-4. ✅ `lestockage_20250125` - **85% COMPLETE** (45/45 tests) - Persistent Storage Layer (SQLite, Salsa, Turso config, cross-project)
-5. ✅ `lepasserelle_20250125` - **90% COMPLETE** (72/72 tests) - Integration & API Layer (CLI, MCP server, cache management)
+4. ✅ `lestockage_20250125` - **COMPLETE** (45/45 tests) - Persistent Storage Layer (SQLite, Salsa, Turso config, cross-project)
+5. ✅ `lepasserelle_20250125` - **COMPLETE** (72/72 tests) - Integration & API Layer (CLI, MCP server, cache management)
 
 **Performance Targets:**
 - 10x memory reduction (400→32 bytes per node) ✅
@@ -266,3 +266,23 @@ This file tracks all major tracks for the project. Each track has its own detail
 - 987e91c: Implement Phase 7.4 - Cross-Project Integration Tests
 - a30967b: Implement Phase 7.3 - Cross-Project PDG Extension
 - afc71ea: Implement Phase 7.2 - Cross-Project Resolution
+
+---
+
+## [~] Track: LeIndex Dashboard Backend 🦀 MASTER TRACK
+*Link: [./maestro/tracks/dashboard_backend_20260213/](./maestro/tracks/dashboard_backend_20260213/)*
+
+**Description:** Complete Rust backend implementation for LeIndex Dashboard with HTTP/WebSocket API, unique project IDs, global registry, code editing, and real-time sync. Frontend handled separately via `docs/frontend-plan.md`.
+
+**Status:** NEW
+
+**Created:** 2026-02-13
+
+**Type:** Master Track (orchestratable with 5 sub-tracks)
+
+**Sub-Tracks Status:**
+1. [ ] `leunique_id_20260213` - Unique Project ID System
+2. [ ] `leglobal_20260213` - Global Registry & Discovery
+3. [ ] `leserve_20260213` - HTTP/WebSocket Server
+4. [ ] `leedit_20260213` - Code Editing Engine
+5. [ ] `levalidation_20260213` - Edit Validation
