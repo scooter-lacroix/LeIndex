@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_api_response_success() {
-        let response = ApiResponse::<String>::success("test data");
+        let response = ApiResponse::<String>::success("test data".to_string());
         assert!(response.success);
         assert_eq!(response.data, "test data");
         assert!(response.error.is_none());
@@ -398,9 +398,9 @@ mod tests {
 
     #[test]
     fn test_api_response_error() {
-        let response = ApiResponse::<String>::error("error message");
+        let response = ApiResponse::<String>::error("error message".to_string());
         assert!(!response.success);
-        assert_eq!(response.error, Some("error message"));
+        assert_eq!(response.error, Some("error message".to_string()));
     }
 
     #[test]
@@ -412,7 +412,7 @@ mod tests {
 
     #[test]
     fn test_file_node_file() {
-        let node = FileNode::file("test.rs", "/path/to/test.rs", 1024);
+        let node = FileNode::file("test.rs".to_string(), "/path/to/test.rs".to_string(), 1024);
         assert_eq!(node.name, "test.rs");
         assert_eq!(node.node_type, "file");
         assert_eq!(node.size, Some(1024));
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn test_file_node_directory() {
-        let node = FileNode::directory("src", "/path/to/src");
+        let node = FileNode::directory("src".to_string(), "/path/to/src".to_string());
         assert_eq!(node.name, "src");
         assert_eq!(node.node_type, "directory");
         assert!(node.size.is_none());
@@ -429,8 +429,8 @@ mod tests {
 
     #[test]
     fn test_file_node_add_child() {
-        let mut parent = FileNode::directory("src", "/src");
-        let child = FileNode::file("lib.rs", "/src/lib.rs", 100);
+        let mut parent = FileNode::directory("src".to_string(), "/src".to_string());
+        let child = FileNode::file("lib.rs".to_string(), "/src/lib.rs".to_string(), 100);
         parent.add_child(child);
         assert_eq!(parent.children.len(), 1);
         assert_eq!(parent.children[0].name, "lib.rs");

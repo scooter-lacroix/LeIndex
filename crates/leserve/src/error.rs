@@ -102,7 +102,10 @@ impl ApiError {
 
 impl std::fmt::Display for ApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "[{:?}] {}", self.status, self.message)
+        match &self.code {
+            Some(code) => write!(f, "[{:?}] [{}] {}", self.status, code, self.message),
+            None => write!(f, "[{:?}] {}", self.status, self.message),
+        }
     }
 }
 

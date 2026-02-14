@@ -367,7 +367,9 @@ impl BackgroundSync {
     /// Calculate next backoff delay (for testing)
     #[must_use]
     pub const fn calculate_backoff(attempt: u32) -> u64 {
-        let delay = INITIAL_BACKOFF_SECS * 2u64.pow(attempt);
+        // Cap at 20 to prevent overflow (2^20 = 1,048,576)
+        let capped_attempt = if attempt > 20 { 20 } else { attempt };
+        let delay = INITIAL_BACKOFF_SECS * 2u32.pow(capped_attempt) as u64;
         if delay > MAX_BACKOFF_SECS {
             MAX_BACKOFF_SECS
         } else {
@@ -429,7 +431,7 @@ mod tests {
         }
 
         let discovery = DiscoveryEngine::with_roots(vec![temp_dir.path().to_path_buf()]);
-        let mut engine = SyncEngine::new(registry.clone(), discovery.clone());
+        let mut engine = SyncEngine::new(registry, discovery);
 
         let report = engine.sync().unwrap();
         assert_eq!(report.total_discovered, 1);

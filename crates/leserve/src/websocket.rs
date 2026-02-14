@@ -17,6 +17,7 @@ pub const MAX_WS_FRAME_SIZE: usize = 16_384;
 #[serde(tag = "type")]
 pub enum WsEvent {
     /// Project added to registry
+    #[serde(rename = "project_added")]
     ProjectAdded {
         /// Unique codebase identifier
         codebase_id: String,
@@ -29,6 +30,7 @@ pub enum WsEvent {
     },
 
     /// Project metadata updated
+    #[serde(rename = "project_updated")]
     ProjectUpdated {
         /// Unique codebase identifier
         codebase_id: String,
@@ -38,6 +40,7 @@ pub enum WsEvent {
     },
 
     /// Project removed from registry
+    #[serde(rename = "project_removed")]
     ProjectRemoved {
         /// Unique codebase identifier
         codebase_id: String,

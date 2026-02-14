@@ -415,7 +415,7 @@ impl GlobalRegistry {
     #[must_use]
     pub fn is_healthy(&self) -> bool {
         self.conn
-            .execute("SELECT 1", [])
+            .query_row("SELECT 1", [], |_row| Ok(()))
             .map(|_| true)
             .unwrap_or(false)
     }
