@@ -1041,6 +1041,9 @@ main() {
     echo "  ${BOLD}Repository:${NC}  $REPO_URL"
     echo ""
 
+    # Step 0: Purge existing installation
+    purge_existing_installation
+
     # Step 1: Check Rust
     print_step 1 4 "Checking Rust Toolchain"
 
@@ -1101,6 +1104,12 @@ main() {
     echo "  ${CYAN}2.${NC} Index a project: ${YELLOW}$PROJECT_SLUG index /path/to/project${NC}"
     echo "  ${CYAN}3.${NC} Run diagnostics: ${YELLOW}$PROJECT_SLUG diagnostics${NC}"
     echo "  ${CYAN}4.${NC} Start MCP server: ${YELLOW}$PROJECT_SLUG serve${NC}"
+    echo "  ${CYAN}5.${NC} ${BOLD}Start frontend dashboard:${NC} ${YELLOW}cd dashboard && bun run dev${NC}"
+    echo ""
+    echo "  ${BOLD}Frontend Dashboard:${NC}"
+    echo "  The dashboard is available at: ${CYAN}http://localhost:5173${NC}"
+    echo "  To build for production: ${YELLOW}cd dashboard && bun run build${NC}"
+    echo "  Built files will be in: ${CYAN}dashboard/dist/${NC}"
     echo ""
     echo "For MCP server configuration, see the documentation."
     echo ""
