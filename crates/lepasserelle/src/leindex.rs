@@ -14,7 +14,7 @@ use legraphe::{
 use leparse::parallel::ParallelParser;
 use leparse::traits::SignatureInfo;
 use lerecherche::search::{NodeInfo, SearchEngine, SearchQuery, SearchResult};
-use lestockage::{pdg_store, schema::Storage};
+use lestockage::{pdg_store, schema::Storage, UniqueProjectId};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
@@ -35,8 +35,11 @@ pub struct LeIndex {
     /// Project path
     project_path: PathBuf,
 
-    /// Project identifier
+    /// Project identifier (legacy, for backward compatibility)
     project_id: String,
+
+    /// Unique project identifier with BLAKE3-based path hashing
+    unique_id: UniqueProjectId,
 
     /// Storage backend
     storage: Storage,
@@ -110,8 +113,14 @@ pub struct Diagnostics {
     /// Absolute path to the project directory
     pub project_path: String,
 
-    /// Unique identifier for the project
+    /// Unique identifier for the project (legacy, for backward compatibility)
     pub project_id: String,
+
+    /// Unique project identifier with BLAKE3-based path hashing
+    pub unique_project_id: String,
+
+    /// Display name (user-friendly with clone indicator)
+    pub display_name: String,
 
     /// Statistics from the last indexing operation
     pub stats: IndexStats,
@@ -169,17 +178,29 @@ impl LeIndex {
             .unwrap_or("unknown")
             .to_string();
 
-        info!(
-            "Creating LeIndex for project: {} at {:?}",
-            project_id, project_path
-        );
-
-        // Initialize storage
+        // Initialize storage first (needed for conflict resolution)
         let storage_path = project_path.join(".leindex");
         std::fs::create_dir_all(&storage_path).context("Failed to create .leindex directory")?;
 
         let db_path = storage_path.join("leindex.db");
         let storage = Storage::open(&db_path).context("Failed to initialize storage")?;
+
+        // Generate unique project ID with conflict resolution
+        // Load existing projects with same base name
+        let existing_ids = storage
+            .load_existing_ids(&project_id)
+            .unwrap_or_default();
+        let unique_id = UniqueProjectId::generate(&project_path, &existing_ids);
+
+        // Store the project metadata
+        storage
+            .store_project_metadata(&unique_id, &project_path)
+            .context("Failed to store project metadata")?;
+
+        info!(
+            "Creating LeIndex for project: {} (unique ID: {}) at {:?}",
+            project_id, unique_id.to_string(), project_path
+        );
 
         // Initialize search engine
         let search_engine = SearchEngine::new();
@@ -196,6 +217,7 @@ impl LeIndex {
         Ok(Self {
             project_path,
             project_id,
+            unique_id,
             storage,
             search_engine,
             pdg: None,
@@ -632,6 +654,8 @@ impl LeIndex {
         Ok(Diagnostics {
             project_path: self.project_path.display().to_string(),
             project_id: self.project_id.clone(),
+            unique_project_id: self.unique_id.to_string(),
+            display_name: self.unique_id.display(),
             stats: self.stats.clone(),
             memory_usage_bytes: memory_stats.rss_bytes,
             total_memory_bytes: memory_stats.total_bytes,
@@ -697,9 +721,49 @@ impl LeIndex {
         &self.project_path
     }
 
-    /// Get the project ID
+    /// Get the project ID (legacy, for backward compatibility)
     pub fn project_id(&self) -> &str {
         &self.project_id
+    }
+
+    /// Get the unique project identifier
+    ///
+    /// The unique ID combines base_name, BLAKE3 path hash, and instance number
+    /// to provide a deterministic, conflict-free project identifier.
+    ///
+    /// # Returns
+    ///
+    /// Reference to the `UniqueProjectId`
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let unique_id = leindex.unique_id();
+    /// println!("Unique ID: {}", unique_id.to_string()); // "leindex_a3f7d9e2_0"
+    /// println!("Display: {}", unique_id.display());     // "leindex" or "leindex (clone #1)"
+    /// ```
+    pub fn unique_id(&self) -> &UniqueProjectId {
+        &self.unique_id
+    }
+
+    /// Get the display name for the project
+    ///
+    /// Returns a user-friendly name with clone indicator if applicable.
+    /// - Original (instance=0): base_name
+    /// - Clone (instance>0): "base_name (clone #N)"
+    ///
+    /// # Returns
+    ///
+    /// Display name string
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let display = leindex.display_name();
+    /// println!("Project: {}", display); // "leindex" or "leindex (clone #1)"
+    /// ```
+    pub fn display_name(&self) -> String {
+        self.unique_id.display()
     }
 
     /// Get a reference to the search engine
@@ -1230,6 +1294,8 @@ mod tests {
         let diagnostics = Diagnostics {
             project_path: "/test".to_string(),
             project_id: "test".to_string(),
+            unique_project_id: "test_a1b2c3d4_0".to_string(),
+            display_name: "test".to_string(),
             stats: IndexStats {
                 total_files: 0,
                 files_parsed: 0,
@@ -1255,6 +1321,8 @@ mod tests {
         let deserialized: Diagnostics = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.project_id, "test");
+        assert_eq!(deserialized.unique_project_id, "test_a1b2c3d4_0");
+        assert_eq!(deserialized.display_name, "test");
         assert_eq!(deserialized.memory_usage_bytes, 1024);
         assert_eq!(deserialized.cache_entries, 5);
         assert_eq!(deserialized.spilled_bytes, 30000);

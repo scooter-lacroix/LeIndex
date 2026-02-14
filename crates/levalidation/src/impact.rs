@@ -3,7 +3,7 @@
 use crate::edit_change::EditChange;
 use crate::ValidationError;
 use legraphe::{ProgramDependenceGraph};
-use legraphe::pdg::{NodeType, NodeId, EdgeType, EdgeMetadata};
+use legraphe::pdg::{NodeType, NodeId};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -271,6 +271,8 @@ impl ImpactAnalyzer {
 mod tests {
     use super::*;
     use legraphe::Node;
+    use legraphe::pdg::{EdgeType, EdgeMetadata};
+    use legraphe::Edge;
 
     #[test]
     fn test_location_new() {

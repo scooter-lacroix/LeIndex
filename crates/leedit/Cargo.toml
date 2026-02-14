@@ -1,0 +1,40 @@
+[package]
+name = "leedit"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Workspace dependencies
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+
+# Git worktree management
+git2 = "0.18"
+
+# AST manipulation (from workspace)
+tree-sitter.workspace = true
+
+# Diff generation
+diffy = "0.3"
+
+# Internal dependencies
+lestockage = { path = "../lestockage" }
+legraphe = { path = "../legraphe" }
+leparse = { path = "../leparse" }
+
+[dev-dependencies]
+rstest.workspace = true
+tempfile.workspace = true
+
+[lib]
+name = "leedit"
+crate-type = ["rlib"]

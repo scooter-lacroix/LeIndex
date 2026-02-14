@@ -1,0 +1,546 @@
+//! Project discovery engine
+//!
+//! Discovers codebases across the filesystem using fast tools with fallback chain.
+
+use crate::tools::{ToolType, detect_tool};
+use crate::{DEFAULT_MIN_FILE_COUNT, DEFAULT_DISCOVERY_ROOTS};
+use lestockage::UniqueProjectId;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use thiserror::Error;
+use walkdir::WalkDir;
+
+/// Errors that can occur during project discovery
+#[derive(Debug, Error)]
+pub enum DiscoveryError {
+    /// No valid projects found
+    #[error("No valid projects found in discovery roots")]
+    NoProjectsFound,
+
+    /// Invalid discovery root
+    #[error("Invalid discovery root: {0}")]
+    InvalidRoot(String),
+
+    /// Tool execution failed
+    #[error("Tool execution failed: {0}")]
+    ToolFailed(String),
+
+    /// IO error
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// Result type for discovery operations
+pub type Result<T> = std::result::Result<T, DiscoveryError>;
+
+/// A discovered project with metadata
+#[derive(Debug, Clone)]
+pub struct DiscoveredProject {
+    /// Path to the project
+    pub path: PathBuf,
+    /// Base name (directory name)
+    pub base_name: String,
+    /// Detected language (if any)
+    pub language: Option<String>,
+    /// Number of source files
+    pub file_count: usize,
+    /// Whether this is a valid codebase
+    pub is_valid: bool,
+    /// Unique project ID
+    pub unique_id: UniqueProjectId,
+    /// Content fingerprint for clone detection (BLAKE3)
+    pub content_fingerprint: String,
+    /// Last modified timestamp
+    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl DiscoveredProject {
+    /// Create a new discovered project from a path
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the project directory
+    /// * `existing_ids` - Existing project IDs for conflict detection
+    pub fn new(path: PathBuf, existing_ids: &[UniqueProjectId]) -> Self {
+        let base_name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let unique_id = UniqueProjectId::generate(&path, existing_ids);
+
+        // Detect language and count files
+        let (language, file_count) = Self::analyze_path(&path);
+
+        // Check if valid codebase
+        let is_valid = Self::is_valid_codebase(&path);
+
+        // Generate content fingerprint
+        let content_fingerprint = Self::generate_fingerprint(&path);
+
+        // Get last modified time
+        let last_modified = path
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| {
+                chrono::DateTime::<chrono::Utc>::from(t)
+            });
+
+        Self {
+            path,
+            base_name,
+            language,
+            file_count,
+            is_valid,
+            unique_id,
+            content_fingerprint,
+            last_modified,
+        }
+    }
+
+    /// Analyze a path to detect language and count files
+    fn analyze_path(path: &Path) -> (Option<String>, usize) {
+        let mut file_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut total_count = 0usize;
+
+        // Common language extensions mapping
+        let extension_to_lang: &[(&str, &str)] = &[
+            ("rs", "rust"),
+            ("go", "go"),
+            ("py", "python"),
+            ("js", "javascript"),
+            ("ts", "typescript"),
+            ("jsx", "react"),
+            ("tsx", "react-typescript"),
+            ("java", "java"),
+            ("kt", "kotlin"),
+            ("cpp", "cpp"),
+            ("cc", "cpp"),
+            ("cxx", "cpp"),
+            ("c", "c"),
+            ("h", "c"),
+            ("hpp", "cpp"),
+            ("cs", "csharp"),
+            ("rb", "ruby"),
+            ("php", "php"),
+            ("swift", "swift"),
+            ("scala", "scala"),
+            ("sh", "shell"),
+            ("bash", "shell"),
+            ("zsh", "shell"),
+            ("fish", "shell"),
+            ("lua", "lua"),
+            ("r", "r"),
+            ("dart", "dart"),
+            ("ex", "elixir"),
+            ("exs", "elixir"),
+            ("erl", "erlang"),
+            ("hs", "haskell"),
+            ("ml", "ocaml"),
+            ("fs", "fsharp"),
+            ("vue", "vue"),
+            ("svelte", "svelte"),
+            ("astro", "astro"),
+        ];
+
+        let entries: Vec<_> = WalkDir::new(path)
+            .max_depth(3)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .collect();
+
+        for entry in entries {
+            let entry_path = entry.path();
+            if let Some(ext) = entry_path.extension().and_then(|e: &std::ffi::OsStr| e.to_str()) {
+                total_count += 1;
+                if let Some((_, lang)) = extension_to_lang.iter().find(|(e, _)| *e == ext) {
+                    *file_counts.entry(lang.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // Find the most common language
+        let language = file_counts
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(lang, _)| lang);
+
+        (language, total_count)
+    }
+
+    /// Check if a path is a valid codebase
+    fn is_valid_codebase(path: &Path) -> bool {
+        // Must be a directory
+        if !path.is_dir() {
+            return false;
+        }
+
+        // Check for VCS
+        let has_vcs = path.join(".git").is_dir()
+            || path.join(".hg").is_dir()
+            || path.join(".svn").is_dir()
+            || path.join("CVS").is_dir();
+
+        if !has_vcs {
+            return false;
+        }
+
+        // Check minimum file count
+        let file_count = WalkDir::new(path)
+            .max_depth(2)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .count();
+
+        file_count >= DEFAULT_MIN_FILE_COUNT
+    }
+
+    /// Generate content fingerprint for clone detection
+    fn generate_fingerprint(path: &Path) -> String {
+        // Sample a few key files to generate a fingerprint
+        let mut hasher = blake3::Hasher::new();
+
+        // Hash directory structure (names only, not content)
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.filter_map(|e| e.ok()).take(100) {
+                if let Some(name) = entry.file_name().to_str() {
+                    hasher.update(name.as_bytes());
+                }
+            }
+        }
+
+        // Include file count as a simple metric
+        let file_count = WalkDir::new(path)
+            .max_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .count();
+        hasher.update(&file_count.to_be_bytes());
+
+        hasher.finalize().to_hex().to_string()
+    }
+}
+
+/// Project discovery engine
+///
+/// Discovers codebases across the filesystem using configured tools
+pub struct DiscoveryEngine {
+    /// Tool to use for discovery
+    tool: ToolType,
+    /// Custom discovery roots (overrides defaults)
+    roots: Vec<PathBuf>,
+    /// Minimum file count for valid codebase
+    min_file_count: usize,
+}
+
+impl Default for DiscoveryEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DiscoveryEngine {
+    /// Create a new discovery engine with default settings
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            tool: detect_tool(),
+            roots: DEFAULT_DISCOVERY_ROOTS
+                .iter()
+                .map(|p| Self::expand_tilde(p))
+                .filter_map(|p| p.ok())
+                .collect(),
+            min_file_count: DEFAULT_MIN_FILE_COUNT,
+        }
+    }
+
+    /// Create a discovery engine with custom roots
+    ///
+    /// # Arguments
+    ///
+    /// * `roots` - List of root directories to search
+    #[must_use]
+    pub fn with_roots(roots: Vec<PathBuf>) -> Self {
+        Self {
+            tool: detect_tool(),
+            roots,
+            min_file_count: DEFAULT_MIN_FILE_COUNT,
+        }
+    }
+
+    /// Create a discovery engine with custom tool
+    ///
+    /// # Arguments
+    ///
+    /// * `tool` - Specific tool to use
+    #[must_use]
+    pub fn with_tool(tool: ToolType) -> Self {
+        Self {
+            tool,
+            roots: DEFAULT_DISCOVERY_ROOTS
+                .iter()
+                .map(|p| Self::expand_tilde(p))
+                .filter_map(|p| p.ok())
+                .collect(),
+            min_file_count: DEFAULT_MIN_FILE_COUNT,
+        }
+    }
+
+    /// Expand ~ in paths to home directory
+    fn expand_tilde(path: &str) -> Result<PathBuf> {
+        if path.starts_with("~/") {
+            if let Some(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).ok() {
+                return Ok(PathBuf::from(home).join(&path[2..]));
+            }
+        }
+        Ok(PathBuf::from(path))
+    }
+
+    /// Discover projects in configured roots
+    ///
+    /// # Returns
+    ///
+    /// `Result<Vec<DiscoveredProject>>` - All discovered projects
+    pub fn discover(&self) -> Result<Vec<DiscoveredProject>> {
+        let mut projects = Vec::new();
+        let mut seen_ids: HashSet<UniqueProjectId> = HashSet::new();
+
+        for root in &self.roots {
+            if !root.exists() {
+                continue;
+            }
+
+            let root_projects = self.discover_in_root(root, &seen_ids)?;
+            for project in root_projects {
+                seen_ids.insert(project.unique_id.clone());
+                projects.push(project);
+            }
+        }
+
+        if projects.is_empty() {
+            return Err(DiscoveryError::NoProjectsFound);
+        }
+
+        Ok(projects)
+    }
+
+    /// Discover projects in a specific root directory
+    fn discover_in_root(
+        &self,
+        root: &Path,
+        existing_ids: &HashSet<UniqueProjectId>,
+    ) -> Result<Vec<DiscoveredProject>> {
+        let mut projects = Vec::new();
+
+        // Convert existing_ids to Vec for indexing
+        let existing_vec: Vec<UniqueProjectId> = existing_ids.iter().cloned().collect();
+
+        // Walk the root directory looking for projects
+        let entries = WalkDir::new(root)
+            .max_depth(2)
+            .min_depth(1)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_dir());
+
+        for entry in entries {
+            let path = entry.path();
+
+            // Skip hidden directories
+            if path.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with('.'))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            let project = DiscoveredProject::new(path.to_path_buf(), &existing_vec);
+
+            // Only include valid projects
+            if project.is_valid {
+                projects.push(project);
+            }
+        }
+
+        Ok(projects)
+    }
+
+    /// Get the current tool being used
+    #[must_use]
+    pub const fn tool(&self) -> ToolType {
+        self.tool
+    }
+
+    /// Get the configured roots
+    #[must_use]
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_discovered_project_new() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = temp_dir.path().join("test-project");
+
+        // Create a minimal git repo
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        for i in 0..15 {
+            std::fs::write(project_path.join(format!("file{}.rs", i)), "").unwrap();
+        }
+
+        let project = DiscoveredProject::new(project_path.clone(), &[]);
+
+        assert_eq!(project.base_name, "test-project");
+        assert!(project.file_count >= 15);
+        assert!(project.is_valid);
+        assert!(!project.content_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn test_discovered_project_language_detection() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = temp_dir.path().join("rust-project");
+
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        for i in 0..10 {
+            std::fs::write(project_path.join(format!("file{}.rs", i)), "").unwrap();
+        }
+        // Add some other files
+        for i in 0..3 {
+            std::fs::write(project_path.join(format!("file{}.py", i)), "").unwrap();
+        }
+
+        let project = DiscoveredProject::new(project_path, &[]);
+
+        assert_eq!(project.language, Some("rust".to_string()));
+        assert!(project.file_count >= 13);
+    }
+
+    #[test]
+    fn test_discovery_engine_new() {
+        let engine = DiscoveryEngine::new();
+        assert!(!engine.roots().is_empty());
+    }
+
+    #[test]
+    fn test_discovery_engine_with_roots() {
+        let temp_dir = TempDir::new().unwrap();
+        let roots = vec![temp_dir.path().to_path_buf()];
+
+        let engine = DiscoveryEngine::with_roots(roots.clone());
+
+        assert_eq!(engine.roots(), roots);
+    }
+
+    #[test]
+    fn test_discovery_engine_with_tool() {
+        let engine = DiscoveryEngine::with_tool(ToolType::Walkdir);
+        assert_eq!(engine.tool(), ToolType::Walkdir);
+    }
+
+    #[test]
+    fn test_discover_in_temp_root() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a valid project
+        let project_path = temp_dir.path().join("myproject");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        for i in 0..15 {
+            std::fs::write(project_path.join(format!("file{}.rs", i)), "").unwrap();
+        }
+
+        let engine = DiscoveryEngine::with_roots(vec![temp_dir.path().to_path_buf()]);
+        let projects = engine.discover().unwrap();
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].base_name, "myproject");
+        assert!(projects[0].is_valid);
+    }
+
+    #[test]
+    fn test_discover_filters_invalid_projects() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create an invalid project (no VCS)
+        let invalid_path = temp_dir.path().join("invalid");
+        std::fs::create_dir_all(&invalid_path).unwrap();
+        std::fs::write(invalid_path.join("file.rs"), "").unwrap();
+
+        // Create a valid project
+        let valid_path = temp_dir.path().join("valid");
+        std::fs::create_dir_all(valid_path.join(".git")).unwrap();
+        for i in 0..15 {
+            std::fs::write(valid_path.join(format!("file{}.rs", i)), "").unwrap();
+        }
+
+        let engine = DiscoveryEngine::with_roots(vec![temp_dir.path().to_path_buf()]);
+        let projects = engine.discover().unwrap();
+
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].base_name, "valid");
+    }
+
+    #[test]
+    fn test_discover_skips_hidden_dirs() {
+        let temp_dir = TempDir::new().unwrap();
+
+        // Create a hidden project
+        let hidden_path = temp_dir.path().join(".hidden");
+        std::fs::create_dir_all(hidden_path.join(".git")).unwrap();
+        for i in 0..15 {
+            std::fs::write(hidden_path.join(format!("file{}.rs", i)), "").unwrap();
+        }
+
+        let engine = DiscoveryEngine::with_roots(vec![temp_dir.path().to_path_buf()]);
+        let projects = engine.discover().unwrap();
+
+        // Should not find hidden directory
+        assert!(projects.iter().all(|p| p.base_name != ".hidden"));
+    }
+
+    #[test]
+    fn test_discovery_error_no_projects() {
+        let temp_dir = TempDir::new().unwrap();
+
+        let engine = DiscoveryEngine::with_roots(vec![temp_dir.path().to_path_buf()]);
+        let result = engine.discover();
+
+        assert!(matches!(result, Err(DiscoveryError::NoProjectsFound)));
+    }
+
+    #[test]
+    fn test_content_fingerprint_is_deterministic() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = temp_dir.path().join("test");
+
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        for i in 0..5 {
+            std::fs::write(project_path.join(format!("file{}.rs", i)), "").unwrap();
+        }
+
+        let p1 = DiscoveredProject::new(project_path.clone(), &[]);
+        let p2 = DiscoveredProject::new(project_path, &[]);
+
+        assert_eq!(p1.content_fingerprint, p2.content_fingerprint);
+    }
+
+    #[test]
+    fn test_expand_tilde() {
+        let path = "~/projects";
+        let expanded = DiscoveryEngine::expand_tilde(path).unwrap();
+
+        assert!(expanded.is_absolute());
+        assert!(!expanded.to_string_lossy().contains('~'));
+    }
+}

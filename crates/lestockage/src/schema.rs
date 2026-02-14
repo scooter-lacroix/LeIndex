@@ -334,7 +334,7 @@ CREATE TABLE IF NOT EXISTS project_metadata (
     /// This is used for unique project ID generation to avoid conflicts.
     pub fn load_existing_ids(&self, base_name: &str) -> SqliteResult<Vec<UniqueProjectId>> {
         ProjectMetadata::load_existing_ids(&self.conn, base_name)
-            .map_err(|e| rusqlite::Error::InvalidQuery)
+            .map_err(|_| rusqlite::Error::InvalidQuery)
     }
     
     /// Store project metadata.
@@ -351,7 +351,7 @@ CREATE TABLE IF NOT EXISTS project_metadata (
             unique_project_id: unique_id.clone(),
             ..metadata
         };
-        metadata.save(&self.conn).map_err(|e| rusqlite::Error::InvalidQuery)
+        metadata.save(&self.conn).map_err(|_| rusqlite::Error::InvalidQuery)
     }
 
 }
