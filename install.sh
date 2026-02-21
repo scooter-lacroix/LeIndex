@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 5.0.0 - Rust Edition
-# Platform: Linux/Unix
+# Version: 5.1.0 - Rust Edition (Multi-Shell & Multi-Distro)
+# Platform: Linux/Unix (Bash, Zsh, Fish, Arch, Debian, Ubuntu, Fedora, etc.)
 #
 # One-line installer:
 #   curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+#
+# For fish shell users:
+#   curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+#
+# Cargo install alternative:
+#   cargo install leindex
 #
 # Or with wget:
 #   wget -qO- https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
@@ -19,21 +25,38 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="5.0.0"
+readonly SCRIPT_VERSION="5.1.0"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
 readonly MIN_RUST_MINOR=75
 readonly REPO_URL="https://github.com/scooter-lacroix/leindex"
 NONINTERACTIVE=false
+PRESERVE_BINARY=false
+PRESERVE_CONFIG=false
+PRESERVE_DATA=false
+PRESERVE_LOGS=false
+KEEP_ALL=false
+SELECTIVE_PURGE=false
+
+# System detection variables
+USER_SHELL="bash"
+SHELL_RC=""
+SHELL_PROFILE=""
+DISTRO_ID="unknown"
+DISTRO_NAME="Unknown"
+DISTRO_VERSION="unknown"
+PKG_MANAGER="unknown"
+IS_ARCH=false
+IS_DEBIAN=false
+IS_FEDORA=false
 
 # Installation paths
 LEINDEX_HOME="${LEINDEX_HOME:-$HOME/.leindex}"
 CONFIG_DIR="${LEINDEX_HOME}/config"
 DATA_DIR="${LEINDEX_HOME}/data"
 LOG_DIR="${LEINDEX_HOME}/logs"
-# Install to standard system-wide location (requires sudo)
-# This ensures leindex is accessible to all AI tools regardless of PATH
+TEMP_BACKUP_DIR="${HOME}/.leindex.tmp"
 INSTALL_BIN_DIR="/usr/local/bin"
 
 # ============================================================================
@@ -112,6 +135,198 @@ print_warning() {
 }
 
 # ============================================================================
+# SYSTEM DETECTION
+# ============================================================================
+
+detect_shell() {
+    USER_SHELL=$(basename "$SHELL" 2>/dev/null || echo "bash")
+    
+    log_info "Detected shell: $USER_SHELL"
+    
+    case "$USER_SHELL" in
+        bash)
+            SHELL_RC="$HOME/.bashrc"
+            SHELL_PROFILE="$HOME/.bash_profile"
+            ;;
+        zsh)
+            SHELL_RC="$HOME/.zshrc"
+            SHELL_PROFILE="$HOME/.zprofile"
+            ;;
+        fish)
+            SHELL_RC="$HOME/.config/fish/config.fish"
+            SHELL_PROFILE="$HOME/.config/fish/config.fish"
+            mkdir -p "$HOME/.config/fish"
+            ;;
+        *)
+            SHELL_RC="$HOME/.profile"
+            SHELL_PROFILE="$HOME/.profile"
+            ;;
+    esac
+}
+
+detect_distribution() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        DISTRO_ID="${ID:-unknown}"
+        DISTRO_NAME="${NAME:-Unknown}"
+        DISTRO_VERSION="${VERSION_ID:-unknown}"
+    elif [[ -f /etc/arch-release ]]; then
+        DISTRO_ID="arch"
+        DISTRO_NAME="Arch Linux"
+        DISTRO_VERSION="rolling"
+    else
+        DISTRO_ID="unknown"
+        DISTRO_NAME="Unknown"
+        DISTRO_VERSION="unknown"
+    fi
+    
+    log_info "Detected distribution: $DISTRO_NAME ($DISTRO_ID) $DISTRO_VERSION"
+    
+    if command -v pacman &> /dev/null; then
+        PKG_MANAGER="pacman"
+        IS_ARCH=true
+        log_info "Package manager: pacman (Arch Linux)"
+    elif command -v apt &> /dev/null || command -v apt-get &> /dev/null; then
+        PKG_MANAGER="apt"
+        IS_DEBIAN=true
+        log_info "Package manager: apt (Debian/Ubuntu)"
+    elif command -v dnf &> /dev/null; then
+        PKG_MANAGER="dnf"
+        IS_FEDORA=true
+        log_info "Package manager: dnf (Fedora)"
+    elif command -v yum &> /dev/null; then
+        PKG_MANAGER="yum"
+        IS_FEDORA=true
+        log_info "Package manager: yum (RHEL/CentOS)"
+    elif command -v zypper &> /dev/null; then
+        PKG_MANAGER="zypper"
+        log_info "Package manager: zypper (openSUSE)"
+    else
+        PKG_MANAGER="unknown"
+        log_warn "No recognized package manager found"
+    fi
+}
+
+install_dependencies() {
+    print_header "Checking Dependencies"
+    
+    local missing_deps=()
+    
+    if ! command -v curl &> /dev/null && ! command -v wget &> /dev/null; then
+        missing_deps+=("curl or wget")
+    fi
+    
+    if ! command -v git &> /dev/null; then
+        missing_deps+=("git")
+    fi
+    
+    if [[ ${#missing_deps[@]} -eq 0 ]]; then
+        log_success "All required dependencies are installed"
+        return 0
+    fi
+    
+    log_warn "Missing dependencies: ${missing_deps[*]}"
+    
+    local should_install=false
+    if [[ "$NONINTERACTIVE" == true ]]; then
+        log_info "Non-interactive mode: Installing dependencies automatically..."
+        should_install=true
+    else
+        echo ""
+        read -p "Would you like to install missing dependencies? [Y/n] " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            should_install=true
+        fi
+    fi
+    
+    if [[ "$should_install" != true ]]; then
+        log_error "Dependencies are required to continue"
+        exit 1
+    fi
+    
+    case "$PKG_MANAGER" in
+        pacman)
+            log_info "Installing dependencies with pacman..."
+            local pacman_packages=()
+            for dep in "${missing_deps[@]}"; do
+                case "$dep" in
+                    "curl or wget") pacman_packages+=("curl") ;;
+                    "git") pacman_packages+=("git") ;;
+                esac
+            done
+            if [[ ${#pacman_packages[@]} -gt 0 ]]; then
+                sudo pacman -Sy --noconfirm "${pacman_packages[@]}" 2>&1 | tee -a "$INSTALL_LOG"
+            fi
+            ;;
+        apt)
+            log_info "Installing dependencies with apt..."
+            sudo apt-get update 2>&1 | tee -a "$INSTALL_LOG"
+            local apt_packages=()
+            for dep in "${missing_deps[@]}"; do
+                case "$dep" in
+                    "curl or wget") apt_packages+=("curl") ;;
+                    "git") apt_packages+=("git") ;;
+                esac
+            done
+            if [[ ${#apt_packages[@]} -gt 0 ]]; then
+                sudo apt-get install -y "${apt_packages[@]}" 2>&1 | tee -a "$INSTALL_LOG"
+            fi
+            ;;
+        dnf)
+            log_info "Installing dependencies with dnf..."
+            local dnf_packages=()
+            for dep in "${missing_deps[@]}"; do
+                case "$dep" in
+                    "curl or wget") dnf_packages+=("curl") ;;
+                    "git") dnf_packages+=("git") ;;
+                esac
+            done
+            if [[ ${#dnf_packages[@]} -gt 0 ]]; then
+                sudo dnf install -y "${dnf_packages[@]}" 2>&1 | tee -a "$INSTALL_LOG"
+            fi
+            ;;
+        yum)
+            log_info "Installing dependencies with yum..."
+            local yum_packages=()
+            for dep in "${missing_deps[@]}"; do
+                case "$dep" in
+                    "curl or wget") yum_packages+=("curl") ;;
+                    "git") yum_packages+=("git") ;;
+                esac
+            done
+            if [[ ${#yum_packages[@]} -gt 0 ]]; then
+                sudo yum install -y "${yum_packages[@]}" 2>&1 | tee -a "$INSTALL_LOG"
+            fi
+            ;;
+        zypper)
+            log_info "Installing dependencies with zypper..."
+            local zypper_packages=()
+            for dep in "${missing_deps[@]}"; do
+                case "$dep" in
+                    "curl or wget") zypper_packages+=("curl") ;;
+                    "git") zypper_packages+=("git") ;;
+                esac
+            done
+            if [[ ${#zypper_packages[@]} -gt 0 ]]; then
+                sudo zypper install -y "${zypper_packages[@]}" 2>&1 | tee -a "$INSTALL_LOG"
+            fi
+            ;;
+        *)
+            log_error "Cannot install dependencies: unknown package manager"
+            echo ""
+            echo "Please install the following manually:"
+            for dep in "${missing_deps[@]}"; do
+                echo "  - $dep"
+            done
+            exit 1
+            ;;
+    esac
+    
+    log_success "Dependencies installed successfully"
+}
+
+# ============================================================================
 # RUST DETECTION
 # ============================================================================
 
@@ -150,15 +365,44 @@ install_rust() {
         exit 1
     fi
 
-    # Source cargo environment
-    source "$HOME/.cargo/env"
+    if [[ -f "$HOME/.cargo/env" ]]; then
+        source "$HOME/.cargo/env"
+    fi
 
     if detect_rust; then
         log_success "Rust installed successfully"
+        add_rust_to_shell_config
     else
         log_error "Rust installation failed"
         exit 1
     fi
+}
+
+add_rust_to_shell_config() {
+    log_info "Configuring Rust environment for $USER_SHELL..."
+    
+    case "$USER_SHELL" in
+        fish)
+            if [[ -f "$SHELL_RC" ]]; then
+                if ! grep -q "set -gx PATH.*cargo/bin" "$SHELL_RC" 2>/dev/null; then
+                    echo "" >> "$SHELL_RC"
+                    echo "# Rust cargo environment" >> "$SHELL_RC"
+                    echo "set -gx PATH \$HOME/.cargo/bin \$PATH" >> "$SHELL_RC"
+                    log_success "Added Rust to $SHELL_RC"
+                fi
+            fi
+            ;;
+        *)
+            if [[ -f "$SHELL_RC" ]]; then
+                if ! grep -q "cargo/env" "$SHELL_RC" 2>/dev/null; then
+                    echo "" >> "$SHELL_RC"
+                    echo "# Rust cargo environment" >> "$SHELL_RC"
+                    echo ". \"\$HOME/.cargo/env\"" >> "$SHELL_RC"
+                    log_success "Added Rust to $SHELL_RC"
+                fi
+            fi
+            ;;
+    esac
 }
 
 # ============================================================================
@@ -375,21 +619,42 @@ setup_directories() {
 update_path() {
     print_header "Installation Location"
 
-    # Binary is installed to /usr/local/bin which is always in PATH
     log_info "Binary installed to /usr/local/bin (system-wide location)"
     log_info "This location is in the standard PATH for all Unix-like systems"
 
-    # Verify /usr/local/bin is in PATH
     if echo ":$PATH:" | grep -q ":/usr/local/bin:"; then
         log_success "/usr/local/bin is in PATH"
     else
         print_warning "/usr/local/bin is not in your PATH"
         echo ""
-        echo "This is unusual. Add the following to your shell configuration:"
-        echo "  export PATH=\"/usr/local/bin:\$PATH\""
+        echo "Add the following to your shell configuration ($SHELL_RC):"
+        
+        case "$USER_SHELL" in
+            fish)
+                echo "  ${CYAN}set -gx PATH /usr/local/bin \$PATH${NC}"
+                ;;
+            *)
+                echo "  ${CYAN}export PATH=\"/usr/local/bin:\$PATH\"${NC}"
+                ;;
+        esac
+        
         echo ""
         echo "Then restart your shell or run:"
-        echo "  source ~/.bashrc  # or ~/.zshrc"
+        
+        case "$USER_SHELL" in
+            fish)
+                echo "  ${CYAN}source ~/.config/fish/config.fish${NC}"
+                ;;
+            bash)
+                echo "  ${CYAN}source ~/.bashrc${NC}"
+                ;;
+            zsh)
+                echo "  ${CYAN}source ~/.zshrc${NC}"
+                ;;
+            *)
+                echo "  ${CYAN}source ~/.profile${NC}"
+                ;;
+        esac
     fi
 }
 
@@ -626,16 +891,20 @@ configure_tool_mcp() {
             return $?
             ;;
         "Cursor"|"VS Code"|"VSCodium")
-            # Cursor and VS Code family
-            config_file="$HOME/.cursor/settings.json"
-            if [[ ! -f "$config_file" ]]; then
-                config_file="$HOME/.config/Code/User/settings.json"
+            local mcp_config_dir=""
+            if [[ -d "$HOME/.cursor" ]]; then
+                mcp_config_dir="$HOME/.cursor"
+            elif [[ -d "$HOME/.config/Code/User" ]]; then
+                mcp_config_dir="$HOME/.config/Code/User"
+            elif [[ -d "$HOME/.config/VSCodium/User" ]]; then
+                mcp_config_dir="$HOME/.config/VSCodium/User"
+            else
+                print_warning "No VS Code/Cursor config directory found for $tool"
+                return 2
             fi
-            if [[ ! -f "$config_file" ]]; then
-                config_file="$HOME/.config/VSCodium/User/settings.json"
-            fi
-            backup_file="${config_file}.backup"
-            configure_vscode_mcp "$config_file" "$backup_file"
+            local mcp_config_file="$mcp_config_dir/mcp.json"
+            backup_file="${mcp_config_file}.backup"
+            configure_json_mcp "$mcp_config_file" "$backup_file"
             return $?
             ;;
         "Zed")
@@ -651,21 +920,22 @@ configure_tool_mcp() {
             return $?
             ;;
         "Antigravity")
-            # Antigravity uses Cursor/VS Code config
-            config_file="$HOME/.cursor/settings.json"
+            config_file="$HOME/.gemini/antigravity/mcp_config.json"
+            if [[ ! -d "$HOME/.gemini/antigravity" ]]; then
+                mkdir -p "$HOME/.gemini/antigravity"
+            fi
             backup_file="${config_file}.backup"
-            configure_vscode_mcp "$config_file" "$backup_file"
+            configure_json_mcp "$config_file" "$backup_file"
             return $?
             ;;
         "LM Studio")
             config_file="$HOME/.lmstudio/mcp.json"
             backup_file="${config_file}.backup"
-            configure_lmstudio_mcp "$config_file" "$backup_file"
+            configure_json_mcp "$config_file" "$backup_file"
             return $?
             ;;
         *)
-            # CLI tools that might have config files
-            return 2  # Skipped
+            return 2
             ;;
     esac
 }
@@ -687,11 +957,8 @@ configure_json_mcp() {
     local config_file="$1"
     local backup_file="$2"
 
-    # Check if config exists
-    if [[ ! -f "$config_file" ]]; then
-        # Create parent directory if needed
+    if [[ ! -f "$config_file" ]] || [[ ! -s "$config_file" ]]; then
         mkdir -p "$(dirname "$config_file")"
-        # Create new config with leindex as subprocess (stdio mode)
         cat > "$config_file" << 'EOF'
 {
   "mcpServers": {
@@ -702,40 +969,42 @@ configure_json_mcp() {
   }
 }
 EOF
+        log_info "Created MCP config: $config_file"
         return 0
     fi
 
-    # Backup existing config
     backup_config_file "$config_file" "$backup_file"
 
-    # Use Python or jq to add leindex to mcpServers
     if command -v python3 &> /dev/null; then
-        python3 <<PYTHON
+        python3 -c "
 import json
 import sys
 
+config_file = '$config_file'
 try:
-    with open('$config_file', 'r') as f:
-        config = json.load(f)
+    with open(config_file, 'r') as f:
+        content = f.read().strip()
+        if content:
+            config = json.loads(content)
+        else:
+            config = {}
 except:
     config = {}
 
 if 'mcpServers' not in config:
     config['mcpServers'] = {}
 
-# Use stdio command mode (subprocess) - AI tools will start/stop automatically
 config['mcpServers']['leindex'] = {
     'command': 'leindex',
     'args': ['mcp']
 }
 
-with open('$config_file', 'w') as f:
+with open(config_file, 'w') as f:
     json.dump(config, f, indent=2)
     f.write('\n')
-PYTHON
+"
         return $?
     elif command -v jq &> /dev/null; then
-        # Fallback to jq if python3 is not available
         jq '.mcpServers.leindex = {"command": "leindex", "args": ["mcp"]}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
         return $?
     else
@@ -743,112 +1012,74 @@ PYTHON
     fi
 }
 
-# Configure VS Code/Cursor MCP (settings.json with mcpServers)
+# Configure VS Code/Cursor MCP (mcp.json format)
 configure_vscode_mcp() {
     local config_file="$1"
     local backup_file="$2"
 
-    # Check if config exists
-    if [[ ! -f "$config_file" ]]; then
-        return 2  # Skipped
-    fi
-
-    # Backup existing config
-    backup_config_file "$config_file" "$backup_file"
-
-    # VS Code uses the same mcp.json format as Claude Code
-    # but the file is in a different location
     local mcp_config_dir="$(dirname "$config_file")"
     local mcp_config_file="$mcp_config_dir/mcp.json"
 
+    mkdir -p "$mcp_config_dir"
+
     if [[ ! -f "$mcp_config_file" ]]; then
-        # Create mcp.json in the same directory
         cat > "$mcp_config_file" << 'EOF'
 {
   "mcpServers": {
     "leindex": {
-      "type": "http",
-      "url": "http://127.0.0.1:47268/mcp"
+      "command": "leindex",
+      "args": ["mcp"]
     }
   }
 }
 EOF
+        log_info "Created MCP config: $mcp_config_file"
         return 0
     fi
 
-    # Update existing mcp.json
+    backup_config_file "$mcp_config_file" "$backup_file"
     configure_json_mcp "$mcp_config_file" "${mcp_config_file}.backup"
     return $?
 }
 
-# Configure Zed MCP (LSP format)
+# Configure Zed MCP
 configure_zed_mcp() {
     local config_file="$1"
     local backup_file="$2"
 
-    # Check if config exists
-    if [[ ! -f "$config_file" ]]; then
-        return 2  # Skipped
+    local config_dir="$(dirname "$config_file")"
+    mkdir -p "$config_dir"
+
+    if [[ ! -f "$config_file" ]] || [[ ! -s "$config_file" ]]; then
+        cat > "$config_file" << 'EOF'
+{
+  "mcp": {
+    "leindex": {
+      "command": ["leindex", "mcp"],
+      "type": "local"
+    }
+  }
+}
+EOF
+        log_info "Created Zed MCP config: $config_file"
+        return 0
     fi
 
-    # Backup existing config
     backup_config_file "$config_file" "$backup_file"
 
-    # Zed uses a different config format
     if command -v python3 &> /dev/null; then
-        python3 <<PYTHON
+        python3 -c "
 import json
 import sys
 
+config_file = '$config_file'
 try:
-    with open('$config_file', 'r') as f:
-        config = json.load(f)
-except:
-    config = {}
-
-if 'lsp' not in config:
-    config['lsp'] = {}
-
-config['lsp']['leindex'] = {
-    'type': 'http',
-    'url': 'http://127.0.0.1:47268/mcp'
-}
-
-with open('$config_file', 'w') as f:
-    json.dump(config, f, indent=2)
-    f.write('\n')
-PYTHON
-        return $?
-    elif command -v jq &> /dev/null; then
-        jq '.lsp.leindex = {"type": "http", "url": "http://127.0.0.1:47268/mcp"}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
-        return $?
-    else
-        return 1
-    fi
-}
-
-# Configure Opencode MCP
-configure_opencode_mcp() {
-    local config_file="$1"
-    local backup_file="$2"
-
-    # Check if config exists
-    if [[ ! -f "$config_file" ]]; then
-        return 2  # Skipped
-    fi
-
-    # Backup existing config
-    backup_config_file "$config_file" "$backup_file"
-
-    # Opencode MCP format: command array, type: local
-    if command -v python3 &> /dev/null; then
-        python3 <<PYTHON
-import json
-import sys
-
-try:
-    with open('$config_file', 'r') as f:
-        config = json.load(f)
+    with open(config_file, 'r') as f:
+        content = f.read().strip()
+        if content:
+            config = json.loads(content)
+        else:
+            config = {}
 except:
     config = {}
 
@@ -860,22 +1091,99 @@ config['mcp']['leindex'] = {
     'type': 'local'
 }
 
-with open('$config_file', 'w') as f:
+with open(config_file, 'w') as f:
     json.dump(config, f, indent=2)
     f.write('\n')
-PYTHON
+"
         return $?
     else
         return 1
     fi
 }
 
-# Configure LM Studio MCP (uses mcp.json format like Cursor)
+# Configure Opencode MCP
+configure_opencode_mcp() {
+    local config_file="$1"
+    local backup_file="$2"
+
+    local config_dir="$(dirname "$config_file")"
+    mkdir -p "$config_dir"
+
+    if [[ ! -f "$config_file" ]] || [[ ! -s "$config_file" ]]; then
+        cat > "$config_file" << 'EOF'
+{
+  "mcp": {
+    "leindex": {
+      "command": ["leindex", "mcp"],
+      "type": "local"
+    }
+  }
+}
+EOF
+        log_info "Created Opencode MCP config: $config_file"
+        return 0
+    fi
+
+    backup_config_file "$config_file" "$backup_file"
+
+    if command -v python3 &> /dev/null; then
+        python3 -c "
+import json
+import sys
+
+config_file = '$config_file'
+try:
+    with open(config_file, 'r') as f:
+        content = f.read().strip()
+        if content:
+            config = json.loads(content)
+        else:
+            config = {}
+except:
+    config = {}
+
+if 'mcp' not in config:
+    config['mcp'] = {}
+
+config['mcp']['leindex'] = {
+    'command': ['leindex', 'mcp'],
+    'type': 'local'
+}
+
+with open(config_file, 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+"
+        return $?
+    else
+        return 1
+    fi
+}
+
+# Configure LM Studio MCP
 configure_lmstudio_mcp() {
     local config_file="$1"
     local backup_file="$2"
 
-    # LM Studio uses the same mcp.json format as Cursor/Claude Code
+    local config_dir="$(dirname "$config_file")"
+    mkdir -p "$config_dir"
+
+    if [[ ! -f "$config_file" ]] || [[ ! -s "$config_file" ]]; then
+        cat > "$config_file" << 'EOF'
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp"]
+    }
+  }
+}
+EOF
+        log_info "Created LM Studio MCP config: $config_file"
+        return 0
+    fi
+
+    backup_config_file "$config_file" "$backup_file"
     configure_json_mcp "$config_file" "$backup_file"
     return $?
 }
@@ -1007,38 +1315,698 @@ offer_start_server() {
 }
 
 # ============================================================================
+# SELECTIVE PURGE SYSTEM
+# ============================================================================
+
+show_selective_purge_menu() {
+    print_header "Selective Purge Menu"
+
+    echo "Select what to preserve:"
+    echo ""
+    echo "  ${CYAN}1)${NC} ${BOLD}Binary only${NC}        Remove config/data/logs, keep binary"
+    echo "  ${CYAN}2)${NC} ${BOLD}Config only${NC}        Remove binary/data/logs, keep config"
+    echo "  ${CYAN}3)${NC} ${BOLD}Data only${NC}          Remove binary/config/logs, keep data"
+    echo "  ${CYAN}4)${NC} ${BOLD}Logs only${NC}          Remove binary/config/data, keep logs"
+    echo "  ${CYAN}5)${NC} ${BOLD}Custom selection${NC}    Interactive menu for each component"
+    echo "  ${CYAN}6)${NC} ${BOLD}Purge all${NC}          Remove everything (default behavior)"
+    echo "  ${CYAN}7)${NC} ${BOLD}Keep all${NC}          Preserve everything"
+    echo "  ${CYAN}0)${NC} ${BOLD}Cancel${NC}            Cancel installation"
+    echo ""
+    read -p "Enter your choice [0-7]: " -n 1 -r
+    echo ""
+
+    case $REPLY in
+        1)
+            # Keep binary only
+            PRESERVE_BINARY=true
+            SELECTIVE_PURGE=true
+            log_info "Selected: Keep binary only"
+            ;;
+        2)
+            # Keep config only
+            PRESERVE_CONFIG=true
+            SELECTIVE_PURGE=true
+            log_info "Selected: Keep config only"
+            ;;
+        3)
+            # Keep data only
+            PRESERVE_DATA=true
+            SELECTIVE_PURGE=true
+            log_info "Selected: Keep data only"
+            ;;
+        4)
+            # Keep logs only
+            PRESERVE_LOGS=true
+            SELECTIVE_PURGE=true
+            log_info "Selected: Keep logs only"
+            ;;
+        5)
+            # Custom selection
+            show_custom_selection_menu
+            ;;
+        6)
+            # Purge all
+            SELECTIVE_PURGE=false
+            log_info "Selected: Purge all"
+            ;;
+        7)
+            # Keep all
+            KEEP_ALL=true
+            log_info "Selected: Keep all"
+            ;;
+        0)
+            log_info "Installation cancelled by user"
+            exit 0
+            ;;
+        *)
+            log_error "Invalid choice"
+            echo ""
+            read -p "Try again? [Y/n] " -n 1 -r
+            echo ""
+            if [[ $REPLY =~ ^[Nn]$ ]]; then
+                log_info "Installation cancelled"
+                exit 0
+            fi
+            show_selective_purge_menu
+            ;;
+    esac
+}
+
+show_custom_selection_menu() {
+    print_header "Custom Component Selection"
+
+    echo "Select components to ${GREEN}PRESERVE${NC}:"
+    echo ""
+
+    # Binary
+    read -p "Preserve ${BOLD}binary${NC}? [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        PRESERVE_BINARY=true
+        print_bullet "Binary will be preserved"
+    else
+        print_bullet "Binary will be removed"
+    fi
+
+    # Config
+    read -p "Preserve ${BOLD}config${NC}? [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        PRESERVE_CONFIG=true
+        print_bullet "Config will be preserved"
+    else
+        print_bullet "Config will be removed"
+    fi
+
+    # Data
+    read -p "Preserve ${BOLD}data${NC}? [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        PRESERVE_DATA=true
+        print_bullet "Data will be preserved"
+    else
+        print_bullet "Data will be removed"
+    fi
+
+    # Logs
+    read -p "Preserve ${BOLD}logs${NC}? [y/N] " -n 1 -r
+    echo ""
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        PRESERVE_LOGS=true
+        print_bullet "Logs will be preserved"
+    else
+        print_bullet "Logs will be removed"
+    fi
+
+    # Check if at least one component is being preserved
+    if [[ "$PRESERVE_BINARY" == false ]] && [[ "$PRESERVE_CONFIG" == false ]] && \
+       [[ "$PRESERVE_DATA" == false ]] && [[ "$PRESERVE_LOGS" == false ]]; then
+        echo ""
+        log_warn "No components selected for preservation"
+        read -p "Proceed with full purge? [y/N] " -n 1 -r
+        echo ""
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            SELECTIVE_PURGE=false
+        else
+            log_info "Restarting selection..."
+            echo ""
+            show_custom_selection_menu
+        fi
+    else
+        SELECTIVE_PURGE=true
+        echo ""
+        log_success "Custom selection complete"
+    fi
+}
+
+backup_data_to_temp() {
+    local backup_success=false
+
+    print_header "Backing Up Data"
+
+    # Create temp directory
+    if [[ -d "$TEMP_BACKUP_DIR" ]]; then
+        log_warn "Temp backup directory already exists, removing..."
+        rm -rf "$TEMP_BACKUP_DIR"
+    fi
+
+    mkdir -p "$TEMP_BACKUP_DIR"
+    log_info "Created temporary backup directory: $TEMP_BACKUP_DIR"
+    echo ""
+
+    # Backup config if preserving
+    if [[ "$PRESERVE_CONFIG" == true ]] && [[ -d "$CONFIG_DIR" ]]; then
+        log_info "Backing up config..."
+        if cp -r "$CONFIG_DIR" "$TEMP_BACKUP_DIR/config" 2>/dev/null; then
+            log_success "Config backed up"
+            backup_success=true
+        else
+            log_error "Failed to backup config"
+        fi
+    fi
+
+    # Backup data if preserving
+    if [[ "$PRESERVE_DATA" == true ]] && [[ -d "$DATA_DIR" ]]; then
+        log_info "Backing up data..."
+        if cp -r "$DATA_DIR" "$TEMP_BACKUP_DIR/data" 2>/dev/null; then
+            log_success "Data backed up"
+            backup_success=true
+        else
+            log_error "Failed to backup data"
+        fi
+    fi
+
+    # Backup logs if preserving
+    if [[ "$PRESERVE_LOGS" == true ]] && [[ -d "$LOG_DIR" ]]; then
+        log_info "Backing up logs..."
+        if cp -r "$LOG_DIR" "$TEMP_BACKUP_DIR/logs" 2>/dev/null; then
+            log_success "Logs backed up"
+            backup_success=true
+        else
+            log_error "Failed to backup logs"
+        fi
+    fi
+
+    # Backup binary if preserving
+    if [[ "$PRESERVE_BINARY" == true ]] && [[ -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" ]]; then
+        log_info "Backing up binary..."
+        mkdir -p "$TEMP_BACKUP_DIR/binary"
+        if cp "$INSTALL_BIN_DIR/$PROJECT_SLUG" "$TEMP_BACKUP_DIR/binary/" 2>/dev/null; then
+            log_success "Binary backed up"
+            backup_success=true
+        else
+            log_error "Failed to backup binary"
+        fi
+    fi
+
+    echo ""
+    if [[ "$backup_success" == true ]]; then
+        log_success "Backup complete"
+        return 0
+    else
+        log_error "Backup failed"
+        return 1
+    fi
+}
+
+validate_backup_integrity() {
+    print_header "Validating Backup Integrity"
+
+    local validation_failed=false
+
+    # Validate config if backed up
+    if [[ -d "$TEMP_BACKUP_DIR/config" ]]; then
+        log_info "Validating config backup..."
+        local config_files=$(find "$TEMP_BACKUP_DIR/config" -type f 2>/dev/null | wc -l)
+        if [[ $config_files -gt 0 ]]; then
+            log_success "Config backup valid ($config_files files)"
+        else
+            log_error "Config backup validation failed"
+            validation_failed=true
+        fi
+    fi
+
+    # Validate data if backed up
+    if [[ -d "$TEMP_BACKUP_DIR/data" ]]; then
+        log_info "Validating data backup..."
+        local data_files=$(find "$TEMP_BACKUP_DIR/data" -type f 2>/dev/null | wc -l)
+        if [[ $data_files -gt 0 ]]; then
+            log_success "Data backup valid ($data_files files)"
+        else
+            log_error "Data backup validation failed"
+            validation_failed=true
+        fi
+    fi
+
+    # Validate logs if backed up
+    if [[ -d "$TEMP_BACKUP_DIR/logs" ]]; then
+        log_info "Validating logs backup..."
+        local log_files=$(find "$TEMP_BACKUP_DIR/logs" -type f 2>/dev/null | wc -l)
+        if [[ $log_files -gt 0 ]]; then
+            log_success "Logs backup valid ($log_files files)"
+        else
+            log_error "Logs backup validation failed"
+            validation_failed=true
+        fi
+    fi
+
+    # Validate binary if backed up
+    if [[ -f "$TEMP_BACKUP_DIR/binary/$PROJECT_SLUG" ]]; then
+        log_info "Validating binary backup..."
+        if [[ -x "$TEMP_BACKUP_DIR/binary/$PROJECT_SLUG" ]] || chmod +x "$TEMP_BACKUP_DIR/binary/$PROJECT_SLUG" 2>/dev/null; then
+            log_success "Binary backup valid"
+        else
+            log_error "Binary backup validation failed"
+            validation_failed=true
+        fi
+    fi
+
+    echo ""
+    if [[ "$validation_failed" == true ]]; then
+        log_error "Backup validation failed"
+        return 1
+    else
+        log_success "All backups validated successfully"
+        return 0
+    fi
+}
+
+restore_backup_data() {
+    print_header "Restoring Preserved Data"
+
+    local restore_success=false
+
+    # Restore config
+    if [[ -d "$TEMP_BACKUP_DIR/config" ]]; then
+        log_info "Restoring config..."
+        if cp -r "$TEMP_BACKUP_DIR/config"/* "$CONFIG_DIR/" 2>/dev/null; then
+            log_success "Config restored"
+            restore_success=true
+        else
+            log_error "Failed to restore config"
+        fi
+    fi
+
+    # Restore data
+    if [[ -d "$TEMP_BACKUP_DIR/data" ]]; then
+        log_info "Restoring data..."
+        if cp -r "$TEMP_BACKUP_DIR/data"/* "$DATA_DIR/" 2>/dev/null; then
+            log_success "Data restored"
+            restore_success=true
+        else
+            log_error "Failed to restore data"
+        fi
+    fi
+
+    # Restore logs
+    if [[ -d "$TEMP_BACKUP_DIR/logs" ]]; then
+        log_info "Restoring logs..."
+        if cp -r "$TEMP_BACKUP_DIR/logs"/* "$LOG_DIR/" 2>/dev/null; then
+            log_success "Logs restored"
+            restore_success=true
+        else
+            log_error "Failed to restore logs"
+        fi
+    fi
+
+    # Restore binary
+    if [[ -f "$TEMP_BACKUP_DIR/binary/$PROJECT_SLUG" ]]; then
+        log_info "Restoring binary..."
+        if sudo cp "$TEMP_BACKUP_DIR/binary/$PROJECT_SLUG" "$INSTALL_BIN_DIR/" && \
+           sudo chmod +x "$INSTALL_BIN_DIR/$PROJECT_SLUG" 2>/dev/null; then
+            log_success "Binary restored"
+            restore_success=true
+        else
+            log_error "Failed to restore binary"
+        fi
+    fi
+
+    echo ""
+    if [[ "$restore_success" == true ]]; then
+        log_success "Data restoration complete"
+
+        # Clean up temp directory
+        log_info "Cleaning up temporary backup..."
+        rm -rf "$TEMP_BACKUP_DIR"
+        log_success "Temporary backup removed"
+        return 0
+    else
+        log_warn "Some data could not be restored"
+        log_info "Temporary backup preserved at: $TEMP_BACKUP_DIR"
+        return 1
+    fi
+}
+
+handle_validation_failure() {
+    print_header "Validation Failure"
+
+    log_error "Backup validation failed"
+    echo ""
+    echo "Options:"
+    echo "  ${CYAN}1)${NC} Retry backup and validation"
+    echo "  ${CYAN}2)${NC} Abort installation"
+    echo "  ${CYAN}3)${NC} Continue anyway (not recommended)"
+    echo ""
+    read -p "Choose an option [1-3]: " -n 1 -r
+    echo ""
+
+    case $REPLY in
+        1)
+            log_info "Retrying backup..."
+            rm -rf "$TEMP_BACKUP_DIR"
+            if backup_data_to_temp && validate_backup_integrity; then
+                return 0
+            else
+                handle_validation_failure
+            fi
+            ;;
+        2)
+            log_info "Installation aborted by user"
+            # Clean up temp directory
+            rm -rf "$TEMP_BACKUP_DIR"
+            exit 1
+            ;;
+        3)
+            log_warn "Continuing despite validation failure..."
+            return 0
+            ;;
+        *)
+            log_error "Invalid choice"
+            handle_validation_failure
+            ;;
+    esac
+}
+
+selective_purge() {
+    print_header "Selective Purge"
+
+    local has_existing=false
+
+    # Check what exists
+    local has_binary=false
+    local has_config=false
+    local has_data=false
+    local has_logs=false
+
+    if [[ -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" ]]; then
+        has_binary=true
+        has_existing=true
+    fi
+
+    if [[ -d "$CONFIG_DIR" ]]; then
+        has_config=true
+        has_existing=true
+    fi
+
+    if [[ -d "$DATA_DIR" ]]; then
+        has_data=true
+        has_existing=true
+    fi
+
+    if [[ -d "$LOG_DIR" ]]; then
+        has_logs=true
+        has_existing=true
+    fi
+
+    if [[ "$has_existing" == false ]]; then
+        log_info "No existing installation found"
+        return 0
+    fi
+
+    # Show what was found
+    echo "Found existing components:"
+    [[ "$has_binary" == true ]] && print_bullet "Binary: $INSTALL_BIN_DIR/$PROJECT_SLUG"
+    [[ "$has_config" == true ]] && print_bullet "Config: $CONFIG_DIR"
+    [[ "$has_data" == true ]] && print_bullet "Data: $DATA_DIR"
+    [[ "$has_logs" == true ]] && print_bullet "Logs: $LOG_DIR"
+    echo ""
+
+    # If keep all flag is set, skip purge
+    if [[ "$KEEP_ALL" == true ]]; then
+        log_info "Keep all flag set - preserving all existing data"
+        return 0
+    fi
+
+    # If selective purge is not enabled and we're not in non-interactive mode, show menu
+    if [[ "$SELECTIVE_PURGE" == false ]] && [[ "$NONINTERACTIVE" != true ]]; then
+        show_selective_purge_menu
+    fi
+
+    # In non-interactive mode without specific flags, default to keep all
+    if [[ "$NONINTERACTIVE" == true ]] && [[ "$SELECTIVE_PURGE" == false ]] && [[ "$KEEP_ALL" == false ]]; then
+        log_info "Non-interactive mode: Defaulting to keep all"
+        KEEP_ALL=true
+        return 0
+    fi
+
+    # If keeping all, return early
+    if [[ "$KEEP_ALL" == true ]]; then
+        log_info "Preserving all existing data"
+        return 0
+    fi
+
+    # If selective purge, backup data first
+    if [[ "$SELECTIVE_PURGE" == true ]]; then
+        if backup_data_to_temp; then
+            if ! validate_backup_integrity; then
+                handle_validation_failure
+            fi
+        else
+            log_error "Backup failed - aborting selective purge"
+            exit 1
+        fi
+    fi
+
+    # Stop running server
+    if pgrep -f "$PROJECT_SLUG serve" > /dev/null; then
+        log_info "Stopping LeIndex server..."
+        if pkill -f "$PROJECT_SLUG serve" 2>/dev/null; then
+            sleep 1
+            log_success "Server stopped"
+        else
+            log_warn "Failed to stop server"
+        fi
+    fi
+
+    # Remove binary if not preserving
+    if [[ "$has_binary" == true ]] && [[ "$PRESERVE_BINARY" == false ]]; then
+        log_info "Removing binary..."
+        if sudo rm -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" 2>/dev/null || \
+           rm -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" 2>/dev/null; then
+            log_success "Binary removed"
+        else
+            log_warn "Failed to remove binary"
+        fi
+    fi
+
+    # Remove config if not preserving
+    if [[ "$has_config" == true ]] && [[ "$PRESERVE_CONFIG" == false ]]; then
+        log_info "Removing config..."
+        if rm -rf "$CONFIG_DIR" 2>/dev/null; then
+            log_success "Config removed"
+        else
+            log_warn "Failed to remove config"
+        fi
+    fi
+
+    # Remove data if not preserving
+    if [[ "$has_data" == true ]] && [[ "$PRESERVE_DATA" == false ]]; then
+        log_info "Removing data..."
+        if rm -rf "$DATA_DIR" 2>/dev/null; then
+            log_success "Data removed"
+        else
+            log_warn "Failed to remove data"
+        fi
+    fi
+
+    # Remove logs if not preserving
+    if [[ "$has_logs" == true ]] && [[ "$PRESERVE_LOGS" == false ]]; then
+        log_info "Removing logs..."
+        # Preserve install log if it exists
+        if [[ -f "$INSTALL_LOG" ]]; then
+            local install_log_name=$(basename "$INSTALL_LOG")
+            cp "$INSTALL_LOG" "/tmp/$install_log_name" 2>/dev/null
+        fi
+        if rm -rf "$LOG_DIR" 2>/dev/null; then
+            # Recreate log directory for new installation
+            mkdir -p "$LOG_DIR"
+            if [[ -f "/tmp/$install_log_name" ]]; then
+                mv "/tmp/$install_log_name" "$INSTALL_LOG"
+            fi
+            log_success "Logs removed"
+        else
+            log_warn "Failed to remove logs"
+        fi
+    fi
+
+    log_success "Selective purge complete"
+    echo ""
+}
+
+# ============================================================================
+# CLEANUP FUNCTIONS
+# ============================================================================
+
+purge_existing_installation() {
+    print_header "Purging Existing Installation"
+
+    local has_existing=false
+
+    # Check if binary exists
+    if [[ -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" ]]; then
+        has_existing=true
+        log_info "Found existing binary: $INSTALL_BIN_DIR/$PROJECT_SLUG"
+    fi
+
+    # Check if LeIndex home directory exists
+    if [[ -d "$LEINDEX_HOME" ]]; then
+        has_existing=true
+        log_info "Found existing data directory: $LEINDEX_HOME"
+    fi
+
+    # Check if server is running
+    if pgrep -f "$PROJECT_SLUG serve" > /dev/null; then
+        has_existing=true
+        log_info "LeIndex server is running"
+    fi
+
+    if [[ "$has_existing" == false ]]; then
+        log_info "No existing installation found"
+        return 0
+    fi
+
+    # Confirm before purging (only in interactive mode)
+    if [[ "$NONINTERACTIVE" != true ]]; then
+        echo ""
+        print_warning "This will remove:"
+        echo "  - Binary: $INSTALL_BIN_DIR/$PROJECT_SLUG"
+        echo "  - Data directory: $LEINDEX_HOME"
+        echo "  - Config directory: $CONFIG_DIR"
+        echo "  - Stop running server (if any)"
+        echo ""
+        read -p "Continue with purge? [y/N] " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log_info "Purge cancelled"
+            return 0
+        fi
+    else
+        log_info "Non-interactive mode: Purging existing installation..."
+    fi
+
+    # Stop running server
+    if pgrep -f "$PROJECT_SLUG serve" > /dev/null; then
+        log_info "Stopping LeIndex server..."
+        if pkill -f "$PROJECT_SLUG serve" 2>/dev/null; then
+            sleep 1
+            log_success "Server stopped"
+        else
+            log_warn "Failed to stop server (may require manual intervention)"
+        fi
+    fi
+
+    # Remove binary
+    if [[ -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" ]]; then
+        log_info "Removing binary..."
+        if sudo rm -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" 2>/dev/null; then
+            log_success "Binary removed"
+        elif rm -f "$INSTALL_BIN_DIR/$PROJECT_SLUG" 2>/dev/null; then
+            log_success "Binary removed"
+        else
+            log_warn "Failed to remove binary (may require manual removal)"
+        fi
+    fi
+
+    # Remove config directory (note: DATA_DIR is inside LEINDEX_HOME, so we remove the whole home)
+    if [[ -d "$LEINDEX_HOME" ]]; then
+        log_info "Removing LeIndex home directory..."
+        if rm -rf "$LEINDEX_HOME" 2>/dev/null; then
+            # Recreate log directory immediately after removal so logging continues to work
+            mkdir -p "$LOG_DIR"
+            touch "$INSTALL_LOG"
+            log_success "Data directory removed"
+        else
+            log_warn "Failed to remove data directory (may require manual removal)"
+        fi
+    fi
+
+    log_success "Purge complete"
+    echo ""
+}
+
+# ============================================================================
 # MAIN INSTALLATION FLOW
 # ============================================================================
 
 main() {
-    # Parse arguments
     for arg in "$@"; do
         case $arg in
             --yes|-y)
                 NONINTERACTIVE=true
                 ;;
+            --preserve-binary)
+                PRESERVE_BINARY=true
+                SELECTIVE_PURGE=true
+                ;;
+            --preserve-config)
+                PRESERVE_CONFIG=true
+                SELECTIVE_PURGE=true
+                ;;
+            --preserve-data)
+                PRESERVE_DATA=true
+                SELECTIVE_PURGE=true
+                ;;
+            --preserve-logs)
+                PRESERVE_LOGS=true
+                SELECTIVE_PURGE=true
+                ;;
+            --preserve-all)
+                PRESERVE_BINARY=true
+                PRESERVE_CONFIG=true
+                PRESERVE_DATA=true
+                PRESERVE_LOGS=true
+                KEEP_ALL=true
+                ;;
             --help|-h)
                 echo "LeIndex Installer v$SCRIPT_VERSION"
                 echo ""
-                echo "Usage: $0 [--yes|--help]"
+                echo "Usage: $0 [--yes|--help] [--preserve-binary|--preserve-config|--preserve-data|--preserve-logs|--preserve-all]"
                 echo ""
                 echo "Options:"
-                echo "  --yes, -y    Non-interactive mode (auto-confirm all prompts)"
-                echo "  --help, -h   Show this help message"
+                echo "  --yes, -y           Non-interactive mode (auto-confirm all prompts)"
+                echo "  --preserve-binary     Preserve binary during reinstall"
+                echo "  --preserve-config     Preserve config during reinstall"
+                echo "  --preserve-data       Preserve data during reinstall"
+                echo "  --preserve-logs       Preserve logs during reinstall"
+                echo "  --preserve-all       Preserve all components during reinstall"
+                echo "  --help, -h          Show this help message"
+                echo ""
+                echo "Examples:"
+                echo "  $0 --yes --preserve-config    # Install non-interactively, keeping config"
+                echo "  $0 --preserve-all             # Reinstall binary only, keep everything else"
                 echo ""
                 exit 0
                 ;;
         esac
     done
 
+    detect_shell
+    detect_distribution
+
     print_header "LeIndex Rust Installer"
 
-    echo "  ${BOLD}Project:${NC}     $PROJECT_NAME"
-    echo "  ${BOLD}Version:${NC}     $SCRIPT_VERSION"
-    echo "  ${BOLD}Repository:${NC}  $REPO_URL"
+    echo "  ${BOLD}Project:${NC}       $PROJECT_NAME"
+    echo "  ${BOLD}Version:${NC}       $SCRIPT_VERSION"
+    echo "  ${BOLD}Repository:${NC}    $REPO_URL"
+    echo "  ${BOLD}Shell:${NC}         $USER_SHELL"
+    echo "  ${BOLD}Distribution:${NC}  $DISTRO_NAME ($DISTRO_ID)"
+    echo "  ${BOLD}Package Mgr:${NC}   $PKG_MANAGER"
     echo ""
 
-    # Step 1: Check Rust
+    install_dependencies
+
+    purge_existing_installation
+
     print_step 1 4 "Checking Rust Toolchain"
 
     if ! detect_rust; then
@@ -1060,30 +2028,23 @@ main() {
         fi
     fi
 
-    # Step 2: Build LeIndex
     install_leindex
 
-    # Step 3: Verify
     if ! verify_installation; then
         log_error "Installation verification failed"
         exit 1
     fi
 
-    # Step 4: Setup directories
     setup_directories
 
-    # Update PATH
     update_path
 
-    # Detect AI tools
     detect_ai_tools
 
-    # Offer to start LeIndex server
     if [[ "$NONINTERACTIVE" != true ]]; then
         offer_start_server
     fi
 
-    # Success message
     print_header "Installation Complete!"
 
     log_success "LeIndex has been installed successfully!"
@@ -1098,10 +2059,17 @@ main() {
     echo "  ${CYAN}2.${NC} Index a project: ${YELLOW}$PROJECT_SLUG index /path/to/project${NC}"
     echo "  ${CYAN}3.${NC} Run diagnostics: ${YELLOW}$PROJECT_SLUG diagnostics${NC}"
     echo "  ${CYAN}4.${NC} Start MCP server: ${YELLOW}$PROJECT_SLUG serve${NC}"
+    echo "  ${CYAN}5.${NC} ${BOLD}Start frontend dashboard:${NC} ${YELLOW}$PROJECT_SLUG dashboard${NC}"
+    echo ""
+    echo "  ${BOLD}Frontend Dashboard:${NC}"
+    echo "  - Dev server: ${YELLOW}$PROJECT_SLUG dashboard${NC} or ${YELLOW}cd dashboard && bun run dev${NC}"
+    echo "  - Production build: ${YELLOW}$PROJECT_SLUG dashboard --prod${NC} or ${YELLOW}cd dashboard && bun run build${NC}"
+    echo "  - Access dashboard at: ${CYAN}http://localhost:5173${NC}"
+    echo "  - Custom port: ${YELLOW}$PROJECT_SLUG dashboard --port 3000${NC}"
     echo ""
     echo "For MCP server configuration, see the documentation."
     echo ""
-    printf "${GREEN}Happy indexing!${NC} 🚀\n"
+    printf "${GREEN}Happy indexing!${NC}\n"
 }
 
 # Run main function

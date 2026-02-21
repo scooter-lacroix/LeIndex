@@ -29,7 +29,10 @@ pub mod protocol;
 /// MCP server implementation.
 pub mod server;
 
-pub use protocol::{error_codes, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+pub use protocol::{
+    error_codes, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, NotificationType,
+};
 pub use server::{McpServer, McpServerConfig};
 
 /// MCP server version

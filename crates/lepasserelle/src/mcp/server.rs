@@ -215,7 +215,7 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
     };
 
     debug!("Received JSON-RPC request: method={}", json_req.method);
-    let id = json_req.id.clone();
+    let id = json_req.id.clone().unwrap_or(serde_json::Value::Null);
 
     if let Err(e) = json_req.validate() {
         warn!("Invalid JSON-RPC request: {}", e);
