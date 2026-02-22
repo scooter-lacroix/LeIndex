@@ -52,41 +52,41 @@ LeIndex consists of 5 production-ready Rust crates:
 ### Architecture Diagram
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    LeIndex v0.1.0 Architecture                       │
-├─────────────────────────────────────────────────────────────────────┤
-│                                                                       │
-│  ┌──────────────────────┐  ┌──────────────────────┐                │
-│  │     CLI Commands     │  │     MCP Server       │                │
-│  │  index, search,      │  │    JSON-RPC 2.0      │                │
-│  │  analyze, diag, serve│  │   (axum HTTP)        │                │
-│  └──────────┬───────────┘  └──────────┬───────────┘                │
-│             │                         │                              │
-│             └────────────┬────────────┘                              │
-│                          ▼                                           │
-│  ┌───────────────────────────────────────────────────────────────┐  │
-│  │                  LeIndex Orchestration                         │  │
-│  │              (lepasserelle - 675 lines)                       │  │
-│  │  • Project indexing • Search • Analysis • Diagnostics          │  │
-│  │  • Cache spilling/reloading/warming • Memory monitoring        │  │
-│  └─────┬─────────┬─────────┬─────────┬─────────┬───────────────┘  │
-│        │         │         │         │         │                   │
-│  ┌─────▼───┐ ┌──▼────┐ ┌──▼─────┐ ┌▼────────┐ ┌─────────────┐   │
-│  │ leparse │ │legraphe│ │lerech  │ │lestock  │ │   Cache     │   │
-│  │         │ │        │ │ erche  │ │ age      │ │ Management  │   │
-  │  │12 langs │ │  PDG   │ │ HNSW   │ │ SQLite  │ │ RSS Monitor │   │
-  │  │zero-copy│ │gravity │ │ NL Q   │ │ global  │ │ Spill/Reload│   │
-  │  │ tree-   │ │traverse│ │INT8    │ │ symbols │ │ 4 Warm Strat│   │
-  │  │ sitter  │ │ embed  │ │quantize│ │ PDG     │ │             │   ││  └─────────┘ └────────┘ └────────┘ └─────────┘ └─────────────┘   │
-│                                                                       │
-│  Technologies:                                                       │
-│  • Parsing: tree-sitter (12 langs) • Rayon parallel processing       │
-│  • Graph: petgraph StableGraph • Gravity traversal w/ priority queue │
-│  • Search: HNSW (hnsw-rs) • Cosine similarity • NL query parser     │
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                              LeIndex v0.1.0 Architecture                                │
+├─────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                         │
+│             ┌──────────────────────┐  ┌──────────────────────┐                          │
+│             │     CLI Commands     │  │     MCP Server       │                          │
+│             │  index, search,      │  │    JSON-RPC 2.0      │                          │
+│             │  analyze, diag, serve│  │   (axum HTTP)        │                          │
+│             └──────────┬───────────┘  └──────────┬───────────┘                          │
+│                        │                         │                                      │
+│                        └────────────┬────────────┘                                      │
+│                                     ▼                                                   │
+│        ┌────────────────────────────────────────────────────────────────┐               │
+│        │                  LeIndex Orchestration                         │               │
+│        │              (lepasserelle - 675 lines)                        │               │
+│        │  • Project indexing • Search • Analysis • Diagnostics          │               │
+│        │  • Cache spilling/reloading/warming • Memory monitoring        │               │
+│        └─────┬────────┬───────────┬───────────┬─────────────┬───────────┘               │
+│              │        │           │           │             │                           │
+│        ┌─────▼───┐ ┌──▼─────┐ ┌───▼────┐ ┌────▼────┐ ┌──────▼──────┐                    │
+│        │ leparse │ │legraphe│ │lerech  │ │lestock  │ │   Cache     │                    │
+│        │         │ │        │ │ erche  │ │ age     │ │ Management  │                    │
+│        │12 langs │ │  PDG   │ │ HNSW   │ │ SQLite  │ │ RSS Monitor │                    │
+│        │zero-copy│ │gravity │ │ NL Q   │ │ global  │ │ Spill/Reload│                    │
+│        │ tree-   │ │traverse│ │INT8    │ │ symbols │ │ 4 Warm Strat│                    │
+│        │ sitter  │ │ embed  │ │quantize│ │ PDG     │ │             │                    │
+│        └─────────┘ └────────┘ └────────┘ └─────────┘ └─────────────┘                    │
+│  Technologies:                                                                          │
+│  • Parsing: tree-sitter (12 langs) • Rayon parallel processing                          │
+│  • Graph: petgraph StableGraph • Gravity traversal w/ priority queue                    │
+│  • Search: HNSW (hnsw-rs) • Cosine similarity • NL query parser                         │
 │  • Storage: SQLite + BLAKE3 hashing • Vector embeddings • Cross-project global symbols  │
-│  • Server: axum + tokio • JSON-RPC 2.0 protocol                     │
-│                                                                       │
-└─────────────────────────────────────────────────────────────────────┘
+│  • Server: axum + tokio • JSON-RPC 2.0 protocol                                         │
+│                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Language Support
@@ -323,23 +323,14 @@ RUST_LOG=debug cargo run --release -- index .
 - [x] HNSW vector index for semantic search
 - [x] Natural language query processing
 - [x] Cross-project symbol resolution
-- [x] Pure Rust CLI with 5 commands
 - [x] JSON-RPC 2.0 MCP server
 - [x] Cache management (spill/reload/warm)
-- [x] 339/339 tests passing
+
 
 ### v0.2.0 (Planned)
 
 - [ ] Project configuration (TOML/JSON)
 - [ ] Detailed error reporting and recovery
-- [ ] Performance benchmarking suite
-- [ ] User-facing documentation expansion
-
-### v0.3.0 (Future)
-
-- [ ] Turso remote database integration (optional)
-- [ ] Additional language parsers
-- [ ] Web UI for code exploration
 
 ---
 
