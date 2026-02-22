@@ -37,14 +37,13 @@
 
 LeIndex consists of 5 production-ready Rust crates:
 
-| Crate | Purpose | Status | Tests |
-|-------|---------|--------|-------|
-| **leparse** | Zero-copy AST extraction | ✅ Production Ready | 97/97 |
-| **legraphe** | PDG analysis with gravity traversal | ✅ Production Ready | 38/38 |
-| **lerecherche** | HNSW semantic search with NL queries | ✅ Production Ready | 87/87 |
-| **lestockage** | SQLite storage + cross-project | ✅ Production Ready | 45/45 |
-| **lepasserelle** | CLI & MCP server | ✅ Production Ready | 72/72 |
-| **Total** | | | **339/339** |
+| Crate | Purpose | Status |
+|-------|---------|--------|
+| **leparse** | Zero-copy AST extraction | Parsing 12 languages (Python, Rust, JS, TS, Go, Java, C++, C#, Ruby, PHP, Lua, Scala) |
+| **legraphe** | PDG analysis with gravity traversal | Context based exploration |
+| **lerecherche** | HNSW semantic search with NL queries | Semantic similarity search |
+| **lestockage** | SQLite storage + cross-project | RSS monitoring, automatic spilling, and warming strategies |
+| **lepasserelle** | CLI & MCP server orchestration | MCP server tools with configurable token outputs, CLI fallback/alternative |
 
 ### Architecture Diagram
 
@@ -104,14 +103,6 @@ LeIndex consists of 5 production-ready Rust crates:
 | Scala | tree-sitter-scala | ✅ Working |
 
 ---
-=======
-- **Zero-Copy AST** — Tree-sitter parsing for 12 languages (Python, Rust, JS, TS, Go, Java, C++, C#, Ruby, PHP, Lua, Scala)
-- **Semantic Search** — HNSW vector search with natural language queries
-- **PDG Analysis** — Program Dependence Graph with gravity-based traversal
-- **MCP Server** — First-class Model Context Protocol for AI assistants
-- **Smart Caching** — RSS monitoring, automatic spilling, and warming strategies
-- **Cross-Project** — Global symbol table for multi-project resolution
->>>>>>> origin/master
 
 ## Quick Start
 
@@ -204,8 +195,8 @@ Add to `~/.claude/claude_desktop_config.json`:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    lepasserelle (CLI/MCP)                    │
-│              index • search • analyze • serve                │
+│                    lepasserelle (CLI/MCP)                   │
+│              index • search • analyze • serve               │
 └───────────┬─────────────┬─────────────┬─────────────┬───────┘
             │             │             │             |
      ┌──────▼──────┐┌─────▼─────┐┌──────▼──────┐┌─────▼─────┐
