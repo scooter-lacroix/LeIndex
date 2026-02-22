@@ -217,6 +217,7 @@ mod tests {
             embedding: None,
             byte_range_start: Some(0),
             byte_range_end: Some(100),
+            embedding_format: None,
         };
         let node2 = crate::nodes::NodeRecord {
             id: None,
@@ -233,6 +234,7 @@ mod tests {
             embedding: None,
             byte_range_start: Some(0),
             byte_range_end: Some(100),
+            embedding_format: None,
         };
         let id1 = node_store.insert(&node1).unwrap();
         let id2 = node_store.insert(&node2).unwrap();

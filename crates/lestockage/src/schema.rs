@@ -93,7 +93,8 @@ impl Storage {
                 byte_range_start INTEGER,
                 byte_range_end INTEGER,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                embedding_format INTEGER
             )",
             [],
         )?;
@@ -145,6 +146,12 @@ impl Storage {
             )?;
         }
 
+        if !columns.iter().any(|c| c == "embedding_format") {
+            self.conn.execute(
+                "ALTER TABLE intel_nodes ADD COLUMN embedding_format INTEGER",
+                [],
+            )?;
+        }
         // Create intel_edges table
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS intel_edges (

@@ -30,6 +30,7 @@
 - **Natural Language Queries** - Intent-aware search (HowWorks, WhereHandled, Bottlenecks, Semantic, Text)
 - **MCP Server** - First-class Model Context Protocol support for AI assistants
 - **Memory Efficient** - Smart cache management with RSS monitoring, spilling, reloading, and warming
+- **INT8 Quantization** - 74% memory reduction for vector storage with SIMD-optimized distance computation
 - **Cross-Project Intelligence** - Global symbol table for multi-project resolution
 - **Pure Rust CLI** - Five commands: index, search, analyze, diagnostics, serve
 
@@ -73,11 +74,10 @@ LeIndex consists of 5 production-ready Rust crates:
 │  ┌─────▼───┐ ┌──▼────┐ ┌──▼─────┐ ┌▼────────┐ ┌─────────────┐   │
 │  │ leparse │ │legraphe│ │lerech  │ │lestock  │ │   Cache     │   │
 │  │         │ │        │ │ erche  │ │ age      │ │ Management  │   │
-│  │12 langs │ │  PDG   │ │ HNSW   │ │ SQLite  │ │ RSS Monitor │   │
-│  │zero-copy│ │gravity │ │ NL Q   │ │ global  │ │ Spill/Reload│   │
-│  │ tree-   │ │traverse│ │ hybrid │ │ symbols │ │ 4 Warm Strat│   │
-│  │ sitter  │ │ embed  │ │ semantic│ │ PDG     │ │             │   │
-│  └─────────┘ └────────┘ └────────┘ └─────────┘ └─────────────┘   │
+  │  │12 langs │ │  PDG   │ │ HNSW   │ │ SQLite  │ │ RSS Monitor │   │
+  │  │zero-copy│ │gravity │ │ NL Q   │ │ global  │ │ Spill/Reload│   │
+  │  │ tree-   │ │traverse│ │INT8    │ │ symbols │ │ 4 Warm Strat│   │
+  │  │ sitter  │ │ embed  │ │quantize│ │ PDG     │ │             │   ││  └─────────┘ └────────┘ └────────┘ └─────────┘ └─────────────┘   │
 │                                                                       │
 │  Technologies:                                                       │
 │  • Parsing: tree-sitter (12 langs) • Rayon parallel processing       │
