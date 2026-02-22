@@ -1,0 +1,44 @@
+[package]
+name = "leserve"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Workspace dependencies
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+
+# Axum HTTP server
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+tower = { version = "0.5", features = ["full"] }
+http = "1.1"
+
+# Async utilities
+futures = "0.3"
+tokio-tungstenite = "0.21"
+
+# Internal dependencies
+lestockage = { path = "../lestockage" }
+legraphe = { path = "../legraphe" }
+lerecherche = { path = "../lerecherche" }
+
+[dev-dependencies]
+rstest.workspace = true
+tempfile.workspace = true
+
+[lib]
+name = "leserve"
+crate-type = ["rlib"]
+
+[[bin]]
+name = "leserve"
+path = "src/bin/leserve.rs"

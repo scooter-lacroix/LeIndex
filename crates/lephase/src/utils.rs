@@ -19,6 +19,42 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
         "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "hpp", "cc", "cxx",
     ];
 
+    // Optional focused-file mode (used by MCP when path points to a single file).
+    if !options.focus_files.is_empty() {
+        for raw_path in &options.focus_files {
+            let candidate = if raw_path.is_absolute() {
+                raw_path.clone()
+            } else {
+                root.join(raw_path)
+            };
+
+            if !candidate.is_file() {
+                continue;
+            }
+
+            if let Some(ext) = candidate.extension().and_then(|e| e.to_str()) {
+                if code_exts.contains(&ext) {
+                    collected.code_files.push(candidate.clone());
+                } else if options.include_docs && include_docs_extension(ext, options.docs_mode) {
+                    collected.docs_files.push(candidate.clone());
+                }
+            }
+
+            if collected.code_files.len() >= options.max_files {
+                break;
+            }
+        }
+
+        collected.code_files.sort();
+        collected.code_files.dedup();
+        collected.docs_files.sort();
+        collected.docs_files.dedup();
+
+        if !collected.code_files.is_empty() || !collected.docs_files.is_empty() {
+            return Ok(collected);
+        }
+    }
+
     let mut walker = walkdir::WalkDir::new(root).into_iter();
     while let Some(entry) = walker.next() {
         let entry = match entry {
@@ -216,5 +252,28 @@ mod tests {
         )
         .expect("collect text");
         assert_eq!(text_only.docs_files.len(), 1);
+    }
+
+    #[test]
+    fn collect_files_uses_focus_files_when_provided() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir src");
+        let a = dir.path().join("src/a.rs");
+        let b = dir.path().join("src/b.rs");
+        std::fs::write(&a, "pub fn a(){}\n").expect("write a");
+        std::fs::write(&b, "pub fn b(){}\n").expect("write b");
+
+        let collected = collect_files(
+            dir.path(),
+            &PhaseOptions {
+                root: dir.path().to_path_buf(),
+                focus_files: vec![b.clone()],
+                max_files: 1,
+                ..PhaseOptions::default()
+            },
+        )
+        .expect("collect focused");
+
+        assert_eq!(collected.code_files, vec![b]);
     }
 }

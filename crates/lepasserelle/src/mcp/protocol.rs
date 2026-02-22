@@ -462,7 +462,10 @@ pub struct ProgressEvent {
     pub total: usize,
 
     /// Optional message with additional details
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
+
+
     pub message: Option<String>,
 
     /// Timestamp in milliseconds
@@ -493,7 +496,14 @@ impl ProgressEvent {
     }
 
     /// Create a completion event
+
     pub fn complete(stage: impl Into<String>, message: impl Into<String>) -> Self {
+
+    pub fn complete(
+        stage: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+
         Self {
             event_type: "complete".to_string(),
             stage: stage.into(),

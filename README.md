@@ -1,24 +1,21 @@
-# LeIndex
-
 <div align="center">
 
-<img src="leindex.jpeg" alt="LeIndex" width="600"/>
+<img src="leindex.jpeg" alt="LeIndex" width="500"/>
 
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
-[![MCP Server](https://img.shields.io/badge/MCP-Server-blue?style=for-the-badge)](https://modelcontextprotocol.io)
-[![Tests](https://img.shields.io/badge/Tests-339%2F339-passing-success?style=for-the-badge)](https://github.com/scooter-lacroix/leindex)
-[![License](https://img.shields.io/badge/License-MIT-yellow?style=for-the-badge)](LICENSE)
-[![Version](https://img.shields.io/badge/Version-0.1.0-blue?style=for-the-badge)](CHANGELOG.md)
+[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/License-MIT%20%7C%20Apache--2.0-blue?style=flat-square)](LICENSE)
+[![MCP](https://img.shields.io/badge/MCP-Server-purple?style=flat-square)](https://modelcontextprotocol.io)
+[![Tests](https://img.shields.io/badge/Tests-339%2F339-brightgreen?style=flat-square)](https://github.com/scooter-lacroix/leindex)
 
-**Pure Rust Code Search and Analysis Engine**
+**AI-powered code search and indexing with MCP integration**
 
-*Lightning-fast semantic code search with zero-copy parsing, PDG analysis, gravity-based traversal, and intelligent memory management.*
+*Lightning-fast semantic search • Zero-copy parsing • PDG analysis • 12 languages*
 
 </div>
 
 ---
 
-## What is LeIndex?
+## Features
 
 **LeIndex** is a **pure Rust** implementation of an intelligent code search and analysis engine. It combines zero-copy parsing, semantic understanding, and efficient storage to help you navigate and understand large codebases.
 
@@ -107,43 +104,28 @@ LeIndex consists of 5 production-ready Rust crates:
 | Scala | tree-sitter-scala | ✅ Working |
 
 ---
+=======
+- **Zero-Copy AST** — Tree-sitter parsing for 12 languages (Python, Rust, JS, TS, Go, Java, C++, C#, Ruby, PHP, Lua, Scala)
+- **Semantic Search** — HNSW vector search with natural language queries
+- **PDG Analysis** — Program Dependence Graph with gravity-based traversal
+- **MCP Server** — First-class Model Context Protocol for AI assistants
+- **Smart Caching** — RSS monitoring, automatic spilling, and warming strategies
+- **Cross-Project** — Global symbol table for multi-project resolution
+>>>>>>> origin/master
 
 ## Quick Start
 
-### Prerequisites
-
-- **Rust 1.75+** - Install from [rustup.rs](https://rustup.rs/)
-- **Cargo** - Comes with Rust
-
 ### Installation
 
-#### One-Line Installer (Recommended)
-
-**Linux/macOS:**
 ```bash
+# One-line installer (Linux/macOS)
 curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
-```
 
-Or with wget:
-```bash
-wget -qO- https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
-```
+# Or via cargo
+cargo install leindex
 
-#### From Source
-
-```bash
-git clone https://github.com/scooter-lacroix/leindex.git
-cd leindex
-cargo build --release --bins
-```
-
-The binary will be at `target/release/leindex`.
-
-### Verification
-
-```bash
+# Verify
 leindex --version
-# Output: LeIndex 0.1.0
 ```
 
 ### Basic Usage
@@ -153,46 +135,55 @@ leindex --version
 leindex index /path/to/project
 
 # Search semantically
-leindex search "authentication logic"
+leindex search "authentication flow"
 
-# Deep analysis with context expansion
-leindex analyze "how does the database connection work"
+# Deep analysis
+leindex analyze "how does error handling work"
 
-# Run diagnostics
+# 5-phase additive analysis
+leindex phase /path/to/project
+
+# System diagnostics
 leindex diagnostics
-
-# Start MCP server for AI assistant integration
-leindex serve --host 127.0.0.1 --port 3000
 ```
 
----
+## CLI Commands
 
-## MCP Server Integration
+| Command | Description |
+|---------|-------------|
+| `index` | Index a project for search and analysis |
+| `search` | Semantic code search with NL queries |
+| `analyze` | Deep analysis with context expansion |
+| `phase` | 5-phase additive analysis workflow |
+| `diagnostics` | System health and index statistics |
+| `serve` | Start MCP HTTP server (axum) |
+| `mcp` | MCP stdio mode for AI tool integration |
 
-LeIndex includes a built-in MCP server for AI assistant integration.
+## MCP Integration
 
-### Starting the Server
+### Claude Code
 
-```bash
-leindex serve --host 127.0.0.1 --port 3000
-```
-
-The server provides:
-- `POST /mcp` - JSON-RPC 2.0 endpoint
-- `GET /mcp/tools/list` - List available tools
-- `GET /health` - Health check
-
-### Configuration
-
-Add to your MCP client configuration:
+Add to `~/.claude/claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
     "leindex": {
       "command": "leindex",
-      "args": ["serve", "--host", "127.0.0.1", "--port", "3000"],
-      "env": {}
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+### Cursor / Other MCP Clients
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["serve", "--host", "127.0.0.1", "--port", "3000"]
     }
   }
 }
@@ -202,117 +193,82 @@ Add to your MCP client configuration:
 
 | Tool | Description |
 |------|-------------|
-| `deep_analyze` | Deep code analysis with context expansion |
+| `deep_analyze` | Deep code analysis with PDG traversal |
 | `search` | Semantic code search |
-| `index` | Index projects |
-| `context` | Context expansion with gravity traversal |
+| `index` | Index projects for analysis |
+| `context` | Context expansion around nodes |
 | `diagnostics` | System health checks |
+| `phase_analysis` | 5-phase additive analysis |
 
----
+## Architecture
 
-## Cache Management
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    lepasserelle (CLI/MCP)                    │
+│              index • search • analyze • serve                │
+└───────────┬─────────────┬─────────────┬─────────────┬───────┘
+            │             │             │             |
+     ┌──────▼──────┐┌─────▼─────┐┌──────▼──────┐┌─────▼─────┐
+     │   leparse   ││ legraphe  ││ lerecherche ││ lestockage│
+     │             ││           ││             ││           │
+     │ tree-sitter ││    PDG    ││    HNSW     ││  SQLite   │
+     │ 12 langs    ││  gravity  ││   vectors   ││  storage  │
+     │ zero-copy   ││ traversal ││   search    ││  global   │
+     └─────────────┘└───────────┘└─────────────┘└───────────┘
+```
 
-LeIndex includes intelligent cache management for memory efficiency.
-
-### Cache Strategies
-
-- **All** - Warm both PDG and vector caches
-- **PDGOnly** - Warm only PDG cache
-- **SearchIndexOnly** - Warm only vector search cache
-- **RecentFirst** - Prioritize recently accessed data
-
-### Memory Monitoring
-
-- RSS monitoring with 85% threshold
-- Automatic cache spilling when memory limit exceeded
-- Cache reloading from storage
-- Configurable warming strategies
-
----
+**Crates:**
+- **leparse** — Zero-copy AST extraction with tree-sitter
+- **legraphe** — PDG construction with gravity-based traversal
+- **lerecherche** — HNSW semantic search with NL query parser
+- **lestockage** — SQLite persistence with cross-project symbols
+- **lepasserelle** — CLI & MCP server orchestration
 
 ## Development
+
+```bash
+# Build
+cargo build --release
+
+# Test all crates
+cargo test --workspace
+
+# Run with debug logging
+RUST_LOG=debug cargo run --release -- index .
+
+# Format and lint
+cargo fmt && cargo clippy
+```
 
 ### Project Structure
 
 ```
 leindex/
 ├── crates/
-│   ├── leparse/        # AST extraction (97 tests) ✅
-│   ├── legraphe/       # PDG analysis (38 tests) ✅
-│   ├── lerecherche/    # Vector search (87 tests) ✅
-│   ├── lestockage/     # Storage layer (45 tests) ✅
-│   └── lepasserelle/   # CLI & MCP server (72 tests) ✅
-├── Cargo.toml          # Workspace configuration
-├── install.sh          # One-line installer
-└── README.md           # This file
+│   ├── leparse/        # AST extraction
+│   ├── legraphe/       # PDG analysis
+│   ├── lerecherche/    # Vector search
+│   ├── lestockage/     # Storage layer
+│   └── lepasserelle/   # CLI & MCP
+├── Cargo.toml
+└── install.sh
 ```
-
-### Building
-
-```bash
-# Build all crates
-cargo build --release
-
-# Run all tests
-cargo test --workspace
-
-# Run with diagnostics
-RUST_LOG=debug cargo run --release -- index .
-```
-
----
-
-## Performance
-
-### Benchmarks (v0.1.0)
-
-| Metric | Target | Status |
-|--------|--------|--------|
-| **Indexing Speed** | <60s for 50K files | ✅ Achieved |
-| **Search Latency (P95)** | <100ms | ✅ Achieved |
-| **Memory Reduction** | 10x (400→32 bytes/node) | ✅ Achieved |
-| **Token Efficiency** | 20% improvement | ✅ Achieved |
-
-### Code Quality
-
-| Metric | Value |
-|--------|-------|
-| **Tests** | 339/339 passing (100%) |
-| **Warnings** | 0 clippy warnings |
-| **Documentation** | Complete rustdoc |
-| **Code Review** | Tzar-approved for lerecherche (18 issues resolved) |
-
----
-
-## Technology Stack
-
-| Component | Technology | Purpose |
-|-----------|------------|---------|
-| **Parsing** | tree-sitter | Zero-copy AST extraction (12 languages) |
-| **Graph** | petgraph | PDG construction with StableGraph |
-| **Traversal** | Custom | Gravity-based traversal with priority queue |
-| **Vector Search** | hnsw-rs | HNSW approximate nearest neighbors |
-| **NL Queries** | Custom | Intent classification and pattern matching |
-| **CLI** | clap | Command-line argument parsing |
-| **MCP Server** | axum | HTTP-based MCP protocol (JSON-RPC 2.0) |
-| **Async** | tokio | Async runtime |
-| **Logging** | tracing | Structured logging |
-| **Serialization** | serde/bincode | Efficient data encoding |
-| **Storage** | SQLite | Local persistence with WAL mode |
-| **Hashing** | BLAKE3 | Incremental computation cache |
-
----
 
 ## Documentation
 
-- [Installation Guide](INSTALLATION_RUST.md) - Detailed setup instructions
-- [Architecture](ARCHITECTURE.md) - System design and internals
-- [Migration Guide](MIGRATION.md) - Python to Rust migration
-- [MCP Compatibility](MCP_COMPATIBILITY.md) - MCP server details
-- [Contributing](CONTRIBUTING.md) - Development guidelines
-- [Changelog](CHANGELOG.md) - Version history
+- [Architecture Guide](ARCHITECTURE.md) — System design internals
+- [API Reference](API.md) — Detailed API documentation
+- [MCP Compatibility](MCP_COMPATIBILITY.md) — MCP server details
+- [Contributing](CONTRIBUTING.md) — Development guidelines
 
----
+## Performance
+
+| Metric | Target | Status |
+|--------|--------|--------|
+| Indexing (50K files) | <60s | ✅ |
+| Search P95 latency | <100ms | ✅ |
+| Memory per node | 32 bytes | ✅ |
+| Tests | 339/339 | ✅ 100% |
 
 ## Roadmap
 
@@ -325,6 +281,7 @@ RUST_LOG=debug cargo run --release -- index .
 - [x] Cross-project symbol resolution
 - [x] JSON-RPC 2.0 MCP server
 - [x] Cache management (spill/reload/warm)
+- [x] INT8 quantization for vector storage
 
 
 ### v0.2.0 (Planned)
@@ -348,36 +305,14 @@ Areas where help is especially appreciated:
 
 ## License
 
-MIT OR Apache-2.0 - see [LICENSE](LICENSE) for details.
-
----
-
-## Acknowledgments
-
-LeIndex is built on amazing open-source projects:
-
-- [Tree-sitter](https://tree-sitter.github.io/tree-sitter/) - Incremental parsing system
-- [petgraph](https://github.com/petgraph/petgraph) - Graph data structures
-- [hnsw-rs](https://github.com/jorgecarleitao/hnsw_rs) - HNSW algorithm
-- [axum](https://github.com/tokio-rs/axum) - Web framework
-- [Model Context Protocol](https://modelcontextprotocol.io) - AI integration
-
----
-
-## Support
-
-- **GitHub Issues:** [https://github.com/scooter-lacroix/leindex/issues](https://github.com/scooter-lacroix/leindex/issues)
-- **Documentation:** [https://github.com/scooter-lacroix/leindex](https://github.com/scooter-lacroix/leindex)
-- **Star us on GitHub** - It helps more people discover LeIndex! ⭐
+MIT OR Apache-2.0 — see [LICENSE](LICENSE) for details.
 
 ---
 
 <div align="center">
 
-**Built with ❤️ and Rust for developers who love their code**
+**Built with Rust for developers who love their code**
 
-*⭐ Star us on GitHub — it makes us smile!*
-
-**Ready to search smarter?** [Install LeIndex now](#quick-start) 🚀
+[Install Now](#quick-start) • [Documentation](#documentation) • [Contribute](CONTRIBUTING.md)
 
 </div>

@@ -290,29 +290,3 @@ This file tracks all major tracks for the project. Each track has its own detail
 5. [x] `levalidation_20260213` - Edit Validation ✅
 
 **Total Test Coverage:** ~115 tests passing across all crates
-
-
----
-
-## [ ] Track: Claude Code CLI MCP + Pi-Mono/OMP Detection & Integration
-*Link: [./maestro/tracks/pi_omp_detection_20260216/](./maestro/tracks/pi_omp_detection_20260216/)*
-
-**Description:** Fix Claude Code MCP configuration to use canonical `claude mcp add` CLI command, plus add pi-mono and OMP detection. Claude Code's old file-path method was broken on some systems.
-
-**Status:** NEW
-
-**Created:** 2026-02-16
-
-**Type:** Feature Track (Priority Fix + Enhancement)
-
-**Priority Order:**
-1. **Phase 0 (PRIORITY):** Fix Claude Code MCP to use `claude mcp add -s user leindex -- leindex mcp`
-2. **Phase 1-3:** Add OMP (MCP) and pi-mono (Skill) detection
-
-**Key Tasks:**
-- Fix Claude Code to use `claude mcp add` CLI command (not brittle file path)
-- Add OMP detection with MCP configuration at `~/.omp/agent/mcp.json`
-- Add pi-mono detection with skill-based integration at `~/.pi/agent/skills/leindex/SKILL.md`
-- Update installer UI and documentation
-
-**Why This Order:** Claude Code fix provides valuable learnings about MCP configuration that informs the OMP/pi-mono implementation.

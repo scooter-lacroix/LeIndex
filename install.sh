@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 5.1.0 - Rust Edition (Multi-Shell & Multi-Distro)
-# Platform: Linux/Unix (Bash, Zsh, Fish, Arch, Debian, Ubuntu, Fedora, etc.)
+# Version: 5.0.0 - Rust Edition
+# Platform: Linux/Unix
 #
 # One-line installer:
-#   curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
-#
-# For fish shell users:
 #   curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
 #
 # Cargo install alternative:
@@ -25,7 +22,7 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="5.1.0"
+readonly SCRIPT_VERSION="5.0.0"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
@@ -39,24 +36,14 @@ PRESERVE_LOGS=false
 KEEP_ALL=false
 SELECTIVE_PURGE=false
 
-# System detection variables
-USER_SHELL="bash"
-SHELL_RC=""
-SHELL_PROFILE=""
-DISTRO_ID="unknown"
-DISTRO_NAME="Unknown"
-DISTRO_VERSION="unknown"
-PKG_MANAGER="unknown"
-IS_ARCH=false
-IS_DEBIAN=false
-IS_FEDORA=false
-
 # Installation paths
 LEINDEX_HOME="${LEINDEX_HOME:-$HOME/.leindex}"
 CONFIG_DIR="${LEINDEX_HOME}/config"
 DATA_DIR="${LEINDEX_HOME}/data"
 LOG_DIR="${LEINDEX_HOME}/logs"
 TEMP_BACKUP_DIR="${HOME}/.leindex.tmp"
+# Install to standard system-wide location (requires sudo)
+# This ensures leindex is accessible to all AI tools regardless of PATH
 INSTALL_BIN_DIR="/usr/local/bin"
 
 # ============================================================================
@@ -135,198 +122,6 @@ print_warning() {
 }
 
 # ============================================================================
-# SYSTEM DETECTION
-# ============================================================================
-
-detect_shell() {
-    USER_SHELL=$(basename "$SHELL" 2>/dev/null || echo "bash")
-    
-    log_info "Detected shell: $USER_SHELL"
-    
-    case "$USER_SHELL" in
-        bash)
-            SHELL_RC="$HOME/.bashrc"
-            SHELL_PROFILE="$HOME/.bash_profile"
-            ;;
-        zsh)
-            SHELL_RC="$HOME/.zshrc"
-            SHELL_PROFILE="$HOME/.zprofile"
-            ;;
-        fish)
-            SHELL_RC="$HOME/.config/fish/config.fish"
-            SHELL_PROFILE="$HOME/.config/fish/config.fish"
-            mkdir -p "$HOME/.config/fish"
-            ;;
-        *)
-            SHELL_RC="$HOME/.profile"
-            SHELL_PROFILE="$HOME/.profile"
-            ;;
-    esac
-}
-
-detect_distribution() {
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        DISTRO_ID="${ID:-unknown}"
-        DISTRO_NAME="${NAME:-Unknown}"
-        DISTRO_VERSION="${VERSION_ID:-unknown}"
-    elif [[ -f /etc/arch-release ]]; then
-        DISTRO_ID="arch"
-        DISTRO_NAME="Arch Linux"
-        DISTRO_VERSION="rolling"
-    else
-        DISTRO_ID="unknown"
-        DISTRO_NAME="Unknown"
-        DISTRO_VERSION="unknown"
-    fi
-    
-    log_info "Detected distribution: $DISTRO_NAME ($DISTRO_ID) $DISTRO_VERSION"
-    
-    if command -v pacman &> /dev/null; then
-        PKG_MANAGER="pacman"
-        IS_ARCH=true
-        log_info "Package manager: pacman (Arch Linux)"
-    elif command -v apt &> /dev/null || command -v apt-get &> /dev/null; then
-        PKG_MANAGER="apt"
-        IS_DEBIAN=true
-        log_info "Package manager: apt (Debian/Ubuntu)"
-    elif command -v dnf &> /dev/null; then
-        PKG_MANAGER="dnf"
-        IS_FEDORA=true
-        log_info "Package manager: dnf (Fedora)"
-    elif command -v yum &> /dev/null; then
-        PKG_MANAGER="yum"
-        IS_FEDORA=true
-        log_info "Package manager: yum (RHEL/CentOS)"
-    elif command -v zypper &> /dev/null; then
-        PKG_MANAGER="zypper"
-        log_info "Package manager: zypper (openSUSE)"
-    else
-        PKG_MANAGER="unknown"
-        log_warn "No recognized package manager found"
-    fi
-}
-
-install_dependencies() {
-    print_header "Checking Dependencies"
-    
-    local missing_deps=()
-    
-    if ! command -v curl &> /dev/null && ! command -v wget &> /dev/null; then
-        missing_deps+=("curl or wget")
-    fi
-    
-    if ! command -v git &> /dev/null; then
-        missing_deps+=("git")
-    fi
-    
-    if [[ ${#missing_deps[@]} -eq 0 ]]; then
-        log_success "All required dependencies are installed"
-        return 0
-    fi
-    
-    log_warn "Missing dependencies: ${missing_deps[*]}"
-    
-    local should_install=false
-    if [[ "$NONINTERACTIVE" == true ]]; then
-        log_info "Non-interactive mode: Installing dependencies automatically..."
-        should_install=true
-    else
-        echo ""
-        read -p "Would you like to install missing dependencies? [Y/n] " -n 1 -r
-        echo ""
-        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
-            should_install=true
-        fi
-    fi
-    
-    if [[ "$should_install" != true ]]; then
-        log_error "Dependencies are required to continue"
-        exit 1
-    fi
-    
-    case "$PKG_MANAGER" in
-        pacman)
-            log_info "Installing dependencies with pacman..."
-            local pacman_packages=()
-            for dep in "${missing_deps[@]}"; do
-                case "$dep" in
-                    "curl or wget") pacman_packages+=("curl") ;;
-                    "git") pacman_packages+=("git") ;;
-                esac
-            done
-            if [[ ${#pacman_packages[@]} -gt 0 ]]; then
-                sudo pacman -Sy --noconfirm "${pacman_packages[@]}" 2>&1 | tee -a "$INSTALL_LOG"
-            fi
-            ;;
-        apt)
-            log_info "Installing dependencies with apt..."
-            sudo apt-get update 2>&1 | tee -a "$INSTALL_LOG"
-            local apt_packages=()
-            for dep in "${missing_deps[@]}"; do
-                case "$dep" in
-                    "curl or wget") apt_packages+=("curl") ;;
-                    "git") apt_packages+=("git") ;;
-                esac
-            done
-            if [[ ${#apt_packages[@]} -gt 0 ]]; then
-                sudo apt-get install -y "${apt_packages[@]}" 2>&1 | tee -a "$INSTALL_LOG"
-            fi
-            ;;
-        dnf)
-            log_info "Installing dependencies with dnf..."
-            local dnf_packages=()
-            for dep in "${missing_deps[@]}"; do
-                case "$dep" in
-                    "curl or wget") dnf_packages+=("curl") ;;
-                    "git") dnf_packages+=("git") ;;
-                esac
-            done
-            if [[ ${#dnf_packages[@]} -gt 0 ]]; then
-                sudo dnf install -y "${dnf_packages[@]}" 2>&1 | tee -a "$INSTALL_LOG"
-            fi
-            ;;
-        yum)
-            log_info "Installing dependencies with yum..."
-            local yum_packages=()
-            for dep in "${missing_deps[@]}"; do
-                case "$dep" in
-                    "curl or wget") yum_packages+=("curl") ;;
-                    "git") yum_packages+=("git") ;;
-                esac
-            done
-            if [[ ${#yum_packages[@]} -gt 0 ]]; then
-                sudo yum install -y "${yum_packages[@]}" 2>&1 | tee -a "$INSTALL_LOG"
-            fi
-            ;;
-        zypper)
-            log_info "Installing dependencies with zypper..."
-            local zypper_packages=()
-            for dep in "${missing_deps[@]}"; do
-                case "$dep" in
-                    "curl or wget") zypper_packages+=("curl") ;;
-                    "git") zypper_packages+=("git") ;;
-                esac
-            done
-            if [[ ${#zypper_packages[@]} -gt 0 ]]; then
-                sudo zypper install -y "${zypper_packages[@]}" 2>&1 | tee -a "$INSTALL_LOG"
-            fi
-            ;;
-        *)
-            log_error "Cannot install dependencies: unknown package manager"
-            echo ""
-            echo "Please install the following manually:"
-            for dep in "${missing_deps[@]}"; do
-                echo "  - $dep"
-            done
-            exit 1
-            ;;
-    esac
-    
-    log_success "Dependencies installed successfully"
-}
-
-# ============================================================================
 # RUST DETECTION
 # ============================================================================
 
@@ -365,44 +160,15 @@ install_rust() {
         exit 1
     fi
 
-    if [[ -f "$HOME/.cargo/env" ]]; then
-        source "$HOME/.cargo/env"
-    fi
+    # Source cargo environment
+    source "$HOME/.cargo/env"
 
     if detect_rust; then
         log_success "Rust installed successfully"
-        add_rust_to_shell_config
     else
         log_error "Rust installation failed"
         exit 1
     fi
-}
-
-add_rust_to_shell_config() {
-    log_info "Configuring Rust environment for $USER_SHELL..."
-    
-    case "$USER_SHELL" in
-        fish)
-            if [[ -f "$SHELL_RC" ]]; then
-                if ! grep -q "set -gx PATH.*cargo/bin" "$SHELL_RC" 2>/dev/null; then
-                    echo "" >> "$SHELL_RC"
-                    echo "# Rust cargo environment" >> "$SHELL_RC"
-                    echo "set -gx PATH \$HOME/.cargo/bin \$PATH" >> "$SHELL_RC"
-                    log_success "Added Rust to $SHELL_RC"
-                fi
-            fi
-            ;;
-        *)
-            if [[ -f "$SHELL_RC" ]]; then
-                if ! grep -q "cargo/env" "$SHELL_RC" 2>/dev/null; then
-                    echo "" >> "$SHELL_RC"
-                    echo "# Rust cargo environment" >> "$SHELL_RC"
-                    echo ". \"\$HOME/.cargo/env\"" >> "$SHELL_RC"
-                    log_success "Added Rust to $SHELL_RC"
-                fi
-            fi
-            ;;
-    esac
 }
 
 # ============================================================================
@@ -619,42 +385,21 @@ setup_directories() {
 update_path() {
     print_header "Installation Location"
 
+    # Binary is installed to /usr/local/bin which is always in PATH
     log_info "Binary installed to /usr/local/bin (system-wide location)"
     log_info "This location is in the standard PATH for all Unix-like systems"
 
+    # Verify /usr/local/bin is in PATH
     if echo ":$PATH:" | grep -q ":/usr/local/bin:"; then
         log_success "/usr/local/bin is in PATH"
     else
         print_warning "/usr/local/bin is not in your PATH"
         echo ""
-        echo "Add the following to your shell configuration ($SHELL_RC):"
-        
-        case "$USER_SHELL" in
-            fish)
-                echo "  ${CYAN}set -gx PATH /usr/local/bin \$PATH${NC}"
-                ;;
-            *)
-                echo "  ${CYAN}export PATH=\"/usr/local/bin:\$PATH\"${NC}"
-                ;;
-        esac
-        
+        echo "This is unusual. Add the following to your shell configuration:"
+        echo "  export PATH=\"/usr/local/bin:\$PATH\""
         echo ""
         echo "Then restart your shell or run:"
-        
-        case "$USER_SHELL" in
-            fish)
-                echo "  ${CYAN}source ~/.config/fish/config.fish${NC}"
-                ;;
-            bash)
-                echo "  ${CYAN}source ~/.bashrc${NC}"
-                ;;
-            zsh)
-                echo "  ${CYAN}source ~/.zshrc${NC}"
-                ;;
-            *)
-                echo "  ${CYAN}source ~/.profile${NC}"
-                ;;
-        esac
+        echo "  source ~/.bashrc  # or ~/.zshrc"
     fi
 }
 
@@ -891,20 +636,16 @@ configure_tool_mcp() {
             return $?
             ;;
         "Cursor"|"VS Code"|"VSCodium")
-            local mcp_config_dir=""
-            if [[ -d "$HOME/.cursor" ]]; then
-                mcp_config_dir="$HOME/.cursor"
-            elif [[ -d "$HOME/.config/Code/User" ]]; then
-                mcp_config_dir="$HOME/.config/Code/User"
-            elif [[ -d "$HOME/.config/VSCodium/User" ]]; then
-                mcp_config_dir="$HOME/.config/VSCodium/User"
-            else
-                print_warning "No VS Code/Cursor config directory found for $tool"
-                return 2
+            # Cursor and VS Code family
+            config_file="$HOME/.cursor/settings.json"
+            if [[ ! -f "$config_file" ]]; then
+                config_file="$HOME/.config/Code/User/settings.json"
             fi
-            local mcp_config_file="$mcp_config_dir/mcp.json"
-            backup_file="${mcp_config_file}.backup"
-            configure_json_mcp "$mcp_config_file" "$backup_file"
+            if [[ ! -f "$config_file" ]]; then
+                config_file="$HOME/.config/VSCodium/User/settings.json"
+            fi
+            backup_file="${config_file}.backup"
+            configure_vscode_mcp "$config_file" "$backup_file"
             return $?
             ;;
         "Zed")
@@ -920,22 +661,21 @@ configure_tool_mcp() {
             return $?
             ;;
         "Antigravity")
-            config_file="$HOME/.gemini/antigravity/mcp_config.json"
-            if [[ ! -d "$HOME/.gemini/antigravity" ]]; then
-                mkdir -p "$HOME/.gemini/antigravity"
-            fi
+            # Antigravity uses Cursor/VS Code config
+            config_file="$HOME/.cursor/settings.json"
             backup_file="${config_file}.backup"
-            configure_json_mcp "$config_file" "$backup_file"
+            configure_vscode_mcp "$config_file" "$backup_file"
             return $?
             ;;
         "LM Studio")
             config_file="$HOME/.lmstudio/mcp.json"
             backup_file="${config_file}.backup"
-            configure_json_mcp "$config_file" "$backup_file"
+            configure_lmstudio_mcp "$config_file" "$backup_file"
             return $?
             ;;
         *)
-            return 2
+            # CLI tools that might have config files
+            return 2  # Skipped
             ;;
     esac
 }
@@ -957,8 +697,11 @@ configure_json_mcp() {
     local config_file="$1"
     local backup_file="$2"
 
-    if [[ ! -f "$config_file" ]] || [[ ! -s "$config_file" ]]; then
+    # Check if config exists
+    if [[ ! -f "$config_file" ]]; then
+        # Create parent directory if needed
         mkdir -p "$(dirname "$config_file")"
+        # Create new config with leindex as subprocess (stdio mode)
         cat > "$config_file" << 'EOF'
 {
   "mcpServers": {
@@ -969,42 +712,40 @@ configure_json_mcp() {
   }
 }
 EOF
-        log_info "Created MCP config: $config_file"
         return 0
     fi
 
+    # Backup existing config
     backup_config_file "$config_file" "$backup_file"
 
+    # Use Python or jq to add leindex to mcpServers
     if command -v python3 &> /dev/null; then
-        python3 -c "
+        python3 <<PYTHON
 import json
 import sys
 
-config_file = '$config_file'
 try:
-    with open(config_file, 'r') as f:
-        content = f.read().strip()
-        if content:
-            config = json.loads(content)
-        else:
-            config = {}
+    with open('$config_file', 'r') as f:
+        config = json.load(f)
 except:
     config = {}
 
 if 'mcpServers' not in config:
     config['mcpServers'] = {}
 
+# Use stdio command mode (subprocess) - AI tools will start/stop automatically
 config['mcpServers']['leindex'] = {
     'command': 'leindex',
     'args': ['mcp']
 }
 
-with open(config_file, 'w') as f:
+with open('$config_file', 'w') as f:
     json.dump(config, f, indent=2)
     f.write('\n')
-"
+PYTHON
         return $?
     elif command -v jq &> /dev/null; then
+        # Fallback to jq if python3 is not available
         jq '.mcpServers.leindex = {"command": "leindex", "args": ["mcp"]}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
         return $?
     else
@@ -1012,89 +753,84 @@ with open(config_file, 'w') as f:
     fi
 }
 
-# Configure VS Code/Cursor MCP (mcp.json format)
+# Configure VS Code/Cursor MCP (settings.json with mcpServers)
 configure_vscode_mcp() {
     local config_file="$1"
     local backup_file="$2"
 
+    # Check if config exists
+    if [[ ! -f "$config_file" ]]; then
+        return 2  # Skipped
+    fi
+
+    # Backup existing config
+    backup_config_file "$config_file" "$backup_file"
+
+    # VS Code uses the same mcp.json format as Claude Code
+    # but the file is in a different location
     local mcp_config_dir="$(dirname "$config_file")"
     local mcp_config_file="$mcp_config_dir/mcp.json"
 
-    mkdir -p "$mcp_config_dir"
-
     if [[ ! -f "$mcp_config_file" ]]; then
+        # Create mcp.json in the same directory
         cat > "$mcp_config_file" << 'EOF'
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"]
+      "type": "http",
+      "url": "http://127.0.0.1:47268/mcp"
     }
   }
 }
 EOF
-        log_info "Created MCP config: $mcp_config_file"
         return 0
     fi
 
-    backup_config_file "$mcp_config_file" "$backup_file"
+    # Update existing mcp.json
     configure_json_mcp "$mcp_config_file" "${mcp_config_file}.backup"
     return $?
 }
 
-# Configure Zed MCP
+# Configure Zed MCP (LSP format)
 configure_zed_mcp() {
     local config_file="$1"
     local backup_file="$2"
 
-    local config_dir="$(dirname "$config_file")"
-    mkdir -p "$config_dir"
-
-    if [[ ! -f "$config_file" ]] || [[ ! -s "$config_file" ]]; then
-        cat > "$config_file" << 'EOF'
-{
-  "mcp": {
-    "leindex": {
-      "command": ["leindex", "mcp"],
-      "type": "local"
-    }
-  }
-}
-EOF
-        log_info "Created Zed MCP config: $config_file"
-        return 0
+    # Check if config exists
+    if [[ ! -f "$config_file" ]]; then
+        return 2  # Skipped
     fi
 
+    # Backup existing config
     backup_config_file "$config_file" "$backup_file"
 
+    # Zed uses a different config format
     if command -v python3 &> /dev/null; then
-        python3 -c "
+        python3 <<PYTHON
 import json
 import sys
 
-config_file = '$config_file'
 try:
-    with open(config_file, 'r') as f:
-        content = f.read().strip()
-        if content:
-            config = json.loads(content)
-        else:
-            config = {}
+    with open('$config_file', 'r') as f:
+        config = json.load(f)
 except:
     config = {}
 
-if 'mcp' not in config:
-    config['mcp'] = {}
+if 'lsp' not in config:
+    config['lsp'] = {}
 
-config['mcp']['leindex'] = {
-    'command': ['leindex', 'mcp'],
-    'type': 'local'
+config['lsp']['leindex'] = {
+    'type': 'http',
+    'url': 'http://127.0.0.1:47268/mcp'
 }
 
-with open(config_file, 'w') as f:
+with open('$config_file', 'w') as f:
     json.dump(config, f, indent=2)
     f.write('\n')
-"
+PYTHON
+        return $?
+    elif command -v jq &> /dev/null; then
+        jq '.lsp.leindex = {"type": "http", "url": "http://127.0.0.1:47268/mcp"}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
         return $?
     else
         return 1
@@ -1106,39 +842,23 @@ configure_opencode_mcp() {
     local config_file="$1"
     local backup_file="$2"
 
-    local config_dir="$(dirname "$config_file")"
-    mkdir -p "$config_dir"
-
-    if [[ ! -f "$config_file" ]] || [[ ! -s "$config_file" ]]; then
-        cat > "$config_file" << 'EOF'
-{
-  "mcp": {
-    "leindex": {
-      "command": ["leindex", "mcp"],
-      "type": "local"
-    }
-  }
-}
-EOF
-        log_info "Created Opencode MCP config: $config_file"
-        return 0
+    # Check if config exists
+    if [[ ! -f "$config_file" ]]; then
+        return 2  # Skipped
     fi
 
+    # Backup existing config
     backup_config_file "$config_file" "$backup_file"
 
+    # Opencode MCP format: command array, type: local
     if command -v python3 &> /dev/null; then
-        python3 -c "
+        python3 <<PYTHON
 import json
 import sys
 
-config_file = '$config_file'
 try:
-    with open(config_file, 'r') as f:
-        content = f.read().strip()
-        if content:
-            config = json.loads(content)
-        else:
-            config = {}
+    with open('$config_file', 'r') as f:
+        config = json.load(f)
 except:
     config = {}
 
@@ -1150,40 +870,22 @@ config['mcp']['leindex'] = {
     'type': 'local'
 }
 
-with open(config_file, 'w') as f:
+with open('$config_file', 'w') as f:
     json.dump(config, f, indent=2)
     f.write('\n')
-"
+PYTHON
         return $?
     else
         return 1
     fi
 }
 
-# Configure LM Studio MCP
+# Configure LM Studio MCP (uses mcp.json format like Cursor)
 configure_lmstudio_mcp() {
     local config_file="$1"
     local backup_file="$2"
 
-    local config_dir="$(dirname "$config_file")"
-    mkdir -p "$config_dir"
-
-    if [[ ! -f "$config_file" ]] || [[ ! -s "$config_file" ]]; then
-        cat > "$config_file" << 'EOF'
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "leindex",
-      "args": ["mcp"]
-    }
-  }
-}
-EOF
-        log_info "Created LM Studio MCP config: $config_file"
-        return 0
-    fi
-
-    backup_config_file "$config_file" "$backup_file"
+    # LM Studio uses the same mcp.json format as Cursor/Claude Code
     configure_json_mcp "$config_file" "$backup_file"
     return $?
 }
@@ -1939,74 +1641,37 @@ purge_existing_installation() {
 # ============================================================================
 
 main() {
+    # Parse arguments
     for arg in "$@"; do
         case $arg in
             --yes|-y)
                 NONINTERACTIVE=true
                 ;;
-            --preserve-binary)
-                PRESERVE_BINARY=true
-                SELECTIVE_PURGE=true
-                ;;
-            --preserve-config)
-                PRESERVE_CONFIG=true
-                SELECTIVE_PURGE=true
-                ;;
-            --preserve-data)
-                PRESERVE_DATA=true
-                SELECTIVE_PURGE=true
-                ;;
-            --preserve-logs)
-                PRESERVE_LOGS=true
-                SELECTIVE_PURGE=true
-                ;;
-            --preserve-all)
-                PRESERVE_BINARY=true
-                PRESERVE_CONFIG=true
-                PRESERVE_DATA=true
-                PRESERVE_LOGS=true
-                KEEP_ALL=true
-                ;;
             --help|-h)
                 echo "LeIndex Installer v$SCRIPT_VERSION"
                 echo ""
-                echo "Usage: $0 [--yes|--help] [--preserve-binary|--preserve-config|--preserve-data|--preserve-logs|--preserve-all]"
+                echo "Usage: $0 [--yes|--help]"
                 echo ""
                 echo "Options:"
-                echo "  --yes, -y           Non-interactive mode (auto-confirm all prompts)"
-                echo "  --preserve-binary     Preserve binary during reinstall"
-                echo "  --preserve-config     Preserve config during reinstall"
-                echo "  --preserve-data       Preserve data during reinstall"
-                echo "  --preserve-logs       Preserve logs during reinstall"
-                echo "  --preserve-all       Preserve all components during reinstall"
-                echo "  --help, -h          Show this help message"
-                echo ""
-                echo "Examples:"
-                echo "  $0 --yes --preserve-config    # Install non-interactively, keeping config"
-                echo "  $0 --preserve-all             # Reinstall binary only, keep everything else"
+                echo "  --yes, -y    Non-interactive mode (auto-confirm all prompts)"
+                echo "  --help, -h   Show this help message"
                 echo ""
                 exit 0
                 ;;
         esac
     done
 
-    detect_shell
-    detect_distribution
-
     print_header "LeIndex Rust Installer"
 
-    echo "  ${BOLD}Project:${NC}       $PROJECT_NAME"
-    echo "  ${BOLD}Version:${NC}       $SCRIPT_VERSION"
-    echo "  ${BOLD}Repository:${NC}    $REPO_URL"
-    echo "  ${BOLD}Shell:${NC}         $USER_SHELL"
-    echo "  ${BOLD}Distribution:${NC}  $DISTRO_NAME ($DISTRO_ID)"
-    echo "  ${BOLD}Package Mgr:${NC}   $PKG_MANAGER"
+    echo "  ${BOLD}Project:${NC}     $PROJECT_NAME"
+    echo "  ${BOLD}Version:${NC}     $SCRIPT_VERSION"
+    echo "  ${BOLD}Repository:${NC}  $REPO_URL"
     echo ""
 
-    install_dependencies
-
+    # Step 0: Purge existing installation
     purge_existing_installation
 
+    # Step 1: Check Rust
     print_step 1 4 "Checking Rust Toolchain"
 
     if ! detect_rust; then
@@ -2028,23 +1693,30 @@ main() {
         fi
     fi
 
+    # Step 2: Build LeIndex
     install_leindex
 
+    # Step 3: Verify
     if ! verify_installation; then
         log_error "Installation verification failed"
         exit 1
     fi
 
+    # Step 4: Setup directories
     setup_directories
 
+    # Update PATH
     update_path
 
+    # Detect AI tools
     detect_ai_tools
 
+    # Offer to start LeIndex server
     if [[ "$NONINTERACTIVE" != true ]]; then
         offer_start_server
     fi
 
+    # Success message
     print_header "Installation Complete!"
 
     log_success "LeIndex has been installed successfully!"
@@ -2059,17 +1731,16 @@ main() {
     echo "  ${CYAN}2.${NC} Index a project: ${YELLOW}$PROJECT_SLUG index /path/to/project${NC}"
     echo "  ${CYAN}3.${NC} Run diagnostics: ${YELLOW}$PROJECT_SLUG diagnostics${NC}"
     echo "  ${CYAN}4.${NC} Start MCP server: ${YELLOW}$PROJECT_SLUG serve${NC}"
-    echo "  ${CYAN}5.${NC} ${BOLD}Start frontend dashboard:${NC} ${YELLOW}$PROJECT_SLUG dashboard${NC}"
+    echo "  ${CYAN}5.${NC} ${BOLD}Start frontend dashboard:${NC} ${YELLOW}cd dashboard && bun run dev${NC}"
     echo ""
     echo "  ${BOLD}Frontend Dashboard:${NC}"
-    echo "  - Dev server: ${YELLOW}$PROJECT_SLUG dashboard${NC} or ${YELLOW}cd dashboard && bun run dev${NC}"
-    echo "  - Production build: ${YELLOW}$PROJECT_SLUG dashboard --prod${NC} or ${YELLOW}cd dashboard && bun run build${NC}"
-    echo "  - Access dashboard at: ${CYAN}http://localhost:5173${NC}"
-    echo "  - Custom port: ${YELLOW}$PROJECT_SLUG dashboard --port 3000${NC}"
+    echo "  The dashboard is available at: ${CYAN}http://localhost:5173${NC}"
+    echo "  To build for production: ${YELLOW}cd dashboard && bun run build${NC}"
+    echo "  Built files will be in: ${CYAN}dashboard/dist/${NC}"
     echo ""
     echo "For MCP server configuration, see the documentation."
     echo ""
-    printf "${GREEN}Happy indexing!${NC}\n"
+    printf "${GREEN}Happy indexing!${NC} 🚀\n"
 }
 
 # Run main function

@@ -2,6 +2,12 @@
 # LeIndex Windows Installer
 # Version: 5.0.0 - Rust Edition
 # Platform: Windows PowerShell
+#
+# One-line installer:
+#   iwr https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.ps1 -UseBasicParsing | iex
+#
+# Cargo install alternative:
+#   cargo install leindex
 #############################################
 
 param(
