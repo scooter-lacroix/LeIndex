@@ -114,7 +114,14 @@ pub unsafe fn dot_product_adc(
     let mut total = _mm_cvtss_f32(sum32);
 
     // Handle remainder (dimensions not divisible by 16)
+    // SAFETY: We use get_unchecked here for performance in the hot loop.
+    // The safety invariant is: 0 <= i < q_slice.len()
+    // - The loop starts at n_chunks * 16, which is <= dimension
+    // - The loop iterates through query which has exactly 'dimension' elements
+    // - q_slice comes from qvec which also has exactly 'dimension' elements
+    // - Therefore i is always in bounds [0, dimension) for both slices
     for (i, &q_val) in query.iter().enumerate().skip(n_chunks * 16) {
+        debug_assert!(i < q_slice.len(), "Index {} out of bounds for q_slice of len {}", i, q_slice.len());
         total += q_val * (*q_slice.get_unchecked(i) as f32);
     }
 

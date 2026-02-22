@@ -743,24 +743,37 @@ async fn cmd_dashboard_impl(port: u16, prod: bool) -> AnyhowResult<()> {
     let current_dir = std::env::current_dir().context("Failed to get current directory")?;
     let dashboard_path = current_dir.join("dashboard");
 
-    if !dashboard_path.exists() {
-        // Check if we can find it by going up directories
+    let dashboard_path = if dashboard_path.exists() {
+        dashboard_path
+    } else {
+        // Development convenience: traverse up to 5 parent directories to find dashboard
+        // This supports running from various locations within the project tree during development
         let mut parent = current_dir.as_path();
-        let mut found = false;
-        for _ in 0..5 {
-            if parent.join("dashboard").exists() {
-                found = true;
+        let mut found_path = None;
+        for depth in 0..5 {
+            let candidate = parent.join("dashboard");
+            if candidate.exists() {
+                found_path = Some(candidate);
                 break;
             }
-            parent = parent.parent().unwrap_or(parent);
+            // SAFETY: We limit traversal to 5 levels to prevent infinite loops
+            // in malformed environments. If we reach root, parent() returns None
+            // and we break out of the loop.
+            parent = parent.parent().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Dashboard directory not found. Traversed {} levels up from {:?}",
+                    depth,
+                    current_dir
+                )
+            })?;
         }
 
-        if !found {
-            anyhow::bail!(
+        found_path.ok_or_else(|| {
+            anyhow::anyhow!(
                 "Dashboard directory not found. Please ensure you're in the LeIndex repository or run from the installed location."
-            );
-        }
-    }
+            )
+        })?
+    };
 
     // Check if bun is installed
     let bun_exists = Command::new("bun")
