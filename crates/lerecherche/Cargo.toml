@@ -20,15 +20,27 @@ once_cell = "1.19"
 unicode-normalization = "0.1"
 hnsw_rs = "0.1.0"
 lru = "0.12"
+bytemuck = "1.15"
+wide = "0.7"  # Portable SIMD for stable Rust
 
 # Internal dependencies
 leparse = { path = "../leparse" }
 legraphe = { path = "../legraphe" }
+bincode.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
 tokio = { workspace = true }
 rand = "0.8"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "simd_benchmarks"
+harness = false
+
+[[bench]]
+name = "search_benchmarks"
+harness = false
 
 [lib]
 name = "lerecherche"

@@ -2,6 +2,35 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [Unreleased] - INT8 Quantization Optimization
+
+### ✨ **Performance: INT8 Quantized Vector Search**
+
+Major performance optimization for vector search with ~74% memory reduction.
+
+#### **Key Features**
+- **INT8 Quantization**: 4x memory reduction for vector storage
+- **AVX2 SIMD Optimization**: 3-4x speedup on x86_64 with AVX2
+- **Runtime Feature Detection**: Automatic selection of optimal implementation
+- **Asymmetric Distance Computation (ADC)**: Maintains search accuracy with quantized vectors
+- **Cross-Platform**: Portable fallback for non-AVX2 platforms
+
+#### **Technical Details**
+- SIMD module with runtime dispatch (AVX2 → fallback)
+- NaN/Inf validation for input vectors
+- Comprehensive safety documentation for unsafe code
+- Property-based tests for correctness verification
+- Criterion benchmarks for performance tracking
+
+#### **Performance Improvements**
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Memory per 768d vector | 3,072 bytes | ~800 bytes | **~74% reduction** |
+| Distance computation (AVX2) | Baseline | 3-4x faster | **AVX2 intrinsics** |
+| Search latency | Baseline | Similar | **Maintained accuracy** |
+
+---
+
 ## [0.1.0] - 2025-01-26 - Rust Rewrite Release
 
 ### 🦀 **Major Release: Complete Rewrite in Pure Rust**

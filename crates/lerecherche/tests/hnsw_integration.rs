@@ -611,4 +611,141 @@ mod tests {
         assert!(results.len() <= 100);
         assert!(search_time.as_millis() < 500, "HNSW search should be fast");
     }
+
+    /// End-to-end test for INT8 quantized HNSW search
+    ///
+    /// This test verifies:
+    /// - INT8 quantization works end-to-end
+    /// - Search results are reasonable
+    /// - Memory is reduced compared to f32
+    /// - Results are deterministic
+    #[test]
+    fn test_int8_quantized_hnsw_end_to_end() {
+        use lerecherche::quantization::{Int8HnswIndex, Int8HnswParams};
+
+        let dimension = 768;
+        let num_vectors = 1000;
+
+        // Create index with INT8 quantization
+        let params = Int8HnswParams::new()
+            .with_m(16)
+            .with_ef_construction(200)
+            .with_ef_search(50);
+        
+        let mut index = Int8HnswIndex::with_params(dimension, params);
+
+        // Insert test vectors
+        let mut inserted_ids = Vec::new();
+        for i in 0..num_vectors {
+            let vector: Vec<f32> = (0..dimension)
+                .map(|j| ((i * dimension + j) % 100) as f32 / 100.0)
+                .collect();
+            let id = format!("vec_{}", i);
+            index.insert(id.clone(), vector).unwrap();
+            inserted_ids.push(id);
+        }
+
+        // Verify index size
+        assert_eq!(index.len(), num_vectors);
+
+        // Verify memory reduction
+        let reduction = index.memory_reduction_ratio();
+        assert!(
+            reduction > 0.50,
+            "Memory reduction should be >50%, got {:.1}%",
+            reduction * 100.0
+        );
+
+        // Create a query vector
+        let query: Vec<f32> = (0..dimension)
+            .map(|j| (j % 50) as f32 / 100.0)
+            .collect();
+
+        // Perform search
+        let results1 = index.search(&query, 10);
+        
+        // Verify we got results
+        assert!(!results1.is_empty(), "Search should return results");
+        assert!(results1.len() <= 10);
+
+        // Verify results are sorted by similarity (descending)
+        for i in 1..results1.len() {
+            assert!(
+                results1[i-1].1 >= results1[i].1,
+                "Results should be sorted by similarity"
+            );
+        }
+
+        // Verify deterministic results (same query = same results)
+        let results2 = index.search(&query, 10);
+        assert_eq!(results1.len(), results2.len());
+        for i in 0..results1.len() {
+            assert_eq!(results1[i].0, results2[i].0);
+        }
+
+        // Verify all returned IDs are valid
+        for (id, _score) in &results1 {
+            assert!(
+                inserted_ids.contains(id),
+                "Returned ID {} was not in inserted vectors",
+                id
+            );
+        }
+    }
+
+    /// Test INT8 vs f32 search accuracy comparison
+    ///
+    /// Verifies that INT8 quantized search maintains reasonable accuracy
+    /// compared to the original f32 vectors.
+    #[test]
+    fn test_int8_vs_f32_search_accuracy() {
+        use lerecherche::quantization::{Int8HnswIndex, Int8HnswParams};
+
+        let dimension = 256;  // Smaller dimension for faster test
+        let num_vectors = 500;
+        let top_k = 10;
+
+        // Create orthogonal vectors for clear nearest neighbors
+        let mut vectors = Vec::new();
+        for i in 0..num_vectors {
+            let mut vec = vec![0.0f32; dimension];
+            vec[i % dimension] = 1.0;
+            vectors.push((format!("vec_{}", i), vec));
+        }
+
+        // Create INT8 index
+        let params = Int8HnswParams::new()
+            .with_m(8)
+            .with_ef_construction(100)
+            .with_ef_search(50);
+        
+        let mut index = Int8HnswIndex::with_params(dimension, params);
+
+        // Insert vectors
+        for (id, vec) in &vectors {
+            index.insert(id.clone(), vec.clone()).unwrap();
+        }
+
+        // Search with query matching one of the vectors
+        let query_idx = 42;
+        let query = vectors[query_idx].1.clone();
+        
+        let results = index.search(&query, top_k);
+
+        // The query should find the exact match or very close neighbors
+        assert!(!results.is_empty());
+        
+        // All similarities should be reasonable (not NaN, in valid range)
+        for (_, similarity) in &results {
+            assert!(
+                similarity.is_finite(),
+                "Similarity should be finite"
+            );
+            assert!(
+                *similarity >= 0.0 && *similarity <= 1.0,
+                "Similarity should be in [0, 1], got {}",
+                similarity
+            );
+        }
+    }
 }

@@ -84,6 +84,8 @@ pub struct HNSWParams {
     /// Higher values = better for large datasets but slower search
     /// Typical range: 8-32, default: 16
     pub max_layer: usize,
+    /// Whether to use INT8 quantization (reduces memory usage by ~74%)
+    pub quantized: bool,
 }
 
 impl Default for HNSWParams {
@@ -94,6 +96,7 @@ impl Default for HNSWParams {
             ef_search: 50,
             max_elements: 100_000,
             max_layer: 16,
+            quantized: false,
         }
     }
 }
@@ -744,6 +747,7 @@ mod tests {
             ef_search: 25,
             max_elements: 50000,
             max_layer: 12,
+            ..Default::default()
         };
         let index = HNSWIndex::with_params(3, params);
 

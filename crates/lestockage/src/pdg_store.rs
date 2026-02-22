@@ -26,6 +26,7 @@ type NodeDbRow = (
     Option<Vec<u8>>,
     Option<i64>,
     Option<i64>,
+    Option<i32>,
 );
 
 /// Errors that can occur during PDG persistence
@@ -196,11 +197,12 @@ pub fn save_pdg(
             embedding: embedding_blob,
             byte_range_start: Some(pdg_node.byte_range.0 as i64),
             byte_range_end: Some(pdg_node.byte_range.1 as i64),
+            embedding_format: Some(0),
         };
 
         let db_id: i64 = tx.query_row(
-            "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, created_at, updated_at, embedding_format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
              RETURNING id",
             params![
                 record.project_id,
@@ -218,6 +220,7 @@ pub fn save_pdg(
                 record.byte_range_end,
                 chrono::Utc::now().timestamp(),
                 chrono::Utc::now().timestamp(),
+                record.embedding_format,
             ],
             |row| row.get(0),
         )?;
@@ -299,7 +302,7 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
 
     // Load all nodes for the project
     let mut nodes_stmt = storage.conn().prepare(
-        "SELECT id, file_path, node_id, symbol_name, qualified_name, language, node_type, complexity, content_hash, embedding, byte_range_start, byte_range_end
+        "SELECT id, file_path, node_id, symbol_name, qualified_name, language, node_type, complexity, content_hash, embedding, byte_range_start, byte_range_end, embedding_format
          FROM intel_nodes WHERE project_id = ?1"
     )?;
 
@@ -318,6 +321,7 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
                 row.get::<_, Option<Vec<u8>>>(9)?, // embedding
                 row.get::<_, Option<i64>>(10)?,    // byte_range_start
                 row.get::<_, Option<i64>>(11)?,    // byte_range_end
+                row.get::<_, Option<i32>>(12)?,    // embedding_format
             ))
         })?
         .collect::<SqliteResult<Vec<_>>>()?;
@@ -335,6 +339,7 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
         embedding_blob,
         start,
         end,
+        _embedding_format,
     ) in node_rows
     {
         let node_type = StorageNodeType::from_str_name(&node_type_str).ok_or_else(|| {

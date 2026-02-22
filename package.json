@@ -147,5 +147,33 @@
   "scripts": {
     "install": "pip install leindex",
     "postinstall": "leindex --version"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "^5.90.21",
+    "@tanstack/react-router": "^1.159.10",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "clsx": "^2.1.1",
+    "date-fns": "^4.1.0",
+    "lucide-react": "^0.564.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "react-force-graph-2d": "^1.29.1",
+    "tailwind-merge": "^3.4.0",
+    "zod": "^4.3.6",
+    "zustand": "^5.0.11"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@typescript-eslint/eslint-plugin": "^8.55.0",
+    "@typescript-eslint/parser": "^8.55.0",
+    "@vitejs/plugin-react": "^5.1.4",
+    "autoprefixer": "^10.4.24",
+    "eslint": "^10.0.0",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "eslint-plugin-react-refresh": "^0.5.0",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^4.1.18",
+    "vite": "^7.3.1"
   }
 }

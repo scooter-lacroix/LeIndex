@@ -162,18 +162,25 @@ pub enum NodeKind {
 
 ### 3. lerecherche - Vector Search
 
-**Purpose:** HNSW-based semantic similarity search
+**Purpose:** HNSW-based semantic similarity search with INT8 quantization
 
 **Key Responsibilities:**
 - Vector embedding storage (in-memory)
 - HNSW index construction
 - Approximate nearest neighbor search
 - Similarity scoring
+- INT8 quantization for memory efficiency
+
+**Key Features:**
+- **INT8 Quantization:** 74% memory reduction using Asymmetric Distance Computation (ADC)
+- **SIMD Optimization:** Runtime feature detection with AVX2 and portable fallback
+- **HNSW Integration:** Full HNSW index support with quantized vectors
+- **Multi-platform:** Works on x86_64, AArch64, and other platforms
 
 **Current State:**
 - In-memory HNSW via `hnsw_rs`
-- Temporary implementation
-- Will be replaced by Turso/libsql with vec0 extension
+- INT8 quantization production-ready
+- Temporary implementation (will integrate with Turso/libsql vec0)
 
 **Key Types:**
 ```rust

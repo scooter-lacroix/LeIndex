@@ -148,6 +148,17 @@ pub enum Commands {
         #[arg(long = "stdio")]
         stdio: bool,
     },
+
+    /// Start the frontend dashboard
+    Dashboard {
+        /// Port to run the dashboard on (default: 5173)
+        #[arg(long = "port", default_value = "5173")]
+        port: u16,
+
+        /// Build for production instead of dev server
+        #[arg(long = "prod")]
+        prod: bool,
+    },
 }
 
 impl Cli {
@@ -212,6 +223,9 @@ impl Cli {
             Commands::Diagnostics => cmd_diagnostics_impl(global_project).await,
             Commands::Serve { host, port } => cmd_serve_impl(host, port).await,
             Commands::Mcp { .. } => cmd_mcp_stdio_impl(global_project).await,
+            Commands::Dashboard { port, prod } => {
+                cmd_dashboard_impl(port, prod).await
+            }
         }
     }
 }
@@ -544,7 +558,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, IndexHandler,
         PhaseAnalysisAliasHandler, PhaseAnalysisHandler, SearchHandler,
     };
-    use crate::mcp::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+    use crate::mcp::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse};
     use std::io::{self, BufRead, Read, Write};
 
     let project_path = get_project_path(project);
@@ -643,13 +657,13 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 
         use_content_length = use_content_length || framed;
 
-        // Parse JSON-RPC request
-        let request: JsonRpcRequest = match serde_json::from_str(&json_payload) {
-            Ok(r) => r,
+        // Parse JSON-RPC message (request or notification)
+        let message = match JsonRpcMessage::from_json(&json_payload) {
+            Ok(m) => m,
             Err(e) => {
                 let error_response = JsonRpcResponse::error(
                     serde_json::Value::Null,
-                    JsonRpcError::parse_error(e.to_string()),
+                    e,
                 );
                 let response = serde_json::to_string(&error_response).unwrap_or_default();
                 if use_content_length {
@@ -667,51 +681,148 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
             }
         };
 
-        // Extract request ID before moving request
-        let request_id = request.id.clone();
+        // Handle based on message type
+        match message {
+            JsonRpcMessage::Notification(notification) => {
+                eprintln!(
+                    "[INFO] Received notification: {} (type: {})",
+                    notification.method,
+                    notification.notification_type()
+                );
+                continue;
+            }
+            JsonRpcMessage::Request(request) => {
+                let request_id = request.id.clone().unwrap_or(serde_json::Value::Null);
 
-        // Check if this is a notification (no response expected for notifications)
-        let is_notification = request_id.is_null();
+                let response = match handle_mcp_request(request, project_path.clone()).await {
+                    Ok(r) => r,
+                    Err(e) => JsonRpcResponse::error(
+                        request_id,
+                        JsonRpcError::internal_error(e.to_string()),
+                    ),
+                };
 
-        // Handle the request
-        let response = match handle_mcp_request(request, project_path.clone()).await {
-            Ok(r) => r,
-            Err(e) => JsonRpcResponse::error(
-                request_id.clone(),
-                JsonRpcError::internal_error(e.to_string()),
-            ),
-        };
+                let response_json = match serde_json::to_string(&response) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        format!("{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":-32700,\"message\":\"Failed to serialize response: {}\"}}}}", e)
+                    }
+                };
 
-        // Only send response if this is not a notification
-        if !is_notification {
-            // Write response to stdout
-            let response_json = match serde_json::to_string(&response) {
-                Ok(j) => j,
-                Err(e) => {
-                    // If we can't serialize, create a simple error response
-                    format!("{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":-32700,\"message\":\"Failed to serialize response: {}\"}}}}", e)
-                }
-            };
-
-            if use_content_length {
-                if writeln!(
-                    stdout,
-                    "Content-Length: {}\r\n\r\n{}",
-                    response_json.len(),
-                    response_json
-                )
-                .is_err()
-                {
+                if use_content_length {
+                    if writeln!(
+                        stdout,
+                        "Content-Length: {}\r\n\r\n{}",
+                        response_json.len(),
+                        response_json
+                    )
+                    .is_err()
+                    {
+                        eprintln!("[ERROR] Failed to write to stdout");
+                        break;
+                    }
+                } else if writeln!(stdout, "{}\n", response_json).is_err() {
                     eprintln!("[ERROR] Failed to write to stdout");
                     break;
                 }
-            } else if writeln!(stdout, "{}\n", response_json).is_err() {
-                eprintln!("[ERROR] Failed to write to stdout");
+
+                let _ = stdout.flush();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Dashboard command implementation - Start the frontend dashboard
+async fn cmd_dashboard_impl(port: u16, prod: bool) -> AnyhowResult<()> {
+    use std::process::Command;
+
+    // Find the dashboard directory
+    // Check if we're in the repo root
+    let current_dir = std::env::current_dir().context("Failed to get current directory")?;
+    let dashboard_path = current_dir.join("dashboard");
+
+    let dashboard_path = if dashboard_path.exists() {
+        dashboard_path
+    } else {
+        // Development convenience: traverse up to 5 parent directories to find dashboard
+        // This supports running from various locations within the project tree during development
+        let mut parent = current_dir.as_path();
+        let mut found_path = None;
+        for depth in 0..5 {
+            let candidate = parent.join("dashboard");
+            if candidate.exists() {
+                found_path = Some(candidate);
                 break;
             }
+            // SAFETY: We limit traversal to 5 levels to prevent infinite loops
+            // in malformed environments. If we reach root, parent() returns None
+            // and we break out of the loop.
+            parent = parent.parent().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Dashboard directory not found. Traversed {} levels up from {:?}",
+                    depth,
+                    current_dir
+                )
+            })?;
+        }
 
-            // Flush to ensure immediate delivery
-            let _ = stdout.flush();
+        found_path.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Dashboard directory not found. Please ensure you're in the LeIndex repository or run from the installed location."
+            )
+        })?
+    };
+
+    // Check if bun is installed
+    let bun_exists = Command::new("bun")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if !bun_exists {
+        anyhow::bail!(
+            "Bun is required to run the dashboard. Please install it first:\n  curl -fsSL https://bun.sh/install | bash"
+        );
+    }
+
+    println!("\nLeIndex Dashboard\n");
+    println!("Starting dashboard server...\n");
+
+    if prod {
+        // Build for production
+        println!("Building dashboard for production...");
+        let build_status = Command::new("bun")
+            .current_dir(&dashboard_path)
+            .arg("run")
+            .arg("build")
+            .status()
+            .context("Failed to build dashboard")?;
+
+        if !build_status.success() {
+            anyhow::bail!("Dashboard build failed");
+        }
+
+        println!("\nDashboard built successfully!");
+        println!("Built files: {}/dist", dashboard_path.display());
+        println!("\nTo serve the production build, use:");
+        println!("  cd {} && bun run preview", dashboard_path.display());
+    } else {
+        // Start dev server
+        println!("Dashboard will be available at: http://localhost:{}", port);
+        println!("Press Ctrl+C to stop the server\n");
+
+        let status = Command::new("bun")
+            .current_dir(&dashboard_path)
+            .arg("run")
+            .arg("dev")
+            .status()
+            .context("Failed to start dashboard")?;
+
+        if !status.success() {
+            anyhow::bail!("Dashboard server exited with error");
         }
     }
 
@@ -726,7 +837,7 @@ async fn handle_mcp_request(
     use crate::mcp::server::{handle_tool_call, list_tools_json, HANDLERS, SERVER_STATE};
 
     let method_name = request.method.clone();
-    let id = request.id.clone();
+    let id = request.id.clone().unwrap_or(serde_json::Value::Null);
 
     // Get the global state and handlers
     let state = SERVER_STATE
@@ -830,6 +941,42 @@ mod tests {
                 assert_eq!(mode, "ultra");
             }
             _ => panic!("Expected Phase command"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_command_parsing() {
+        let cli = Cli::try_parse_from(["leindex", "dashboard"]).unwrap();
+        match cli.command {
+            Some(Commands::Dashboard { port, prod }) => {
+                assert_eq!(port, 5173);
+                assert!(!prod);
+            }
+            _ => panic!("Expected Dashboard command"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_command_with_port() {
+        let cli = Cli::try_parse_from(["leindex", "dashboard", "--port", "3000"]).unwrap();
+        match cli.command {
+            Some(Commands::Dashboard { port, prod }) => {
+                assert_eq!(port, 3000);
+                assert!(!prod);
+            }
+            _ => panic!("Expected Dashboard command"),
+        }
+    }
+
+    #[test]
+    fn test_dashboard_command_prod() {
+        let cli = Cli::try_parse_from(["leindex", "dashboard", "--prod"]).unwrap();
+        match cli.command {
+            Some(Commands::Dashboard { port, prod }) => {
+                assert_eq!(port, 5173);
+                assert!(prod);
+            }
+            _ => panic!("Expected Dashboard command"),
         }
     }
 }

@@ -17,12 +17,101 @@
 
 ## Features
 
+**LeIndex** is a **pure Rust** implementation of an intelligent code search and analysis engine. It combines zero-copy parsing, semantic understanding, and efficient storage to help you navigate and understand large codebases.
+
+### Key Features
+
+- **Zero-Copy AST Extraction** - Tree-sitter based parsing with 12 language support
+- **Program Dependence Graph (PDG)** - Advanced code relationship analysis with gravity-based traversal
+- **HNSW Vector Search** - Production-scale semantic similarity search with natural language queries
+- **Natural Language Queries** - Intent-aware search (HowWorks, WhereHandled, Bottlenecks, Semantic, Text)
+- **MCP Server** - First-class Model Context Protocol support for AI assistants
+- **Memory Efficient** - Smart cache management with RSS monitoring, spilling, reloading, and warming
+- **INT8 Quantization** - 74% memory reduction for vector storage with SIMD-optimized distance computation
+- **Cross-Project Intelligence** - Global symbol table for multi-project resolution
+- **Pure Rust CLI** - Five commands: index, search, analyze, diagnostics, serve
+
+---
+
+## Architecture
+
+LeIndex consists of 5 production-ready Rust crates:
+
+| Crate | Purpose | Status | Tests |
+|-------|---------|--------|-------|
+| **leparse** | Zero-copy AST extraction | ✅ Production Ready | 97/97 |
+| **legraphe** | PDG analysis with gravity traversal | ✅ Production Ready | 38/38 |
+| **lerecherche** | HNSW semantic search with NL queries | ✅ Production Ready | 87/87 |
+| **lestockage** | SQLite storage + cross-project | ✅ Production Ready | 45/45 |
+| **lepasserelle** | CLI & MCP server | ✅ Production Ready | 72/72 |
+| **Total** | | | **339/339** |
+
+### Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────────┐
+│                              LeIndex v0.1.0 Architecture                                │
+├─────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                         │
+│             ┌──────────────────────┐  ┌──────────────────────┐                          │
+│             │     CLI Commands     │  │     MCP Server       │                          │
+│             │  index, search,      │  │    JSON-RPC 2.0      │                          │
+│             │  analyze, diag, serve│  │   (axum HTTP)        │                          │
+│             └──────────┬───────────┘  └──────────┬───────────┘                          │
+│                        │                         │                                      │
+│                        └────────────┬────────────┘                                      │
+│                                     ▼                                                   │
+│        ┌────────────────────────────────────────────────────────────────┐               │
+│        │                  LeIndex Orchestration                         │               │
+│        │              (lepasserelle - 675 lines)                        │               │
+│        │  • Project indexing • Search • Analysis • Diagnostics          │               │
+│        │  • Cache spilling/reloading/warming • Memory monitoring        │               │
+│        └─────┬────────┬───────────┬───────────┬─────────────┬───────────┘               │
+│              │        │           │           │             │                           │
+│        ┌─────▼───┐ ┌──▼─────┐ ┌───▼────┐ ┌────▼────┐ ┌──────▼──────┐                    │
+│        │ leparse │ │legraphe│ │lerech  │ │lestock  │ │   Cache     │                    │
+│        │         │ │        │ │ erche  │ │ age     │ │ Management  │                    │
+│        │12 langs │ │  PDG   │ │ HNSW   │ │ SQLite  │ │ RSS Monitor │                    │
+│        │zero-copy│ │gravity │ │ NL Q   │ │ global  │ │ Spill/Reload│                    │
+│        │ tree-   │ │traverse│ │INT8    │ │ symbols │ │ 4 Warm Strat│                    │
+│        │ sitter  │ │ embed  │ │quantize│ │ PDG     │ │             │                    │
+│        └─────────┘ └────────┘ └────────┘ └─────────┘ └─────────────┘                    │
+│  Technologies:                                                                          │
+│  • Parsing: tree-sitter (12 langs) • Rayon parallel processing                          │
+│  • Graph: petgraph StableGraph • Gravity traversal w/ priority queue                    │
+│  • Search: HNSW (hnsw-rs) • Cosine similarity • NL query parser                         │
+│  • Storage: SQLite + BLAKE3 hashing • Vector embeddings • Cross-project global symbols  │
+│  • Server: axum + tokio • JSON-RPC 2.0 protocol                                         │
+│                                                                                         │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Language Support
+
+| Language | Parser | Status |
+|----------|--------|--------|
+| Python | tree-sitter-python | ✅ Working |
+| Rust | tree-sitter-rust | ✅ Working |
+| JavaScript | tree-sitter-javascript | ✅ Working |
+| TypeScript | tree-sitter-typescript | ✅ Working |
+| Go | tree-sitter-go | ✅ Working |
+| Java | tree-sitter-java | ✅ Working |
+| C++ | tree-sitter-cpp | ✅ Working |
+| C# | tree-sitter-c-sharp | ✅ Working |
+| Ruby | tree-sitter-ruby | ✅ Working |
+| PHP | tree-sitter-php | ✅ Working |
+| Lua | tree-sitter-lua | ✅ Working |
+| Scala | tree-sitter-scala | ✅ Working |
+
+---
+=======
 - **Zero-Copy AST** — Tree-sitter parsing for 12 languages (Python, Rust, JS, TS, Go, Java, C++, C#, Ruby, PHP, Lua, Scala)
 - **Semantic Search** — HNSW vector search with natural language queries
 - **PDG Analysis** — Program Dependence Graph with gravity-based traversal
 - **MCP Server** — First-class Model Context Protocol for AI assistants
 - **Smart Caching** — RSS monitoring, automatic spilling, and warming strategies
 - **Cross-Project** — Global symbol table for multi-project resolution
+>>>>>>> origin/master
 
 ## Quick Start
 
@@ -180,6 +269,39 @@ leindex/
 | Search P95 latency | <100ms | ✅ |
 | Memory per node | 32 bytes | ✅ |
 | Tests | 339/339 | ✅ 100% |
+
+## Roadmap
+
+### Completed ✅
+
+- [x] Zero-copy AST extraction with 12 languages
+- [x] PDG construction with gravity-based traversal
+- [x] HNSW vector index for semantic search
+- [x] Natural language query processing
+- [x] Cross-project symbol resolution
+- [x] JSON-RPC 2.0 MCP server
+- [x] Cache management (spill/reload/warm)
+- [x] INT8 quantization for vector storage
+
+
+### v0.2.0 (Planned)
+
+- [ ] Project configuration (TOML/JSON)
+- [ ] Detailed error reporting and recovery
+
+---
+
+## Contributing
+
+We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+Areas where help is especially appreciated:
+- Additional language parsers
+- Performance optimizations
+- Documentation improvements
+- Bug fixes
+
+---
 
 ## License
 

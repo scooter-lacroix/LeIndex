@@ -1,0 +1,11 @@
+{
+  "mcp": {
+    "leindex": {
+      "command": [
+        "leindex",
+        "mcp"
+      ],
+      "type": "local"
+    }
+  }
+}

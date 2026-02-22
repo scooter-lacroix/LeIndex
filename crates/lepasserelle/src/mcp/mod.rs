@@ -31,7 +31,10 @@ pub mod server;
 /// SSE streaming support for indexing progress.
 pub mod sse;
 
-pub use protocol::{error_codes, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+pub use protocol::{
+    error_codes, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
+    JsonRpcResponse, NotificationType,
+};
 pub use server::{McpServer, McpServerConfig};
 
 /// MCP server version

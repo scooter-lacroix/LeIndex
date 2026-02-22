@@ -15,6 +15,8 @@ pub mod ranking;
 pub mod search;
 /// Semantic analysis and embedding generation.
 pub mod semantic;
+/// INT8 Quantization system.
+pub mod quantization;
 /// Vector storage and indexing.
 pub mod vector;
 

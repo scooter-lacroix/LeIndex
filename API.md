@@ -552,6 +552,12 @@ embeddings:
   model: nomic-ai/CodeRankEmbed
   device: cpu  # cpu or cuda
   batch_size: 32
+
+# Vector quantization settings (Rust implementation)
+quantization:
+  enabled: true              # Enable INT8 quantization (~74% memory reduction)
+  simd: auto                 # SIMD implementation: auto, avx2, fallback
+  metric: cosine             # Distance metric: cosine, l2, dot
 ```
 
 ### Environment Variables
