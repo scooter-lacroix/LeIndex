@@ -51,6 +51,26 @@ This reads JSON-RPC from stdin and writes responses to stdout, with logs to stde
 
 ---
 
+## Tool Comparison vs Standard Tools
+
+LeIndex tools are designed to **replace or supersede** standard Claude Code tools for
+code navigation tasks. The table below shows the token efficiency advantage:
+
+| Task | Standard Tools | Tokens | LeIndex Tool | Tokens | Savings |
+|------|---------------|-------:|--------------|-------:|--------:|
+| Understand a file | `Read` (full file) | ~2 000 | `leindex_file_summary` | ~380 | **81%** |
+| Find all callers | `Grep` + 3×`Read` | ~5 800 | `leindex_symbol_lookup` | ~420 | **93%** |
+| Navigate project | `Glob` + 5×`Read` | ~8 500 | `leindex_project_map` | ~650 | **92%** |
+| Find symbol uses | `Grep` | ~1 200 | `leindex_grep_symbols` | ~310 | **74%** |
+| Read a function | `Read` (full file) | ~1 800 | `leindex_read_symbol` | ~220 | **88%** |
+| Preview a rename | N/A | ∞ | `leindex_edit_preview` | ~280 | **New** |
+| Cross-file rename | `Grep` + N×`Edit` | ~12 000 | `leindex_rename_symbol` | ~340 | **97%** |
+| Change impact | N/A | ∞ | `leindex_impact_analysis` | ~260 | **New** |
+
+> See [TOOL_SUPREMACY_BENCHMARKS.md](TOOL_SUPREMACY_BENCHMARKS.md) for detailed analysis.
+
+---
+
 ## Available Tools
 
 ### `leindex_index`
@@ -469,6 +489,348 @@ Compatibility alias for `leindex_phase_analysis`. Identical functionality with s
 
 ---
 
+## Phase C Tools — Read/Grep/Glob Replacements
+
+These tools provide **structural awareness** and **cross-file dependency information**
+that standard tools cannot provide. Each tool's response is self-contained — no
+follow-up `Read` calls needed.
+
+### `leindex_file_summary`
+
+Structural analysis of a file: all symbols, signatures, complexity scores,
+cross-file deps/dependents, and module role. **5-10x more token efficient than Read.**
+
+**Parameters:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "file_path": { "type": "string", "description": "Absolute path to the file" },
+    "token_budget": { "type": "integer", "default": 1000 },
+    "include_source": { "type": "boolean", "default": false },
+    "focus_symbol": { "type": "string" }
+  },
+  "required": ["file_path"]
+}
+```
+
+**Example:**
+
+```json
+{
+  "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+  "params": {
+    "name": "leindex_file_summary",
+    "arguments": { "file_path": "/project/src/auth.rs", "token_budget": 800 }
+  }
+}
+```
+
+**Response includes:** `file_path`, `language`, `line_count`, `symbols` (name, type, line_range, complexity, dependencies, dependents), `module_role`.
+
+---
+
+### `leindex_symbol_lookup`
+
+Look up a symbol and get its full structural context: definition, signature, callers,
+callees, data dependencies, and impact radius. **Replaces Grep + multiple Read calls.**
+
+**Parameters:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "symbol": { "type": "string", "description": "Symbol name to look up" },
+    "token_budget": { "type": "integer", "default": 1500 },
+    "include_source": { "type": "boolean", "default": false },
+    "include_callers": { "type": "boolean", "default": true },
+    "include_callees": { "type": "boolean", "default": true },
+    "depth": { "type": "integer", "default": 2, "minimum": 1, "maximum": 5 }
+  },
+  "required": ["symbol"]
+}
+```
+
+**Example:**
+
+```json
+{
+  "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+  "params": {
+    "name": "leindex_symbol_lookup",
+    "arguments": { "symbol": "handle_request", "include_callers": true }
+  }
+}
+```
+
+**Response includes:** `symbol`, `file`, `line_range`, `node_type`, `callers`, `callees`, `impact_radius`, `data_dependencies`.
+
+---
+
+### `leindex_project_map`
+
+Annotated project structure map: files, directories, symbol counts, complexity
+hotspots, and inter-module dependency arrows. **Replaces Glob + directory reads.**
+
+**Parameters:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "path": { "type": "string", "description": "Subdirectory to scope to (default: project root)" },
+    "depth": { "type": "integer", "default": 3, "minimum": 1, "maximum": 10 },
+    "token_budget": { "type": "integer", "default": 2000 },
+    "sort_by": { "type": "string", "enum": ["complexity", "name", "dependencies", "size"], "default": "complexity" },
+    "include_symbols": { "type": "boolean", "default": false }
+  }
+}
+```
+
+**Example:**
+
+```json
+{
+  "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+  "params": {
+    "name": "leindex_project_map",
+    "arguments": { "depth": 3, "sort_by": "complexity" }
+  }
+}
+```
+
+**Response includes:** Nested directory/file tree with `symbol_count`, `complexity`, `language`, `dependencies_out`, `dependencies_in` per file.
+
+---
+
+### `leindex_grep_symbols`
+
+Search for symbols across the indexed codebase with structural awareness. Unlike
+text-based grep, results include symbol type and dependency graph role.
+
+**Parameters:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "pattern": { "type": "string", "description": "Symbol name, substring, or query" },
+    "scope": { "type": "string", "description": "Limit to file/directory path" },
+    "type_filter": { "type": "string", "enum": ["function", "class", "method", "variable", "module", "all"], "default": "all" },
+    "token_budget": { "type": "integer", "default": 1500 },
+    "max_results": { "type": "integer", "default": 20, "minimum": 1, "maximum": 100 }
+  },
+  "required": ["pattern"]
+}
+```
+
+**Example:**
+
+```json
+{
+  "jsonrpc": "2.0", "id": 13, "method": "tools/call",
+  "params": {
+    "name": "leindex_grep_symbols",
+    "arguments": { "pattern": "auth", "type_filter": "function", "max_results": 10 }
+  }
+}
+```
+
+**Response includes:** Array of matches with `name`, `file`, `line_range`, `node_type`, `complexity`.
+
+---
+
+### `leindex_read_symbol`
+
+Read the source code of a specific symbol with its doc comment and dependency
+signatures. **Reads exactly what you need — supersedes targeted Read.**
+
+**Parameters:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "symbol": { "type": "string", "description": "Symbol to read source for" },
+    "file_path": { "type": "string", "description": "Disambiguate when symbol exists in multiple files" },
+    "include_dependencies": { "type": "boolean", "default": true },
+    "token_budget": { "type": "integer", "default": 2000 }
+  },
+  "required": ["symbol"]
+}
+```
+
+**Example:**
+
+```json
+{
+  "jsonrpc": "2.0", "id": 14, "method": "tools/call",
+  "params": {
+    "name": "leindex_read_symbol",
+    "arguments": { "symbol": "IndexHandler", "include_dependencies": true }
+  }
+}
+```
+
+**Response includes:** `symbol`, `file`, `source` (exact byte-range content), `doc_comment`, `dependency_signatures`.
+
+---
+
+## Phase D Tools — Context-Aware Editing
+
+These tools provide **safe, impact-aware code editing** with no equivalent in standard
+Claude Code tools. Always preview before applying.
+
+### `leindex_edit_preview`
+
+Preview a code edit: unified diff, affected symbols/files, breaking changes, and risk
+level — all before touching the filesystem. **No equivalent in standard tools.**
+
+**Parameters:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "file_path": { "type": "string", "description": "Absolute path to the file to edit" },
+    "changes": {
+      "type": "array",
+      "description": "List of changes. Each has 'type' (replace_text/rename_symbol) and type-specific fields.",
+      "items": { "type": "object" }
+    }
+  },
+  "required": ["file_path", "changes"]
+}
+```
+
+**Change types:**
+- `replace_text`: `{ "type": "replace_text", "old_text": "...", "new_text": "...", "start_byte": 100, "end_byte": 150 }`
+- `rename_symbol`: `{ "type": "rename_symbol", "old_name": "OldName", "new_name": "NewName" }`
+
+**Example:**
+
+```json
+{
+  "jsonrpc": "2.0", "id": 15, "method": "tools/call",
+  "params": {
+    "name": "leindex_edit_preview",
+    "arguments": {
+      "file_path": "/project/src/auth.rs",
+      "changes": [{ "type": "rename_symbol", "old_name": "authenticate", "new_name": "verify_identity" }]
+    }
+  }
+}
+```
+
+**Response includes:** `diff` (unified diff), `affected_symbols`, `affected_files`, `breaking_changes`, `risk_level` (low/medium/high), `change_count`.
+
+---
+
+### `leindex_edit_apply`
+
+Apply code edits to files. Use `dry_run=true` to get a preview without modifying files.
+**Always run `leindex_edit_preview` first.**
+
+**Parameters:** Same as `leindex_edit_preview` plus:
+- `dry_run` (boolean, default `false`): If true, return preview without modifying files.
+
+**Example:**
+
+```json
+{
+  "jsonrpc": "2.0", "id": 16, "method": "tools/call",
+  "params": {
+    "name": "leindex_edit_apply",
+    "arguments": {
+      "file_path": "/project/src/auth.rs",
+      "changes": [{ "type": "replace_text", "old_text": "foo", "new_text": "bar" }],
+      "dry_run": false
+    }
+  }
+}
+```
+
+**Response includes:** `success`, `changes_applied`, `files_modified`.
+
+---
+
+### `leindex_rename_symbol`
+
+Rename a symbol across all files using PDG to find all reference sites. Generates a
+unified multi-file diff. **Replaces manual Grep + multi-file Edit.**
+
+**Parameters:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "old_name": { "type": "string", "description": "Current symbol name" },
+    "new_name": { "type": "string", "description": "New symbol name" },
+    "scope": { "type": "string", "description": "Limit rename to a file or directory path" },
+    "preview_only": { "type": "boolean", "default": true, "description": "Return diff without applying (safety default)" }
+  },
+  "required": ["old_name", "new_name"]
+}
+```
+
+**Example:**
+
+```json
+{
+  "jsonrpc": "2.0", "id": 17, "method": "tools/call",
+  "params": {
+    "name": "leindex_rename_symbol",
+    "arguments": { "old_name": "UserData", "new_name": "UserProfile", "preview_only": true }
+  }
+}
+```
+
+**Response includes:** `old_name`, `new_name`, `files_affected`, `preview_only`, `diffs` (per-file), `applied`.
+
+---
+
+### `leindex_impact_analysis`
+
+Analyze the transitive impact of changing a symbol: all affected symbols/files at each
+dependency depth level with a risk assessment. **No equivalent in standard tools.**
+
+**Parameters:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "symbol": { "type": "string", "description": "Symbol to analyze impact for" },
+    "change_type": {
+      "type": "string",
+      "enum": ["modify", "remove", "rename", "change_signature"],
+      "default": "modify"
+    },
+    "depth": { "type": "integer", "default": 3, "minimum": 1, "maximum": 5 }
+  },
+  "required": ["symbol"]
+}
+```
+
+**Example:**
+
+```json
+{
+  "jsonrpc": "2.0", "id": 18, "method": "tools/call",
+  "params": {
+    "name": "leindex_impact_analysis",
+    "arguments": { "symbol": "StorageEngine", "change_type": "change_signature", "depth": 3 }
+  }
+}
+```
+
+**Response includes:** `symbol`, `file`, `change_type`, `direct_callers`, `transitive_affected_symbols`, `transitive_affected_files`, `risk_level` (low/medium/high), `summary`.
+
+---
+
 ## SSE Streaming
 
 For long-running indexing operations, use the SSE endpoint for real-time progress:
@@ -522,32 +884,9 @@ data: {"type":"complete","stage":"indexing","current":0,"total":0,"message":"Don
 
 ### Claude Code
 
-Add to your `.claude/settings.json`:
+**Recommended: stdio transport** (most reliable, subprocess-based):
 
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "leindex",
-      "args": ["mcp", "--stdio"]
-    }
-  }
-}
-```
-
-Or for HTTP mode:
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "url": "http://localhost:3000/mcp"
-    }
-  }
-}
-```
-
-**Project-specific configuration** (`.claude/settings.local.json`):
+Add to `~/.claude.json` (global, available in all projects):
 
 ```json
 {
@@ -555,6 +894,52 @@ Or for HTTP mode:
     "leindex": {
       "command": "leindex",
       "args": ["mcp", "--stdio"],
+      "type": "stdio"
+    }
+  }
+}
+```
+
+Or add to `.claude/settings.json` (project-local):
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp", "--stdio"],
+      "type": "stdio"
+    }
+  }
+}
+```
+
+**Note:** The `--stdio` flag is the recommended transport. It launches `leindex` as a
+subprocess, reads JSON-RPC from stdin, and writes responses to stdout. Each response is
+a single line of JSON (no double-newlines), which is required for the MCP protocol.
+
+**HTTP transport** (alternative, requires running `leindex serve` separately):
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "url": "http://localhost:3000/mcp",
+      "type": "http"
+    }
+  }
+}
+```
+
+**Project-specific override** (`.claude/settings.local.json`):
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp", "--stdio"],
+      "type": "stdio",
       "cwd": "/path/to/your/project"
     }
   }
