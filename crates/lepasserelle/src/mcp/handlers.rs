@@ -639,6 +639,10 @@ async fn execute_phase_analysis(
         None => base_project_root.clone(),
     };
 
+    // Keep a clone for the C.7 single-file deep-dive enrichment below.
+    let single_file_target: Option<PathBuf> =
+        if canonical_target.is_file() { Some(canonical_target.clone()) } else { None };
+
     let (root, focus_files) = if canonical_target.is_file() {
         let file_root = canonical_target
             .parent()
@@ -659,6 +663,90 @@ async fn execute_phase_analysis(
     let top_n = extract_usize(&args, "top_n", 10)?;
     let max_output_chars = extract_usize(&args, "max_chars", 12000)?;
 
+    // ── Single-file deep dive (Task C.7) ────────────────────────────────────
+    // When `path` is a file, augment the phase report with per-symbol PDG data:
+    // signature, line range, complexity, caller_count, cross-file deps.
+    let file_symbols_json: Option<Vec<serde_json::Value>> = if let Some(ref file_path) = single_file_target {
+        // Read the file for byte→line conversion (single file, cheap).
+        let file_content = std::fs::read_to_string(file_path).unwrap_or_default();
+
+        // Build line-start offsets for O(log N) byte→line lookups.
+        let mut line_starts = vec![0usize];
+        for (i, &b) in file_content.as_bytes().iter().enumerate() {
+            if b == b'\n' {
+                line_starts.push(i + 1);
+            }
+        }
+        let byte_to_line = |byte: usize| -> usize {
+            // Returns 1-indexed line number
+            line_starts.partition_point(|&s| s <= byte)
+        };
+
+        let file_path_str = file_path.to_string_lossy().to_string();
+        let reader = leindex.lock().await;
+        if let Some(pdg) = reader.pdg() {
+            let node_ids = pdg.nodes_in_file(&file_path_str);
+            let mut symbols: Vec<serde_json::Value> = node_ids
+                .iter()
+                .filter_map(|&node_idx| {
+                    let node = pdg.get_node(node_idx)?;
+                    let (start_byte, end_byte) = node.byte_range;
+                    let line_start = byte_to_line(start_byte);
+                    let line_end = byte_to_line(end_byte.saturating_sub(1));
+
+                    // Signature: first non-empty line at the node's byte offset.
+                    let signature: Option<String> = if start_byte < file_content.len() {
+                        file_content[start_byte..]
+                            .lines()
+                            .next()
+                            .map(|l| l.trim().to_string())
+                            .filter(|l| !l.is_empty() && !l.starts_with("// ["))
+                    } else {
+                        None
+                    };
+
+                    // Cross-file outgoing dependencies (calls/imports to other files).
+                    let cross_file_deps: Vec<serde_json::Value> = pdg
+                        .neighbors(node_idx)
+                        .iter()
+                        .filter_map(|&dep_idx| pdg.get_node(dep_idx))
+                        .filter(|dep| dep.file_path != node.file_path)
+                        .map(|dep| {
+                            serde_json::json!({
+                                "name": dep.name,
+                                "file": dep.file_path,
+                                "type": format!("{:?}", dep.node_type).to_lowercase(),
+                            })
+                        })
+                        .collect();
+
+                    let symbol_type = format!("{:?}", node.node_type).to_lowercase();
+
+                    Some(serde_json::json!({
+                        "name": node.name,
+                        "symbol_type": symbol_type,
+                        "signature": signature,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "complexity": node.complexity,
+                        "caller_count": pdg.predecessor_count(node_idx),
+                        "dependency_count": pdg.neighbors(node_idx).len(),
+                        "cross_file_deps": cross_file_deps,
+                    }))
+                })
+                .collect();
+
+            // Sort by line_start so the LLM reads top-to-bottom.
+            symbols.sort_by_key(|s| s["line_start"].as_u64().unwrap_or(0));
+            Some(symbols)
+        } else {
+            // PDG not available (project not yet indexed) — skip enrichment.
+            None
+        }
+    } else {
+        None
+    };
+
     let options = PhaseOptions {
         root,
         focus_files,
@@ -678,8 +766,17 @@ async fn execute_phase_analysis(
         .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))?
         .map_err(|e| JsonRpcError::internal_error(format!("Phase analysis failed: {}", e)))?;
 
-    serde_json::to_value(report)
-        .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
+    let mut report_value = serde_json::to_value(report)
+        .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?;
+
+    // Merge per-symbol data into the response when available.
+    if let Some(symbols) = file_symbols_json {
+        if let serde_json::Value::Object(ref mut map) = report_value {
+            map.insert("file_symbols".to_string(), serde_json::json!(symbols));
+        }
+    }
+
+    Ok(report_value)
 }
 
 /// Handler for leindex_diagnostics
