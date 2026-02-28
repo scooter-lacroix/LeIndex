@@ -541,9 +541,10 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
 /// This mode allows AI tools to start LeIndex as a subprocess for automatic integration
 async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     use crate::mcp::handlers::{
-        ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, FileSummaryHandler,
-        GrepSymbolsHandler, IndexHandler, PhaseAnalysisAliasHandler, PhaseAnalysisHandler,
-        ProjectMapHandler, ReadSymbolHandler, SearchHandler, SymbolLookupHandler,
+        ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, EditApplyHandler,
+        EditPreviewHandler, FileSummaryHandler, GrepSymbolsHandler, ImpactAnalysisHandler,
+        IndexHandler, PhaseAnalysisAliasHandler, PhaseAnalysisHandler, ProjectMapHandler,
+        ReadSymbolHandler, RenameSymbolHandler, SearchHandler, SymbolLookupHandler,
     };
     use crate::mcp::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
     use std::io::{self, BufRead, Read, Write};
@@ -583,6 +584,11 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         crate::mcp::handlers::ToolHandler::ProjectMap(ProjectMapHandler),
         crate::mcp::handlers::ToolHandler::GrepSymbols(GrepSymbolsHandler),
         crate::mcp::handlers::ToolHandler::ReadSymbol(ReadSymbolHandler),
+        // Phase D: Context-Aware Editing
+        crate::mcp::handlers::ToolHandler::EditPreview(EditPreviewHandler),
+        crate::mcp::handlers::ToolHandler::EditApply(EditApplyHandler),
+        crate::mcp::handlers::ToolHandler::RenameSymbol(RenameSymbolHandler),
+        crate::mcp::handlers::ToolHandler::ImpactAnalysis(ImpactAnalysisHandler),
     ]);
 
     eprintln!("[INFO] LeIndex MCP stdio server starting");

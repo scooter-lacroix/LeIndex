@@ -4,9 +4,10 @@
 // using axum for HTTP handling.
 
 use super::handlers::{
-    ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, FileSummaryHandler,
-    GrepSymbolsHandler, IndexHandler, PhaseAnalysisAliasHandler, PhaseAnalysisHandler,
-    ProjectMapHandler, ReadSymbolHandler, SearchHandler, SymbolLookupHandler, ToolHandler,
+    ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, EditApplyHandler, EditPreviewHandler,
+    FileSummaryHandler, GrepSymbolsHandler, ImpactAnalysisHandler, IndexHandler,
+    PhaseAnalysisAliasHandler, PhaseAnalysisHandler, ProjectMapHandler, ReadSymbolHandler,
+    RenameSymbolHandler, SearchHandler, SymbolLookupHandler, ToolHandler,
 };
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::leindex::LeIndex;
@@ -105,6 +106,11 @@ impl McpServer {
             ToolHandler::ProjectMap(ProjectMapHandler),
             ToolHandler::GrepSymbols(GrepSymbolsHandler),
             ToolHandler::ReadSymbol(ReadSymbolHandler),
+            // Phase D: Context-Aware Editing
+            ToolHandler::EditPreview(EditPreviewHandler),
+            ToolHandler::EditApply(EditApplyHandler),
+            ToolHandler::RenameSymbol(RenameSymbolHandler),
+            ToolHandler::ImpactAnalysis(ImpactAnalysisHandler),
         ];
         HANDLERS
             .set(handlers)
