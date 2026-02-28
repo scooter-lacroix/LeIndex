@@ -659,7 +659,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
                         response.len(),
                         response
                     );
-                } else if writeln!(stdout, "{}\n", response).is_err() {
+                } else if writeln!(stdout, "{}", response).is_err() {
                     break;
                 }
                 let _ = stdout.flush();
@@ -705,7 +705,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
                     eprintln!("[ERROR] Failed to write to stdout");
                     break;
                 }
-            } else if writeln!(stdout, "{}\n", response_json).is_err() {
+            } else if writeln!(stdout, "{}", response_json).is_err() {
                 eprintln!("[ERROR] Failed to write to stdout");
                 break;
             }
