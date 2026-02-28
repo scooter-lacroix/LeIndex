@@ -290,3 +290,37 @@ This file tracks all major tracks for the project. Each track has its own detail
 5. [x] `levalidation_20260213` - Edit Validation ✅
 
 **Total Test Coverage:** ~115 tests passing across all crates
+
+---
+
+## [~] Track: MCP Fix & LeIndex Tool Supremacy
+*Link: [./maestro/tracks/mcp_fix_tool_supremacy_20260227/](./maestro/tracks/mcp_fix_tool_supremacy_20260227/)*
+
+**Description:** Fix MCP stdio double-newline injection bug and placeholder hash embeddings, then expand LeIndex MCP tool surface to completely replace glob/grep/read/edit tools — making LeIndex the preferred toolset for LLM code navigation, understanding, and editing.
+
+**Status:** NEW
+
+**Created:** 2026-02-27
+
+**Type:** Standard Track (Bug Fix + Feature Expansion)
+
+**Parent Track:** `lepasserelle_20250125`
+
+**Phases:**
+1. Phase A: MCP Stdio Transport Fix (2 tasks)
+2. Phase B: Semantic Embedding Fix (2 tasks)
+3. Phase C: Read/Grep/Glob Replacement — 5 new tools + 2 enhancements (8 tasks)
+4. Phase D: Context-Aware Editing — 4 new tools + leedit core (6 tasks)
+5. Phase E: Integration Testing & Tool Description Polish (4 tasks)
+
+**Total Tasks:** 22 + 5 Maestro verification gates
+
+**Key Deliverables:**
+- MCP stdio connection fix (2-char change × 2 lines)
+- TF-IDF semantic embedding system replacing placeholder hash
+- 5 new MCP tools: `leindex_file_summary`, `leindex_symbol_lookup`, `leindex_project_map`, `leindex_grep_symbols`, `leindex_read_symbol`
+- 4 new edit MCP tools: `leindex_edit_preview`, `leindex_edit_apply`, `leindex_rename_symbol`, `leindex_impact_analysis`
+- Enhanced `leindex_search` with signatures, doc summaries, caller counts
+- Enhanced `leindex_phase_analysis` single-file deep dive
+- `leedit` crate placeholder implementations completed
+- Token efficiency benchmarks showing 5-10x improvement over standard tools
