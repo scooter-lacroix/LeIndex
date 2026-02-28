@@ -204,25 +204,30 @@ impl EditEngine {
     /// Preview an edit without applying it
     pub async fn preview_edit(&self, request: &EditRequest) -> Result<EditPreview> {
         // Read the original content
-        let _content = self.read_file_content(&request.file_path).await?;
+        let original = self.read_file_content(&request.file_path).await?;
 
-        // Generate diff for each change
-        let mut diff_output = String::new();
-        let affected_files = vec![request.file_path.clone()];
-
-        for (idx, _change) in request.changes.iter().enumerate() {
-            let change_diff = self.generate_diff(idx)?;
-            diff_output.push_str(&change_diff);
-            diff_output.push('\n');
+        // Apply each change to produce modified content, then generate diff
+        let mut modified = original.clone();
+        for change in &request.changes {
+            modified = self.apply_change_to_string(&modified, change)?;
         }
+
+        let diff = self.generate_diff(&original, &modified, &request.file_path)?;
 
         // Analyze impact using PDG
         let impact = self.analyze_impact(request).await?;
+        let affected_files = impact.affected_files.clone();
+        let mut all_files = vec![request.file_path.clone()];
+        for f in affected_files {
+            if !all_files.contains(&f) {
+                all_files.push(f);
+            }
+        }
 
         Ok(EditPreview {
-            diff: diff_output,
+            diff,
             impact,
-            files_affected: affected_files,
+            files_affected: all_files,
         })
     }
 
@@ -281,50 +286,122 @@ impl EditEngine {
         })
     }
 
-    /// Generate diff for a change
-    fn generate_diff(&self, idx: usize) -> Result<String> {
-        // For now, return a simple placeholder
-        // In a full implementation, this would use diffy or similar
-        Ok(format!("--- Change {} ---\n", idx))
+    /// Generate a unified diff between original and modified content.
+    pub fn generate_diff(&self, original: &str, modified: &str, file_path: &Path) -> Result<String> {
+        let patch = diffy::create_patch(original, modified);
+        // Prepend file path header for clarity
+        let patch_str = patch.to_string();
+        if patch_str.is_empty() {
+            Ok(format!("--- {}\n+++ {}\n(no changes)\n", file_path.display(), file_path.display()))
+        } else {
+            Ok(format!("--- {}\n+++ {}\n{}", file_path.display(), file_path.display(), patch_str))
+        }
     }
 
-    /// Analyze impact of an edit
+    /// Apply a single EditChange to a string in memory, returning the modified string.
+    ///
+    /// Used by `preview_edit` to compute the diff without touching the filesystem.
+    fn apply_change_to_string(&self, content: &str, change: &EditChange) -> Result<String> {
+        match change {
+            EditChange::ReplaceText { start, end, new_text } => {
+                let bytes = content.as_bytes();
+                let start_idx = (*start).min(bytes.len());
+                let end_idx = (*end).min(bytes.len());
+                if start_idx > end_idx {
+                    return Err(EditError::InvalidRange {
+                        start: *start,
+                        end: *end,
+                        file: PathBuf::from("(in-memory)"),
+                    });
+                }
+                let result = format!(
+                    "{}{}{}",
+                    &content[..start_idx],
+                    new_text,
+                    &content[end_idx..]
+                );
+                Ok(result)
+            }
+            EditChange::RenameSymbol { old_name, new_name } => {
+                // Simple text replacement within the given content
+                Ok(content.replace(old_name.as_str(), new_name.as_str()))
+            }
+            EditChange::ExtractFunction { .. } | EditChange::InlineVariable { .. } => {
+                // AST-level changes are complex; return content unchanged for preview
+                Ok(content.to_owned())
+            }
+        }
+    }
+
+    /// Analyze impact of an edit using forward PDG traversal.
     async fn analyze_impact(&self, request: &EditRequest) -> Result<ImpactAnalysis> {
-        let mut affected_nodes = Vec::new();
-        let affected_files = vec![request.file_path.clone()];
+        let mut affected_nodes: Vec<String> = Vec::new();
+        let mut affected_files: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        affected_files.insert(request.file_path.clone());
         let mut breaking_changes = Vec::new();
 
         // Check each change for impact
         for change in &request.changes {
             match change {
                 EditChange::RenameSymbol { old_name, new_name: _ } => {
-                    // Find all references in PDG
-                    if let Some(_node) = self.pdg.find_by_symbol(old_name) {
+                    if let Some(node_id) = self.pdg.find_by_symbol(old_name) {
                         affected_nodes.push(old_name.clone());
+                        // Forward impact: all nodes reachable from this one
+                        let forward = self.pdg.get_forward_impact(node_id);
+                        for dep_id in forward {
+                            if let Some(dep_node) = self.pdg.get_node(dep_id) {
+                                affected_nodes.push(dep_node.name.clone());
+                                affected_files.insert(PathBuf::from(&dep_node.file_path));
+                            }
+                        }
+                        // Backward impact: callers that reference this symbol (rename risk)
+                        let backward = self.pdg.get_backward_impact(node_id);
+                        if !backward.is_empty() {
+                            breaking_changes.push(format!(
+                                "Renaming '{}' may break {} caller(s)",
+                                old_name, backward.len()
+                            ));
+                            for bid in backward {
+                                if let Some(bn) = self.pdg.get_node(bid) {
+                                    affected_files.insert(PathBuf::from(&bn.file_path));
+                                }
+                            }
+                        }
                     } else {
-                        // Warn that symbol wasn't found
-                        breaking_changes.push(format!("Symbol '{}' not found in PDG", old_name));
+                        breaking_changes.push(format!("Symbol '{}' not found in PDG — rename may miss references", old_name));
                     }
                 }
                 EditChange::ReplaceText { .. } => {
-                    // Text replacement is low impact
+                    // Text replacement is low impact unless it touches a symbol boundary
                 }
-                EditChange::ExtractFunction { .. } => {
-                    // Extracting a function affects the current scope
+                EditChange::ExtractFunction { function_name, .. } => {
+                    breaking_changes.push(format!(
+                        "Extracting function '{}' — verify no name collision",
+                        function_name
+                    ));
                 }
                 EditChange::InlineVariable { variable_name } => {
-                    // Find variable references
-                    if let Some(_node) = self.pdg.find_by_symbol(variable_name) {
+                    if let Some(node_id) = self.pdg.find_by_symbol(variable_name) {
                         affected_nodes.push(variable_name.clone());
+                        let forward = self.pdg.get_forward_impact(node_id);
+                        for dep_id in forward {
+                            if let Some(dep_node) = self.pdg.get_node(dep_id) {
+                                affected_nodes.push(dep_node.name.clone());
+                                affected_files.insert(PathBuf::from(&dep_node.file_path));
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Calculate risk level
-        let risk_level = if affected_nodes.len() > 5 || affected_files.len() > 2 {
+        let affected_files_vec: Vec<PathBuf> = affected_files.into_iter().collect();
+
+        // Calculate risk level based on blast radius
+        let risk_level = if affected_nodes.len() > 5 || affected_files_vec.len() > 3 {
             RiskLevel::High
-        } else if affected_nodes.len() > 1 || affected_files.len() > 1 {
+        } else if affected_nodes.len() > 1 || affected_files_vec.len() > 1 {
             RiskLevel::Medium
         } else {
             RiskLevel::Low
@@ -332,32 +409,70 @@ impl EditEngine {
 
         Ok(ImpactAnalysis {
             affected_nodes,
-            affected_files,
+            affected_files: affected_files_vec,
             breaking_changes,
             risk_level,
         })
     }
 
-    /// Apply a single change
+    /// Apply a single change to a file in the worktree session's path.
     async fn apply_change(
         &self,
-        _session: &mut WorktreeSession,
-        _file_path: &Path,
-        _change: &EditChange,
+        session: &mut WorktreeSession,
+        file_path: &Path,
+        change: &EditChange,
     ) -> Result<bool> {
-        // Placeholder - in full implementation, this would:
-        // 1. Read file content
-        // 2. Parse with tree-sitter
-        // 3. Apply the change
-        // 4. Write back to worktree
+        // Resolve the file path within the worktree
+        let target_path = if file_path.is_absolute() {
+            // Use the worktree path as the base — map absolute path to worktree
+            let file_name = file_path.file_name().unwrap_or(file_path.as_os_str());
+            session.path().join(file_name)
+        } else {
+            session.path().join(file_path)
+        };
+
+        // Read current content (fall back to the original path if worktree copy not found)
+        let content = if target_path.exists() {
+            std::fs::read_to_string(&target_path).map_err(|e| {
+                EditError::Generic(format!("Failed to read {:?}: {}", target_path, e))
+            })?
+        } else if file_path.exists() {
+            std::fs::read_to_string(file_path).map_err(|e| {
+                EditError::Generic(format!("Failed to read {:?}: {}", file_path, e))
+            })?
+        } else {
+            return Err(EditError::FileNotFound(file_path.to_path_buf()));
+        };
+
+        let modified = self.apply_change_to_string(&content, change)?;
+
+        if modified == content {
+            return Ok(false); // No change
+        }
+
+        // Write modified content back
+        let write_path = if target_path.parent().map(|p| p.exists()).unwrap_or(false) {
+            target_path
+        } else {
+            file_path.to_path_buf()
+        };
+
+        std::fs::write(&write_path, modified.as_bytes()).map_err(|e| {
+            EditError::Generic(format!("Failed to write {:?}: {}", write_path, e))
+        })?;
+
         Ok(true)
     }
 
-    /// Read file content from storage
-    async fn read_file_content(&self, file_path: &Path) -> Result<String> {
-        // For now, return a placeholder
-        // In full implementation, this would read from storage
-        Ok(format!("// Content of {:?}\n", file_path))
+    /// Read file content from disk.
+    pub async fn read_file_content(&self, file_path: &Path) -> Result<String> {
+        std::fs::read_to_string(file_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                EditError::FileNotFound(file_path.to_path_buf())
+            } else {
+                EditError::Generic(format!("Failed to read {:?}: {}", file_path, e))
+            }
+        })
     }
 
     /// Undo last edit
@@ -1056,6 +1171,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_engine_preview_edit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("test.py");
+        std::fs::write(&file_path, b"hello world").expect("write test file");
+
         let pdg = Arc::new(create_test_pdg());
         let storage = Arc::new(make_test_storage());
         let engine = EditEngine::new(pdg, storage).unwrap();
@@ -1063,20 +1182,23 @@ mod tests {
         let project_id = make_test_id();
         let request = EditRequest {
             project_id,
-            file_path: PathBuf::from("test.py"),
+            file_path: file_path.clone(),
             changes: vec![EditChange::ReplaceText {
                 start: 0,
-                end: 10,
-                new_text: "new".to_string(),
+                end: 5,  // "hello"
+                new_text: "goodbye".to_string(),
             }],
             preview_only: true,
         };
 
         let result = engine.preview_edit(&request).await;
-        assert!(result.is_ok());
+        assert!(result.is_ok(), "preview_edit should succeed: {:?}", result.err());
         let preview = result.unwrap();
-        assert_eq!(preview.files_affected.len(), 1);
+        // The edited file is always in affected list
+        assert!(!preview.files_affected.is_empty());
         assert!(matches!(preview.impact.risk_level, RiskLevel::Low));
+        // Diff should contain some content
+        assert!(!preview.diff.is_empty());
     }
 
     #[tokio::test]
