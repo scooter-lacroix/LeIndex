@@ -199,10 +199,18 @@ fn test_tools_list_every_tool_has_description_and_schema() {
 
     for tool in tools {
         let name = tool["name"].as_str().unwrap_or("<unnamed>");
+        let desc = tool["description"].as_str().unwrap_or("");
         assert!(
-            tool["description"].as_str().map(|s| !s.is_empty()).unwrap_or(false),
+            !desc.is_empty(),
             "Tool '{}' has empty or missing description",
             name
+        );
+        assert!(
+            desc.len() <= 300,
+            "Tool '{}' description exceeds 300 chars ({} chars): {}",
+            name,
+            desc.len(),
+            desc
         );
         assert!(
             tool["inputSchema"].is_object(),

@@ -286,7 +286,7 @@ impl SearchHandler {
 
     /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
-        "Search indexed code using semantic search. Returns the most relevant code snippets matching your query."
+        "Semantic code search across the indexed project. Finds symbols by meaning even without exact name matches — supersedes Grep for concept-level discovery. Returns ranked results with file, line range, and context."
     }
 
     /// Returns the JSON schema for the arguments of this RPC method
@@ -350,7 +350,7 @@ impl DeepAnalyzeHandler {
 
     /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
-        "Perform deep code analysis with context expansion. Uses semantic search combined with Program Dependence Graph traversal to provide comprehensive understanding."
+        "Deep analysis combining semantic search with PDG traversal: definition, callers, callees, data flow, and impact radius. Supersedes Grep + multiple Read calls for understanding unfamiliar code without context loss."
     }
 
     /// Returns the JSON schema for the arguments of this RPC method
@@ -414,7 +414,7 @@ impl ContextHandler {
 
     /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
-        "Expand context around a specific code node using Program Dependence Graph traversal. Useful for understanding code relationships."
+        "Expand context around a code node via PDG: callers, callees, data dependencies, and sibling nodes. Supersedes Read for understanding how a function fits into its module without reading the entire file."
     }
 
     /// Returns the JSON schema for the arguments of this RPC method
@@ -787,11 +787,10 @@ impl FileSummaryHandler {
     pub fn name(&self) -> &str { "leindex_file_summary" }
 
     pub fn description(&self) -> &str {
-        "Get a comprehensive structural analysis of a file: all symbols with signatures, \
-complexity scores, cross-file dependencies and dependents, import/export maps, and \
-module role summary. Returns everything needed to understand a file without reading \
-its raw content — typically 5-10x more token efficient than Read. Includes cross-file \
-relationship information that Read cannot provide."
+        "Structural analysis of a file: all symbols, signatures, complexity scores, \
+cross-file deps/dependents, and module role. 5-10x more token efficient than Read — \
+returns what you need to understand a file without reading raw content. Includes \
+cross-file relationships that Read cannot provide."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -966,10 +965,9 @@ impl SymbolLookupHandler {
     pub fn name(&self) -> &str { "leindex_symbol_lookup" }
 
     pub fn description(&self) -> &str {
-        "Look up any symbol (function, class, method, variable) and get its full structural \
-context: definition location, signature, callers, callees, data dependencies, and impact \
-radius showing how many symbols and files would be affected by changes. Replaces Grep + \
-multiple Read calls with a single structured response."
+        "Look up a symbol and get its full structural context: definition, signature, callers, \
+callees, data dependencies, and impact radius. Replaces Grep + multiple Read calls with \
+a single structured response including cross-file relationships."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -1133,11 +1131,10 @@ impl ProjectMapHandler {
     pub fn name(&self) -> &str { "leindex_project_map" }
 
     pub fn description(&self) -> &str {
-        "Get an annotated project structure map showing files, directories, symbol counts, \
-complexity hotspots, and inter-module dependency arrows. Unlike Glob which returns flat \
-file lists, this shows the project's architecture — which modules depend on which, where \
-complexity lives, and what the entry points are. Typically 5x more token efficient than \
-Glob + directory reads."
+        "Annotated project structure map: files, directories, symbol counts, complexity \
+hotspots, and inter-module dependency arrows. Unlike Glob's flat file lists, shows \
+architecture — which modules depend on which and where complexity lives. 5x more \
+token efficient than Glob + directory reads."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -1289,10 +1286,9 @@ impl GrepSymbolsHandler {
     pub fn name(&self) -> &str { "leindex_grep_symbols" }
 
     pub fn description(&self) -> &str {
-        "Search for symbols and patterns across the indexed codebase with structural awareness. \
-Unlike text-based grep, results include each match's type (function/class/method), its role \
-in the dependency graph, and related symbols. Supports exact match, substring, and semantic \
-search. Supersedes Grep for symbol-oriented searches."
+        "Search for symbols across the indexed codebase with structural awareness. Unlike \
+text-based grep, results include each match's type (function/class/method) and its role \
+in the dependency graph. Supports exact match, substring, and semantic search."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -1441,10 +1437,9 @@ impl ReadSymbolHandler {
     pub fn name(&self) -> &str { "leindex_read_symbol" }
 
     pub fn description(&self) -> &str {
-        "Read the source code of a specific symbol along with its doc comment, signature, \
-and the signatures of its dependencies and dependents. Reads exactly what you need instead \
-of an entire file — far more token efficient for targeted understanding. Supersedes \
-targeted Read calls for symbol-level code review."
+        "Read the source code of a specific symbol with its doc comment and the signatures \
+of its dependencies and dependents. Reads exactly what you need — far more token efficient \
+than reading an entire file. Supersedes targeted Read."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -1712,10 +1707,9 @@ impl EditPreviewHandler {
     pub fn name(&self) -> &str { "leindex_edit_preview" }
 
     pub fn description(&self) -> &str {
-        "Preview the impact of a code edit before applying it: returns a unified diff, affected \
-symbols, affected files, potential breaking changes, and a risk level. Use this before \
-leindex_edit_apply to understand the blast radius of your change. Has no equivalent in \
-standard tools — provides cross-file dependency analysis for free."
+        "Preview a code edit: unified diff, affected symbols/files, breaking changes, and risk \
+level — all before touching the filesystem. No equivalent in standard tools. Run before \
+leindex_edit_apply to understand the blast radius of your change."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -1888,10 +1882,9 @@ impl RenameSymbolHandler {
     pub fn name(&self) -> &str { "leindex_rename_symbol" }
 
     pub fn description(&self) -> &str {
-        "Rename a symbol across all files that reference it, with preview mode enabled by default \
-for safety. Uses the PDG to find all reference sites, generates a unified multi-file diff, \
-and (when preview_only=false) applies all renames atomically. Replaces manual Grep + \
-multi-file Edit workflows with a single safe operation."
+        "Rename a symbol across all files using PDG to find all reference sites. Generates a \
+unified multi-file diff (preview_only=true by default for safety). Replaces manual \
+Grep + multi-file Edit with a single atomic operation."
     }
 
     pub fn argument_schema(&self) -> Value {
