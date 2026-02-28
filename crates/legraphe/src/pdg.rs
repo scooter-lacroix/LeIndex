@@ -355,9 +355,30 @@ impl ProgramDependenceGraph {
         self.graph.edge_endpoints(edge_id)
     }
 
-    /// Get neighbors of a node (outgoing)
+    /// Get neighbors of a node (outgoing edges)
     pub fn neighbors(&self, node_id: NodeId) -> Vec<NodeId> {
         self.graph.neighbors(node_id).collect()
+    }
+
+    /// Count incoming edges (predecessors) of a node.
+    ///
+    /// This counts all nodes that have a directed edge pointing TO `node_id`,
+    /// i.e., the number of direct callers / dependents.
+    pub fn predecessor_count(&self, node_id: NodeId) -> usize {
+        use petgraph::Direction;
+        self.graph
+            .neighbors_directed(node_id, Direction::Incoming)
+            .count()
+    }
+
+    /// Find a node by its string ID (`node.id` field).
+    ///
+    /// This is distinct from `find_by_symbol` which searches the `name` field.
+    /// Node IDs are typically `"<file_path>:<symbol_name>"`.
+    pub fn find_by_id(&self, node_id: &str) -> Option<NodeId> {
+        self.graph
+            .node_indices()
+            .find(|&idx| self.graph[idx].id == node_id)
     }
 
     /// Add multiple call edges

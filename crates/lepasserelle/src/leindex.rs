@@ -775,10 +775,31 @@ impl LeIndex {
             threshold: Some(0.1), // Added default threshold for better quality
         };
 
-        let results = self
+        let mut results = self
             .search_engine
             .search(search_query)
             .context("Search operation failed")?;
+
+        // Enrich results with PDG metadata: symbol_type, caller_count, dependency_count.
+        // These require the in-memory PDG which is available here but not in lerecherche.
+        if let Some(pdg) = &self.pdg {
+            for result in &mut results {
+                // Look up the PDG node by its string ID
+                if let Some(node_idx) = pdg.find_by_id(&result.node_id) {
+                    if let Some(node) = pdg.get_node(node_idx) {
+                        result.symbol_type = Some(match node.node_type {
+                            legraphe::pdg::NodeType::Function => "function".to_string(),
+                            legraphe::pdg::NodeType::Class    => "class".to_string(),
+                            legraphe::pdg::NodeType::Method   => "method".to_string(),
+                            legraphe::pdg::NodeType::Variable => "variable".to_string(),
+                            legraphe::pdg::NodeType::Module   => "module".to_string(),
+                        });
+                    }
+                    result.caller_count     = Some(pdg.predecessor_count(node_idx));
+                    result.dependency_count = Some(pdg.neighbors(node_idx).len());
+                }
+            }
+        }
 
         debug!("Search for '{}' returned {} results", query, results.len());
 
@@ -1019,6 +1040,11 @@ impl LeIndex {
             node_id: node_id.to_string(),
             file_path: String::new(), // Will be filled if found
             symbol_name: node_id.to_string(),
+            symbol_type: None,
+            signature: None,
+            complexity: 0,
+            caller_count: None,
+            dependency_count: None,
             language,
             score: lerecherche::ranking::Score::default(),
             context: None,
