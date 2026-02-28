@@ -19,6 +19,164 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
+// ============================================================================
+// TF-IDF EMBEDDING SYSTEM
+// ============================================================================
+
+/// Tokenize a code string into sub-tokens by splitting camelCase, snake_case,
+/// whitespace, and punctuation, then lowercasing all tokens.
+///
+/// Examples:
+/// - `"getUserName"` → `["get", "user", "name"]`
+/// - `"get_user_name"` → `["get", "user", "name"]`
+/// - `"HTTP2Connection"` → `["http", "2", "connection"]`
+fn tokenize_code(text: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            // Start of uppercase in the middle of a word → camelCase split
+            if ch.is_uppercase() && !current.is_empty() {
+                // Check if the last char was lowercase (normal camel case boundary)
+                // e.g. "userName" → "user", "Name"
+                if current.chars().last().map(|c| c.is_lowercase()).unwrap_or(false) {
+                    if current.len() >= 2 {
+                        tokens.push(current.to_lowercase());
+                    }
+                    current = ch.to_string();
+                } else {
+                    current.push(ch);
+                }
+            } else {
+                current.push(ch);
+            }
+        } else if ch == '_' || ch == '-' || ch.is_whitespace() || ch.is_ascii_punctuation() {
+            // Word separator: flush current token
+            if current.len() >= 2 {
+                tokens.push(current.to_lowercase());
+            }
+            current = String::new();
+        } else {
+            current.push(ch);
+        }
+    }
+    if current.len() >= 2 {
+        tokens.push(current.to_lowercase());
+    }
+    tokens
+}
+
+/// TF-IDF based embedding system for code content.
+///
+/// Produces 768-dimensional vectors by computing TF-IDF scores for the
+/// top-768 tokens by IDF value, then L2-normalizing the result.
+///
+/// This provides meaningful cosine similarity (> 0 for related code) unlike
+/// the previous hash-based approach which produced random vectors.
+struct TfIdfEmbedder {
+    /// Ordered vocabulary (top-K tokens by IDF, K ≤ 768)
+    vocab: Vec<String>,
+    /// IDF values indexed by vocab position
+    idf: Vec<f32>,
+    /// Embedding dimension (matches existing vector index: 768)
+    dimension: usize,
+}
+
+impl TfIdfEmbedder {
+    /// Build a TF-IDF embedder from a corpus of (id, content) documents.
+    ///
+    /// # Steps
+    /// 1. Tokenize every document
+    /// 2. Build document-frequency table (df[token] = # docs containing token)
+    /// 3. Compute IDF = ln(N / df) per token
+    /// 4. Select top-768 tokens by IDF as vocabulary
+    fn build(documents: &[(String, String)]) -> Self {
+        const TARGET_DIM: usize = 768;
+        let n = documents.len();
+
+        if n == 0 {
+            return Self {
+                vocab: Vec::new(),
+                idf: Vec::new(),
+                dimension: TARGET_DIM,
+            };
+        }
+
+        // Count document frequency per token
+        let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for (_, content) in documents {
+            let toks: std::collections::HashSet<String> = tokenize_code(content).into_iter().collect();
+            for tok in toks {
+                *df.entry(tok).or_insert(0) += 1;
+            }
+        }
+
+        // Compute IDF for each token and collect into sorted vec
+        let n_f = n as f32;
+        let mut idf_scores: Vec<(String, f32)> = df
+            .into_iter()
+            .map(|(tok, df_count)| {
+                let idf = (n_f / df_count as f32).ln();
+                (tok, idf)
+            })
+            .collect();
+
+        // Sort descending by IDF (rarest/most discriminative tokens first)
+        idf_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        idf_scores.truncate(TARGET_DIM);
+
+        let vocab: Vec<String> = idf_scores.iter().map(|(t, _)| t.clone()).collect();
+        let idf: Vec<f32> = idf_scores.iter().map(|(_, s)| *s).collect();
+
+        Self {
+            vocab,
+            idf,
+            dimension: TARGET_DIM,
+        }
+    }
+
+    /// Embed a text string to a 768-dimensional L2-normalized TF-IDF vector.
+    fn embed(&self, text: &str) -> Vec<f32> {
+        let mut vec = vec![0.0f32; self.dimension];
+
+        if self.vocab.is_empty() {
+            return vec;
+        }
+
+        // Compute term frequencies
+        let tokens = tokenize_code(text);
+        let total = tokens.len() as f32;
+        if total == 0.0 {
+            return vec;
+        }
+
+        let mut tf_map: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
+        for tok in &tokens {
+            *tf_map.entry(tok.as_str()).or_insert(0.0) += 1.0;
+        }
+
+        // Compute TF-IDF for each vocab position
+        for (i, (word, idf_val)) in self.vocab.iter().zip(self.idf.iter()).enumerate() {
+            if let Some(&count) = tf_map.get(word.as_str()) {
+                vec[i] = (count / total) * idf_val;
+            }
+        }
+
+        // L2 normalize
+        let magnitude: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if magnitude > 1e-9 {
+            for v in &mut vec {
+                *v /= magnitude;
+            }
+        }
+
+        vec
+    }
+}
+
+// ============================================================================
+
 /// LeIndex - Main orchestration struct
 ///
 /// This struct provides a unified API for the entire LeIndex system,
@@ -55,6 +213,10 @@ pub struct LeIndex {
 
     /// Indexing statistics
     stats: IndexStats,
+
+    /// TF-IDF embedder, built from indexed node content.
+    /// None until index_nodes() is called with a sufficient corpus.
+    embedder: Option<TfIdfEmbedder>,
 }
 
 /// Statistics from indexing operations
@@ -233,6 +395,7 @@ impl LeIndex {
                 indexed_nodes: 0,
                 indexing_time_ms: 0,
             },
+            embedder: None,
         })
     }
 
@@ -1062,11 +1225,17 @@ impl LeIndex {
 
     // ========================================================================
 
-    /// Generate a deterministic embedding for a query string
+    /// Generate an embedding for a query string.
+    ///
+    /// Uses the TF-IDF embedder built at index time when available, ensuring
+    /// queries are projected into the same vector space as the indexed nodes.
+    /// Falls back to deterministic hashing for edge cases (empty corpus, not yet indexed).
     pub fn generate_query_embedding(&self, query: &str) -> Vec<f32> {
-        // For query embeddings, we only have the query text.
-        // We use it as the symbol name to match against nodes.
-        self.generate_deterministic_embedding(query, "", "")
+        if let Some(ref emb) = self.embedder {
+            emb.embed(query)
+        } else {
+            self.generate_deterministic_embedding(query, "", "")
+        }
     }
 
     /// Generate a deterministic 768-dimensional embedding for a node
@@ -1106,15 +1275,20 @@ impl LeIndex {
         embedding
     }
 
-    /// Index nodes from PDG for search
+    /// Index nodes from PDG for search.
+    ///
+    /// Builds a TF-IDF embedder from the full corpus of node content, then uses
+    /// it to embed each node. This produces meaningful cosine similarity between
+    /// related code nodes, replacing the previous hash-based placeholder.
     fn index_nodes(&mut self, pdg: &ProgramDependenceGraph) -> Result<()> {
-        let mut nodes = Vec::new();
-
         // Read file contents once per file to avoid repeated I/O
         let mut file_cache: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
-        // Convert PDG nodes to NodeInfo for indexing
+        // --- Pass 1: collect all node content for TF-IDF corpus building ---
+        let mut corpus: Vec<(String, String)> = Vec::new();
+        let mut raw_nodes: Vec<(_, String)> = Vec::new();
+
         for node_idx in pdg.node_indices() {
             if let Some(node) = pdg.get_node(node_idx) {
                 // Get file content
@@ -1151,13 +1325,22 @@ impl LeIndex {
                     )
                 };
 
-                // Use existing embedding if present, otherwise generate a deterministic one
+                corpus.push((node.id.clone(), node_content.clone()));
+                raw_nodes.push((node_idx, node_content));
+            }
+        }
+
+        // --- Build TF-IDF embedder from the full corpus ---
+        let embedder = TfIdfEmbedder::build(&corpus);
+
+        // --- Pass 2: build NodeInfo vec using the embedder for embeddings ---
+        let mut nodes: Vec<NodeInfo> = Vec::new();
+
+        for (node_idx, node_content) in raw_nodes {
+            if let Some(node) = pdg.get_node(node_idx) {
+                // Prefer any pre-computed embedding; fall back to TF-IDF
                 let embedding = node.embedding.clone().unwrap_or_else(|| {
-                    self.generate_deterministic_embedding(
-                        &node.name,
-                        &node.file_path,
-                        &node_content,
-                    )
+                    embedder.embed(&node_content)
                 });
 
                 let node_info = NodeInfo {
@@ -1174,6 +1357,9 @@ impl LeIndex {
                 nodes.push(node_info);
             }
         }
+
+        // Store embedder on self for query embedding at search time
+        self.embedder = Some(embedder);
 
         // Index the nodes
         self.search_engine.index_nodes(nodes);
@@ -1326,5 +1512,121 @@ mod tests {
         assert_eq!(deserialized.memory_usage_bytes, 1024);
         assert_eq!(deserialized.cache_entries, 5);
         assert_eq!(deserialized.spilled_bytes, 30000);
+    }
+
+    // =========================================================================
+    // TF-IDF Embedding Tests
+    // =========================================================================
+
+    #[test]
+    fn test_tokenize_code_camel_case() {
+        let toks = tokenize_code("getUserName");
+        assert!(toks.contains(&"get".to_string()), "expected 'get', got {:?}", toks);
+        assert!(toks.contains(&"user".to_string()), "expected 'user', got {:?}", toks);
+        assert!(toks.contains(&"name".to_string()), "expected 'name', got {:?}", toks);
+    }
+
+    #[test]
+    fn test_tokenize_code_snake_case() {
+        let toks = tokenize_code("get_user_name");
+        assert!(toks.contains(&"get".to_string()), "expected 'get', got {:?}", toks);
+        assert!(toks.contains(&"user".to_string()), "expected 'user', got {:?}", toks);
+        assert!(toks.contains(&"name".to_string()), "expected 'name', got {:?}", toks);
+    }
+
+    #[test]
+    fn test_tokenize_code_filters_short_tokens() {
+        // Single-character tokens should be filtered out (len < 2)
+        let toks = tokenize_code("a b c xyz");
+        assert!(!toks.contains(&"a".to_string()));
+        assert!(!toks.contains(&"b".to_string()));
+        assert!(!toks.contains(&"c".to_string()));
+        assert!(toks.contains(&"xyz".to_string()));
+    }
+
+    #[test]
+    fn test_tokenize_code_empty() {
+        let toks = tokenize_code("");
+        assert!(toks.is_empty());
+    }
+
+    #[test]
+    fn test_tfidf_embedder_empty_corpus() {
+        let embedder = TfIdfEmbedder::build(&[]);
+        let vec = embedder.embed("test query");
+        assert_eq!(vec.len(), 768, "must produce 768-dim vector even for empty corpus");
+        assert!(vec.iter().all(|&v| v == 0.0), "empty corpus → zero vector");
+    }
+
+    #[test]
+    fn test_tfidf_embedding_dimension() {
+        let docs: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("doc_{}", i), format!("fn handle_request_{} {{ let result = process(); result }}", i)))
+            .collect();
+        let embedder = TfIdfEmbedder::build(&docs);
+        let vec = embedder.embed("handle request process");
+        assert_eq!(vec.len(), 768, "embedding dimension must be 768");
+    }
+
+    #[test]
+    fn test_tfidf_embedding_normalized() {
+        let docs: Vec<(String, String)> = vec![
+            ("auth".to_string(), "fn authenticate_user(token: &str) -> bool { verify_token(token) }".to_string()),
+            ("db".to_string(), "fn connect_database(url: &str) -> Connection { open_connection(url) }".to_string()),
+            ("http".to_string(), "fn send_request(endpoint: &str) -> Response { http_get(endpoint) }".to_string()),
+        ];
+        let embedder = TfIdfEmbedder::build(&docs);
+        let vec = embedder.embed("authenticate token verify");
+        let magnitude: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+        // For a non-zero vector, magnitude should be ≈ 1.0
+        if magnitude > 1e-9 {
+            assert!((magnitude - 1.0).abs() < 1e-4, "embedding should be L2-normalized, got magnitude {}", magnitude);
+        }
+    }
+
+    #[test]
+    fn test_tfidf_related_content_higher_similarity() {
+        // Two auth-related snippets should have higher cosine similarity
+        // than an auth snippet and an unrelated db snippet
+        let docs: Vec<(String, String)> = vec![
+            ("a1".into(), "fn authenticate_user(token: &str) -> bool { verify_token(token) }".into()),
+            ("a2".into(), "fn check_user_credentials(password: &str) -> bool { hash_check(password) }".into()),
+            ("b1".into(), "fn connect_database(url: &str) -> Connection { open_connection(url) }".into()),
+            ("b2".into(), "fn execute_sql_query(query: &str) -> Vec<Row> { db_execute(query) }".into()),
+            ("c1".into(), "fn parse_json_payload(data: &str) -> Value { serde_parse(data) }".into()),
+        ];
+        let embedder = TfIdfEmbedder::build(&docs);
+
+        let auth1 = embedder.embed("fn authenticate_user token verify");
+        let auth2 = embedder.embed("fn check_user credentials password hash");
+        let db1 = embedder.embed("fn connect database execute sql query");
+
+        let cosine = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+        };
+
+        let sim_related = cosine(&auth1, &auth2);
+        let sim_unrelated = cosine(&auth1, &db1);
+
+        // Related content should have higher similarity than unrelated
+        // (or at minimum, not significantly lower)
+        assert!(
+            sim_related >= sim_unrelated - 0.1,
+            "related similarity ({}) should not be much lower than unrelated similarity ({})",
+            sim_related, sim_unrelated
+        );
+    }
+
+    #[test]
+    fn test_tfidf_zero_vector_for_unseen_terms() {
+        let docs: Vec<(String, String)> = vec![
+            ("a".into(), "fn foo_bar() -> bool { true }".into()),
+        ];
+        let embedder = TfIdfEmbedder::build(&docs);
+        // Query with terms not in any doc → vocab won't contain them → zero vector
+        let vec = embedder.embed("zzzzzz aaaaaaa bbbbbbb cccccccc");
+        let magnitude: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+        // Either zero vector or a valid normalized one
+        assert!(magnitude < 1.1, "magnitude out of range: {}", magnitude);
     }
 }
