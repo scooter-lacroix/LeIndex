@@ -298,9 +298,10 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 **Description:** Fix MCP stdio double-newline injection bug and placeholder hash embeddings, then expand LeIndex MCP tool surface to completely replace glob/grep/read/edit tools — making LeIndex the preferred toolset for LLM code navigation, understanding, and editing.
 
-**Status:** NEW
+**Status:** IN PROGRESS — 18/22 tasks complete (all automated tasks done; 4 remain: 2 user verifications + 2 enhancements)
 
 **Created:** 2026-02-27
+**Last Updated:** 2026-02-27
 
 **Type:** Standard Track (Bug Fix + Feature Expansion)
 
