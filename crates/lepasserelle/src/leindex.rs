@@ -112,19 +112,71 @@ impl TfIdfEmbedder {
             }
         }
 
-        // Compute IDF for each token and collect into sorted vec
+        // Compute IDF for each token using a moderate-frequency filter.
+        //
+        // WHY: "top-768 by IDF" = the 768 RAREST tokens (df=1, IDF≈ln(N)≈9).
+        // These are hapax legomena — unique identifiers seen in only one document.
+        // Query words almost never hit these rare tokens → zero query embedding
+        // → semantic: 0.0 for all results.
+        //
+        // FIX: restrict to tokens with moderate document frequency:
+        //   min_df = N/1000 (at least 0.1% of docs) — skip ultra-rare hapaxes
+        //   max_df = N/4   (at most 25% of docs)   — skip ubiquitous noise
+        //
+        // Typical informative code terms ("embed", "semantic", "search", "vector")
+        // appear in 10–200 of 8859 nodes → df falls squarely in this range →
+        // they become vocabulary entries → queries produce non-zero embeddings.
         let n_f = n as f32;
+        let min_df: usize = (n / 1000).max(3); // at least 3 occurrences
+        let max_df: usize = (n / 4).max(min_df + 1);
+
         let mut idf_scores: Vec<(String, f32)> = df
             .into_iter()
+            .filter(|(_, df_count)| *df_count >= min_df && *df_count <= max_df)
             .map(|(tok, df_count)| {
                 let idf = (n_f / df_count as f32).ln();
                 (tok, idf)
             })
             .collect();
 
-        // Sort descending by IDF (rarest/most discriminative tokens first)
-        idf_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        idf_scores.truncate(TARGET_DIM);
+        info!(
+            vocab_candidates = idf_scores.len(),
+            min_df,
+            max_df,
+            n_docs = n,
+            "TF-IDF vocabulary candidates (moderate-IDF filter)"
+        );
+
+        // Stratified vocabulary selection across the full IDF range.
+        //
+        // WHY NOT "top-768 by IDF": even with min_df filtering, 768+ tokens in the
+        // [min_df, max_df] range have higher IDF than typical query terms.  Sorting
+        // by IDF descending and truncating to 768 fills the vocab with the rarest
+        // non-hapax tokens (df=8–38) and entirely excludes moderately-common terms
+        // ("semantic", "cosine", etc.) that queries actually contain.
+        //
+        // FIX: sort by IDF ascending, then stride-sample evenly across the range.
+        // This guarantees vocab coverage from the most common to the rarest candidate,
+        // so both high-df query words ("search") and low-df terms ("cosine") land
+        // in the vocabulary.
+        idf_scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let final_scores: Vec<(String, f32)> = if idf_scores.len() <= TARGET_DIM {
+            // Fewer candidates than dimensions — use all of them, pad later
+            idf_scores
+        } else {
+            // Stride-sample: take TARGET_DIM evenly-spaced tokens across the sorted list
+            let total = idf_scores.len();
+            let stride = total as f64 / TARGET_DIM as f64;
+            (0..TARGET_DIM)
+                .map(|i| {
+                    let idx = ((i as f64 * stride) as usize).min(total - 1);
+                    idf_scores[idx].clone()
+                })
+                .collect()
+        };
+
+        let idf_scores = final_scores;
 
         let vocab: Vec<String> = idf_scores.iter().map(|(t, _)| t.clone()).collect();
         let idf: Vec<f32> = idf_scores.iter().map(|(_, s)| *s).collect();
@@ -1343,10 +1395,11 @@ impl LeIndex {
 
         for (node_idx, node_content) in raw_nodes {
             if let Some(node) = pdg.get_node(node_idx) {
-                // Prefer any pre-computed embedding; fall back to TF-IDF
-                let embedding = node.embedding.clone().unwrap_or_else(|| {
-                    embedder.embed(&node_content)
-                });
+                // Always use TF-IDF embedding — do NOT use any stored embedding
+                // from a previous index run, as those may be hash-based vectors
+                // that live in a different space from TF-IDF query embeddings.
+                // Cosine similarity between hash vectors and TF-IDF vectors ≈ 0.
+                let embedding = embedder.embed(&node_content);
 
                 let node_info = NodeInfo {
                     node_id: node.id.clone(),
