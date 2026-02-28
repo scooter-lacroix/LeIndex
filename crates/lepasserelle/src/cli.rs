@@ -541,8 +541,9 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
 /// This mode allows AI tools to start LeIndex as a subprocess for automatic integration
 async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     use crate::mcp::handlers::{
-        ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, IndexHandler,
-        PhaseAnalysisAliasHandler, PhaseAnalysisHandler, SearchHandler,
+        ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, FileSummaryHandler,
+        GrepSymbolsHandler, IndexHandler, PhaseAnalysisAliasHandler, PhaseAnalysisHandler,
+        ProjectMapHandler, ReadSymbolHandler, SearchHandler, SymbolLookupHandler,
     };
     use crate::mcp::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
     use std::io::{self, BufRead, Read, Write};
@@ -576,6 +577,12 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         crate::mcp::handlers::ToolHandler::Search(SearchHandler),
         crate::mcp::handlers::ToolHandler::PhaseAnalysis(PhaseAnalysisHandler),
         crate::mcp::handlers::ToolHandler::PhaseAnalysisAlias(PhaseAnalysisAliasHandler),
+        // Phase C: Tool Supremacy
+        crate::mcp::handlers::ToolHandler::FileSummary(FileSummaryHandler),
+        crate::mcp::handlers::ToolHandler::SymbolLookup(SymbolLookupHandler),
+        crate::mcp::handlers::ToolHandler::ProjectMap(ProjectMapHandler),
+        crate::mcp::handlers::ToolHandler::GrepSymbols(GrepSymbolsHandler),
+        crate::mcp::handlers::ToolHandler::ReadSymbol(ReadSymbolHandler),
     ]);
 
     eprintln!("[INFO] LeIndex MCP stdio server starting");

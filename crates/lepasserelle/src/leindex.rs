@@ -934,6 +934,11 @@ impl LeIndex {
         &self.search_engine
     }
 
+    /// Get the Program Dependence Graph, if the project has been indexed.
+    pub fn pdg(&self) -> Option<&ProgramDependenceGraph> {
+        self.pdg.as_ref()
+    }
+
     /// Get the current indexing statistics
     pub fn get_stats(&self) -> &IndexStats {
         &self.stats

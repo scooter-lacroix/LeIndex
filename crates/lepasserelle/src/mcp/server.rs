@@ -4,8 +4,9 @@
 // using axum for HTTP handling.
 
 use super::handlers::{
-    ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, IndexHandler,
-    PhaseAnalysisAliasHandler, PhaseAnalysisHandler, SearchHandler, ToolHandler,
+    ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, FileSummaryHandler,
+    GrepSymbolsHandler, IndexHandler, PhaseAnalysisAliasHandler, PhaseAnalysisHandler,
+    ProjectMapHandler, ReadSymbolHandler, SearchHandler, SymbolLookupHandler, ToolHandler,
 };
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::leindex::LeIndex;
@@ -98,6 +99,12 @@ impl McpServer {
             ToolHandler::Search(SearchHandler),
             ToolHandler::PhaseAnalysis(PhaseAnalysisHandler),
             ToolHandler::PhaseAnalysisAlias(PhaseAnalysisAliasHandler),
+            // Phase C: Tool Supremacy
+            ToolHandler::FileSummary(FileSummaryHandler),
+            ToolHandler::SymbolLookup(SymbolLookupHandler),
+            ToolHandler::ProjectMap(ProjectMapHandler),
+            ToolHandler::GrepSymbols(GrepSymbolsHandler),
+            ToolHandler::ReadSymbol(ReadSymbolHandler),
         ];
         HANDLERS
             .set(handlers)
