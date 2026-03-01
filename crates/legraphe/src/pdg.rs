@@ -371,14 +371,22 @@ impl ProgramDependenceGraph {
             .count()
     }
 
+    /// Get all predecessor nodes (incoming edges) of a node.
+    ///
+    /// Returns the NodeIds of all nodes that have a directed edge pointing TO `node_id`.
+    pub fn predecessors(&self, node_id: NodeId) -> Vec<NodeId> {
+        use petgraph::Direction;
+        self.graph
+            .neighbors_directed(node_id, Direction::Incoming)
+            .collect()
+    }
+
     /// Find a node by its string ID (`node.id` field).
     ///
     /// This is distinct from `find_by_symbol` which searches the `name` field.
     /// Node IDs are typically `"<file_path>:<symbol_name>"`.
     pub fn find_by_id(&self, node_id: &str) -> Option<NodeId> {
-        self.graph
-            .node_indices()
-            .find(|&idx| self.graph[idx].id == node_id)
+        self.symbol_index.get(node_id).copied()
     }
 
     /// Add multiple call edges
@@ -491,6 +499,59 @@ impl ProgramDependenceGraph {
             }
         }
         impact
+    }
+
+    /// Get forward impact with a maximum traversal depth.
+    ///
+    /// Like `get_forward_impact` but stops after `max_depth` hops.
+    pub fn get_forward_impact_bounded(&self, start: NodeId, max_depth: usize) -> Vec<NodeId> {
+        use std::collections::{HashSet, VecDeque};
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back((start, 0usize));
+        visited.insert(start);
+        let mut result = Vec::new();
+
+        while let Some((nid, depth)) = queue.pop_front() {
+            if nid != start {
+                result.push(nid);
+            }
+            if depth < max_depth {
+                for neighbor in self.graph.neighbors(nid) {
+                    if visited.insert(neighbor) {
+                        queue.push_back((neighbor, depth + 1));
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Get backward impact with a maximum traversal depth.
+    ///
+    /// Like `get_backward_impact` but stops after `max_depth` hops.
+    pub fn get_backward_impact_bounded(&self, start: NodeId, max_depth: usize) -> Vec<NodeId> {
+        use petgraph::Direction;
+        use std::collections::{HashSet, VecDeque};
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back((start, 0usize));
+        visited.insert(start);
+        let mut result = Vec::new();
+
+        while let Some((nid, depth)) = queue.pop_front() {
+            if nid != start {
+                result.push(nid);
+            }
+            if depth < max_depth {
+                for neighbor in self.graph.neighbors_directed(nid, Direction::Incoming) {
+                    if visited.insert(neighbor) {
+                        queue.push_back((neighbor, depth + 1));
+                    }
+                }
+            }
+        }
+        result
     }
 
     /// Serialize the graph to a byte vector

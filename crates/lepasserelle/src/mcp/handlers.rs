@@ -853,22 +853,16 @@ fn read_source_snippet(file_path: &str, byte_range: (usize, usize)) -> Option<St
     Some(String::from_utf8_lossy(&bytes[start..end]).into_owned())
 }
 
-/// Collect the NodeIds of all nodes that have a direct Call or DataDependency
-/// edge pointing *to* `target_id` (i.e. the callers / direct dependents).
+/// Collect the NodeIds of all nodes that have a direct edge pointing *to*
+/// `target_id` (i.e. the callers / direct dependents).
+///
+/// Uses petgraph's `neighbors_directed(Incoming)` for O(degree) performance
+/// instead of the previous O(E) full-edge scan.
 fn get_direct_callers(
     pdg: &legraphe::pdg::ProgramDependenceGraph,
     target_id: legraphe::pdg::NodeId,
 ) -> Vec<legraphe::pdg::NodeId> {
-    pdg.edge_indices()
-        .filter_map(|eid| {
-            let (src, tgt) = pdg.edge_endpoints(eid)?;
-            if tgt == target_id {
-                Some(src)
-            } else {
-                None
-            }
-        })
-        .collect()
+    pdg.predecessors(target_id)
 }
 
 // ============================================================================
@@ -1006,7 +1000,7 @@ cross-file relationships that Read cannot provide."
             let mut sym = serde_json::json!({
                 "name": node.name,
                 "type": node_type_str(&node.node_type),
-                "line_range": node.byte_range,
+                "byte_range": node.byte_range,
                 "complexity": node.complexity,
                 "dependencies": dependencies,
                 "dependents": dependents,
@@ -1116,7 +1110,7 @@ a single structured response including cross-file relationships."
         let include_source = extract_bool(&args, "include_source", false);
         let include_callers = extract_bool(&args, "include_callers", true);
         let include_callees = extract_bool(&args, "include_callees", true);
-        let _depth = extract_usize(&args, "depth", 2)?.min(5);
+        let depth = extract_usize(&args, "depth", 2)?.min(5);
         let token_budget = extract_usize(&args, "token_budget", 1500)?;
 
         let index = leindex.lock().await;
@@ -1181,8 +1175,8 @@ a single structured response including cross-file relationships."
             Vec::new()
         };
 
-        // Forward impact (transitive dependents)
-        let forward = pdg.get_forward_impact(node_id);
+        // Forward impact (depth-bounded transitive dependents)
+        let forward = pdg.get_forward_impact_bounded(node_id, depth);
         let affected_files: std::collections::HashSet<&str> = forward
             .iter()
             .filter_map(|&nid| pdg.get_node(nid).map(|n| n.file_path.as_str()))
@@ -1385,7 +1379,7 @@ impl GrepSymbolsHandler {
     pub fn description(&self) -> &str {
         "Search for symbols across the indexed codebase with structural awareness. Unlike \
 text-based grep, results include each match's type (function/class/method) and its role \
-in the dependency graph. Supports exact match, substring, and semantic search."
+in the dependency graph. Supports exact match and substring search."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -1620,11 +1614,9 @@ than reading an entire file. Supersedes targeted Read."
         // Extract doc comment: read lines above byte_range and look for `///` or `//!`
         let doc_comment = (|| {
             let file_bytes = std::fs::read(&node.file_path).ok()?;
-            let file_str = String::from_utf8_lossy(&file_bytes);
-            let up_to_def: String = file_str
-                .chars()
-                .take(node.byte_range.0)
-                .collect();
+            // Use byte slicing (not char counting) to correctly handle multi-byte UTF-8
+            let end = node.byte_range.0.min(file_bytes.len());
+            let up_to_def = String::from_utf8_lossy(&file_bytes[..end]).into_owned();
             let comment_lines: Vec<&str> = up_to_def
                 .lines()
                 .rev()
@@ -1737,44 +1729,101 @@ fn parse_edit_changes(changes_val: &Value) -> Result<Vec<EditChange>, JsonRpcErr
 }
 
 /// Apply a Vec<EditChange> to content in memory and return the modified string.
+///
+/// ReplaceText changes are sorted in reverse order by start offset so that
+/// earlier changes don't invalidate later changes' byte positions.
 fn apply_changes_in_memory(content: &str, changes: &[EditChange]) -> Result<String, JsonRpcError> {
-    let mut modified = content.to_owned();
+    // Separate replace_text (byte-offset–sensitive) from other change types
+    let mut replace_changes: Vec<&EditChange> = Vec::new();
+    let mut other_changes: Vec<&EditChange> = Vec::new();
     for change in changes {
+        match change {
+            EditChange::ReplaceText { .. } => replace_changes.push(change),
+            _ => other_changes.push(change),
+        }
+    }
+
+    // Sort byte-range replacements in reverse order so earlier edits don't
+    // shift later offsets.
+    replace_changes.sort_by(|a, b| {
+        let a_start = match a { EditChange::ReplaceText { start, .. } => *start, _ => 0 };
+        let b_start = match b { EditChange::ReplaceText { start, .. } => *start, _ => 0 };
+        b_start.cmp(&a_start)
+    });
+
+    let mut modified = content.to_owned();
+
+    // Apply byte-range replacements first (in reverse order)
+    for change in &replace_changes {
+        if let EditChange::ReplaceText { start, end, new_text } = change {
+            let bytes = modified.as_bytes();
+            let s = (*start).min(bytes.len());
+            let e = (*end).min(bytes.len());
+            modified = format!("{}{}{}", &modified[..s], new_text, &modified[e..]);
+        }
+    }
+
+    // Then apply rename / other changes
+    for change in &other_changes {
         modified = match change {
-            EditChange::ReplaceText { start, end, new_text } => {
-                let bytes = modified.as_bytes();
-                let s = (*start).min(bytes.len());
-                let e = (*end).min(bytes.len());
-                format!("{}{}{}", &modified[..s], new_text, &modified[e..])
-            }
             EditChange::RenameSymbol { old_name, new_name } => {
-                modified.replace(old_name.as_str(), new_name.as_str())
+                replace_whole_word(&modified, old_name, new_name)
             }
-            _ => modified, // Complex changes not supported in memory preview
+            _ => modified,
         };
     }
+
     Ok(modified)
 }
 
-/// Generate a unified diff using diffy via leedit's public interface.
+/// Check if a byte is a word character (alphanumeric or underscore).
+fn is_word_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Replace `old` with `new` only at word boundaries.
+///
+/// A match at position `pos` is a whole-word match if:
+/// - The character before `pos` is not a word character (or `pos == 0`)
+/// - The character after `pos + old.len()` is not a word character (or at end)
+fn replace_whole_word(content: &str, old: &str, new: &str) -> String {
+    if old.is_empty() {
+        return content.to_owned();
+    }
+    let bytes = content.as_bytes();
+    let old_bytes = old.as_bytes();
+    let mut result = String::with_capacity(content.len());
+    let mut i = 0;
+
+    while i <= bytes.len().saturating_sub(old_bytes.len()) {
+        if &bytes[i..i + old_bytes.len()] == old_bytes {
+            let before_ok = i == 0 || !is_word_char(bytes[i - 1]);
+            let after_ok = i + old_bytes.len() >= bytes.len()
+                || !is_word_char(bytes[i + old_bytes.len()]);
+            if before_ok && after_ok {
+                result.push_str(new);
+                i += old_bytes.len();
+                continue;
+            }
+        }
+        result.push(bytes[i] as char);
+        i += 1;
+    }
+    // Append remaining bytes that couldn't start a match
+    if i < bytes.len() {
+        result.push_str(&content[i..]);
+    }
+    result
+}
+
+/// Generate a unified diff between two strings.
 fn make_diff(original: &str, modified: &str, file_path: &str) -> String {
-    // Use leedit's generate_diff indirectly: construct engine just for diff
-    // Since diffy is not directly accessible, we use diffy via leedit reexport.
-    // Alternatively, build the patch inline:
-    let path = std::path::Path::new(file_path);
-    let dummy_pdg = std::sync::Arc::new(legraphe::pdg::ProgramDependenceGraph::new());
-    let storage = std::sync::Arc::new(
-        lestockage::schema::Storage::open_with_config(":memory:", lestockage::StorageConfig {
-            db_path: ":memory:".to_string(),
-            wal_enabled: false,
-            cache_size_pages: None,
-        }).unwrap()
-    );
-    match leedit::EditEngine::new(dummy_pdg, storage) {
-        Ok(engine) => engine.generate_diff(original, modified, path).unwrap_or_else(|_| {
-            format!("--- {}\n+++ {}\n(diff error)", file_path, file_path)
-        }),
-        Err(_) => format!("--- {}\n+++ {}\n(diff unavailable)", file_path, file_path),
+    let patch = diffy::create_patch(original, modified);
+    let patch_str = patch.to_string();
+    if patch_str.is_empty() {
+        format!("--- {}\n+++ {}\n(no changes)\n", file_path, file_path)
+    } else {
+        format!("--- {}\n+++ {}\n{}", file_path, file_path, patch_str)
     }
 }
 
@@ -2033,8 +2082,8 @@ Grep + multi-file Edit with a single atomic operation."
             if let Some(n) = pdg.get_node(node_id) {
                 ref_files.insert(n.file_path.clone());
             }
-            // All callers' files
-            for dep_id in pdg.get_backward_impact(node_id) {
+            // Direct callers' files (only direct references need renaming)
+            for dep_id in get_direct_callers(pdg, node_id) {
                 if let Some(dn) = pdg.get_node(dep_id) {
                     ref_files.insert(dn.file_path.clone());
                 }
@@ -2062,7 +2111,7 @@ Grep + multi-file Edit with a single atomic operation."
 
         for file_path in &filtered_files {
             let Ok(original) = std::fs::read_to_string(file_path) else { continue };
-            let modified = original.replace(old_name.as_str(), new_name.as_str());
+            let modified = replace_whole_word(&original, &old_name, &new_name);
             if modified != original {
                 let diff = make_diff(&original, &modified, file_path);
                 diffs.push(serde_json::json!({ "file": file_path, "diff": diff }));
@@ -2074,7 +2123,7 @@ Grep + multi-file Edit with a single atomic operation."
             // Apply changes to all files
             for file_path in &files_to_modify {
                 if let Ok(original) = std::fs::read_to_string(file_path) {
-                    let modified = original.replace(old_name.as_str(), new_name.as_str());
+                    let modified = replace_whole_word(&original, &old_name, &new_name);
                     let _ = std::fs::write(file_path, modified.as_bytes());
                 }
             }
@@ -2134,7 +2183,7 @@ to understand the blast radius of your change. No equivalent in standard tools."
     ) -> Result<Value, JsonRpcError> {
         let symbol = extract_string(&args, "symbol")?;
         let change_type = args.get("change_type").and_then(|v| v.as_str()).unwrap_or("modify").to_owned();
-        let _depth = extract_usize(&args, "depth", 3)?.min(5);
+        let depth = extract_usize(&args, "depth", 3)?.min(5);
 
         let index = leindex.lock().await;
         let pdg = index.pdg().ok_or_else(|| {
@@ -2159,16 +2208,13 @@ to understand the blast radius of your change. No equivalent in standard tools."
         })?;
 
         // Direct callers (depth 1)
-        let direct_callers: Vec<String> = pdg
-            .edge_indices()
-            .filter_map(|eid| {
-                let (src, tgt) = pdg.edge_endpoints(eid)?;
-                if tgt == node_id { pdg.get_node(src).map(|n| n.name.clone()) } else { None }
-            })
+        let direct_callers: Vec<String> = get_direct_callers(pdg, node_id)
+            .iter()
+            .filter_map(|&cid| pdg.get_node(cid).map(|n| n.name.clone()))
             .collect();
 
-        // Transitive forward impact
-        let forward = pdg.get_forward_impact(node_id);
+        // Depth-bounded transitive forward impact
+        let forward = pdg.get_forward_impact_bounded(node_id, depth);
         let affected_symbols: Vec<String> = forward
             .iter()
             .filter_map(|&nid| pdg.get_node(nid).map(|n| n.name.clone()))
@@ -2179,8 +2225,8 @@ to understand the blast radius of your change. No equivalent in standard tools."
             .filter_map(|&nid| pdg.get_node(nid).map(|n| n.file_path.as_str()))
             .collect();
 
-        // Transitive backward impact (what calls into the callers)
-        let backward = pdg.get_backward_impact(node_id);
+        // Depth-bounded transitive backward impact
+        let backward = pdg.get_backward_impact_bounded(node_id, depth);
 
         let risk = match change_type.as_str() {
             "remove" | "change_signature" => {

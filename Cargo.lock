@@ -1804,6 +1804,7 @@ dependencies = [
  "blake3",
  "bytes 1.11.0",
  "clap",
+ "diffy",
  "futures-util",
  "http 1.4.0",
  "http-body-util",

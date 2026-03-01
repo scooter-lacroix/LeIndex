@@ -58,6 +58,9 @@ blake3 = "1.5"
 bincode = "1.3"
 lru = "0.12"
 
+# Diff generation (used by MCP edit handlers)
+diffy = "0.3"
+
 # Internal dependencies
 leparse = { path = "../leparse" }
 legraphe = { path = "../legraphe" }

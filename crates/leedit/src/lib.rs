@@ -424,9 +424,13 @@ impl EditEngine {
     ) -> Result<bool> {
         // Resolve the file path within the worktree
         let target_path = if file_path.is_absolute() {
-            // Use the worktree path as the base — map absolute path to worktree
-            let file_name = file_path.file_name().unwrap_or(file_path.as_os_str());
-            session.path().join(file_name)
+            // Map absolute path into worktree, preserving directory structure.
+            // Try stripping common prefixes; fall back to the full relative path.
+            let rel = file_path
+                .strip_prefix(session.path())
+                .or_else(|_| file_path.strip_prefix("/"))
+                .unwrap_or(file_path);
+            session.path().join(rel)
         } else {
             session.path().join(file_path)
         };

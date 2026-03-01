@@ -24,11 +24,13 @@ use tracing::{debug, info, warn};
 // ============================================================================
 
 /// Tokenize a code string into sub-tokens by splitting camelCase, snake_case,
-/// whitespace, and punctuation, then lowercasing all tokens.
+/// acronym boundaries, digit boundaries, whitespace, and punctuation, then
+/// lowercasing all tokens.
 ///
 /// Examples:
 /// - `"getUserName"` → `["get", "user", "name"]`
 /// - `"get_user_name"` → `["get", "user", "name"]`
+/// - `"HTTPConnection"` → `["http", "connection"]`
 /// - `"HTTP2Connection"` → `["http", "2", "connection"]`
 fn tokenize_code(text: &str) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
@@ -36,25 +38,52 @@ fn tokenize_code(text: &str) -> Vec<String> {
 
     for ch in text.chars() {
         if ch.is_alphanumeric() {
-            // Start of uppercase in the middle of a word → camelCase split
             if ch.is_uppercase() && !current.is_empty() {
-                // Check if the last char was lowercase (normal camel case boundary)
-                // e.g. "userName" → "user", "Name"
-                if current.chars().last().map(|c| c.is_lowercase()).unwrap_or(false) {
+                let last = current.chars().last().unwrap();
+                if last.is_lowercase() || last.is_ascii_digit() {
+                    // camelCase or digit→upper boundary: "userName" → "user" | "Name"
                     if current.len() >= 2 {
                         tokens.push(current.to_lowercase());
+                    } else if current.chars().all(|c| c.is_ascii_digit()) {
+                        tokens.push(current.clone());
                     }
                     current = ch.to_string();
                 } else {
                     current.push(ch);
                 }
+            } else if ch.is_lowercase() && !current.is_empty()
+                && current.len() > 1
+                && current.chars().last().map(|c| c.is_uppercase()).unwrap_or(false)
+                && current.chars().rev().nth(1).map(|c| c.is_uppercase()).unwrap_or(false)
+            {
+                // Acronym→camelCase: "HTTPC" + 'o' → push "HTTP", start "Co"
+                let last_char = current.pop().unwrap();
+                if current.len() >= 2 {
+                    tokens.push(current.to_lowercase());
+                }
+                current = format!("{}{}", last_char, ch);
+            } else if ch.is_ascii_digit() && !current.is_empty()
+                && current.chars().last().map(|c| c.is_alphabetic()).unwrap_or(false)
+            {
+                // letter→digit boundary: "HTTP" + '2' → push "http", start "2"
+                if current.len() >= 2 {
+                    tokens.push(current.to_lowercase());
+                }
+                current = ch.to_string();
+            } else if ch.is_alphabetic() && !current.is_empty()
+                && current.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false)
+            {
+                // digit→letter boundary: "2" + 'C' → push "2", start "C"
+                tokens.push(current.to_lowercase());
+                current = ch.to_string();
             } else {
                 current.push(ch);
             }
         } else if ch == '_' || ch == '-' || ch.is_whitespace() || ch.is_ascii_punctuation() {
-            // Word separator: flush current token
             if current.len() >= 2 {
                 tokens.push(current.to_lowercase());
+            } else if !current.is_empty() && current.chars().all(|c| c.is_ascii_digit()) {
+                tokens.push(current.clone());
             }
             current = String::new();
         } else {
@@ -62,6 +91,8 @@ fn tokenize_code(text: &str) -> Vec<String> {
         }
     }
     if current.len() >= 2 {
+        tokens.push(current.to_lowercase());
+    } else if !current.is_empty() && current.chars().all(|c| c.is_ascii_digit()) {
         tokens.push(current.to_lowercase());
     }
     tokens
@@ -1364,7 +1395,8 @@ impl LeIndex {
     /// it to embed each node. This produces meaningful cosine similarity between
     /// related code nodes, replacing the previous hash-based placeholder.
     fn index_nodes(&mut self, pdg: &ProgramDependenceGraph) -> Result<()> {
-        // Read file contents once per file to avoid repeated I/O
+        // Read file contents once per file to avoid repeated I/O.
+        // Cache is scoped to this function and shared across both passes.
         let mut file_cache: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
 
@@ -1374,16 +1406,15 @@ impl LeIndex {
 
         for node_idx in pdg.node_indices() {
             if let Some(node) = pdg.get_node(node_idx) {
-                // Get file content
-                let content = if let Some(fc) = file_cache.get(&node.file_path) {
-                    fc.clone()
-                } else if let Ok(bytes) = std::fs::read(&node.file_path) {
-                    let fc = String::from_utf8_lossy(&bytes).to_string();
-                    file_cache.insert(node.file_path.clone(), fc.clone());
-                    fc
-                } else {
-                    String::new()
-                };
+                // Get file content (cached per unique file path)
+                let content = file_cache
+                    .entry(node.file_path.clone())
+                    .or_insert_with(|| {
+                        std::fs::read(&node.file_path)
+                            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                            .unwrap_or_default()
+                    })
+                    .clone();
 
                 // Extract node-specific content for better text matching.
                 // Use byte-safe slicing to avoid panics on invalid UTF-8 char boundaries.
@@ -1608,6 +1639,18 @@ mod tests {
         assert!(toks.contains(&"get".to_string()), "expected 'get', got {:?}", toks);
         assert!(toks.contains(&"user".to_string()), "expected 'user', got {:?}", toks);
         assert!(toks.contains(&"name".to_string()), "expected 'name', got {:?}", toks);
+    }
+
+    #[test]
+    fn test_tokenize_code_acronyms_and_digits() {
+        let toks = tokenize_code("HTTPConnection");
+        assert!(toks.contains(&"http".to_string()), "expected 'http', got {:?}", toks);
+        assert!(toks.contains(&"connection".to_string()), "expected 'connection', got {:?}", toks);
+
+        let toks2 = tokenize_code("HTTP2Connection");
+        assert!(toks2.contains(&"http".to_string()), "expected 'http', got {:?}", toks2);
+        assert!(toks2.contains(&"2".to_string()), "expected '2', got {:?}", toks2);
+        assert!(toks2.contains(&"connection".to_string()), "expected 'connection', got {:?}", toks2);
     }
 
     #[test]

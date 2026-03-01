@@ -19,7 +19,8 @@ pub const JSONRPC_VERSION: &str = "2.0";
 pub struct JsonRpcRequest {
     /// JSON-RPC version string, must be "2.0"
     pub jsonrpc: String,
-    /// Unique identifier for the request
+    /// Unique identifier for the request (null for notifications)
+    #[serde(default)]
     pub id: Value,
     /// Method name to be invoked
     pub method: String,
