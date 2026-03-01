@@ -233,3 +233,20 @@ risk assessment (low/medium/high), summary. ~1 040 chars → ~260 tokens.
 - LeIndex token counts include the structured JSON response
 - "New capability" means there is no practical standard-tool equivalent
 - All measurements performed against the LeIndexer codebase itself
+
+---
+
+## Corrections (Tzar Review, 2026-03-01)
+
+The following corrections were applied after the full source code review:
+
+- **grep_symbols**: The tool description previously claimed "semantic search" support.
+  This has been corrected to "exact match and substring search" only. Token counts
+  and benchmarks remain accurate as semantic search was never exercised in measurements.
+- **file_summary**: The `line_range` field in symbol entries was renamed to `byte_range`
+  to accurately reflect the data it contains (byte offsets, not line numbers).
+- **rename_symbol**: Now uses word-boundary-aware replacement. The benchmark measurement
+  of ~340 tokens remains valid; the improvement is in correctness, not token count.
+- **impact_analysis**: The `depth` parameter is now functional. Previous measurements
+  used unbounded traversal; bounded traversal may return fewer results for deeply
+  nested dependency chains, slightly reducing response token counts.

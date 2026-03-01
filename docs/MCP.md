@@ -69,6 +69,13 @@ code navigation tasks. The table below shows the token efficiency advantage:
 
 > See [TOOL_SUPREMACY_BENCHMARKS.md](TOOL_SUPREMACY_BENCHMARKS.md) for detailed analysis.
 
+**Correctness Notes (v0.1.0 Tzar Review):**
+- `leindex_file_summary` now reports `byte_range` (previously mislabeled as `line_range`)
+- `leindex_grep_symbols` description accurately reflects supported search modes (exact match and substring)
+- `leindex_symbol_lookup` and `leindex_impact_analysis` now honor the `depth` parameter for bounded traversal
+- `leindex_rename_symbol` uses word-boundary-aware matching to prevent false-positive substring replacements
+- `leindex_edit_apply` sorts byte-range changes in reverse order to prevent offset corruption in multi-change requests
+
 ---
 
 ## Available Tools
@@ -760,6 +767,8 @@ Apply code edits to files. Use `dry_run=true` to get a preview without modifying
 
 Rename a symbol across all files using PDG to find all reference sites. Generates a
 unified multi-file diff. **Replaces manual Grep + multi-file Edit.**
+
+> **Note:** Rename matching uses word-boundary detection. Renaming `get` will not affect `get_user` or `widget`.
 
 **Parameters:**
 
