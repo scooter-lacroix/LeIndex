@@ -69,7 +69,7 @@ code navigation tasks. The table below shows the token efficiency advantage:
 
 > See [TOOL_SUPREMACY_BENCHMARKS.md](TOOL_SUPREMACY_BENCHMARKS.md) for detailed analysis.
 
-**Correctness Notes (v0.1.0 Tzar Review):**
+**Correctness Notes (v1.5.0):**
 - `leindex_file_summary` now reports `byte_range` (previously mislabeled as `line_range`)
 - `leindex_grep_symbols` description accurately reflects supported search modes (exact match and substring)
 - `leindex_symbol_lookup` and `leindex_impact_analysis` now honor the `depth` parameter for bounded traversal
@@ -1696,5 +1696,5 @@ Or via the health endpoint:
 
 ```bash
 curl http://localhost:3000/health
-# {"status":"ok","service":"leindex-mcp-server","version":"0.1.0"}
+# {"status":"ok","service":"leserve","version":"1.5.0"}
 ```

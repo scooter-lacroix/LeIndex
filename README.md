@@ -5,192 +5,145 @@
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT%20%7C%20Apache--2.0-blue?style=flat-square)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-Server-purple?style=flat-square)](https://modelcontextprotocol.io)
-[![Tests](https://img.shields.io/badge/Tests-339%2F339-brightgreen?style=flat-square)](https://github.com/scooter-lacroix/leindex)
 
-**AI-powered code search and indexing with MCP integration**
+**LeIndex v1.5.0**
 
-*Lightning-fast semantic search • Zero-copy parsing • PDG analysis • 12 languages*
+AI-powered code indexing, semantic search, dependency analysis, MCP tooling, and dashboard observability.
 
 </div>
 
 ---
 
-## Features
+## What Is LeIndex?
 
-- **Zero-Copy AST** — Tree-sitter parsing for 12 languages (Python, Rust, JS, TS, Go, Java, C++, C#, Ruby, PHP, Lua, Scala)
-- **Semantic Search** — HNSW vector search with natural language queries
-- **PDG Analysis** — Program Dependence Graph with gravity-based traversal
-- **MCP Server** — First-class Model Context Protocol for AI assistants
-- **Smart Caching** — RSS monitoring, automatic spilling, and warming strategies
-- **Cross-Project** — Global symbol table for multi-project resolution
+LeIndex is a Rust workspace for code intelligence. It provides:
+
+- Fast indexing with tree-sitter parsing.
+- PDG-based structural analysis and context expansion.
+- Semantic + structural retrieval for code understanding.
+- 16 MCP tools for read, analysis, and safe code-edit workflows.
+- HTTP/WebSocket server (`leserve`) and a frontend dashboard.
+- Multi-project support with low-resource operation.
+
+## Install
+
+### Option A: One-line installer (recommended)
+
+```bash
+curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+```
+
+This installs:
+
+- `leindex` binary to `/usr/local/bin`
+- dashboard assets to `~/.leindex/dashboard`
+- optional dashboard production build (if Bun is available)
+
+### Option B: crates.io
+
+```bash
+cargo install leindex
+```
+
+Note: crates.io installs the CLI/MCP binaries. Dashboard assets are distributed from repository installs (or manual clone) rather than bundled in the crate artifact.
 
 ## Quick Start
 
-### Installation
-
 ```bash
-# One-line installer (Linux/macOS)
-curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
-
-# Or via cargo
-cargo install leindex
-
-# Verify
-leindex --version
-```
-
-### Basic Usage
-
-```bash
-# Index a project
+# index
 leindex index /path/to/project
 
-# Search semantically
+# semantic search
 leindex search "authentication flow"
 
-# Deep analysis
-leindex analyze "how does error handling work"
+# deep analysis
+leindex analyze "how authorization is enforced"
 
 # 5-phase additive analysis
-leindex phase /path/to/project
+leindex phase --all --path /path/to/project
 
-# System diagnostics
+# diagnostics
 leindex diagnostics
+
+# MCP stdio mode (for Claude/Codex/Cursor integrations)
+leindex mcp
+
+# HTTP MCP server
+leindex serve --host 127.0.0.1 --port 47268
+
+# Dashboard (dev server)
+leindex dashboard
 ```
 
-## CLI Commands
+## Dashboard
 
-| Command | Description |
-|---------|-------------|
-| `index` | Index a project for search and analysis |
-| `search` | Semantic code search with NL queries |
-| `analyze` | Deep analysis with context expansion |
-| `phase` | 5-phase additive analysis workflow |
-| `diagnostics` | System health and index statistics |
-| `serve` | Start MCP HTTP server (axum) |
-| `mcp` | MCP stdio mode for AI tool integration |
+LeIndex ships with a Bun + React dashboard focused on operational visibility:
 
-## MCP Integration
+- codebase inventory and per-project metrics
+- graph volume and dependency telemetry
+- cache temperature/hit-rate snapshot
+- external dependency counters
+- live events over WebSocket
 
-### Claude Code
+Local dashboard paths used by the CLI:
 
-Add to `~/.claude/claude_desktop_config.json`:
+1. `./dashboard` (repo root)
+2. parent-directory traversal (dev convenience)
+3. `LEINDEX_DASHBOARD_DIR` env override
+4. `~/.leindex/dashboard` (installer default)
 
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "leindex",
-      "args": ["mcp"]
-    }
-  }
-}
-```
+## Workspace Layout
 
-### Cursor / Other MCP Clients
+LeIndex v1.5.0 workspace crates:
 
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "leindex",
-      "args": ["serve", "--host", "127.0.0.1", "--port", "3000"]
-    }
-  }
-}
-```
+- `leparse`: language parsing and signature extraction
+- `legraphe`: graph construction and traversal
+- `lerecherche`: retrieval / scoring / vector search internals
+- `lestockage`: SQLite persistence + storage primitives
+- `lephase`: additive phase analysis pipeline
+- `lepasserelle`: CLI + MCP protocol handlers
+- `leglobal`: cross-project discovery/registry support
+- `leserve`: HTTP/WebSocket API server
+- `leedit`: edit-preview/apply support
+- `levalidation`: validation and guardrails
 
-### Available MCP Tools
+## MCP Tools (16)
 
-| Tool | Description |
-|------|-------------|
-| `deep_analyze` | Deep code analysis with PDG traversal |
-| `search` | Semantic code search |
-| `index` | Index projects for analysis |
-| `context` | Context expansion around nodes |
-| `diagnostics` | System health checks |
-| `phase_analysis` | 5-phase additive analysis |
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    lepasserelle (CLI/MCP)                    │
-│              index • search • analyze • serve                │
-└───────────┬─────────────┬─────────────┬─────────────┬───────┘
-            │             │             │             |
-     ┌──────▼──────┐┌─────▼─────┐┌──────▼──────┐┌─────▼─────┐
-     │   leparse   ││ legraphe  ││ lerecherche ││ lestockage│
-     │             ││           ││             ││           │
-     │ tree-sitter ││    PDG    ││    HNSW     ││  SQLite   │
-     │ 12 langs    ││  gravity  ││   vectors   ││  storage  │
-     │ zero-copy   ││ traversal ││   search    ││  global   │
-     └─────────────┘└───────────┘└─────────────┘└───────────┘
-```
-
-**Crates:**
-- **leparse** — Zero-copy AST extraction with tree-sitter
-- **legraphe** — PDG construction with gravity-based traversal
-- **lerecherche** — HNSW semantic search with NL query parser
-- **lestockage** — SQLite persistence with cross-project symbols
-- **lepasserelle** — CLI & MCP server orchestration
+- `leindex_index`
+- `leindex_search`
+- `leindex_deep_analyze`
+- `leindex_context`
+- `leindex_diagnostics`
+- `leindex_phase_analysis`
+- `phase_analysis` (alias)
+- `leindex_file_summary`
+- `leindex_symbol_lookup`
+- `leindex_project_map`
+- `leindex_grep_symbols`
+- `leindex_read_symbol`
+- `leindex_edit_preview`
+- `leindex_edit_apply`
+- `leindex_rename_symbol`
+- `leindex_impact_analysis`
 
 ## Development
 
 ```bash
-# Build
-cargo build --release
-
-# Test all crates
+cargo build --workspace
 cargo test --workspace
 
-# Run with debug logging
-RUST_LOG=debug cargo run --release -- index .
-
-# Format and lint
-cargo fmt && cargo clippy
+cd dashboard
+bun install
+bun run build
 ```
 
-### Project Structure
+## Docs
 
-```
-leindex/
-├── crates/
-│   ├── leparse/        # AST extraction
-│   ├── legraphe/       # PDG analysis
-│   ├── lerecherche/    # Vector search
-│   ├── lestockage/     # Storage layer
-│   └── lepasserelle/   # CLI & MCP
-├── Cargo.toml
-└── install.sh
-```
-
-## Documentation
-
-- [Architecture Guide](ARCHITECTURE.md) — System design internals
-- [API Reference](API.md) — Detailed API documentation
-- [MCP Compatibility](MCP_COMPATIBILITY.md) — MCP server details
-- [Contributing](CONTRIBUTING.md) — Development guidelines
-
-## Performance
-
-| Metric | Target | Status |
-|--------|--------|--------|
-| Indexing (50K files) | <60s | ✅ |
-| Search P95 latency | <100ms | ✅ |
-| Memory per node | 32 bytes | ✅ |
-| Tests | 339/339 | ✅ 100% |
+- [ARCHITECTURE.md](ARCHITECTURE.md)
+- [API.md](API.md)
+- [docs/MCP.md](docs/MCP.md)
+- [dashboard/README.md](dashboard/README.md)
 
 ## License
 
-MIT OR Apache-2.0 — see [LICENSE](LICENSE) for details.
-
----
-
-<div align="center">
-
-**Built with Rust for developers who love their code**
-
-[Install Now](#quick-start) • [Documentation](#documentation) • [Contribute](CONTRIBUTING.md)
-
-</div>
+MIT OR Apache-2.0

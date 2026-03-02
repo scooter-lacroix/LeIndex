@@ -2,6 +2,57 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [1.5.0] - 2026-03-02 - Multi-Project MCP, Dashboard Integration, Release Polish
+
+### Added
+
+- Multi-project registry path for MCP/CLI server workflows with per-project concurrency handling.
+- Dashboard command and installer integration improvements, including packaged dashboard assets at `~/.leindex/dashboard`.
+- Dashboard API integration for cache telemetry, dependency counters, and codebase-level metrics.
+
+### Changed
+
+- Workspace release version bumped to `1.5.0` for coordinated crate publishing.
+- Installer upgraded to `5.1.0` and now attempts dashboard dependency install/build when Bun is available.
+- MCP protocol request ID handling aligned with notification-safe optional IDs.
+- CLI MCP stdio response framing/newline behavior stabilized for stricter clients.
+- `publish_crates.sh` default publish target updated to `1.5.0`.
+
+### Fixed
+
+- Merge-level conflict resolutions across CLI, MCP protocol, and dashboard config/type files.
+- SQLite busy-timeout configured to reduce transient lock failures during concurrent access.
+- Boolean parameter handling and tool argument coercion consistency improvements (accepting both boolean and string forms where required).
+
+## [Unreleased] - INT8 Quantization Optimization
+
+### ✨ **Performance: INT8 Quantized Vector Search**
+
+Major performance optimization for vector search with ~74% memory reduction.
+
+#### **Key Features**
+- **INT8 Quantization**: 4x memory reduction for vector storage
+- **AVX2 SIMD Optimization**: 3-4x speedup on x86_64 with AVX2
+- **Runtime Feature Detection**: Automatic selection of optimal implementation
+- **Asymmetric Distance Computation (ADC)**: Maintains search accuracy with quantized vectors
+- **Cross-Platform**: Portable fallback for non-AVX2 platforms
+
+#### **Technical Details**
+- SIMD module with runtime dispatch (AVX2 → fallback)
+- NaN/Inf validation for input vectors
+- Comprehensive safety documentation for unsafe code
+- Property-based tests for correctness verification
+- Criterion benchmarks for performance tracking
+
+#### **Performance Improvements**
+| Metric | Before | After | Improvement |
+|--------|--------|-------|-------------|
+| Memory per 768d vector | 3,072 bytes | ~800 bytes | **~74% reduction** |
+| Distance computation (AVX2) | Baseline | 3-4x faster | **AVX2 intrinsics** |
+| Search latency | Baseline | Similar | **Maintained accuracy** |
+
+---
+
 ## [0.1.0] - 2025-01-26 - Rust Rewrite Release
 
 ### 🦀 **Major Release: Complete Rewrite in Pure Rust**

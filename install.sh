@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 5.0.0 - Rust Edition
+# Version: 5.1.0 - Rust Edition + Dashboard Assets
 # Platform: Linux/Unix
 #
 # One-line installer:
@@ -22,7 +22,7 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="5.0.0"
+readonly SCRIPT_VERSION="5.1.0"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
@@ -41,6 +41,7 @@ LEINDEX_HOME="${LEINDEX_HOME:-$HOME/.leindex}"
 CONFIG_DIR="${LEINDEX_HOME}/config"
 DATA_DIR="${LEINDEX_HOME}/data"
 LOG_DIR="${LEINDEX_HOME}/logs"
+DASHBOARD_DIR="${LEINDEX_HOME}/dashboard"
 TEMP_BACKUP_DIR="${HOME}/.leindex.tmp"
 # Install to standard system-wide location (requires sudo)
 # This ensures leindex is accessible to all AI tools regardless of PATH
@@ -311,12 +312,62 @@ install_leindex() {
         exit 1
     fi
 
+    # Install dashboard assets for packaged installs and convenience.
+    install_dashboard_assets "$repo_dir"
+
     # Clean up temporary clone if we created it
     if [[ "$should_cleanup" == true ]]; then
         log_info "Cleaning up temporary files..."
         cd /
         rm -rf "$repo_dir"
         log_success "Cleanup complete"
+    fi
+}
+
+install_dashboard_assets() {
+    local repo_dir="$1"
+    local source_dir="$repo_dir/dashboard"
+
+    if [[ ! -d "$source_dir" ]]; then
+        log_warn "Dashboard source not found in repository; skipping dashboard asset install"
+        return 0
+    fi
+
+    log_info "Installing dashboard assets to $DASHBOARD_DIR"
+    mkdir -p "$DASHBOARD_DIR"
+
+    # Replace existing dashboard payload atomically.
+    local temp_dashboard_dir="${DASHBOARD_DIR}.tmp"
+    rm -rf "$temp_dashboard_dir"
+    mkdir -p "$temp_dashboard_dir"
+    cp -a "$source_dir/." "$temp_dashboard_dir/"
+    rm -rf "$DASHBOARD_DIR"
+    mv "$temp_dashboard_dir" "$DASHBOARD_DIR"
+    log_success "Dashboard files installed"
+
+    if ! command -v bun &> /dev/null; then
+        log_warn "Bun not found; skipping dashboard dependency install/build"
+        return 0
+    fi
+
+    log_info "Installing dashboard dependencies..."
+    if (cd "$DASHBOARD_DIR" && bun install --frozen-lockfile) >> "$INSTALL_LOG" 2>&1; then
+        log_success "Dashboard dependencies installed"
+    else
+        log_warn "Frozen lockfile install failed, retrying with bun install"
+        if (cd "$DASHBOARD_DIR" && bun install) >> "$INSTALL_LOG" 2>&1; then
+            log_success "Dashboard dependencies installed"
+        else
+            log_warn "Dashboard dependency install failed; continuing without prebuilt assets"
+            return 0
+        fi
+    fi
+
+    log_info "Building dashboard assets..."
+    if (cd "$DASHBOARD_DIR" && bun run build) >> "$INSTALL_LOG" 2>&1; then
+        log_success "Dashboard production build created at $DASHBOARD_DIR/dist"
+    else
+        log_warn "Dashboard build failed; source assets were still installed"
     fi
 }
 
@@ -374,7 +425,7 @@ setup_directories() {
     print_step 4 4 "Setting up Directories"
 
     # Create LeIndex data directories (bin directory is created during install with sudo)
-    for dir in "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR"; do
+    for dir in "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$DASHBOARD_DIR"; do
         if [[ ! -d "$dir" ]]; then
             mkdir -p "$dir"
             log_success "Created: $dir"
@@ -2016,6 +2067,7 @@ main() {
     echo "  ${BOLD}Binary:${NC}       $INSTALL_BIN_DIR/$PROJECT_SLUG"
     echo "  ${BOLD}Config:${NC}       $CONFIG_DIR"
     echo "  ${BOLD}Data:${NC}         $DATA_DIR"
+    echo "  ${BOLD}Dashboard:${NC}    $DASHBOARD_DIR"
     echo "  ${BOLD}Install log:${NC}  $INSTALL_LOG"
     echo ""
     echo "To get started:"
@@ -2023,12 +2075,13 @@ main() {
     echo "  ${CYAN}2.${NC} Index a project: ${YELLOW}$PROJECT_SLUG index /path/to/project${NC}"
     echo "  ${CYAN}3.${NC} Run diagnostics: ${YELLOW}$PROJECT_SLUG diagnostics${NC}"
     echo "  ${CYAN}4.${NC} Start MCP server: ${YELLOW}$PROJECT_SLUG serve${NC}"
-    echo "  ${CYAN}5.${NC} ${BOLD}Start frontend dashboard:${NC} ${YELLOW}cd dashboard && bun run dev${NC}"
+    echo "  ${CYAN}5.${NC} ${BOLD}Start frontend dashboard:${NC} ${YELLOW}$PROJECT_SLUG dashboard${NC}"
     echo ""
     echo "  ${BOLD}Frontend Dashboard:${NC}"
     echo "  The dashboard is available at: ${CYAN}http://localhost:5173${NC}"
-    echo "  To build for production: ${YELLOW}cd dashboard && bun run build${NC}"
-    echo "  Built files will be in: ${CYAN}dashboard/dist/${NC}"
+    echo "  Installed dashboard path: ${CYAN}$DASHBOARD_DIR${NC}"
+    echo "  To rebuild production assets manually: ${YELLOW}cd $DASHBOARD_DIR && bun run build${NC}"
+    echo "  Built files are in: ${CYAN}$DASHBOARD_DIR/dist/${NC}"
     echo ""
     echo "For MCP server configuration, see the documentation."
     echo ""

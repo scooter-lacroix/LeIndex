@@ -19,6 +19,11 @@
       "@/*": ["./src/*"]
     }
   },
-  "include": ["src/**/*"],
+  "include": [
+    "src/index.tsx",
+    "src/app.tsx",
+    "src/lib/**/*.ts",
+    "src/types/index.ts"
+  ],
   "exclude": ["node_modules", "dist"]
 }

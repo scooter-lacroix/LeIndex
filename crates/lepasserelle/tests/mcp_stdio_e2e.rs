@@ -86,7 +86,7 @@ fn test_initialize_request_parses_correctly() {
     let json = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{}}}"#;
     let req = parse_request(json);
     assert_eq!(req.method, "initialize");
-    assert_eq!(req.id, serde_json::json!(1));
+    assert_eq!(req.id, Some(serde_json::json!(1)));
 }
 
 #[test]
@@ -119,7 +119,7 @@ fn test_notification_has_no_id_field() {
     let json = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
     let req = parse_request(json);
     assert_eq!(req.method, "notifications/initialized");
-    assert!(req.id.is_null(), "Notification should not have an id");
+    assert!(req.id.is_none(), "Notification should not have an id");
 }
 
 #[test]
@@ -372,7 +372,7 @@ fn test_notification_request_has_no_id() {
     let json = r#"{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}"#;
     let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
     assert!(
-        req.id.is_null(),
+        req.id.is_none(),
         "Notification must have no id (so callers know not to send a response)"
     );
 }

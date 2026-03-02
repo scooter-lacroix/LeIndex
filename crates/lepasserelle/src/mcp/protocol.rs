@@ -13,18 +13,19 @@ pub const JSONRPC_VERSION: &str = "2.0";
 /// Per the JSON-RPC 2.0 spec, a request must have:
 /// - jsonrpc: "2.0"
 /// - method: A string containing the method name to invoke
-/// - id: Request identifier (can be null for notifications)
+/// - id: Optional request identifier (absent for notifications)
 /// - params: Optional parameters (can be omitted if not needed)
 #[derive(Debug, Clone, Deserialize)]
 pub struct JsonRpcRequest {
     /// JSON-RPC version string, must be "2.0"
     pub jsonrpc: String,
-    /// Unique identifier for the request (null for notifications)
+    /// Unique identifier for the request (None for notifications)
     #[serde(default)]
-    pub id: Value,
+    pub id: Option<Value>,
     /// Method name to be invoked
     pub method: String,
     /// Parameters for the method call
+    #[serde(default)]
     pub params: Option<Value>,
 }
 
@@ -38,6 +39,11 @@ impl JsonRpcRequest {
             )));
         }
         Ok(())
+    }
+
+    /// Check if this is a notification (no id field)
+    pub fn is_notification(&self) -> bool {
+        self.id.is_none()
     }
 
     /// Extract tool call parameters from the request
@@ -63,6 +69,181 @@ impl JsonRpcRequest {
             name: name.to_string(),
             arguments,
         })
+    }
+}
+
+/// JSON-RPC 2.0 Notification
+///
+/// A notification is a Request object without an "id" member.
+/// The Server MUST NOT reply to a notification, including errors.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct JsonRpcNotification {
+    /// JSON-RPC version string, must be "2.0"
+    pub jsonrpc: String,
+    /// Method name for the notification
+    pub method: String,
+    /// Parameters for the notification
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+
+impl JsonRpcNotification {
+    /// Create a new notification
+    pub fn new(method: impl Into<String>) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: method.into(),
+            params: None,
+        }
+    }
+
+    /// Create a notification with parameters
+    pub fn with_params(method: impl Into<String>, params: Value) -> Self {
+        Self {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            method: method.into(),
+            params: Some(params),
+        }
+    }
+
+    /// Check if this is a known MCP notification type
+    pub fn notification_type(&self) -> NotificationType {
+        match self.method.as_str() {
+            "notifications/initialized" => NotificationType::Initialized,
+            "notifications/cancelled" => NotificationType::Cancelled,
+            "notifications/progress" => NotificationType::Progress,
+            "notifications/message" => NotificationType::Message,
+            "notifications/resources/updated" => NotificationType::ResourcesUpdated,
+            "notifications/resources/list_changed" => NotificationType::ResourcesListChanged,
+            "notifications/tools/list_changed" => NotificationType::ToolsListChanged,
+            "notifications/prompts/list_changed" => NotificationType::PromptsListChanged,
+            "notifications/roots/list_changed" => NotificationType::RootsListChanged,
+            _ => NotificationType::Unknown(self.method.clone()),
+        }
+    }
+}
+
+/// Known MCP notification types
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotificationType {
+    /// Sent by the client after initialization is complete
+    Initialized,
+    /// Sent to cancel a request
+    Cancelled,
+    /// Progress notification for long-running operations
+    Progress,
+    /// Logging message notification
+    Message,
+    /// Resource content updated notification
+    ResourcesUpdated,
+    /// Resource list changed notification
+    ResourcesListChanged,
+    /// Tool list changed notification
+    ToolsListChanged,
+    /// Prompt list changed notification
+    PromptsListChanged,
+    /// Roots list changed notification
+    RootsListChanged,
+    /// Unknown notification type
+    Unknown(String),
+}
+
+impl std::fmt::Display for NotificationType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotificationType::Initialized => write!(f, "notifications/initialized"),
+            NotificationType::Cancelled => write!(f, "notifications/cancelled"),
+            NotificationType::Progress => write!(f, "notifications/progress"),
+            NotificationType::Message => write!(f, "notifications/message"),
+            NotificationType::ResourcesUpdated => write!(f, "notifications/resources/updated"),
+            NotificationType::ResourcesListChanged => {
+                write!(f, "notifications/resources/list_changed")
+            }
+            NotificationType::ToolsListChanged => write!(f, "notifications/tools/list_changed"),
+            NotificationType::PromptsListChanged => write!(f, "notifications/prompts/list_changed"),
+            NotificationType::RootsListChanged => write!(f, "notifications/roots/list_changed"),
+            NotificationType::Unknown(method) => write!(f, "{}", method),
+        }
+    }
+}
+
+/// JSON-RPC 2.0 Message (Request or Notification)
+///
+/// This enum allows parsing either a request (with id) or notification (without id)
+/// from incoming JSON data.
+#[derive(Debug, Clone)]
+pub enum JsonRpcMessage {
+    /// A request with an id (expects response)
+    Request(JsonRpcRequest),
+    /// A notification without id (no response expected)
+    Notification(JsonRpcNotification),
+}
+
+impl JsonRpcMessage {
+    /// Parse a JSON string into a JsonRpcMessage
+    pub fn from_json(json: &str) -> Result<Self, JsonRpcError> {
+        let raw: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| JsonRpcError::parse_error(format!("Invalid JSON: {}", e)))?;
+
+        if !raw.is_object() {
+            return Err(JsonRpcError::invalid_request(
+                "Message must be a JSON object",
+            ));
+        }
+
+        let obj = raw.as_object().unwrap();
+
+        if let Some(jsonrpc) = obj.get("jsonrpc") {
+            if jsonrpc.as_str() != Some(JSONRPC_VERSION) {
+                return Err(JsonRpcError::invalid_request(format!(
+                    "Unsupported JSON-RPC version: {:?}",
+                    jsonrpc
+                )));
+            }
+        } else {
+            return Err(JsonRpcError::invalid_request("Missing jsonrpc field"));
+        }
+
+        if !obj.contains_key("method") {
+            return Err(JsonRpcError::invalid_request("Missing method field"));
+        }
+
+        if obj.contains_key("id") {
+            let request: JsonRpcRequest = serde_json::from_value(raw)
+                .map_err(|e| JsonRpcError::invalid_request(format!("Invalid request: {}", e)))?;
+            Ok(JsonRpcMessage::Request(request))
+        } else {
+            let notification: JsonRpcNotification = serde_json::from_value(raw).map_err(|e| {
+                JsonRpcError::invalid_request(format!("Invalid notification: {}", e))
+            })?;
+            Ok(JsonRpcMessage::Notification(notification))
+        }
+    }
+
+    /// Check if this message is a notification
+    pub fn is_notification(&self) -> bool {
+        matches!(self, JsonRpcMessage::Notification(_))
+    }
+
+    /// Check if this message is a request
+    pub fn is_request(&self) -> bool {
+        matches!(self, JsonRpcMessage::Request(_))
+    }
+
+    /// Get the method name from the message
+    pub fn method(&self) -> &str {
+        match self {
+            JsonRpcMessage::Request(req) => &req.method,
+            JsonRpcMessage::Notification(notif) => &notif.method,
+        }
+    }
+
+    /// Get the id if this is a request
+    pub fn id(&self) -> Option<&Value> {
+        match self {
+            JsonRpcMessage::Request(req) => req.id.as_ref(),
+            JsonRpcMessage::Notification(_) => None,
+        }
     }
 }
 
@@ -94,6 +275,11 @@ impl JsonRpcResponse {
         }
     }
 
+    /// Create a successful response with optional id
+    pub fn success_opt(id: Option<Value>, result: Value) -> Self {
+        Self::success(id.unwrap_or(Value::Null), result)
+    }
+
     /// Create an error response
     pub fn error(id: Value, error: JsonRpcError) -> Self {
         Self {
@@ -104,6 +290,11 @@ impl JsonRpcResponse {
         }
     }
 
+    /// Create an error response with optional id
+    pub fn error_opt(id: Option<Value>, error: JsonRpcError) -> Self {
+        Self::error(id.unwrap_or(Value::Null), error)
+    }
+
     /// Create a response from a Result
     pub fn from_result(id: Value, result: Result<Value, JsonRpcError>) -> Self {
         match result {
@@ -111,17 +302,22 @@ impl JsonRpcResponse {
             Err(err) => Self::error(id, err),
         }
     }
+
+    /// Create a response from a Result with optional id
+    pub fn from_result_opt(id: Option<Value>, result: Result<Value, JsonRpcError>) -> Self {
+        Self::from_result(id.unwrap_or(Value::Null), result)
+    }
 }
 
 /// JSON-RPC 2.0 Error
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcError {
     /// Error code indicating the type of failure
     pub code: i32,
     /// Human-readable description of the error
     pub message: String,
     /// Optional additional error details
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
 }
 
@@ -273,6 +469,7 @@ pub struct ToolCallParams {
     /// Name of the tool to be called
     pub name: String,
     /// Arguments for the tool call
+    #[serde(default)]
     pub arguments: Value,
 }
 
@@ -296,6 +493,10 @@ pub struct ProgressEvent {
     pub total: usize,
 
     /// Optional message with additional details
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+
+
     pub message: Option<String>,
 
     /// Timestamp in milliseconds
@@ -417,6 +618,64 @@ mod tests {
         let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
         assert!(req.validate().is_ok());
         assert_eq!(req.method, "tools/call");
+        assert!(!req.is_notification());
+        assert_eq!(req.id, Some(serde_json::json!(1)));
+    }
+
+    #[test]
+    fn test_jsonrpc_request_notification() {
+        let json = r#"{
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }"#;
+
+        let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
+        assert!(req.validate().is_ok());
+        assert!(req.is_notification());
+        assert!(req.id.is_none());
+    }
+
+    #[test]
+    fn test_jsonrpc_notification_parsing() {
+        let json = r#"{
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        }"#;
+
+        let notif: JsonRpcNotification = serde_json::from_str(json).unwrap();
+        assert_eq!(notif.method, "notifications/initialized");
+        assert_eq!(notif.notification_type(), NotificationType::Initialized);
+    }
+
+    #[test]
+    fn test_jsonrpc_message_request() {
+        let json = r#"{
+            "jsonrpc": "2.0",
+            "id": 42,
+            "method": "tools/call",
+            "params": {"name": "test"}
+        }"#;
+
+        let msg = JsonRpcMessage::from_json(json).unwrap();
+        assert!(msg.is_request());
+        assert!(!msg.is_notification());
+        assert_eq!(msg.method(), "tools/call");
+        assert_eq!(msg.id(), Some(&serde_json::json!(42)));
+    }
+
+    #[test]
+    fn test_jsonrpc_message_notification() {
+        let json = r#"{
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }"#;
+
+        let msg = JsonRpcMessage::from_json(json).unwrap();
+        assert!(msg.is_notification());
+        assert!(!msg.is_request());
+        assert_eq!(msg.method(), "notifications/initialized");
+        assert!(msg.id().is_none());
     }
 
     #[test]
@@ -429,6 +688,29 @@ mod tests {
 
         let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
         assert!(req.validate().is_err());
+    }
+
+    #[test]
+    fn test_jsonrpc_message_invalid_version() {
+        let json = r#"{
+            "jsonrpc": "1.0",
+            "id": 1,
+            "method": "tools/call"
+        }"#;
+
+        let result = JsonRpcMessage::from_json(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_jsonrpc_message_missing_method() {
+        let json = r#"{
+            "jsonrpc": "2.0",
+            "id": 1
+        }"#;
+
+        let result = JsonRpcMessage::from_json(json);
+        assert!(result.is_err());
     }
 
     #[test]
@@ -449,6 +731,15 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("\"error\""));
         assert!(!json.contains("\"result\""));
+    }
+
+    #[test]
+    fn test_jsonrpc_response_with_null_id() {
+        let response =
+            JsonRpcResponse::success(serde_json::Value::Null, serde_json::json!({"result": "ok"}));
+
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("\"id\":null"));
     }
 
     #[test]
@@ -479,5 +770,54 @@ mod tests {
         assert_eq!(error_codes::INTERNAL_ERROR, -32603);
         assert_eq!(error_codes::PROJECT_NOT_FOUND, -32001);
         assert_eq!(error_codes::PROJECT_NOT_INDEXED, -32002);
+    }
+
+    #[test]
+    fn test_notification_types() {
+        assert_eq!(
+            JsonRpcNotification::new("notifications/initialized").notification_type(),
+            NotificationType::Initialized
+        );
+        assert_eq!(
+            JsonRpcNotification::new("notifications/cancelled").notification_type(),
+            NotificationType::Cancelled
+        );
+        assert_eq!(
+            JsonRpcNotification::new("notifications/progress").notification_type(),
+            NotificationType::Progress
+        );
+        assert_eq!(
+            JsonRpcNotification::new("notifications/message").notification_type(),
+            NotificationType::Message
+        );
+        assert_eq!(
+            JsonRpcNotification::new("notifications/resources/updated").notification_type(),
+            NotificationType::ResourcesUpdated
+        );
+        assert_eq!(
+            JsonRpcNotification::new("unknown/notification").notification_type(),
+            NotificationType::Unknown("unknown/notification".to_string())
+        );
+    }
+
+    #[test]
+    fn test_backwards_compatibility() {
+        // Ensure requests with id still work as before
+        let json = r#"{
+            "jsonrpc": "2.0",
+            "id": "test-id-123",
+            "method": "initialize",
+            "params": {}
+        }"#;
+
+        let msg = JsonRpcMessage::from_json(json).unwrap();
+        assert!(msg.is_request());
+
+        if let JsonRpcMessage::Request(req) = msg {
+            assert_eq!(req.id, Some(serde_json::json!("test-id-123")));
+            assert!(!req.is_notification());
+        } else {
+            panic!("Expected request");
+        }
     }
 }

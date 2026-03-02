@@ -1,13 +1,16 @@
 {
   "name": "leindex-dashboard",
-  "version": "2.0.0",
+  "private": true,
+  "version": "1.5.0",
   "description": "LeIndex Dashboard - Visual interface for code indexing and analysis",
   "type": "module",
   "scripts": {
     "dev": "bun run --hot server.ts",
     "build": "bun build ./index.html --outdir=dist --minify",
     "start": "bun run server.ts",
-    "typecheck": "tsc --noEmit"
+    "preview": "bun run server.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "echo 'lint not configured'"
   },
   "dependencies": {
     "react": "^18.2.0",

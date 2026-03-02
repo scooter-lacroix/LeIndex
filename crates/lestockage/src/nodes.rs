@@ -34,7 +34,10 @@ pub struct NodeRecord {
     /// Byte range start
     pub byte_range_start: Option<i64>,
     /// Byte range end
+    /// Byte range end
     pub byte_range_end: Option<i64>,
+    /// Embedding format (0 = f32, 1 = int8 quantized)
+    pub embedding_format: Option<i32>,
 }
 
 /// Node type enum
@@ -91,8 +94,8 @@ impl<'a> NodeStore<'a> {
     /// Insert a node record
     pub fn insert(&mut self, record: &NodeRecord) -> SqliteResult<i64> {
         self.storage.conn().execute(
-            "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, created_at, updated_at, embedding_format)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 record.project_id,
                 record.file_path,
@@ -109,6 +112,7 @@ impl<'a> NodeStore<'a> {
                 record.byte_range_end,
                 chrono::Utc::now().timestamp(),
                 chrono::Utc::now().timestamp(),
+                record.embedding_format,
             ],
         )?;
 
@@ -122,8 +126,8 @@ impl<'a> NodeStore<'a> {
         let mut ids = Vec::new();
         for record in records {
             tx.execute(
-                "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, created_at, updated_at, embedding_format)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     record.project_id,
                     record.file_path,
@@ -140,6 +144,7 @@ impl<'a> NodeStore<'a> {
                     record.byte_range_end,
                     chrono::Utc::now().timestamp(),
                     chrono::Utc::now().timestamp(),
+                    record.embedding_format,
                 ],
             )?;
             ids.push(tx.last_insert_rowid());
@@ -152,7 +157,7 @@ impl<'a> NodeStore<'a> {
     /// Get node by ID
     pub fn get(&self, id: i64) -> SqliteResult<Option<NodeRecord>> {
         let mut stmt = self.storage.conn().prepare(
-            "SELECT id, project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end
+            "SELECT id, project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, embedding_format
              FROM intel_nodes WHERE id = ?1"
         )?;
 
@@ -173,6 +178,7 @@ impl<'a> NodeStore<'a> {
                 embedding: row.get(11)?,
                 byte_range_start: row.get(12)?,
                 byte_range_end: row.get(13)?,
+                embedding_format: row.get(14)?,
             })
         });
 
@@ -182,7 +188,7 @@ impl<'a> NodeStore<'a> {
     /// Find node by content hash
     pub fn find_by_hash(&self, hash: &str) -> SqliteResult<Option<NodeRecord>> {
         let mut stmt = self.storage.conn().prepare(
-            "SELECT id, project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end
+            "SELECT id, project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, embedding_format
              FROM intel_nodes WHERE content_hash = ?1"
         )?;
 
@@ -203,6 +209,7 @@ impl<'a> NodeStore<'a> {
                 embedding: row.get(11)?,
                 byte_range_start: row.get(12)?,
                 byte_range_end: row.get(13)?,
+                embedding_format: row.get(14)?,
             })
         });
 
@@ -212,7 +219,7 @@ impl<'a> NodeStore<'a> {
     /// Get nodes by file path
     pub fn get_by_file(&self, file_path: &str) -> SqliteResult<Vec<NodeRecord>> {
         let mut stmt = self.storage.conn().prepare(
-            "SELECT id, project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end
+            "SELECT id, project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, signature, complexity, content_hash, embedding, byte_range_start, byte_range_end, embedding_format
              FROM intel_nodes WHERE file_path = ?1"
         )?;
 
@@ -234,6 +241,7 @@ impl<'a> NodeStore<'a> {
                     embedding: row.get(11)?,
                     byte_range_start: row.get(12)?,
                     byte_range_end: row.get(13)?,
+                    embedding_format: row.get(14)?,
                 })
             })?
             .collect::<SqliteResult<Vec<_>>>()?;
@@ -269,6 +277,7 @@ mod tests {
             embedding: None,
             byte_range_start: Some(0),
             byte_range_end: Some(100),
+            embedding_format: None,
         };
 
         let id = store.insert(&record).unwrap();
@@ -299,6 +308,7 @@ mod tests {
             embedding: None,
             byte_range_start: Some(0),
             byte_range_end: Some(100),
+            embedding_format: None,
         };
 
         store.insert(&record).unwrap();

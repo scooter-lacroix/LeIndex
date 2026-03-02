@@ -17,7 +17,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Version to publish
-VERSION="0.1.0"
+VERSION="1.5.0"
 
 echo -e "${GREEN}=== LeIndex Crate Publishing Script ===${NC}"
 echo "Publishing version: $VERSION"
