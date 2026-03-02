@@ -3,13 +3,14 @@
 // This module implements the handlers for each MCP tool that the server exposes.
 
 use super::protocol::JsonRpcError;
+#[cfg(test)]
 use crate::leindex::LeIndex;
+use crate::registry::ProjectRegistry;
 use leedit::EditChange;
 use lephase::{run_phase_analysis, DocsMode, FormatMode, PhaseOptions, PhaseSelection};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 
 /// Enum of all tool handlers
 ///
@@ -123,26 +124,26 @@ impl ToolHandler {
     /// Execute the tool
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         match self {
-            ToolHandler::Index(h) => h.execute(leindex, args).await,
-            ToolHandler::Search(h) => h.execute(leindex, args).await,
-            ToolHandler::DeepAnalyze(h) => h.execute(leindex, args).await,
-            ToolHandler::Context(h) => h.execute(leindex, args).await,
-            ToolHandler::Diagnostics(h) => h.execute(leindex, args).await,
-            ToolHandler::PhaseAnalysis(h) => h.execute(leindex, args).await,
-            ToolHandler::PhaseAnalysisAlias(h) => h.execute(leindex, args).await,
-            ToolHandler::FileSummary(h) => h.execute(leindex, args).await,
-            ToolHandler::SymbolLookup(h) => h.execute(leindex, args).await,
-            ToolHandler::ProjectMap(h) => h.execute(leindex, args).await,
-            ToolHandler::GrepSymbols(h) => h.execute(leindex, args).await,
-            ToolHandler::ReadSymbol(h) => h.execute(leindex, args).await,
-            ToolHandler::EditPreview(h) => h.execute(leindex, args).await,
-            ToolHandler::EditApply(h) => h.execute(leindex, args).await,
-            ToolHandler::RenameSymbol(h) => h.execute(leindex, args).await,
-            ToolHandler::ImpactAnalysis(h) => h.execute(leindex, args).await,
+            ToolHandler::Index(h) => h.execute(registry, args).await,
+            ToolHandler::Search(h) => h.execute(registry, args).await,
+            ToolHandler::DeepAnalyze(h) => h.execute(registry, args).await,
+            ToolHandler::Context(h) => h.execute(registry, args).await,
+            ToolHandler::Diagnostics(h) => h.execute(registry, args).await,
+            ToolHandler::PhaseAnalysis(h) => h.execute(registry, args).await,
+            ToolHandler::PhaseAnalysisAlias(h) => h.execute(registry, args).await,
+            ToolHandler::FileSummary(h) => h.execute(registry, args).await,
+            ToolHandler::SymbolLookup(h) => h.execute(registry, args).await,
+            ToolHandler::ProjectMap(h) => h.execute(registry, args).await,
+            ToolHandler::GrepSymbols(h) => h.execute(registry, args).await,
+            ToolHandler::ReadSymbol(h) => h.execute(registry, args).await,
+            ToolHandler::EditPreview(h) => h.execute(registry, args).await,
+            ToolHandler::EditApply(h) => h.execute(registry, args).await,
+            ToolHandler::RenameSymbol(h) => h.execute(registry, args).await,
+            ToolHandler::ImpactAnalysis(h) => h.execute(registry, args).await,
         }
     }
 }
@@ -160,18 +161,59 @@ fn extract_string(args: &Value, key: &str) -> Result<String, JsonRpcError> {
         })
 }
 
-/// Helper to extract usize argument with default
+/// Helper to extract usize argument with default.
+///
+/// Accepts native JSON numbers **and** string representations (`"10"`, `"200"`)
+/// for robustness against LLM clients that serialise integers as strings.
 fn extract_usize(args: &Value, key: &str, default: usize) -> Result<usize, JsonRpcError> {
-    args.get(key)
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .or(Some(default))
-        .ok_or_else(|| JsonRpcError::invalid_params(format!("Invalid usize argument: {}", key)))
+    match args.get(key) {
+        Some(Value::Number(n)) => Ok(n.as_u64().map(|v| v as usize).unwrap_or(default)),
+        Some(Value::String(s)) => s.trim().parse::<usize>().or(Ok(default)),
+        _ => Ok(default),
+    }
 }
 
 /// Helper to extract bool argument with default.
+///
+/// Accepts both native JSON booleans (`true`/`false`) and string representations
+/// (`"true"`, `"false"`, `"1"`, `"0"`, `"yes"`, `"no"`).  This makes the API
+/// robust against LLM clients that serialize booleans as strings.
 fn extract_bool(args: &Value, key: &str, default: bool) -> bool {
-    args.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+    match args.get(key) {
+        Some(Value::Bool(b)) => *b,
+        Some(Value::String(s)) => match s.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => true,
+            "false" | "0" | "no" => false,
+            _ => default,
+        },
+        Some(Value::Number(n)) => n.as_u64().map(|v| v != 0).unwrap_or(default),
+        _ => default,
+    }
+}
+
+// `ensure_project_ready` is replaced by `ProjectRegistry::get_or_create()`.
+
+/// Validate that a file path resides within the project root.
+///
+/// Returns `Ok(canonical_path)` if the file is within bounds, or an error
+/// describing the boundary violation.
+fn validate_file_within_project(
+    file_path: &str,
+    project_root: &std::path::Path,
+) -> Result<PathBuf, JsonRpcError> {
+    let canonical = std::path::Path::new(file_path)
+        .canonicalize()
+        .map_err(|e| {
+            JsonRpcError::invalid_params(format!("Cannot resolve file path '{}': {}", file_path, e))
+        })?;
+    if !canonical.starts_with(project_root) {
+        return Err(JsonRpcError::invalid_params(format!(
+            "File '{}' is outside the project boundary '{}'",
+            file_path,
+            project_root.display()
+        )));
+    }
+    Ok(canonical)
 }
 
 /// Handler for leindex_index
@@ -188,7 +230,9 @@ impl IndexHandler {
 
     /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
-        "Index a project for code search and analysis. Parses all source files, builds the Program Dependence Graph, and creates the semantic search index."
+        "Index a project. Auto-indexes on first use; returns cached stats on repeat calls. \
+Use force_reindex=true only to rebuild after external file changes. All other tools \
+also accept project_path and auto-index, so explicit indexing is optional."
     }
 
     /// Returns the JSON schema for the arguments of this RPC method
@@ -202,7 +246,8 @@ impl IndexHandler {
                 },
                 "force_reindex": {
                     "type": "boolean",
-                    "description": "If true, re-index even if already indexed (default: false)",
+                    "description": "If true, re-index even if already indexed (default: false). \
+        Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
                     "default": false
                 }
             },
@@ -213,59 +258,26 @@ impl IndexHandler {
     /// Executes the RPC method
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let project_path = extract_string(&args, "project_path")?;
-        let force_reindex = args
-            .get("force_reindex")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let force_reindex = extract_bool(&args, "force_reindex", false);
 
-        // Check if already indexed and we're not forcing reindex
-        {
-            let index = leindex.lock().await;
-            if index.is_indexed() && !force_reindex {
+        if !force_reindex {
+            // Auto-index-if-needed path: registry handles everything.
+            let handle = registry.get_or_create(Some(&project_path)).await?;
+            let index = handle.lock().await;
+            if index.is_indexed() {
                 return serde_json::to_value(index.get_stats()).map_err(|e| {
                     JsonRpcError::internal_error(format!("Serialization error: {}", e))
                 });
             }
         }
 
-        // Create new LeIndex instance and index the project in a blocking task
-        let project_path_clone = project_path.clone();
-        let stats = tokio::task::spawn_blocking(move || {
-            let mut temp_leindex = LeIndex::new(&project_path_clone).map_err(|e| {
-                JsonRpcError::indexing_failed(format!("Failed to create LeIndex: {}", e))
-            })?;
-
-            temp_leindex
-                .index_project(force_reindex)
-                .map_err(|e| JsonRpcError::indexing_failed(format!("Indexing failed: {}", e)))
-        })
-        .await
-        .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))??;
-
-        // Update shared state by loading the newly indexed project from storage
-        let mut index = leindex.lock().await;
-
-        // Ensure path matches (canonicalize to be safe)
-        let path = std::path::Path::new(&project_path)
-            .canonicalize()
-            .map_err(|e| {
-                JsonRpcError::internal_error(format!("Failed to canonicalize path: {}", e))
-            })?;
-
-        if index.project_path() != path {
-            let _ = index.close();
-            *index = LeIndex::new(&path).map_err(|e| {
-                JsonRpcError::indexing_failed(format!("Failed to re-initialize LeIndex: {}", e))
-            })?;
-        }
-
-        index.load_from_storage().map_err(|e| {
-            JsonRpcError::indexing_failed(format!("Failed to load indexed data: {}", e))
-        })?;
+        let stats = registry
+            .index_project(Some(&project_path), force_reindex)
+            .await?;
 
         serde_json::to_value(stats)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
@@ -286,7 +298,9 @@ impl SearchHandler {
 
     /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
-        "Semantic code search across the indexed project. Finds symbols by meaning even without exact name matches — supersedes Grep for concept-level discovery. Returns ranked results with file, line range, and context."
+        "Semantic code search. Finds symbols by meaning, not just name. Returns ranked \
+results with composite scores (semantic + text + structural). Accepts project_path \
+to auto-switch/auto-index projects."
     }
 
     /// Returns the JSON schema for the arguments of this RPC method
@@ -298,12 +312,22 @@ impl SearchHandler {
                     "type": "string",
                     "description": "Search query (e.g., 'authentication', 'database connection')"
                 },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                },
                 "top_k": {
                     "type": "integer",
                     "description": "Maximum number of results to return (default: 10)",
                     "default": 10,
                     "minimum": 1,
                     "maximum": 100
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Skip the first N results for pagination (default: 0)",
+                    "default": 0,
+                    "minimum": 0
                 }
             },
             "required": ["query"]
@@ -313,13 +337,16 @@ impl SearchHandler {
     /// Executes the RPC method
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let query = extract_string(&args, "query")?;
         let top_k = extract_usize(&args, "top_k", 10)?;
+        let offset = extract_usize(&args, "offset", 0)?;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let mut index = leindex.lock().await;
+        let handle = registry.get_or_create(project_path).await?;
+        let mut index = handle.lock().await;
 
         if index.search_engine().is_empty() {
             return Err(JsonRpcError::project_not_indexed(
@@ -327,12 +354,22 @@ impl SearchHandler {
             ));
         }
 
-        let results = index
-            .search(&query, top_k)
+        // Fetch top_k + offset results, then slice for pagination
+        let all_results = index
+            .search(&query, top_k + offset)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
-        serde_json::to_value(results)
-            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
+        let page: Vec<_> = all_results.into_iter().skip(offset).collect();
+        let total_returned = page.len();
+
+        Ok(serde_json::json!({
+            "results": serde_json::to_value(&page).map_err(|e|
+                JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
+            "offset": offset,
+            "count": total_returned,
+            "has_more": total_returned == top_k,
+            "scoring": "Each result has a composite score (0.0–1.0): 0.5×semantic (TF-IDF cosine similarity) + 0.3×text_match (token overlap) + 0.2×structural (PDG centrality)."
+        }))
     }
 }
 
@@ -350,7 +387,9 @@ impl DeepAnalyzeHandler {
 
     /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
-        "Deep analysis combining semantic search with PDG traversal: definition, callers, callees, data flow, and impact radius. Supersedes Grep + multiple Read calls for understanding unfamiliar code without context loss."
+        "Deep analysis: semantic search + PDG traversal for definition, callers, callees, \
+data flow, and impact radius. Supersedes Grep + multiple Read. Accepts project_path \
+to auto-switch/auto-index projects."
     }
 
     /// Returns the JSON schema for the arguments of this RPC method
@@ -361,6 +400,10 @@ impl DeepAnalyzeHandler {
                 "query": {
                     "type": "string",
                     "description": "Analysis query (e.g., 'How does authentication work?', 'Where is user data stored?')"
+                },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
                 },
                 "token_budget": {
                     "type": "integer",
@@ -377,13 +420,15 @@ impl DeepAnalyzeHandler {
     /// Executes the RPC method
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let query = extract_string(&args, "query")?;
         let token_budget = extract_usize(&args, "token_budget", 2000)?;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let mut writer = leindex.lock().await;
+        let handle = registry.get_or_create(project_path).await?;
+        let mut writer = handle.lock().await;
 
         if writer.search_engine().is_empty() {
             return Err(JsonRpcError::project_not_indexed(
@@ -414,7 +459,9 @@ impl ContextHandler {
 
     /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
-        "Expand context around a code node via PDG: callers, callees, data dependencies, and sibling nodes. Supersedes Read for understanding how a function fits into its module without reading the entire file."
+        "Expand context around a code node via PDG: callers, callees, data dependencies, and \
+sibling nodes. Supersedes Read for understanding how a function fits into its module \
+without reading the entire file. Accepts project_path to auto-switch between projects."
     }
 
     /// Returns the JSON schema for the arguments of this RPC method
@@ -424,7 +471,11 @@ impl ContextHandler {
             "properties": {
                 "node_id": {
                     "type": "string",
-                    "description": "Node ID to expand context around"
+                    "description": "Node ID to expand context around (short name like 'my_func' or full ID like 'file.py:Class.method')"
+                },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
                 },
                 "token_budget": {
                     "type": "integer",
@@ -441,13 +492,15 @@ impl ContextHandler {
     /// Executes the RPC method
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let node_id = extract_string(&args, "node_id")?;
         let token_budget = extract_usize(&args, "token_budget", 2000)?;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let reader = leindex.lock().await;
+        let handle = registry.get_or_create(project_path).await?;
+        let reader = handle.lock().await;
 
         if !reader.is_indexed() {
             return Err(JsonRpcError::project_not_indexed(
@@ -487,10 +540,10 @@ impl PhaseAnalysisHandler {
     /// Executes the RPC method.
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        execute_phase_analysis(leindex, args).await
+        execute_phase_analysis(registry, args).await
     }
 }
 
@@ -517,10 +570,10 @@ impl PhaseAnalysisAliasHandler {
     /// Executes the alias method.
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        execute_phase_analysis(leindex, args).await
+        execute_phase_analysis(registry, args).await
     }
 }
 
@@ -535,13 +588,18 @@ fn phase_analysis_schema() -> Value {
                 ],
                 "default": "all"
             },
+            "project_path": {
+                "type": "string",
+                "description": "Project directory (auto-indexes on first use; omit to use current project)"
+            },
             "mode": {
                 "type": "string",
                 "enum": ["ultra", "balanced", "verbose"],
                 "default": "balanced"
             },
             "path": {
-                "type": "string"
+                "type": "string",
+                "description": "File or directory to analyze (defaults to project root)"
             },
             "max_files": {
                 "type": "integer",
@@ -561,6 +619,8 @@ fn phase_analysis_schema() -> Value {
             },
             "include_docs": {
                 "type": "boolean",
+                "description": "Include Markdown/Text docs in phase analysis (default: false). \
+    Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
                 "default": false
             },
             "docs_mode": {
@@ -574,9 +634,12 @@ fn phase_analysis_schema() -> Value {
 }
 
 async fn execute_phase_analysis(
-    leindex: &Arc<Mutex<LeIndex>>,
+    registry: &Arc<ProjectRegistry>,
     args: Value,
 ) -> Result<Value, JsonRpcError> {
+    let project_path = args.get("project_path").and_then(|v| v.as_str());
+    let handle = registry.get_or_create(project_path).await?;
+
     let selection = match args.get("phase") {
         None => PhaseSelection::All,
         Some(Value::String(s)) if s.eq_ignore_ascii_case("all") => PhaseSelection::All,
@@ -603,8 +666,7 @@ async fn execute_phase_analysis(
         _ => {
             return Err(JsonRpcError::invalid_params_with_suggestion(
                 "Invalid 'phase'".to_string(),
-                "Use phase: 1..5, phase: \"1\"..\"5\", or phase: \"all\" (default)"
-                    .to_string(),
+                "Use phase: 1..5, phase: \"1\"..\"5\", or phase: \"all\" (default)".to_string(),
             ));
         }
     };
@@ -628,7 +690,7 @@ async fn execute_phase_analysis(
     let include_docs = extract_bool(&args, "include_docs", false);
 
     let base_project_root = {
-        let reader = leindex.lock().await;
+        let reader = handle.lock().await;
         reader.project_path().to_path_buf()
     };
 
@@ -640,8 +702,11 @@ async fn execute_phase_analysis(
     };
 
     // Keep a clone for the C.7 single-file deep-dive enrichment below.
-    let single_file_target: Option<PathBuf> =
-        if canonical_target.is_file() { Some(canonical_target.clone()) } else { None };
+    let single_file_target: Option<PathBuf> = if canonical_target.is_file() {
+        Some(canonical_target.clone())
+    } else {
+        None
+    };
 
     let (root, focus_files) = if canonical_target.is_file() {
         let file_root = canonical_target
@@ -666,86 +731,87 @@ async fn execute_phase_analysis(
     // ── Single-file deep dive (Task C.7) ────────────────────────────────────
     // When `path` is a file, augment the phase report with per-symbol PDG data:
     // signature, line range, complexity, caller_count, cross-file deps.
-    let file_symbols_json: Option<Vec<serde_json::Value>> = if let Some(ref file_path) = single_file_target {
-        // Read the file for byte→line conversion (single file, cheap).
-        let file_content = std::fs::read_to_string(file_path).unwrap_or_default();
+    let file_symbols_json: Option<Vec<serde_json::Value>> =
+        if let Some(ref file_path) = single_file_target {
+            // Read the file for byte→line conversion (single file, cheap).
+            let file_content = std::fs::read_to_string(file_path).unwrap_or_default();
 
-        // Build line-start offsets for O(log N) byte→line lookups.
-        let mut line_starts = vec![0usize];
-        for (i, &b) in file_content.as_bytes().iter().enumerate() {
-            if b == b'\n' {
-                line_starts.push(i + 1);
+            // Build line-start offsets for O(log N) byte→line lookups.
+            let mut line_starts = vec![0usize];
+            for (i, &b) in file_content.as_bytes().iter().enumerate() {
+                if b == b'\n' {
+                    line_starts.push(i + 1);
+                }
             }
-        }
-        let byte_to_line = |byte: usize| -> usize {
-            // Returns 1-indexed line number
-            line_starts.partition_point(|&s| s <= byte)
-        };
+            let byte_to_line = |byte: usize| -> usize {
+                // Returns 1-indexed line number
+                line_starts.partition_point(|&s| s <= byte)
+            };
 
-        let file_path_str = file_path.to_string_lossy().to_string();
-        let reader = leindex.lock().await;
-        if let Some(pdg) = reader.pdg() {
-            let node_ids = pdg.nodes_in_file(&file_path_str);
-            let mut symbols: Vec<serde_json::Value> = node_ids
-                .iter()
-                .filter_map(|&node_idx| {
-                    let node = pdg.get_node(node_idx)?;
-                    let (start_byte, end_byte) = node.byte_range;
-                    let line_start = byte_to_line(start_byte);
-                    let line_end = byte_to_line(end_byte.saturating_sub(1));
+            let file_path_str = file_path.to_string_lossy().to_string();
+            let reader = handle.lock().await;
+            if let Some(pdg) = reader.pdg() {
+                let node_ids = pdg.nodes_in_file(&file_path_str);
+                let mut symbols: Vec<serde_json::Value> = node_ids
+                    .iter()
+                    .filter_map(|&node_idx| {
+                        let node = pdg.get_node(node_idx)?;
+                        let (start_byte, end_byte) = node.byte_range;
+                        let line_start = byte_to_line(start_byte);
+                        let line_end = byte_to_line(end_byte.saturating_sub(1));
 
-                    // Signature: first non-empty line at the node's byte offset.
-                    let signature: Option<String> = if start_byte < file_content.len() {
-                        file_content[start_byte..]
-                            .lines()
-                            .next()
-                            .map(|l| l.trim().to_string())
-                            .filter(|l| !l.is_empty() && !l.starts_with("// ["))
-                    } else {
-                        None
-                    };
+                        // Signature: first non-empty line at the node's byte offset.
+                        let signature: Option<String> = if start_byte < file_content.len() {
+                            file_content[start_byte..]
+                                .lines()
+                                .next()
+                                .map(|l| l.trim().to_string())
+                                .filter(|l| !l.is_empty() && !l.starts_with("// ["))
+                        } else {
+                            None
+                        };
 
-                    // Cross-file outgoing dependencies (calls/imports to other files).
-                    let cross_file_deps: Vec<serde_json::Value> = pdg
-                        .neighbors(node_idx)
-                        .iter()
-                        .filter_map(|&dep_idx| pdg.get_node(dep_idx))
-                        .filter(|dep| dep.file_path != node.file_path)
-                        .map(|dep| {
-                            serde_json::json!({
-                                "name": dep.name,
-                                "file": dep.file_path,
-                                "type": format!("{:?}", dep.node_type).to_lowercase(),
+                        // Cross-file outgoing dependencies (calls/imports to other files).
+                        let cross_file_deps: Vec<serde_json::Value> = pdg
+                            .neighbors(node_idx)
+                            .iter()
+                            .filter_map(|&dep_idx| pdg.get_node(dep_idx))
+                            .filter(|dep| dep.file_path != node.file_path)
+                            .map(|dep| {
+                                serde_json::json!({
+                                    "name": dep.name,
+                                    "file": dep.file_path,
+                                    "type": format!("{:?}", dep.node_type).to_lowercase(),
+                                })
                             })
-                        })
-                        .collect();
+                            .collect();
 
-                    let symbol_type = format!("{:?}", node.node_type).to_lowercase();
+                        let symbol_type = format!("{:?}", node.node_type).to_lowercase();
 
-                    Some(serde_json::json!({
-                        "name": node.name,
-                        "symbol_type": symbol_type,
-                        "signature": signature,
-                        "line_start": line_start,
-                        "line_end": line_end,
-                        "complexity": node.complexity,
-                        "caller_count": pdg.predecessor_count(node_idx),
-                        "dependency_count": pdg.neighbors(node_idx).len(),
-                        "cross_file_deps": cross_file_deps,
-                    }))
-                })
-                .collect();
+                        Some(serde_json::json!({
+                            "name": node.name,
+                            "symbol_type": symbol_type,
+                            "signature": signature,
+                            "line_start": line_start,
+                            "line_end": line_end,
+                            "complexity": node.complexity,
+                            "caller_count": pdg.predecessor_count(node_idx),
+                            "dependency_count": pdg.neighbors(node_idx).len(),
+                            "cross_file_deps": cross_file_deps,
+                        }))
+                    })
+                    .collect();
 
-            // Sort by line_start so the LLM reads top-to-bottom.
-            symbols.sort_by_key(|s| s["line_start"].as_u64().unwrap_or(0));
-            Some(symbols)
+                // Sort by line_start so the LLM reads top-to-bottom.
+                symbols.sort_by_key(|s| s["line_start"].as_u64().unwrap_or(0));
+                Some(symbols)
+            } else {
+                // PDG not available (project not yet indexed) — skip enrichment.
+                None
+            }
         } else {
-            // PDG not available (project not yet indexed) — skip enrichment.
             None
-        }
-    } else {
-        None
-    };
+        };
 
     let options = PhaseOptions {
         root,
@@ -800,7 +866,12 @@ impl DiagnosticsHandler {
     pub fn argument_schema(&self) -> Value {
         serde_json::json!({
             "type": "object",
-            "properties": {},
+            "properties": {
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (omit to use current project)"
+                }
+            },
             "required": []
         })
     }
@@ -808,10 +879,12 @@ impl DiagnosticsHandler {
     /// Executes the RPC method
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
-        _args: Value,
+        registry: &Arc<ProjectRegistry>,
+        args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let reader = leindex.lock().await;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
+        let reader = handle.lock().await;
 
         let diagnostics = reader.get_diagnostics().map_err(|e| {
             JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e))
@@ -875,7 +948,9 @@ pub struct FileSummaryHandler;
 
 #[allow(missing_docs)]
 impl FileSummaryHandler {
-    pub fn name(&self) -> &str { "leindex_file_summary" }
+    pub fn name(&self) -> &str {
+        "leindex_file_summary"
+    }
 
     pub fn description(&self) -> &str {
         "Structural analysis of a file: all symbols, signatures, complexity scores, \
@@ -892,6 +967,10 @@ cross-file relationships that Read cannot provide."
                     "type": "string",
                     "description": "Absolute path to the file to analyze"
                 },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                },
                 "token_budget": {
                     "type": "integer",
                     "description": "Max tokens for response (default: 1000)",
@@ -899,7 +978,8 @@ cross-file relationships that Read cannot provide."
                 },
                 "include_source": {
                     "type": "boolean",
-                    "description": "Include source snippets for key symbols (default: false)",
+                    "description": "Include source snippets for key symbols (default: false). \
+        Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
                     "default": false
                 },
                 "focus_symbol": {
@@ -913,15 +993,23 @@ cross-file relationships that Read cannot provide."
 
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let file_path = extract_string(&args, "file_path")?;
         let include_source = extract_bool(&args, "include_source", false);
-        let focus_symbol = args.get("focus_symbol").and_then(|v| v.as_str()).map(str::to_owned);
+        let focus_symbol = args
+            .get("focus_symbol")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
         let token_budget = extract_usize(&args, "token_budget", 1000)?;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let index = leindex.lock().await;
+        let handle = registry.get_or_create(project_path).await?;
+        let index = handle.lock().await;
+
+        // Enforce project boundary
+        let _ = validate_file_within_project(&file_path, index.project_path())?;
 
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
@@ -1027,9 +1115,15 @@ cross-file relationships that Read cannot provide."
         let func_count = symbols.iter().filter(|s| s["type"] == "function").count();
         let class_count = symbols.iter().filter(|s| s["type"] == "class").count();
         let module_role = if class_count > func_count {
-            format!("Class definitions ({} classes, {} functions)", class_count, func_count)
+            format!(
+                "Class definitions ({} classes, {} functions)",
+                class_count, func_count
+            )
         } else {
-            format!("Function module ({} functions, {} classes)", func_count, class_count)
+            format!(
+                "Function module ({} functions, {} classes)",
+                func_count, class_count
+            )
         };
 
         Ok(serde_json::json!({
@@ -1053,7 +1147,9 @@ pub struct SymbolLookupHandler;
 
 #[allow(missing_docs)]
 impl SymbolLookupHandler {
-    pub fn name(&self) -> &str { "leindex_symbol_lookup" }
+    pub fn name(&self) -> &str {
+        "leindex_symbol_lookup"
+    }
 
     pub fn description(&self) -> &str {
         "Look up a symbol and get its full structural context: definition, signature, callers, \
@@ -1067,7 +1163,16 @@ a single structured response including cross-file relationships."
             "properties": {
                 "symbol": {
                     "type": "string",
-                    "description": "Symbol name to look up"
+                    "description": "Symbol name to look up (single symbol)"
+                },
+                "symbols": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Batch mode: look up multiple symbols in one call (max 20)"
+                },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
                 },
                 "token_budget": {
                     "type": "integer",
@@ -1076,17 +1181,20 @@ a single structured response including cross-file relationships."
                 },
                 "include_source": {
                     "type": "boolean",
-                    "description": "Include source code of definition (default: false)",
+                    "description": "Include source code of definition (default: false). \
+        Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
                     "default": false
                 },
                 "include_callers": {
                     "type": "boolean",
-                    "description": "Include callers (default: true)",
+                    "description": "Include callers (default: true). \
+        Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
                     "default": true
                 },
                 "include_callees": {
                     "type": "boolean",
-                    "description": "Include callees (default: true)",
+                    "description": "Include callees (default: true). \
+        Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
                     "default": true
                 },
                 "depth": {
@@ -1097,60 +1205,163 @@ a single structured response including cross-file relationships."
                     "maximum": 5
                 }
             },
-            "required": ["symbol"]
+            "required": []
         })
     }
 
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let symbol = extract_string(&args, "symbol")?;
         let include_source = extract_bool(&args, "include_source", false);
         let include_callers = extract_bool(&args, "include_callers", true);
         let include_callees = extract_bool(&args, "include_callees", true);
         let depth = extract_usize(&args, "depth", 2)?.min(5);
         let token_budget = extract_usize(&args, "token_budget", 1500)?;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let index = leindex.lock().await;
+        // Determine symbol list: single "symbol" or batch "symbols"
+        let symbols: Vec<String> = if let Some(arr) = args.get("symbols").and_then(|v| v.as_array())
+        {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .take(20)
+                .collect()
+        } else if let Ok(sym) = extract_string(&args, "symbol") {
+            vec![sym]
+        } else {
+            return Err(JsonRpcError::invalid_params(
+                "Provide either 'symbol' (string) or 'symbols' (array of strings)".to_string(),
+            ));
+        };
+
+        let handle = registry.get_or_create(project_path).await?;
+        let index = handle.lock().await;
 
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
 
-        // 1. Exact symbol lookup
-        let node_id = if let Some(nid) = pdg.find_by_symbol(&symbol) {
+        // For batch mode, collect results for each symbol
+        if symbols.len() > 1 {
+            let char_budget = token_budget * 4;
+            let per_symbol_budget = char_budget / symbols.len();
+            let mut results: Vec<Value> = Vec::new();
+
+            for symbol in &symbols {
+                match self.lookup_single_symbol(
+                    pdg,
+                    symbol,
+                    include_source,
+                    include_callers,
+                    include_callees,
+                    depth,
+                    per_symbol_budget,
+                ) {
+                    Ok(val) => results.push(val),
+                    Err(e) => results.push(serde_json::json!({
+                        "symbol": symbol,
+                        "error": format!("{}", e)
+                    })),
+                }
+            }
+
+            return Ok(serde_json::json!({
+                "batch": true,
+                "count": results.len(),
+                "results": results
+            }));
+        }
+
+        // Single symbol mode
+        let char_budget = token_budget * 4;
+        self.lookup_single_symbol(
+            pdg,
+            &symbols[0],
+            include_source,
+            include_callers,
+            include_callees,
+            depth,
+            char_budget,
+        )
+    }
+
+    /// Resolve and return full structural context for a single symbol.
+    fn lookup_single_symbol(
+        &self,
+        pdg: &legraphe::pdg::ProgramDependenceGraph,
+        symbol: &str,
+        include_source: bool,
+        include_callers: bool,
+        include_callees: bool,
+        depth: usize,
+        char_budget: usize,
+    ) -> Result<Value, JsonRpcError> {
+        // 1. Exact symbol lookup (by node.id in symbol_index)
+        let node_id = if let Some(nid) = pdg.find_by_symbol(symbol) {
+            nid
+        // 2. Exact name lookup (by node.name in name_index) — prefer non-module nodes
+        } else if let Some(nid) = {
+            let candidates = pdg.find_all_by_name(symbol);
+            // Prefer class/function/method over module nodes
+            candidates
+                .iter()
+                .copied()
+                .find(|&nid| {
+                    pdg.get_node(nid)
+                        .map(|n| n.node_type != legraphe::pdg::NodeType::Module)
+                        .unwrap_or(false)
+                })
+                .or_else(|| candidates.first().copied())
+        } {
             nid
         } else {
-            // 2. Fuzzy match: substring, case-insensitive
+            // 3. Fuzzy match: substring, case-insensitive — prefer non-module nodes
             let sym_lower = symbol.to_lowercase();
-            let found = pdg.node_indices().find(|&nid| {
-                pdg.get_node(nid)
-                    .map(|n| n.name.to_lowercase().contains(&sym_lower) || n.id.to_lowercase().contains(&sym_lower))
-                    .unwrap_or(false)
-            });
-            found.ok_or_else(|| {
-                JsonRpcError::invalid_params(format!("Symbol '{}' not found in project index", symbol))
+            let mut best: Option<legraphe::pdg::NodeId> = None;
+            let mut best_is_module = true;
+            for nid in pdg.node_indices() {
+                let Some(n) = pdg.get_node(nid) else { continue };
+                let matches = n.name.to_lowercase().contains(&sym_lower)
+                    || n.id.to_lowercase().contains(&sym_lower);
+                if !matches {
+                    continue;
+                }
+                let is_module = n.node_type == legraphe::pdg::NodeType::Module;
+                // Always prefer non-module; only accept module if it's the first match
+                if best.is_none() || (best_is_module && !is_module) {
+                    best = Some(nid);
+                    best_is_module = is_module;
+                    if !is_module {
+                        break;
+                    } // non-module is best, stop early
+                }
+            }
+            best.ok_or_else(|| {
+                JsonRpcError::invalid_params_with_suggestion(
+                    format!("Symbol '{}' not found in project index", symbol),
+                    "Check spelling, or use leindex_grep_symbols to search for partial matches",
+                )
             })?
         };
 
-        let node = pdg.get_node(node_id).ok_or_else(|| {
-            JsonRpcError::internal_error("PDG node disappeared after lookup")
-        })?;
-
-        let char_budget = token_budget * 4;
+        let node = pdg
+            .get_node(node_id)
+            .ok_or_else(|| JsonRpcError::internal_error("PDG node disappeared after lookup"))?;
 
         // Callees (direct)
         let callees: Vec<Value> = if include_callees {
             pdg.neighbors(node_id)
                 .iter()
                 .filter_map(|&cid| {
-                    pdg.get_node(cid).map(|cn| serde_json::json!({
-                        "name": cn.name,
-                        "file": cn.file_path,
-                        "type": node_type_str(&cn.node_type)
-                    }))
+                    pdg.get_node(cid).map(|cn| {
+                        serde_json::json!({
+                            "name": cn.name,
+                            "file": cn.file_path,
+                            "type": node_type_str(&cn.node_type)
+                        })
+                    })
                 })
                 .take(50)
                 .collect()
@@ -1163,11 +1374,13 @@ a single structured response including cross-file relationships."
             get_direct_callers(pdg, node_id)
                 .iter()
                 .filter_map(|&cid| {
-                    pdg.get_node(cid).map(|cn| serde_json::json!({
-                        "name": cn.name,
-                        "file": cn.file_path,
-                        "type": node_type_str(&cn.node_type)
-                    }))
+                    pdg.get_node(cid).map(|cn| {
+                        serde_json::json!({
+                            "name": cn.name,
+                            "file": cn.file_path,
+                            "type": node_type_str(&cn.node_type)
+                        })
+                    })
                 })
                 .take(50)
                 .collect()
@@ -1219,7 +1432,9 @@ pub struct ProjectMapHandler;
 
 #[allow(missing_docs)]
 impl ProjectMapHandler {
-    pub fn name(&self) -> &str { "leindex_project_map" }
+    pub fn name(&self) -> &str {
+        "leindex_project_map"
+    }
 
     pub fn description(&self) -> &str {
         "Annotated project structure map: files, directories, symbol counts, complexity \
@@ -1235,6 +1450,10 @@ token efficient than Glob + directory reads."
                 "path": {
                     "type": "string",
                     "description": "Subdirectory to scope to (default: project root)"
+                },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
                 },
                 "depth": {
                     "type": "integer",
@@ -1256,8 +1475,20 @@ token efficient than Glob + directory reads."
                 },
                 "include_symbols": {
                     "type": "boolean",
-                    "description": "Include top symbols per file (default: false)",
+                    "description": "Include top symbols per file (default: false). \
+        Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
                     "default": false
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Skip the first N files for pagination (default: 0)",
+                    "default": 0,
+                    "minimum": 0
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of files to return (default: unlimited, subject to token_budget)",
+                    "minimum": 1
                 }
             },
             "required": []
@@ -1266,25 +1497,52 @@ token efficient than Glob + directory reads."
 
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let sort_by = args.get("sort_by").and_then(|v| v.as_str()).unwrap_or("complexity").to_owned();
+        let sort_by = args
+            .get("sort_by")
+            .and_then(|v| v.as_str())
+            .unwrap_or("complexity")
+            .to_owned();
         let depth = extract_usize(&args, "depth", 3)?.min(10);
         let token_budget = extract_usize(&args, "token_budget", 2000)?;
         let include_symbols = extract_bool(&args, "include_symbols", false);
+        let offset = extract_usize(&args, "offset", 0)?;
+        let limit = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let index = leindex.lock().await;
+        let handle = registry.get_or_create(project_path).await?;
+        let index = handle.lock().await;
         let project_root = index.project_path().to_path_buf();
 
         let scope_path = match args.get("path").and_then(|v| v.as_str()) {
-            Some(p) => PathBuf::from(p),
+            Some(p) => {
+                // Canonicalize if possible, fall back to raw path
+                PathBuf::from(p)
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(p))
+            }
             None => project_root.clone(),
         };
 
-        let pdg = index.pdg().ok_or_else(|| {
-            JsonRpcError::project_not_indexed(project_root.display().to_string())
-        })?;
+        // Ensure scope_path string ends with separator for proper prefix matching
+        // This prevents "/path/src" from matching "/path/src_backup/file.py"
+        let scope_str = {
+            let s = scope_path.to_string_lossy().to_string();
+            if s.ends_with(std::path::MAIN_SEPARATOR) || s.ends_with('/') {
+                s
+            } else {
+                format!("{}{}", s, std::path::MAIN_SEPARATOR)
+            }
+        };
+
+        let pdg = index
+            .pdg()
+            .ok_or_else(|| JsonRpcError::project_not_indexed(project_root.display().to_string()))?;
 
         // Build file info from PDG nodes
         let mut file_map: std::collections::HashMap<String, (usize, u32, Vec<String>)> =
@@ -1292,7 +1550,9 @@ token efficient than Glob + directory reads."
 
         for nid in pdg.node_indices() {
             if let Some(node) = pdg.get_node(nid) {
-                let entry = file_map.entry(node.file_path.clone()).or_insert((0, 0, Vec::new()));
+                let entry = file_map
+                    .entry(node.file_path.clone())
+                    .or_insert((0, 0, Vec::new()));
                 entry.0 += 1;
                 entry.1 += node.complexity;
                 if entry.2.len() < 5 {
@@ -1301,10 +1561,15 @@ token efficient than Glob + directory reads."
             }
         }
 
-        // Filter to scope path and respect depth
+        // Filter to scope path and respect depth.
+        // Files must either be exactly in the scope directory or in a subdirectory.
         let mut files: Vec<Value> = file_map
             .iter()
-            .filter(|(fp, _)| fp.starts_with(scope_path.to_str().unwrap_or("")))
+            .filter(|(fp, _)| {
+                // File is in scope if its path starts with scope_str (directory prefix)
+                // or if the file IS the scope path (exact match for single-file scope)
+                fp.starts_with(&scope_str) || fp.as_str() == scope_path.to_str().unwrap_or("")
+            })
             .filter_map(|(fp, (count, complexity, syms))| {
                 let path = std::path::Path::new(fp);
                 let rel = path.strip_prefix(&scope_path).ok()?;
@@ -1319,9 +1584,8 @@ token efficient than Glob + directory reads."
                     "total_complexity": complexity
                 });
                 if include_symbols {
-                    entry["top_symbols"] = Value::Array(
-                        syms.iter().map(|s| Value::String(s.clone())).collect()
-                    );
+                    entry["top_symbols"] =
+                        Value::Array(syms.iter().map(|s| Value::String(s.clone())).collect());
                 }
                 Some(entry)
             })
@@ -1330,19 +1594,34 @@ token efficient than Glob + directory reads."
         // Sort
         match sort_by.as_str() {
             "complexity" => files.sort_by(|a, b| {
-                b["total_complexity"].as_u64().unwrap_or(0)
+                b["total_complexity"]
+                    .as_u64()
+                    .unwrap_or(0)
                     .cmp(&a["total_complexity"].as_u64().unwrap_or(0))
             }),
             "name" => files.sort_by(|a, b| {
-                a["relative_path"].as_str().unwrap_or("")
+                a["relative_path"]
+                    .as_str()
+                    .unwrap_or("")
                     .cmp(b["relative_path"].as_str().unwrap_or(""))
             }),
             "dependencies" | "size" => files.sort_by(|a, b| {
-                b["symbol_count"].as_u64().unwrap_or(0)
+                b["symbol_count"]
+                    .as_u64()
+                    .unwrap_or(0)
                     .cmp(&a["symbol_count"].as_u64().unwrap_or(0))
             }),
             _ => {}
         }
+
+        // Apply pagination: offset + limit
+        let total_before_pagination = files.len();
+        let files: Vec<Value> = files.into_iter().skip(offset).collect();
+        let files: Vec<Value> = if let Some(lim) = limit {
+            files.into_iter().take(lim).collect()
+        } else {
+            files
+        };
 
         // Truncate to token budget
         let char_budget = token_budget * 4;
@@ -1351,14 +1630,19 @@ token efficient than Glob + directory reads."
         for f in files {
             let s = f.to_string();
             total_chars += s.len();
-            if total_chars > char_budget { break; }
+            if total_chars > char_budget {
+                break;
+            }
             truncated_files.push(f);
         }
 
         Ok(serde_json::json!({
             "project_root": project_root.display().to_string(),
             "scope": scope_path.display().to_string(),
-            "total_files": truncated_files.len(),
+            "total_files_in_scope": total_before_pagination,
+            "offset": offset,
+            "count": truncated_files.len(),
+            "has_more": offset + truncated_files.len() < total_before_pagination,
             "files": truncated_files
         }))
     }
@@ -1374,7 +1658,9 @@ pub struct GrepSymbolsHandler;
 
 #[allow(missing_docs)]
 impl GrepSymbolsHandler {
-    pub fn name(&self) -> &str { "leindex_grep_symbols" }
+    pub fn name(&self) -> &str {
+        "leindex_grep_symbols"
+    }
 
     pub fn description(&self) -> &str {
         "Search for symbols across the indexed codebase with structural awareness. Unlike \
@@ -1389,6 +1675,10 @@ in the dependency graph. Supports exact match and substring search."
                 "pattern": {
                     "type": "string",
                     "description": "Symbol name, substring, or natural language query"
+                },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
                 },
                 "scope": {
                     "type": "string",
@@ -1414,10 +1704,16 @@ in the dependency graph. Supports exact match and substring search."
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum results (default: 20, max: 100)",
+                    "description": "Maximum results (default: 20, max: 200)",
                     "default": 20,
                     "minimum": 1,
-                    "maximum": 100
+                    "maximum": 200
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Skip the first N results for pagination (default: 0)",
+                    "default": 0,
+                    "minimum": 0
                 }
             },
             "required": ["pattern"]
@@ -1426,17 +1722,43 @@ in the dependency graph. Supports exact match and substring search."
 
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let pattern = extract_string(&args, "pattern")?;
-        let scope = args.get("scope").and_then(|v| v.as_str()).map(str::to_owned);
-        let type_filter = args.get("type_filter").and_then(|v| v.as_str()).unwrap_or("all").to_owned();
+        let scope_raw = args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
+        let type_filter = args
+            .get("type_filter")
+            .and_then(|v| v.as_str())
+            .unwrap_or("all")
+            .to_owned();
         let token_budget = extract_usize(&args, "token_budget", 1500)?;
-        let max_results = extract_usize(&args, "max_results", 20)?.min(100);
+        let max_results = extract_usize(&args, "max_results", 20)?.min(200);
         let context_lines = extract_usize(&args, "include_context_lines", 0)?.min(10);
+        let offset = extract_usize(&args, "offset", 0)?;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let index = leindex.lock().await;
+        let handle = registry.get_or_create(project_path).await?;
+        let index = handle.lock().await;
+
+        // Validate and canonicalise scope path if provided
+        let scope = if let Some(raw) = scope_raw {
+            let p = std::path::Path::new(&raw);
+            let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+            let s = canonical.to_string_lossy().to_string();
+            // Ensure directory scopes end with separator for correct prefix matching
+            if canonical.is_dir() && !s.ends_with(std::path::MAIN_SEPARATOR) && !s.ends_with('/') {
+                Some(format!("{}{}", s, std::path::MAIN_SEPARATOR))
+            } else {
+                Some(s)
+            }
+        } else {
+            None
+        };
+
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -1445,12 +1767,15 @@ in the dependency graph. Supports exact match and substring search."
         let char_budget = token_budget * 4;
 
         // Collect matches via exact, then substring, then semantic fallback
+        // Fetch max_results + offset matches, then paginate
+        let fetch_limit = max_results + offset;
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut results: Vec<Value> = Vec::new();
-        let mut total_chars = 0usize;
+        let mut all_matches: Vec<Value> = Vec::new();
 
         for nid in pdg.node_indices() {
-            if results.len() >= max_results { break; }
+            if all_matches.len() >= fetch_limit {
+                break;
+            }
 
             let node = match pdg.get_node(nid) {
                 Some(n) => n,
@@ -1464,9 +1789,11 @@ in the dependency graph. Supports exact match and substring search."
                 }
             }
 
-            // Scope filter
+            // Scope filter — file path must start with the (canonical, separator-terminated) scope
             if let Some(ref s) = scope {
-                if !node.file_path.starts_with(s.as_str()) {
+                if !node.file_path.starts_with(s.as_str())
+                    && node.file_path != s.trim_end_matches(std::path::MAIN_SEPARATOR)
+                {
                     continue;
                 }
             }
@@ -1496,20 +1823,40 @@ in the dependency graph. Supports exact match and substring search."
 
             if context_lines > 0 {
                 if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
-                    let snippet: String = src.lines().take(context_lines).collect::<Vec<_>>().join("\n");
+                    let snippet: String = src
+                        .lines()
+                        .take(context_lines)
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     entry["context"] = Value::String(snippet);
                 }
             }
 
+            all_matches.push(entry);
+        }
+
+        // Apply pagination
+        let total_matched = all_matches.len();
+        let page: Vec<Value> = all_matches.into_iter().skip(offset).collect();
+
+        // Truncate to token budget
+        let mut results: Vec<Value> = Vec::new();
+        let mut total_chars = 0usize;
+        for entry in page {
             let s = entry.to_string();
             total_chars += s.len();
-            if total_chars > char_budget { break; }
+            if total_chars > char_budget {
+                break;
+            }
             results.push(entry);
         }
 
         Ok(serde_json::json!({
             "pattern": pattern,
-            "result_count": results.len(),
+            "offset": offset,
+            "count": results.len(),
+            "total_matched": total_matched,
+            "has_more": offset + results.len() < total_matched,
             "results": results
         }))
     }
@@ -1525,7 +1872,9 @@ pub struct ReadSymbolHandler;
 
 #[allow(missing_docs)]
 impl ReadSymbolHandler {
-    pub fn name(&self) -> &str { "leindex_read_symbol" }
+    pub fn name(&self) -> &str {
+        "leindex_read_symbol"
+    }
 
     pub fn description(&self) -> &str {
         "Read the source code of a specific symbol with its doc comment and the signatures \
@@ -1545,9 +1894,14 @@ than reading an entire file. Supersedes targeted Read."
                     "type": "string",
                     "description": "Disambiguate when symbol exists in multiple files (optional)"
                 },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                },
                 "include_dependencies": {
                     "type": "boolean",
-                    "description": "Include dependency signatures (default: true)",
+                    "description": "Include dependency signatures (default: true). \
+        Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
                     "default": true
                 },
                 "token_budget": {
@@ -1562,15 +1916,20 @@ than reading an entire file. Supersedes targeted Read."
 
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let symbol = extract_string(&args, "symbol")?;
-        let file_path_hint = args.get("file_path").and_then(|v| v.as_str()).map(str::to_owned);
+        let file_path_hint = args
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
         let include_dependencies = extract_bool(&args, "include_dependencies", true);
         let token_budget = extract_usize(&args, "token_budget", 2000)?;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let index = leindex.lock().await;
+        let handle = registry.get_or_create(project_path).await?;
+        let index = handle.lock().await;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -1579,13 +1938,11 @@ than reading an entire file. Supersedes targeted Read."
         let symbol_lower = symbol.to_lowercase();
         let node_id = if let Some(ref fp_hint) = file_path_hint {
             // Find by name within the specific file
-            pdg.nodes_in_file(fp_hint)
-                .into_iter()
-                .find(|&nid| {
-                    pdg.get_node(nid)
-                        .map(|n| n.name.to_lowercase() == symbol_lower)
-                        .unwrap_or(false)
-                })
+            pdg.nodes_in_file(fp_hint).into_iter().find(|&nid| {
+                pdg.get_node(nid)
+                    .map(|n| n.name.to_lowercase() == symbol_lower)
+                    .unwrap_or(false)
+            })
         } else {
             pdg.find_by_symbol(&symbol).or_else(|| {
                 // Fuzzy match
@@ -1601,9 +1958,9 @@ than reading an entire file. Supersedes targeted Read."
             JsonRpcError::invalid_params(format!("Symbol '{}' not found in project index", symbol))
         })?;
 
-        let node = pdg.get_node(node_id).ok_or_else(|| {
-            JsonRpcError::internal_error("PDG node disappeared after lookup")
-        })?;
+        let node = pdg
+            .get_node(node_id)
+            .ok_or_else(|| JsonRpcError::internal_error("PDG node disappeared after lookup"))?;
 
         let char_budget = token_budget * 4;
 
@@ -1623,7 +1980,11 @@ than reading an entire file. Supersedes targeted Read."
                 .take(10)
                 .take_while(|l| {
                     let t = l.trim();
-                    t.starts_with("///") || t.starts_with("//!") || t.starts_with("/**") || t.starts_with("*") || t.is_empty()
+                    t.starts_with("///")
+                        || t.starts_with("//!")
+                        || t.starts_with("/**")
+                        || t.starts_with("*")
+                        || t.is_empty()
                 })
                 .collect::<Vec<_>>();
             if comment_lines.is_empty() {
@@ -1681,17 +2042,26 @@ than reading an entire file. Supersedes targeted Read."
 // ============================================================================
 
 /// Parse a JSON `changes` array into a Vec<EditChange>.
-fn parse_edit_changes(changes_val: &Value) -> Result<Vec<EditChange>, JsonRpcError> {
+///
+/// Supports two modes for `replace_text`:
+/// - **Byte-offset mode**: When `start_byte` and `end_byte` are provided, uses exact offsets.
+/// - **Text-search mode**: When `old_text` is provided without explicit offsets, searches
+///   for `old_text` in the file content and replaces at the found position.
+///
+/// The `content` parameter enables text-search mode resolution.
+fn parse_edit_changes(
+    changes_val: &Value,
+    content: Option<&str>,
+) -> Result<Vec<EditChange>, JsonRpcError> {
     let arr = changes_val
         .as_array()
         .ok_or_else(|| JsonRpcError::invalid_params("'changes' must be an array"))?;
 
     let mut result = Vec::new();
     for (i, item) in arr.iter().enumerate() {
-        let change_type = item
-            .get("type")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| JsonRpcError::invalid_params(format!("changes[{}]: missing 'type'", i)))?;
+        let change_type = item.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
+            JsonRpcError::invalid_params(format!("changes[{}]: missing 'type'", i))
+        })?;
 
         let change = match change_type {
             "replace_text" => {
@@ -1699,27 +2069,98 @@ fn parse_edit_changes(changes_val: &Value) -> Result<Vec<EditChange>, JsonRpcErr
                 let new_text = item
                     .get("new_text")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_text'", i)))?;
-                let start = item.get("start_byte").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                let end = item.get("end_byte").and_then(|v| v.as_u64())
-                    .map(|v| v as usize)
-                    .unwrap_or(start + old_text.len());
-                EditChange::ReplaceText { start, end, new_text: new_text.to_owned() }
+                    .ok_or_else(|| {
+                        JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_text'", i))
+                    })?;
+
+                let has_explicit_start = item.get("start_byte").is_some();
+                let has_explicit_end = item.get("end_byte").is_some();
+
+                if has_explicit_start || has_explicit_end {
+                    // Byte-offset mode: use exact offsets
+                    let start =
+                        item.get("start_byte").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let end = item
+                        .get("end_byte")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .unwrap_or(start + old_text.len());
+                    EditChange::ReplaceText {
+                        start,
+                        end,
+                        new_text: new_text.to_owned(),
+                    }
+                } else if !old_text.is_empty() {
+                    // Text-search mode: find old_text in content and use its position.
+                    // Falls back to whitespace-normalised matching if exact match fails.
+                    if let Some(content) = content {
+                        if let Some(pos) = content.find(old_text) {
+                            EditChange::ReplaceText {
+                                start: pos,
+                                end: pos + old_text.len(),
+                                new_text: new_text.to_owned(),
+                            }
+                        } else if let Some((pos, matched_len)) =
+                            find_normalised_whitespace(content, old_text)
+                        {
+                            // Whitespace-normalised match: the old_text matched after
+                            // collapsing runs of whitespace to single spaces.  Use the
+                            // original content's byte range so the replacement is exact.
+                            EditChange::ReplaceText {
+                                start: pos,
+                                end: pos + matched_len,
+                                new_text: new_text.to_owned(),
+                            }
+                        } else {
+                            let preview = if old_text.len() > 60 {
+                                format!("{}...", &old_text[..60])
+                            } else {
+                                old_text.to_string()
+                            };
+                            return Err(JsonRpcError::invalid_params_with_suggestion(
+                                format!("changes[{}]: old_text not found in file content: '{}'", i, preview),
+                                "Ensure old_text exactly matches the source. Whitespace-normalised matching \
+                                 is attempted automatically. You can also use start_byte/end_byte for precise offsets.",
+                            ));
+                        }
+                    } else {
+                        // No content available — fall back to zero-based offset (legacy)
+                        let start = 0usize;
+                        let end = old_text.len();
+                        EditChange::ReplaceText {
+                            start,
+                            end,
+                            new_text: new_text.to_owned(),
+                        }
+                    }
+                } else {
+                    return Err(JsonRpcError::invalid_params(format!(
+                        "changes[{}]: replace_text requires either 'start_byte'/'end_byte' or non-empty 'old_text'", i
+                    )));
+                }
             }
             "rename_symbol" => {
                 let old_name = item
                     .get("old_name")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| JsonRpcError::invalid_params(format!("changes[{}]: missing 'old_name'", i)))?;
+                    .ok_or_else(|| {
+                        JsonRpcError::invalid_params(format!("changes[{}]: missing 'old_name'", i))
+                    })?;
                 let new_name = item
                     .get("new_name")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_name'", i)))?;
-                EditChange::RenameSymbol { old_name: old_name.to_owned(), new_name: new_name.to_owned() }
+                    .ok_or_else(|| {
+                        JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_name'", i))
+                    })?;
+                EditChange::RenameSymbol {
+                    old_name: old_name.to_owned(),
+                    new_name: new_name.to_owned(),
+                }
             }
             other => {
                 return Err(JsonRpcError::invalid_params(format!(
-                    "changes[{}]: unknown type '{}' (use replace_text or rename_symbol)", i, other
+                    "changes[{}]: unknown type '{}' (use replace_text or rename_symbol)",
+                    i, other
                 )));
             }
         };
@@ -1746,8 +2187,14 @@ fn apply_changes_in_memory(content: &str, changes: &[EditChange]) -> Result<Stri
     // Sort byte-range replacements in reverse order so earlier edits don't
     // shift later offsets.
     replace_changes.sort_by(|a, b| {
-        let a_start = match a { EditChange::ReplaceText { start, .. } => *start, _ => 0 };
-        let b_start = match b { EditChange::ReplaceText { start, .. } => *start, _ => 0 };
+        let a_start = match a {
+            EditChange::ReplaceText { start, .. } => *start,
+            _ => 0,
+        };
+        let b_start = match b {
+            EditChange::ReplaceText { start, .. } => *start,
+            _ => 0,
+        };
         b_start.cmp(&a_start)
     });
 
@@ -1755,7 +2202,12 @@ fn apply_changes_in_memory(content: &str, changes: &[EditChange]) -> Result<Stri
 
     // Apply byte-range replacements first (in reverse order)
     for change in &replace_changes {
-        if let EditChange::ReplaceText { start, end, new_text } = change {
+        if let EditChange::ReplaceText {
+            start,
+            end,
+            new_text,
+        } = change
+        {
             let bytes = modified.as_bytes();
             let s = (*start).min(bytes.len());
             let e = (*end).min(bytes.len());
@@ -1798,8 +2250,8 @@ fn replace_whole_word(content: &str, old: &str, new: &str) -> String {
     while i <= bytes.len().saturating_sub(old_bytes.len()) {
         if &bytes[i..i + old_bytes.len()] == old_bytes {
             let before_ok = i == 0 || !is_word_char(bytes[i - 1]);
-            let after_ok = i + old_bytes.len() >= bytes.len()
-                || !is_word_char(bytes[i + old_bytes.len()]);
+            let after_ok =
+                i + old_bytes.len() >= bytes.len() || !is_word_char(bytes[i + old_bytes.len()]);
             if before_ok && after_ok {
                 result.push_str(new);
                 i += old_bytes.len();
@@ -1816,6 +2268,83 @@ fn replace_whole_word(content: &str, old: &str, new: &str) -> String {
     result
 }
 
+/// Normalise whitespace in a string: collapse runs of spaces/tabs/newlines into a
+/// single space, then trim.  Used to match old_text against file content when the
+/// LLM inserts slightly different indentation or line breaks.
+fn normalise_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !in_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            in_ws = true;
+        } else {
+            in_ws = false;
+            out.push(ch);
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// Find `needle` in `haystack` using whitespace-normalised matching.
+///
+/// Returns `Some((start_byte, matched_byte_len))` where start_byte and
+/// matched_byte_len refer to byte offsets in the **original** (un-normalised)
+/// haystack.  Returns `None` if no match is found.
+fn find_normalised_whitespace(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    let norm_needle = normalise_ws(needle);
+    if norm_needle.is_empty() {
+        return None;
+    }
+
+    // Sliding window over lines in haystack.
+    // We check progressively wider windows to find a contiguous span whose
+    // normalised form contains the normalised needle.
+    let lines: Vec<&str> = haystack.lines().collect();
+    for start_line in 0..lines.len() {
+        let mut window = String::new();
+        let mut raw_start_byte: Option<usize> = None;
+        for end_line in start_line..lines.len().min(start_line + needle.lines().count() + 5) {
+            if !window.is_empty() {
+                window.push(' ');
+            }
+            window.push_str(lines[end_line].trim());
+
+            let norm_window = normalise_ws(&window);
+            if let Some(_pos) = norm_window.find(&norm_needle) {
+                // Found it.  Compute byte positions in the original haystack.
+                let byte_start = if raw_start_byte.is_none() {
+                    let mut offset = 0;
+                    for l in 0..start_line {
+                        offset += lines[l].len() + 1; // +1 for newline
+                    }
+                    offset
+                } else {
+                    raw_start_byte.unwrap()
+                };
+                let mut byte_end = byte_start;
+                for l in start_line..=end_line {
+                    byte_end += lines[l].len() + 1;
+                }
+                // Trim trailing newline
+                byte_end = byte_end.min(haystack.len());
+                return Some((byte_start, byte_end - byte_start));
+            }
+
+            if raw_start_byte.is_none() {
+                let mut offset = 0;
+                for l in 0..start_line {
+                    offset += lines[l].len() + 1;
+                }
+                raw_start_byte = Some(offset);
+            }
+        }
+    }
+    None
+}
+
 /// Generate a unified diff between two strings.
 fn make_diff(original: &str, modified: &str, file_path: &str) -> String {
     let patch = diffy::create_patch(original, modified);
@@ -1826,7 +2355,6 @@ fn make_diff(original: &str, modified: &str, file_path: &str) -> String {
         format!("--- {}\n+++ {}\n{}", file_path, file_path, patch_str)
     }
 }
-
 
 // ============================================================================
 // D.2 — leindex_edit_preview
@@ -1850,7 +2378,9 @@ pub struct ImpactAnalysisHandler;
 
 #[allow(missing_docs)]
 impl EditPreviewHandler {
-    pub fn name(&self) -> &str { "leindex_edit_preview" }
+    pub fn name(&self) -> &str {
+        "leindex_edit_preview"
+    }
 
     pub fn description(&self) -> &str {
         "Preview a code edit: unified diff, affected symbols/files, breaking changes, and risk \
@@ -1866,6 +2396,10 @@ leindex_edit_apply to understand the blast radius of your change."
                     "type": "string",
                     "description": "Absolute path to the file to edit"
                 },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                },
                 "changes": {
                     "type": "array",
                     "description": "List of changes to preview. Each change has 'type' (replace_text/rename_symbol) and type-specific fields.",
@@ -1878,14 +2412,22 @@ leindex_edit_apply to understand the blast radius of your change."
 
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let file_path = extract_string(&args, "file_path")?;
-        let changes_val = args.get("changes").cloned().unwrap_or_else(|| Value::Array(vec![]));
-        let changes = parse_edit_changes(&changes_val)?;
+        let changes_val = args
+            .get("changes")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(vec![]));
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let index = leindex.lock().await;
+        let handle = registry.get_or_create(project_path).await?;
+        let index = handle.lock().await;
+
+        // Enforce project boundary
+        let _ = validate_file_within_project(&file_path, index.project_path())?;
+
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -1895,6 +2437,9 @@ leindex_edit_apply to understand the blast radius of your change."
             JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
         })?;
 
+        // Parse changes with content available for text-search resolution
+        let changes = parse_edit_changes(&changes_val, Some(&original))?;
+
         // Apply changes in memory
         let modified = apply_changes_in_memory(&original, &changes)?;
 
@@ -1903,13 +2448,23 @@ leindex_edit_apply to understand the blast radius of your change."
 
         // Compute impact from PDG
         let mut affected_nodes: Vec<String> = Vec::new();
-        let mut affected_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut affected_files: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
         affected_files.insert(file_path.clone());
         let mut breaking_changes: Vec<String> = Vec::new();
 
         for change in &changes {
-            if let EditChange::RenameSymbol { old_name, new_name: _ } = change {
-                if let Some(node_id) = pdg.find_by_symbol(old_name) {
+            if let EditChange::RenameSymbol {
+                old_name,
+                new_name: _,
+            } = change
+            {
+                // Try name-based lookup for PDG impact analysis
+                let found_id = pdg
+                    .find_by_symbol(old_name)
+                    .or_else(|| pdg.find_by_name(old_name))
+                    .or_else(|| pdg.find_by_name_in_file(old_name, None));
+                if let Some(node_id) = found_id {
                     let forward = pdg.get_forward_impact(node_id);
                     for dep_id in &forward {
                         if let Some(dn) = pdg.get_node(*dep_id) {
@@ -1920,7 +2475,9 @@ leindex_edit_apply to understand the blast radius of your change."
                     let backward = pdg.get_backward_impact(node_id);
                     if !backward.is_empty() {
                         breaking_changes.push(format!(
-                            "Renaming '{}' may break {} caller(s)", old_name, backward.len()
+                            "Renaming '{}' may break {} caller(s)",
+                            old_name,
+                            backward.len()
                         ));
                     }
                 }
@@ -1948,7 +2505,9 @@ leindex_edit_apply to understand the blast radius of your change."
 
 #[allow(missing_docs)]
 impl EditApplyHandler {
-    pub fn name(&self) -> &str { "leindex_edit_apply" }
+    pub fn name(&self) -> &str {
+        "leindex_edit_apply"
+    }
 
     pub fn description(&self) -> &str {
         "Apply code edits to files with optional dry-run mode and impact reporting. \
@@ -1964,6 +2523,10 @@ returns the preview without modifying any files."
                     "type": "string",
                     "description": "Absolute path to the file to edit"
                 },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                },
                 "changes": {
                     "type": "array",
                     "description": "List of changes to apply",
@@ -1971,7 +2534,8 @@ returns the preview without modifying any files."
                 },
                 "dry_run": {
                     "type": "boolean",
-                    "description": "If true, return preview without modifying files (default: false)",
+                    "description": "If true, return preview without modifying files (default: false). \
+        Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
                     "default": false
                 }
             },
@@ -1981,25 +2545,37 @@ returns the preview without modifying any files."
 
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let dry_run = extract_bool(&args, "dry_run", false);
 
         if dry_run {
             // Delegate to preview
-            return EditPreviewHandler.execute(leindex, args).await;
+            return EditPreviewHandler.execute(registry, args).await;
         }
 
         let file_path = extract_string(&args, "file_path")?;
-        let changes_val = args.get("changes").cloned().unwrap_or_else(|| Value::Array(vec![]));
-        let changes = parse_edit_changes(&changes_val)?;
+        let changes_val = args
+            .get("changes")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(vec![]));
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        // Read → apply → write
+        let handle = registry.get_or_create(project_path).await?;
+
+        // Enforce project boundary
+        {
+            let index = handle.lock().await;
+            let _ = validate_file_within_project(&file_path, index.project_path())?;
+        }
+
+        // Read → parse (with content for text-search) → apply → write
         let original = std::fs::read_to_string(&file_path).map_err(|e| {
             JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
         })?;
 
+        let changes = parse_edit_changes(&changes_val, Some(&original))?;
         let modified = apply_changes_in_memory(&original, &changes)?;
 
         if modified == original {
@@ -2025,7 +2601,9 @@ returns the preview without modifying any files."
 
 #[allow(missing_docs)]
 impl RenameSymbolHandler {
-    pub fn name(&self) -> &str { "leindex_rename_symbol" }
+    pub fn name(&self) -> &str {
+        "leindex_rename_symbol"
+    }
 
     pub fn description(&self) -> &str {
         "Rename a symbol across all files using PDG to find all reference sites. Generates a \
@@ -2045,13 +2623,18 @@ Grep + multi-file Edit with a single atomic operation."
                     "type": "string",
                     "description": "New symbol name"
                 },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                },
                 "scope": {
                     "type": "string",
                     "description": "Limit rename to a file or directory path (optional)"
                 },
                 "preview_only": {
                     "type": "boolean",
-                    "description": "If true, return diff without applying changes (default: true)",
+                    "description": "If true, return diff without applying changes (default: true). \
+        Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
                     "default": true
                 }
             },
@@ -2061,15 +2644,20 @@ Grep + multi-file Edit with a single atomic operation."
 
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let old_name = extract_string(&args, "old_name")?;
         let new_name = extract_string(&args, "new_name")?;
-        let scope = args.get("scope").and_then(|v| v.as_str()).map(str::to_owned);
+        let scope = args
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
         let preview_only = extract_bool(&args, "preview_only", true);
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let index = leindex.lock().await;
+        let handle = registry.get_or_create(project_path).await?;
+        let index = handle.lock().await;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -2077,7 +2665,16 @@ Grep + multi-file Edit with a single atomic operation."
         // Collect all files containing references to old_name
         let mut ref_files: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        if let Some(node_id) = pdg.find_by_symbol(&old_name) {
+        // Resolve old_name to PDG node using multiple strategies:
+        // 1. Exact ID match ("file_path:qualified_name")
+        // 2. Name-based match ("health_check")
+        // 3. Fuzzy case-insensitive substring match
+        let node_id = pdg
+            .find_by_symbol(&old_name)
+            .or_else(|| pdg.find_by_name(&old_name))
+            .or_else(|| pdg.find_by_name_in_file(&old_name, None));
+
+        if let Some(node_id) = node_id {
             // The definition file
             if let Some(n) = pdg.get_node(node_id) {
                 ref_files.insert(n.file_path.clone());
@@ -2088,11 +2685,18 @@ Grep + multi-file Edit with a single atomic operation."
                     ref_files.insert(dn.file_path.clone());
                 }
             }
+            // Also include files where the old_name appears in other symbols' IDs
+            // (e.g., imports or references that aren't captured as direct callers)
+            for nid in pdg.find_all_by_name(&old_name) {
+                if let Some(n) = pdg.get_node(nid) {
+                    ref_files.insert(n.file_path.clone());
+                }
+            }
         } else {
-            // Symbol not in PDG — just search all files for textual occurrence
-            // (No PDG info, text-based fallback)
             return Err(JsonRpcError::invalid_params(format!(
-                "Symbol '{}' not found in project index. Try leindex_grep_symbols first.",
+                "Symbol '{}' not found in project index. The index uses short symbol names \
+                (e.g., 'health_check', not 'ClassName.health_check'). \
+                Try leindex_grep_symbols to find the exact name.",
                 old_name
             )));
         }
@@ -2101,7 +2705,10 @@ Grep + multi-file Edit with a single atomic operation."
         let filtered_files: Vec<String> = ref_files
             .into_iter()
             .filter(|f| {
-                scope.as_ref().map(|s| f.starts_with(s.as_str())).unwrap_or(true)
+                scope
+                    .as_ref()
+                    .map(|s| f.starts_with(s.as_str()))
+                    .unwrap_or(true)
             })
             .collect();
 
@@ -2110,7 +2717,9 @@ Grep + multi-file Edit with a single atomic operation."
         let mut files_to_modify: Vec<String> = Vec::new();
 
         for file_path in &filtered_files {
-            let Ok(original) = std::fs::read_to_string(file_path) else { continue };
+            let Ok(original) = std::fs::read_to_string(file_path) else {
+                continue;
+            };
             let modified = replace_whole_word(&original, &old_name, &new_name);
             if modified != original {
                 let diff = make_diff(&original, &modified, file_path);
@@ -2142,7 +2751,9 @@ Grep + multi-file Edit with a single atomic operation."
 
 #[allow(missing_docs)]
 impl ImpactAnalysisHandler {
-    pub fn name(&self) -> &str { "leindex_impact_analysis" }
+    pub fn name(&self) -> &str {
+        "leindex_impact_analysis"
+    }
 
     pub fn description(&self) -> &str {
         "Analyze the transitive impact of changing a symbol: shows all symbols and files \
@@ -2157,6 +2768,10 @@ to understand the blast radius of your change. No equivalent in standard tools."
                 "symbol": {
                     "type": "string",
                     "description": "Symbol to analyze impact for"
+                },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
                 },
                 "change_type": {
                     "type": "string",
@@ -2178,14 +2793,20 @@ to understand the blast radius of your change. No equivalent in standard tools."
 
     pub async fn execute(
         &self,
-        leindex: &Arc<Mutex<LeIndex>>,
+        registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let symbol = extract_string(&args, "symbol")?;
-        let change_type = args.get("change_type").and_then(|v| v.as_str()).unwrap_or("modify").to_owned();
+        let change_type = args
+            .get("change_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("modify")
+            .to_owned();
         let depth = extract_usize(&args, "depth", 3)?.min(5);
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let index = leindex.lock().await;
+        let handle = registry.get_or_create(project_path).await?;
+        let index = handle.lock().await;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -2194,18 +2815,23 @@ to understand the blast radius of your change. No equivalent in standard tools."
             nid
         } else {
             let sym_lower = symbol.to_lowercase();
-            pdg.node_indices().find(|&nid| {
-                pdg.get_node(nid)
-                    .map(|n| n.name.to_lowercase() == sym_lower)
-                    .unwrap_or(false)
-            }).ok_or_else(|| {
-                JsonRpcError::invalid_params(format!("Symbol '{}' not found in project index", symbol))
-            })?
+            pdg.node_indices()
+                .find(|&nid| {
+                    pdg.get_node(nid)
+                        .map(|n| n.name.to_lowercase() == sym_lower)
+                        .unwrap_or(false)
+                })
+                .ok_or_else(|| {
+                    JsonRpcError::invalid_params(format!(
+                        "Symbol '{}' not found in project index",
+                        symbol
+                    ))
+                })?
         };
 
-        let node = pdg.get_node(node_id).ok_or_else(|| {
-            JsonRpcError::internal_error("PDG node disappeared")
-        })?;
+        let node = pdg
+            .get_node(node_id)
+            .ok_or_else(|| JsonRpcError::internal_error("PDG node disappeared"))?;
 
         // Direct callers (depth 1)
         let direct_callers: Vec<String> = get_direct_callers(pdg, node_id)
@@ -2230,14 +2856,22 @@ to understand the blast radius of your change. No equivalent in standard tools."
 
         let risk = match change_type.as_str() {
             "remove" | "change_signature" => {
-                if forward.len() > 5 || affected_files.len() > 3 { "high" }
-                else if !forward.is_empty() { "medium" }
-                else { "low" }
+                if forward.len() > 5 || affected_files.len() > 3 {
+                    "high"
+                } else if !forward.is_empty() {
+                    "medium"
+                } else {
+                    "low"
+                }
             }
             _ => {
-                if affected_files.len() > 3 { "high" }
-                else if affected_files.len() > 1 { "medium" }
-                else { "low" }
+                if affected_files.len() > 3 {
+                    "high"
+                } else if affected_files.len() > 1 {
+                    "medium"
+                } else {
+                    "low"
+                }
             }
         };
 
@@ -2266,6 +2900,11 @@ to understand the blast radius of your change. No equivalent in standard tools."
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn test_registry_for(path: &std::path::Path) -> Arc<ProjectRegistry> {
+        let leindex = LeIndex::new(path).expect("leindex");
+        Arc::new(ProjectRegistry::with_initial_project(5, leindex))
+    }
 
     #[test]
     fn test_extract_string() {
@@ -2349,14 +2988,14 @@ mod tests {
         std::fs::create_dir_all(src.parent().expect("parent")).expect("mkdir");
         std::fs::write(&src, "pub fn ping()->bool{true}\n").expect("write source");
 
-        let leindex = Arc::new(Mutex::new(LeIndex::new(dir.path()).expect("leindex")));
+        let registry = test_registry_for(dir.path());
         let args = serde_json::json!({
             "path": src.display().to_string(),
             "mode": "balanced",
             "max_files": 1
         });
 
-        let value = execute_phase_analysis(&leindex, args)
+        let value = execute_phase_analysis(&registry, args)
             .await
             .expect("phase analysis");
         let phases = value
@@ -2379,7 +3018,7 @@ mod tests {
         std::fs::create_dir_all(src.parent().expect("parent")).expect("mkdir");
         std::fs::write(&src, "pub fn ping()->bool{true}\n").expect("write source");
 
-        let leindex = Arc::new(Mutex::new(LeIndex::new(dir.path()).expect("leindex")));
+        let registry = test_registry_for(dir.path());
         let args = serde_json::json!({
             "path": src.display().to_string(),
             "phase": "1",
@@ -2387,7 +3026,7 @@ mod tests {
             "max_files": 1
         });
 
-        let value = execute_phase_analysis(&leindex, args)
+        let value = execute_phase_analysis(&registry, args)
             .await
             .expect("phase analysis");
         let phases = value
@@ -2409,10 +3048,16 @@ mod tests {
 
     #[test]
     fn test_node_type_str() {
-        assert_eq!(node_type_str(&legraphe::pdg::NodeType::Function), "function");
+        assert_eq!(
+            node_type_str(&legraphe::pdg::NodeType::Function),
+            "function"
+        );
         assert_eq!(node_type_str(&legraphe::pdg::NodeType::Class), "class");
         assert_eq!(node_type_str(&legraphe::pdg::NodeType::Method), "method");
-        assert_eq!(node_type_str(&legraphe::pdg::NodeType::Variable), "variable");
+        assert_eq!(
+            node_type_str(&legraphe::pdg::NodeType::Variable),
+            "variable"
+        );
         assert_eq!(node_type_str(&legraphe::pdg::NodeType::Module), "module");
     }
 
@@ -2509,11 +3154,9 @@ mod tests {
     #[tokio::test]
     async fn test_file_summary_requires_indexed_project() {
         let dir = tempdir().unwrap();
-        let leindex = Arc::new(Mutex::new(
-            crate::leindex::LeIndex::new(dir.path()).expect("leindex"),
-        ));
+        let registry = test_registry_for(dir.path());
         let args = serde_json::json!({ "file_path": "/some/file.rs" });
-        let result = FileSummaryHandler.execute(&leindex, args).await;
+        let result = FileSummaryHandler.execute(&registry, args).await;
         // Should return project_not_indexed error since no PDG
         assert!(result.is_err());
     }
@@ -2521,44 +3164,46 @@ mod tests {
     #[tokio::test]
     async fn test_symbol_lookup_requires_indexed_project() {
         let dir = tempdir().unwrap();
-        let leindex = Arc::new(Mutex::new(
-            crate::leindex::LeIndex::new(dir.path()).expect("leindex"),
-        ));
+        let registry = test_registry_for(dir.path());
         let args = serde_json::json!({ "symbol": "my_func" });
-        let result = SymbolLookupHandler.execute(&leindex, args).await;
+        let result = SymbolLookupHandler.execute(&registry, args).await;
         assert!(result.is_err());
     }
 
     #[tokio::test]
-    async fn test_project_map_requires_indexed_project() {
+    async fn test_project_map_auto_indexes_empty_project() {
+        // With auto-indexing, an empty project returns an empty file list (not an error)
         let dir = tempdir().unwrap();
-        let leindex = Arc::new(Mutex::new(
-            crate::leindex::LeIndex::new(dir.path()).expect("leindex"),
-        ));
+        // Create a minimal source file so indexing has something to find
+        let src = dir.path().join("main.rs");
+        std::fs::write(&src, "fn main() {}\n").unwrap();
+        let registry = test_registry_for(dir.path());
         let args = serde_json::json!({});
-        let result = ProjectMapHandler.execute(&leindex, args).await;
-        assert!(result.is_err());
+        let result = ProjectMapHandler.execute(&registry, args).await;
+        assert!(result.is_ok(), "auto-indexing should succeed");
     }
 
     #[tokio::test]
-    async fn test_grep_symbols_requires_indexed_project() {
+    async fn test_grep_symbols_auto_indexes_returns_empty() {
+        // With auto-indexing, a project with no matching symbols returns empty results
         let dir = tempdir().unwrap();
-        let leindex = Arc::new(Mutex::new(
-            crate::leindex::LeIndex::new(dir.path()).expect("leindex"),
-        ));
-        let args = serde_json::json!({ "pattern": "auth" });
-        let result = GrepSymbolsHandler.execute(&leindex, args).await;
-        assert!(result.is_err());
+        let src = dir.path().join("lib.rs");
+        std::fs::write(&src, "pub fn greet() {}\n").unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "pattern": "nonexistent" });
+        let result = GrepSymbolsHandler.execute(&registry, args).await;
+        // Should succeed (auto-index happens) but with 0 matches
+        assert!(result.is_ok(), "auto-indexing should succeed");
+        let val = result.unwrap();
+        assert_eq!(val["count"].as_u64().unwrap_or(0), 0);
     }
 
     #[tokio::test]
     async fn test_read_symbol_requires_indexed_project() {
         let dir = tempdir().unwrap();
-        let leindex = Arc::new(Mutex::new(
-            crate::leindex::LeIndex::new(dir.path()).expect("leindex"),
-        ));
+        let registry = test_registry_for(dir.path());
         let args = serde_json::json!({ "symbol": "my_func" });
-        let result = ReadSymbolHandler.execute(&leindex, args).await;
+        let result = ReadSymbolHandler.execute(&registry, args).await;
         assert!(result.is_err());
     }
 
@@ -2567,7 +3212,8 @@ mod tests {
         // All Phase C schemas should be valid JSON objects with required fields
         let schemas = vec![
             (FileSummaryHandler.argument_schema(), vec!["file_path"]),
-            (SymbolLookupHandler.argument_schema(), vec!["symbol"]),
+            // SymbolLookupHandler has no required fields (symbol or symbols accepted)
+            (SymbolLookupHandler.argument_schema(), vec![]),
             (ProjectMapHandler.argument_schema(), vec![]),
             (GrepSymbolsHandler.argument_schema(), vec!["pattern"]),
             (ReadSymbolHandler.argument_schema(), vec!["symbol"]),
@@ -2586,6 +3232,318 @@ mod tests {
                     field
                 );
             }
+        }
+    }
+
+    // =========================================================================
+    // Remediation tests — validate fixes for evaluation report issues
+    // =========================================================================
+
+    #[test]
+    fn test_parse_edit_changes_text_search_mode() {
+        // When old_text is provided without start_byte, should find text in content
+        let content = "fn hello() {\n    println!(\"Hello\");\n}";
+        let changes_json = serde_json::json!([{
+            "type": "replace_text",
+            "old_text": "println!(\"Hello\")",
+            "new_text": "println!(\"Goodbye\")"
+        }]);
+        let changes = parse_edit_changes(&changes_json, Some(content)).unwrap();
+        assert_eq!(changes.len(), 1);
+        if let EditChange::ReplaceText {
+            start,
+            end,
+            new_text,
+        } = &changes[0]
+        {
+            assert_eq!(*start, content.find("println!(\"Hello\")").unwrap());
+            assert_eq!(*end, *start + "println!(\"Hello\")".len());
+            assert_eq!(new_text, "println!(\"Goodbye\")");
+        } else {
+            panic!("Expected ReplaceText");
+        }
+    }
+
+    #[test]
+    fn test_parse_edit_changes_explicit_byte_offsets() {
+        // When start_byte and end_byte are provided, use them directly
+        let changes_json = serde_json::json!([{
+            "type": "replace_text",
+            "start_byte": 10,
+            "end_byte": 20,
+            "new_text": "replacement"
+        }]);
+        let changes = parse_edit_changes(&changes_json, Some("any content")).unwrap();
+        assert_eq!(changes.len(), 1);
+        if let EditChange::ReplaceText { start, end, .. } = &changes[0] {
+            assert_eq!(*start, 10);
+            assert_eq!(*end, 20);
+        } else {
+            panic!("Expected ReplaceText");
+        }
+    }
+
+    #[test]
+    fn test_parse_edit_changes_text_not_found_returns_error() {
+        let changes_json = serde_json::json!([{
+            "type": "replace_text",
+            "old_text": "nonexistent text",
+            "new_text": "replacement"
+        }]);
+        let result = parse_edit_changes(&changes_json, Some("actual file content"));
+        assert!(
+            result.is_err(),
+            "Should error when old_text not found in content"
+        );
+    }
+
+    #[test]
+    fn test_apply_changes_in_memory_text_search_integration() {
+        let content = "def health_check(self):\n    return True\n\ndef other():\n    pass";
+        let changes_json = serde_json::json!([{
+            "type": "replace_text",
+            "old_text": "def health_check(self):\n    return True",
+            "new_text": "def health_status(self):\n    return True"
+        }]);
+        let changes = parse_edit_changes(&changes_json, Some(content)).unwrap();
+        let modified = apply_changes_in_memory(content, &changes).unwrap();
+        assert!(
+            modified.contains("def health_status(self):"),
+            "Replacement should be applied"
+        );
+        assert!(
+            modified.contains("def other():"),
+            "Other content should be preserved"
+        );
+    }
+
+    #[test]
+    fn test_replace_whole_word_basic() {
+        assert_eq!(
+            replace_whole_word("foo bar baz", "bar", "qux"),
+            "foo qux baz"
+        );
+        assert_eq!(replace_whole_word("foobar baz", "bar", "qux"), "foobar baz");
+        assert_eq!(replace_whole_word("bar_foo", "bar", "qux"), "bar_foo");
+        assert_eq!(replace_whole_word("bar", "bar", "qux"), "qux");
+    }
+
+    #[test]
+    fn test_pdg_find_by_name() {
+        let mut pdg = legraphe::pdg::ProgramDependenceGraph::new();
+        let n1 = pdg.add_node(legraphe::pdg::Node {
+            id: "file.py:MyClass.health_check".into(),
+            node_type: legraphe::pdg::NodeType::Method,
+            name: "health_check".into(),
+            file_path: "file.py".into(),
+            byte_range: (0, 50),
+            complexity: 2,
+            language: "python".into(),
+            embedding: None,
+        });
+
+        // find_by_symbol with full ID works
+        assert_eq!(pdg.find_by_symbol("file.py:MyClass.health_check"), Some(n1));
+
+        // find_by_name with short name works
+        assert_eq!(pdg.find_by_name("health_check"), Some(n1));
+
+        // find_by_symbol with short name does NOT work (that's the old bug)
+        assert_eq!(pdg.find_by_symbol("health_check"), None);
+    }
+
+    #[test]
+    fn test_pdg_find_by_name_in_file() {
+        let mut pdg = legraphe::pdg::ProgramDependenceGraph::new();
+        let n1 = pdg.add_node(legraphe::pdg::Node {
+            id: "a.py:run".into(),
+            node_type: legraphe::pdg::NodeType::Function,
+            name: "run".into(),
+            file_path: "a.py".into(),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "python".into(),
+            embedding: None,
+        });
+        let n2 = pdg.add_node(legraphe::pdg::Node {
+            id: "b.py:run".into(),
+            node_type: legraphe::pdg::NodeType::Function,
+            name: "run".into(),
+            file_path: "b.py".into(),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "python".into(),
+            embedding: None,
+        });
+
+        // Without file hint, returns first match
+        assert!(pdg.find_by_name("run").is_some());
+
+        // With file hint, returns correct one
+        assert_eq!(pdg.find_by_name_in_file("run", Some("a.py")), Some(n1));
+        assert_eq!(pdg.find_by_name_in_file("run", Some("b.py")), Some(n2));
+    }
+
+    #[test]
+    fn test_make_diff_generates_unified_diff() {
+        let original = "line1\nline2\nline3\n";
+        let modified = "line1\nmodified\nline3\n";
+        let diff = make_diff(original, modified, "test.rs");
+        assert!(
+            diff.contains("--- test.rs"),
+            "Should have original file header"
+        );
+        assert!(
+            diff.contains("+++ test.rs"),
+            "Should have modified file header"
+        );
+        assert!(diff.contains("-line2"), "Should show removed line");
+        assert!(diff.contains("+modified"), "Should show added line");
+    }
+
+    // =========================================================================
+    // Boolean coercion & multi-project tests
+    // =========================================================================
+
+    #[test]
+    fn test_extract_bool_native_bool() {
+        let args = serde_json::json!({"flag": true, "off": false});
+        assert_eq!(extract_bool(&args, "flag", false), true);
+        assert_eq!(extract_bool(&args, "off", true), false);
+    }
+
+    #[test]
+    fn test_extract_bool_string_coercion() {
+        let args = serde_json::json!({
+            "a": "true", "b": "false", "c": "1", "d": "0", "e": "yes", "f": "no",
+            "g": "TRUE", "h": "False"
+        });
+        assert_eq!(extract_bool(&args, "a", false), true);
+        assert_eq!(extract_bool(&args, "b", true), false);
+        assert_eq!(extract_bool(&args, "c", false), true);
+        assert_eq!(extract_bool(&args, "d", true), false);
+        assert_eq!(extract_bool(&args, "e", false), true);
+        assert_eq!(extract_bool(&args, "f", true), false);
+        assert_eq!(extract_bool(&args, "g", false), true);
+        assert_eq!(extract_bool(&args, "h", true), false);
+    }
+
+    #[test]
+    fn test_extract_bool_number_coercion() {
+        let args = serde_json::json!({"one": 1, "zero": 0, "big": 42});
+        assert_eq!(extract_bool(&args, "one", false), true);
+        assert_eq!(extract_bool(&args, "zero", true), false);
+        assert_eq!(extract_bool(&args, "big", false), true);
+    }
+
+    #[test]
+    fn test_extract_bool_missing_uses_default() {
+        let args = serde_json::json!({});
+        assert_eq!(extract_bool(&args, "absent", true), true);
+        assert_eq!(extract_bool(&args, "absent", false), false);
+    }
+
+    #[test]
+    fn test_validate_file_within_project_ok() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("src/main.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let result = validate_file_within_project(file.to_str().unwrap(), dir.path());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_file_outside_project_fails() {
+        let dir = tempdir().unwrap();
+        // /tmp is always outside our tempdir
+        let result = validate_file_within_project("/etc/passwd", dir.path());
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("outside the project boundary"));
+    }
+
+    #[test]
+    fn test_symbol_lookup_schema_supports_batch() {
+        let schema = SymbolLookupHandler.argument_schema();
+        let props = schema.get("properties").unwrap();
+        assert!(props.get("symbol").is_some(), "should have 'symbol'");
+        assert!(
+            props.get("symbols").is_some(),
+            "should have 'symbols' for batch"
+        );
+
+        // Required should be empty (either symbol or symbols accepted)
+        let required = schema.get("required").and_then(|v| v.as_array());
+        assert!(
+            required.map(|r| r.is_empty()).unwrap_or(true),
+            "required should be empty since symbol/symbols are alternatives"
+        );
+    }
+
+    #[test]
+    fn test_search_schema_has_pagination() {
+        let schema = SearchHandler.argument_schema();
+        let props = schema.get("properties").unwrap();
+        assert!(
+            props.get("offset").is_some(),
+            "should have 'offset' for pagination"
+        );
+        assert!(
+            props.get("project_path").is_some(),
+            "should have 'project_path'"
+        );
+    }
+
+    #[test]
+    fn test_grep_symbols_schema_has_pagination() {
+        let schema = GrepSymbolsHandler.argument_schema();
+        let props = schema.get("properties").unwrap();
+        assert!(
+            props.get("offset").is_some(),
+            "should have 'offset' for pagination"
+        );
+        assert!(
+            props.get("project_path").is_some(),
+            "should have 'project_path'"
+        );
+    }
+
+    #[test]
+    fn test_project_map_schema_has_pagination() {
+        let schema = ProjectMapHandler.argument_schema();
+        let props = schema.get("properties").unwrap();
+        assert!(props.get("offset").is_some(), "should have 'offset'");
+        assert!(props.get("limit").is_some(), "should have 'limit'");
+        assert!(
+            props.get("project_path").is_some(),
+            "should have 'project_path'"
+        );
+    }
+
+    #[test]
+    fn test_all_tools_have_project_path_except_index_diagnostics() {
+        // Tools that need indexed data should all accept project_path
+        let tools_with_project_path = vec![
+            SearchHandler.argument_schema(),
+            DeepAnalyzeHandler.argument_schema(),
+            ContextHandler.argument_schema(),
+            FileSummaryHandler.argument_schema(),
+            SymbolLookupHandler.argument_schema(),
+            ProjectMapHandler.argument_schema(),
+            GrepSymbolsHandler.argument_schema(),
+            ReadSymbolHandler.argument_schema(),
+            EditPreviewHandler.argument_schema(),
+            EditApplyHandler.argument_schema(),
+            RenameSymbolHandler.argument_schema(),
+            ImpactAnalysisHandler.argument_schema(),
+        ];
+        for schema in tools_with_project_path {
+            let props = schema.get("properties").unwrap();
+            assert!(
+                props.get("project_path").is_some(),
+                "All query tools must accept project_path"
+            );
         }
     }
 }

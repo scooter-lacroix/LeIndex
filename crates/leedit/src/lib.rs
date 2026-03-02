@@ -11,7 +11,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 // Re-exports from legraphe
-pub use legraphe::pdg::{ProgramDependenceGraph as PDG, Node, NodeType, Edge, EdgeType};
+pub use legraphe::pdg::{Edge, EdgeType, Node, NodeType, ProgramDependenceGraph as PDG};
 
 // Re-exports from lestockage
 pub use lestockage::{Storage, StorageConfig, UniqueProjectId};
@@ -234,17 +234,23 @@ impl EditEngine {
     /// Apply an edit
     pub async fn apply_edit(&self, request: &EditRequest) -> Result<EditResult> {
         // Create worktree session
-        let mut session = self.worktree_manager.create_session(
-            &request.project_id,
-            &format!("edit-{}", chrono::Utc::now().timestamp()),
-        ).await?;
+        let mut session = self
+            .worktree_manager
+            .create_session(
+                &request.project_id,
+                &format!("edit-{}", chrono::Utc::now().timestamp()),
+            )
+            .await?;
 
         // Apply changes in worktree
         let mut changes_applied = 0;
         let mut files_modified = Vec::new();
 
         for change in &request.changes {
-            match self.apply_change(&mut session, &request.file_path, change).await {
+            match self
+                .apply_change(&mut session, &request.file_path, change)
+                .await
+            {
                 Ok(modified) => {
                     if modified {
                         changes_applied += 1;
@@ -287,14 +293,28 @@ impl EditEngine {
     }
 
     /// Generate a unified diff between original and modified content.
-    pub fn generate_diff(&self, original: &str, modified: &str, file_path: &Path) -> Result<String> {
+    pub fn generate_diff(
+        &self,
+        original: &str,
+        modified: &str,
+        file_path: &Path,
+    ) -> Result<String> {
         let patch = diffy::create_patch(original, modified);
         // Prepend file path header for clarity
         let patch_str = patch.to_string();
         if patch_str.is_empty() {
-            Ok(format!("--- {}\n+++ {}\n(no changes)\n", file_path.display(), file_path.display()))
+            Ok(format!(
+                "--- {}\n+++ {}\n(no changes)\n",
+                file_path.display(),
+                file_path.display()
+            ))
         } else {
-            Ok(format!("--- {}\n+++ {}\n{}", file_path.display(), file_path.display(), patch_str))
+            Ok(format!(
+                "--- {}\n+++ {}\n{}",
+                file_path.display(),
+                file_path.display(),
+                patch_str
+            ))
         }
     }
 
@@ -303,7 +323,11 @@ impl EditEngine {
     /// Used by `preview_edit` to compute the diff without touching the filesystem.
     fn apply_change_to_string(&self, content: &str, change: &EditChange) -> Result<String> {
         match change {
-            EditChange::ReplaceText { start, end, new_text } => {
+            EditChange::ReplaceText {
+                start,
+                end,
+                new_text,
+            } => {
                 let bytes = content.as_bytes();
                 let start_idx = (*start).min(bytes.len());
                 let end_idx = (*end).min(bytes.len());
@@ -344,7 +368,10 @@ impl EditEngine {
         // Check each change for impact
         for change in &request.changes {
             match change {
-                EditChange::RenameSymbol { old_name, new_name: _ } => {
+                EditChange::RenameSymbol {
+                    old_name,
+                    new_name: _,
+                } => {
                     if let Some(node_id) = self.pdg.find_by_symbol(old_name) {
                         affected_nodes.push(old_name.clone());
                         // Forward impact: all nodes reachable from this one
@@ -360,7 +387,8 @@ impl EditEngine {
                         if !backward.is_empty() {
                             breaking_changes.push(format!(
                                 "Renaming '{}' may break {} caller(s)",
-                                old_name, backward.len()
+                                old_name,
+                                backward.len()
                             ));
                             for bid in backward {
                                 if let Some(bn) = self.pdg.get_node(bid) {
@@ -369,7 +397,10 @@ impl EditEngine {
                             }
                         }
                     } else {
-                        breaking_changes.push(format!("Symbol '{}' not found in PDG — rename may miss references", old_name));
+                        breaking_changes.push(format!(
+                            "Symbol '{}' not found in PDG — rename may miss references",
+                            old_name
+                        ));
                     }
                 }
                 EditChange::ReplaceText { .. } => {
@@ -441,9 +472,8 @@ impl EditEngine {
                 EditError::Generic(format!("Failed to read {:?}: {}", target_path, e))
             })?
         } else if file_path.exists() {
-            std::fs::read_to_string(file_path).map_err(|e| {
-                EditError::Generic(format!("Failed to read {:?}: {}", file_path, e))
-            })?
+            std::fs::read_to_string(file_path)
+                .map_err(|e| EditError::Generic(format!("Failed to read {:?}: {}", file_path, e)))?
         } else {
             return Err(EditError::FileNotFound(file_path.to_path_buf()));
         };
@@ -461,9 +491,8 @@ impl EditEngine {
             file_path.to_path_buf()
         };
 
-        std::fs::write(&write_path, modified.as_bytes()).map_err(|e| {
-            EditError::Generic(format!("Failed to write {:?}: {}", write_path, e))
-        })?;
+        std::fs::write(&write_path, modified.as_bytes())
+            .map_err(|e| EditError::Generic(format!("Failed to write {:?}: {}", write_path, e)))?;
 
         Ok(true)
     }
@@ -506,14 +535,12 @@ impl EditEngine {
     pub async fn redo(&self) -> Result<EditResult> {
         let mut history = self.history.lock().await;
         match history.redo() {
-            Some(EditCommand::Edit { file_path, .. }) => {
-                Ok(EditResult {
-                    success: true,
-                    changes_applied: 1,
-                    files_modified: vec![file_path.clone()],
-                    error: None,
-                })
-            }
+            Some(EditCommand::Edit { file_path, .. }) => Ok(EditResult {
+                success: true,
+                changes_applied: 1,
+                files_modified: vec![file_path.clone()],
+                error: None,
+            }),
             Some(_) | None => Ok(EditResult {
                 success: false,
                 changes_applied: 0,
@@ -623,10 +650,10 @@ impl WorktreeSession {
 pub struct EditHistory {
     /// List of recorded edit commands
     pub commands: Vec<EditCommand>,
-    
+
     /// Current position in the command history
     pub current_index: usize,
-    
+
     /// Named rollback points mapping to command indices
     pub rollback_points: HashMap<String, usize>,
 }
@@ -714,13 +741,13 @@ pub enum EditCommand {
     Edit {
         /// Project identifier
         project_id: UniqueProjectId,
-        
+
         /// File path to edit
         file_path: PathBuf,
-        
+
         /// Changes to apply
         changes: Vec<EditChange>,
-        
+
         /// Timestamp of the edit operation
         timestamp: chrono::DateTime<chrono::Utc>,
     },
@@ -729,7 +756,7 @@ pub enum EditCommand {
     RollbackPoint {
         /// Name of the rollback point
         name: String,
-        
+
         /// Timestamp of the rollback operation
         timestamp: chrono::DateTime<chrono::Utc>,
     },
@@ -833,18 +860,12 @@ pub struct Impact;
 
 impl Impact {
     /// Analyze forward impact (what depends on this change)
-    pub fn analyze_forward_impact(
-        _pdg: &PDG,
-        _symbol: &str,
-    ) -> Result<Vec<String>> {
+    pub fn analyze_forward_impact(_pdg: &PDG, _symbol: &str) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
 
     /// Analyze backward impact (what this change depends on)
-    pub fn analyze_backward_impact(
-        _pdg: &PDG,
-        _symbol: &str,
-    ) -> Result<Vec<String>> {
+    pub fn analyze_backward_impact(_pdg: &PDG, _symbol: &str) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
 }
@@ -868,11 +889,15 @@ mod tests {
 
     /// Helper to create test storage
     fn make_test_storage() -> Storage {
-        Storage::open_with_config(":memory:", StorageConfig {
-            db_path: ":memory:".to_string(),
-            wal_enabled: false,
-            cache_size_pages: None,
-        }).unwrap()
+        Storage::open_with_config(
+            ":memory:",
+            StorageConfig {
+                db_path: ":memory:".to_string(),
+                wal_enabled: false,
+                cache_size_pages: None,
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1189,14 +1214,18 @@ mod tests {
             file_path: file_path.clone(),
             changes: vec![EditChange::ReplaceText {
                 start: 0,
-                end: 5,  // "hello"
+                end: 5, // "hello"
                 new_text: "goodbye".to_string(),
             }],
             preview_only: true,
         };
 
         let result = engine.preview_edit(&request).await;
-        assert!(result.is_ok(), "preview_edit should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "preview_edit should succeed: {:?}",
+            result.err()
+        );
         let preview = result.unwrap();
         // The edited file is always in affected list
         assert!(!preview.files_affected.is_empty());

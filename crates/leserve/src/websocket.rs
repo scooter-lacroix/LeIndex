@@ -21,10 +21,10 @@ pub enum WsEvent {
     ProjectAdded {
         /// Unique codebase identifier
         codebase_id: String,
-        
+
         /// Display name of the project
         display_name: String,
-        
+
         /// Base name of the project
         base_name: String,
     },
@@ -34,7 +34,7 @@ pub enum WsEvent {
     ProjectUpdated {
         /// Unique codebase identifier
         codebase_id: String,
-        
+
         /// New display name of the project
         display_name: String,
     },
@@ -51,13 +51,13 @@ pub enum WsEvent {
     IndexingProgress {
         /// Unique codebase identifier
         codebase_id: String,
-        
+
         /// Current indexing phase
         phase: u32,
-        
+
         /// Progress percentage (0-100)
         percent: u8,
-        
+
         /// Currently processed file
         current_file: String,
     },
@@ -162,14 +162,22 @@ impl WsManager {
         let state = ConnectionState::new(conn_id.clone(), ip_addr);
         let mut connections = self.connections.write().await;
         connections.insert(conn_id.clone(), state);
-        info!("WebSocket connected: {} (active: {})", conn_id, connections.len());
+        info!(
+            "WebSocket connected: {} (active: {})",
+            conn_id,
+            connections.len()
+        );
     }
 
     /// Unregister a connection
     pub async fn unregister_connection(&self, conn_id: &str) {
         let mut connections = self.connections.write().await;
         connections.remove(conn_id);
-        info!("WebSocket disconnected: {} (active: {})", conn_id, connections.len());
+        info!(
+            "WebSocket disconnected: {} (active: {})",
+            conn_id,
+            connections.len()
+        );
     }
 
     /// Broadcast event to all connected clients
@@ -243,10 +251,7 @@ mod tests {
 
     #[test]
     fn test_connection_state_new() {
-        let state = ConnectionState::new(
-            "conn_1".to_string(),
-            Some("127.0.0.1:12345".to_string()),
-        );
+        let state = ConnectionState::new("conn_1".to_string(), Some("127.0.0.1:12345".to_string()));
         assert_eq!(state.id, "conn_1");
         assert_eq!(state.ip_addr, Some("127.0.0.1:12345".to_string()));
         assert!(state.subscriptions.is_empty());
@@ -293,9 +298,7 @@ mod tests {
     #[tokio::test]
     async fn test_ws_manager_broadcast() {
         let manager = WsManager::new();
-        let event = WsEvent::Heartbeat {
-            timestamp: 123,
-        };
+        let event = WsEvent::Heartbeat { timestamp: 123 };
 
         // Should not panic
         manager.broadcast(event).await;
@@ -304,7 +307,9 @@ mod tests {
     #[tokio::test]
     async fn test_ws_manager_register_connection() {
         let manager = WsManager::new();
-        manager.register_connection("conn_1".to_string(), Some("127.0.0.1".to_string())).await;
+        manager
+            .register_connection("conn_1".to_string(), Some("127.0.0.1".to_string()))
+            .await;
 
         assert_eq!(manager.connection_count().await, 1);
 
@@ -317,8 +322,12 @@ mod tests {
     #[tokio::test]
     async fn test_ws_manager_unregister_connection() {
         let manager = WsManager::new();
-        manager.register_connection("conn_1".to_string(), None).await;
-        manager.register_connection("conn_2".to_string(), None).await;
+        manager
+            .register_connection("conn_1".to_string(), None)
+            .await;
+        manager
+            .register_connection("conn_2".to_string(), None)
+            .await;
 
         assert_eq!(manager.connection_count().await, 2);
 

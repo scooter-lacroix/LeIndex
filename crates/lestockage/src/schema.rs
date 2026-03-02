@@ -1,9 +1,9 @@
 // Storage schema and database management
 
+use crate::{ProjectMetadata, UniqueProjectId};
 use rusqlite::{Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use crate::{ProjectMetadata, UniqueProjectId};
 
 /// Storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +49,11 @@ impl Storage {
         if config.wal_enabled {
             conn.pragma_update(None, "journal_mode", "WAL")?;
         }
+
+        // Allow concurrent access: wait up to 5 seconds for locks instead of
+        // immediately failing.  This is critical when multiple LeIndex instances
+        // (or a ProjectRegistry) access the same project's .leindex/leindex.db.
+        conn.pragma_update(None, "busy_timeout", 5000)?;
 
         // Set cache size if specified
         if let Some(cache_size) = config.cache_size_pages {
@@ -336,7 +341,7 @@ CREATE TABLE IF NOT EXISTS project_metadata (
         ProjectMetadata::load_existing_ids(&self.conn, base_name)
             .map_err(|_| rusqlite::Error::InvalidQuery)
     }
-    
+
     /// Store project metadata.
     ///
     /// This persists the unique project ID and associated metadata.
@@ -351,9 +356,10 @@ CREATE TABLE IF NOT EXISTS project_metadata (
             unique_project_id: unique_id.clone(),
             ..metadata
         };
-        metadata.save(&self.conn).map_err(|_| rusqlite::Error::InvalidQuery)
+        metadata
+            .save(&self.conn)
+            .map_err(|_| rusqlite::Error::InvalidQuery)
     }
-
 }
 
 #[cfg(test)]

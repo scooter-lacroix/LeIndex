@@ -35,13 +35,11 @@ impl ToolType {
     pub fn is_available(&self) -> bool {
         match self {
             Self::Walkdir => true, // Always available (it's a Rust crate)
-            Self::Fd | Self::Ripgrep => {
-                Command::new(self.command_name())
-                    .arg("--version")
-                    .output()
-                    .map(|o| o.status.success())
-                    .unwrap_or(false)
-            }
+            Self::Fd | Self::Ripgrep => Command::new(self.command_name())
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false),
         }
     }
 }

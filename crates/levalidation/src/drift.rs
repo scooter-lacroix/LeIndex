@@ -1,10 +1,10 @@
 //! Semantic drift detection for signature changes and API breakage
 
 use crate::edit_change::EditChange;
-use crate::ValidationError;
 use crate::Location;
-use legraphe::{ProgramDependenceGraph};
+use crate::ValidationError;
 use legraphe::pdg::NodeType;
+use legraphe::ProgramDependenceGraph;
 use leparse::traits::{CodeIntelligence, SignatureInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,11 +69,7 @@ impl DriftItem {
     }
 
     /// Create a type changed drift
-    pub fn type_changed(
-        symbol_name: String,
-        location: Location,
-        type_desc: String,
-    ) -> Self {
+    pub fn type_changed(symbol_name: String, location: Location, type_desc: String) -> Self {
         Self {
             symbol_name,
             drift_type: DriftType::TypeChanged,
@@ -206,11 +202,7 @@ impl SemanticDriftAnalyzer {
             let new_sigs = self.extract_signatures(change, &change.new_content)?;
 
             // Compare signatures to detect drift
-            drift_items.extend(self.compare_signatures(
-                change,
-                &original_sigs,
-                &new_sigs,
-            )?);
+            drift_items.extend(self.compare_signatures(change, &original_sigs, &new_sigs)?);
         }
 
         Ok(drift_items)
@@ -234,37 +226,43 @@ impl SemanticDriftAnalyzer {
             "python" => {
                 use leparse::python::PythonParser;
                 let parser = PythonParser::new();
-                parser.get_signatures(source)
+                parser
+                    .get_signatures(source)
                     .map_err(|e| ValidationError::Parse(format!("Failed to parse Python: {}", e)))
             }
             "javascript" => {
                 use leparse::javascript::JavaScriptParser;
                 let parser = JavaScriptParser::new();
-                parser.get_signatures(source)
-                    .map_err(|e| ValidationError::Parse(format!("Failed to parse JavaScript: {}", e)))
+                parser.get_signatures(source).map_err(|e| {
+                    ValidationError::Parse(format!("Failed to parse JavaScript: {}", e))
+                })
             }
             "typescript" => {
                 use leparse::javascript::TypeScriptParser;
                 let parser = TypeScriptParser::new();
-                parser.get_signatures(source)
-                    .map_err(|e| ValidationError::Parse(format!("Failed to parse TypeScript: {}", e)))
+                parser.get_signatures(source).map_err(|e| {
+                    ValidationError::Parse(format!("Failed to parse TypeScript: {}", e))
+                })
             }
             "rust" => {
                 use leparse::rust::RustParser;
                 let parser = RustParser::new();
-                parser.get_signatures(source)
+                parser
+                    .get_signatures(source)
                     .map_err(|e| ValidationError::Parse(format!("Failed to parse Rust: {}", e)))
             }
             "go" => {
                 use leparse::go::GoParser;
                 let parser = GoParser::new();
-                parser.get_signatures(source)
+                parser
+                    .get_signatures(source)
                     .map_err(|e| ValidationError::Parse(format!("Failed to parse Go: {}", e)))
             }
             "java" => {
                 use leparse::java::JavaParser;
                 let parser = JavaParser::new();
-                parser.get_signatures(source)
+                parser
+                    .get_signatures(source)
                     .map_err(|e| ValidationError::Parse(format!("Failed to parse Java: {}", e)))
             }
             _ => {
@@ -283,10 +281,7 @@ impl SemanticDriftAnalyzer {
     ) -> Result<Vec<DriftItem>, ValidationError> {
         let mut drift_items = Vec::new();
 
-        let original_map: HashMap<_, _> = original
-            .iter()
-            .map(|sig| (&sig.name, sig))
-            .collect();
+        let original_map: HashMap<_, _> = original.iter().map(|sig| (&sig.name, sig)).collect();
 
         let new_map: HashMap<_, _> = new.iter().map(|sig| (&sig.name, sig)).collect();
 
@@ -294,7 +289,8 @@ impl SemanticDriftAnalyzer {
         for name in original_map.keys() {
             if !new_map.contains_key(name) {
                 // Find location in original content
-                let location = self.find_signature_location(change, original_map.get(name).unwrap());
+                let location =
+                    self.find_signature_location(change, original_map.get(name).unwrap());
                 drift_items.push(DriftItem::removed(name.to_string(), location));
             }
         }
@@ -311,11 +307,9 @@ impl SemanticDriftAnalyzer {
         for name in original_map.keys() {
             if let Some(new_sig) = new_map.get(name) {
                 if let Some(original_sig) = original_map.get(name) {
-                    if let Some(drift) = self.detect_signature_drift(
-                        change,
-                        original_sig,
-                        new_sig,
-                    )? {
+                    if let Some(drift) =
+                        self.detect_signature_drift(change, original_sig, new_sig)?
+                    {
                         drift_items.push(drift);
                     }
                 }
@@ -370,11 +364,7 @@ impl SemanticDriftAnalyzer {
     }
 
     /// Find the location of a signature in the edit change
-    fn find_signature_location(
-        &self,
-        change: &EditChange,
-        sig: &SignatureInfo,
-    ) -> Location {
+    fn find_signature_location(&self, change: &EditChange, sig: &SignatureInfo) -> Location {
         let byte_offset = sig.byte_range.0;
         let mut line = 1;
         let mut column = 1;

@@ -198,9 +198,7 @@ impl GlobalRegistry {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| path.to_string_lossy().to_string());
 
-        let path_hash = blake3::hash(canonical_path.as_bytes())
-            .to_hex()[..8]
-            .to_string();
+        let path_hash = blake3::hash(canonical_path.as_bytes()).to_hex()[..8].to_string();
 
         let registered_now = chrono::Utc::now();
         let registered_at = registered_now.timestamp();
@@ -210,7 +208,8 @@ impl GlobalRegistry {
             .ok()
             .and_then(|m| m.modified().ok())
             .and_then(|t| {
-                t.duration_since(std::time::UNIX_EPOCH).ok()
+                t.duration_since(std::time::UNIX_EPOCH)
+                    .ok()
                     .map(|d| d.as_secs() as i64)
             });
 
@@ -256,26 +255,27 @@ impl GlobalRegistry {
             "#,
         )?;
 
-        let projects = stmt.query_map([], |row| {
-            let id_str: String = row.get(0)?;
-            let unique_id = UniqueProjectId::from_str(&id_str)
-                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+        let projects = stmt
+            .query_map([], |row| {
+                let id_str: String = row.get(0)?;
+                let unique_id = UniqueProjectId::from_str(&id_str)
+                    .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
 
-            Ok(ProjectInfo {
-                unique_id,
-                base_name: row.get(1)?,
-                path: PathBuf::from(row.get::<_, String>(2)?),
-                language: row.get(3)?,
-                file_count: row.get::<_, i64>(4)? as usize,
-                content_fingerprint: row.get(5)?,
-                is_clone: row.get(6)?,
-                cloned_from: row.get(7)?,
-                registered_at: row.get(8)?,
-                last_modified: row.get::<_, Option<i64>>(9)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+                Ok(ProjectInfo {
+                    unique_id,
+                    base_name: row.get(1)?,
+                    path: PathBuf::from(row.get::<_, String>(2)?),
+                    language: row.get(3)?,
+                    file_count: row.get::<_, i64>(4)? as usize,
+                    content_fingerprint: row.get(5)?,
+                    is_clone: row.get(6)?,
+                    cloned_from: row.get(7)?,
+                    registered_at: row.get(8)?,
+                    last_modified: row.get::<_, Option<i64>>(9)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
 
         Ok(projects)
     }
@@ -301,8 +301,8 @@ impl GlobalRegistry {
 
         let result = stmt.query_row(params![id], |row| {
             let id_str: String = row.get(0)?;
-            let unique_id = UniqueProjectId::from_str(&id_str)
-                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+            let unique_id =
+                UniqueProjectId::from_str(&id_str).ok_or_else(|| rusqlite::Error::InvalidQuery)?;
 
             Ok(ProjectInfo {
                 unique_id,
@@ -365,8 +365,8 @@ impl GlobalRegistry {
 
         let result = stmt.query_row(params![fingerprint], |row| {
             let id_str: String = row.get(0)?;
-            let unique_id = UniqueProjectId::from_str(&id_str)
-                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+            let unique_id =
+                UniqueProjectId::from_str(&id_str).ok_or_else(|| rusqlite::Error::InvalidQuery)?;
 
             Ok(ProjectInfo {
                 unique_id,
@@ -391,9 +391,9 @@ impl GlobalRegistry {
 
     /// Load existing project IDs for a given base name
     fn load_existing_ids(&self, base_name: &str) -> Result<Vec<UniqueProjectId>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT unique_project_id FROM global_projects WHERE base_name = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT unique_project_id FROM global_projects WHERE base_name = ?1")?;
 
         let ids: Vec<UniqueProjectId> = stmt
             .query_map(params![base_name], |row| {
@@ -488,12 +488,9 @@ mod tests {
         let project_path = temp_dir.path().join("myproject");
         std::fs::create_dir_all(project_path.join(".git")).unwrap();
 
-        let id = registry.register_project(
-            &project_path,
-            Some("rust".to_string()),
-            100,
-            "fp123",
-        ).unwrap();
+        let id = registry
+            .register_project(&project_path, Some("rust".to_string()), 100, "fp123")
+            .unwrap();
 
         let project = registry.get_project(&id).unwrap();
 
@@ -515,13 +512,17 @@ mod tests {
         for i in 0..3 {
             let path = temp_dir.path().join(format!("project{}", i));
             std::fs::create_dir_all(path.join(".git")).unwrap();
-            registry.register_project(&path, Some("rust".to_string()), 10 + i, &format!("fp{}", i)).unwrap();
+            registry
+                .register_project(&path, Some("rust".to_string()), 10 + i, &format!("fp{}", i))
+                .unwrap();
         }
 
         let projects = registry.list_projects().unwrap();
 
         assert_eq!(projects.len(), 3);
-        assert!(projects.iter().all(|p| p.language == Some("rust".to_string())));
+        assert!(projects
+            .iter()
+            .all(|p| p.language == Some("rust".to_string())));
     }
 
     #[test]
@@ -533,7 +534,9 @@ mod tests {
         let project_path = temp_dir.path().join("todelete");
         std::fs::create_dir_all(project_path.join(".git")).unwrap();
 
-        let id = registry.register_project(&project_path, None, 5, "fp").unwrap();
+        let id = registry
+            .register_project(&project_path, None, 5, "fp")
+            .unwrap();
 
         // Delete it
         assert!(registry.delete_project(&id).is_ok());
@@ -552,12 +555,16 @@ mod tests {
         // Register original project
         let path1 = temp_dir.path().join("original");
         std::fs::create_dir_all(path1.join(".git")).unwrap();
-        registry.register_project(&path1, Some("rust".to_string()), 50, "same-fp").unwrap();
+        registry
+            .register_project(&path1, Some("rust".to_string()), 50, "same-fp")
+            .unwrap();
 
         // Register clone with same fingerprint
         let path2 = temp_dir.path().join("clone");
         std::fs::create_dir_all(path2.join(".git")).unwrap();
-        registry.register_project(&path2, Some("rust".to_string()), 50, "same-fp").unwrap();
+        registry
+            .register_project(&path2, Some("rust".to_string()), 50, "same-fp")
+            .unwrap();
 
         let projects = registry.list_projects().unwrap();
         let clone = projects.iter().find(|p| p.base_name == "clone").unwrap();

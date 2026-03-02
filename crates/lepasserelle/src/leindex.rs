@@ -3,7 +3,8 @@
 // *L'Index* (The Index) - Unified API that brings together all LeIndex crates
 
 use crate::memory::{
-    pdg_cache_key, search_cache_key, CacheEntry, CacheSpiller, MemoryConfig, WarmStrategy,
+    analysis_cache_key, pdg_cache_key, search_cache_key, CacheEntry, CacheSpiller, MemoryConfig,
+    WarmStrategy,
 };
 use anyhow::{Context, Result};
 use legraphe::{
@@ -51,10 +52,20 @@ fn tokenize_code(text: &str) -> Vec<String> {
                 } else {
                     current.push(ch);
                 }
-            } else if ch.is_lowercase() && !current.is_empty()
+            } else if ch.is_lowercase()
+                && !current.is_empty()
                 && current.len() > 1
-                && current.chars().last().map(|c| c.is_uppercase()).unwrap_or(false)
-                && current.chars().rev().nth(1).map(|c| c.is_uppercase()).unwrap_or(false)
+                && current
+                    .chars()
+                    .last()
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false)
+                && current
+                    .chars()
+                    .rev()
+                    .nth(1)
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false)
             {
                 // Acronym→camelCase: "HTTPC" + 'o' → push "HTTP", start "Co"
                 let last_char = current.pop().unwrap();
@@ -62,16 +73,26 @@ fn tokenize_code(text: &str) -> Vec<String> {
                     tokens.push(current.to_lowercase());
                 }
                 current = format!("{}{}", last_char, ch);
-            } else if ch.is_ascii_digit() && !current.is_empty()
-                && current.chars().last().map(|c| c.is_alphabetic()).unwrap_or(false)
+            } else if ch.is_ascii_digit()
+                && !current.is_empty()
+                && current
+                    .chars()
+                    .last()
+                    .map(|c| c.is_alphabetic())
+                    .unwrap_or(false)
             {
                 // letter→digit boundary: "HTTP" + '2' → push "http", start "2"
                 if current.len() >= 2 {
                     tokens.push(current.to_lowercase());
                 }
                 current = ch.to_string();
-            } else if ch.is_alphabetic() && !current.is_empty()
-                && current.chars().last().map(|c| c.is_ascii_digit()).unwrap_or(false)
+            } else if ch.is_alphabetic()
+                && !current.is_empty()
+                && current
+                    .chars()
+                    .last()
+                    .map(|c| c.is_ascii_digit())
+                    .unwrap_or(false)
             {
                 // digit→letter boundary: "2" + 'C' → push "2", start "C"
                 tokens.push(current.to_lowercase());
@@ -137,7 +158,8 @@ impl TfIdfEmbedder {
         // Count document frequency per token
         let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for (_, content) in documents {
-            let toks: std::collections::HashSet<String> = tokenize_code(content).into_iter().collect();
+            let toks: std::collections::HashSet<String> =
+                tokenize_code(content).into_iter().collect();
             for tok in toks {
                 *df.entry(tok).or_insert(0) += 1;
             }
@@ -331,6 +353,18 @@ pub struct IndexStats {
 
     /// Total time taken for the indexing process in milliseconds
     pub indexing_time_ms: u64,
+
+    /// Number of external dependencies found in lock files
+    #[serde(default)]
+    pub external_deps_in_lockfile: usize,
+
+    /// Number of external module nodes resolved via lock files
+    #[serde(default)]
+    pub external_deps_resolved: usize,
+
+    /// Number of external module nodes still unresolved
+    #[serde(default)]
+    pub external_deps_unresolved: usize,
 }
 
 /// Result from a deep analysis operation
@@ -393,6 +427,54 @@ pub struct Diagnostics {
 
     /// Total size of the spilled cache on disk in bytes
     pub spilled_bytes: usize,
+
+    /// Total cache hits (memory + disk).
+    #[serde(default)]
+    pub cache_hits: usize,
+
+    /// Number of in-memory cache hits.
+    #[serde(default)]
+    pub cache_memory_hits: usize,
+
+    /// Number of disk-restored cache hits.
+    #[serde(default)]
+    pub cache_disk_hits: usize,
+
+    /// Number of cache misses.
+    #[serde(default)]
+    pub cache_misses: usize,
+
+    /// Cache hit rate in [0.0, 1.0].
+    #[serde(default)]
+    pub cache_hit_rate: f64,
+
+    /// Number of cache write operations.
+    #[serde(default)]
+    pub cache_writes: usize,
+
+    /// Number of cache spill/persist operations.
+    #[serde(default)]
+    pub cache_spills: usize,
+
+    /// Number of cache restore operations.
+    #[serde(default)]
+    pub cache_restores: usize,
+
+    /// Cache temperature classification: `cold`, `warm`, `hot`.
+    #[serde(default)]
+    pub cache_temperature: String,
+
+    /// Whether a PDG is loaded in memory
+    pub pdg_loaded: bool,
+
+    /// Estimated size of the in-memory PDG (nodes × ~200 bytes + edges × ~64 bytes)
+    pub pdg_estimated_bytes: usize,
+
+    /// Number of nodes in the search engine index
+    pub search_index_nodes: usize,
+
+    /// Overall index health: "healthy", "stale", or "empty"
+    pub index_health: String,
 }
 
 impl LeIndex {
@@ -432,9 +514,7 @@ impl LeIndex {
 
         // Generate unique project ID with conflict resolution
         // Load existing projects with same base name
-        let existing_ids = storage
-            .load_existing_ids(&project_id)
-            .unwrap_or_default();
+        let existing_ids = storage.load_existing_ids(&project_id).unwrap_or_default();
         let unique_id = UniqueProjectId::generate(&project_path, &existing_ids);
 
         // Store the project metadata
@@ -444,7 +524,9 @@ impl LeIndex {
 
         info!(
             "Creating LeIndex for project: {} (unique ID: {}) at {:?}",
-            project_id, unique_id.to_string(), project_path
+            project_id,
+            unique_id.to_string(),
+            project_path
         );
 
         // Initialize search engine
@@ -456,8 +538,15 @@ impl LeIndex {
             cache_dir,
             ..Default::default()
         };
-        let cache_spiller =
+        let mut cache_spiller =
             CacheSpiller::new(memory_config).context("Failed to initialize cache spiller")?;
+        if let Ok(restored) = cache_spiller.auto_restore() {
+            debug!(
+                "Cache auto-restore on startup: restored={} failed={}",
+                restored.entries_restored,
+                restored.entries_failed.len()
+            );
+        }
 
         Ok(Self {
             project_path,
@@ -477,6 +566,9 @@ impl LeIndex {
                 pdg_edges: 0,
                 indexed_nodes: 0,
                 indexing_time_ms: 0,
+                external_deps_in_lockfile: 0,
+                external_deps_resolved: 0,
+                external_deps_unresolved: 0,
             },
             embedder: None,
         })
@@ -636,6 +728,25 @@ impl LeIndex {
             }
         }
 
+        // Step 5b: Resolve external dependencies via lock files
+        let ext_registry = legraphe::ExternalDependencyRegistry::from_project(&self.project_path);
+        let (ext_in_lockfile, ext_resolved, ext_unresolved) = if !ext_registry.is_empty() {
+            let annotation_stats = legraphe::annotate_external_nodes(&mut pdg, &ext_registry);
+            info!(
+                "External dependency resolution: {}/{} resolved via lock files ({} packages in registry)",
+                annotation_stats.resolved,
+                annotation_stats.total_external,
+                ext_registry.len()
+            );
+            (
+                ext_registry.len(),
+                annotation_stats.resolved,
+                annotation_stats.unresolved,
+            )
+        } else {
+            (0, 0, 0)
+        };
+
         let pdg_node_count = pdg.node_count();
         let pdg_edge_count = pdg.edge_count();
 
@@ -668,6 +779,9 @@ impl LeIndex {
             pdg_edges: pdg_edge_count,
             indexed_nodes: indexed_count,
             indexing_time_ms: start_time.elapsed().as_millis() as u64,
+            external_deps_in_lockfile: ext_in_lockfile,
+            external_deps_resolved: ext_resolved,
+            external_deps_unresolved: ext_unresolved,
         };
 
         // Keep PDG in memory
@@ -690,11 +804,58 @@ impl LeIndex {
     fn collect_source_files_with_hashes(&self) -> Result<Vec<(PathBuf, String)>> {
         let mut source_files = Vec::new();
 
-        // Common source file extensions
+        // Load project config for exclusion patterns.
+        // Falls back to the comprehensive defaults defined in config::ExclusionConfig
+        // which covers: target, node_modules, vendor, dist, build, out, .venv, venv,
+        // env, __pycache__, *.min.js, *.min.css, *.pb.go, *.generated.rs
+        let project_config =
+            crate::config::ProjectConfig::load(&self.project_path).unwrap_or_default();
+
+        // All file extensions supported by the leparse parser.
+        // This must stay in sync with leparse::grammar::LanguageId::from_extension.
         let extensions = [
             "rs", "py", "js", "ts", "tsx", "jsx", // Main languages
-            "go", "java", "cpp", "c", "h", "hpp", // Systems languages
-            "rb", "php", "lua", "scala", // Scripting languages
+            "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Systems languages
+            "cs",  // C#
+            "rb", "php", "lua", "scala", "sc", // Scripting languages
+            "sh", "bash", // Shell
+            "json", // Data
+        ];
+
+        // Directories to always skip (fast-path, checked before config-based
+        // exclusion to avoid a HashMap lookup for the most common cases).
+        // These are a superset of config::ExclusionConfig defaults — the config
+        // exclusions catch anything else the user adds.
+        const ALWAYS_SKIP_DIRS: &[&str] = &[
+            // Version control
+            ".git",
+            ".hg",
+            ".svn",
+            // Build outputs
+            "target",
+            "build",
+            "dist",
+            "out",
+            ".next",
+            "coverage",
+            // Package managers / dependencies
+            "node_modules",
+            "vendor",
+            "bower_components",
+            // Python virtual environments & caches
+            ".venv",
+            "venv",
+            "env",
+            "__pycache__",
+            ".tox",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            // IDE / editor metadata
+            ".idea",
+            ".vscode",
+            // Misc generated
+            ".leindex",
         ];
 
         // Walk the project directory efficiently
@@ -709,30 +870,33 @@ impl LeIndex {
             let path = entry.path();
             let file_name = entry.file_name().to_string_lossy();
 
-            // Skip hidden files and directories
-            if file_name.starts_with('.') && file_name != "." {
+            // Skip hidden files and directories (starting with '.')
+            // Do not skip the project root itself, even if its directory name is hidden.
+            if path != self.project_path && file_name.starts_with('.') && file_name != "." {
                 if entry.file_type().is_dir() {
                     walker.skip_current_dir();
                 }
                 continue;
             }
 
-            // Skip common non-source directories
+            // Skip excluded directories (fast-path + config-based)
             if entry.file_type().is_dir() {
-                if file_name == "target"
-                    || file_name == "node_modules"
-                    || file_name == "vendor"
-                    || file_name == ".git"
-                {
+                if ALWAYS_SKIP_DIRS.contains(&file_name.as_ref()) {
                     walker.skip_current_dir();
                     continue;
                 }
+                // Config-based directory exclusion (user-customizable via .leindex/config.toml)
+                if project_config.should_exclude(path) {
+                    walker.skip_current_dir();
+                    continue;
+                }
+                continue;
             }
 
-            // Check if file has a source extension
+            // Check if file has a supported source extension and isn't excluded
             if entry.file_type().is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if extensions.contains(&ext) {
+                    if extensions.contains(&ext) && !project_config.should_exclude(path) {
                         let hash = self.hash_file(path)?;
                         source_files.push((path.to_path_buf(), hash));
                     }
@@ -771,6 +935,39 @@ impl LeIndex {
         }
     }
 
+    fn index_fingerprint(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.stats.pdg_nodes, self.stats.pdg_edges, self.stats.indexed_nodes
+        )
+    }
+
+    fn stable_project_cache_id(&self) -> String {
+        let path = self.project_path.to_string_lossy();
+        let hash = blake3::hash(path.as_bytes()).to_hex();
+        format!("{}:{}", self.project_id, &hash[..12])
+    }
+
+    fn search_cache_key_for(&self, query: &str, top_k: usize) -> String {
+        search_cache_key(&format!(
+            "query:{}:{}:{}:{}",
+            self.stable_project_cache_id(),
+            self.index_fingerprint(),
+            top_k,
+            query.trim().to_lowercase()
+        ))
+    }
+
+    fn analysis_cache_key_for(&self, query: &str, token_budget: usize) -> String {
+        analysis_cache_key(&format!(
+            "analyze:{}:{}:{}:{}",
+            self.stable_project_cache_id(),
+            self.index_fingerprint(),
+            token_budget,
+            query.trim().to_lowercase()
+        ))
+    }
+
     /// Search the indexed code
     ///
     /// # Arguments
@@ -794,6 +991,25 @@ impl LeIndex {
         if self.search_engine.is_empty() {
             warn!("Search attempted on empty index");
             return Ok(Vec::new());
+        }
+
+        let search_cache_key = self.search_cache_key_for(query, top_k);
+        if let Some(CacheEntry::Binary {
+            serialized_data, ..
+        }) = self
+            .cache_spiller
+            .store_mut()
+            .get_or_load(&search_cache_key)?
+        {
+            if let Ok(cached_results) = bincode::deserialize::<Vec<SearchResult>>(&serialized_data)
+            {
+                debug!(
+                    "Search cache hit for '{}' ({} results)",
+                    query,
+                    cached_results.len()
+                );
+                return Ok(cached_results);
+            }
         }
 
         let search_query = SearchQuery {
@@ -820,19 +1036,40 @@ impl LeIndex {
                     if let Some(node) = pdg.get_node(node_idx) {
                         result.symbol_type = Some(match node.node_type {
                             legraphe::pdg::NodeType::Function => "function".to_string(),
-                            legraphe::pdg::NodeType::Class    => "class".to_string(),
-                            legraphe::pdg::NodeType::Method   => "method".to_string(),
+                            legraphe::pdg::NodeType::Class => "class".to_string(),
+                            legraphe::pdg::NodeType::Method => "method".to_string(),
                             legraphe::pdg::NodeType::Variable => "variable".to_string(),
-                            legraphe::pdg::NodeType::Module   => "module".to_string(),
+                            legraphe::pdg::NodeType::Module => "module".to_string(),
                         });
                     }
-                    result.caller_count     = Some(pdg.predecessor_count(node_idx));
+                    result.caller_count = Some(pdg.predecessor_count(node_idx));
                     result.dependency_count = Some(pdg.neighbors(node_idx).len());
                 }
             }
         }
 
         debug!("Search for '{}' returned {} results", query, results.len());
+
+        if let Ok(serialized) = bincode::serialize(&results) {
+            let entry = CacheEntry::Binary {
+                metadata: std::collections::HashMap::from([
+                    ("type".to_string(), "search_results".to_string()),
+                    ("query".to_string(), query.to_string()),
+                ]),
+                serialized_data: serialized,
+            };
+            if self
+                .cache_spiller
+                .store_mut()
+                .insert(search_cache_key.clone(), entry)
+                .is_ok()
+            {
+                let _ = self
+                    .cache_spiller
+                    .store_mut()
+                    .persist_key(&search_cache_key);
+            }
+        }
 
         Ok(results)
     }
@@ -861,6 +1098,21 @@ impl LeIndex {
     pub fn analyze(&mut self, query: &str, token_budget: usize) -> Result<AnalysisResult> {
         let start_time = std::time::Instant::now();
 
+        let analysis_cache_key = self.analysis_cache_key_for(query, token_budget);
+        if let Some(CacheEntry::Analysis {
+            serialized_data, ..
+        }) = self
+            .cache_spiller
+            .store_mut()
+            .get_or_load(&analysis_cache_key)?
+        {
+            if let Ok(mut cached) = bincode::deserialize::<AnalysisResult>(&serialized_data) {
+                cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
+                debug!("Analysis cache hit for '{}'", query);
+                return Ok(cached);
+            }
+        }
+
         // Step 1: Semantic search for entry points
         let search_query = SearchQuery {
             query: query.to_string(),
@@ -887,14 +1139,37 @@ impl LeIndex {
 
         // Estimate tokens used (rough approximation: 4 chars per token)
         let tokens_used = context.len() / 4;
-
-        Ok(AnalysisResult {
+        let analysis = AnalysisResult {
             query: query.to_string(),
             results,
             context: Some(context),
             tokens_used,
             processing_time_ms: start_time.elapsed().as_millis() as u64,
-        })
+        };
+
+        if let Ok(serialized) = bincode::serialize(&analysis) {
+            let entry = CacheEntry::Analysis {
+                query: query.to_string(),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                serialized_data: serialized,
+            };
+            if self
+                .cache_spiller
+                .store_mut()
+                .insert(analysis_cache_key.clone(), entry)
+                .is_ok()
+            {
+                let _ = self
+                    .cache_spiller
+                    .store_mut()
+                    .persist_key(&analysis_cache_key);
+            }
+        }
+
+        Ok(analysis)
     }
 
     /// Get diagnostics about the indexed project
@@ -918,6 +1193,34 @@ impl LeIndex {
         let threshold_exceeded = self.cache_spiller.store().total_bytes() > 0
             && self.cache_spiller.is_threshold_exceeded().unwrap_or(false);
 
+        let pdg_loaded = self.pdg.is_some();
+        let (pdg_nodes, pdg_edges) = self
+            .pdg
+            .as_ref()
+            .map(|p| (p.node_count(), p.edge_count()))
+            .unwrap_or((0, 0));
+        // Rough estimate: ~200 bytes per node (name, file_path, id strings + overhead)
+        // ~64 bytes per edge (two indices + edge metadata)
+        let pdg_estimated_bytes = pdg_nodes * 200 + pdg_edges * 64;
+
+        let search_index_nodes = self.search_engine.node_count();
+
+        let index_health = if !pdg_loaded || pdg_nodes == 0 {
+            "empty".to_string()
+        } else if self.stats.failed_parses > 0 {
+            "stale".to_string()
+        } else {
+            "healthy".to_string()
+        };
+
+        let cache_temperature = if memory_stats.cache_hits == 0 {
+            "cold".to_string()
+        } else if memory_stats.cache_hit_rate >= 0.70 && memory_stats.cache_hits >= 5 {
+            "hot".to_string()
+        } else {
+            "warm".to_string()
+        };
+
         Ok(Diagnostics {
             project_path: self.project_path.display().to_string(),
             project_id: self.project_id.clone(),
@@ -932,6 +1235,19 @@ impl LeIndex {
             cache_bytes: memory_stats.cache_bytes,
             spilled_entries: memory_stats.spilled_entries,
             spilled_bytes: memory_stats.spilled_bytes,
+            cache_hits: memory_stats.cache_hits,
+            cache_memory_hits: memory_stats.cache_memory_hits,
+            cache_disk_hits: memory_stats.cache_disk_hits,
+            cache_misses: memory_stats.cache_misses,
+            cache_hit_rate: memory_stats.cache_hit_rate,
+            cache_writes: memory_stats.cache_writes,
+            cache_spills: memory_stats.cache_spills,
+            cache_restores: memory_stats.cache_restores,
+            cache_temperature,
+            pdg_loaded,
+            pdg_estimated_bytes,
+            search_index_nodes,
+            index_health,
         })
     }
 
@@ -1048,7 +1364,15 @@ impl LeIndex {
         &self.stats
     }
 
-    /// Expand context around a specific node
+    /// Expand context around a specific node.
+    ///
+    /// Accepts flexible node identification:
+    /// - Full node ID (`"file_path:qualified_name"`)
+    /// - Short symbol name (`"health_check"`)
+    /// - Qualified name (`"ClassName.method_name"`)
+    /// - `"file_path:symbol_name"` partial IDs
+    ///
+    /// Populates the SearchResult with real metadata from the PDG node.
     pub fn expand_node_context(
         &self,
         node_id: &str,
@@ -1060,26 +1384,61 @@ impl LeIndex {
             anyhow::anyhow!("No PDG available for context expansion. Has the project been indexed?")
         })?;
 
-        let language = pdg
+        // Resolve the node_id using multiple lookup strategies:
+        // 1. Exact ID match (full "file_path:qualified_name")
+        // 2. By name (short display name like "health_check")
+        // 3. Case-insensitive substring match on name or id
+        let resolved_nid = pdg
             .find_by_symbol(node_id)
-            .and_then(|id| pdg.get_node(id))
-            .map(|n| n.language.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+            .or_else(|| pdg.find_by_name(node_id))
+            .or_else(|| pdg.find_by_name_in_file(node_id, None));
+
+        let (result_node_id, file_path, symbol_name, language, byte_range, complexity) =
+            if let Some(nid) = resolved_nid {
+                if let Some(node) = pdg.get_node(nid) {
+                    (
+                        node.id.clone(),
+                        node.file_path.clone(),
+                        node.name.clone(),
+                        node.language.clone(),
+                        node.byte_range,
+                        node.complexity,
+                    )
+                } else {
+                    (
+                        node_id.to_string(),
+                        String::new(),
+                        node_id.to_string(),
+                        "unknown".to_string(),
+                        (0, 0),
+                        0,
+                    )
+                }
+            } else {
+                (
+                    node_id.to_string(),
+                    String::new(),
+                    node_id.to_string(),
+                    "unknown".to_string(),
+                    (0, 0),
+                    0,
+                )
+            };
 
         let results = vec![SearchResult {
             rank: 1,
-            node_id: node_id.to_string(),
-            file_path: String::new(), // Will be filled if found
-            symbol_name: node_id.to_string(),
+            node_id: result_node_id,
+            file_path,
+            symbol_name,
             symbol_type: None,
             signature: None,
-            complexity: 0,
+            complexity,
             caller_count: None,
             dependency_count: None,
             language,
             score: lerecherche::ranking::Score::default(),
             context: None,
-            byte_range: (0, 0),
+            byte_range,
         }];
 
         let context = self.expand_context(pdg, &results, token_budget)?;
@@ -1495,10 +1854,15 @@ impl LeIndex {
         };
         let traversal = GravityTraversal::with_config(config);
 
-        // Map SearchResult entries to PDG node IDs for the traversal call
+        // Map SearchResult entries to PDG node IDs for the traversal call.
+        // Try exact ID match first, then fall back to name-based lookup.
         let entry_points: Vec<_> = results
             .iter()
-            .filter_map(|r| pdg.find_by_symbol(&r.node_id))
+            .filter_map(|r| {
+                pdg.find_by_symbol(&r.node_id)
+                    .or_else(|| pdg.find_by_name(&r.node_id))
+                    .or_else(|| pdg.find_by_name(&r.symbol_name))
+            })
             .collect();
 
         let expanded_node_ids = traversal.expand_context(pdg, entry_points);
@@ -1564,6 +1928,9 @@ mod tests {
             pdg_edges: 1200,
             indexed_nodes: 300,
             indexing_time_ms: 5000,
+            external_deps_in_lockfile: 0,
+            external_deps_resolved: 0,
+            external_deps_unresolved: 0,
         };
 
         let json = serde_json::to_string(&stats).unwrap();
@@ -1607,6 +1974,9 @@ mod tests {
                 pdg_edges: 0,
                 indexed_nodes: 0,
                 indexing_time_ms: 0,
+                external_deps_in_lockfile: 0,
+                external_deps_resolved: 0,
+                external_deps_unresolved: 0,
             },
             memory_usage_bytes: 1024,
             total_memory_bytes: 8192,
@@ -1616,6 +1986,19 @@ mod tests {
             cache_bytes: 50000,
             spilled_entries: 3,
             spilled_bytes: 30000,
+            cache_hits: 9,
+            cache_memory_hits: 7,
+            cache_disk_hits: 2,
+            cache_misses: 3,
+            cache_hit_rate: 0.75,
+            cache_writes: 12,
+            cache_spills: 4,
+            cache_restores: 2,
+            cache_temperature: "warm".to_string(),
+            pdg_loaded: true,
+            pdg_estimated_bytes: 60000,
+            search_index_nodes: 100,
+            index_health: "healthy".to_string(),
         };
 
         let json = serde_json::to_string(&diagnostics).unwrap();
@@ -1626,6 +2009,7 @@ mod tests {
         assert_eq!(deserialized.display_name, "test");
         assert_eq!(deserialized.memory_usage_bytes, 1024);
         assert_eq!(deserialized.cache_entries, 5);
+        assert_eq!(deserialized.cache_hits, 9);
         assert_eq!(deserialized.spilled_bytes, 30000);
     }
 
@@ -1636,29 +2020,73 @@ mod tests {
     #[test]
     fn test_tokenize_code_camel_case() {
         let toks = tokenize_code("getUserName");
-        assert!(toks.contains(&"get".to_string()), "expected 'get', got {:?}", toks);
-        assert!(toks.contains(&"user".to_string()), "expected 'user', got {:?}", toks);
-        assert!(toks.contains(&"name".to_string()), "expected 'name', got {:?}", toks);
+        assert!(
+            toks.contains(&"get".to_string()),
+            "expected 'get', got {:?}",
+            toks
+        );
+        assert!(
+            toks.contains(&"user".to_string()),
+            "expected 'user', got {:?}",
+            toks
+        );
+        assert!(
+            toks.contains(&"name".to_string()),
+            "expected 'name', got {:?}",
+            toks
+        );
     }
 
     #[test]
     fn test_tokenize_code_acronyms_and_digits() {
         let toks = tokenize_code("HTTPConnection");
-        assert!(toks.contains(&"http".to_string()), "expected 'http', got {:?}", toks);
-        assert!(toks.contains(&"connection".to_string()), "expected 'connection', got {:?}", toks);
+        assert!(
+            toks.contains(&"http".to_string()),
+            "expected 'http', got {:?}",
+            toks
+        );
+        assert!(
+            toks.contains(&"connection".to_string()),
+            "expected 'connection', got {:?}",
+            toks
+        );
 
         let toks2 = tokenize_code("HTTP2Connection");
-        assert!(toks2.contains(&"http".to_string()), "expected 'http', got {:?}", toks2);
-        assert!(toks2.contains(&"2".to_string()), "expected '2', got {:?}", toks2);
-        assert!(toks2.contains(&"connection".to_string()), "expected 'connection', got {:?}", toks2);
+        assert!(
+            toks2.contains(&"http".to_string()),
+            "expected 'http', got {:?}",
+            toks2
+        );
+        assert!(
+            toks2.contains(&"2".to_string()),
+            "expected '2', got {:?}",
+            toks2
+        );
+        assert!(
+            toks2.contains(&"connection".to_string()),
+            "expected 'connection', got {:?}",
+            toks2
+        );
     }
 
     #[test]
     fn test_tokenize_code_snake_case() {
         let toks = tokenize_code("get_user_name");
-        assert!(toks.contains(&"get".to_string()), "expected 'get', got {:?}", toks);
-        assert!(toks.contains(&"user".to_string()), "expected 'user', got {:?}", toks);
-        assert!(toks.contains(&"name".to_string()), "expected 'name', got {:?}", toks);
+        assert!(
+            toks.contains(&"get".to_string()),
+            "expected 'get', got {:?}",
+            toks
+        );
+        assert!(
+            toks.contains(&"user".to_string()),
+            "expected 'user', got {:?}",
+            toks
+        );
+        assert!(
+            toks.contains(&"name".to_string()),
+            "expected 'name', got {:?}",
+            toks
+        );
     }
 
     #[test]
@@ -1681,14 +2109,26 @@ mod tests {
     fn test_tfidf_embedder_empty_corpus() {
         let embedder = TfIdfEmbedder::build(&[]);
         let vec = embedder.embed("test query");
-        assert_eq!(vec.len(), 768, "must produce 768-dim vector even for empty corpus");
+        assert_eq!(
+            vec.len(),
+            768,
+            "must produce 768-dim vector even for empty corpus"
+        );
         assert!(vec.iter().all(|&v| v == 0.0), "empty corpus → zero vector");
     }
 
     #[test]
     fn test_tfidf_embedding_dimension() {
         let docs: Vec<(String, String)> = (0..10)
-            .map(|i| (format!("doc_{}", i), format!("fn handle_request_{} {{ let result = process(); result }}", i)))
+            .map(|i| {
+                (
+                    format!("doc_{}", i),
+                    format!(
+                        "fn handle_request_{} {{ let result = process(); result }}",
+                        i
+                    ),
+                )
+            })
             .collect();
         let embedder = TfIdfEmbedder::build(&docs);
         let vec = embedder.embed("handle request process");
@@ -1698,16 +2138,29 @@ mod tests {
     #[test]
     fn test_tfidf_embedding_normalized() {
         let docs: Vec<(String, String)> = vec![
-            ("auth".to_string(), "fn authenticate_user(token: &str) -> bool { verify_token(token) }".to_string()),
-            ("db".to_string(), "fn connect_database(url: &str) -> Connection { open_connection(url) }".to_string()),
-            ("http".to_string(), "fn send_request(endpoint: &str) -> Response { http_get(endpoint) }".to_string()),
+            (
+                "auth".to_string(),
+                "fn authenticate_user(token: &str) -> bool { verify_token(token) }".to_string(),
+            ),
+            (
+                "db".to_string(),
+                "fn connect_database(url: &str) -> Connection { open_connection(url) }".to_string(),
+            ),
+            (
+                "http".to_string(),
+                "fn send_request(endpoint: &str) -> Response { http_get(endpoint) }".to_string(),
+            ),
         ];
         let embedder = TfIdfEmbedder::build(&docs);
         let vec = embedder.embed("authenticate token verify");
         let magnitude: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
         // For a non-zero vector, magnitude should be ≈ 1.0
         if magnitude > 1e-9 {
-            assert!((magnitude - 1.0).abs() < 1e-4, "embedding should be L2-normalized, got magnitude {}", magnitude);
+            assert!(
+                (magnitude - 1.0).abs() < 1e-4,
+                "embedding should be L2-normalized, got magnitude {}",
+                magnitude
+            );
         }
     }
 
@@ -1716,11 +2169,26 @@ mod tests {
         // Two auth-related snippets should have higher cosine similarity
         // than an auth snippet and an unrelated db snippet
         let docs: Vec<(String, String)> = vec![
-            ("a1".into(), "fn authenticate_user(token: &str) -> bool { verify_token(token) }".into()),
-            ("a2".into(), "fn check_user_credentials(password: &str) -> bool { hash_check(password) }".into()),
-            ("b1".into(), "fn connect_database(url: &str) -> Connection { open_connection(url) }".into()),
-            ("b2".into(), "fn execute_sql_query(query: &str) -> Vec<Row> { db_execute(query) }".into()),
-            ("c1".into(), "fn parse_json_payload(data: &str) -> Value { serde_parse(data) }".into()),
+            (
+                "a1".into(),
+                "fn authenticate_user(token: &str) -> bool { verify_token(token) }".into(),
+            ),
+            (
+                "a2".into(),
+                "fn check_user_credentials(password: &str) -> bool { hash_check(password) }".into(),
+            ),
+            (
+                "b1".into(),
+                "fn connect_database(url: &str) -> Connection { open_connection(url) }".into(),
+            ),
+            (
+                "b2".into(),
+                "fn execute_sql_query(query: &str) -> Vec<Row> { db_execute(query) }".into(),
+            ),
+            (
+                "c1".into(),
+                "fn parse_json_payload(data: &str) -> Value { serde_parse(data) }".into(),
+            ),
         ];
         let embedder = TfIdfEmbedder::build(&docs);
 
@@ -1728,9 +2196,8 @@ mod tests {
         let auth2 = embedder.embed("fn check_user credentials password hash");
         let db1 = embedder.embed("fn connect database execute sql query");
 
-        let cosine = |a: &[f32], b: &[f32]| -> f32 {
-            a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-        };
+        let cosine =
+            |a: &[f32], b: &[f32]| -> f32 { a.iter().zip(b.iter()).map(|(x, y)| x * y).sum() };
 
         let sim_related = cosine(&auth1, &auth2);
         let sim_unrelated = cosine(&auth1, &db1);
@@ -1740,15 +2207,15 @@ mod tests {
         assert!(
             sim_related >= sim_unrelated - 0.1,
             "related similarity ({}) should not be much lower than unrelated similarity ({})",
-            sim_related, sim_unrelated
+            sim_related,
+            sim_unrelated
         );
     }
 
     #[test]
     fn test_tfidf_zero_vector_for_unseen_terms() {
-        let docs: Vec<(String, String)> = vec![
-            ("a".into(), "fn foo_bar() -> bool { true }".into()),
-        ];
+        let docs: Vec<(String, String)> =
+            vec![("a".into(), "fn foo_bar() -> bool { true }".into())];
         let embedder = TfIdfEmbedder::build(&docs);
         // Query with terms not in any doc → vocab won't contain them → zero vector
         let vec = embedder.embed("zzzzzz aaaaaaa bbbbbbb cccccccc");

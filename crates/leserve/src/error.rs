@@ -74,11 +74,7 @@ impl ApiError {
 
     /// 500 Internal Server Error
     pub fn internal(message: impl Into<String>) -> Self {
-        Self::with_code(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            message,
-            "INTERNAL_ERROR",
-        )
+        Self::with_code(StatusCode::INTERNAL_SERVER_ERROR, message, "INTERNAL_ERROR")
     }
 
     /// 501 Not Implemented

@@ -198,24 +198,52 @@ impl JsonRpcError {
     pub fn project_not_indexed(project: String) -> Self {
         Self::with_data(
             error_codes::PROJECT_NOT_INDEXED,
-            "Project not indexed",
-            serde_json::json!({ "project": project, "suggestion": "Run leindex_index first" }),
+            "Project not indexed — call leindex_index or pass project_path to auto-index",
+            serde_json::json!({
+                "project": project,
+                "suggestion": "Pass project_path to any tool to auto-index on first use, or call leindex_index explicitly.",
+                "error_type": "project_not_indexed"
+            }),
         )
     }
 
     /// Create an indexing failed error
     pub fn indexing_failed(msg: impl Into<String>) -> Self {
-        Self::new(error_codes::INDEXING_FAILED, msg)
+        let m = msg.into();
+        Self::with_data(
+            error_codes::INDEXING_FAILED,
+            &m,
+            serde_json::json!({
+                "error_type": "indexing_failed",
+                "suggestion": "Check that project_path is a valid directory with source files. Use force_reindex=true to rebuild."
+            }),
+        )
     }
 
     /// Create a search failed error
     pub fn search_failed(msg: impl Into<String>) -> Self {
-        Self::new(error_codes::SEARCH_FAILED, msg)
+        let m = msg.into();
+        Self::with_data(
+            error_codes::SEARCH_FAILED,
+            &m,
+            serde_json::json!({
+                "error_type": "search_failed",
+                "suggestion": "Ensure the project is indexed. Try a different query or increase top_k."
+            }),
+        )
     }
 
     /// Create a context expansion failed error
     pub fn context_expansion_failed(msg: impl Into<String>) -> Self {
-        Self::new(error_codes::CONTEXT_EXPANSION_FAILED, msg)
+        let m = msg.into();
+        Self::with_data(
+            error_codes::CONTEXT_EXPANSION_FAILED,
+            &m,
+            serde_json::json!({
+                "error_type": "context_expansion_failed",
+                "suggestion": "Check that the node_id exists. Use leindex_grep_symbols to find valid symbol names."
+            }),
+        )
     }
 
     /// Create a memory limit exceeded error
@@ -223,7 +251,10 @@ impl JsonRpcError {
         Self::with_data(
             error_codes::MEMORY_LIMIT_EXCEEDED,
             "Memory limit exceeded",
-            serde_json::json!({ "suggestion": "Try a smaller operation or increase memory budget" }),
+            serde_json::json!({
+                "error_type": "memory_limit_exceeded",
+                "suggestion": "Reduce token_budget, use pagination (offset/limit), or re-index with a smaller scope."
+            }),
         )
     }
 }
@@ -295,10 +326,7 @@ impl ProgressEvent {
     }
 
     /// Create a completion event
-    pub fn complete(
-        stage: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
+    pub fn complete(stage: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             event_type: "complete".to_string(),
             stage: stage.into(),

@@ -383,7 +383,6 @@ impl Default for PhantomData {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,7 +469,6 @@ mod tests {
         assert_eq!(score.structural, 0.7);
         assert_eq!(score.overall, 0.85);
     }
-
 
     #[test]
     fn test_search_results_empty() {

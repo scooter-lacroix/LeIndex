@@ -1,8 +1,8 @@
 //! Reference integrity checking via legraphe
 
 use crate::edit_change::EditChange;
-use crate::ValidationError;
 use crate::Location;
+use crate::ValidationError;
 use legraphe::ProgramDependenceGraph;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -72,9 +72,7 @@ impl ReferenceIssue {
     /// Create an undefined reference issue
     pub fn undefined_reference(name: String, file_path: PathBuf, location: Location) -> Self {
         Self {
-            issue_type: ReferenceIssueType::UndefinedReference {
-                name: name.clone(),
-            },
+            issue_type: ReferenceIssueType::UndefinedReference { name: name.clone() },
             file_path,
             location,
             description: format!("Undefined reference '{}'", name),
@@ -114,7 +112,10 @@ impl ReferenceChecker {
     ///
     /// # Returns
     /// Vector of reference issues found
-    pub fn check_references(&self, changes: &[EditChange]) -> Result<Vec<ReferenceIssue>, ValidationError> {
+    pub fn check_references(
+        &self,
+        changes: &[EditChange],
+    ) -> Result<Vec<ReferenceIssue>, ValidationError> {
         let mut issues = Vec::new();
 
         for change in changes {
@@ -197,13 +198,15 @@ impl ReferenceChecker {
                 for line in change.new_content.lines() {
                     let line = line.trim();
                     if line.starts_with("use ") {
-                        let import_path = line.trim_start_matches("use ")
+                        let import_path = line
+                            .trim_start_matches("use ")
                             .trim_end_matches(';')
                             .trim()
                             .to_string();
                         imports.push(import_path);
                     } else if line.starts_with("mod ") {
-                        let mod_name = line.trim_start_matches("mod ")
+                        let mod_name = line
+                            .trim_start_matches("mod ")
                             .trim_end_matches(';')
                             .trim()
                             .to_string();
@@ -238,7 +241,9 @@ impl ReferenceChecker {
         for node_id in self.pdg.node_indices() {
             if let Some(node) = self.pdg.get_node(node_id) {
                 let node_name_lower = node.name.to_lowercase();
-                if node_name_lower.contains(&import_lower) || import_lower.contains(&node_name_lower) {
+                if node_name_lower.contains(&import_lower)
+                    || import_lower.contains(&node_name_lower)
+                {
                     return true;
                 }
             }
@@ -324,15 +329,77 @@ impl ReferenceChecker {
     /// Check if a name is a Python built-in
     fn is_python_builtin(&self, name: &str) -> bool {
         const BUILTINS: &[&str] = &[
-            "print", "len", "str", "int", "float", "list", "dict", "set", "tuple",
-            "range", "enumerate", "zip", "map", "filter", "sorted", "reversed",
-            "sum", "min", "max", "abs", "all", "any", "bool", "type", "isinstance",
-            "open", "input", "exit", "quit", "help", "dir", "vars", "id",
-            "super", "self", "cls", "None", "True", "False", "await", "async",
-            "if", "else", "elif", "for", "while", "def", "class", "return", "yield",
-            "import", "from", "as", "with", "try", "except", "finally", "raise",
-            "assert", "pass", "break", "continue", "and", "or", "not", "in", "is",
-            "lambda", "global", "nonlocal", "del",
+            "print",
+            "len",
+            "str",
+            "int",
+            "float",
+            "list",
+            "dict",
+            "set",
+            "tuple",
+            "range",
+            "enumerate",
+            "zip",
+            "map",
+            "filter",
+            "sorted",
+            "reversed",
+            "sum",
+            "min",
+            "max",
+            "abs",
+            "all",
+            "any",
+            "bool",
+            "type",
+            "isinstance",
+            "open",
+            "input",
+            "exit",
+            "quit",
+            "help",
+            "dir",
+            "vars",
+            "id",
+            "super",
+            "self",
+            "cls",
+            "None",
+            "True",
+            "False",
+            "await",
+            "async",
+            "if",
+            "else",
+            "elif",
+            "for",
+            "while",
+            "def",
+            "class",
+            "return",
+            "yield",
+            "import",
+            "from",
+            "as",
+            "with",
+            "try",
+            "except",
+            "finally",
+            "raise",
+            "assert",
+            "pass",
+            "break",
+            "continue",
+            "and",
+            "or",
+            "not",
+            "in",
+            "is",
+            "lambda",
+            "global",
+            "nonlocal",
+            "del",
         ];
         BUILTINS.contains(&name)
     }
@@ -343,7 +410,10 @@ impl ReferenceChecker {
     }
 
     /// Check for cycles introduced by the changes
-    fn check_for_cycles(&self, changes: &[EditChange]) -> Result<Vec<ReferenceIssue>, ValidationError> {
+    fn check_for_cycles(
+        &self,
+        changes: &[EditChange],
+    ) -> Result<Vec<ReferenceIssue>, ValidationError> {
         let mut issues = Vec::new();
 
         // Build a dependency graph from the changes
@@ -416,7 +486,10 @@ mod tests {
             PathBuf::from("test.py"),
             Location { line: 1, column: 1 },
         );
-        assert!(matches!(issue.issue_type, ReferenceIssueType::BrokenImport { .. }));
+        assert!(matches!(
+            issue.issue_type,
+            ReferenceIssueType::BrokenImport { .. }
+        ));
         assert_eq!(issue.file_path, PathBuf::from("test.py"));
     }
 
@@ -425,7 +498,10 @@ mod tests {
         let issue = ReferenceIssue::undefined_reference(
             "undefined_func".to_string(),
             PathBuf::from("test.py"),
-            Location { line: 5, column: 10 },
+            Location {
+                line: 5,
+                column: 10,
+            },
         );
         assert!(matches!(
             issue.issue_type,

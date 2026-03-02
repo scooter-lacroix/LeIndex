@@ -14,11 +14,11 @@ pub enum ProjectMetadataError {
     /// Database error
     #[error("Database error: {0}")]
     Database(#[from] rusqlite::Error),
-    
+
     /// Invalid project ID
     #[error("Invalid project ID: {0}")]
     InvalidId(String),
-    
+
     /// Project not found
     #[error("Project not found: {0}")]
     NotFound(String),
@@ -55,18 +55,16 @@ impl ProjectMetadata {
             .canonicalize()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| project_path.to_string_lossy().to_string());
-        
+
         let base_name = project_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        
-        let path_hash = blake3::hash(canonical_path.as_bytes())
-            .to_hex()
-            .to_string();
-        
+
+        let path_hash = blake3::hash(canonical_path.as_bytes()).to_hex().to_string();
+
         let unique_project_id = UniqueProjectId::generate(project_path, &[]);
-        
+
         Self {
             unique_project_id,
             base_name,
@@ -78,7 +76,7 @@ impl ProjectMetadata {
             cloned_from: None,
         }
     }
-    
+
     /// Load existing project IDs for a given base name.
     ///
     /// # Arguments
@@ -93,9 +91,8 @@ impl ProjectMetadata {
         conn: &rusqlite::Connection,
         base_name: &str,
     ) -> Result<Vec<UniqueProjectId>> {
-        let mut stmt = conn.prepare(
-            "SELECT unique_project_id FROM project_metadata WHERE base_name = ?1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT unique_project_id FROM project_metadata WHERE base_name = ?1")?;
 
         let ids: Vec<UniqueProjectId> = stmt
             .query_map(params![base_name], |row| {
@@ -107,7 +104,7 @@ impl ProjectMetadata {
 
         Ok(ids)
     }
-    
+
     /// Save project metadata to the database.
     pub fn save(&self, conn: &rusqlite::Connection) -> Result<()> {
         conn.execute(
@@ -127,28 +124,30 @@ impl ProjectMetadata {
         )?;
         Ok(())
     }
-    
+
     /// Load project metadata by unique ID.
     pub fn load(conn: &rusqlite::Connection, id: &UniqueProjectId) -> Result<Self> {
         let mut stmt = conn.prepare(
             r#"SELECT unique_project_id, base_name, path_hash, instance, canonical_path, display_name, is_clone, cloned_from
                FROM project_metadata WHERE unique_project_id = ?1"#,
         )?;
-        let result = stmt.query_row(params![id.to_string()], |row| {
-            let id_str: String = row.get(0)?;
-            let unique_project_id = UniqueProjectId::from_str(&id_str)
-                .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
-            Ok(Self {
-                unique_project_id,
-                base_name: row.get(1)?,
-                path_hash: row.get(2)?,
-                instance: row.get(3)?,
-                canonical_path: row.get(4)?,
-                display_name: row.get(5)?,
-                is_clone: row.get(6)?,
-                cloned_from: row.get(7)?,
+        let result = stmt
+            .query_row(params![id.to_string()], |row| {
+                let id_str: String = row.get(0)?;
+                let unique_project_id = UniqueProjectId::from_str(&id_str)
+                    .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+                Ok(Self {
+                    unique_project_id,
+                    base_name: row.get(1)?,
+                    path_hash: row.get(2)?,
+                    instance: row.get(3)?,
+                    canonical_path: row.get(4)?,
+                    display_name: row.get(5)?,
+                    is_clone: row.get(6)?,
+                    cloned_from: row.get(7)?,
+                })
             })
-        }).map_err(ProjectMetadataError::from)?;
+            .map_err(ProjectMetadataError::from)?;
         Ok(result)
     }
 }
@@ -157,12 +156,12 @@ impl ProjectMetadata {
 mod tests {
     use super::*;
     use tempfile::tempdir;
-    
+
     #[test]
     fn test_project_metadata_new() {
         let dir = tempdir().unwrap();
         let path = dir.path();
-        
+
         let metadata = ProjectMetadata::new(path);
         assert!(!metadata.base_name.is_empty());
         assert!(!metadata.canonical_path.is_empty());

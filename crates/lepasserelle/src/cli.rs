@@ -5,6 +5,7 @@
 use crate::leindex::LeIndex;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::mcp::McpServer;
+use crate::registry::{ProjectRegistry, DEFAULT_MAX_PROJECTS};
 use anyhow::Context;
 use anyhow::Result as AnyhowResult;
 use clap::{Parser, Subcommand};
@@ -12,7 +13,6 @@ use lephase::{run_phase_analysis, DocsMode, FormatMode, PhaseOptions, PhaseSelec
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 /// LeIndex - Code Search and Analysis Engine
@@ -566,8 +566,11 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     let _ = leindex.load_from_storage();
 
     // Initialize global state for handlers
-    let state = Arc::new(Mutex::new(leindex));
-    let _ = crate::mcp::server::SERVER_STATE.set(state.clone());
+    let registry = Arc::new(ProjectRegistry::with_initial_project(
+        DEFAULT_MAX_PROJECTS,
+        leindex,
+    ));
+    let _ = crate::mcp::server::SERVER_STATE.set(registry.clone());
 
     // Initialize handlers
     let _ = crate::mcp::server::HANDLERS.set(vec![
@@ -776,7 +779,7 @@ async fn handle_mcp_request(
         }
         "tools/call" => {
             // Use the centralized tool call handler that formats for MCP
-            let result = handle_tool_call(state, handlers, request).await;
+            let result = handle_tool_call(state, handlers, &request).await;
             Ok(JsonRpcResponse::from_result(id, result))
         }
         "tools/list" => {

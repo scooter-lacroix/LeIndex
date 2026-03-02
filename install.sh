@@ -488,6 +488,16 @@ detect_ai_tools() {
         detected_clis+=("Maestro")
     fi
 
+    # iflow
+    if command -v iflow &> /dev/null || [[ -d "$HOME/.iflow" ]]; then
+        detected_clis+=("iflow")
+    fi
+
+    # Qwen CLI
+    if command -v qwen &> /dev/null || [[ -d "$HOME/.qwen" ]]; then
+        detected_clis+=("Qwen CLI")
+    fi
+
     # LM Studio
     if [[ -f "$HOME/.lmstudio/mcp.json" ]] || [[ -d "$HOME/.lmstudio" ]]; then
         detected_clis+=("LM Studio")
@@ -516,11 +526,11 @@ detect_ai_tools() {
             echo ""
         fi
 
-        # In non-interactive mode, show config and exit
+        # In non-interactive mode, auto-configure all detected tools
         if [[ "$NONINTERACTIVE" == true ]]; then
-            log_info "Non-interactive mode: Skipping MCP configuration"
+            log_info "Non-interactive mode: Auto-configuring all detected tools..."
             echo ""
-            show_mcp_config_instructions
+            configure_mcp_servers "${detected_tools[@]}"
             return 0
         fi
 
@@ -547,36 +557,41 @@ detect_ai_tools() {
 configure_mcp_servers() {
     local tools=("$@")
 
-    print_header "Select Tools to Configure"
-
-    echo "Select which tools to configure (enter numbers separated by spaces, or 'all'):"
-    echo ""
-
-    local i=1
-    for tool in "${tools[@]}"; do
-        echo "  ${CYAN}$i)${NC} $tool"
-        ((i++))
-    done
-    echo ""
-    echo "  ${CYAN}all)${NC} Configure all detected tools"
-
-    read -p "Selection: " selection
-
-    # Parse selection
     local selected_tools=()
-    if [[ "$selection" == "all" ]]; then
+
+    if [[ "$NONINTERACTIVE" == true ]]; then
         selected_tools=("${tools[@]}")
     else
-        for num in $selection; do
-            if [[ "$num" =~ ^[0-9]+$ ]] && [[ $num -ge 1 ]] && [[ $num -le ${#tools[@]} ]]; then
-                selected_tools+=("${tools[$((num-1))]}")
-            fi
-        done
-    fi
+        print_header "Select Tools to Configure"
 
-    if [[ ${#selected_tools[@]} -eq 0 ]]; then
-        log_warn "No valid tools selected"
-        return 0
+        echo "Select which tools to configure (enter numbers separated by spaces, or 'all'):"
+        echo ""
+
+        local i=1
+        for tool in "${tools[@]}"; do
+            echo "  ${CYAN}$i)${NC} $tool"
+            ((i++))
+        done
+        echo ""
+        echo "  ${CYAN}all)${NC} Configure all detected tools"
+
+        read -p "Selection: " selection
+
+        # Parse selection
+        if [[ "$selection" == "all" ]]; then
+            selected_tools=("${tools[@]}")
+        else
+            for num in $selection; do
+                if [[ "$num" =~ ^[0-9]+$ ]] && [[ $num -ge 1 ]] && [[ $num -le ${#tools[@]} ]]; then
+                    selected_tools+=("${tools[$((num-1))]}")
+                fi
+            done
+        fi
+
+        if [[ ${#selected_tools[@]} -eq 0 ]]; then
+            log_warn "No valid tools selected"
+            return 0
+        fi
     fi
 
     echo ""
@@ -661,10 +676,11 @@ configure_tool_mcp() {
             return $?
             ;;
         "Antigravity")
-            # Antigravity uses Cursor/VS Code config
-            config_file="$HOME/.cursor/settings.json"
+            # Antigravity is a VS Code fork with its own config directory
+            config_file="$HOME/.config/Antigravity/User/mcp.json"
             backup_file="${config_file}.backup"
-            configure_vscode_mcp "$config_file" "$backup_file"
+            mkdir -p "$(dirname "$config_file")"
+            configure_json_mcp "$config_file" "$backup_file"
             return $?
             ;;
         "LM Studio")
@@ -673,8 +689,36 @@ configure_tool_mcp() {
             configure_lmstudio_mcp "$config_file" "$backup_file"
             return $?
             ;;
+        "Amp Code")
+            config_file="$HOME/.config/amp/settings.json"
+            backup_file="${config_file}.backup"
+            configure_amp_mcp "$config_file" "$backup_file"
+            return $?
+            ;;
+        "Gemini CLI")
+            config_file="$HOME/.gemini/settings.json"
+            backup_file="${config_file}.backup"
+            configure_gemini_mcp "$config_file" "$backup_file"
+            return $?
+            ;;
+        "Qwen CLI")
+            config_file="$HOME/.qwen/settings.json"
+            backup_file="${config_file}.backup"
+            configure_qwen_mcp "$config_file" "$backup_file"
+            return $?
+            ;;
+        "iflow")
+            config_file="$HOME/.iflow/settings.json"
+            backup_file="${config_file}.backup"
+            configure_iflow_mcp "$config_file" "$backup_file"
+            return $?
+            ;;
+        "Maestro")
+            configure_maestro_mcp
+            return $?
+            ;;
         *)
-            # CLI tools that might have config files
+            # CLI tools without known config locations
             return 2  # Skipped
             ;;
     esac
@@ -791,20 +835,21 @@ EOF
     return $?
 }
 
-# Configure Zed MCP (LSP format)
+# Configure Zed MCP (context_servers format)
 configure_zed_mcp() {
     local config_file="$1"
     local backup_file="$2"
 
-    # Check if config exists
+    # Create settings.json if it doesn't exist
     if [[ ! -f "$config_file" ]]; then
-        return 2  # Skipped
+        mkdir -p "$(dirname "$config_file")"
+        echo '{}' > "$config_file"
     fi
 
     # Backup existing config
     backup_config_file "$config_file" "$backup_file"
 
-    # Zed uses a different config format
+    # Zed uses context_servers with command format for MCP
     if command -v python3 &> /dev/null; then
         python3 <<PYTHON
 import json
@@ -816,12 +861,20 @@ try:
 except:
     config = {}
 
-if 'lsp' not in config:
-    config['lsp'] = {}
+# Remove legacy lsp-based config if present
+if 'lsp' in config and 'leindex' in config['lsp']:
+    del config['lsp']['leindex']
+    if not config['lsp']:
+        del config['lsp']
 
-config['lsp']['leindex'] = {
-    'type': 'http',
-    'url': 'http://127.0.0.1:47268/mcp'
+if 'context_servers' not in config:
+    config['context_servers'] = {}
+
+config['context_servers']['leindex'] = {
+    'command': {
+        'path': 'leindex',
+        'args': ['mcp']
+    }
 }
 
 with open('$config_file', 'w') as f:
@@ -830,7 +883,8 @@ with open('$config_file', 'w') as f:
 PYTHON
         return $?
     elif command -v jq &> /dev/null; then
-        jq '.lsp.leindex = {"type": "http", "url": "http://127.0.0.1:47268/mcp"}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+        # Remove legacy lsp config and add context_servers
+        jq 'if .lsp.leindex then del(.lsp.leindex) else . end | if .lsp == {} then del(.lsp) else . end | .context_servers.leindex = {"command": {"path": "leindex", "args": ["mcp"]}}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
         return $?
     else
         return 1
@@ -890,6 +944,229 @@ configure_lmstudio_mcp() {
     return $?
 }
 
+# Configure Amp CLI MCP (uses amp.mcpServers key in settings.json)
+configure_amp_mcp() {
+    local config_file="$1"
+    local backup_file="$2"
+
+    mkdir -p "$(dirname "$config_file")"
+
+    if [[ ! -f "$config_file" ]]; then
+        cat > "$config_file" << 'EOF'
+{
+  "amp.mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp"]
+    }
+  }
+}
+EOF
+        return 0
+    fi
+
+    backup_config_file "$config_file" "$backup_file"
+
+    if command -v python3 &> /dev/null; then
+        python3 <<PYTHON
+import json
+
+try:
+    with open('$config_file', 'r') as f:
+        config = json.load(f)
+except:
+    config = {}
+
+if 'amp.mcpServers' not in config:
+    config['amp.mcpServers'] = {}
+
+config['amp.mcpServers']['leindex'] = {
+    'command': 'leindex',
+    'args': ['mcp']
+}
+
+with open('$config_file', 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+PYTHON
+        return $?
+    elif command -v jq &> /dev/null; then
+        jq '."amp.mcpServers".leindex = {"command": "leindex", "args": ["mcp"]}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+        return $?
+    else
+        return 1
+    fi
+}
+
+# Configure Gemini CLI MCP (uses mcpServers key in settings.json)
+configure_gemini_mcp() {
+    local config_file="$1"
+    local backup_file="$2"
+
+    mkdir -p "$(dirname "$config_file")"
+
+    if [[ ! -f "$config_file" ]]; then
+        cat > "$config_file" << 'EOF'
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp"]
+    }
+  }
+}
+EOF
+        return 0
+    fi
+
+    backup_config_file "$config_file" "$backup_file"
+
+    if command -v python3 &> /dev/null; then
+        python3 <<PYTHON
+import json
+
+try:
+    with open('$config_file', 'r') as f:
+        config = json.load(f)
+except:
+    config = {}
+
+if 'mcpServers' not in config:
+    config['mcpServers'] = {}
+
+config['mcpServers']['leindex'] = {
+    'command': 'leindex',
+    'args': ['mcp']
+}
+
+with open('$config_file', 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+PYTHON
+        return $?
+    elif command -v jq &> /dev/null; then
+        jq '.mcpServers.leindex = {"command": "leindex", "args": ["mcp"]}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+        return $?
+    else
+        return 1
+    fi
+}
+
+# Configure Qwen CLI MCP (uses mcpServers key in settings.json)
+configure_qwen_mcp() {
+    local config_file="$1"
+    local backup_file="$2"
+
+    mkdir -p "$(dirname "$config_file")"
+
+    if [[ ! -f "$config_file" ]]; then
+        cat > "$config_file" << 'EOF'
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp"]
+    }
+  }
+}
+EOF
+        return 0
+    fi
+
+    backup_config_file "$config_file" "$backup_file"
+
+    if command -v python3 &> /dev/null; then
+        python3 <<PYTHON
+import json
+
+try:
+    with open('$config_file', 'r') as f:
+        config = json.load(f)
+except:
+    config = {}
+
+if 'mcpServers' not in config:
+    config['mcpServers'] = {}
+
+config['mcpServers']['leindex'] = {
+    'command': 'leindex',
+    'args': ['mcp']
+}
+
+with open('$config_file', 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+PYTHON
+        return $?
+    elif command -v jq &> /dev/null; then
+        jq '.mcpServers.leindex = {"command": "leindex", "args": ["mcp"]}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+        return $?
+    else
+        return 1
+    fi
+}
+
+# Configure iflow MCP (uses mcpServers key in settings.json)
+configure_iflow_mcp() {
+    local config_file="$1"
+    local backup_file="$2"
+
+    if [[ ! -f "$config_file" ]]; then
+        return 2  # Skipped - iflow creates its own settings.json
+    fi
+
+    backup_config_file "$config_file" "$backup_file"
+
+    if command -v python3 &> /dev/null; then
+        python3 <<PYTHON
+import json
+
+try:
+    with open('$config_file', 'r') as f:
+        config = json.load(f)
+except:
+    config = {}
+
+if 'mcpServers' not in config:
+    config['mcpServers'] = {}
+
+config['mcpServers']['leindex'] = {
+    'command': 'leindex',
+    'args': ['mcp']
+}
+
+with open('$config_file', 'w') as f:
+    json.dump(config, f, indent=2)
+    f.write('\n')
+PYTHON
+        return $?
+    elif command -v jq &> /dev/null; then
+        jq '.mcpServers.leindex = {"command": "leindex", "args": ["mcp"]}' "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+        return $?
+    else
+        return 1
+    fi
+}
+
+# Configure Maestro MCP pool (inserts into maestro.db mcp_servers table)
+configure_maestro_mcp() {
+    local db_file="$HOME/.maestro/maestro.db"
+
+    if [[ ! -f "$db_file" ]]; then
+        log_warn "Maestro database not found at $db_file"
+        return 2
+    fi
+
+    if ! command -v sqlite3 &> /dev/null; then
+        log_warn "sqlite3 not found, cannot configure Maestro"
+        return 1
+    fi
+
+    # Upsert leindex into the mcp_servers table with the correct command
+    sqlite3 "$db_file" "INSERT OR REPLACE INTO mcp_servers (name, transport, command, args, status) VALUES ('leindex', 'stdio', 'leindex', '[\"mcp\"]', 'stopped');" 2>/dev/null
+    return $?
+}
+
 show_mcp_config_instructions() {
     echo "═══════════════════════════════════════════════════"
     echo "  MCP Server Configuration"
@@ -911,12 +1188,27 @@ show_mcp_config_instructions() {
     echo '    {"mcpServers": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
     echo ""
     echo "  Zed (~/.config/zed/settings.json):"
-    echo '    {"lsp": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
+    echo '    {"context_servers": {"leindex": {"command": {"path": "leindex", "args": ["mcp"]}}}}'
     echo ""
     echo "  Opencode (~/.config/opencode/opencode.json):"
     echo '    {"mcp": {"leindex": {"command": ["leindex", "mcp"], "type": "local"}}}'
     echo ""
     echo "  LM Studio (~/.lmstudio/mcp.json):"
+    echo '    {"mcpServers": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
+    echo ""
+    echo "  Amp CLI (~/.config/amp/settings.json):"
+    echo '    {"amp.mcpServers": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
+    echo ""
+    echo "  Gemini CLI (~/.gemini/settings.json):"
+    echo '    {"mcpServers": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
+    echo ""
+    echo "  Qwen CLI (~/.qwen/settings.json):"
+    echo '    {"mcpServers": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
+    echo ""
+    echo "  iflow (~/.iflow/settings.json):"
+    echo '    {"mcpServers": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
+    echo ""
+    echo "  Antigravity (~/.config/Antigravity/User/mcp.json):"
     echo '    {"mcpServers": {"leindex": {"command": "leindex", "args": ["mcp"]}}}'
     echo ""
     echo "Note: When configured this way, AI tools automatically start LeIndex"

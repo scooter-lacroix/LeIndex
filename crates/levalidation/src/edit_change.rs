@@ -35,11 +35,7 @@ pub enum EditType {
 
 impl EditChange {
     /// Create a new edit change
-    pub fn new(
-        file_path: PathBuf,
-        original_content: String,
-        new_content: String,
-    ) -> Self {
+    pub fn new(file_path: PathBuf, original_content: String, new_content: String) -> Self {
         let edit_type = if original_content.is_empty() {
             EditType::Insert
         } else if new_content.is_empty() {
@@ -104,9 +100,7 @@ impl EditChange {
 
     /// Get the file extension
     pub fn extension(&self) -> Option<&str> {
-        self.file_path
-            .extension()
-            .and_then(|ext| ext.to_str())
+        self.file_path.extension().and_then(|ext| ext.to_str())
     }
 
     /// Infer language from file extension
@@ -233,7 +227,12 @@ mod tests {
 
         for (file, expected_lang) in cases {
             let change = EditChange::insert(PathBuf::from(file), "content".to_string());
-            assert_eq!(change.infer_language(), expected_lang, "Failed for {}", file);
+            assert_eq!(
+                change.infer_language(),
+                expected_lang,
+                "Failed for {}",
+                file
+            );
         }
     }
 

@@ -635,9 +635,7 @@ impl SearchEngine {
                     .skip(1) // skip "// name in path" header
                     .map(|l| l.trim())
                     .find(|l| {
-                        !l.is_empty()
-                            && !l.starts_with("// [No source")
-                            && !l.starts_with("// [")
+                        !l.is_empty() && !l.starts_with("// [No source") && !l.starts_with("// [")
                     })
                     .map(|l| l.to_string());
 
@@ -646,7 +644,7 @@ impl SearchEngine {
                     node_id: node.node_id.clone(),
                     file_path: node.file_path.clone(),
                     symbol_name: node.symbol_name.clone(),
-                    symbol_type: None,      // enriched by LeIndex::search()
+                    symbol_type: None, // enriched by LeIndex::search()
                     signature,
                     complexity: node.complexity,
                     caller_count: None,     // enriched by LeIndex::search()

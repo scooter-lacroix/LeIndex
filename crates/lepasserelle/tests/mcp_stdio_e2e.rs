@@ -17,7 +17,6 @@ use lepasserelle::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use lepasserelle::mcp::server::{handle_tool_call, list_tools_json};
 use std::sync::Arc;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
 
 // ============================================================================
 // Test helpers
@@ -48,10 +47,12 @@ fn all_handlers() -> Vec<ToolHandler> {
 }
 
 /// Create a minimal LeIndex state backed by a temp directory (not indexed).
-fn make_state(tmp: &TempDir) -> Arc<Mutex<lepasserelle::leindex::LeIndex>> {
-    let leindex = lepasserelle::leindex::LeIndex::new(tmp.path())
-        .expect("Failed to create LeIndex for test");
-    Arc::new(Mutex::new(leindex))
+fn make_state(tmp: &TempDir) -> Arc<lepasserelle::ProjectRegistry> {
+    let leindex =
+        lepasserelle::leindex::LeIndex::new(tmp.path()).expect("Failed to create LeIndex for test");
+    Arc::new(lepasserelle::ProjectRegistry::with_initial_project(
+        5, leindex,
+    ))
 }
 
 /// Parse a JSON-RPC request from a JSON string (simulates stdin line).
@@ -123,17 +124,15 @@ fn test_notification_has_no_id_field() {
 
 #[test]
 fn test_no_double_newline_in_error_response() {
-    let err = lepasserelle::mcp::protocol::JsonRpcError::method_not_found("unknown_method".to_string());
+    let err =
+        lepasserelle::mcp::protocol::JsonRpcError::method_not_found("unknown_method".to_string());
     let resp = JsonRpcResponse::error(serde_json::json!(42), err);
     assert_no_double_newline(&resp);
 }
 
 #[test]
 fn test_no_double_newline_in_success_response() {
-    let resp = JsonRpcResponse::success(
-        serde_json::json!(99),
-        serde_json::json!({ "tools": [] }),
-    );
+    let resp = JsonRpcResponse::success(serde_json::json!(99), serde_json::json!({ "tools": [] }));
     assert_no_double_newline(&resp);
 }
 
@@ -146,7 +145,12 @@ fn test_tools_list_returns_16_tools() {
     let handlers = all_handlers();
     let result = list_tools_json(&handlers);
     let tools = result["tools"].as_array().expect("tools must be an array");
-    assert_eq!(tools.len(), 16, "Expected exactly 16 registered tools, got {}", tools.len());
+    assert_eq!(
+        tools.len(),
+        16,
+        "Expected exactly 16 registered tools, got {}",
+        tools.len()
+    );
 }
 
 #[test]
@@ -239,7 +243,7 @@ async fn test_tools_call_unknown_tool_returns_error() {
     let handlers = all_handlers();
 
     let req = make_tool_call(1, "leindex_nonexistent_tool", serde_json::json!({}));
-    let result = handle_tool_call(&state, &handlers, req).await;
+    let result = handle_tool_call(&state, &handlers, &req).await;
 
     // Should be an Err (method not found) or an Ok with isError:true
     // The server wraps errors as isError:true for MCP compliance
@@ -260,8 +264,11 @@ async fn test_tools_call_file_summary_unindexed_returns_structured_response() {
     );
 
     // handle_tool_call always returns Ok (error is wrapped as isError:true)
-    let result = handle_tool_call(&state, &handlers, req).await;
-    assert!(result.is_ok(), "Tool call should return Ok with structured error response");
+    let result = handle_tool_call(&state, &handlers, &req).await;
+    assert!(
+        result.is_ok(),
+        "Tool call should return Ok with structured error response"
+    );
 
     let response = result.unwrap();
     // MCP wraps errors as isError:true with content array
@@ -284,7 +291,7 @@ async fn test_tools_call_symbol_lookup_unindexed_returns_structured_response() {
         serde_json::json!({ "symbol": "some_function" }),
     );
 
-    let result = handle_tool_call(&state, &handlers, req).await;
+    let result = handle_tool_call(&state, &handlers, &req).await;
     assert!(result.is_ok());
 
     let response = result.unwrap();
@@ -301,13 +308,9 @@ async fn test_tools_call_project_map_unindexed_returns_structured_response() {
     let state = make_state(&tmp);
     let handlers = all_handlers();
 
-    let req = make_tool_call(
-        4,
-        "leindex_project_map",
-        serde_json::json!({}),
-    );
+    let req = make_tool_call(4, "leindex_project_map", serde_json::json!({}));
 
-    let result = handle_tool_call(&state, &handlers, req).await;
+    let result = handle_tool_call(&state, &handlers, &req).await;
     assert!(result.is_ok());
 
     let response = result.unwrap();
@@ -332,7 +335,7 @@ async fn test_tools_call_edit_preview_unindexed_returns_structured_response() {
         }),
     );
 
-    let result = handle_tool_call(&state, &handlers, req).await;
+    let result = handle_tool_call(&state, &handlers, &req).await;
     assert!(result.is_ok());
     let response = result.unwrap();
     assert!(response.get("isError").is_some() || response.get("content").is_some());
@@ -346,7 +349,7 @@ async fn test_tools_call_diagnostics_returns_ok() {
     let handlers = all_handlers();
 
     let req = make_tool_call(6, "leindex_diagnostics", serde_json::json!({}));
-    let result = handle_tool_call(&state, &handlers, req).await;
+    let result = handle_tool_call(&state, &handlers, &req).await;
     assert!(result.is_ok());
 
     let response = result.unwrap();

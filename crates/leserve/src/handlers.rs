@@ -1,32 +1,25 @@
 //! HTTP handlers for REST API endpoints
 
 use axum::{
-    extract::{Path, Query, State, ws::WebSocketUpgrade},
+    extract::{ws::WebSocketUpgrade, Path, Query, State},
     http::StatusCode,
-    Json, Router,
     response::IntoResponse,
+    Json, Router,
 };
+use futures::stream::StreamExt;
 use lestockage::Storage;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info};
-use futures::stream::StreamExt;
 
 use crate::config::ServerConfig;
 use crate::error::{ApiError, ApiResult};
 use crate::responses::{
-    CodebaseListResponse,
-    CodebaseResponse,
-    FileTreeResponse,
-    FileNode,
-    GraphDataResponse,
-    GraphNodeResponse,
-    GraphLinkResponse,
+    CodebaseListResponse, CodebaseResponse, FileNode, FileTreeResponse, GraphDataResponse,
+    GraphLinkResponse, GraphNodeResponse, ScoreResponse, SearchResultResponse,
     SearchResultsResponse,
-    SearchResultResponse,
-    ScoreResponse,
 };
-use crate::websocket::{WsManager, WsEvent};
+use crate::websocket::{WsEvent, WsManager};
 
 /// Query parameters for search endpoint
 #[derive(Debug, Deserialize)]
@@ -57,7 +50,7 @@ pub struct SearchQuery {
 pub struct AppState {
     /// Thread-safe storage access requiring mutex lock
     pub storage: Arc<Mutex<Storage>>,
-    
+
     /// Immutable server configuration
     pub config: Arc<ServerConfig>,
 }
@@ -86,11 +79,10 @@ pub async fn list_codebases(
 ) -> ApiResult<Json<CodebaseListResponse>> {
     info!("Listing all codebases");
 
-    let storage = state.storage.lock()
-        .map_err(|e| {
-            error!("Failed to acquire storage lock: {}", e);
-            ApiError::internal(format!("Storage lock error: {}", e))
-        })?;
+    let storage = state.storage.lock().map_err(|e| {
+        error!("Failed to acquire storage lock: {}", e);
+        ApiError::internal(format!("Storage lock error: {}", e))
+    })?;
 
     // Query all projects from the database
     let conn = storage.conn();
@@ -127,9 +119,9 @@ pub async fn list_codebases(
                 display_name: row.get(5)?,
                 project_type: "Rust".to_string(), // Default for now
                 last_indexed: "Unknown".to_string(), // TODO: Add timestamp tracking
-                file_count: 0, // TODO: Query from indexed_files
-                node_count: 0, // TODO: Query from intel_nodes
-                edge_count: 0, // TODO: Query from intel_edges
+                file_count: 0,                    // TODO: Query from indexed_files
+                node_count: 0,                    // TODO: Query from intel_nodes
+                edge_count: 0,                    // TODO: Query from intel_edges
                 is_valid: true,
                 is_clone: row.get(6)?,
                 cloned_from: row.get(7)?,
@@ -170,11 +162,10 @@ pub async fn get_graph(
 ) -> ApiResult<Json<GraphDataResponse>> {
     info!("Getting graph for codebase: {}", id);
 
-    let storage = state.storage.lock()
-        .map_err(|e| {
-            error!("Failed to acquire storage lock: {}", e);
-            ApiError::internal(format!("Storage lock error: {}", e))
-        })?;
+    let storage = state.storage.lock().map_err(|e| {
+        error!("Failed to acquire storage lock: {}", e);
+        ApiError::internal(format!("Storage lock error: {}", e))
+    })?;
 
     let conn = storage.conn();
 
@@ -263,7 +254,12 @@ pub async fn get_graph(
             ApiError::internal(format!("Result collection error: {}", e))
         })?;
 
-    info!("Retrieved {} nodes and {} links for codebase {}", nodes.len(), links.len(), id);
+    info!(
+        "Retrieved {} nodes and {} links for codebase {}",
+        nodes.len(),
+        links.len(),
+        id
+    );
     Ok(Json(GraphDataResponse { nodes, links }))
 }
 
@@ -274,11 +270,10 @@ pub async fn get_file_tree(
 ) -> ApiResult<Json<FileTreeResponse>> {
     info!("Getting file tree for codebase: {}", id);
 
-    let storage = state.storage.lock()
-        .map_err(|e| {
-            error!("Failed to acquire storage lock: {}", e);
-            ApiError::internal(format!("Storage lock error: {}", e))
-        })?;
+    let storage = state.storage.lock().map_err(|e| {
+        error!("Failed to acquire storage lock: {}", e);
+        ApiError::internal(format!("Storage lock error: {}", e))
+    })?;
 
     let conn = storage.conn();
 
@@ -303,7 +298,11 @@ pub async fn get_file_tree(
         .query_map([&id], |row| {
             let file_path: String = row.get(0)?;
             Ok(FileNode {
-                name: file_path.rsplit('/').next().unwrap_or(&file_path).to_string(),
+                name: file_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&file_path)
+                    .to_string(),
                 node_type: "file".to_string(),
                 path: file_path.clone(),
                 size: None, // TODO: Get actual file size
@@ -339,11 +338,10 @@ pub async fn search(
         return Ok(Json(SearchResultsResponse::empty()));
     }
 
-    let storage = state.storage.lock()
-        .map_err(|e| {
-            error!("Failed to acquire storage lock: {}", e);
-            ApiError::internal(format!("Storage lock error: {}", e))
-        })?;
+    let storage = state.storage.lock().map_err(|e| {
+        error!("Failed to acquire storage lock: {}", e);
+        ApiError::internal(format!("Storage lock error: {}", e))
+    })?;
 
     let conn = storage.conn();
 
@@ -405,15 +403,11 @@ pub async fn search(
         })?;
 
     info!("Search returned {} results", results.len());
-    Ok(Json(SearchResultsResponse {
-        results,
-    }))
+    Ok(Json(SearchResultsResponse { results }))
 }
 
 /// GET /api/health - Health check endpoint
-pub async fn health_check(
-    State(_state): State<AppState>,
-) -> ApiResult<Json<serde_json::Value>> {
+pub async fn health_check(State(_state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(serde_json::json!({
         "status": "ok",
         "service": "leserve",
@@ -432,10 +426,13 @@ pub async fn websocket_handler(
         let manager = WsManager::new();
 
         // Generate simple connection ID
-        let conn_id = format!("ws_{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis());
+        let conn_id = format!(
+            "ws_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
 
         // Register connection
         manager.register_connection(conn_id.clone(), None).await;
@@ -512,7 +509,10 @@ pub fn create_router() -> Router<AppState> {
         .route("/api/codebases", axum::routing::get(list_codebases))
         .route("/api/codebases/:id", axum::routing::get(refresh_codebase))
         .route("/api/codebases/:id/graph", axum::routing::get(get_graph))
-        .route("/api/codebases/:id/files", axum::routing::get(get_file_tree))
+        .route(
+            "/api/codebases/:id/files",
+            axum::routing::get(get_file_tree),
+        )
         .route("/api/search", axum::routing::get(search))
         .route("/ws", axum::routing::get(websocket_handler))
 }

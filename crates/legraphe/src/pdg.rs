@@ -130,6 +130,10 @@ struct SerializablePDG {
 
     /// File path to node indices mapping
     file_index: HashMap<String, Vec<u32>>,
+
+    /// Human-readable name → node indices mapping (multiple nodes may share a name)
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
 }
 
 impl SerializablePDG {
@@ -176,11 +180,19 @@ impl SerializablePDG {
             .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
             .collect();
 
+        // Convert name index: Vec<NodeId> -> Vec<u32>
+        let name_index: HashMap<String, Vec<u32>> = pdg
+            .name_index
+            .iter()
+            .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
+            .collect();
+
         Self {
             nodes,
             edges,
             symbol_index,
             file_index,
+            name_index,
         }
     }
 
@@ -233,6 +245,29 @@ impl SerializablePDG {
                 .add_edge(*source_id, *target_id, serializable_edge.edge.clone());
         }
 
+        // Rebuild name index with new NodeIds
+        if !self.name_index.is_empty() {
+            for (name, old_indices) in &self.name_index {
+                let new_indices: Vec<NodeId> = old_indices
+                    .iter()
+                    .filter_map(|old_index| index_map.get(old_index).copied())
+                    .collect();
+                if !new_indices.is_empty() {
+                    pdg.name_index.insert(name.clone(), new_indices);
+                }
+            }
+        } else {
+            // Backward compatibility: rebuild name_index from nodes when not serialized
+            for nid in pdg.graph.node_indices() {
+                if let Some(node) = pdg.graph.node_weight(nid) {
+                    pdg.name_index
+                        .entry(node.name.clone())
+                        .or_default()
+                        .push(nid);
+                }
+            }
+        }
+
         Ok(pdg)
     }
 }
@@ -244,11 +279,15 @@ pub struct ProgramDependenceGraph {
     /// Internal graph structure
     graph: StableGraph<Node, Edge>,
 
-    /// Symbol name to node ID mapping
+    /// Symbol ID (`node.id`, e.g. "file:qualified_name") to node ID mapping
     symbol_index: HashMap<String, NodeId>,
 
     /// File path to node IDs mapping
     file_index: HashMap<String, Vec<NodeId>>,
+
+    /// Human-readable symbol name (`node.name`) to node IDs mapping.
+    /// Multiple nodes may share the same name across different files.
+    name_index: HashMap<String, Vec<NodeId>>,
 }
 
 impl ProgramDependenceGraph {
@@ -258,6 +297,7 @@ impl ProgramDependenceGraph {
             graph: StableGraph::new(),
             symbol_index: HashMap::new(),
             file_index: HashMap::new(),
+            name_index: HashMap::new(),
         }
     }
 
@@ -267,6 +307,10 @@ impl ProgramDependenceGraph {
         self.symbol_index.insert(node.id.clone(), id);
         self.file_index
             .entry(node.file_path.clone())
+            .or_default()
+            .push(id);
+        self.name_index
+            .entry(node.name.clone())
             .or_default()
             .push(id);
         id
@@ -280,6 +324,11 @@ impl ProgramDependenceGraph {
     /// Get node by ID
     pub fn get_node(&self, id: NodeId) -> Option<&Node> {
         self.graph.node_weight(id)
+    }
+
+    /// Get mutable reference to a node by ID.
+    pub fn get_node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        self.graph.node_weight_mut(id)
     }
 
     /// Get edge by ID
@@ -317,6 +366,9 @@ impl ProgramDependenceGraph {
         if let Some(node) = self.graph.remove_node(node_id) {
             self.symbol_index.remove(&node.id);
             if let Some(nodes) = self.file_index.get_mut(&node.file_path) {
+                nodes.retain(|&id| id != node_id);
+            }
+            if let Some(nodes) = self.name_index.get_mut(&node.name) {
                 nodes.retain(|&id| id != node_id);
             }
             Some(node)
@@ -381,12 +433,88 @@ impl ProgramDependenceGraph {
             .collect()
     }
 
-    /// Find a node by its string ID (`node.id` field).
+    /// Find a node by its string ID (`node.id` field), which is `"file_path:qualified_name"`.
     ///
-    /// This is distinct from `find_by_symbol` which searches the `name` field.
-    /// Node IDs are typically `"<file_path>:<symbol_name>"`.
+    /// This is the same lookup as `find_by_symbol` (both search `symbol_index`).
     pub fn find_by_id(&self, node_id: &str) -> Option<NodeId> {
         self.symbol_index.get(node_id).copied()
+    }
+
+    /// Find the first node with the given human-readable name (`node.name` field).
+    ///
+    /// Unlike `find_by_symbol` (which searches by `node.id`, the full qualified
+    /// `"file_path:qualified_name"` key), this searches by the short display name
+    /// that users typically provide, e.g. `"health_check"` instead of
+    /// `"/path/file.py:UnifiedServer.health_check"`.
+    ///
+    /// Returns the first match if multiple nodes share the same name.
+    pub fn find_by_name(&self, name: &str) -> Option<NodeId> {
+        self.name_index
+            .get(name)
+            .and_then(|ids| ids.first().copied())
+    }
+
+    /// Find all nodes with the given human-readable name (`node.name` field).
+    ///
+    /// Returns all NodeIds that share this name (may span multiple files).
+    pub fn find_all_by_name(&self, name: &str) -> Vec<NodeId> {
+        self.name_index.get(name).cloned().unwrap_or_default()
+    }
+
+    /// Find a node by name with optional file_path disambiguation.
+    ///
+    /// Tries exact name match first. If `file_hint` is provided and multiple
+    /// nodes share the name, returns the one in the specified file.
+    /// Falls back to case-insensitive substring search if exact match fails.
+    pub fn find_by_name_in_file(&self, name: &str, file_hint: Option<&str>) -> Option<NodeId> {
+        // 1. Exact name match
+        let candidates = self.find_all_by_name(name);
+        if !candidates.is_empty() {
+            // If file hint provided, narrow to that file
+            if let Some(fp) = file_hint {
+                if let Some(&nid) = candidates.iter().find(|&&nid| {
+                    self.get_node(nid)
+                        .map(|n| n.file_path == fp)
+                        .unwrap_or(false)
+                }) {
+                    return Some(nid);
+                }
+            }
+            return Some(candidates[0]);
+        }
+
+        // 2. Case-insensitive exact match on name
+        let name_lower = name.to_lowercase();
+        for nid in self.graph.node_indices() {
+            if let Some(node) = self.graph.node_weight(nid) {
+                if node.name.to_lowercase() == name_lower {
+                    if let Some(fp) = file_hint {
+                        if node.file_path != fp {
+                            continue;
+                        }
+                    }
+                    return Some(nid);
+                }
+            }
+        }
+
+        // 3. Substring match on name or id (case-insensitive)
+        for nid in self.graph.node_indices() {
+            if let Some(node) = self.graph.node_weight(nid) {
+                if node.name.to_lowercase().contains(&name_lower)
+                    || node.id.to_lowercase().contains(&name_lower)
+                {
+                    if let Some(fp) = file_hint {
+                        if node.file_path != fp {
+                            continue;
+                        }
+                    }
+                    return Some(nid);
+                }
+            }
+        }
+
+        None
     }
 
     /// Add multiple call edges

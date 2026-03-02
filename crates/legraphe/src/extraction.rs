@@ -90,11 +90,83 @@ pub fn extract_pdg_from_signatures(
     // Track node IDs for edge creation
     let mut node_ids: HashMap<String, crate::pdg::NodeId> = HashMap::new();
 
-    // Phase 1: Create nodes from signatures
+    // Phase 1a: Create nodes from signatures
     for signature in &signatures {
         let node = signature_to_node(signature, file_path, language);
         let node_id = pdg.add_node(node);
         node_ids.insert(signature.qualified_name.clone(), node_id);
+    }
+
+    // Phase 1b: Infer Class nodes from method qualified_names.
+    //
+    // Methods have qualified_names like "ClassName.method_name" or "ClassName::method_name".
+    // For each unique class prefix, create a Class node if one doesn't already exist,
+    // and add containment edges (Class → Method).
+    {
+        let mut class_prefixes: HashMap<String, Vec<crate::pdg::NodeId>> = HashMap::new();
+        for sig in &signatures {
+            if sig.is_method {
+                // Normalize the qualified name to use dots, then extract class prefix.
+                // This handles both "ClassName.method" (Python/JS) and
+                // "ClassName::method" (Rust/C++) separators.
+                let normalized = normalize_symbol(&sig.qualified_name);
+                if let Some(dot_pos) = normalized.rfind('.') {
+                    let class_name_normalized = &normalized[..dot_pos];
+                    // Use the original qualified_name for node_ids lookup
+                    if let Some(&method_nid) = node_ids.get(&sig.qualified_name) {
+                        class_prefixes
+                            .entry(class_name_normalized.to_string())
+                            .or_default()
+                            .push(method_nid);
+                    }
+                }
+            }
+        }
+        let mut containment_edges: Vec<(crate::pdg::NodeId, crate::pdg::NodeId)> = Vec::new();
+        for (class_name, method_nids) in &class_prefixes {
+            // Only create a class node if one isn't already in the PDG.
+            // Check both the normalized name and the original qualified names.
+            let already_exists = node_ids.contains_key(class_name)
+                || node_ids.keys().any(|k| normalize_symbol(k) == *class_name);
+            if !already_exists {
+                // Derive a byte_range from the earliest method's start to the latest method's end
+                let mut min_start = usize::MAX;
+                let mut max_end = 0usize;
+                for &mnid in method_nids {
+                    if let Some(mnode) = pdg.get_node(mnid) {
+                        min_start = min_start.min(mnode.byte_range.0);
+                        max_end = max_end.max(mnode.byte_range.1);
+                    }
+                }
+                // Use the short class name (last segment after any dots)
+                let short_name = class_name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(class_name)
+                    .to_string();
+
+                let class_node = Node {
+                    id: format!("{}:{}", file_path, class_name),
+                    node_type: NodeType::Class,
+                    name: short_name,
+                    file_path: file_path.to_string(),
+                    byte_range: (min_start, max_end),
+                    complexity: method_nids.len() as u32, // complexity ≈ number of methods
+                    language: language.to_string(),
+                    embedding: None,
+                };
+                let class_nid = pdg.add_node(class_node);
+                node_ids.insert(class_name.clone(), class_nid);
+
+                // Add containment edges: class → method
+                for &mnid in method_nids {
+                    containment_edges.push((class_nid, mnid));
+                }
+            }
+        }
+        if !containment_edges.is_empty() {
+            pdg.add_call_graph_edges(containment_edges);
+        }
     }
 
     // Phase 2: Extract and add type dependency edges
@@ -849,15 +921,33 @@ mod tests {
 
         let pdg = extract_pdg_from_signatures(signatures, b"", "test.py", "python");
 
-        assert_eq!(pdg.node_count(), 1);
+        // Method + inferred Class node = 2 nodes, plus a containment edge
+        assert_eq!(pdg.node_count(), 2);
 
-        let node_id = pdg
+        let method_id = pdg
             .find_by_symbol("test.py:MyClass::process")
-            .expect("Node not found");
-        let node = pdg.get_node(node_id).expect("Node weight not found");
+            .expect("Method node not found");
+        let method_node = pdg
+            .get_node(method_id)
+            .expect("Method node weight not found");
+        assert_eq!(method_node.node_type, NodeType::Method);
+        assert_eq!(method_node.name, "process");
 
-        assert_eq!(node.node_type, NodeType::Method);
-        assert_eq!(node.name, "process");
+        // Verify the inferred Class node was created
+        let class_id = pdg
+            .find_by_symbol("test.py:MyClass")
+            .expect("Inferred Class node not found");
+        let class_node = pdg.get_node(class_id).expect("Class node weight not found");
+        assert_eq!(class_node.node_type, NodeType::Class);
+        assert_eq!(class_node.name, "MyClass");
+
+        // Verify the containment edge: Class → Method
+        assert_eq!(pdg.edge_count(), 1);
+        let class_neighbors = pdg.neighbors(class_id);
+        assert!(
+            class_neighbors.contains(&method_id),
+            "Class should have a containment edge to its method"
+        );
     }
 
     #[test]
@@ -1001,19 +1091,32 @@ mod tests {
 
         let pdg = extract_pdg_from_signatures(signatures, b"", "test.py", "python");
 
-        // Should have 2 nodes and 1 inheritance edge
-        assert_eq!(pdg.node_count(), 2);
-        assert_eq!(pdg.edge_count(), 1);
+        // 2 method nodes + 2 inferred Class nodes = 4 nodes
+        assert_eq!(pdg.node_count(), 4);
+        // 1 inheritance edge (DerivedClass::process → Base::process)
+        // + 2 containment edges (Base → Base::process, DerivedClass → DerivedClass::process)
+        assert_eq!(pdg.edge_count(), 3);
 
-        // Verify edge exists from DerivedClass to Base (longer name → shorter name)
-        // The heuristic assumes shorter names are base classes
+        // Verify inheritance edge exists from DerivedClass::process to Base::process
         let derived_id = pdg.find_by_symbol("test.py:DerivedClass::process").unwrap();
-        let neighbors = pdg.neighbors(derived_id);
-        assert_eq!(neighbors.len(), 1);
-
-        // Verify the neighbor is Base
         let base_id = pdg.find_by_symbol("test.py:Base::process").unwrap();
-        assert_eq!(neighbors[0], base_id);
+        let derived_neighbors = pdg.neighbors(derived_id);
+        assert!(
+            derived_neighbors.contains(&base_id),
+            "DerivedClass::process should have an inheritance edge to Base::process"
+        );
+
+        // Verify Class nodes were created
+        let base_class_id = pdg.find_by_symbol("test.py:Base").unwrap();
+        let derived_class_id = pdg.find_by_symbol("test.py:DerivedClass").unwrap();
+        assert_eq!(
+            pdg.get_node(base_class_id).unwrap().node_type,
+            NodeType::Class
+        );
+        assert_eq!(
+            pdg.get_node(derived_class_id).unwrap().node_type,
+            NodeType::Class
+        );
     }
 
     #[test]
