@@ -147,6 +147,11 @@ dmypy.json
 **/target/
 Cargo.lock
 
+# Dashboard build/runtime artifacts
+/dashboard/node_modules/
+/dashboard/dist/
+/dashboard/src/.leindex/
+
 # Tree-sitter generated files
 *.o
 *.so

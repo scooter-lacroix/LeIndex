@@ -363,6 +363,103 @@ impl SearchResultsResponse {
     }
 }
 
+/// Language distribution entry for dashboard analytics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LanguageDistributionResponse {
+    /// Programming language name.
+    pub language: String,
+    /// Number of indexed symbols for this language.
+    pub count: i64,
+}
+
+/// Per-codebase metrics shown on the dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardCodebaseMetricsResponse {
+    /// Unique project ID.
+    pub id: String,
+    /// Human-friendly project name.
+    pub display_name: String,
+    /// Canonical project path.
+    pub project_path: String,
+    /// Number of indexed files.
+    pub file_count: i64,
+    /// Number of indexed nodes/symbols.
+    pub node_count: i64,
+    /// Number of graph edges.
+    pub edge_count: i64,
+    /// Number of import edges.
+    pub import_edge_count: i64,
+    /// Number of cross-project external references.
+    pub external_ref_count: i64,
+    /// Number of project dependency links.
+    pub dependency_link_count: i64,
+}
+
+/// Capability flags exposed to dashboard clients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FeatureStatusResponse {
+    /// Multi-project access and switching is supported.
+    pub multi_project_enabled: bool,
+    /// Cache telemetry fields are available in diagnostics pipeline.
+    pub cache_telemetry_enabled: bool,
+    /// External dependency resolution support is enabled.
+    pub external_dependency_resolution_enabled: bool,
+    /// Context-aware edit tooling support is enabled.
+    pub context_aware_editing_enabled: bool,
+    /// Bounded impact/dependency traversal is supported.
+    pub bounded_impact_analysis_enabled: bool,
+}
+
+/// Cache overview shown in dashboard summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheOverviewResponse {
+    /// Number of persisted analysis cache entries.
+    pub analysis_cache_entries: i64,
+    /// Estimated cache temperature derived from available cache metrics.
+    pub temperature: String,
+    /// Estimated hit rate if directly measurable (not yet persisted globally).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub estimated_hit_rate: Option<f64>,
+}
+
+/// External dependency overview shown in dashboard summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalDependencyOverviewResponse {
+    /// Count of cross-project external references.
+    pub external_refs: i64,
+    /// Count of project dependency links.
+    pub project_dependency_links: i64,
+    /// Count of import edges seen in current graph data.
+    pub import_edges: i64,
+}
+
+/// Aggregated dashboard overview response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardOverviewResponse {
+    /// Unix timestamp when this snapshot was generated.
+    pub generated_at: i64,
+    /// Service status string.
+    pub status: String,
+    /// Total registered codebases.
+    pub total_codebases: usize,
+    /// Total indexed files across all codebases.
+    pub total_files: i64,
+    /// Total indexed nodes across all codebases.
+    pub total_nodes: i64,
+    /// Total edges across all codebases.
+    pub total_edges: i64,
+    /// Language distribution over indexed symbols.
+    pub language_distribution: Vec<LanguageDistributionResponse>,
+    /// Feature status flags.
+    pub feature_status: FeatureStatusResponse,
+    /// Cache overview.
+    pub cache: CacheOverviewResponse,
+    /// External dependency overview.
+    pub external_dependencies: ExternalDependencyOverviewResponse,
+    /// Per-codebase metrics.
+    pub codebases: Vec<DashboardCodebaseMetricsResponse>,
+}
+
 /// Graph node detail response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GraphNodeDetailResponse {
