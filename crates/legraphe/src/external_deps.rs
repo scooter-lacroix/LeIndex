@@ -169,6 +169,12 @@ impl ExternalDependencyRegistry {
         }
 
         // Go — go.sum
+        let go_mod = root.join("go.mod");
+        if go_mod.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&go_mod) {
+                registry.parse_go_mod(&content);
+            }
+        }
         let go_sum = root.join("go.sum");
         if go_sum.is_file() {
             if let Ok(content) = std::fs::read_to_string(&go_sum) {
@@ -723,6 +729,54 @@ impl ExternalDependencyRegistry {
         }
     }
 
+    /// Parse go.mod requirements.
+    ///
+    /// ```text
+    /// require github.com/gorilla/mux v1.8.1
+    /// require (
+    ///   golang.org/x/net v0.24.0
+    /// )
+    /// ```
+    fn parse_go_mod(&mut self, content: &str) {
+        let mut in_require_block = false;
+        for raw in content.lines() {
+            let line = raw.split("//").next().unwrap_or("").trim();
+            if line.is_empty() {
+                continue;
+            }
+
+            if line.starts_with("require (") {
+                in_require_block = true;
+                continue;
+            }
+            if in_require_block && line == ")" {
+                in_require_block = false;
+                continue;
+            }
+
+            if in_require_block {
+                if let Some((name, version)) = parse_go_requirement(line) {
+                    self.insert(ExternalDependency {
+                        name,
+                        version,
+                        ecosystem: Ecosystem::GoModules,
+                    });
+                }
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("require ") {
+                if let Some((name, version)) = parse_go_requirement(rest.trim()) {
+                    self.insert(ExternalDependency {
+                        name,
+                        version,
+                        ecosystem: Ecosystem::GoModules,
+                    });
+                }
+            }
+        }
+    }
+
     /// Parse Gemfile.lock.
     ///
     /// ```text
@@ -884,6 +938,19 @@ fn parse_python_requirement_spec(spec: &str) -> Option<ExternalDependency> {
     })
 }
 
+fn parse_go_requirement(raw: &str) -> Option<(String, String)> {
+    let parts: Vec<&str> = raw.split_whitespace().collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let name = parts[0].trim();
+    let version = parts[1].trim();
+    if name.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((name.to_string(), version.to_string()))
+}
+
 fn python_import_aliases(package_name: &str) -> Vec<String> {
     let canonical = package_name.to_lowercase();
     let mut aliases = vec![
@@ -916,6 +983,90 @@ fn python_import_aliases(package_name: &str) -> Vec<String> {
     aliases.sort();
     aliases.dedup();
     aliases
+}
+
+fn is_probable_builtin_import(import_name: &str) -> bool {
+    let normalized = normalise_import(import_name);
+    if normalized.is_empty() {
+        return false;
+    }
+
+    const RUST_BUILTINS: &[&str] = &["std", "core", "alloc", "proc_macro", "test"];
+    const NODE_BUILTINS: &[&str] = &[
+        "assert",
+        "buffer",
+        "child_process",
+        "crypto",
+        "events",
+        "fs",
+        "http",
+        "https",
+        "net",
+        "os",
+        "path",
+        "stream",
+        "tls",
+        "url",
+        "util",
+        "worker_threads",
+        "zlib",
+    ];
+    const PY_BUILTINS: &[&str] = &[
+        "abc",
+        "argparse",
+        "asyncio",
+        "collections",
+        "datetime",
+        "functools",
+        "itertools",
+        "json",
+        "logging",
+        "math",
+        "os",
+        "pathlib",
+        "re",
+        "subprocess",
+        "sys",
+        "time",
+        "typing",
+        "unittest",
+    ];
+    const GO_BUILTINS: &[&str] = &[
+        "bufio",
+        "bytes",
+        "context",
+        "crypto",
+        "database.sql",
+        "encoding.json",
+        "errors",
+        "fmt",
+        "io",
+        "log",
+        "math",
+        "net.http",
+        "net.url",
+        "os",
+        "path",
+        "regexp",
+        "sort",
+        "strconv",
+        "strings",
+        "sync",
+        "testing",
+        "time",
+    ];
+
+    RUST_BUILTINS
+        .iter()
+        .chain(NODE_BUILTINS.iter())
+        .chain(PY_BUILTINS.iter())
+        .chain(GO_BUILTINS.iter())
+        .any(|prefix| {
+            normalized == *prefix
+                || normalized.starts_with(&format!("{}.", prefix))
+                || normalized == format!("node.{}", prefix)
+                || normalized.starts_with(&format!("node.{}.", prefix))
+        })
 }
 
 /// Annotate PDG external module nodes with resolved dependency metadata.
@@ -964,6 +1115,11 @@ pub fn annotate_external_nodes(
                     );
                 }
             }
+        } else if is_probable_builtin_import(&import_name) {
+            stats.builtin += 1;
+            if let Some(node) = pdg.get_node_mut(node_id) {
+                node.language = "external:system".to_string();
+            }
         } else {
             stats.unresolved += 1;
         }
@@ -979,6 +1135,8 @@ pub struct AnnotationStats {
     pub total_external: usize,
     /// Successfully resolved via lock file.
     pub resolved: usize,
+    /// Recognized as builtin/system modules.
+    pub builtin: usize,
     /// Still unresolved.
     pub unresolved: usize,
 }
@@ -1408,5 +1566,43 @@ PLATFORMS
 
         let registry = ExternalDependencyRegistry::from_project(dir.path());
         assert!(registry.resolve("react").is_some());
+    }
+
+    #[test]
+    fn from_project_with_go_mod() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module demo\n\nrequire github.com/gorilla/mux v1.8.1\n",
+        )
+        .expect("write");
+
+        let registry = ExternalDependencyRegistry::from_project(dir.path());
+        assert!(registry.resolve("github.com/gorilla/mux").is_some());
+    }
+
+    #[test]
+    fn annotate_external_nodes_marks_builtin_modules() {
+        use crate::pdg::{Node, NodeType, ProgramDependenceGraph};
+
+        let mut pdg = ProgramDependenceGraph::new();
+        let ext_id = pdg.add_node(Node {
+            id: "std".to_string(),
+            name: "std".to_string(),
+            node_type: NodeType::Module,
+            file_path: "".to_string(),
+            byte_range: (0, 0),
+            language: "external".to_string(),
+            complexity: 0,
+            embedding: None,
+        });
+
+        let registry = ExternalDependencyRegistry::new();
+        let stats = annotate_external_nodes(&mut pdg, &registry);
+        assert_eq!(stats.total_external, 1);
+        assert_eq!(stats.resolved, 0);
+        assert_eq!(stats.builtin, 1);
+        assert_eq!(stats.unresolved, 0);
+        assert_eq!(pdg.get_node(ext_id).unwrap().language, "external:system");
     }
 }

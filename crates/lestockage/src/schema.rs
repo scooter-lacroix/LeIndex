@@ -207,6 +207,23 @@ CREATE TABLE IF NOT EXISTS project_metadata (
             [],
         )?;
 
+        // Persistent cache telemetry for cross-session hit-rate tracking.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS cache_telemetry (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                cache_hits INTEGER NOT NULL DEFAULT 0,
+                cache_misses INTEGER NOT NULL DEFAULT 0,
+                cache_writes INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO cache_telemetry (id, cache_hits, cache_misses, cache_writes, updated_at)
+             VALUES (1, 0, 0, 0, strftime('%s', 'now'))",
+            [],
+        )?;
+
         // Create global_symbols table (Phase 7: Cross-Project Resolution)
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS global_symbols (
@@ -383,12 +400,12 @@ mod tests {
         let table_count: i64 = storage
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND (name LIKE 'intel_%' OR name = 'analysis_cache' OR name LIKE 'global_%' OR name LIKE 'external_%' OR name LIKE 'project_%')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND (name LIKE 'intel_%' OR name = 'analysis_cache' OR name = 'cache_telemetry' OR name LIKE 'global_%' OR name LIKE 'external_%' OR name LIKE 'project_%')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
 
-        assert_eq!(table_count, 7); // intel_nodes, intel_edges, analysis_cache, global_symbols, external_refs, project_deps, project_metadata
+        assert_eq!(table_count, 8); // intel_nodes, intel_edges, analysis_cache, cache_telemetry, global_symbols, external_refs, project_deps, project_metadata
     }
 }
