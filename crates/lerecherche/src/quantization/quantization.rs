@@ -89,7 +89,9 @@ pub fn quantization_error(original: &[f32], dequantized: &[f32]) -> f32 {
 }
 
 /// Batch quantize multiple vectors with shared parameters
-pub fn batch_quantize(vectors: &[Vec<f32>]) -> Option<(Vec<Int8QuantizedVector>, Int8QuantizedVectorMetadata)> {
+pub fn batch_quantize(
+    vectors: &[Vec<f32>],
+) -> Option<(Vec<Int8QuantizedVector>, Int8QuantizedVectorMetadata)> {
     if vectors.is_empty() {
         return None;
     }
@@ -98,12 +100,10 @@ pub fn batch_quantize(vectors: &[Vec<f32>]) -> Option<(Vec<Int8QuantizedVector>,
     let (global_min, global_max, _, _) = vectors.iter().fold(
         (f32::INFINITY, f32::NEG_INFINITY, 0.0f32, 0.0f32),
         |(min, max, sum, sq_sum), vec| {
-            vec.iter().fold(
-                (min, max, sum, sq_sum),
-                |(min, max, sum, sq_sum), &v| {
+            vec.iter()
+                .fold((min, max, sum, sq_sum), |(min, max, sum, sq_sum), &v| {
                     (min.min(v), max.max(v), sum + v, sq_sum + v * v)
-                },
-            )
+                })
         },
     );
 
@@ -112,15 +112,13 @@ pub fn batch_quantize(vectors: &[Vec<f32>]) -> Option<(Vec<Int8QuantizedVector>,
 
     // Compute average sum and squared_sum for metadata
     let total_sum: f32 = vectors.iter().map(|v| v.iter().sum::<f32>()).sum();
-    let total_sq_sum: f32 = vectors.iter().map(|v| v.iter().map(|&x| x * x).sum::<f32>()).sum();
+    let total_sq_sum: f32 = vectors
+        .iter()
+        .map(|v| v.iter().map(|&x| x * x).sum::<f32>())
+        .sum();
     let n = vectors.len() as f32;
 
-    let metadata = Int8QuantizedVectorMetadata::new(
-        scale,
-        bias,
-        total_sum / n,
-        total_sq_sum / n,
-    );
+    let metadata = Int8QuantizedVectorMetadata::new(scale, bias, total_sum / n, total_sq_sum / n);
 
     let quantized: Vec<Int8QuantizedVector> = vectors
         .iter()

@@ -7,6 +7,8 @@
 
 /// Hierarchical Navigable Small World (HNSW) implementation for vector search.
 pub mod hnsw;
+/// INT8 Quantization system.
+pub mod quantization;
 /// Query parsing and intent detection.
 pub mod query;
 /// Hybrid ranking and scoring algorithms.
@@ -15,8 +17,6 @@ pub mod ranking;
 pub mod search;
 /// Semantic analysis and embedding generation.
 pub mod semantic;
-/// INT8 Quantization system.
-pub mod quantization;
 /// Vector storage and indexing.
 pub mod vector;
 

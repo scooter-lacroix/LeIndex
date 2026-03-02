@@ -495,8 +495,6 @@ pub struct ProgressEvent {
     /// Optional message with additional details
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-
-
     pub message: Option<String>,
 
     /// Timestamp in milliseconds

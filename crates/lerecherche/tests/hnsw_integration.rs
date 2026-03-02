@@ -631,7 +631,7 @@ mod tests {
             .with_m(16)
             .with_ef_construction(200)
             .with_ef_search(50);
-        
+
         let mut index = Int8HnswIndex::with_params(dimension, params);
 
         // Insert test vectors
@@ -657,13 +657,11 @@ mod tests {
         );
 
         // Create a query vector
-        let query: Vec<f32> = (0..dimension)
-            .map(|j| (j % 50) as f32 / 100.0)
-            .collect();
+        let query: Vec<f32> = (0..dimension).map(|j| (j % 50) as f32 / 100.0).collect();
 
         // Perform search
         let results1 = index.search(&query, 10);
-        
+
         // Verify we got results
         assert!(!results1.is_empty(), "Search should return results");
         assert!(results1.len() <= 10);
@@ -671,7 +669,7 @@ mod tests {
         // Verify results are sorted by similarity (descending)
         for i in 1..results1.len() {
             assert!(
-                results1[i-1].1 >= results1[i].1,
+                results1[i - 1].1 >= results1[i].1,
                 "Results should be sorted by similarity"
             );
         }
@@ -701,7 +699,7 @@ mod tests {
     fn test_int8_vs_f32_search_accuracy() {
         use lerecherche::quantization::{Int8HnswIndex, Int8HnswParams};
 
-        let dimension = 256;  // Smaller dimension for faster test
+        let dimension = 256; // Smaller dimension for faster test
         let num_vectors = 500;
         let top_k = 10;
 
@@ -718,7 +716,7 @@ mod tests {
             .with_m(8)
             .with_ef_construction(100)
             .with_ef_search(50);
-        
+
         let mut index = Int8HnswIndex::with_params(dimension, params);
 
         // Insert vectors
@@ -729,18 +727,15 @@ mod tests {
         // Search with query matching one of the vectors
         let query_idx = 42;
         let query = vectors[query_idx].1.clone();
-        
+
         let results = index.search(&query, top_k);
 
         // The query should find the exact match or very close neighbors
         assert!(!results.is_empty());
-        
+
         // All similarities should be reasonable (not NaN, in valid range)
         for (_, similarity) in &results {
-            assert!(
-                similarity.is_finite(),
-                "Similarity should be finite"
-            );
+            assert!(similarity.is_finite(), "Similarity should be finite");
             assert!(
                 *similarity >= 0.0 && *similarity <= 1.0,
                 "Similarity should be in [0, 1], got {}",

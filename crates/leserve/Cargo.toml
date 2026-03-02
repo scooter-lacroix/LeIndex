@@ -25,6 +25,7 @@ http = "1.1"
 # Async utilities
 futures = "0.3"
 tokio-tungstenite = "0.21"
+walkdir = "2.5"
 
 # Internal dependencies
 lestockage = { path = "../lestockage" }

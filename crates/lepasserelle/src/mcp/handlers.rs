@@ -368,7 +368,16 @@ to auto-switch/auto-index projects."
             "offset": offset,
             "count": total_returned,
             "has_more": total_returned == top_k,
-            "scoring": "Each result has a composite score (0.0–1.0): 0.5×semantic (TF-IDF cosine similarity) + 0.3×text_match (token overlap) + 0.2×structural (PDG centrality)."
+            "scoring_explanation": {
+                "semantic": "TF-IDF cosine similarity (0-1) - measures conceptual relevance",
+                "text_match": "Token overlap ratio (0-1) - exact keyword matches",
+                "structural": "PDG centrality score (0-1) - importance in call graph"
+            },
+            "example_interpretation": {
+                "score_0.8_plus": "Highly relevant - likely what you're looking for",
+                "score_0.5_to_0.79": "Moderately relevant - worth reviewing",
+                "score_below_0.5": "Low relevance - refine query or broaden context"
+            }
         }))
     }
 }
@@ -840,6 +849,26 @@ async fn execute_phase_analysis(
         if let serde_json::Value::Object(ref mut map) = report_value {
             map.insert("file_symbols".to_string(), serde_json::json!(symbols));
         }
+    }
+
+    if let serde_json::Value::Object(ref mut map) = report_value {
+        map.insert(
+            "phase_explanations".to_string(),
+            serde_json::json!({
+                "1": "File parsing & signature extraction",
+                "2": "Import graph construction (internal/external edges)",
+                "3": "Entry point identification & impact analysis",
+                "4": "Complexity hotspot detection",
+                "5": "Actionable recommendations generation"
+            }),
+        );
+        map.insert(
+            "example_interpretation".to_string(),
+            serde_json::json!({
+                "high_unresolved_modules": "Consider adding missing type definitions",
+                "many_entry_points": "May indicate architectural coupling issues"
+            }),
+        );
     }
 
     Ok(report_value)
@@ -2553,7 +2582,17 @@ leindex_edit_apply to understand the blast radius of your change."
             "affected_files": affected_files.into_iter().collect::<Vec<_>>(),
             "breaking_changes": breaking_changes,
             "risk_level": risk,
-            "change_count": changes.len()
+            "change_count": changes.len(),
+            "breaking_change_examples": {
+                "signature_change": "Function parameters modified - callers may break",
+                "return_type_change": "Return type altered - dependent code affected",
+                "symbol_removal": "Symbol deleted - all references will fail"
+            },
+            "safety_checklist": [
+                "Review all affected symbols before applying",
+                "Run tests on impacted files",
+                "Consider using dry_run=true first"
+            ]
         }))
     }
 }
@@ -2649,7 +2688,17 @@ returns the preview without modifying any files."
         Ok(serde_json::json!({
             "success": true,
             "changes_applied": changes.len(),
-            "files_modified": [file_path]
+            "files_modified": [file_path],
+            "breaking_change_examples": {
+                "signature_change": "Function parameters modified - callers may break",
+                "return_type_change": "Return type altered - dependent code affected",
+                "symbol_removal": "Symbol deleted - all references will fail"
+            },
+            "safety_checklist": [
+                "Review all affected symbols before applying",
+                "Run tests on impacted files",
+                "Consider using dry_run=true first"
+            ]
         }))
     }
 }
@@ -2943,7 +2992,16 @@ to understand the blast radius of your change. No equivalent in standard tools."
             "summary": format!(
                 "Changing '{}' directly affects {} symbols in {} files (risk: {})",
                 node.name, forward.len(), affected_files.len(), risk
-            )
+            ),
+            "risk_assessment_guide": {
+                "low": "<10 affected symbols, single file - safe to modify",
+                "medium": "10-50 affected symbols or cross-file impact - review carefully",
+                "high": ">50 affected symbols or critical path - requires thorough testing"
+            },
+            "example_usage": {
+                "before_refactoring": "Run this first to understand blast radius",
+                "recommended_followup": "Use leindex_edit_preview after reviewing impact"
+            }
         }))
     }
 }

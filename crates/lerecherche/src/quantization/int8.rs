@@ -3,7 +3,9 @@
 //! This module provides the foundational types and traits for INT8 quantization
 //! in the lerecherche crate. It implements Zvec-style quantization.
 
-pub use super::quantization::{Quantize, Dequantize, quantization_error, batch_quantize, dequantize_value};
+pub use super::quantization::{
+    batch_quantize, dequantize_value, quantization_error, Dequantize, Quantize,
+};
 pub use super::vector::{Int8QuantizedVector, Int8QuantizedVectorMetadata, SimdBlock};
 
 #[cfg(test)]
@@ -20,10 +22,7 @@ mod integration_tests {
             })
             .collect();
 
-        let quantized: Vec<Int8QuantizedVector> = embeddings
-            .iter()
-            .map(|e| e.quantize())
-            .collect();
+        let quantized: Vec<Int8QuantizedVector> = embeddings.iter().map(|e| e.quantize()).collect();
 
         for qv in &quantized {
             assert_eq!(qv.len(), 128);

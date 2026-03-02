@@ -223,9 +223,7 @@ impl Cli {
             Commands::Diagnostics => cmd_diagnostics_impl(global_project).await,
             Commands::Serve { host, port } => cmd_serve_impl(host, port).await,
             Commands::Mcp { .. } => cmd_mcp_stdio_impl(global_project).await,
-            Commands::Dashboard { port, prod } => {
-                cmd_dashboard_impl(port, prod).await
-            }
+            Commands::Dashboard { port, prod } => cmd_dashboard_impl(port, prod).await,
         }
     }
 }
@@ -677,10 +675,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         let message = match JsonRpcMessage::from_json(&json_payload) {
             Ok(m) => m,
             Err(e) => {
-                let error_response = JsonRpcResponse::error(
-                    serde_json::Value::Null,
-                    e,
-                );
+                let error_response = JsonRpcResponse::error(serde_json::Value::Null, e);
                 let response = serde_json::to_string(&error_response).unwrap_or_default();
                 if use_content_length {
                     let _ = writeln!(

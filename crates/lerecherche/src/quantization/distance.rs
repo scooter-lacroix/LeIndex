@@ -40,11 +40,11 @@
 //! - ✅ **DO** create separate `Int8HnswIndex` instances per thread
 //! - ✅ **DO** use single-threaded `search()` method
 
+use super::simd::{dot_product_adc, l2_squared_adc};
+use super::vector::Int8QuantizedVector;
+use hnsw_rs::prelude::Distance;
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use hnsw_rs::prelude::Distance;
-use super::vector::Int8QuantizedVector;
-use super::simd::{dot_product_adc, l2_squared_adc};
 
 // Thread-local storage for ADC query context
 thread_local! {
@@ -87,8 +87,7 @@ pub struct AdcQueryContext {
 }
 
 /// Distance metric for ADC computation
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AdcDistanceMetric {
     /// Cosine similarity (converted to distance)
     #[default]
@@ -98,7 +97,6 @@ pub enum AdcDistanceMetric {
     /// Dot product (converted to distance)
     Dot,
 }
-
 
 impl AdcQueryContext {
     /// Create a new query context from an f32 query vector
@@ -138,9 +136,7 @@ pub fn with_adc_query_context<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(&AdcQueryContext) -> R,
 {
-    ADC_QUERY_CONTEXT.with(|ctx| {
-        ctx.borrow().as_ref().map(f)
-    })
+    ADC_QUERY_CONTEXT.with(|ctx| ctx.borrow().as_ref().map(f))
 }
 
 /// Check if an ADC query context is currently set
@@ -194,13 +190,18 @@ impl Distance<Int8QuantizedVector> for AdcDistanceMetric {
                         n1 += d1[i] * d1[i];
                         n2 += d2[i] * d2[i];
                     }
-                    if n1 == 0.0 || n2 == 0.0 { return 1.0; }
+                    if n1 == 0.0 || n2 == 0.0 {
+                        return 1.0;
+                    }
                     (1.0 - dot / (n1.sqrt() * n2.sqrt())).max(0.0)
                 }
                 AdcDistanceMetric::L2Squared => {
                     let d1 = v1.to_f32();
                     let d2 = v2.to_f32();
-                    d1.iter().zip(d2.iter()).map(|(a, b)| (a - b) * (a - b)).sum()
+                    d1.iter()
+                        .zip(d2.iter())
+                        .map(|(a, b)| (a - b) * (a - b))
+                        .sum()
                 }
                 AdcDistanceMetric::Dot => {
                     let d1 = v1.to_f32();
@@ -278,7 +279,8 @@ mod tests {
         let stored_f32 = vec![0.5, 0.5, 0.5, 0.5];
         let stored = stored_f32.quantize();
         let distance_fn = Int8AdcDistance::cosine();
-        let distance = distance_fn.eval(std::slice::from_ref(&stored), std::slice::from_ref(&stored));
+        let distance =
+            distance_fn.eval(std::slice::from_ref(&stored), std::slice::from_ref(&stored));
         assert!(distance >= 0.0 && distance <= 1.0);
         clear_adc_query_context();
     }

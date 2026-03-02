@@ -101,7 +101,7 @@ pub fn l2_squared_adc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quantization::{Quantize, Dequantize};
+    use crate::quantization::{Dequantize, Quantize};
 
     #[test]
     fn test_dot_product_adc_basic() {
@@ -118,13 +118,19 @@ mod tests {
 
         // Verify against manual calculation
         let dequantized = qvec.dequantize();
-        let expected_dot: f32 = query.iter().zip(dequantized.iter()).map(|(q, d)| q * d).sum();
+        let expected_dot: f32 = query
+            .iter()
+            .zip(dequantized.iter())
+            .map(|(q, d)| q * d)
+            .sum();
         assert!((result - expected_dot).abs() < 1e-3);
     }
 
     #[test]
     fn test_various_dimensions() {
-        for dim in [1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129] {
+        for dim in [
+            1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+        ] {
             let original: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.01).collect();
             let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.02).collect();
 

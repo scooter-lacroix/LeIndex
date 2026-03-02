@@ -1,6 +1,8 @@
 //! Server instance management
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::signal;
 use tracing::{error, info};
@@ -9,6 +11,7 @@ use crate::config::ServerConfig;
 use crate::error::ApiError;
 use crate::handlers::{create_router, AppState};
 use lestockage::Storage;
+use walkdir::WalkDir;
 
 /// LeServe HTTP/WebSocket server
 ///
@@ -39,10 +42,26 @@ impl LeServeServer {
         }
 
         // Open storage
-        let storage = Storage::open(&config.db_path).map_err(|e| {
+        let mut storage = Storage::open(&config.db_path).map_err(|e| {
             error!("Failed to open storage: {}", e);
             ApiError::internal(format!("Failed to open storage: {}", e))
         })?;
+
+        // Discover existing LeIndex project databases on the system and ingest them
+        let discovered = discover_leindex_dbs();
+        if discovered.is_empty() {
+            info!("No existing LeIndex project databases discovered");
+        } else {
+            info!(
+                "Discovered {} LeIndex project database(s)",
+                discovered.len()
+            );
+        }
+        for db_path in discovered {
+            if let Err(e) = ingest_project_db(&mut storage, &db_path) {
+                error!("Failed to ingest {:?}: {}", db_path, e);
+            }
+        }
 
         Ok(Self {
             config,
@@ -162,4 +181,88 @@ mod tests {
         let server = LeServeServer::new(config);
         assert!(server.is_ok());
     }
+}
+
+/// Search the filesystem for `.leindex/leindex.db` project databases.
+/// Roots are taken from `LEINDEX_DISCOVERY_ROOTS` (comma-separated) when set;
+/// otherwise defaults to `$HOME` and the current working directory.
+fn discover_leindex_dbs() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Ok(env_roots) = std::env::var("LEINDEX_DISCOVERY_ROOTS") {
+        for part in env_roots.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                roots.push(PathBuf::from(trimmed));
+            }
+        }
+    }
+
+    if roots.is_empty() {
+        if let Ok(home) = std::env::var("HOME") {
+            roots.push(PathBuf::from(home));
+        }
+        if let Ok(cwd) = std::env::current_dir() {
+            roots.push(cwd);
+        }
+    }
+
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut found: Vec<PathBuf> = Vec::new();
+
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(root)
+            .follow_links(false)
+            .max_depth(8)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if path.file_name().map(|n| n == "leindex.db").unwrap_or(false) {
+                if let Some(parent) = path.parent() {
+                    if parent.file_name().map(|n| n == ".leindex").unwrap_or(false) {
+                        if let Ok(canon) = path.canonicalize() {
+                            if seen.insert(canon.clone()) {
+                                found.push(canon);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    found
+}
+
+/// Attach a project database and copy its contents into the server database.
+fn ingest_project_db(target: &mut Storage, project_db: &Path) -> Result<(), ApiError> {
+    let db_str = project_db
+        .to_str()
+        .ok_or_else(|| ApiError::internal("Invalid project db path"))?
+        .replace('\'', "''");
+
+    let sql = format!(
+        "
+        ATTACH DATABASE '{db}' AS project;
+        INSERT OR IGNORE INTO project_metadata SELECT * FROM project.project_metadata;
+        INSERT OR IGNORE INTO indexed_files SELECT * FROM project.indexed_files;
+        INSERT OR IGNORE INTO intel_nodes SELECT * FROM project.intel_nodes;
+        INSERT OR IGNORE INTO intel_edges SELECT * FROM project.intel_edges;
+        INSERT OR IGNORE INTO global_symbols SELECT * FROM project.global_symbols;
+        INSERT OR IGNORE INTO external_refs SELECT * FROM project.external_refs;
+        INSERT OR IGNORE INTO project_deps SELECT * FROM project.project_deps;
+        DETACH DATABASE project;
+        ",
+        db = db_str
+    );
+
+    target
+        .conn()
+        .execute_batch(&sql)
+        .map_err(|e| ApiError::internal(format!("Ingest failed: {}", e)))?;
+
+    Ok(())
 }

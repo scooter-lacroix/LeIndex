@@ -19,8 +19,8 @@
 //! 5. Convert i32 to f32 using `_mm256_cvtepi32_ps`
 //! 6. Multiply-accumulate with query values using `_mm256_fmadd_ps`
 
-use std::arch::x86_64::*;
 use super::super::vector::Int8QuantizedVector;
+use std::arch::x86_64::*;
 
 /// Compute asymmetric dot product using ADC with AVX2
 ///
@@ -31,11 +31,7 @@ use super::super::vector::Int8QuantizedVector;
 /// - Pointers derived from slices are always valid and properly aligned for AVX2
 ///   (32-byte alignment is ideal but not required - we use unaligned loads)
 #[target_feature(enable = "avx2")]
-pub unsafe fn dot_product_adc(
-    query: &[f32],
-    qvec: &Int8QuantizedVector,
-    query_sum: f32,
-) -> f32 {
+pub unsafe fn dot_product_adc(query: &[f32], qvec: &Int8QuantizedVector, query_sum: f32) -> f32 {
     let q_slice = qvec.as_slice();
     let dimension = qvec.len();
 
@@ -53,7 +49,7 @@ pub unsafe fn dot_product_adc(
             let prefetch_ptr = q_slice.as_ptr().add((i + 4) * 16) as *const i8;
             _mm_prefetch(prefetch_ptr as *const i8, _MM_HINT_T0);
         }
-        
+
         // Load 16 i8 values (128-bit)
         // Using unaligned load - the slice may not be 16-byte aligned
         let i8_ptr = q_slice.as_ptr().add(i * 16) as *const __m128i;
@@ -121,7 +117,12 @@ pub unsafe fn dot_product_adc(
     // - q_slice comes from qvec which also has exactly 'dimension' elements
     // - Therefore i is always in bounds [0, dimension) for both slices
     for (i, &q_val) in query.iter().enumerate().skip(n_chunks * 16) {
-        debug_assert!(i < q_slice.len(), "Index {} out of bounds for q_slice of len {}", i, q_slice.len());
+        debug_assert!(
+            i < q_slice.len(),
+            "Index {} out of bounds for q_slice of len {}",
+            i,
+            q_slice.len()
+        );
         total += q_val * (*q_slice.get_unchecked(i) as f32);
     }
 
@@ -149,7 +150,7 @@ pub unsafe fn l2_squared_distance(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quantization::{Quantize, Dequantize};
+    use crate::quantization::{Dequantize, Quantize};
 
     #[test]
     #[cfg(target_arch = "x86_64")]
@@ -173,7 +174,11 @@ mod tests {
 
         // Verify against dequantized calculation
         let dequantized = qvec.dequantize();
-        let expected: f32 = query.iter().zip(dequantized.iter()).map(|(q, d)| q * d).sum();
+        let expected: f32 = query
+            .iter()
+            .zip(dequantized.iter())
+            .map(|(q, d)| q * d)
+            .sum();
 
         assert!(
             (result - expected).abs() < 1e-3,
@@ -191,7 +196,9 @@ mod tests {
         }
 
         // Test various dimensions to ensure remainder handling works
-        for dim in [1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129] {
+        for dim in [
+            1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129,
+        ] {
             let original: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.01).collect();
             let query: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.02).collect();
 
