@@ -188,6 +188,52 @@ pub struct EditEngine {
     pub history: Arc<tokio::sync::Mutex<EditHistory>>,
 }
 
+fn clamp_to_char_boundary(content: &str, idx: usize) -> usize {
+    let mut i = idx.min(content.len());
+    while i > 0 && !content.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn replace_whole_word(content: &str, old: &str, new: &str) -> String {
+    if old.is_empty() {
+        return content.to_owned();
+    }
+
+    let mut result = String::with_capacity(content.len());
+    let mut last_match_end = 0usize;
+
+    for (start, matched) in content.match_indices(old) {
+        let end = start + matched.len();
+        let before_ok = start == 0
+            || content[..start]
+                .chars()
+                .last()
+                .map(|c| !is_word_char(c))
+                .unwrap_or(true);
+        let after_ok = end == content.len()
+            || content[end..]
+                .chars()
+                .next()
+                .map(|c| !is_word_char(c))
+                .unwrap_or(true);
+
+        if before_ok && after_ok {
+            result.push_str(&content[last_match_end..start]);
+            result.push_str(new);
+            last_match_end = end;
+        }
+    }
+
+    result.push_str(&content[last_match_end..]);
+    result
+}
+
 impl EditEngine {
     /// Create a new edit engine
     pub fn new(pdg: Arc<PDG>, _storage: Arc<Storage>) -> Result<Self> {
@@ -216,13 +262,7 @@ impl EditEngine {
 
         // Analyze impact using PDG
         let impact = self.analyze_impact(request).await?;
-        let affected_files = impact.affected_files.clone();
-        let mut all_files = vec![request.file_path.clone()];
-        for f in affected_files {
-            if !all_files.contains(&f) {
-                all_files.push(f);
-            }
-        }
+        let all_files = impact.affected_files.clone();
 
         Ok(EditPreview {
             diff,
@@ -328,9 +368,8 @@ impl EditEngine {
                 end,
                 new_text,
             } => {
-                let bytes = content.as_bytes();
-                let start_idx = (*start).min(bytes.len());
-                let end_idx = (*end).min(bytes.len());
+                let start_idx = clamp_to_char_boundary(content, *start);
+                let end_idx = clamp_to_char_boundary(content, *end);
                 if start_idx > end_idx {
                     return Err(EditError::InvalidRange {
                         start: *start,
@@ -346,10 +385,11 @@ impl EditEngine {
                 );
                 Ok(result)
             }
-            EditChange::RenameSymbol { old_name, new_name } => {
-                // Simple text replacement within the given content
-                Ok(content.replace(old_name.as_str(), new_name.as_str()))
-            }
+            EditChange::RenameSymbol { old_name, new_name } => Ok(replace_whole_word(
+                content,
+                old_name.as_str(),
+                new_name.as_str(),
+            )),
             EditChange::ExtractFunction { .. } | EditChange::InlineVariable { .. } => {
                 // AST-level changes are complex; return content unchanged for preview
                 Ok(content.to_owned())
@@ -466,14 +506,27 @@ impl EditEngine {
             session.path().join(file_path)
         };
 
-        // Read current content (fall back to the original path if worktree copy not found)
+        // Always materialize/read the target in the worktree to keep edits isolated.
         let content = if target_path.exists() {
             std::fs::read_to_string(&target_path).map_err(|e| {
                 EditError::Generic(format!("Failed to read {:?}: {}", target_path, e))
             })?
         } else if file_path.exists() {
-            std::fs::read_to_string(file_path)
-                .map_err(|e| EditError::Generic(format!("Failed to read {:?}: {}", file_path, e)))?
+            let source = std::fs::read_to_string(file_path).map_err(|e| {
+                EditError::Generic(format!("Failed to read {:?}: {}", file_path, e))
+            })?;
+            if let Some(parent) = target_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    EditError::Generic(format!("Failed to create worktree dir {:?}: {}", parent, e))
+                })?;
+            }
+            std::fs::write(&target_path, source.as_bytes()).map_err(|e| {
+                EditError::Generic(format!(
+                    "Failed to materialize worktree file {:?}: {}",
+                    target_path, e
+                ))
+            })?;
+            source
         } else {
             return Err(EditError::FileNotFound(file_path.to_path_buf()));
         };
@@ -484,15 +537,14 @@ impl EditEngine {
             return Ok(false); // No change
         }
 
-        // Write modified content back
-        let write_path = if target_path.parent().map(|p| p.exists()).unwrap_or(false) {
-            target_path
-        } else {
-            file_path.to_path_buf()
-        };
-
-        std::fs::write(&write_path, modified.as_bytes())
-            .map_err(|e| EditError::Generic(format!("Failed to write {:?}: {}", write_path, e)))?;
+        // Write modified content back into worktree only.
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                EditError::Generic(format!("Failed to create worktree dir {:?}: {}", parent, e))
+            })?;
+        }
+        std::fs::write(&target_path, modified.as_bytes())
+            .map_err(|e| EditError::Generic(format!("Failed to write {:?}: {}", target_path, e)))?;
 
         Ok(true)
     }

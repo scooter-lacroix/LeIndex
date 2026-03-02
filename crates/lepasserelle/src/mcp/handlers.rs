@@ -1674,7 +1674,7 @@ in the dependency graph. Supports exact match and substring search."
             "properties": {
                 "pattern": {
                     "type": "string",
-                    "description": "Symbol name, substring, or natural language query"
+                    "description": "Symbol name or substring to search for"
                 },
                 "project_path": {
                     "type": "string",
@@ -1742,7 +1742,7 @@ in the dependency graph. Supports exact match and substring search."
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
 
         // Validate and canonicalise scope path if provided
         let scope = if let Some(raw) = scope_raw {
@@ -1759,6 +1759,12 @@ in the dependency graph. Supports exact match and substring search."
             None
         };
 
+        // Use indexed search to pre-filter candidates (avoids full O(N) PDG scans).
+        let candidate_limit = (max_results + offset).saturating_mul(5).max(50);
+        let candidate_results = index
+            .search(&pattern, candidate_limit)
+            .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
+
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -1766,17 +1772,20 @@ in the dependency graph. Supports exact match and substring search."
         let pattern_lower = pattern.to_lowercase();
         let char_budget = token_budget * 4;
 
-        // Collect matches via exact, then substring, then semantic fallback
+        // Collect matches from pre-filtered candidates
         // Fetch max_results + offset matches, then paginate
         let fetch_limit = max_results + offset;
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut all_matches: Vec<Value> = Vec::new();
 
-        for nid in pdg.node_indices() {
+        for sr in candidate_results {
             if all_matches.len() >= fetch_limit {
                 break;
             }
 
+            let Some(nid) = pdg.find_by_id(&sr.node_id) else {
+                continue;
+            };
             let node = match pdg.get_node(nid) {
                 Some(n) => n,
                 None => continue,
@@ -1968,25 +1977,67 @@ than reading an entire file. Supersedes targeted Read."
         let source = read_source_snippet(&node.file_path, node.byte_range)
             .map(|s| s.chars().take(char_budget / 2).collect::<String>());
 
-        // Extract doc comment: read lines above byte_range and look for `///` or `//!`
+        // Extract doc comment: read lines above byte_range and look for `///`, `//!`,
+        // or proper `/** ... */` blocks only.
         let doc_comment = (|| {
             let file_bytes = std::fs::read(&node.file_path).ok()?;
             // Use byte slicing (not char counting) to correctly handle multi-byte UTF-8
             let end = node.byte_range.0.min(file_bytes.len());
             let up_to_def = String::from_utf8_lossy(&file_bytes[..end]).into_owned();
-            let comment_lines: Vec<&str> = up_to_def
-                .lines()
-                .rev()
-                .take(10)
-                .take_while(|l| {
-                    let t = l.trim();
-                    t.starts_with("///")
-                        || t.starts_with("//!")
-                        || t.starts_with("/**")
-                        || t.starts_with("*")
-                        || t.is_empty()
-                })
-                .collect::<Vec<_>>();
+            let mut comment_lines: Vec<&str> = Vec::new();
+            let mut in_doc_block = false;
+            let mut saw_doc_start = false;
+
+            for line in up_to_def.lines().rev().take(20) {
+                let t = line.trim_start();
+
+                if t.starts_with("///") || t.starts_with("//!") {
+                    comment_lines.push(line);
+                    continue;
+                }
+
+                if t.starts_with("*/") {
+                    in_doc_block = true;
+                    comment_lines.push(line);
+                    continue;
+                }
+
+                if in_doc_block {
+                    if t.starts_with("/**") {
+                        saw_doc_start = true;
+                        comment_lines.push(line);
+                        in_doc_block = false;
+                        continue;
+                    }
+
+                    // Keep only canonical inner doc-block lines.
+                    if t.starts_with('*') || t.is_empty() {
+                        comment_lines.push(line);
+                        continue;
+                    }
+
+                    // Non-doc block comment (`/*`) or code => reject block capture.
+                    comment_lines.clear();
+                    break;
+                }
+
+                if t.is_empty() && !comment_lines.is_empty() {
+                    comment_lines.push(line);
+                    continue;
+                }
+
+                break;
+            }
+
+            if in_doc_block
+                || (!saw_doc_start
+                    && comment_lines
+                        .iter()
+                        .any(|l| l.trim_start().starts_with("*/")))
+            {
+                comment_lines.clear();
+            }
+
             if comment_lines.is_empty() {
                 None
             } else {
@@ -2229,10 +2280,6 @@ fn apply_changes_in_memory(content: &str, changes: &[EditChange]) -> Result<Stri
 }
 
 /// Check if a byte is a word character (alphanumeric or underscore).
-fn is_word_char(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
-}
-
 /// Replace `old` with `new` only at word boundaries.
 ///
 /// A match at position `pos` is a whole-word match if:
@@ -2242,29 +2289,37 @@ fn replace_whole_word(content: &str, old: &str, new: &str) -> String {
     if old.is_empty() {
         return content.to_owned();
     }
-    let bytes = content.as_bytes();
-    let old_bytes = old.as_bytes();
-    let mut result = String::with_capacity(content.len());
-    let mut i = 0;
 
-    while i <= bytes.len().saturating_sub(old_bytes.len()) {
-        if &bytes[i..i + old_bytes.len()] == old_bytes {
-            let before_ok = i == 0 || !is_word_char(bytes[i - 1]);
-            let after_ok =
-                i + old_bytes.len() >= bytes.len() || !is_word_char(bytes[i + old_bytes.len()]);
-            if before_ok && after_ok {
-                result.push_str(new);
-                i += old_bytes.len();
-                continue;
-            }
+    fn is_word_char(c: char) -> bool {
+        c.is_alphanumeric() || c == '_'
+    }
+
+    let mut result = String::with_capacity(content.len());
+    let mut last_match_end = 0usize;
+
+    for (start, matched) in content.match_indices(old) {
+        let end = start + matched.len();
+        let before_ok = start == 0
+            || content[..start]
+                .chars()
+                .last()
+                .map(|c| !is_word_char(c))
+                .unwrap_or(true);
+        let after_ok = end == content.len()
+            || content[end..]
+                .chars()
+                .next()
+                .map(|c| !is_word_char(c))
+                .unwrap_or(true);
+
+        if before_ok && after_ok {
+            result.push_str(&content[last_match_end..start]);
+            result.push_str(new);
+            last_match_end = end;
         }
-        result.push(bytes[i] as char);
-        i += 1;
     }
-    // Append remaining bytes that couldn't start a match
-    if i < bytes.len() {
-        result.push_str(&content[i..]);
-    }
+
+    result.push_str(&content[last_match_end..]);
     result
 }
 
@@ -2679,9 +2734,10 @@ Grep + multi-file Edit with a single atomic operation."
             if let Some(n) = pdg.get_node(node_id) {
                 ref_files.insert(n.file_path.clone());
             }
-            // Direct callers' files (only direct references need renaming)
-            for dep_id in get_direct_callers(pdg, node_id) {
-                if let Some(dn) = pdg.get_node(dep_id) {
+            // Include all known incoming references, not just direct call edges.
+            // This captures call, data, and transitive usage relationships.
+            for ref_id in pdg.get_backward_impact_bounded(node_id, 5) {
+                if let Some(dn) = pdg.get_node(ref_id) {
                     ref_files.insert(dn.file_path.clone());
                 }
             }

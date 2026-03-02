@@ -730,22 +730,27 @@ impl LeIndex {
 
         // Step 5b: Resolve external dependencies via lock files
         let ext_registry = legraphe::ExternalDependencyRegistry::from_project(&self.project_path);
-        let (ext_in_lockfile, ext_resolved, ext_unresolved) = if !ext_registry.is_empty() {
-            let annotation_stats = legraphe::annotate_external_nodes(&mut pdg, &ext_registry);
+        let annotation_stats = legraphe::annotate_external_nodes(&mut pdg, &ext_registry);
+        if !ext_registry.is_empty() {
             info!(
-                "External dependency resolution: {}/{} resolved via lock files ({} packages in registry)",
+                "External dependency resolution: {}/{} resolved via lock files, {} recognized builtins ({} packages in registry)",
                 annotation_stats.resolved,
                 annotation_stats.total_external,
+                annotation_stats.builtin,
                 ext_registry.len()
             );
-            (
-                ext_registry.len(),
-                annotation_stats.resolved,
-                annotation_stats.unresolved,
-            )
-        } else {
-            (0, 0, 0)
-        };
+        } else if annotation_stats.total_external > 0 {
+            info!(
+                "External dependency resolution: no lockfile registry found, {} builtins recognized, {} unresolved external imports",
+                annotation_stats.builtin,
+                annotation_stats.unresolved
+            );
+        }
+        let (ext_in_lockfile, ext_resolved, ext_unresolved) = (
+            ext_registry.len(),
+            annotation_stats.resolved,
+            annotation_stats.unresolved,
+        );
 
         let pdg_node_count = pdg.node_count();
         let pdg_edge_count = pdg.edge_count();
@@ -1756,7 +1761,7 @@ impl LeIndex {
     fn index_nodes(&mut self, pdg: &ProgramDependenceGraph) -> Result<()> {
         // Read file contents once per file to avoid repeated I/O.
         // Cache is scoped to this function and shared across both passes.
-        let mut file_cache: std::collections::HashMap<String, String> =
+        let mut file_cache: std::collections::HashMap<String, std::sync::Arc<String>> =
             std::collections::HashMap::new();
 
         // --- Pass 1: collect all node content for TF-IDF corpus building ---
@@ -1769,9 +1774,11 @@ impl LeIndex {
                 let content = file_cache
                     .entry(node.file_path.clone())
                     .or_insert_with(|| {
-                        std::fs::read(&node.file_path)
-                            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-                            .unwrap_or_default()
+                        std::sync::Arc::new(
+                            std::fs::read(&node.file_path)
+                                .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+                                .unwrap_or_default(),
+                        )
                     })
                     .clone();
 
