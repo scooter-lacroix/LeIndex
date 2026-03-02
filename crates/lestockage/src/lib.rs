@@ -13,14 +13,14 @@ pub mod cross_project;
 pub mod edges;
 /// Global symbol table for cross-project indexing.
 pub mod global_symbols;
-/// Persistent storage for Program Dependence Graphs.
-pub mod pdg_store;
-/// Project metadata storage and retrieval.
-pub mod project_metadata;
-/// Unique project identification with BLAKE3 path hashing.
-pub mod project_id;
 /// Storage and retrieval of code nodes.
 pub mod nodes;
+/// Persistent storage for Program Dependence Graphs.
+pub mod pdg_store;
+/// Unique project identification with BLAKE3 path hashing.
+pub mod project_id;
+/// Project metadata storage and retrieval.
+pub mod project_metadata;
 /// Salsa-inspired incremental computation and caching.
 pub mod salsa;
 /// Database schema and connection management.

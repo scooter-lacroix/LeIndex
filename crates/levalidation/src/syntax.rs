@@ -97,16 +97,12 @@ pub struct SyntaxValidator {
 impl SyntaxValidator {
     /// Create a new syntax validator
     pub fn new() -> Self {
-        Self {
-            strict_mode: false,
-        }
+        Self { strict_mode: false }
     }
 
     /// Create a strict syntax validator
     pub fn strict() -> Self {
-        Self {
-            strict_mode: true,
-        }
+        Self { strict_mode: true }
     }
 
     /// Get LanguageId from language name string
@@ -138,7 +134,10 @@ impl SyntaxValidator {
     ///
     /// # Returns
     /// Vector of syntax errors found
-    pub fn validate_syntax(&self, changes: &[EditChange]) -> Result<Vec<SyntaxError>, ValidationError> {
+    pub fn validate_syntax(
+        &self,
+        changes: &[EditChange],
+    ) -> Result<Vec<SyntaxError>, ValidationError> {
         let mut errors = Vec::new();
 
         for change in changes {
@@ -166,38 +165,37 @@ impl SyntaxValidator {
     }
 
     /// Parse content and detect syntax errors
-    fn parse_content(
-        &self,
-        content: &str,
-        language_id: LanguageId,
-    ) -> Result<(), SyntaxError> {
+    fn parse_content(&self, content: &str, language_id: LanguageId) -> Result<(), SyntaxError> {
         let mut parser = tree_sitter::Parser::new();
-        let language = language_id.from_cache()
-            .map_err(|_| SyntaxError::new(
+        let language = language_id.from_cache().map_err(|_| {
+            SyntaxError::new(
                 PathBuf::from("<unknown>"),
                 0,
                 0,
                 format!("Failed to load language for {:?}", language_id),
                 ErrorSeverity::Error,
-            ))?;
-        parser.set_language(&language)
-            .map_err(|_| SyntaxError::new(
+            )
+        })?;
+        parser.set_language(&language).map_err(|_| {
+            SyntaxError::new(
                 PathBuf::from("<unknown>"),
                 0,
                 0,
                 format!("Failed to set language for {:?}", language_id),
                 ErrorSeverity::Error,
-            ))?;
+            )
+        })?;
 
         let source = content.as_bytes();
-        let tree = parser.parse(source, None)
-            .ok_or_else(|| SyntaxError::new(
+        let tree = parser.parse(source, None).ok_or_else(|| {
+            SyntaxError::new(
                 PathBuf::from("<unknown>"),
                 0,
                 0,
                 "Failed to parse source".to_string(),
                 ErrorSeverity::Error,
-            ))?;
+            )
+        })?;
 
         // Check for error nodes in the tree
         let root = tree.root_node();
@@ -209,11 +207,7 @@ impl SyntaxValidator {
     }
 
     /// Recursively find error nodes in the tree
-    fn find_error_nodes(
-        &self,
-        node: &tree_sitter::Node,
-        source: &[u8],
-    ) -> Result<(), SyntaxError> {
+    fn find_error_nodes(&self, node: &tree_sitter::Node, source: &[u8]) -> Result<(), SyntaxError> {
         if node.is_error() || node.is_missing() {
             return Err(SyntaxError::from_tree_sitter_node(
                 PathBuf::from("<unknown>"),
@@ -405,11 +399,7 @@ mod tests {
     fn test_validate_syntax_long_line_warning() {
         let validator = SyntaxValidator::strict();
         let long_line = "x".repeat(250);
-        let change = EditChange::new(
-            PathBuf::from("test.py"),
-            String::new(),
-            long_line,
-        );
+        let change = EditChange::new(PathBuf::from("test.py"), String::new(), long_line);
         let errors = validator.validate_syntax(&[change]).unwrap();
         assert!(!errors.is_empty());
         assert_eq!(errors[0].severity, ErrorSeverity::Warning);

@@ -663,4 +663,76 @@ fn greet() {
         // Cache should handle multiple spills
         assert!(second_stats.spilled_entries >= first_stats.spilled_entries);
     }
+
+    #[test]
+    fn test_search_cache_hit_rate_increases_on_repeat_query() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+        let _ = leindex.index_project(false).unwrap();
+
+        let _ = leindex.search("greet", 5).unwrap();
+        let first = leindex.get_cache_stats().unwrap();
+        let _ = leindex.search("greet", 5).unwrap();
+        let second = leindex.get_cache_stats().unwrap();
+
+        assert!(second.cache_hits >= first.cache_hits);
+        assert!(second.cache_hit_rate >= first.cache_hit_rate);
+    }
+
+    #[test]
+    fn test_analysis_cache_persists_across_sessions() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        {
+            let mut first = LeIndex::new(&project_path).unwrap();
+            let _ = first.index_project(false).unwrap();
+            let _ = first.analyze("How does greet work?", 800).unwrap();
+            let stats = first.get_cache_stats().unwrap();
+            assert!(stats.cache_writes > 0);
+        }
+
+        let mut second = LeIndex::new(&project_path).unwrap();
+        let _ = second.load_from_storage();
+        let _ = second.analyze("How does greet work?", 800).unwrap();
+        let stats = second.get_cache_stats().unwrap();
+
+        assert!(
+            stats.cache_disk_hits > 0 || stats.cache_memory_hits > 0,
+            "Expected cache hit from persisted session data"
+        );
+    }
+
+    #[test]
+    fn test_diagnostics_reports_cache_temperature() {
+        let temp_dir = TempDir::new().unwrap();
+        let project_path = create_test_project(&temp_dir);
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+        let cold = leindex.get_diagnostics().unwrap();
+        assert_eq!(cold.cache_temperature, "cold");
+
+        let stats = leindex.index_project(false).unwrap();
+        assert!(
+            stats.indexed_nodes > 0,
+            "Expected indexed nodes > 0, got {:?}",
+            stats
+        );
+        let _ = leindex.search("greet", 5).unwrap();
+        let _ = leindex.search("greet", 5).unwrap();
+        let cache_stats = leindex.get_cache_stats().unwrap();
+        assert!(
+            cache_stats.cache_hits > 0,
+            "Expected cache hits > 0 after repeated query, got {:?}",
+            cache_stats
+        );
+        let warm_or_hot = leindex.get_diagnostics().unwrap();
+        assert!(
+            warm_or_hot.cache_temperature == "warm" || warm_or_hot.cache_temperature == "hot",
+            "Expected warm/hot cache temperature, got {:?}",
+            warm_or_hot
+        );
+    }
 }

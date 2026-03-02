@@ -4,7 +4,7 @@ LeIndex is a modular Rust library for code intelligence, providing AST parsing, 
 
 ## Overview
 
-LeIndex follows a layered architecture with five core crates:
+LeIndex follows a layered architecture with ten workspace crates (five core analysis crates plus orchestration/service/edit/validation modules):
 
 | Crate | Purpose | Dependencies |
 |-------|---------|--------------|
@@ -40,7 +40,7 @@ For production use, reference the workspace version:
 
 ```toml
 [dependencies]
-lepasserelle = { version = "0.1.0", path = "crates/lepasserelle" }
+lepasserelle = { version = "1.5.0", path = "crates/lepasserelle" }
 ```
 
 ### Feature Flags
@@ -49,7 +49,7 @@ lepasserelle = { version = "0.1.0", path = "crates/lepasserelle" }
 
 ```toml
 [dependencies.lepasserelle]
-version = "0.1.0"
+version = "1.5.0"
 features = ["mcp-server"]  # Default: enables MCP JSON-RPC server
 # features = []            # Disable MCP for minimal binary
 ```

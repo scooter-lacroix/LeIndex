@@ -11,7 +11,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 // Re-exports from legraphe
-pub use legraphe::pdg::{ProgramDependenceGraph as PDG, Node, NodeType, Edge, EdgeType};
+pub use legraphe::pdg::{Edge, EdgeType, Node, NodeType, ProgramDependenceGraph as PDG};
 
 // Re-exports from lestockage
 pub use lestockage::{Storage, StorageConfig, UniqueProjectId};
@@ -188,6 +188,52 @@ pub struct EditEngine {
     pub history: Arc<tokio::sync::Mutex<EditHistory>>,
 }
 
+fn clamp_to_char_boundary(content: &str, idx: usize) -> usize {
+    let mut i = idx.min(content.len());
+    while i > 0 && !content.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+fn replace_whole_word(content: &str, old: &str, new: &str) -> String {
+    if old.is_empty() {
+        return content.to_owned();
+    }
+
+    let mut result = String::with_capacity(content.len());
+    let mut last_match_end = 0usize;
+
+    for (start, matched) in content.match_indices(old) {
+        let end = start + matched.len();
+        let before_ok = start == 0
+            || content[..start]
+                .chars()
+                .last()
+                .map(|c| !is_word_char(c))
+                .unwrap_or(true);
+        let after_ok = end == content.len()
+            || content[end..]
+                .chars()
+                .next()
+                .map(|c| !is_word_char(c))
+                .unwrap_or(true);
+
+        if before_ok && after_ok {
+            result.push_str(&content[last_match_end..start]);
+            result.push_str(new);
+            last_match_end = end;
+        }
+    }
+
+    result.push_str(&content[last_match_end..]);
+    result
+}
+
 impl EditEngine {
     /// Create a new edit engine
     pub fn new(pdg: Arc<PDG>, _storage: Arc<Storage>) -> Result<Self> {
@@ -204,42 +250,47 @@ impl EditEngine {
     /// Preview an edit without applying it
     pub async fn preview_edit(&self, request: &EditRequest) -> Result<EditPreview> {
         // Read the original content
-        let _content = self.read_file_content(&request.file_path).await?;
+        let original = self.read_file_content(&request.file_path).await?;
 
-        // Generate diff for each change
-        let mut diff_output = String::new();
-        let affected_files = vec![request.file_path.clone()];
-
-        for (idx, _change) in request.changes.iter().enumerate() {
-            let change_diff = self.generate_diff(idx)?;
-            diff_output.push_str(&change_diff);
-            diff_output.push('\n');
+        // Apply each change to produce modified content, then generate diff
+        let mut modified = original.clone();
+        for change in &request.changes {
+            modified = self.apply_change_to_string(&modified, change)?;
         }
+
+        let diff = self.generate_diff(&original, &modified, &request.file_path)?;
 
         // Analyze impact using PDG
         let impact = self.analyze_impact(request).await?;
+        let all_files = impact.affected_files.clone();
 
         Ok(EditPreview {
-            diff: diff_output,
+            diff,
             impact,
-            files_affected: affected_files,
+            files_affected: all_files,
         })
     }
 
     /// Apply an edit
     pub async fn apply_edit(&self, request: &EditRequest) -> Result<EditResult> {
         // Create worktree session
-        let mut session = self.worktree_manager.create_session(
-            &request.project_id,
-            &format!("edit-{}", chrono::Utc::now().timestamp()),
-        ).await?;
+        let mut session = self
+            .worktree_manager
+            .create_session(
+                &request.project_id,
+                &format!("edit-{}", chrono::Utc::now().timestamp()),
+            )
+            .await?;
 
         // Apply changes in worktree
         let mut changes_applied = 0;
         let mut files_modified = Vec::new();
 
         for change in &request.changes {
-            match self.apply_change(&mut session, &request.file_path, change).await {
+            match self
+                .apply_change(&mut session, &request.file_path, change)
+                .await
+            {
                 Ok(modified) => {
                     if modified {
                         changes_applied += 1;
@@ -281,50 +332,147 @@ impl EditEngine {
         })
     }
 
-    /// Generate diff for a change
-    fn generate_diff(&self, idx: usize) -> Result<String> {
-        // For now, return a simple placeholder
-        // In a full implementation, this would use diffy or similar
-        Ok(format!("--- Change {} ---\n", idx))
+    /// Generate a unified diff between original and modified content.
+    pub fn generate_diff(
+        &self,
+        original: &str,
+        modified: &str,
+        file_path: &Path,
+    ) -> Result<String> {
+        let patch = diffy::create_patch(original, modified);
+        // Prepend file path header for clarity
+        let patch_str = patch.to_string();
+        if patch_str.is_empty() {
+            Ok(format!(
+                "--- {}\n+++ {}\n(no changes)\n",
+                file_path.display(),
+                file_path.display()
+            ))
+        } else {
+            Ok(format!(
+                "--- {}\n+++ {}\n{}",
+                file_path.display(),
+                file_path.display(),
+                patch_str
+            ))
+        }
     }
 
-    /// Analyze impact of an edit
+    /// Apply a single EditChange to a string in memory, returning the modified string.
+    ///
+    /// Used by `preview_edit` to compute the diff without touching the filesystem.
+    fn apply_change_to_string(&self, content: &str, change: &EditChange) -> Result<String> {
+        match change {
+            EditChange::ReplaceText {
+                start,
+                end,
+                new_text,
+            } => {
+                let start_idx = clamp_to_char_boundary(content, *start);
+                let end_idx = clamp_to_char_boundary(content, *end);
+                if start_idx > end_idx {
+                    return Err(EditError::InvalidRange {
+                        start: *start,
+                        end: *end,
+                        file: PathBuf::from("(in-memory)"),
+                    });
+                }
+                let result = format!(
+                    "{}{}{}",
+                    &content[..start_idx],
+                    new_text,
+                    &content[end_idx..]
+                );
+                Ok(result)
+            }
+            EditChange::RenameSymbol { old_name, new_name } => Ok(replace_whole_word(
+                content,
+                old_name.as_str(),
+                new_name.as_str(),
+            )),
+            EditChange::ExtractFunction { .. } | EditChange::InlineVariable { .. } => {
+                // AST-level changes are complex; return content unchanged for preview
+                Ok(content.to_owned())
+            }
+        }
+    }
+
+    /// Analyze impact of an edit using forward PDG traversal.
     async fn analyze_impact(&self, request: &EditRequest) -> Result<ImpactAnalysis> {
-        let mut affected_nodes = Vec::new();
-        let affected_files = vec![request.file_path.clone()];
+        let mut affected_nodes: Vec<String> = Vec::new();
+        let mut affected_files: std::collections::HashSet<PathBuf> =
+            std::collections::HashSet::new();
+        affected_files.insert(request.file_path.clone());
         let mut breaking_changes = Vec::new();
 
         // Check each change for impact
         for change in &request.changes {
             match change {
-                EditChange::RenameSymbol { old_name, new_name: _ } => {
-                    // Find all references in PDG
-                    if let Some(_node) = self.pdg.find_by_symbol(old_name) {
+                EditChange::RenameSymbol {
+                    old_name,
+                    new_name: _,
+                } => {
+                    if let Some(node_id) = self.pdg.find_by_symbol(old_name) {
                         affected_nodes.push(old_name.clone());
+                        // Forward impact: all nodes reachable from this one
+                        let forward = self.pdg.get_forward_impact(node_id);
+                        for dep_id in forward {
+                            if let Some(dep_node) = self.pdg.get_node(dep_id) {
+                                affected_nodes.push(dep_node.name.clone());
+                                affected_files.insert(PathBuf::from(&dep_node.file_path));
+                            }
+                        }
+                        // Backward impact: callers that reference this symbol (rename risk)
+                        let backward = self.pdg.get_backward_impact(node_id);
+                        if !backward.is_empty() {
+                            breaking_changes.push(format!(
+                                "Renaming '{}' may break {} caller(s)",
+                                old_name,
+                                backward.len()
+                            ));
+                            for bid in backward {
+                                if let Some(bn) = self.pdg.get_node(bid) {
+                                    affected_files.insert(PathBuf::from(&bn.file_path));
+                                }
+                            }
+                        }
                     } else {
-                        // Warn that symbol wasn't found
-                        breaking_changes.push(format!("Symbol '{}' not found in PDG", old_name));
+                        breaking_changes.push(format!(
+                            "Symbol '{}' not found in PDG — rename may miss references",
+                            old_name
+                        ));
                     }
                 }
                 EditChange::ReplaceText { .. } => {
-                    // Text replacement is low impact
+                    // Text replacement is low impact unless it touches a symbol boundary
                 }
-                EditChange::ExtractFunction { .. } => {
-                    // Extracting a function affects the current scope
+                EditChange::ExtractFunction { function_name, .. } => {
+                    breaking_changes.push(format!(
+                        "Extracting function '{}' — verify no name collision",
+                        function_name
+                    ));
                 }
                 EditChange::InlineVariable { variable_name } => {
-                    // Find variable references
-                    if let Some(_node) = self.pdg.find_by_symbol(variable_name) {
+                    if let Some(node_id) = self.pdg.find_by_symbol(variable_name) {
                         affected_nodes.push(variable_name.clone());
+                        let forward = self.pdg.get_forward_impact(node_id);
+                        for dep_id in forward {
+                            if let Some(dep_node) = self.pdg.get_node(dep_id) {
+                                affected_nodes.push(dep_node.name.clone());
+                                affected_files.insert(PathBuf::from(&dep_node.file_path));
+                            }
+                        }
                     }
                 }
             }
         }
 
-        // Calculate risk level
-        let risk_level = if affected_nodes.len() > 5 || affected_files.len() > 2 {
+        let affected_files_vec: Vec<PathBuf> = affected_files.into_iter().collect();
+
+        // Calculate risk level based on blast radius
+        let risk_level = if affected_nodes.len() > 5 || affected_files_vec.len() > 3 {
             RiskLevel::High
-        } else if affected_nodes.len() > 1 || affected_files.len() > 1 {
+        } else if affected_nodes.len() > 1 || affected_files_vec.len() > 1 {
             RiskLevel::Medium
         } else {
             RiskLevel::Low
@@ -332,32 +480,84 @@ impl EditEngine {
 
         Ok(ImpactAnalysis {
             affected_nodes,
-            affected_files,
+            affected_files: affected_files_vec,
             breaking_changes,
             risk_level,
         })
     }
 
-    /// Apply a single change
+    /// Apply a single change to a file in the worktree session's path.
     async fn apply_change(
         &self,
-        _session: &mut WorktreeSession,
-        _file_path: &Path,
-        _change: &EditChange,
+        session: &mut WorktreeSession,
+        file_path: &Path,
+        change: &EditChange,
     ) -> Result<bool> {
-        // Placeholder - in full implementation, this would:
-        // 1. Read file content
-        // 2. Parse with tree-sitter
-        // 3. Apply the change
-        // 4. Write back to worktree
+        // Resolve the file path within the worktree
+        let target_path = if file_path.is_absolute() {
+            // Map absolute path into worktree, preserving directory structure.
+            // Try stripping common prefixes; fall back to the full relative path.
+            let rel = file_path
+                .strip_prefix(session.path())
+                .or_else(|_| file_path.strip_prefix("/"))
+                .unwrap_or(file_path);
+            session.path().join(rel)
+        } else {
+            session.path().join(file_path)
+        };
+
+        // Always materialize/read the target in the worktree to keep edits isolated.
+        let content = if target_path.exists() {
+            std::fs::read_to_string(&target_path).map_err(|e| {
+                EditError::Generic(format!("Failed to read {:?}: {}", target_path, e))
+            })?
+        } else if file_path.exists() {
+            let source = std::fs::read_to_string(file_path).map_err(|e| {
+                EditError::Generic(format!("Failed to read {:?}: {}", file_path, e))
+            })?;
+            if let Some(parent) = target_path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    EditError::Generic(format!("Failed to create worktree dir {:?}: {}", parent, e))
+                })?;
+            }
+            std::fs::write(&target_path, source.as_bytes()).map_err(|e| {
+                EditError::Generic(format!(
+                    "Failed to materialize worktree file {:?}: {}",
+                    target_path, e
+                ))
+            })?;
+            source
+        } else {
+            return Err(EditError::FileNotFound(file_path.to_path_buf()));
+        };
+
+        let modified = self.apply_change_to_string(&content, change)?;
+
+        if modified == content {
+            return Ok(false); // No change
+        }
+
+        // Write modified content back into worktree only.
+        if let Some(parent) = target_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                EditError::Generic(format!("Failed to create worktree dir {:?}: {}", parent, e))
+            })?;
+        }
+        std::fs::write(&target_path, modified.as_bytes())
+            .map_err(|e| EditError::Generic(format!("Failed to write {:?}: {}", target_path, e)))?;
+
         Ok(true)
     }
 
-    /// Read file content from storage
-    async fn read_file_content(&self, file_path: &Path) -> Result<String> {
-        // For now, return a placeholder
-        // In full implementation, this would read from storage
-        Ok(format!("// Content of {:?}\n", file_path))
+    /// Read file content from disk.
+    pub async fn read_file_content(&self, file_path: &Path) -> Result<String> {
+        std::fs::read_to_string(file_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                EditError::FileNotFound(file_path.to_path_buf())
+            } else {
+                EditError::Generic(format!("Failed to read {:?}: {}", file_path, e))
+            }
+        })
     }
 
     /// Undo last edit
@@ -387,14 +587,12 @@ impl EditEngine {
     pub async fn redo(&self) -> Result<EditResult> {
         let mut history = self.history.lock().await;
         match history.redo() {
-            Some(EditCommand::Edit { file_path, .. }) => {
-                Ok(EditResult {
-                    success: true,
-                    changes_applied: 1,
-                    files_modified: vec![file_path.clone()],
-                    error: None,
-                })
-            }
+            Some(EditCommand::Edit { file_path, .. }) => Ok(EditResult {
+                success: true,
+                changes_applied: 1,
+                files_modified: vec![file_path.clone()],
+                error: None,
+            }),
             Some(_) | None => Ok(EditResult {
                 success: false,
                 changes_applied: 0,
@@ -504,10 +702,10 @@ impl WorktreeSession {
 pub struct EditHistory {
     /// List of recorded edit commands
     pub commands: Vec<EditCommand>,
-    
+
     /// Current position in the command history
     pub current_index: usize,
-    
+
     /// Named rollback points mapping to command indices
     pub rollback_points: HashMap<String, usize>,
 }
@@ -595,13 +793,13 @@ pub enum EditCommand {
     Edit {
         /// Project identifier
         project_id: UniqueProjectId,
-        
+
         /// File path to edit
         file_path: PathBuf,
-        
+
         /// Changes to apply
         changes: Vec<EditChange>,
-        
+
         /// Timestamp of the edit operation
         timestamp: chrono::DateTime<chrono::Utc>,
     },
@@ -610,7 +808,7 @@ pub enum EditCommand {
     RollbackPoint {
         /// Name of the rollback point
         name: String,
-        
+
         /// Timestamp of the rollback operation
         timestamp: chrono::DateTime<chrono::Utc>,
     },
@@ -714,18 +912,12 @@ pub struct Impact;
 
 impl Impact {
     /// Analyze forward impact (what depends on this change)
-    pub fn analyze_forward_impact(
-        _pdg: &PDG,
-        _symbol: &str,
-    ) -> Result<Vec<String>> {
+    pub fn analyze_forward_impact(_pdg: &PDG, _symbol: &str) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
 
     /// Analyze backward impact (what this change depends on)
-    pub fn analyze_backward_impact(
-        _pdg: &PDG,
-        _symbol: &str,
-    ) -> Result<Vec<String>> {
+    pub fn analyze_backward_impact(_pdg: &PDG, _symbol: &str) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
 }
@@ -749,11 +941,15 @@ mod tests {
 
     /// Helper to create test storage
     fn make_test_storage() -> Storage {
-        Storage::open_with_config(":memory:", StorageConfig {
-            db_path: ":memory:".to_string(),
-            wal_enabled: false,
-            cache_size_pages: None,
-        }).unwrap()
+        Storage::open_with_config(
+            ":memory:",
+            StorageConfig {
+                db_path: ":memory:".to_string(),
+                wal_enabled: false,
+                cache_size_pages: None,
+            },
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1056,6 +1252,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_engine_preview_edit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("test.py");
+        std::fs::write(&file_path, b"hello world").expect("write test file");
+
         let pdg = Arc::new(create_test_pdg());
         let storage = Arc::new(make_test_storage());
         let engine = EditEngine::new(pdg, storage).unwrap();
@@ -1063,20 +1263,27 @@ mod tests {
         let project_id = make_test_id();
         let request = EditRequest {
             project_id,
-            file_path: PathBuf::from("test.py"),
+            file_path: file_path.clone(),
             changes: vec![EditChange::ReplaceText {
                 start: 0,
-                end: 10,
-                new_text: "new".to_string(),
+                end: 5, // "hello"
+                new_text: "goodbye".to_string(),
             }],
             preview_only: true,
         };
 
         let result = engine.preview_edit(&request).await;
-        assert!(result.is_ok());
+        assert!(
+            result.is_ok(),
+            "preview_edit should succeed: {:?}",
+            result.err()
+        );
         let preview = result.unwrap();
-        assert_eq!(preview.files_affected.len(), 1);
+        // The edited file is always in affected list
+        assert!(!preview.files_affected.is_empty());
         assert!(matches!(preview.impact.risk_level, RiskLevel::Low));
+        // Diff should contain some content
+        assert!(!preview.diff.is_empty());
     }
 
     #[tokio::test]

@@ -66,7 +66,13 @@ impl IncrementalCache {
             })
         });
 
-        result.optional()
+        let optional = result.optional()?;
+        if optional.is_some() {
+            let _ = self.bump_cache_hits();
+        } else {
+            let _ = self.bump_cache_misses();
+        }
+        Ok(optional)
     }
 
     /// Store computation result in cache
@@ -85,7 +91,38 @@ impl IncrementalCache {
                 computation.timestamp,
             ],
         )?;
+        let _ = self.bump_cache_writes();
         Ok(())
+    }
+
+    fn bump_cache_hits(&self) -> SqliteResult<usize> {
+        self.storage.conn().execute(
+            "UPDATE cache_telemetry
+             SET cache_hits = cache_hits + 1,
+                 updated_at = strftime('%s', 'now')
+             WHERE id = 1",
+            [],
+        )
+    }
+
+    fn bump_cache_misses(&self) -> SqliteResult<usize> {
+        self.storage.conn().execute(
+            "UPDATE cache_telemetry
+             SET cache_misses = cache_misses + 1,
+                 updated_at = strftime('%s', 'now')
+             WHERE id = 1",
+            [],
+        )
+    }
+
+    fn bump_cache_writes(&self) -> SqliteResult<usize> {
+        self.storage.conn().execute(
+            "UPDATE cache_telemetry
+             SET cache_writes = cache_writes + 1,
+                 updated_at = strftime('%s', 'now')
+             WHERE id = 1",
+            [],
+        )
     }
 
     /// Invalidate cached entries older than timestamp
@@ -199,5 +236,17 @@ mod tests {
 
         let retrieved = cache.get(&hash).unwrap().unwrap();
         assert_eq!(retrieved.cfg_data, Some(vec![1, 2, 3]));
+
+        let telemetry: (i64, i64, i64) = cache
+            .storage
+            .conn()
+            .query_row(
+                "SELECT cache_hits, cache_misses, cache_writes FROM cache_telemetry WHERE id = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(telemetry.0 >= 1, "expected cache hit telemetry");
+        assert!(telemetry.2 >= 1, "expected cache write telemetry");
     }
 }

@@ -86,6 +86,9 @@ pub mod errors;
 pub mod leindex;
 /// Memory management and cache orchestration.
 pub mod memory;
+/// Multi-project registry with per-project concurrency.
+#[cfg(feature = "mcp-server")]
+pub mod registry;
 
 /// Model Context Protocol (MCP) server implementation.
 #[cfg(feature = "mcp-server")]
@@ -101,6 +104,8 @@ pub use memory::{MemoryConfig as MemoryManagementConfig, MemoryManager};
 pub use mcp::{
     error_codes, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpServer, McpServerConfig,
 };
+#[cfg(feature = "mcp-server")]
+pub use registry::ProjectRegistry;
 
 /// Library initialization
 pub fn init() {

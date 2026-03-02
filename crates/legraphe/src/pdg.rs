@@ -130,6 +130,10 @@ struct SerializablePDG {
 
     /// File path to node indices mapping
     file_index: HashMap<String, Vec<u32>>,
+
+    /// Human-readable name → node indices mapping (multiple nodes may share a name)
+    #[serde(default)]
+    name_index: HashMap<String, Vec<u32>>,
 }
 
 impl SerializablePDG {
@@ -176,11 +180,19 @@ impl SerializablePDG {
             .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
             .collect();
 
+        // Convert name index: Vec<NodeId> -> Vec<u32>
+        let name_index: HashMap<String, Vec<u32>> = pdg
+            .name_index
+            .iter()
+            .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
+            .collect();
+
         Self {
             nodes,
             edges,
             symbol_index,
             file_index,
+            name_index,
         }
     }
 
@@ -233,6 +245,29 @@ impl SerializablePDG {
                 .add_edge(*source_id, *target_id, serializable_edge.edge.clone());
         }
 
+        // Rebuild name index with new NodeIds
+        if !self.name_index.is_empty() {
+            for (name, old_indices) in &self.name_index {
+                let new_indices: Vec<NodeId> = old_indices
+                    .iter()
+                    .filter_map(|old_index| index_map.get(old_index).copied())
+                    .collect();
+                if !new_indices.is_empty() {
+                    pdg.name_index.insert(name.clone(), new_indices);
+                }
+            }
+        } else {
+            // Backward compatibility: rebuild name_index from nodes when not serialized
+            for nid in pdg.graph.node_indices() {
+                if let Some(node) = pdg.graph.node_weight(nid) {
+                    pdg.name_index
+                        .entry(node.name.clone())
+                        .or_default()
+                        .push(nid);
+                }
+            }
+        }
+
         Ok(pdg)
     }
 }
@@ -244,11 +279,15 @@ pub struct ProgramDependenceGraph {
     /// Internal graph structure
     graph: StableGraph<Node, Edge>,
 
-    /// Symbol name to node ID mapping
+    /// Symbol ID (`node.id`, e.g. "file:qualified_name") to node ID mapping
     symbol_index: HashMap<String, NodeId>,
 
     /// File path to node IDs mapping
     file_index: HashMap<String, Vec<NodeId>>,
+
+    /// Human-readable symbol name (`node.name`) to node IDs mapping.
+    /// Multiple nodes may share the same name across different files.
+    name_index: HashMap<String, Vec<NodeId>>,
 }
 
 impl ProgramDependenceGraph {
@@ -258,6 +297,7 @@ impl ProgramDependenceGraph {
             graph: StableGraph::new(),
             symbol_index: HashMap::new(),
             file_index: HashMap::new(),
+            name_index: HashMap::new(),
         }
     }
 
@@ -267,6 +307,10 @@ impl ProgramDependenceGraph {
         self.symbol_index.insert(node.id.clone(), id);
         self.file_index
             .entry(node.file_path.clone())
+            .or_default()
+            .push(id);
+        self.name_index
+            .entry(node.name.clone())
             .or_default()
             .push(id);
         id
@@ -280,6 +324,11 @@ impl ProgramDependenceGraph {
     /// Get node by ID
     pub fn get_node(&self, id: NodeId) -> Option<&Node> {
         self.graph.node_weight(id)
+    }
+
+    /// Get mutable reference to a node by ID.
+    pub fn get_node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        self.graph.node_weight_mut(id)
     }
 
     /// Get edge by ID
@@ -319,6 +368,9 @@ impl ProgramDependenceGraph {
             if let Some(nodes) = self.file_index.get_mut(&node.file_path) {
                 nodes.retain(|&id| id != node_id);
             }
+            if let Some(nodes) = self.name_index.get_mut(&node.name) {
+                nodes.retain(|&id| id != node_id);
+            }
             Some(node)
         } else {
             None
@@ -355,9 +407,114 @@ impl ProgramDependenceGraph {
         self.graph.edge_endpoints(edge_id)
     }
 
-    /// Get neighbors of a node (outgoing)
+    /// Get neighbors of a node (outgoing edges)
     pub fn neighbors(&self, node_id: NodeId) -> Vec<NodeId> {
         self.graph.neighbors(node_id).collect()
+    }
+
+    /// Count incoming edges (predecessors) of a node.
+    ///
+    /// This counts all nodes that have a directed edge pointing TO `node_id`,
+    /// i.e., the number of direct callers / dependents.
+    pub fn predecessor_count(&self, node_id: NodeId) -> usize {
+        use petgraph::Direction;
+        self.graph
+            .neighbors_directed(node_id, Direction::Incoming)
+            .count()
+    }
+
+    /// Get all predecessor nodes (incoming edges) of a node.
+    ///
+    /// Returns the NodeIds of all nodes that have a directed edge pointing TO `node_id`.
+    pub fn predecessors(&self, node_id: NodeId) -> Vec<NodeId> {
+        use petgraph::Direction;
+        self.graph
+            .neighbors_directed(node_id, Direction::Incoming)
+            .collect()
+    }
+
+    /// Find a node by its string ID (`node.id` field), which is `"file_path:qualified_name"`.
+    ///
+    /// This is the same lookup as `find_by_symbol` (both search `symbol_index`).
+    pub fn find_by_id(&self, node_id: &str) -> Option<NodeId> {
+        self.symbol_index.get(node_id).copied()
+    }
+
+    /// Find the first node with the given human-readable name (`node.name` field).
+    ///
+    /// Unlike `find_by_symbol` (which searches by `node.id`, the full qualified
+    /// `"file_path:qualified_name"` key), this searches by the short display name
+    /// that users typically provide, e.g. `"health_check"` instead of
+    /// `"/path/file.py:UnifiedServer.health_check"`.
+    ///
+    /// Returns the first match if multiple nodes share the same name.
+    pub fn find_by_name(&self, name: &str) -> Option<NodeId> {
+        self.name_index
+            .get(name)
+            .and_then(|ids| ids.first().copied())
+    }
+
+    /// Find all nodes with the given human-readable name (`node.name` field).
+    ///
+    /// Returns all NodeIds that share this name (may span multiple files).
+    pub fn find_all_by_name(&self, name: &str) -> Vec<NodeId> {
+        self.name_index.get(name).cloned().unwrap_or_default()
+    }
+
+    /// Find a node by name with optional file_path disambiguation.
+    ///
+    /// Tries exact name match first. If `file_hint` is provided and multiple
+    /// nodes share the name, returns the one in the specified file.
+    /// Falls back to case-insensitive substring search if exact match fails.
+    pub fn find_by_name_in_file(&self, name: &str, file_hint: Option<&str>) -> Option<NodeId> {
+        // 1. Exact name match
+        let candidates = self.find_all_by_name(name);
+        if !candidates.is_empty() {
+            // If file hint provided, narrow to that file
+            if let Some(fp) = file_hint {
+                if let Some(&nid) = candidates.iter().find(|&&nid| {
+                    self.get_node(nid)
+                        .map(|n| n.file_path == fp)
+                        .unwrap_or(false)
+                }) {
+                    return Some(nid);
+                }
+            }
+            return Some(candidates[0]);
+        }
+
+        // 2. Case-insensitive exact match on name
+        let name_lower = name.to_lowercase();
+        for nid in self.graph.node_indices() {
+            if let Some(node) = self.graph.node_weight(nid) {
+                if node.name.to_lowercase() == name_lower {
+                    if let Some(fp) = file_hint {
+                        if node.file_path != fp {
+                            continue;
+                        }
+                    }
+                    return Some(nid);
+                }
+            }
+        }
+
+        // 3. Substring match on name or id (case-insensitive)
+        for nid in self.graph.node_indices() {
+            if let Some(node) = self.graph.node_weight(nid) {
+                if node.name.to_lowercase().contains(&name_lower)
+                    || node.id.to_lowercase().contains(&name_lower)
+                {
+                    if let Some(fp) = file_hint {
+                        if node.file_path != fp {
+                            continue;
+                        }
+                    }
+                    return Some(nid);
+                }
+            }
+        }
+
+        None
     }
 
     /// Add multiple call edges
@@ -470,6 +627,59 @@ impl ProgramDependenceGraph {
             }
         }
         impact
+    }
+
+    /// Get forward impact with a maximum traversal depth.
+    ///
+    /// Like `get_forward_impact` but stops after `max_depth` hops.
+    pub fn get_forward_impact_bounded(&self, start: NodeId, max_depth: usize) -> Vec<NodeId> {
+        use std::collections::{HashSet, VecDeque};
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back((start, 0usize));
+        visited.insert(start);
+        let mut result = Vec::new();
+
+        while let Some((nid, depth)) = queue.pop_front() {
+            if nid != start {
+                result.push(nid);
+            }
+            if depth < max_depth {
+                for neighbor in self.graph.neighbors(nid) {
+                    if visited.insert(neighbor) {
+                        queue.push_back((neighbor, depth + 1));
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Get backward impact with a maximum traversal depth.
+    ///
+    /// Like `get_backward_impact` but stops after `max_depth` hops.
+    pub fn get_backward_impact_bounded(&self, start: NodeId, max_depth: usize) -> Vec<NodeId> {
+        use petgraph::Direction;
+        use std::collections::{HashSet, VecDeque};
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back((start, 0usize));
+        visited.insert(start);
+        let mut result = Vec::new();
+
+        while let Some((nid, depth)) = queue.pop_front() {
+            if nid != start {
+                result.push(nid);
+            }
+            if depth < max_depth {
+                for neighbor in self.graph.neighbors_directed(nid, Direction::Incoming) {
+                    if visited.insert(neighbor) {
+                        queue.push_back((neighbor, depth + 1));
+                    }
+                }
+            }
+        }
+        result
     }
 
     /// Serialize the graph to a byte vector

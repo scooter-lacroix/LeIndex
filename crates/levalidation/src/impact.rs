@@ -2,8 +2,8 @@
 
 use crate::edit_change::EditChange;
 use crate::ValidationError;
-use legraphe::{ProgramDependenceGraph};
-use legraphe::pdg::{NodeType, NodeId};
+use legraphe::pdg::{NodeId, NodeType};
+use legraphe::ProgramDependenceGraph;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -58,9 +58,9 @@ impl RiskLevel {
     pub fn color_code(&self) -> &str {
         match self {
             Self::Low => "\x1b[32m",      // Green
-            Self::Medium => "\x1b[33m",    // Yellow
-            Self::High => "\x1b[31m",      // Red
-            Self::Critical => "\x1b[35m",  // Magenta
+            Self::Medium => "\x1b[33m",   // Yellow
+            Self::High => "\x1b[31m",     // Red
+            Self::Critical => "\x1b[35m", // Magenta
         }
     }
 }
@@ -188,11 +188,8 @@ impl ImpactAnalyzer {
         }
 
         // Calculate risk level
-        let risk_level = self.calculate_risk_level(
-            total_affected_nodes,
-            &affected_files,
-            &affected_apis,
-        );
+        let risk_level =
+            self.calculate_risk_level(total_affected_nodes, &affected_files, &affected_apis);
 
         Ok(ImpactReport::new(
             risk_level,
@@ -270,9 +267,9 @@ impl ImpactAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use legraphe::Node;
-    use legraphe::pdg::{EdgeType, EdgeMetadata};
+    use legraphe::pdg::{EdgeMetadata, EdgeType};
     use legraphe::Edge;
+    use legraphe::Node;
 
     #[test]
     fn test_location_new() {
@@ -450,11 +447,7 @@ mod tests {
         let analyzer = ImpactAnalyzer::new(Arc::new(pdg));
 
         // Change to func_c should show impact
-        let change = EditChange::new(
-            PathBuf::from("c.py"),
-            "old".to_string(),
-            "new".to_string(),
-        );
+        let change = EditChange::new(PathBuf::from("c.py"), "old".to_string(), "new".to_string());
 
         let report = analyzer.analyze_impact(&[change]).unwrap();
         // func_c is in c.py, and func_b and func_a depend on it

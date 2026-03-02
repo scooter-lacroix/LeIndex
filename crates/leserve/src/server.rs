@@ -39,11 +39,10 @@ impl LeServeServer {
         }
 
         // Open storage
-        let storage = Storage::open(&config.db_path)
-            .map_err(|e| {
-                error!("Failed to open storage: {}", e);
-                ApiError::internal(format!("Failed to open storage: {}", e))
-            })?;
+        let storage = Storage::open(&config.db_path).map_err(|e| {
+            error!("Failed to open storage: {}", e);
+            ApiError::internal(format!("Failed to open storage: {}", e))
+        })?;
 
         Ok(Self {
             config,
@@ -77,16 +76,18 @@ impl LeServeServer {
         let app = create_router().with_state(state);
 
         // Create server
-        let listener = tokio::net::TcpListener::bind(addr)
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            error!("Failed to bind to {}: {:?}", addr, e);
+            ApiError::internal(format!("Failed to bind to {}: {}", addr, e))
+        })?;
+
+        info!(
+            "Server listening on: http://{}:{}",
+            self.config.host, self.config.port
+        );
+
+        axum::serve(listener, app)
             .await
-            .map_err(|e| {
-                error!("Failed to bind to {}: {:?}", addr, e);
-                ApiError::internal(format!("Failed to bind to {}: {}", addr, e))
-            })?;
-
-        info!("Server listening on: http://{}:{}", self.config.host, self.config.port);
-
-        axum::serve(listener, app).await
             .map_err(|e| ApiError::internal(format!("Server error: {}", e)))
     }
 

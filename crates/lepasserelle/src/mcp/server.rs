@@ -4,14 +4,19 @@
 // using axum for HTTP handling.
 
 use super::handlers::{
-    ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, IndexHandler,
-    PhaseAnalysisAliasHandler, PhaseAnalysisHandler, SearchHandler, ToolHandler,
+    ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, EditApplyHandler, EditPreviewHandler,
+    FileSummaryHandler, GrepSymbolsHandler, ImpactAnalysisHandler, IndexHandler,
+    PhaseAnalysisAliasHandler, PhaseAnalysisHandler, ProjectMapHandler, ReadSymbolHandler,
+    RenameSymbolHandler, SearchHandler, SymbolLookupHandler, ToolHandler,
 };
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
-use crate::leindex::LeIndex;
+use crate::registry::ProjectRegistry;
 use anyhow::Context;
 use axum::{
-    response::{sse::{Event, Sse}, Json},
+    response::{
+        sse::{Event, Sse},
+        Json,
+    },
     routing::{get, post},
     Router, Server,
 };
@@ -20,13 +25,15 @@ use serde_json::Value;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 
-/// Global server state - using OnceLock for lazy initialization
-/// This works with axum 0.6's trait bounds
-pub static SERVER_STATE: std::sync::OnceLock<Arc<Mutex<LeIndex>>> = std::sync::OnceLock::new();
+/// Global server state — multi-project registry.
+///
+/// Replaces the old `Arc<Mutex<LeIndex>>` singleton. Multiple projects can
+/// be loaded in one process, with per-project coordination in `ProjectRegistry`.
+pub static SERVER_STATE: std::sync::OnceLock<Arc<ProjectRegistry>> = std::sync::OnceLock::new();
 
 /// Global tool handlers list
 pub static HANDLERS: std::sync::OnceLock<Vec<ToolHandler>> = std::sync::OnceLock::new();
@@ -62,8 +69,8 @@ impl Default for McpServerConfig {
 pub struct McpServer {
     /// Configuration for the server
     pub config: McpServerConfig,
-    /// Shared state containing the LeIndex instance
-    pub _state: Arc<Mutex<LeIndex>>, // Keep reference to prevent drop
+    /// Multi-project registry (kept alive for the server's lifetime).
+    pub _registry: Arc<ProjectRegistry>,
 }
 
 impl McpServer {
@@ -72,7 +79,7 @@ impl McpServer {
     /// # Arguments
     ///
     /// * `config` - Server configuration
-    /// * `leindex` - LeIndex instance to use for operations
+    /// * `leindex` - Initial LeIndex instance (the startup project)
     ///
     /// # Example
     ///
@@ -82,11 +89,13 @@ impl McpServer {
     /// let server = McpServer::new(config, leindex)?;
     /// server.run().await?;
     /// ```
-    pub fn new(config: McpServerConfig, leindex: LeIndex) -> anyhow::Result<Self> {
-        // Initialize global state
-        let state = Arc::new(Mutex::new(leindex));
+    pub fn new(config: McpServerConfig, leindex: crate::leindex::LeIndex) -> anyhow::Result<Self> {
+        let registry = Arc::new(ProjectRegistry::with_initial_project(
+            crate::registry::DEFAULT_MAX_PROJECTS,
+            leindex,
+        ));
         SERVER_STATE
-            .set(state.clone())
+            .set(registry.clone())
             .map_err(|_| anyhow::anyhow!("Server state already initialized"))?;
 
         // Initialize handlers
@@ -98,16 +107,30 @@ impl McpServer {
             ToolHandler::Search(SearchHandler),
             ToolHandler::PhaseAnalysis(PhaseAnalysisHandler),
             ToolHandler::PhaseAnalysisAlias(PhaseAnalysisAliasHandler),
+            // Phase C: Tool Supremacy
+            ToolHandler::FileSummary(FileSummaryHandler),
+            ToolHandler::SymbolLookup(SymbolLookupHandler),
+            ToolHandler::ProjectMap(ProjectMapHandler),
+            ToolHandler::GrepSymbols(GrepSymbolsHandler),
+            ToolHandler::ReadSymbol(ReadSymbolHandler),
+            // Phase D: Context-Aware Editing
+            ToolHandler::EditPreview(EditPreviewHandler),
+            ToolHandler::EditApply(EditApplyHandler),
+            ToolHandler::RenameSymbol(RenameSymbolHandler),
+            ToolHandler::ImpactAnalysis(ImpactAnalysisHandler),
         ];
         HANDLERS
             .set(handlers)
             .map_err(|_| anyhow::anyhow!("Handlers already initialized"))?;
 
-        info!("MCP server initialized");
+        info!(
+            "MCP server initialized (multi-project registry, max {} projects)",
+            crate::registry::DEFAULT_MAX_PROJECTS
+        );
 
         Ok(Self {
             config,
-            _state: state,
+            _registry: registry,
         })
     }
 
@@ -121,7 +144,10 @@ impl McpServer {
     /// # Returns
     ///
     /// `Result<McpServer>` - New server instance or error
-    pub fn with_address(bind_address: SocketAddr, leindex: LeIndex) -> anyhow::Result<Self> {
+    pub fn with_address(
+        bind_address: SocketAddr,
+        leindex: crate::leindex::LeIndex,
+    ) -> anyhow::Result<Self> {
         let config = McpServerConfig {
             bind_address,
             ..Default::default()
@@ -196,7 +222,9 @@ pub async fn index_stream_handler(
         let state = match SERVER_STATE.get() {
             Some(s) => s,
             None => {
-                let _ = tx.send(ProgressEvent::error("Server not initialized")).await;
+                let _ = tx
+                    .send(ProgressEvent::error("Server not initialized"))
+                    .await;
                 return;
             }
         };
@@ -210,13 +238,18 @@ pub async fn index_stream_handler(
             }
         };
 
-        let force_reindex = body
-            .get("force_reindex")
-            .and_then(|v: &Value| v.as_bool())
-            .unwrap_or(false);
+        let force_reindex = match body.get("force_reindex") {
+            Some(Value::Bool(v)) => *v,
+            Some(Value::String(v)) => {
+                matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes")
+            }
+            Some(Value::Number(v)) => v.as_u64().map(|n| n != 0).unwrap_or(false),
+            _ => false,
+        };
 
         // Send starting event
-        let _ = tx.send(ProgressEvent::progress(
+        let _ = tx
+            .send(ProgressEvent::progress(
                 "starting",
                 0,
                 0,
@@ -227,137 +260,95 @@ pub async fn index_stream_handler(
         // Perform indexing with progress callbacks
         match index_with_progress(state, &project_path, force_reindex, tx.clone()).await {
             Ok(stats) => {
-                let _ = tx.send(ProgressEvent::complete(
+                let _ = tx
+                    .send(ProgressEvent::complete(
                         "indexing",
                         format!("Done: {} files", stats.files_parsed),
                     ))
                     .await;
             }
             Err(e) => {
-                let _ = tx.send(ProgressEvent::error(format!(
-                        "Error: {}", e)))
-                    .await;
+                let _ = tx.send(ProgressEvent::error(format!("Error: {}", e))).await;
             }
         }
     });
 
     // Create SSE stream from receiver
-    let stream = ReceiverStream::new(rx)
-        .map(|event| -> Result<Event, Infallible> {
-            let event_data = Event::default()
-                .json_data(event)
-                .unwrap_or_else(|_| Event::default().data("error".to_string()));
-            Ok(event_data)
-        });
+    let stream = ReceiverStream::new(rx).map(|event| -> Result<Event, Infallible> {
+        let event_data = Event::default()
+            .json_data(event)
+            .unwrap_or_else(|_| Event::default().data("error".to_string()));
+        Ok(event_data)
+    });
 
-    Sse::new(stream)
-        .keep_alive(
-            axum::response::sse::KeepAlive::new()
-                .interval(std::time::Duration::from_secs(15))
-                .text("keep-alive")
-        )
+    Sse::new(stream).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keep-alive"),
+    )
 }
 
-/// Perform indexing with progress reporting via channel
+/// Perform indexing with progress reporting via channel.
 ///
-/// This helper function runs the indexing operation while sending progress
-/// events through the provided channel.
-///
-/// # Arguments
-///
-/// * `state` - Reference to global LeIndex state
-/// * `project_path` - Path to project to index
-/// * `force_reindex` - Whether to re-index even if already indexed
-/// * `tx` - Channel sender for progress events
-///
-/// # Returns
-///
-/// * `Result<IndexStats, JsonRpcError>` - Index statistics or error
+/// Uses the `ProjectRegistry` to look up the project and index it.
+/// The old data stays readable during indexing; only a brief write-lock
+/// swap happens at the end.
 pub async fn index_with_progress(
-    state: &Arc<Mutex<LeIndex>>,
+    registry: &Arc<ProjectRegistry>,
     project_path: &str,
     force_reindex: bool,
     tx: mpsc::Sender<super::protocol::ProgressEvent>,
 ) -> Result<crate::leindex::IndexStats, JsonRpcError> {
     use super::protocol::ProgressEvent;
 
-    let index = state.lock().await;
+    // Quick cached check first so we can emit a skip event immediately.
+    let handle = registry.get_or_load(Some(project_path)).await?;
+    let cached_stats = {
+        let idx = handle.lock().await;
+        if idx.is_indexed() && !force_reindex {
+            Some(idx.get_stats().clone())
+        } else {
+            None
+        }
+    };
 
-    // Check if already indexed and we're not forcing reindex
-    if index.is_indexed() && !force_reindex {
-        let _ = tx.send(ProgressEvent::progress(
-                    "skipping",
-                    1,
-                    1,
-                    "Already indexed",
-                ))
-                .await;
-        return Ok(index.get_stats().clone());
+    if let Some(stats) = cached_stats {
+        let _ = tx
+            .send(ProgressEvent::progress("skipping", 1, 1, "Already indexed"))
+            .await;
+        return Ok(stats);
     }
 
-    // Send collecting files event
-    let _ = tx.send(ProgressEvent::progress(
-                "collecting",
-                0,
-                0,
-                "Collecting source files...",
-            ))
-            .await;
+    let _ = tx
+        .send(ProgressEvent::progress(
+            "collecting",
+            0,
+            0,
+            "Collecting source files...",
+        ))
+        .await;
 
-    // Perform indexing in blocking task
-    let project_path = project_path.to_string();
-    let project_path_for_blocking = project_path.clone();
-    let stats = tokio::task::spawn_blocking(move || {
-        let mut temp_leindex = LeIndex::new(&project_path_for_blocking).map_err(|e| {
-            JsonRpcError::indexing_failed(format!("Failed to create LeIndex: {}", e))
-        })?;
+    let _ = tx
+        .send(ProgressEvent::progress(
+            "consolidating",
+            0,
+            0,
+            "Waiting for any in-flight index on this project...",
+        ))
+        .await;
 
-        temp_leindex
-            .index_project(force_reindex)
-            .map_err(|e| {
-                JsonRpcError::indexing_failed(format!("Indexing failed: {}", e))
-            })
-    })
-    .await
-        .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))??;
+    let stats = registry
+        .index_project(Some(project_path), force_reindex)
+        .await?;
 
-    // Update shared state by loading newly indexed project from storage
-    let mut index = state.lock().await;
-
-    let path = std::path::Path::new(&project_path)
-        .canonicalize()
-        .map_err(|e| JsonRpcError::internal_error(format!("Failed to canonicalize path: {}", e)))
-        ?;
-
-    if index.project_path() != path {
-        info!("Switching projects: {:?} -> {:?}", index.project_path(), path);
-        let _ = tx.send(ProgressEvent::progress(
-                    "switching_projects",
-                    0,
-                    0,
-                    format!("{:?}", index.project_path()),
-                ))
-                .await;
-
-        let _ = index.close();
-        *index = LeIndex::new(&path).map_err(|e| {
-            JsonRpcError::indexing_failed(format!("Failed to re-initialize LeIndex: {}", e))
-        })?;
-    }
-
-    let _ = tx.send(ProgressEvent::progress(
-                "loading_storage",
-                0,
-                0,
-                "Loading indexed data from storage...",
-            ))
-            .await;
-
-    index
-        .load_from_storage()
-        .map_err(|e| {
-            JsonRpcError::indexing_failed(format!("Failed to load indexed data: {}", e))
-        })?;
+    let _ = tx
+        .send(ProgressEvent::progress(
+            "loading_storage",
+            0,
+            0,
+            "Loading indexed data...",
+        ))
+        .await;
 
     Ok(stats)
 }
@@ -420,7 +411,7 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
     }
 
     let response = match json_req.method.as_str() {
-        "tools/call" => handle_tool_call(state, handlers, json_req).await,
+        "tools/call" => handle_tool_call(state, handlers, &json_req).await,
         "tools/list" => Ok(list_tools_json(handlers)),
         _ => Err(JsonRpcError::method_not_found(json_req.method.clone())),
     };
@@ -441,9 +432,9 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
 
 /// Handle tool call requests
 pub async fn handle_tool_call(
-    state: &Arc<Mutex<LeIndex>>,
+    registry: &Arc<ProjectRegistry>,
     handlers: &[ToolHandler],
-    req: JsonRpcRequest,
+    req: &JsonRpcRequest,
 ) -> Result<Value, JsonRpcError> {
     let tool_call = req.extract_tool_call()?;
     debug!("Tool call: name={}", tool_call.name);
@@ -454,7 +445,7 @@ pub async fn handle_tool_call(
         .ok_or_else(|| JsonRpcError::method_not_found(tool_call.name.clone()))?;
 
     // Execute the tool and wrap the result in standard MCP content format
-    match handler.execute(state, tool_call.arguments).await {
+    match handler.execute(registry, tool_call.arguments).await {
         Ok(value) => {
             // For DeepAnalyze and Context, we might want to be more specific,
             // but for now, we just stringify the result.

@@ -9,6 +9,8 @@
 pub mod cross_project;
 /// Graph node embedding and vector representation.
 pub mod embedding;
+/// External dependency resolution via lock files.
+pub mod external_deps;
 /// Extraction logic for building PDGs from signatures.
 pub mod extraction;
 /// Program Dependence Graph implementation.
@@ -18,6 +20,7 @@ pub mod traversal;
 
 pub use cross_project::{CrossProjectPDG, ExternalNodeRef, MergeError};
 pub use embedding::NodeEmbedding;
+pub use external_deps::{annotate_external_nodes, ExternalDependencyRegistry};
 pub use extraction::extract_pdg_from_signatures;
 pub use pdg::{Edge, Node, ProgramDependenceGraph};
 pub use traversal::{GravityTraversal, TraversalConfig};

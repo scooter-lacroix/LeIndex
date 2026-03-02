@@ -5,6 +5,7 @@
 use crate::leindex::LeIndex;
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::mcp::McpServer;
+use crate::registry::{ProjectRegistry, DEFAULT_MAX_PROJECTS};
 use anyhow::Context;
 use anyhow::Result as AnyhowResult;
 use clap::{Parser, Subcommand};
@@ -12,7 +13,6 @@ use lephase::{run_phase_analysis, DocsMode, FormatMode, PhaseOptions, PhaseSelec
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 /// LeIndex - Code Search and Analysis Engine
@@ -555,8 +555,10 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
 /// This mode allows AI tools to start LeIndex as a subprocess for automatic integration
 async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     use crate::mcp::handlers::{
-        ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, IndexHandler,
-        PhaseAnalysisAliasHandler, PhaseAnalysisHandler, SearchHandler,
+        ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, EditApplyHandler,
+        EditPreviewHandler, FileSummaryHandler, GrepSymbolsHandler, ImpactAnalysisHandler,
+        IndexHandler, PhaseAnalysisAliasHandler, PhaseAnalysisHandler, ProjectMapHandler,
+        ReadSymbolHandler, RenameSymbolHandler, SearchHandler, SymbolLookupHandler,
     };
     use crate::mcp::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse};
     use std::io::{self, BufRead, Read, Write};
@@ -578,8 +580,11 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     let _ = leindex.load_from_storage();
 
     // Initialize global state for handlers
-    let state = Arc::new(Mutex::new(leindex));
-    let _ = crate::mcp::server::SERVER_STATE.set(state.clone());
+    let registry = Arc::new(ProjectRegistry::with_initial_project(
+        DEFAULT_MAX_PROJECTS,
+        leindex,
+    ));
+    let _ = crate::mcp::server::SERVER_STATE.set(registry.clone());
 
     // Initialize handlers
     let _ = crate::mcp::server::HANDLERS.set(vec![
@@ -590,6 +595,17 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         crate::mcp::handlers::ToolHandler::Search(SearchHandler),
         crate::mcp::handlers::ToolHandler::PhaseAnalysis(PhaseAnalysisHandler),
         crate::mcp::handlers::ToolHandler::PhaseAnalysisAlias(PhaseAnalysisAliasHandler),
+        // Phase C: Tool Supremacy
+        crate::mcp::handlers::ToolHandler::FileSummary(FileSummaryHandler),
+        crate::mcp::handlers::ToolHandler::SymbolLookup(SymbolLookupHandler),
+        crate::mcp::handlers::ToolHandler::ProjectMap(ProjectMapHandler),
+        crate::mcp::handlers::ToolHandler::GrepSymbols(GrepSymbolsHandler),
+        crate::mcp::handlers::ToolHandler::ReadSymbol(ReadSymbolHandler),
+        // Phase D: Context-Aware Editing
+        crate::mcp::handlers::ToolHandler::EditPreview(EditPreviewHandler),
+        crate::mcp::handlers::ToolHandler::EditApply(EditApplyHandler),
+        crate::mcp::handlers::ToolHandler::RenameSymbol(RenameSymbolHandler),
+        crate::mcp::handlers::ToolHandler::ImpactAnalysis(ImpactAnalysisHandler),
     ]);
 
     eprintln!("[INFO] LeIndex MCP stdio server starting");
@@ -673,7 +689,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
                         response.len(),
                         response
                     );
-                } else if writeln!(stdout, "{}\n", response).is_err() {
+                } else if writeln!(stdout, "{}", response).is_err() {
                     break;
                 }
                 let _ = stdout.flush();
@@ -721,11 +737,10 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
                         eprintln!("[ERROR] Failed to write to stdout");
                         break;
                     }
-                } else if writeln!(stdout, "{}\n", response_json).is_err() {
+                } else if writeln!(stdout, "{}", response_json).is_err() {
                     eprintln!("[ERROR] Failed to write to stdout");
                     break;
                 }
-
                 let _ = stdout.flush();
             }
         }
@@ -738,41 +753,43 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 async fn cmd_dashboard_impl(port: u16, prod: bool) -> AnyhowResult<()> {
     use std::process::Command;
 
-    // Find the dashboard directory
-    // Check if we're in the repo root
+    // Find the dashboard directory.
     let current_dir = std::env::current_dir().context("Failed to get current directory")?;
-    let dashboard_path = current_dir.join("dashboard");
+    let dashboard_path = {
+        let mut candidates = Vec::new();
 
-    let dashboard_path = if dashboard_path.exists() {
-        dashboard_path
-    } else {
-        // Development convenience: traverse up to 5 parent directories to find dashboard
-        // This supports running from various locations within the project tree during development
+        // 1) Current directory.
+        candidates.push(current_dir.join("dashboard"));
+
+        // 2) Parent traversal for source checkouts.
         let mut parent = current_dir.as_path();
-        let mut found_path = None;
-        for depth in 0..5 {
-            let candidate = parent.join("dashboard");
-            if candidate.exists() {
-                found_path = Some(candidate);
+        for _ in 0..5 {
+            if let Some(next) = parent.parent() {
+                candidates.push(next.join("dashboard"));
+                parent = next;
+            } else {
                 break;
             }
-            // SAFETY: We limit traversal to 5 levels to prevent infinite loops
-            // in malformed environments. If we reach root, parent() returns None
-            // and we break out of the loop.
-            parent = parent.parent().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Dashboard directory not found. Traversed {} levels up from {:?}",
-                    depth,
-                    current_dir
-                )
-            })?;
         }
 
-        found_path.ok_or_else(|| {
-            anyhow::anyhow!(
-                "Dashboard directory not found. Please ensure you're in the LeIndex repository or run from the installed location."
-            )
-        })?
+        // 3) Explicit override for packaged installs.
+        if let Ok(explicit) = std::env::var("LEINDEX_DASHBOARD_DIR") {
+            candidates.push(PathBuf::from(explicit));
+        }
+
+        // 4) Installer default location.
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(PathBuf::from(home).join(".leindex").join("dashboard"));
+        }
+
+        candidates
+            .into_iter()
+            .find(|path| path.exists() && path.is_dir())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Dashboard directory not found. Checked current repo paths, LEINDEX_DASHBOARD_DIR, and ~/.leindex/dashboard."
+                )
+            })?
     };
 
     // Check if bun is installed
@@ -808,7 +825,7 @@ async fn cmd_dashboard_impl(port: u16, prod: bool) -> AnyhowResult<()> {
         println!("\nDashboard built successfully!");
         println!("Built files: {}/dist", dashboard_path.display());
         println!("\nTo serve the production build, use:");
-        println!("  cd {} && bun run preview", dashboard_path.display());
+        println!("  cd {} && bun run start", dashboard_path.display());
     } else {
         // Start dev server
         println!("Dashboard will be available at: http://localhost:{}", port);
@@ -874,7 +891,7 @@ async fn handle_mcp_request(
         }
         "tools/call" => {
             // Use the centralized tool call handler that formats for MCP
-            let result = handle_tool_call(state, handlers, request).await;
+            let result = handle_tool_call(state, handlers, &request).await;
             Ok(JsonRpcResponse::from_result(id, result))
         }
         "tools/list" => {

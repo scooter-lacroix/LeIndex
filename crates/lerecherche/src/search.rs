@@ -252,6 +252,35 @@ pub struct SearchResult {
     /// Symbol name
     pub symbol_name: String,
 
+    /// Symbol type: function | method | class | variable | module
+    ///
+    /// Populated by `LeIndex::search()` from PDG node type.
+    /// `None` when the node is not in the PDG (e.g., external refs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_type: Option<String>,
+
+    /// First line of the symbol's source (declaration / signature).
+    ///
+    /// Extracted from `node.content` — the second line after the
+    /// `// name in path` header comment, trimmed of leading whitespace.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+
+    /// Cyclomatic complexity score of the symbol.
+    pub complexity: u32,
+
+    /// Number of call-sites that invoke this symbol (direct callers in PDG).
+    ///
+    /// Populated by `LeIndex::search()`. `None` if PDG is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_count: Option<usize>,
+
+    /// Number of symbols this symbol depends on (outgoing PDG edges).
+    ///
+    /// Populated by `LeIndex::search()`. `None` if PDG is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependency_count: Option<usize>,
+
     /// Programming language
     pub language: String,
 
@@ -608,11 +637,29 @@ impl SearchEngine {
                     }
                 }
 
+                // Extract signature: find the first non-empty, non-placeholder
+                // line in node content (skipping the "// name in path" header).
+                // Lines like "// [No source code available]" are discarded.
+                let signature = node
+                    .content
+                    .lines()
+                    .skip(1) // skip "// name in path" header
+                    .map(|l| l.trim())
+                    .find(|l| {
+                        !l.is_empty() && !l.starts_with("// [No source") && !l.starts_with("// [")
+                    })
+                    .map(|l| l.to_string());
+
                 results.push(SearchResult {
                     rank: 0, // Will be set after sorting
                     node_id: node.node_id.clone(),
                     file_path: node.file_path.clone(),
                     symbol_name: node.symbol_name.clone(),
+                    symbol_type: None, // enriched by LeIndex::search()
+                    signature,
+                    complexity: node.complexity,
+                    caller_count: None,     // enriched by LeIndex::search()
+                    dependency_count: None, // enriched by LeIndex::search()
                     language: node.language.clone(),
                     score,
                     context: None,

@@ -1,9 +1,9 @@
 // Storage schema and database management
 
+use crate::{ProjectMetadata, UniqueProjectId};
 use rusqlite::{Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
-use crate::{ProjectMetadata, UniqueProjectId};
 
 /// Storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +49,11 @@ impl Storage {
         if config.wal_enabled {
             conn.pragma_update(None, "journal_mode", "WAL")?;
         }
+
+        // Allow concurrent access: wait up to 5 seconds for locks instead of
+        // immediately failing.  This is critical when multiple LeIndex instances
+        // (or a ProjectRegistry) access the same project's .leindex/leindex.db.
+        conn.pragma_update(None, "busy_timeout", 5000)?;
 
         // Set cache size if specified
         if let Some(cache_size) = config.cache_size_pages {
@@ -209,6 +214,23 @@ CREATE TABLE IF NOT EXISTS project_metadata (
             [],
         )?;
 
+        // Persistent cache telemetry for cross-session hit-rate tracking.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS cache_telemetry (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                cache_hits INTEGER NOT NULL DEFAULT 0,
+                cache_misses INTEGER NOT NULL DEFAULT 0,
+                cache_writes INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )?;
+        self.conn.execute(
+            "INSERT OR IGNORE INTO cache_telemetry (id, cache_hits, cache_misses, cache_writes, updated_at)
+             VALUES (1, 0, 0, 0, strftime('%s', 'now'))",
+            [],
+        )?;
+
         // Create global_symbols table (Phase 7: Cross-Project Resolution)
         self.conn.execute(
             "CREATE TABLE IF NOT EXISTS global_symbols (
@@ -343,7 +365,7 @@ CREATE TABLE IF NOT EXISTS project_metadata (
         ProjectMetadata::load_existing_ids(&self.conn, base_name)
             .map_err(|_| rusqlite::Error::InvalidQuery)
     }
-    
+
     /// Store project metadata.
     ///
     /// This persists the unique project ID and associated metadata.
@@ -358,9 +380,10 @@ CREATE TABLE IF NOT EXISTS project_metadata (
             unique_project_id: unique_id.clone(),
             ..metadata
         };
-        metadata.save(&self.conn).map_err(|_| rusqlite::Error::InvalidQuery)
+        metadata
+            .save(&self.conn)
+            .map_err(|_| rusqlite::Error::InvalidQuery)
     }
-
 }
 
 #[cfg(test)]
@@ -384,12 +407,12 @@ mod tests {
         let table_count: i64 = storage
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND (name LIKE 'intel_%' OR name = 'analysis_cache' OR name LIKE 'global_%' OR name LIKE 'external_%' OR name LIKE 'project_%')",
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND (name LIKE 'intel_%' OR name = 'analysis_cache' OR name = 'cache_telemetry' OR name LIKE 'global_%' OR name LIKE 'external_%' OR name LIKE 'project_%')",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
 
-        assert_eq!(table_count, 7); // intel_nodes, intel_edges, analysis_cache, global_symbols, external_refs, project_deps, project_metadata
+        assert_eq!(table_count, 8); // intel_nodes, intel_edges, analysis_cache, cache_telemetry, global_symbols, external_refs, project_deps, project_metadata
     }
 }

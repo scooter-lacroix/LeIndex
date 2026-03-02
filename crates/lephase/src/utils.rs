@@ -15,8 +15,15 @@ pub struct CollectedFiles {
 pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFiles> {
     let mut collected = CollectedFiles::default();
 
+    // All file extensions supported by leparse.
+    // Must stay in sync with leparse::grammar::LanguageId::from_extension.
     let code_exts = [
-        "rs", "py", "js", "jsx", "ts", "tsx", "go", "java", "c", "h", "hpp", "cc", "cxx",
+        "rs", "py", "js", "jsx", "ts", "tsx", // Main languages
+        "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Systems languages
+        "cs",  // C#
+        "rb", "php", "lua", "scala", "sc", // Scripting languages
+        "sh", "bash", // Shell
+        "json", // Data
     ];
 
     // Optional focused-file mode (used by MCP when path points to a single file).
@@ -120,17 +127,23 @@ pub fn display_path(root: &Path, path: &Path) -> String {
 }
 
 fn should_skip_dir(file_name: &str) -> bool {
+    // Must stay in sync with lepasserelle::leindex::ALWAYS_SKIP_DIRS
+    // and config::ExclusionConfig defaults.
     matches!(
         file_name,
-        ".git"
-            | ".hg"
-            | ".svn"
-            | "target"
-            | "node_modules"
-            | "vendor"
-            | "dist"
-            | "build"
-            | "__pycache__"
+        // Version control
+        ".git" | ".hg" | ".svn"
+        // Build outputs
+        | "target" | "build" | "dist" | "out" | ".next" | "coverage"
+        // Package managers / dependencies
+        | "node_modules" | "vendor" | "bower_components"
+        // Python virtual environments & caches
+        | ".venv" | "venv" | "env" | "__pycache__" | ".tox" | ".mypy_cache"
+        | ".pytest_cache" | ".ruff_cache"
+        // IDE / editor metadata
+        | ".idea" | ".vscode"
+        // Misc generated
+        | ".leindex"
     )
 }
 
@@ -275,5 +288,80 @@ mod tests {
         .expect("collect focused");
 
         assert_eq!(collected.code_files, vec![b]);
+    }
+
+    #[test]
+    fn should_skip_dir_covers_all_build_output_dirs() {
+        // Version control
+        assert!(should_skip_dir(".git"));
+        assert!(should_skip_dir(".hg"));
+        assert!(should_skip_dir(".svn"));
+        // Build outputs
+        assert!(should_skip_dir("target"));
+        assert!(should_skip_dir("build"));
+        assert!(should_skip_dir("dist"));
+        assert!(should_skip_dir("out"));
+        assert!(should_skip_dir(".next"));
+        assert!(should_skip_dir("coverage"));
+        // Package managers / dependencies
+        assert!(should_skip_dir("node_modules"));
+        assert!(should_skip_dir("vendor"));
+        assert!(should_skip_dir("bower_components"));
+        // Python virtual environments & caches
+        assert!(should_skip_dir(".venv"));
+        assert!(should_skip_dir("venv"));
+        assert!(should_skip_dir("env"));
+        assert!(should_skip_dir("__pycache__"));
+        assert!(should_skip_dir(".tox"));
+        assert!(should_skip_dir(".mypy_cache"));
+        assert!(should_skip_dir(".pytest_cache"));
+        assert!(should_skip_dir(".ruff_cache"));
+        // IDE / editor metadata
+        assert!(should_skip_dir(".idea"));
+        assert!(should_skip_dir(".vscode"));
+        // Misc generated
+        assert!(should_skip_dir(".leindex"));
+        // Ensure normal dirs are NOT skipped
+        assert!(!should_skip_dir("src"));
+        assert!(!should_skip_dir("lib"));
+        assert!(!should_skip_dir("tests"));
+        assert!(!should_skip_dir("docs"));
+    }
+
+    #[test]
+    fn collect_files_skips_all_build_output_dirs() {
+        let dir = tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("src")).expect("mkdir src");
+        std::fs::write(dir.path().join("src/lib.rs"), "pub fn f(){}\n").expect("write code");
+
+        // Create files inside build output directories - they should be skipped
+        for build_dir in &["target", "build", "dist", "out", ".next", "coverage"] {
+            std::fs::create_dir_all(dir.path().join(build_dir)).expect("mkdir build_dir");
+            std::fs::write(
+                dir.path().join(format!("{}/generated.rs", build_dir)),
+                "pub fn g(){}\n",
+            )
+            .expect("write generated");
+        }
+
+        let collected = collect_files(
+            dir.path(),
+            &PhaseOptions {
+                root: dir.path().to_path_buf(),
+                ..PhaseOptions::default()
+            },
+        )
+        .expect("collect");
+
+        assert_eq!(
+            collected.code_files.len(),
+            1,
+            "only src/lib.rs should be collected"
+        );
+        assert!(
+            collected.code_files[0].ends_with("src/lib.rs"),
+            "collected file should be src/lib.rs, got: {:?}",
+            collected.code_files[0]
+        );
     }
 }

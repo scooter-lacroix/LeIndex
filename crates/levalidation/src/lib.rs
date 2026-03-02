@@ -7,17 +7,17 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
-mod syntax;
-mod reference;
 mod drift;
-mod impact;
 mod edit_change;
+mod impact;
+mod reference;
+mod syntax;
 
-pub use syntax::{SyntaxValidator, SyntaxError, ErrorSeverity};
-pub use reference::{ReferenceChecker, ReferenceIssue, ReferenceIssueType};
-pub use drift::{SemanticDriftAnalyzer, DriftReport, DriftItem, DriftType};
-pub use impact::{ImpactAnalyzer, ImpactReport, RiskLevel, Location};
+pub use drift::{DriftItem, DriftReport, DriftType, SemanticDriftAnalyzer};
 pub use edit_change::EditChange;
+pub use impact::{ImpactAnalyzer, ImpactReport, Location, RiskLevel};
+pub use reference::{ReferenceChecker, ReferenceIssue, ReferenceIssueType};
+pub use syntax::{ErrorSeverity, SyntaxError, SyntaxValidator};
 
 use legraphe::ProgramDependenceGraph;
 use lestockage::Storage;
@@ -103,15 +103,21 @@ impl ValidationResult {
 
     /// Check if there are any errors (not warnings)
     pub fn has_errors(&self) -> bool {
-        self.syntax_errors.iter().any(|e| e.severity == ErrorSeverity::Error)
+        self.syntax_errors
+            .iter()
+            .any(|e| e.severity == ErrorSeverity::Error)
             || self.reference_issues.iter().any(|i| {
-                matches!(i.issue_type,
+                matches!(
+                    i.issue_type,
                     ReferenceIssueType::BrokenImport { .. }
                         | ReferenceIssueType::UndefinedReference { .. }
                 )
             })
             || self.semantic_drift.iter().any(|d| {
-                matches!(d.drift_type, DriftType::Removed | DriftType::SignatureChanged)
+                matches!(
+                    d.drift_type,
+                    DriftType::Removed | DriftType::SignatureChanged
+                )
             })
     }
 }
@@ -296,7 +302,10 @@ mod tests {
 
     #[test]
     fn test_location_display() {
-        let loc = Location { line: 10, column: 5 };
+        let loc = Location {
+            line: 10,
+            column: 5,
+        };
         assert_eq!(loc.to_string(), "10:5");
     }
 }

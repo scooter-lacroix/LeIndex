@@ -169,11 +169,16 @@ impl LanguageConfig {
     pub fn enabled_extensions(&self) -> HashSet<String> {
         let mut extensions = HashSet::new();
 
-        // All supported extensions
+        // All file extensions supported by leparse.
+        // Must stay in sync with leparse::grammar::LanguageId::from_extension
+        // and lepasserelle::leindex::collect_source_files_with_hashes.
         let all_extensions = [
             "rs", "py", "js", "ts", "tsx", "jsx", // Main languages
-            "go", "java", "cpp", "c", "h", "hpp", // Systems languages
-            "rb", "php", "lua", "scala", // Scripting languages
+            "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Systems languages
+            "cs",  // C#
+            "rb", "php", "lua", "scala", "sc", // Scripting languages
+            "sh", "bash", // Shell
+            "json", // Data
         ];
 
         if self.enable_all {
@@ -213,10 +218,13 @@ impl LanguageConfig {
             "java" => vec!["java"],
             "cpp" | "c++" => vec!["cpp", "cc", "cxx", "c", "h", "hpp"],
             "c" => vec!["c", "h"],
+            "csharp" | "c#" => vec!["cs"],
             "ruby" => vec!["rb"],
             "php" => vec!["php"],
             "lua" => vec!["lua"],
-            "scala" => vec!["scala"],
+            "scala" => vec!["scala", "sc"],
+            "bash" | "shell" => vec!["sh", "bash"],
+            "json" => vec!["json"],
             _ => vec![],
         }
     }
@@ -244,25 +252,50 @@ impl Default for ExclusionConfig {
     fn default() -> Self {
         Self {
             directory_patterns: vec![
+                // Version control
+                ".git".into(),
+                ".hg".into(),
+                ".svn".into(),
+                // Build outputs
                 "target".into(),
+                "build".into(),
+                "dist".into(),
+                "out".into(),
+                ".next".into(),
+                "coverage".into(),
+                // Package managers / dependencies
                 "node_modules".into(),
                 "vendor".into(),
-                ".git".into(),
-                "dist".into(),
-                "build".into(),
-                "out".into(),
+                "bower_components".into(),
+                // Python virtual environments & caches
                 ".venv".into(),
                 "venv".into(),
                 "env".into(),
                 "__pycache__".into(),
+                ".tox".into(),
+                ".mypy_cache".into(),
+                ".pytest_cache".into(),
+                ".ruff_cache".into(),
+                // IDE / editor metadata
+                ".idea".into(),
+                ".vscode".into(),
+                // Misc generated
+                ".leindex".into(),
             ],
             file_patterns: vec![
                 "*.min.js".into(),
                 "*.min.css".into(),
                 "*.pb.go".into(), // Generated protobuf files
                 "*.generated.rs".into(),
+                "*.bundle.js".into(), // Bundled JS
+                "*.chunk.js".into(),  // Webpack chunks
             ],
-            path_patterns: vec!["*/target/*".into(), "*/node_modules/*".into()],
+            path_patterns: vec![
+                "*/target/*".into(),
+                "*/node_modules/*".into(),
+                "*/dist/*".into(),
+                "*/out/*".into(),
+            ],
         }
     }
 }
@@ -504,6 +537,86 @@ mod tests {
         assert!(config.should_exclude("target/main.rs"));
         assert!(config.should_exclude("node_modules/package/index.js"));
         assert!(!config.should_exclude("src/main.rs"));
+    }
+
+    #[test]
+    fn test_exclusion_build_output_dirs() {
+        let config = ExclusionConfig::default();
+        // Build outputs: out/, dist/, build/, .next/, coverage/
+        assert!(config.should_exclude("out/bundle.js"));
+        assert!(config.should_exclude("dist/index.js"));
+        assert!(config.should_exclude("build/main.js"));
+        assert!(config.should_exclude(".next/server/app.js"));
+        assert!(config.should_exclude("coverage/lcov.info"));
+        // Python caches
+        assert!(config.should_exclude("__pycache__/module.pyc"));
+        assert!(config.should_exclude(".mypy_cache/stubs.json"));
+        assert!(config.should_exclude(".pytest_cache/v/cache.json"));
+        assert!(config.should_exclude(".ruff_cache/data.json"));
+        assert!(config.should_exclude(".tox/py39/lib/site.py"));
+        // IDE
+        assert!(config.should_exclude(".idea/workspace.xml"));
+        assert!(config.should_exclude(".vscode/settings.json"));
+        // Virtual envs
+        assert!(config.should_exclude(".venv/lib/python3.12/os.py"));
+        assert!(config.should_exclude("venv/lib/python3.12/os.py"));
+        // Source should NOT be excluded
+        assert!(!config.should_exclude("src/main.rs"));
+        assert!(!config.should_exclude("lib/utils.ts"));
+    }
+
+    #[test]
+    fn test_exclusion_minified_and_generated_files() {
+        let config = ExclusionConfig::default();
+        assert!(config.should_exclude("app.min.js"));
+        assert!(config.should_exclude("styles.min.css"));
+        assert!(config.should_exclude("service.pb.go"));
+        assert!(config.should_exclude("schema.generated.rs"));
+        assert!(config.should_exclude("vendor.bundle.js"));
+        assert!(config.should_exclude("main.chunk.js"));
+        // Normal files should NOT be excluded
+        assert!(!config.should_exclude("app.js"));
+        assert!(!config.should_exclude("service.go"));
+    }
+
+    #[test]
+    fn test_language_extensions_complete() {
+        let config = LanguageConfig::default();
+        let exts = config.enabled_extensions();
+        // All extensions supported by leparse
+        for ext in &[
+            "rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "cpp", "cc", "cxx", "c", "h",
+            "hpp", "cs", "rb", "php", "lua", "scala", "sc", "sh", "bash", "json",
+        ] {
+            assert!(exts.contains(*ext), "Extension '{}' should be enabled", ext);
+        }
+    }
+
+    #[test]
+    fn test_language_to_extensions_complete() {
+        // Verify all language names resolve to extensions
+        let cases = vec![
+            ("rust", vec!["rs"]),
+            ("python", vec!["py"]),
+            ("javascript", vec!["js", "jsx"]),
+            ("typescript", vec!["ts", "tsx"]),
+            ("csharp", vec!["cs"]),
+            ("c#", vec!["cs"]),
+            ("bash", vec!["sh", "bash"]),
+            ("scala", vec!["scala", "sc"]),
+            ("json", vec!["json"]),
+        ];
+        for (name, expected_exts) in cases {
+            let exts = LanguageConfig::language_to_extensions(name);
+            for ext in expected_exts {
+                assert!(
+                    exts.contains(&ext),
+                    "Language '{}' should map to extension '{}'",
+                    name,
+                    ext
+                );
+            }
+        }
     }
 
     #[test]

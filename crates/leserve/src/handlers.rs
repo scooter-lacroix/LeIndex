@@ -1,32 +1,27 @@
 //! HTTP handlers for REST API endpoints
 
 use axum::{
-    extract::{Path, Query, State, ws::WebSocketUpgrade},
+    extract::{ws::WebSocketUpgrade, Path, Query, State},
     http::StatusCode,
-    Json, Router,
     response::IntoResponse,
+    Json, Router,
 };
+use futures::stream::StreamExt;
 use lestockage::Storage;
 use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use tracing::{error, info};
-use futures::stream::StreamExt;
 
 use crate::config::ServerConfig;
 use crate::error::{ApiError, ApiResult};
 use crate::responses::{
-    CodebaseListResponse,
-    CodebaseResponse,
-    FileTreeResponse,
-    FileNode,
-    GraphDataResponse,
-    GraphNodeResponse,
-    GraphLinkResponse,
-    SearchResultsResponse,
-    SearchResultResponse,
-    ScoreResponse,
+    CacheOverviewResponse, CodebaseDetailResponse, CodebaseListResponse, CodebaseResponse,
+    DashboardCodebaseMetricsResponse, DashboardOverviewResponse,
+    ExternalDependencyOverviewResponse, FeatureStatusResponse, FileNode, FileTreeResponse,
+    GraphDataResponse, GraphLinkResponse, GraphNodeResponse, LanguageDistributionResponse,
+    ScoreResponse, SearchResultResponse, SearchResultsResponse,
 };
-use crate::websocket::{WsManager, WsEvent};
+use crate::websocket::{WsEvent, WsManager};
 
 /// Query parameters for search endpoint
 #[derive(Debug, Deserialize)]
@@ -57,7 +52,7 @@ pub struct SearchQuery {
 pub struct AppState {
     /// Thread-safe storage access requiring mutex lock
     pub storage: Arc<Mutex<Storage>>,
-    
+
     /// Immutable server configuration
     pub config: Arc<ServerConfig>,
 }
@@ -86,11 +81,10 @@ pub async fn list_codebases(
 ) -> ApiResult<Json<CodebaseListResponse>> {
     info!("Listing all codebases");
 
-    let storage = state.storage.lock()
-        .map_err(|e| {
-            error!("Failed to acquire storage lock: {}", e);
-            ApiError::internal(format!("Storage lock error: {}", e))
-        })?;
+    let storage = state.storage.lock().map_err(|e| {
+        error!("Failed to acquire storage lock: {}", e);
+        ApiError::internal(format!("Storage lock error: {}", e))
+    })?;
 
     // Query all projects from the database
     let conn = storage.conn();
@@ -98,16 +92,35 @@ pub async fn list_codebases(
         .prepare(
             r#"
             SELECT
-                unique_project_id,
-                base_name,
-                path_hash,
-                instance,
-                canonical_path,
-                display_name,
-                is_clone,
-                cloned_from
-            FROM project_metadata
-            ORDER BY base_name
+                pm.unique_project_id,
+                pm.base_name,
+                pm.path_hash,
+                pm.instance,
+                pm.canonical_path,
+                pm.display_name,
+                COALESCE(fc.file_count, 0) AS file_count,
+                COALESCE(nc.node_count, 0) AS node_count,
+                COALESCE(ec.edge_count, 0) AS edge_count,
+                pm.is_clone,
+                pm.cloned_from
+            FROM project_metadata pm
+            LEFT JOIN (
+                SELECT project_id, COUNT(*) AS file_count
+                FROM indexed_files
+                GROUP BY project_id
+            ) fc ON fc.project_id = pm.unique_project_id
+            LEFT JOIN (
+                SELECT project_id, COUNT(*) AS node_count
+                FROM intel_nodes
+                GROUP BY project_id
+            ) nc ON nc.project_id = pm.unique_project_id
+            LEFT JOIN (
+                SELECT n.project_id, COUNT(*) AS edge_count
+                FROM intel_edges e
+                INNER JOIN intel_nodes n ON e.caller_id = n.id
+                GROUP BY n.project_id
+            ) ec ON ec.project_id = pm.unique_project_id
+            ORDER BY pm.base_name, pm.instance
             "#,
         )
         .map_err(|e| {
@@ -127,12 +140,12 @@ pub async fn list_codebases(
                 display_name: row.get(5)?,
                 project_type: "Rust".to_string(), // Default for now
                 last_indexed: "Unknown".to_string(), // TODO: Add timestamp tracking
-                file_count: 0, // TODO: Query from indexed_files
-                node_count: 0, // TODO: Query from intel_nodes
-                edge_count: 0, // TODO: Query from intel_edges
+                file_count: row.get(6)?,
+                node_count: row.get(7)?,
+                edge_count: row.get(8)?,
                 is_valid: true,
-                is_clone: row.get(6)?,
-                cloned_from: row.get(7)?,
+                is_clone: row.get(9)?,
+                cloned_from: row.get(10)?,
             })
         })
         .map_err(|e| {
@@ -154,13 +167,339 @@ pub async fn list_codebases(
     }))
 }
 
-/// POST /api/codebases/:id/refresh - Trigger manual re-sync
+/// GET /api/codebases/:id - Get one codebase by ID.
+pub async fn get_codebase(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> ApiResult<Json<CodebaseDetailResponse>> {
+    info!("Getting codebase detail: {}", id);
+
+    let storage = state.storage.lock().map_err(|e| {
+        error!("Failed to acquire storage lock: {}", e);
+        ApiError::internal(format!("Storage lock error: {}", e))
+    })?;
+
+    let conn = storage.conn();
+    let mut stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                pm.unique_project_id,
+                pm.base_name,
+                pm.path_hash,
+                pm.instance,
+                pm.canonical_path,
+                pm.display_name,
+                COALESCE(fc.file_count, 0) AS file_count,
+                COALESCE(nc.node_count, 0) AS node_count,
+                COALESCE(ec.edge_count, 0) AS edge_count,
+                pm.is_clone,
+                pm.cloned_from
+            FROM project_metadata pm
+            LEFT JOIN (
+                SELECT project_id, COUNT(*) AS file_count
+                FROM indexed_files
+                GROUP BY project_id
+            ) fc ON fc.project_id = pm.unique_project_id
+            LEFT JOIN (
+                SELECT project_id, COUNT(*) AS node_count
+                FROM intel_nodes
+                GROUP BY project_id
+            ) nc ON nc.project_id = pm.unique_project_id
+            LEFT JOIN (
+                SELECT n.project_id, COUNT(*) AS edge_count
+                FROM intel_edges e
+                INNER JOIN intel_nodes n ON e.caller_id = n.id
+                GROUP BY n.project_id
+            ) ec ON ec.project_id = pm.unique_project_id
+            WHERE pm.unique_project_id = ?1
+            LIMIT 1
+            "#,
+        )
+        .map_err(|e| {
+            error!("Failed to prepare get_codebase query: {}", e);
+            ApiError::internal(format!("Database query error: {}", e))
+        })?;
+
+    let mut rows = stmt.query([&id]).map_err(|e| {
+        error!("Failed to execute get_codebase query: {}", e);
+        ApiError::internal(format!("Database execution error: {}", e))
+    })?;
+    let maybe_row = if let Some(row) = rows.next().map_err(|e| {
+        error!("Failed to read get_codebase row: {}", e);
+        ApiError::internal(format!("Database row read error: {}", e))
+    })? {
+        Some(CodebaseResponse {
+            id: row.get::<_, String>(0).map_err(|e| {
+                ApiError::internal(format!("Failed to read codebase id column: {}", e))
+            })?,
+            unique_project_id: row.get::<_, String>(0).map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to read codebase unique_project_id column: {}",
+                    e
+                ))
+            })?,
+            base_name: row.get(1).map_err(|e| {
+                ApiError::internal(format!("Failed to read codebase base_name column: {}", e))
+            })?,
+            path_hash: row.get(2).map_err(|e| {
+                ApiError::internal(format!("Failed to read codebase path_hash column: {}", e))
+            })?,
+            instance: row.get(3).map_err(|e| {
+                ApiError::internal(format!("Failed to read codebase instance column: {}", e))
+            })?,
+            project_path: row.get(4).map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to read codebase project_path column: {}",
+                    e
+                ))
+            })?,
+            display_name: row.get(5).map_err(|e| {
+                ApiError::internal(format!(
+                    "Failed to read codebase display_name column: {}",
+                    e
+                ))
+            })?,
+            project_type: "Rust".to_string(),
+            last_indexed: "Unknown".to_string(),
+            file_count: row.get(6).map_err(|e| {
+                ApiError::internal(format!("Failed to read codebase file_count column: {}", e))
+            })?,
+            node_count: row.get(7).map_err(|e| {
+                ApiError::internal(format!("Failed to read codebase node_count column: {}", e))
+            })?,
+            edge_count: row.get(8).map_err(|e| {
+                ApiError::internal(format!("Failed to read codebase edge_count column: {}", e))
+            })?,
+            is_valid: true,
+            is_clone: row.get(9).map_err(|e| {
+                ApiError::internal(format!("Failed to read codebase is_clone column: {}", e))
+            })?,
+            cloned_from: row.get(10).map_err(|e| {
+                ApiError::internal(format!("Failed to read codebase cloned_from column: {}", e))
+            })?,
+        })
+    } else {
+        None
+    };
+
+    let codebase = maybe_row.ok_or_else(|| ApiError::not_found(id))?;
+    Ok(Json(CodebaseDetailResponse { codebase }))
+}
+
+/// POST /api/codebases/:id/refresh - Trigger manual re-sync.
 pub async fn refresh_codebase(
     Path(id): Path<String>,
     State(_state): State<AppState>,
 ) -> ApiResult<StatusCode> {
     info!("Triggering refresh for codebase: {}", id);
     Ok(StatusCode::ACCEPTED)
+}
+
+/// GET /api/dashboard/overview - Aggregate dashboard metrics.
+pub async fn dashboard_overview(
+    State(state): State<AppState>,
+) -> ApiResult<Json<DashboardOverviewResponse>> {
+    info!("Building dashboard overview");
+
+    let storage = state.storage.lock().map_err(|e| {
+        error!("Failed to acquire storage lock: {}", e);
+        ApiError::internal(format!("Storage lock error: {}", e))
+    })?;
+    let conn = storage.conn();
+
+    let mut codebase_stmt = conn
+        .prepare(
+            r#"
+            SELECT
+                pm.unique_project_id,
+                pm.display_name,
+                pm.canonical_path,
+                COALESCE(fc.file_count, 0) AS file_count,
+                COALESCE(nc.node_count, 0) AS node_count,
+                COALESCE(ec.edge_count, 0) AS edge_count,
+                COALESCE(ic.import_edge_count, 0) AS import_edge_count,
+                COALESCE(er.external_ref_count, 0) AS external_ref_count,
+                COALESCE(pd.dependency_link_count, 0) AS dependency_link_count
+            FROM project_metadata pm
+            LEFT JOIN (
+                SELECT project_id, COUNT(*) AS file_count
+                FROM indexed_files
+                GROUP BY project_id
+            ) fc ON fc.project_id = pm.unique_project_id
+            LEFT JOIN (
+                SELECT project_id, COUNT(*) AS node_count
+                FROM intel_nodes
+                GROUP BY project_id
+            ) nc ON nc.project_id = pm.unique_project_id
+            LEFT JOIN (
+                SELECT n.project_id, COUNT(*) AS edge_count
+                FROM intel_edges e
+                INNER JOIN intel_nodes n ON e.caller_id = n.id
+                GROUP BY n.project_id
+            ) ec ON ec.project_id = pm.unique_project_id
+            LEFT JOIN (
+                SELECT n.project_id, COUNT(*) AS import_edge_count
+                FROM intel_edges e
+                INNER JOIN intel_nodes n ON e.caller_id = n.id
+                WHERE lower(e.edge_type) = 'import'
+                GROUP BY n.project_id
+            ) ic ON ic.project_id = pm.unique_project_id
+            LEFT JOIN (
+                SELECT source_project_id AS project_id, COUNT(*) AS external_ref_count
+                FROM external_refs
+                GROUP BY source_project_id
+            ) er ON er.project_id = pm.unique_project_id
+            LEFT JOIN (
+                SELECT project_id, COUNT(*) AS dependency_link_count
+                FROM project_deps
+                GROUP BY project_id
+            ) pd ON pd.project_id = pm.unique_project_id
+            ORDER BY pm.base_name, pm.instance
+            "#,
+        )
+        .map_err(|e| {
+            error!("Failed to prepare codebase metrics query: {}", e);
+            ApiError::internal(format!("Database query error: {}", e))
+        })?;
+
+    let codebases = codebase_stmt
+        .query_map([], |row| {
+            Ok(DashboardCodebaseMetricsResponse {
+                id: row.get(0)?,
+                display_name: row.get(1)?,
+                project_path: row.get(2)?,
+                file_count: row.get(3)?,
+                node_count: row.get(4)?,
+                edge_count: row.get(5)?,
+                import_edge_count: row.get(6)?,
+                external_ref_count: row.get(7)?,
+                dependency_link_count: row.get(8)?,
+            })
+        })
+        .map_err(|e| {
+            error!("Failed to execute codebase metrics query: {}", e);
+            ApiError::internal(format!("Database execution error: {}", e))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            error!("Failed to collect codebase metrics: {}", e);
+            ApiError::internal(format!("Result collection error: {}", e))
+        })?;
+
+    let total_files = codebases.iter().map(|c| c.file_count).sum::<i64>();
+    let total_nodes = codebases.iter().map(|c| c.node_count).sum::<i64>();
+    let total_edges = codebases.iter().map(|c| c.edge_count).sum::<i64>();
+
+    let mut lang_stmt = conn
+        .prepare(
+            r#"
+            SELECT language, COUNT(*) AS count
+            FROM intel_nodes
+            GROUP BY language
+            ORDER BY count DESC, language
+            LIMIT 24
+            "#,
+        )
+        .map_err(|e| {
+            error!("Failed to prepare language distribution query: {}", e);
+            ApiError::internal(format!("Database query error: {}", e))
+        })?;
+
+    let language_distribution = lang_stmt
+        .query_map([], |row| {
+            Ok(LanguageDistributionResponse {
+                language: row.get(0)?,
+                count: row.get(1)?,
+            })
+        })
+        .map_err(|e| {
+            error!("Failed to execute language distribution query: {}", e);
+            ApiError::internal(format!("Database execution error: {}", e))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
+            error!("Failed to collect language distribution: {}", e);
+            ApiError::internal(format!("Result collection error: {}", e))
+        })?;
+
+    let analysis_cache_entries: i64 = conn
+        .query_row("SELECT COUNT(*) FROM analysis_cache", [], |row| row.get(0))
+        .unwrap_or(0);
+
+    let telemetry_result = conn.query_row(
+        "SELECT cache_hits, cache_misses FROM cache_telemetry WHERE id = 1",
+        [],
+        |row| {
+            let hits: i64 = row.get(0)?;
+            let misses: i64 = row.get(1)?;
+            Ok((hits, misses))
+        },
+    );
+    let estimated_hit_rate = telemetry_result.ok().and_then(|(hits, misses)| {
+        let total = hits + misses;
+        if total > 0 {
+            Some((hits as f64) / (total as f64))
+        } else {
+            None
+        }
+    });
+
+    let temperature = match estimated_hit_rate {
+        Some(rate) if rate >= 0.75 => "hot",
+        Some(rate) if rate >= 0.35 => "warm",
+        Some(_) => "cold",
+        None if analysis_cache_entries > 0 => "warm",
+        None => "cold",
+    }
+    .to_string();
+
+    let external_refs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM external_refs", [], |row| row.get(0))
+        .unwrap_or(0);
+    let dependency_links: i64 = conn
+        .query_row("SELECT COUNT(*) FROM project_deps", [], |row| row.get(0))
+        .unwrap_or(0);
+    let import_edges: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM intel_edges WHERE lower(edge_type) = 'import'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+
+    let generated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or_default();
+
+    Ok(Json(DashboardOverviewResponse {
+        generated_at,
+        status: "healthy".to_string(),
+        total_codebases: codebases.len(),
+        total_files,
+        total_nodes,
+        total_edges,
+        language_distribution,
+        feature_status: FeatureStatusResponse {
+            multi_project_enabled: true,
+            cache_telemetry_enabled: true,
+            external_dependency_resolution_enabled: true,
+            context_aware_editing_enabled: true,
+            bounded_impact_analysis_enabled: true,
+        },
+        cache: CacheOverviewResponse {
+            analysis_cache_entries,
+            temperature,
+            estimated_hit_rate,
+        },
+        external_dependencies: ExternalDependencyOverviewResponse {
+            external_refs,
+            project_dependency_links: dependency_links,
+            import_edges,
+        },
+        codebases,
+    }))
 }
 
 /// GET /api/codebases/:id/graph - Get dependency graph data
@@ -170,11 +509,10 @@ pub async fn get_graph(
 ) -> ApiResult<Json<GraphDataResponse>> {
     info!("Getting graph for codebase: {}", id);
 
-    let storage = state.storage.lock()
-        .map_err(|e| {
-            error!("Failed to acquire storage lock: {}", e);
-            ApiError::internal(format!("Storage lock error: {}", e))
-        })?;
+    let storage = state.storage.lock().map_err(|e| {
+        error!("Failed to acquire storage lock: {}", e);
+        ApiError::internal(format!("Storage lock error: {}", e))
+    })?;
 
     let conn = storage.conn();
 
@@ -263,7 +601,12 @@ pub async fn get_graph(
             ApiError::internal(format!("Result collection error: {}", e))
         })?;
 
-    info!("Retrieved {} nodes and {} links for codebase {}", nodes.len(), links.len(), id);
+    info!(
+        "Retrieved {} nodes and {} links for codebase {}",
+        nodes.len(),
+        links.len(),
+        id
+    );
     Ok(Json(GraphDataResponse { nodes, links }))
 }
 
@@ -274,11 +617,10 @@ pub async fn get_file_tree(
 ) -> ApiResult<Json<FileTreeResponse>> {
     info!("Getting file tree for codebase: {}", id);
 
-    let storage = state.storage.lock()
-        .map_err(|e| {
-            error!("Failed to acquire storage lock: {}", e);
-            ApiError::internal(format!("Storage lock error: {}", e))
-        })?;
+    let storage = state.storage.lock().map_err(|e| {
+        error!("Failed to acquire storage lock: {}", e);
+        ApiError::internal(format!("Storage lock error: {}", e))
+    })?;
 
     let conn = storage.conn();
 
@@ -303,7 +645,11 @@ pub async fn get_file_tree(
         .query_map([&id], |row| {
             let file_path: String = row.get(0)?;
             Ok(FileNode {
-                name: file_path.rsplit('/').next().unwrap_or(&file_path).to_string(),
+                name: file_path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&file_path)
+                    .to_string(),
                 node_type: "file".to_string(),
                 path: file_path.clone(),
                 size: None, // TODO: Get actual file size
@@ -339,11 +685,10 @@ pub async fn search(
         return Ok(Json(SearchResultsResponse::empty()));
     }
 
-    let storage = state.storage.lock()
-        .map_err(|e| {
-            error!("Failed to acquire storage lock: {}", e);
-            ApiError::internal(format!("Storage lock error: {}", e))
-        })?;
+    let storage = state.storage.lock().map_err(|e| {
+        error!("Failed to acquire storage lock: {}", e);
+        ApiError::internal(format!("Storage lock error: {}", e))
+    })?;
 
     let conn = storage.conn();
 
@@ -405,15 +750,11 @@ pub async fn search(
         })?;
 
     info!("Search returned {} results", results.len());
-    Ok(Json(SearchResultsResponse {
-        results,
-    }))
+    Ok(Json(SearchResultsResponse { results }))
 }
 
 /// GET /api/health - Health check endpoint
-pub async fn health_check(
-    State(_state): State<AppState>,
-) -> ApiResult<Json<serde_json::Value>> {
+pub async fn health_check(State(_state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(serde_json::json!({
         "status": "ok",
         "service": "leserve",
@@ -432,10 +773,13 @@ pub async fn websocket_handler(
         let manager = WsManager::new();
 
         // Generate simple connection ID
-        let conn_id = format!("ws_{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis());
+        let conn_id = format!(
+            "ws_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+        );
 
         // Register connection
         manager.register_connection(conn_id.clone(), None).await;
@@ -509,12 +853,23 @@ pub async fn websocket_handler(
 pub fn create_router() -> Router<AppState> {
     Router::new()
         .route("/api/health", axum::routing::get(health_check))
+        .route(
+            "/api/dashboard/overview",
+            axum::routing::get(dashboard_overview),
+        )
         .route("/api/codebases", axum::routing::get(list_codebases))
-        .route("/api/codebases/:id", axum::routing::get(refresh_codebase))
+        .route(
+            "/api/codebases/:id",
+            axum::routing::get(get_codebase).post(refresh_codebase),
+        )
         .route("/api/codebases/:id/graph", axum::routing::get(get_graph))
-        .route("/api/codebases/:id/files", axum::routing::get(get_file_tree))
+        .route(
+            "/api/codebases/:id/files",
+            axum::routing::get(get_file_tree),
+        )
         .route("/api/search", axum::routing::get(search))
         .route("/ws", axum::routing::get(websocket_handler))
+        .route("/ws/events", axum::routing::get(websocket_handler))
 }
 
 #[cfg(test)]

@@ -204,7 +204,7 @@ impl ServerConfig {
 
         // Validate log level
         match self.log_level.as_str() {
-            "trace" | "debug" | "info" | "warn" | "error" => {},
+            "trace" | "debug" | "info" | "warn" | "error" => {}
             _ => {
                 return Err(format!(
                     "Invalid log level: {}. Must be one of: trace, debug, info, warn, error",
@@ -229,7 +229,10 @@ mod tests {
         assert!(config.cors_origins.len() > 0);
         assert_eq!(config.db_path, "leindex.db");
         assert_eq!(config.max_ws_connections, MAX_WS_CONNECTIONS);
-        assert_eq!(config.ws_heartbeat_interval_secs, WS_HEARTBEAT_INTERVAL_SECS);
+        assert_eq!(
+            config.ws_heartbeat_interval_secs,
+            WS_HEARTBEAT_INTERVAL_SECS
+        );
         assert_eq!(config.enable_logging, true);
         assert_eq!(config.log_level, "info");
     }
@@ -258,7 +261,9 @@ mod tests {
     #[test]
     fn test_config_socket_addr() {
         let config = ServerConfig::default();
-        let addr = config.socket_addr().expect("Default socket address should be valid");
+        let addr = config
+            .socket_addr()
+            .expect("Default socket address should be valid");
         assert_eq!(addr.ip(), std::net::Ipv4Addr::new(127, 0, 0, 1));
         assert_eq!(addr.port(), 47269);
     }

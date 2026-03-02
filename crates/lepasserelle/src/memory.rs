@@ -148,6 +148,45 @@ impl CacheEntry {
     }
 }
 
+/// Runtime cache telemetry for hit-rate and persistence observability.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CacheTelemetry {
+    /// Number of hits served directly from in-memory cache.
+    pub memory_hits: usize,
+    /// Number of hits restored from disk cache.
+    pub disk_hits: usize,
+    /// Number of cache lookups that missed entirely.
+    pub misses: usize,
+    /// Number of write operations into the cache.
+    pub writes: usize,
+    /// Number of spill/persist operations written to disk.
+    pub spills: usize,
+    /// Number of entries restored from disk into memory.
+    pub restores: usize,
+}
+
+impl CacheTelemetry {
+    /// Total cache hits (memory + disk).
+    pub fn total_hits(&self) -> usize {
+        self.memory_hits + self.disk_hits
+    }
+
+    /// Total cache lookups.
+    pub fn total_lookups(&self) -> usize {
+        self.total_hits() + self.misses
+    }
+
+    /// Hit rate in the range [0.0, 1.0].
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.total_lookups();
+        if total == 0 {
+            0.0
+        } else {
+            self.total_hits() as f64 / total as f64
+        }
+    }
+}
+
 // ============================================================================
 // CACHE STORE
 // ============================================================================
@@ -165,6 +204,9 @@ pub struct CacheStore {
 
     /// Cache directory for spilled items
     cache_dir: PathBuf,
+
+    /// Runtime cache telemetry counters.
+    telemetry: CacheTelemetry,
 }
 
 impl CacheStore {
@@ -187,12 +229,14 @@ impl CacheStore {
             total_bytes: 0,
             max_bytes: config.max_cache_bytes,
             cache_dir: config.cache_dir.clone(),
+            telemetry: CacheTelemetry::default(),
         }
     }
 
     /// Insert an entry into the cache
     pub fn insert(&mut self, key: CacheKey, entry: CacheEntry) -> Result<(), Error> {
         let entry_size = entry.size_bytes();
+        self.telemetry.writes += 1;
 
         // Check if we need to evict entries
         while self.total_bytes + entry_size > self.max_bytes && !self.cache.is_empty() {
@@ -224,7 +268,38 @@ impl CacheStore {
 
     /// Get an entry from the cache
     pub fn get(&mut self, key: &str) -> Option<CacheEntry> {
-        self.cache.get(key).cloned()
+        let found = self.cache.get(key).cloned();
+        if found.is_some() {
+            self.telemetry.memory_hits += 1;
+        } else {
+            self.telemetry.misses += 1;
+        }
+        found
+    }
+
+    /// Get an entry from memory cache, or restore from disk if available.
+    pub fn get_or_load(&mut self, key: &str) -> Result<Option<CacheEntry>, Error> {
+        if let Some(entry) = self.cache.get(key).cloned() {
+            self.telemetry.memory_hits += 1;
+            return Ok(Some(entry));
+        }
+
+        match self.load_from_disk(key) {
+            Ok(entry) => {
+                self.telemetry.disk_hits += 1;
+                self.telemetry.restores += 1;
+                self.insert(key.to_string(), entry.clone())?;
+                Ok(Some(entry))
+            }
+            Err(Error::CacheNotFound(_)) => {
+                self.telemetry.misses += 1;
+                Ok(None)
+            }
+            Err(e) => {
+                self.telemetry.misses += 1;
+                Err(e)
+            }
+        }
     }
 
     /// Remove an entry from the cache
@@ -262,6 +337,21 @@ impl CacheStore {
         &self.cache_dir
     }
 
+    /// Get cache telemetry snapshot.
+    pub fn telemetry(&self) -> &CacheTelemetry {
+        &self.telemetry
+    }
+
+    /// Persist one in-memory cache entry to disk immediately.
+    pub fn persist_key(&mut self, key: &str) -> Result<bool, Error> {
+        if let Some(entry) = self.cache.get(key).cloned() {
+            self.spill_to_disk(key, &entry)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     /// Pop the least recently used entry from cache
     pub fn pop_lru(&mut self) -> Option<(CacheKey, CacheEntry)> {
         if let Some((key, entry)) = self.cache.pop_lru() {
@@ -277,8 +367,13 @@ impl CacheStore {
         let bytes_freed = self.total_bytes;
 
         // Spill all entries to disk before clearing
-        for (key, entry) in self.cache.iter() {
-            if let Err(e) = self.spill_to_disk(key, entry) {
+        let snapshot: Vec<(CacheKey, CacheEntry)> = self
+            .cache
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.clone()))
+            .collect();
+        for (key, entry) in snapshot {
+            if let Err(e) = self.spill_to_disk(&key, &entry) {
                 warn!("Failed to spill entry '{}' to disk: {}", key, e);
             }
         }
@@ -290,7 +385,7 @@ impl CacheStore {
     }
 
     /// Spill a specific entry to disk
-    fn spill_to_disk(&self, key: &str, entry: &CacheEntry) -> Result<(), Error> {
+    fn spill_to_disk(&mut self, key: &str, entry: &CacheEntry) -> Result<(), Error> {
         let cache_file = self.cache_dir.join(format!("{}.bin", sanitize_key(key)));
 
         // Serialize the entry
@@ -317,6 +412,7 @@ impl CacheStore {
             key,
             serialized.len()
         );
+        self.telemetry.spills += 1;
 
         Ok(())
     }
@@ -469,6 +565,8 @@ impl CacheStore {
             }
         }
 
+        self.telemetry.restores += restored;
+
         Ok(RestoreResult {
             entries_restored: restored,
             entries_failed: failed,
@@ -582,6 +680,7 @@ impl CacheSpiller {
 
     /// Get memory usage statistics
     pub fn memory_stats(&self) -> Result<MemoryStats, Error> {
+        let telemetry = self.store.telemetry();
         Ok(MemoryStats {
             rss_bytes: self.memory_manager.get_rss_bytes()?,
             total_bytes: self.memory_manager.get_total_memory()?,
@@ -589,6 +688,14 @@ impl CacheSpiller {
             cache_bytes: self.store.total_bytes(),
             spilled_entries: self.store.list_spilled()?.len(),
             spilled_bytes: self.store.spilled_size_bytes()?,
+            cache_hits: telemetry.total_hits(),
+            cache_memory_hits: telemetry.memory_hits,
+            cache_disk_hits: telemetry.disk_hits,
+            cache_misses: telemetry.misses,
+            cache_hit_rate: telemetry.hit_rate(),
+            cache_writes: telemetry.writes,
+            cache_spills: telemetry.spills,
+            cache_restores: telemetry.restores,
         })
     }
 
@@ -683,6 +790,7 @@ impl CacheSpiller {
             "Cache warming complete: {} entries warmed, {} skipped",
             warmed, skipped
         );
+        self.store.telemetry.restores += warmed;
 
         Ok(WarmResult {
             entries_warmed: warmed,
@@ -785,6 +893,7 @@ impl CacheSpiller {
             restored,
             failed.len()
         );
+        self.store.telemetry.restores += restored;
 
         Ok(RestoreResult {
             entries_restored: restored,
@@ -888,6 +997,38 @@ pub struct MemoryStats {
 
     /// Total size of the spilled cache on disk in bytes
     pub spilled_bytes: usize,
+
+    /// Total cache hits (memory + disk).
+    #[serde(default)]
+    pub cache_hits: usize,
+
+    /// In-memory cache hits.
+    #[serde(default)]
+    pub cache_memory_hits: usize,
+
+    /// Disk-restored cache hits.
+    #[serde(default)]
+    pub cache_disk_hits: usize,
+
+    /// Cache misses.
+    #[serde(default)]
+    pub cache_misses: usize,
+
+    /// Cache hit rate in range [0.0, 1.0].
+    #[serde(default)]
+    pub cache_hit_rate: f64,
+
+    /// Cache write operations.
+    #[serde(default)]
+    pub cache_writes: usize,
+
+    /// Spill/persist operations.
+    #[serde(default)]
+    pub cache_spills: usize,
+
+    /// Restore operations.
+    #[serde(default)]
+    pub cache_restores: usize,
 }
 
 /// Cache entry validation result
@@ -1130,6 +1271,33 @@ mod tests {
 
         let retrieved = store.get("test_key");
         assert!(retrieved.is_some());
+        assert_eq!(store.telemetry().memory_hits, 1);
+        assert_eq!(store.telemetry().misses, 0);
+    }
+
+    #[test]
+    fn test_cache_store_get_or_load_from_disk() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = MemoryConfig {
+            cache_dir: temp_dir.path().join("cache"),
+            max_cache_bytes: 10_000,
+            ..Default::default()
+        };
+
+        let mut store = CacheStore::new(&config);
+        let entry = CacheEntry::Binary {
+            metadata: HashMap::new(),
+            serialized_data: vec![1u8; 128],
+        };
+
+        store.insert("persist_me".to_string(), entry).unwrap();
+        assert!(store.persist_key("persist_me").unwrap());
+        let _ = store.remove("persist_me");
+
+        let loaded = store.get_or_load("persist_me").unwrap();
+        assert!(loaded.is_some());
+        assert_eq!(store.telemetry().disk_hits, 1);
+        assert_eq!(store.telemetry().restores, 1);
     }
 
     #[test]
@@ -1155,10 +1323,19 @@ mod tests {
             cache_bytes: 50_000,
             spilled_entries: 5,
             spilled_bytes: 25_000,
+            cache_hits: 80,
+            cache_memory_hits: 60,
+            cache_disk_hits: 20,
+            cache_misses: 20,
+            cache_hit_rate: 0.80,
+            cache_writes: 40,
+            cache_spills: 5,
+            cache_restores: 7,
         };
 
         let percent = stats.memory_percent();
         assert!(percent > 0.0 && percent < 100.0);
+        assert!(stats.cache_hit_rate >= 0.0 && stats.cache_hit_rate <= 1.0);
     }
 
     #[test]

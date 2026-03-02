@@ -109,8 +109,7 @@ fn scan_project(path: &std::path::Path) -> Option<DiscoveredProject> {
         .iter()
         .filter(|entry| {
             // Filter out directories and hidden files
-            entry.path().is_file() &&
-                !entry.file_name().to_string_lossy().starts_with('.')
+            entry.path().is_file() && !entry.file_name().to_string_lossy().starts_with('.')
         })
         .count();
 
@@ -135,7 +134,7 @@ fn scan_project(path: &std::path::Path) -> Option<DiscoveredProject> {
     let unique_id = UniqueProjectId::new(
         base_name.clone(),
         content_fingerprint.clone(),
-        0 // instance 0 for first discovery
+        0, // instance 0 for first discovery
     );
 
     Some(DiscoveredProject {
@@ -150,7 +149,10 @@ fn scan_project(path: &std::path::Path) -> Option<DiscoveredProject> {
 }
 
 /// Recursively scan subdirectories for projects
-fn scan_subdirectories(path: &std::path::Path, max_depth: usize) -> std::io::Result<Vec<DiscoveredProject>> {
+fn scan_subdirectories(
+    path: &std::path::Path,
+    max_depth: usize,
+) -> std::io::Result<Vec<DiscoveredProject>> {
     let mut discovered = Vec::new();
 
     if max_depth == 0 {
@@ -185,7 +187,10 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
     let extensions: Vec<String> = entries
         .iter()
         .filter_map(|entry| {
-            entry.path().extension().and_then(|ext| ext.to_str().map(|s| s.to_string()))
+            entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str().map(|s| s.to_string()))
         })
         .collect();
 
@@ -196,8 +201,7 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
     }
 
     // Find most common extension
-    let most_common = counts.into_iter()
-        .max_by_key(|(_, count)| *count);
+    let most_common = counts.into_iter().max_by_key(|(_, count)| *count);
 
     match most_common {
         Some((ext, _)) => match ext.as_str() {

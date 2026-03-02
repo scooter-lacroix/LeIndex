@@ -2,8 +2,8 @@
 //!
 //! Handles validation, clone detection, and background sync with exponential backoff.
 
-use crate::registry::{GlobalRegistry, GlobalRegistryError};
 use crate::discovery::{DiscoveredProject, DiscoveryEngine, DiscoveryError};
+use crate::registry::{GlobalRegistry, GlobalRegistryError};
 use crate::{INITIAL_BACKOFF_SECS, MAX_BACKOFF_SECS};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -141,11 +141,10 @@ impl SyncEngine {
 
         // Get existing projects from registry
         let existing = match self.registry.list_projects() {
-            Ok(projects) => {
-                projects.into_iter()
-                    .map(|p| (p.unique_id.to_string(), p))
-                    .collect::<HashMap<_, _>>()
-            }
+            Ok(projects) => projects
+                .into_iter()
+                .map(|p| (p.unique_id.to_string(), p))
+                .collect::<HashMap<_, _>>(),
             Err(_) => HashMap::new(),
         };
 
@@ -162,7 +161,10 @@ impl SyncEngine {
 
             // Group by fingerprint for clone detection
             let fp = project.content_fingerprint.clone();
-            fingerprint_groups.entry(fp).or_default().push(project.clone());
+            fingerprint_groups
+                .entry(fp)
+                .or_default()
+                .push(project.clone());
 
             // Check if already in registry
             let id = project.unique_id.to_string();

@@ -571,11 +571,53 @@ Add to `~/.claude/claude_desktop_config.json`:
 
 ---
 
+### `leindex dashboard`
+
+Start the frontend dashboard via Bun.
+
+#### Synopsis
+
+```
+leindex dashboard [OPTIONS]
+```
+
+#### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--port <PORT>` | 5173 | Dashboard port |
+| `--prod` | false | Build production assets instead of starting dev server |
+
+#### Resolution Order
+
+Dashboard path is resolved in this order:
+
+1. `./dashboard`
+2. Parent-directory traversal (up to 5 levels)
+3. `LEINDEX_DASHBOARD_DIR`
+4. `~/.leindex/dashboard`
+
+#### Examples
+
+```bash
+# Start dev server
+leindex dashboard
+
+# Build production assets
+leindex dashboard --prod
+
+# Custom port
+leindex dashboard --port 3001
+```
+
+---
+
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LEINDEX_PORT` | 47268 | Override default port for `serve` command |
+| `LEINDEX_DASHBOARD_DIR` | `~/.leindex/dashboard` | Override dashboard asset directory |
 | `RUST_LOG` | info | Logging level (debug, trace, warn, error) |
 
 ### Using Environment Variables
