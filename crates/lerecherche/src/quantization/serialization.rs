@@ -53,14 +53,12 @@ pub enum SerializationError {
 
 /// Serialize quantized vector to compact binary format
 pub fn to_bytes(vector: &Int8QuantizedVector) -> Result<Vec<u8>, SerializationError> {
-    bincode::serialize(vector)
-        .map_err(|e| SerializationError::Serialization(e.to_string()))
+    bincode::serialize(vector).map_err(|e| SerializationError::Serialization(e.to_string()))
 }
 
 /// Deserialize quantized vector from compact binary format
 pub fn from_bytes(bytes: &[u8]) -> Result<Int8QuantizedVector, SerializationError> {
-    bincode::deserialize(bytes)
-        .map_err(|e| SerializationError::Deserialization(e.to_string()))
+    bincode::deserialize(bytes).map_err(|e| SerializationError::Deserialization(e.to_string()))
 }
 
 #[cfg(test)]
@@ -98,13 +96,17 @@ mod tests {
         // - Metadata: 16 bytes (4 floats, padding skipped)
         // - Dimension: 8 bytes (usize)
         // Total: 72 + 16 + 8 = 96 bytes
-        
+
         // Allow for minor platform differences or bincode variations, but strictly < 112 (size with padding)
-        assert!(bytes.len() < 112, "Serialized size {} indicates padding was NOT skipped (expected ~96 bytes)", bytes.len());
-        
+        assert!(
+            bytes.len() < 112,
+            "Serialized size {} indicates padding was NOT skipped (expected ~96 bytes)",
+            bytes.len()
+        );
+
         // Exact check for 64-bit bincode standard
         if std::mem::size_of::<usize>() == 8 {
-             assert_eq!(bytes.len(), 96, "Unexpected serialized size");
+            assert_eq!(bytes.len(), 96, "Unexpected serialized size");
         }
     }
 }

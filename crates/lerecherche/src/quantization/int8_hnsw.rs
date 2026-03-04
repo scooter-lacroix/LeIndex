@@ -40,9 +40,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
-use super::vector::Int8QuantizedVector;
+use super::distance::{
+    clear_adc_query_context, set_adc_query_context, AdcDistanceMetric, Int8AdcDistance,
+};
 use super::quantization::Quantize;
-use super::distance::{Int8AdcDistance, AdcDistanceMetric, set_adc_query_context, clear_adc_query_context};
+use super::vector::Int8QuantizedVector;
 
 /// Parameters for INT8 quantized HNSW index
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,7 +327,9 @@ impl Int8HnswIndex {
 
         // Search using HNSW
         let ef_search = self.params.ef_search.max(top_k);
-        let results = self.hnsw.search(std::slice::from_ref(&dummy_query), top_k, ef_search);
+        let results = self
+            .hnsw
+            .search(std::slice::from_ref(&dummy_query), top_k, ef_search);
 
         // Clear the ADC query context after search
         clear_adc_query_context();
@@ -432,8 +436,10 @@ impl Int8HnswIndex {
         // Graph edges: each node has ~m connections
         let edge_data = self.count * self.params.m * std::mem::size_of::<usize>();
         // HashMap overhead
-        let map_overhead = self.id_map.len() * (std::mem::size_of::<usize>() + std::mem::size_of::<String>())
-            + self.reverse_map.len() * (std::mem::size_of::<String>() + std::mem::size_of::<usize>());
+        let map_overhead = self.id_map.len()
+            * (std::mem::size_of::<usize>() + std::mem::size_of::<String>())
+            + self.reverse_map.len()
+                * (std::mem::size_of::<String>() + std::mem::size_of::<usize>());
 
         vector_data + edge_data + map_overhead
     }
@@ -590,7 +596,9 @@ mod tests {
     #[test]
     fn test_int8_hnsw_wrong_dimension_search() {
         let mut index = Int8HnswIndex::new(64);
-        index.insert("test".to_string(), create_test_vector(64, 0.5)).unwrap();
+        index
+            .insert("test".to_string(), create_test_vector(64, 0.5))
+            .unwrap();
 
         let query = create_test_vector(32, 0.5); // Wrong dimension
         let results = index.search(&query, 10);
@@ -603,7 +611,12 @@ mod tests {
         let mut index = Int8HnswIndex::new(64);
 
         let vectors: Vec<(String, Vec<f32>)> = (0..10)
-            .map(|i| (format!("node_{}", i), create_test_vector(64, i as f32 / 10.0)))
+            .map(|i| {
+                (
+                    format!("node_{}", i),
+                    create_test_vector(64, i as f32 / 10.0),
+                )
+            })
             .collect();
 
         let inserted = index.insert_batch(vectors);
@@ -614,7 +627,9 @@ mod tests {
     #[test]
     fn test_int8_hnsw_remove() {
         let mut index = Int8HnswIndex::new(64);
-        index.insert("test".to_string(), create_test_vector(64, 0.5)).unwrap();
+        index
+            .insert("test".to_string(), create_test_vector(64, 0.5))
+            .unwrap();
 
         assert_eq!(index.len(), 1);
         assert!(index.remove("test"));
@@ -627,7 +642,9 @@ mod tests {
         let mut index = Int8HnswIndex::new(64);
 
         for i in 0..5 {
-            index.insert(format!("node_{}", i), create_test_vector(64, 0.5)).unwrap();
+            index
+                .insert(format!("node_{}", i), create_test_vector(64, 0.5))
+                .unwrap();
         }
 
         assert_eq!(index.len(), 5);
@@ -661,7 +678,9 @@ mod tests {
 
         // Insert 100 vectors
         for i in 0..100 {
-            let vector: Vec<f32> = (0..768).map(|j| ((i * 768 + j) % 100) as f32 / 100.0).collect();
+            let vector: Vec<f32> = (0..768)
+                .map(|j| ((i * 768 + j) % 100) as f32 / 100.0)
+                .collect();
             index.insert(format!("node_{}", i), vector).unwrap();
         }
 
@@ -669,7 +688,11 @@ mod tests {
         let reduction_ratio = index.memory_reduction_ratio();
 
         // Should have significant memory reduction (~74% for large dimensions)
-        assert!(reduction_ratio > 0.5, "Memory reduction too low: {}", reduction_ratio);
+        assert!(
+            reduction_ratio > 0.5,
+            "Memory reduction too low: {}",
+            reduction_ratio
+        );
 
         // Quantized memory should be less than f32 memory
         let f32_memory = 100 * 768 * 4;
@@ -678,7 +701,11 @@ mod tests {
 
     #[test]
     fn test_int8_hnsw_different_metrics() {
-        for metric in [AdcDistanceMetric::Cosine, AdcDistanceMetric::L2Squared, AdcDistanceMetric::Dot] {
+        for metric in [
+            AdcDistanceMetric::Cosine,
+            AdcDistanceMetric::L2Squared,
+            AdcDistanceMetric::Dot,
+        ] {
             let params = Int8HnswParams::new().with_metric(metric);
             let mut index = Int8HnswIndex::with_params(64, params);
 

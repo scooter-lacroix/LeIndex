@@ -10,8 +10,8 @@
 // For concurrent access, wrap in `Arc<RwLock<SearchEngine>>`.
 
 use crate::hnsw::{HNSWIndex, HNSWParams};
-use crate::quantization::int8_hnsw::{Int8HnswIndex, Int8HnswParams};
 use crate::quantization::distance::AdcDistanceMetric;
+use crate::quantization::int8_hnsw::{Int8HnswIndex, Int8HnswParams};
 use crate::query::{QueryIntent, QueryParser, MAX_EMBEDDING_DIMENSION, MIN_EMBEDDING_DIMENSION};
 use crate::ranking::{HybridScorer, Score};
 use crate::vector::VectorIndex;
@@ -535,7 +535,8 @@ impl SearchEngine {
                 // This is legacy behavior, should be avoided
                 self.nodes
                     .iter()
-                    .find_map(|n| n.embedding.as_ref()).cloned()
+                    .find_map(|n| n.embedding.as_ref())
+                    .cloned()
             };
 
             if let Some(emb) = embedding {
@@ -740,10 +741,9 @@ impl SearchEngine {
             let mut matching = 0;
             for token in content.split(|c: char| !c.is_alphanumeric()) {
                 let token_lower = token.to_ascii_lowercase();
-                if token_lower.len() >= 2
-                    && precomputed.query_tokens.contains(&token_lower) {
-                        matching += 1;
-                    }
+                if token_lower.len() >= 2 && precomputed.query_tokens.contains(&token_lower) {
+                    matching += 1;
+                }
             }
 
             if precomputed.query_tokens.is_empty() {
@@ -898,10 +898,7 @@ impl SearchEngine {
                 int8_params,
             )))
         } else {
-            VectorIndexImpl::HNSW(Box::new(HNSWIndex::with_params(
-                dimension,
-                hnsw_params,
-            )))
+            VectorIndexImpl::HNSW(Box::new(HNSWIndex::with_params(dimension, hnsw_params)))
         };
 
         Self {
@@ -958,7 +955,11 @@ impl SearchEngine {
                     match new_hnsw_index.insert(node.node_id.clone(), embedding.clone()) {
                         Ok(()) => migrated += 1,
                         Err(e) => {
-                            tracing::warn!("Failed to migrate embedding for {}: {}", node.node_id, e);
+                            tracing::warn!(
+                                "Failed to migrate embedding for {}: {}",
+                                node.node_id,
+                                e
+                            );
                             failed += 1;
                             if failed > total_embeddings / 10 {
                                 return Err(Error::QueryFailed(format!(
@@ -979,7 +980,9 @@ impl SearchEngine {
 
             tracing::info!(
                 "Migrated to quantized HNSW index: {}/{} embeddings transferred, {} failed",
-                migrated, total_embeddings, failed
+                migrated,
+                total_embeddings,
+                failed
             );
 
             self.vector_index = VectorIndexImpl::HNSWQuantized(Box::new(new_hnsw_index));
@@ -991,7 +994,11 @@ impl SearchEngine {
                     match new_hnsw_index.insert(node.node_id.clone(), embedding.clone()) {
                         Ok(()) => migrated += 1,
                         Err(e) => {
-                            tracing::warn!("Failed to migrate embedding for {}: {}", node.node_id, e);
+                            tracing::warn!(
+                                "Failed to migrate embedding for {}: {}",
+                                node.node_id,
+                                e
+                            );
                             failed += 1;
                             if failed > total_embeddings / 10 {
                                 return Err(Error::QueryFailed(format!(
@@ -1012,7 +1019,9 @@ impl SearchEngine {
 
             tracing::info!(
                 "Migrated to HNSW index: {}/{} embeddings transferred, {} failed",
-                migrated, total_embeddings, failed
+                migrated,
+                total_embeddings,
+                failed
             );
 
             self.vector_index = VectorIndexImpl::HNSW(Box::new(new_hnsw_index));
@@ -1930,10 +1939,19 @@ mod tests {
 
     #[test]
     fn test_int8_hnsw_engine_creation() {
-        let engine = SearchEngine::with_hnsw(768, crate::hnsw::HNSWParams { quantized: true, ..Default::default() });
+        let engine = SearchEngine::with_hnsw(
+            768,
+            crate::hnsw::HNSWParams {
+                quantized: true,
+                ..Default::default()
+            },
+        );
         assert_eq!(engine.vector_index().dimension(), 768);
         assert!(engine.vector_index().is_empty());
-        assert!(matches!(engine.vector_index(), VectorIndexImpl::HNSWQuantized(_)));
+        assert!(matches!(
+            engine.vector_index(),
+            VectorIndexImpl::HNSWQuantized(_)
+        ));
     }
 
     #[test]
@@ -1944,17 +1962,29 @@ mod tests {
             .with_m(32)
             .with_ef_construction(400)
             .with_ef_search(100);
-        
-        let params = HNSWParams { quantized: true, ..params };
+
+        let params = HNSWParams {
+            quantized: true,
+            ..params
+        };
 
         let engine = SearchEngine::with_hnsw(768, params);
         assert_eq!(engine.vector_index().dimension(), 768);
-        assert!(matches!(engine.vector_index(), VectorIndexImpl::HNSWQuantized(_)));
+        assert!(matches!(
+            engine.vector_index(),
+            VectorIndexImpl::HNSWQuantized(_)
+        ));
     }
 
     #[test]
     fn test_int8_hnsw_index_nodes() {
-        let mut engine = SearchEngine::with_hnsw(3, crate::hnsw::HNSWParams { quantized: true, ..Default::default() });
+        let mut engine = SearchEngine::with_hnsw(
+            3,
+            crate::hnsw::HNSWParams {
+                quantized: true,
+                ..Default::default()
+            },
+        );
 
         let nodes = vec![
             NodeInfo {
@@ -1986,7 +2016,13 @@ mod tests {
 
     #[test]
     fn test_int8_hnsw_semantic_search() {
-        let mut engine = SearchEngine::with_hnsw(3, crate::hnsw::HNSWParams { quantized: true, ..Default::default() });
+        let mut engine = SearchEngine::with_hnsw(
+            3,
+            crate::hnsw::HNSWParams {
+                quantized: true,
+                ..Default::default()
+            },
+        );
 
         let nodes = vec![
             NodeInfo {
@@ -2030,11 +2066,11 @@ mod tests {
         // Should return at least 2 results (func1 and func3 are close)
         // func2 is orthogonal and might be missed or have 0 similarity
         assert!(results.len() >= 2);
-        
+
         // func1 should be most similar (identical)
         assert_eq!(results[0].node_id, "func1");
         assert!(results[0].relevance > 0.9);
-        
+
         // func3 should be second (similar to func1)
         assert_eq!(results[1].node_id, "func3");
 
@@ -2044,7 +2080,13 @@ mod tests {
 
     #[test]
     fn test_int8_hnsw_hybrid_search() {
-        let mut engine = SearchEngine::with_hnsw(3, crate::hnsw::HNSWParams { quantized: true, ..Default::default() });
+        let mut engine = SearchEngine::with_hnsw(
+            3,
+            crate::hnsw::HNSWParams {
+                quantized: true,
+                ..Default::default()
+            },
+        );
 
         let nodes = vec![
             NodeInfo {
@@ -2092,7 +2134,13 @@ mod tests {
 
     #[test]
     fn test_int8_hnsw_empty_search() {
-        let engine = SearchEngine::with_hnsw(3, HNSWParams { quantized: true, ..Default::default() });
+        let engine = SearchEngine::with_hnsw(
+            3,
+            HNSWParams {
+                quantized: true,
+                ..Default::default()
+            },
+        );
         let query = vec![0.1, 0.2, 0.3];
 
         let results = engine.semantic_search(&query, 10).unwrap();
@@ -2102,17 +2150,41 @@ mod tests {
     #[test]
     fn test_int8_hnsw_dimension_validation() {
         // Valid dimensions should work
-        let _ = SearchEngine::with_hnsw(1, HNSWParams { quantized: true, ..Default::default() });
-        let _ = SearchEngine::with_hnsw(MAX_EMBEDDING_DIMENSION, HNSWParams { quantized: true, ..Default::default() });
+        let _ = SearchEngine::with_hnsw(
+            1,
+            HNSWParams {
+                quantized: true,
+                ..Default::default()
+            },
+        );
+        let _ = SearchEngine::with_hnsw(
+            MAX_EMBEDDING_DIMENSION,
+            HNSWParams {
+                quantized: true,
+                ..Default::default()
+            },
+        );
 
         // Invalid dimensions should panic
         let result = std::panic::catch_unwind(|| {
-            let _ = SearchEngine::with_hnsw(0, HNSWParams { quantized: true, ..Default::default() });
+            let _ = SearchEngine::with_hnsw(
+                0,
+                HNSWParams {
+                    quantized: true,
+                    ..Default::default()
+                },
+            );
         });
         assert!(result.is_err(), "Dimension 0 should panic");
 
         let result = std::panic::catch_unwind(|| {
-            let _ = SearchEngine::with_hnsw(MAX_EMBEDDING_DIMENSION + 1, HNSWParams { quantized: true, ..Default::default() });
+            let _ = SearchEngine::with_hnsw(
+                MAX_EMBEDDING_DIMENSION + 1,
+                HNSWParams {
+                    quantized: true,
+                    ..Default::default()
+                },
+            );
         });
         assert!(
             result.is_err(),
@@ -2149,13 +2221,22 @@ mod tests {
         ];
 
         engine.index_nodes(nodes);
-        assert!(!matches!(engine.vector_index(), VectorIndexImpl::HNSWQuantized(_)));
+        assert!(!matches!(
+            engine.vector_index(),
+            VectorIndexImpl::HNSWQuantized(_)
+        ));
         assert_eq!(engine.vector_index().len(), 2);
 
         // Enable INT8 quantization
-        let result = engine.enable_hnsw(HNSWParams { quantized: true, ..Default::default() });
+        let result = engine.enable_hnsw(HNSWParams {
+            quantized: true,
+            ..Default::default()
+        });
         assert!(result.is_ok());
-        assert!(matches!(engine.vector_index(), VectorIndexImpl::HNSWQuantized(_)));
+        assert!(matches!(
+            engine.vector_index(),
+            VectorIndexImpl::HNSWQuantized(_)
+        ));
         assert_eq!(engine.vector_index().len(), 2); // Data should be preserved
 
         // Verify search still works
@@ -2169,29 +2250,39 @@ mod tests {
     fn test_disable_int8_quantization() {
         use crate::hnsw::HNSWParams;
 
-        let mut engine = SearchEngine::with_hnsw(3, HNSWParams { quantized: true, ..Default::default() });
+        let mut engine = SearchEngine::with_hnsw(
+            3,
+            HNSWParams {
+                quantized: true,
+                ..Default::default()
+            },
+        );
 
         // Add initial nodes with INT8 index
-        let nodes = vec![
-            NodeInfo {
-                node_id: "func1".to_string(),
-                file_path: "test.rs".to_string(),
-                symbol_name: "function_one".to_string(),
-                language: "rust".to_string(),
-                content: "fn function_one() {}".to_string(),
-                byte_range: (0, 20),
-                embedding: Some(vec![1.0, 0.0, 0.0]),
-                complexity: 1,
-            },
-        ];
+        let nodes = vec![NodeInfo {
+            node_id: "func1".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "function_one".to_string(),
+            language: "rust".to_string(),
+            content: "fn function_one() {}".to_string(),
+            byte_range: (0, 20),
+            embedding: Some(vec![1.0, 0.0, 0.0]),
+            complexity: 1,
+        }];
 
         engine.index_nodes(nodes);
-        assert!(matches!(engine.vector_index(), VectorIndexImpl::HNSWQuantized(_)));
+        assert!(matches!(
+            engine.vector_index(),
+            VectorIndexImpl::HNSWQuantized(_)
+        ));
 
         // Disable INT8 quantization (migrate back to brute-force)
         let result = engine.disable_hnsw();
         assert!(result.is_ok());
-        assert!(!matches!(engine.vector_index(), VectorIndexImpl::HNSWQuantized(_)));
+        assert!(!matches!(
+            engine.vector_index(),
+            VectorIndexImpl::HNSWQuantized(_)
+        ));
         assert_eq!(engine.vector_index().len(), 1);
 
         // Verify search still works
@@ -2203,7 +2294,13 @@ mod tests {
 
     #[test]
     fn test_int8_hnsw_clear() {
-        let mut engine = SearchEngine::with_hnsw(3, HNSWParams { quantized: true, ..Default::default() });
+        let mut engine = SearchEngine::with_hnsw(
+            3,
+            HNSWParams {
+                quantized: true,
+                ..Default::default()
+            },
+        );
 
         let nodes = vec![NodeInfo {
             node_id: "func1".to_string(),
@@ -2227,7 +2324,13 @@ mod tests {
 
     #[test]
     fn test_int8_hnsw_search_consistency() {
-        let mut engine = SearchEngine::with_hnsw(64, HNSWParams { quantized: true, ..Default::default() });
+        let mut engine = SearchEngine::with_hnsw(
+            64,
+            HNSWParams {
+                quantized: true,
+                ..Default::default()
+            },
+        );
 
         // Insert orthogonal vectors
         for i in 0..5 {
@@ -2266,7 +2369,13 @@ mod tests {
 
     #[test]
     fn test_int8_hnsw_memory_efficiency() {
-        let mut engine = SearchEngine::with_hnsw(768, HNSWParams { quantized: true, ..Default::default() });
+        let mut engine = SearchEngine::with_hnsw(
+            768,
+            HNSWParams {
+                quantized: true,
+                ..Default::default()
+            },
+        );
 
         // Insert 100 vectors
         for i in 0..100 {

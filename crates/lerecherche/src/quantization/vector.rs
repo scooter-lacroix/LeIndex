@@ -28,7 +28,9 @@ impl SimdBlock {
     /// Create a new SimdBlock with all zeros
     #[inline]
     pub fn zeros() -> Self {
-        Self { data: [0i8; SIMD_LANES] }
+        Self {
+            data: [0i8; SIMD_LANES],
+        }
     }
 
     /// Create a new SimdBlock from a slice of i8 values
@@ -37,7 +39,12 @@ impl SimdBlock {
     /// Panics if the slice length is not exactly SIMD_LANES (32)
     #[inline]
     pub fn from_slice(slice: &[i8]) -> Self {
-        assert_eq!(slice.len(), SIMD_LANES, "Slice must have exactly {} elements", SIMD_LANES);
+        assert_eq!(
+            slice.len(),
+            SIMD_LANES,
+            "Slice must have exactly {} elements",
+            SIMD_LANES
+        );
         let mut data = [0i8; SIMD_LANES];
         data.copy_from_slice(slice);
         Self { data }
@@ -145,9 +152,7 @@ impl Int8QuantizedVectorMetadata {
 
         let (min, max, sum, squared_sum) = vector.iter().fold(
             (f32::INFINITY, f32::NEG_INFINITY, 0.0f32, 0.0f32),
-            |(min, max, sum, sq_sum), &v| {
-                (min.min(v), max.max(v), sum + v, sq_sum + v * v)
-            },
+            |(min, max, sum, sq_sum), &v| (min.min(v), max.max(v), sum + v, sq_sum + v * v),
         );
 
         let scale = 254.0 / (max - min).max(1e-9);
@@ -236,7 +241,11 @@ impl Int8QuantizedVector {
 
     /// Create a new quantized vector from pre-formed blocks
     #[inline]
-    pub fn from_blocks(blocks: Vec<SimdBlock>, metadata: Int8QuantizedVectorMetadata, dimension: usize) -> Self {
+    pub fn from_blocks(
+        blocks: Vec<SimdBlock>,
+        metadata: Int8QuantizedVectorMetadata,
+        dimension: usize,
+    ) -> Self {
         Self {
             blocks,
             metadata,
@@ -274,7 +283,7 @@ impl Int8QuantizedVector {
         unsafe {
             std::slice::from_raw_parts(
                 self.blocks.as_ptr() as *const i8,
-                self.blocks.len() * SIMD_LANES
+                self.blocks.len() * SIMD_LANES,
             )
         }
     }
@@ -327,7 +336,7 @@ pub fn padded_dimension(dimension: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quantization::quantization::{Quantize, Dequantize};
+    use crate::quantization::quantization::{Dequantize, Quantize};
 
     #[test]
     fn test_simd_block_alignment() {
@@ -462,7 +471,7 @@ mod tests {
         // Empty vectors should produce empty quantized vectors
         let empty: Vec<f32> = vec![];
         let qv = empty.quantize();
-        
+
         assert_eq!(qv.len(), 0);
         assert_eq!(qv.as_slice().len(), 0);
         assert_eq!(qv.num_blocks(), 0);
@@ -472,28 +481,25 @@ mod tests {
     fn test_large_dimension_vectors() {
         // Test various large dimensions commonly used in embeddings
         let dimensions = vec![1000, 2048, 4096, 8192, 10000];
-        
+
         for dim in dimensions {
             let vector: Vec<f32> = (0..dim).map(|i| (i % 100) as f32 * 0.01).collect();
             let quantized = vector.quantize();
             let dequantized = quantized.dequantize();
-            
+
             // Verify roundtrip preserves dimension
             assert_eq!(dequantized.len(), dim, "Dimension mismatch for {}", dim);
-            
+
             // Verify quantization error is reasonable (< 1% RMSE for these test values)
-            let mse: f32 = vector.iter()
+            let mse: f32 = vector
+                .iter()
                 .zip(dequantized.iter())
                 .map(|(o, d)| (o - d).powi(2))
-                .sum::<f32>() / dim as f32;
+                .sum::<f32>()
+                / dim as f32;
             let rmse = mse.sqrt();
-            
-            assert!(
-                rmse < 0.01,
-                "RMSE too high for dimension {}: {}",
-                dim,
-                rmse
-            );
+
+            assert!(rmse < 0.01, "RMSE too high for dimension {}: {}", dim, rmse);
         }
     }
 
@@ -504,7 +510,7 @@ mod tests {
             let vector: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.1 - 0.5).collect();
             let quantized = vector.quantize();
             let dequantized = quantized.dequantize();
-            
+
             assert_eq!(dequantized.len(), dim);
         }
     }
@@ -515,7 +521,7 @@ mod tests {
         let uniform = vec![0.5f32; 100];
         let quantized = uniform.quantize();
         let dequantized = quantized.dequantize();
-        
+
         // All dequantized values should be very close to original
         for (i, &val) in dequantized.iter().enumerate() {
             assert!(
@@ -533,11 +539,15 @@ mod tests {
         let zeros = vec![0.0f32; 128];
         let quantized = zeros.quantize();
         let dequantized = quantized.dequantize();
-        
+
         assert_eq!(dequantized.len(), 128);
         // All values should be close to zero
         for val in &dequantized {
-            assert!(val.abs() < 0.01f32, "Zero vector dequantized to non-zero: {}", val);
+            assert!(
+                val.abs() < 0.01f32,
+                "Zero vector dequantized to non-zero: {}",
+                val
+            );
         }
     }
 }

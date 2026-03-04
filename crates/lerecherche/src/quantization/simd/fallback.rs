@@ -4,8 +4,8 @@
 //! widening step. It serves as the baseline implementation and correctness reference
 //! for platform-specific optimized versions.
 
-use wide::f32x8;
 use super::super::vector::Int8QuantizedVector;
+use wide::f32x8;
 
 /// Compute asymmetric dot product using ADC (fallback implementation)
 ///
@@ -68,7 +68,7 @@ pub fn dot_product_adc(query: &[f32], qvec: &Int8QuantizedVector, query_sum: f32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::quantization::{Quantize, Dequantize};
+    use crate::quantization::{Dequantize, Quantize};
 
     #[test]
     fn test_fallback_accuracy() {
@@ -82,7 +82,11 @@ mod tests {
 
         // Verify against dequantized calculation
         let dequantized = qvec.dequantize();
-        let expected: f32 = query.iter().zip(dequantized.iter()).map(|(q, d)| q * d).sum();
+        let expected: f32 = query
+            .iter()
+            .zip(dequantized.iter())
+            .map(|(q, d)| q * d)
+            .sum();
 
         assert!(
             (result - expected).abs() < 1e-4,
