@@ -73,6 +73,23 @@ auth/session_policy.rs                enforce_policy       (0.83)
 
 ---
 
+## 90%+ Token Savings for AI Coding Tools
+
+When an LLM reads your code with standard tools, it burns tokens on entire files just to understand one function. LeIndex returns **only what matters** — structured, context-aware results instead of raw file dumps.
+
+| Task | Standard Tools | LeIndex | Savings |
+|------|---------------:|--------:|--------:|
+| Understand a 500-line file | ~2,000 tokens | ~380 tokens | **81%** |
+| Find all callers of a function | ~5,800 tokens | ~420 tokens | **93%** |
+| Navigate project structure | ~8,500 tokens | ~650 tokens | **92%** |
+| Cross-file symbol rename | ~12,000 tokens | ~340 tokens | **97%** |
+
+Every tool call is **context-aware** — not atomic. When you look up a symbol, you don't just get its definition. You get its callers, callees, data dependencies, and impact radius. When you summarize a file, you get cross-file relationships that `Read` can never provide at any token cost. One LeIndex call replaces chains of `Grep → Read → Read → Read`.
+
+> See [full benchmarks](docs/TOOL_SUPREMACY_BENCHMARKS.md) for methodology and detailed comparisons.
+
+---
+
 ## Quick Start (2 minutes)
 
 ### Install
