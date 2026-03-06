@@ -229,6 +229,9 @@ pub struct SearchQuery {
 
     /// Minimum relevance threshold (0.0-1.0)
     pub threshold: Option<f32>,
+
+    /// Query type for adaptive ranking
+    pub query_type: Option<crate::ranking::QueryType>,
 }
 
 // ============================================================================
@@ -626,9 +629,31 @@ impl SearchEngine {
             // Normalize complexity to 0-1 range (divide by 100, not 10)
             let structural_score = (node.complexity as f32 / 100.0).min(1.0);
 
-            let score = self
-                .scorer
-                .score(semantic_score, structural_score, text_score);
+            // Use custom weights based on query type if provided
+            let score = if let Some(qt) = query.query_type {
+                match qt {
+                    crate::ranking::QueryType::Text => {
+                        // Prose/Text mode: heavily favor keyword overlap
+                        self.scorer
+                            .with_weights(0.2, 0.05, 0.75)
+                            .score(semantic_score, structural_score, text_score)
+                    }
+                    crate::ranking::QueryType::Semantic => {
+                        // Semantic-heavy mode
+                        self.scorer
+                            .with_weights(0.7, 0.1, 0.2)
+                            .score(semantic_score, structural_score, text_score)
+                    }
+                    crate::ranking::QueryType::Structural => {
+                        // Structural-heavy mode
+                        self.scorer
+                            .with_weights(0.3, 0.5, 0.2)
+                            .score(semantic_score, structural_score, text_score)
+                    }
+                }
+            } else {
+                self.scorer.score(semantic_score, structural_score, text_score)
+            };
 
             if score.overall > 0.0 {
                 // Apply relevance threshold if specified

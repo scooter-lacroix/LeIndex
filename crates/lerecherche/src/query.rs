@@ -534,6 +534,7 @@ impl QueryParser {
             expand_context: parsed.expand_context,
             query_embedding: None,
             threshold: None,
+            query_type: Some(parsed.query_type),
         }
     }
 

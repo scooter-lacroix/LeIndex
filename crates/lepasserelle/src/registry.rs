@@ -21,12 +21,14 @@
 //!     stats when possible.
 
 use crate::leindex::{IndexStats, LeIndex};
+use crate::errors::detect_corruption;
+use crate::watcher::IndexWatcher;
 use crate::mcp::protocol::JsonRpcError;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Default maximum number of projects kept in memory simultaneously.
 pub const DEFAULT_MAX_PROJECTS: usize = 5;
@@ -50,6 +52,9 @@ pub struct ProjectRegistry {
 
     /// Maximum number of projects to keep in memory.
     max_projects: usize,
+
+    /// File watchers per project (kept alive by registry).
+    watchers: Mutex<HashMap<PathBuf, IndexWatcher>>,
 }
 
 impl ProjectRegistry {
@@ -61,6 +66,7 @@ impl ProjectRegistry {
             default_project: RwLock::new(None),
             index_slots: Mutex::new(HashMap::new()),
             max_projects,
+            watchers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -70,13 +76,19 @@ impl ProjectRegistry {
         let handle: ProjectHandle = Arc::new(Mutex::new(leindex));
 
         let mut map = HashMap::new();
-        map.insert(path.clone(), handle);
+        map.insert(path.clone(), handle.clone());
 
         let mut lru = VecDeque::new();
         lru.push_back(path.clone());
 
         let mut slots = HashMap::new();
         slots.insert(path.clone(), Arc::new(Mutex::new(())));
+        let mut watchers = HashMap::new();
+        watchers.insert(
+            path.clone(),
+            IndexWatcher::start(path.clone(), handle.clone())
+                .expect("failed to start watcher for initial project"),
+        );
 
         Self {
             projects: RwLock::new(map),
@@ -84,6 +96,7 @@ impl ProjectRegistry {
             default_project: RwLock::new(Some(path)),
             index_slots: Mutex::new(slots),
             max_projects,
+            watchers: Mutex::new(watchers),
         }
     }
 
@@ -115,13 +128,18 @@ impl ProjectRegistry {
     ) -> Result<ProjectHandle, JsonRpcError> {
         let handle = self.get_or_load(project_path).await?;
 
-        let needs_index = {
+        let (needs_index, needs_refresh) = {
             let idx = handle.lock().await;
-            !idx.is_indexed()
+            let not_indexed = !idx.is_indexed();
+            let stale = !not_indexed && idx.is_stale_fast();
+            (not_indexed, stale)
         };
 
         if needs_index {
             let _ = self.index_handle(&handle, false).await?;
+        } else if needs_refresh {
+            let _ = self.index_handle(&handle, false).await?;
+            debug!("Auto-refreshed stale index");
         }
 
         Ok(handle)
@@ -166,6 +184,9 @@ impl ProjectRegistry {
 
         let mut slots = self.index_slots.lock().await;
         slots.remove(path);
+
+        let mut watchers = self.watchers.lock().await;
+        watchers.remove(path);
     }
 
     /// Resolve an optional `project_path` string to a canonical `PathBuf`.
@@ -203,19 +224,51 @@ impl ProjectRegistry {
         }
 
         let mut leindex = LeIndex::new(&canonical).map_err(|e| {
-            JsonRpcError::indexing_failed(format!(
-                "Failed to initialise LeIndex for '{}': {}",
-                canonical.display(),
-                e
-            ))
+            JsonRpcError::init_failed(
+                &canonical.display().to_string(),
+                &e.to_string(),
+            )
         })?;
         let _ = leindex.load_from_storage();
+
+        // Corruption detection and auto-repair
+        let corruption = detect_corruption(&canonical).unwrap_or(crate::errors::CorruptionStatus::Healthy);
+        if !corruption.is_usable() {
+            warn!(
+                "Corruption detected in {}: {}. Auto-repairing...",
+                canonical.display(),
+                corruption.message()
+            );
+            let storage_path = canonical.join(".leindex");
+            let _ = std::fs::remove_dir_all(&storage_path);
+
+            let mut fresh = LeIndex::new(&canonical).map_err(|e| {
+                JsonRpcError::init_failed(
+                    &canonical.display().to_string(),
+                    &format!("Original: {}. After wipe: {}", corruption.message(), e),
+                )
+            })?;
+            fresh.index_project(true).map_err(|e| {
+                JsonRpcError::indexing_failed(format!("Auto-repair reindex failed: {}", e))
+            })?;
+            leindex = fresh;
+        }
 
         let handle: ProjectHandle = Arc::new(Mutex::new(leindex));
 
         {
             let mut projects = self.projects.write().await;
             projects.insert(canonical.clone(), handle.clone());
+        }
+
+        // Start file watcher for auto-reindex
+        {
+            let mut watchers = self.watchers.lock().await;
+            if !watchers.contains_key(&canonical) {
+                if let Ok(w) = IndexWatcher::start(canonical.clone(), handle.clone()) {
+                    watchers.insert(canonical.clone(), w);
+                }
+            }
         }
 
         self.touch_lru(&canonical).await;
@@ -254,7 +307,7 @@ impl ProjectRegistry {
         if !force_reindex {
             let cached = {
                 let idx = handle.lock().await;
-                if idx.is_indexed() {
+                if idx.is_indexed() && !idx.is_stale_fast() {
                     Some(idx.get_stats().clone())
                 } else {
                     None
@@ -275,7 +328,10 @@ impl ProjectRegistry {
         let path_for_blocking = project_path.clone();
         let stats = tokio::task::spawn_blocking(move || {
             let mut temp = LeIndex::new(&path_for_blocking).map_err(|e| {
-                JsonRpcError::indexing_failed(format!("Failed to create LeIndex: {}", e))
+                JsonRpcError::init_failed(
+                    &path_for_blocking.display().to_string(),
+                    &e.to_string(),
+                )
             })?;
             temp.index_project(force_reindex)
                 .map_err(|e| JsonRpcError::indexing_failed(format!("Indexing failed: {}", e)))
@@ -284,7 +340,10 @@ impl ProjectRegistry {
         .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))??;
 
         let mut fresh = LeIndex::new(&project_path).map_err(|e| {
-            JsonRpcError::indexing_failed(format!("Failed to re-init LeIndex: {}", e))
+            JsonRpcError::init_failed(
+                &project_path.display().to_string(),
+                &e.to_string(),
+            )
         })?;
         fresh.load_from_storage().map_err(|e| {
             JsonRpcError::indexing_failed(format!("Failed to load indexed data: {}", e))

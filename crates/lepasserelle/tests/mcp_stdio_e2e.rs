@@ -10,8 +10,9 @@
 use lepasserelle::mcp::handlers::{
     ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, EditApplyHandler, EditPreviewHandler,
     FileSummaryHandler, GrepSymbolsHandler, ImpactAnalysisHandler, IndexHandler,
-    PhaseAnalysisAliasHandler, PhaseAnalysisHandler, ProjectMapHandler, ReadSymbolHandler,
-    RenameSymbolHandler, SearchHandler, SymbolLookupHandler, ToolHandler,
+    PhaseAnalysisAliasHandler, PhaseAnalysisHandler, ProjectMapHandler, ReadFileHandler, 
+    ReadSymbolHandler, RenameSymbolHandler, SearchHandler, SymbolLookupHandler, 
+    TextSearchHandler, GitStatusHandler, ToolHandler,
 };
 use lepasserelle::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use lepasserelle::mcp::server::{handle_tool_call, list_tools_json};
@@ -43,6 +44,10 @@ fn all_handlers() -> Vec<ToolHandler> {
         ToolHandler::EditApply(EditApplyHandler),
         ToolHandler::RenameSymbol(RenameSymbolHandler),
         ToolHandler::ImpactAnalysis(ImpactAnalysisHandler),
+        // Phase E: Precision Tooling
+        ToolHandler::TextSearch(TextSearchHandler),
+        ToolHandler::ReadFile(ReadFileHandler),
+        ToolHandler::GitStatus(GitStatusHandler),
     ]
 }
 
@@ -141,14 +146,14 @@ fn test_no_double_newline_in_success_response() {
 // ============================================================================
 
 #[test]
-fn test_tools_list_returns_16_tools() {
+fn test_tools_list_returns_19_tools() {
     let handlers = all_handlers();
     let result = list_tools_json(&handlers);
     let tools = result["tools"].as_array().expect("tools must be an array");
     assert_eq!(
         tools.len(),
-        16,
-        "Expected exactly 16 registered tools, got {}",
+        19,
+        "Expected exactly 19 registered tools, got {}",
         tools.len()
     );
 }
@@ -183,6 +188,10 @@ fn test_tools_list_all_expected_names_present() {
         "leindex_edit_apply",
         "leindex_rename_symbol",
         "leindex_impact_analysis",
+        // Phase E
+        "leindex_text_search",
+        "leindex_read_file",
+        "leindex_git_status",
     ];
 
     for expected in &expected_names {

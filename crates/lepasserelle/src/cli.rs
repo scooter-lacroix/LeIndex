@@ -305,7 +305,7 @@ async fn cmd_search_impl(
     }
 
     // Perform search
-    let results = leindex.search(&query, top_k).context("Search failed")?;
+    let results = leindex.search(&query, top_k, None).context("Search failed")?;
 
     if results.is_empty() {
         println!("No results found for: {}", query);
@@ -556,7 +556,8 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, EditApplyHandler,
         EditPreviewHandler, FileSummaryHandler, GrepSymbolsHandler, ImpactAnalysisHandler,
         IndexHandler, PhaseAnalysisAliasHandler, PhaseAnalysisHandler, ProjectMapHandler,
-        ReadSymbolHandler, RenameSymbolHandler, SearchHandler, SymbolLookupHandler,
+        ReadFileHandler, ReadSymbolHandler, RenameSymbolHandler, SearchHandler, 
+        SymbolLookupHandler, TextSearchHandler, GitStatusHandler,
     };
     use crate::mcp::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse};
     use std::io::{self, BufRead, Read, Write};
@@ -604,6 +605,10 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         crate::mcp::handlers::ToolHandler::EditApply(EditApplyHandler),
         crate::mcp::handlers::ToolHandler::RenameSymbol(RenameSymbolHandler),
         crate::mcp::handlers::ToolHandler::ImpactAnalysis(ImpactAnalysisHandler),
+        // Phase E: Precision Tooling
+        crate::mcp::handlers::ToolHandler::TextSearch(TextSearchHandler),
+        crate::mcp::handlers::ToolHandler::ReadFile(ReadFileHandler),
+        crate::mcp::handlers::ToolHandler::GitStatus(GitStatusHandler),
     ]);
 
     eprintln!("[INFO] LeIndex MCP stdio server starting");

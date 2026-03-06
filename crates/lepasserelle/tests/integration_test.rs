@@ -672,9 +672,9 @@ fn greet() {
         let mut leindex = LeIndex::new(&project_path).unwrap();
         let _ = leindex.index_project(false).unwrap();
 
-        let _ = leindex.search("greet", 5).unwrap();
+        let _ = leindex.search("greet", 5, None).unwrap();
         let first = leindex.get_cache_stats().unwrap();
-        let _ = leindex.search("greet", 5).unwrap();
+        let _ = leindex.search("greet", 5, None).unwrap();
         let second = leindex.get_cache_stats().unwrap();
 
         assert!(second.cache_hits >= first.cache_hits);
@@ -720,8 +720,8 @@ fn greet() {
             "Expected indexed nodes > 0, got {:?}",
             stats
         );
-        let _ = leindex.search("greet", 5).unwrap();
-        let _ = leindex.search("greet", 5).unwrap();
+        let _ = leindex.search("greet", 5, None).unwrap();
+        let _ = leindex.search("greet", 5, None).unwrap();
         let cache_stats = leindex.get_cache_stats().unwrap();
         assert!(
             cache_stats.cache_hits > 0,

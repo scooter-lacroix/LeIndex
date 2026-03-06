@@ -403,15 +403,43 @@ impl JsonRpcError {
         )
     }
 
+    /// Create an initialization failure error with multi-step remediation.
+    pub fn init_failed(path: &str, inner: &str) -> Self {
+        Self::with_data(
+            error_codes::INIT_FAILED,
+            format!(
+                "Failed to initialize LeIndex for '{}'.\n\
+                 Inner error: {}\n\n\
+                 Remediation:\n\
+                 1. Check write permissions on {}\n\
+                 2. Set LEINDEX_HOME=/writable/path env var\n\
+                 3. Delete .leindex/ directory and retry\n\
+                 4. Check available disk space",
+                path, inner, path
+            ),
+            serde_json::json!({
+                "error_type": "init_failed",
+                "inner_error": inner,
+            }),
+        )
+    }
+
     /// Create an indexing failed error
     pub fn indexing_failed(msg: impl Into<String>) -> Self {
         let m = msg.into();
         Self::with_data(
             error_codes::INDEXING_FAILED,
-            &m,
+            format!(
+                "{}\n\n\
+                 Remediation:\n\
+                 1. Verify project_path is a valid directory with source files\n\
+                 2. Try force_reindex=true to rebuild the index\n\
+                 3. Delete .leindex/ directory and retry\n\
+                 4. Check disk space and permissions",
+                m
+            ),
             serde_json::json!({
                 "error_type": "indexing_failed",
-                "suggestion": "Check that project_path is a valid directory with source files. Use force_reindex=true to rebuild."
             }),
         )
     }
@@ -421,10 +449,17 @@ impl JsonRpcError {
         let m = msg.into();
         Self::with_data(
             error_codes::SEARCH_FAILED,
-            &m,
+            format!(
+                "{}\n\n\
+                 Remediation:\n\
+                 1. Ensure the project is indexed (call leindex_index)\n\
+                 2. Try a simpler query (single term instead of complex pattern)\n\
+                 3. Use leindex_grep_symbols for exact/regex pattern matching\n\
+                 4. Try force_reindex=true if the index may be stale",
+                m
+            ),
             serde_json::json!({
                 "error_type": "search_failed",
-                "suggestion": "Ensure the project is indexed. Try a different query or increase top_k."
             }),
         )
     }
@@ -434,10 +469,16 @@ impl JsonRpcError {
         let m = msg.into();
         Self::with_data(
             error_codes::CONTEXT_EXPANSION_FAILED,
-            &m,
+            format!(
+                "{}\n\n\
+                 Remediation:\n\
+                 1. Check that the node_id exists in the indexed project\n\
+                 2. Use leindex_grep_symbols to find valid symbol names\n\
+                 3. Try force_reindex=true if the index may be stale",
+                m
+            ),
             serde_json::json!({
                 "error_type": "context_expansion_failed",
-                "suggestion": "Check that the node_id exists. Use leindex_grep_symbols to find valid symbol names."
             }),
         )
     }
@@ -598,6 +639,15 @@ pub mod error_codes {
 
     /// Memory limit exceeded during operation
     pub const MEMORY_LIMIT_EXCEEDED: i32 = -32006;
+
+    /// Index is stale (files changed since last index)
+    pub const INDEX_STALE: i32 = -32007;
+
+    /// Index initialization failed (directory creation, permissions, etc.)
+    pub const INIT_FAILED: i32 = -32008;
+
+    /// Filesystem error (permissions, disk space, etc.)
+    pub const FILESYSTEM_ERROR: i32 = -32009;
 }
 
 #[cfg(test)]

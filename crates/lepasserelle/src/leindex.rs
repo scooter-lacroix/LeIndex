@@ -17,8 +17,52 @@ use leparse::traits::SignatureInfo;
 use lerecherche::search::{NodeInfo, SearchEngine, SearchQuery, SearchResult};
 use lestockage::{pdg_store, schema::Storage, UniqueProjectId};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
+
+// Supported source file extensions for indexing
+const SOURCE_FILE_EXTENSIONS: &[&str] = &[
+    // Main languages
+    "rs", "py", "js", "ts", "tsx", "jsx",
+    // Systems languages
+    "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp",
+    // Others
+    "cs", "rb", "php", "lua", "scala", "sc", "sh", "bash", "json",
+];
+
+// Directories to always skip during source collection
+const ALWAYS_SKIP_DIRS: &[&str] = &[
+    // Version control
+    ".git",
+    ".hg",
+    ".svn",
+    // Build outputs
+    "target",
+    "build",
+    "dist",
+    "out",
+    ".next",
+    "coverage",
+    // Package managers / dependencies
+    "node_modules",
+    "vendor",
+    "bower_components",
+    // Python virtual environments & caches
+    ".venv",
+    "venv",
+    "env",
+    "__pycache__",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    // IDE / editor metadata
+    ".idea",
+    ".vscode",
+    // Misc generated
+    ".leindex",
+];
 
 // ============================================================================
 // TF-IDF EMBEDDING SYSTEM
@@ -298,6 +342,9 @@ pub struct LeIndex {
     /// Project path
     project_path: PathBuf,
 
+    /// Resolved storage root for index artifacts (may be outside project)
+    storage_path: PathBuf,
+
     /// Project identifier (legacy, for backward compatibility)
     project_id: String,
 
@@ -477,7 +524,131 @@ pub struct Diagnostics {
     pub index_health: String,
 }
 
+/// Coverage report of indexed vs source files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoverageReport {
+    /// Total number of source files discovered
+    pub total_source_files: usize,
+    /// Number of files currently indexed
+    pub indexed_files: usize,
+    /// Source files missing from the index
+    pub missing_files: Vec<String>,
+    /// Index entries whose source files no longer exist
+    pub orphaned_entries: Vec<String>,
+    /// Percentage of source files covered by the index
+    pub coverage_pct: f64,
+}
+
 impl LeIndex {
+    /// Try to create a directory and verify it is writable.
+    fn try_create_dir(path: &Path) -> bool {
+        std::fs::create_dir_all(path).is_ok()
+            && std::fs::metadata(path)
+                .map(|m| !m.permissions().readonly())
+                .unwrap_or(false)
+    }
+
+    /// Resolve the storage directory using a multi-location fallback chain:
+    /// 1. In-project `.leindex/`
+    /// 2. `LEINDEX_HOME` env var
+    /// 3. XDG data dir (`~/.local/share/leindex/<hash>`)
+    /// 4. System temp dir (`/tmp/leindex/<hash>`)
+    fn resolve_storage_path(project_path: &Path) -> Result<PathBuf> {
+        let path_hash = &blake3::hash(project_path.to_string_lossy().as_bytes())
+            .to_hex()[..12];
+        let dir_name = project_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+
+        // 1. Prefer in-project .leindex
+        let in_project = project_path.join(".leindex");
+        if Self::try_create_dir(&in_project) {
+            return Ok(in_project);
+        }
+
+        // 2. LEINDEX_HOME env var
+        if let Ok(home) = std::env::var("LEINDEX_HOME") {
+            let env_path = PathBuf::from(home)
+                .join(format!("{}-{}", dir_name, path_hash));
+            if Self::try_create_dir(&env_path) {
+                warn!(
+                    "Using LEINDEX_HOME fallback for storage: {}",
+                    env_path.display()
+                );
+                return Ok(env_path);
+            }
+        }
+
+        // 3. XDG data dir (~/.local/share/leindex/<hash>)
+        let xdg_dir = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("leindex")
+            .join(format!("{}-{}", dir_name, path_hash));
+        if Self::try_create_dir(&xdg_dir) {
+            warn!(
+                "Using XDG data dir fallback for storage: {}",
+                xdg_dir.display()
+            );
+            return Ok(xdg_dir);
+        }
+
+        // 4. System temp dir
+        let tmp_path = std::env::temp_dir()
+            .join("leindex")
+            .join(format!("{}-{}", dir_name, path_hash));
+        std::fs::create_dir_all(&tmp_path).with_context(|| {
+            format!(
+                "Failed to create .leindex storage directory.\n\
+                 Tried:\n\
+                 1. {} (in-project)\n\
+                 2. $LEINDEX_HOME (not set or not writable)\n\
+                 3. {} (XDG data dir)\n\
+                 4. {} (temp dir)\n\n\
+                 Fix: Check directory permissions, or set LEINDEX_HOME env var to a writable path.",
+                in_project.display(),
+                xdg_dir.display(),
+                tmp_path.display(),
+            )
+        })?;
+        warn!(
+            "Using temp dir fallback for storage: {}",
+            tmp_path.display()
+        );
+        Ok(tmp_path)
+    }
+
+    /// Open storage with retry and exponential backoff for transient failures
+    /// (e.g., SQLite BUSY locks from concurrent access).
+    fn open_storage_with_retry(db_path: &Path, max_retries: u32) -> Result<Storage> {
+        let mut attempt = 0;
+        loop {
+            match Storage::open(db_path) {
+                Ok(s) => return Ok(s),
+                Err(e) if attempt < max_retries => {
+                    attempt += 1;
+                    let delay = std::time::Duration::from_millis(100 * 2u64.pow(attempt));
+                    warn!(
+                        "Storage open attempt {}/{} failed: {}. Retrying in {:?}",
+                        attempt, max_retries, e, delay
+                    );
+                    std::thread::sleep(delay);
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Failed to open storage at {} after {} attempts.\n\
+                             Suggestion: Delete {} and re-index, or check disk space.",
+                            db_path.display(),
+                            max_retries,
+                            db_path.display()
+                        )
+                    });
+                }
+            }
+        }
+    }
+
     /// Create a new LeIndex instance for a project
     ///
     /// # Arguments
@@ -505,12 +676,11 @@ impl LeIndex {
             .unwrap_or("unknown")
             .to_string();
 
-        // Initialize storage first (needed for conflict resolution)
-        let storage_path = project_path.join(".leindex");
-        std::fs::create_dir_all(&storage_path).context("Failed to create .leindex directory")?;
+        // Initialize storage with multi-location fallback and retry
+        let storage_path = Self::resolve_storage_path(&project_path)?;
 
         let db_path = storage_path.join("leindex.db");
-        let storage = Storage::open(&db_path).context("Failed to initialize storage")?;
+        let storage = Self::open_storage_with_retry(&db_path, 3)?;
 
         // Generate unique project ID with conflict resolution
         // Load existing projects with same base name
@@ -550,6 +720,7 @@ impl LeIndex {
 
         Ok(Self {
             project_path,
+            storage_path,
             project_id,
             unique_id,
             storage,
@@ -816,53 +987,6 @@ impl LeIndex {
         let project_config =
             crate::config::ProjectConfig::load(&self.project_path).unwrap_or_default();
 
-        // All file extensions supported by the leparse parser.
-        // This must stay in sync with leparse::grammar::LanguageId::from_extension.
-        let extensions = [
-            "rs", "py", "js", "ts", "tsx", "jsx", // Main languages
-            "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Systems languages
-            "cs",  // C#
-            "rb", "php", "lua", "scala", "sc", // Scripting languages
-            "sh", "bash", // Shell
-            "json", // Data
-        ];
-
-        // Directories to always skip (fast-path, checked before config-based
-        // exclusion to avoid a HashMap lookup for the most common cases).
-        // These are a superset of config::ExclusionConfig defaults — the config
-        // exclusions catch anything else the user adds.
-        const ALWAYS_SKIP_DIRS: &[&str] = &[
-            // Version control
-            ".git",
-            ".hg",
-            ".svn",
-            // Build outputs
-            "target",
-            "build",
-            "dist",
-            "out",
-            ".next",
-            "coverage",
-            // Package managers / dependencies
-            "node_modules",
-            "vendor",
-            "bower_components",
-            // Python virtual environments & caches
-            ".venv",
-            "venv",
-            "env",
-            "__pycache__",
-            ".tox",
-            ".mypy_cache",
-            ".pytest_cache",
-            ".ruff_cache",
-            // IDE / editor metadata
-            ".idea",
-            ".vscode",
-            // Misc generated
-            ".leindex",
-        ];
-
         // Walk the project directory efficiently
         let mut walker = walkdir::WalkDir::new(&self.project_path).into_iter();
 
@@ -901,9 +1025,61 @@ impl LeIndex {
             // Check if file has a supported source extension and isn't excluded
             if entry.file_type().is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if extensions.contains(&ext) && !project_config.should_exclude(path) {
+                    if SOURCE_FILE_EXTENSIONS.contains(&ext)
+                        && !project_config.should_exclude(path)
+                    {
                         let hash = self.hash_file(path)?;
                         source_files.push((path.to_path_buf(), hash));
+                    }
+                }
+            }
+        }
+
+        Ok(source_files)
+    }
+
+    fn collect_source_file_paths(&self) -> Result<Vec<PathBuf>> {
+        let mut source_files = Vec::new();
+
+        let project_config =
+            crate::config::ProjectConfig::load(&self.project_path).unwrap_or_default();
+
+        let mut walker = walkdir::WalkDir::new(&self.project_path).into_iter();
+
+        while let Some(entry) = walker.next() {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            let path = entry.path();
+            let file_name = entry.file_name().to_string_lossy();
+
+            if path != self.project_path && file_name.starts_with('.') && file_name != "." {
+                if entry.file_type().is_dir() {
+                    walker.skip_current_dir();
+                }
+                continue;
+            }
+
+            if entry.file_type().is_dir() {
+                if ALWAYS_SKIP_DIRS.contains(&file_name.as_ref()) {
+                    walker.skip_current_dir();
+                    continue;
+                }
+                if project_config.should_exclude(path) {
+                    walker.skip_current_dir();
+                    continue;
+                }
+                continue;
+            }
+
+            if entry.file_type().is_file() {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if SOURCE_FILE_EXTENSIONS.contains(&ext)
+                        && !project_config.should_exclude(path)
+                    {
+                        source_files.push(path.to_path_buf());
                     }
                 }
             }
@@ -992,7 +1168,7 @@ impl LeIndex {
     ///     println!("{}: {} ({:.2})", result.rank, result.symbol_name, result.score.total);
     /// }
     /// ```
-    pub fn search(&mut self, query: &str, top_k: usize) -> Result<Vec<SearchResult>> {
+    pub fn search(&mut self, query: &str, top_k: usize, query_type: Option<lerecherche::ranking::QueryType>) -> Result<Vec<SearchResult>> {
         if self.search_engine.is_empty() {
             warn!("Search attempted on empty index");
             return Ok(Vec::new());
@@ -1025,6 +1201,7 @@ impl LeIndex {
             expand_context: false,
             query_embedding: Some(self.generate_query_embedding(query)),
             threshold: Some(0.1), // Added default threshold for better quality
+            query_type,
         };
 
         let mut results = self
@@ -1127,6 +1304,7 @@ impl LeIndex {
             expand_context: false,
             query_embedding: Some(self.generate_query_embedding(query)),
             threshold: Some(0.1), // Added threshold for better quality
+            query_type: Some(lerecherche::ranking::QueryType::Semantic),
         };
 
         let results = self
@@ -1300,6 +1478,59 @@ impl LeIndex {
         Ok(())
     }
 
+    /// Check which source files have changed since last index.
+    /// Returns (changed_paths, deleted_paths).
+    pub fn check_freshness(&self) -> Result<(Vec<PathBuf>, Vec<String>)> {
+        let indexed_files =
+            lestockage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
+                .unwrap_or_default();
+
+        let current = self.collect_source_files_with_hashes()?;
+        let current_map: HashMap<String, String> = current
+            .iter()
+            .map(|(p, h)| (p.display().to_string(), h.clone()))
+            .collect();
+
+        let changed: Vec<PathBuf> = current
+            .iter()
+            .filter(|(p, h)| indexed_files.get(&p.display().to_string()) != Some(h))
+            .map(|(p, _)| p.clone())
+            .collect();
+
+        let deleted: Vec<String> = indexed_files
+            .keys()
+            .filter(|k| !current_map.contains_key(*k))
+            .cloned()
+            .collect();
+
+        Ok((changed, deleted))
+    }
+
+    /// Quick staleness check without computing hashes—uses mtime only.
+    pub fn is_stale_fast(&self) -> bool {
+        let index_mtime = self
+            .storage_path
+            .join("leindex.db")
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok();
+
+        let Some(db_time) = index_mtime else { return true };
+
+        let files = self.collect_source_file_paths().unwrap_or_default();
+        if files.is_empty() {
+            return false;
+        }
+
+        let sample_size = (files.len() / 10).max(5).min(files.len());
+        files.iter().take(sample_size).any(|f| {
+            f.metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t > db_time)
+                .unwrap_or(false)
+        })
+    }
+
     // ========================================================================
     // ACCESSOR METHODS (for MCP server integration)
     // ========================================================================
@@ -1307,6 +1538,11 @@ impl LeIndex {
     /// Get the project path
     pub fn project_path(&self) -> &Path {
         &self.project_path
+    }
+
+    /// Get the storage path used for index artifacts
+    pub fn storage_path(&self) -> &Path {
+        &self.storage_path
     }
 
     /// Get the project ID (legacy, for backward compatibility)
@@ -1475,6 +1711,35 @@ impl LeIndex {
         self.storage.close().context("Failed to close storage")?;
         info!("Closed LeIndex for project: {}", self.project_id);
         Ok(())
+    }
+
+    /// Report which files are indexed and which are not.
+    pub fn coverage_report(&self) -> Result<CoverageReport> {
+        let indexed_files =
+            lestockage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
+                .unwrap_or_default();
+        let source_files = self.collect_source_file_paths()?;
+
+        let indexed_set: HashSet<String> = indexed_files.keys().cloned().collect();
+        let source_set: HashSet<String> = source_files
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+
+        let missing: Vec<String> = source_set.difference(&indexed_set).cloned().collect();
+        let orphaned: Vec<String> = indexed_set.difference(&source_set).cloned().collect();
+
+        Ok(CoverageReport {
+            total_source_files: source_files.len(),
+            indexed_files: indexed_files.len(),
+            missing_files: missing,
+            orphaned_entries: orphaned,
+            coverage_pct: if source_files.is_empty() {
+                100.0
+            } else {
+                (indexed_files.len() as f64 / source_files.len() as f64) * 100.0
+            },
+        })
     }
 
     // ========================================================================

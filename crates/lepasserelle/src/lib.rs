@@ -89,6 +89,9 @@ pub mod memory;
 /// Multi-project registry with per-project concurrency.
 #[cfg(feature = "mcp-server")]
 pub mod registry;
+/// File watcher for auto-reindex.
+#[cfg(feature = "mcp-server")]
+pub mod watcher;
 
 /// Model Context Protocol (MCP) server implementation.
 #[cfg(feature = "mcp-server")]

@@ -38,6 +38,7 @@ impl Score {
 }
 
 /// Hybrid scorer combining semantic and structural signals
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct HybridScorer {
     /// Weight for semantic component
     semantic_weight: f32,
@@ -125,11 +126,7 @@ impl HybridScorer {
     }
 }
 
-impl Default for HybridScorer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+
 
 /// Query type for adaptive ranking
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

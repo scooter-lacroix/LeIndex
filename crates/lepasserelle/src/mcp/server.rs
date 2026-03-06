@@ -6,8 +6,9 @@
 use super::handlers::{
     ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, EditApplyHandler, EditPreviewHandler,
     FileSummaryHandler, GrepSymbolsHandler, ImpactAnalysisHandler, IndexHandler,
-    PhaseAnalysisAliasHandler, PhaseAnalysisHandler, ProjectMapHandler, ReadSymbolHandler,
-    RenameSymbolHandler, SearchHandler, SymbolLookupHandler, ToolHandler,
+    PhaseAnalysisAliasHandler, PhaseAnalysisHandler, ProjectMapHandler, ReadFileHandler,
+    ReadSymbolHandler, RenameSymbolHandler, SearchHandler, SymbolLookupHandler, 
+    TextSearchHandler, GitStatusHandler, ToolHandler,
 };
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::registry::ProjectRegistry;
@@ -118,6 +119,10 @@ impl McpServer {
             ToolHandler::EditApply(EditApplyHandler),
             ToolHandler::RenameSymbol(RenameSymbolHandler),
             ToolHandler::ImpactAnalysis(ImpactAnalysisHandler),
+            // Phase E: Precision Tooling
+            ToolHandler::TextSearch(TextSearchHandler),
+            ToolHandler::ReadFile(ReadFileHandler),
+            ToolHandler::GitStatus(GitStatusHandler),
         ];
         HANDLERS
             .set(handlers)

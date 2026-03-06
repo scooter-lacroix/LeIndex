@@ -8,8 +8,9 @@ use crate::leindex::LeIndex;
 use crate::registry::ProjectRegistry;
 use leedit::EditChange;
 use lephase::{run_phase_analysis, DocsMode, FormatMode, PhaseOptions, PhaseSelection};
+use regex::RegexBuilder;
 use serde_json::Value;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Enum of all tool handlers
@@ -52,6 +53,13 @@ pub enum ToolHandler {
     RenameSymbol(RenameSymbolHandler),
     /// Handler for transitive dependency impact analysis
     ImpactAnalysis(ImpactAnalysisHandler),
+    // Phase E: Precision Tooling
+    /// Handler for PDG-enriched text search (replaces rg)
+    TextSearch(TextSearchHandler),
+    /// Handler for PDG-annotated file read (replaces Read/cat)
+    ReadFile(ReadFileHandler),
+    /// Handler for PDG-aware git status (replaces git status/diff)
+    GitStatus(GitStatusHandler),
 }
 
 impl ToolHandler {
@@ -74,6 +82,9 @@ impl ToolHandler {
             ToolHandler::EditApply(h) => h.name(),
             ToolHandler::RenameSymbol(h) => h.name(),
             ToolHandler::ImpactAnalysis(h) => h.name(),
+            ToolHandler::TextSearch(h) => h.name(),
+            ToolHandler::ReadFile(h) => h.name(),
+            ToolHandler::GitStatus(h) => h.name(),
         }
     }
 
@@ -96,6 +107,9 @@ impl ToolHandler {
             ToolHandler::EditApply(h) => h.description(),
             ToolHandler::RenameSymbol(h) => h.description(),
             ToolHandler::ImpactAnalysis(h) => h.description(),
+            ToolHandler::TextSearch(h) => h.description(),
+            ToolHandler::ReadFile(h) => h.description(),
+            ToolHandler::GitStatus(h) => h.description(),
         }
     }
 
@@ -118,6 +132,9 @@ impl ToolHandler {
             ToolHandler::EditApply(h) => h.argument_schema(),
             ToolHandler::RenameSymbol(h) => h.argument_schema(),
             ToolHandler::ImpactAnalysis(h) => h.argument_schema(),
+            ToolHandler::TextSearch(h) => h.argument_schema(),
+            ToolHandler::ReadFile(h) => h.argument_schema(),
+            ToolHandler::GitStatus(h) => h.argument_schema(),
         }
     }
 
@@ -144,6 +161,9 @@ impl ToolHandler {
             ToolHandler::EditApply(h) => h.execute(registry, args).await,
             ToolHandler::RenameSymbol(h) => h.execute(registry, args).await,
             ToolHandler::ImpactAnalysis(h) => h.execute(registry, args).await,
+            ToolHandler::TextSearch(h) => h.execute(registry, args).await,
+            ToolHandler::ReadFile(h) => h.execute(registry, args).await,
+            ToolHandler::GitStatus(h) => h.execute(registry, args).await,
         }
     }
 }
@@ -269,7 +289,7 @@ also accept project_path and auto-index, so explicit indexing is optional."
             let handle = registry.get_or_create(Some(&project_path)).await?;
             let index = handle.lock().await;
             if index.is_indexed() {
-                return serde_json::to_value(index.get_stats()).map_err(|e| {
+                return serde_json::to_value(index.get_stats()).map(|v| wrap_with_meta(v, &index)).map_err(|e| {
                     JsonRpcError::internal_error(format!("Serialization error: {}", e))
                 });
             }
@@ -279,7 +299,10 @@ also accept project_path and auto-index, so explicit indexing is optional."
             .index_project(Some(&project_path), force_reindex)
             .await?;
 
+        let index = registry.get_or_create(Some(&project_path)).await?;
+        let idx = index.lock().await;
         serde_json::to_value(stats)
+            .map(|v| wrap_with_meta(v, &idx))
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
     }
 }
@@ -323,11 +346,23 @@ to auto-switch/auto-index projects."
                     "minimum": 1,
                     "maximum": 100
                 },
+                "scope": {
+                    "type": "string",
+                    "description": "Optional path to limit results (absolute or relative to project root)"
+                },
                 "offset": {
                     "type": "integer",
                     "description": "Skip the first N results for pagination (default: 0)",
                     "default": 0,
                     "minimum": 0
+                },
+                "search_mode": {
+                    "type": "string",
+                    "enum": ["code", "prose", "auto"],
+                    "description": "Scoring mode: 'code' (default) emphasizes semantic/structural similarity, \
+'prose' boosts text-match weight for natural-language queries (e.g. roadmap, README content), \
+'auto' detects based on query shape.",
+                    "default": "code"
                 }
             },
             "required": ["query"]
@@ -343,10 +378,31 @@ to auto-switch/auto-index projects."
         let query = extract_string(&args, "query")?;
         let top_k = extract_usize(&args, "top_k", 10)?;
         let offset = extract_usize(&args, "offset", 0)?;
+        let search_mode = args.get("search_mode").and_then(|v| v.as_str()).unwrap_or("code");
         let project_path = args.get("project_path").and_then(|v| v.as_str());
+
+        // Resolve query type
+        let query_type = match search_mode {
+            "prose" => Some(lerecherche::ranking::QueryType::Text),
+            "code" => Some(lerecherche::ranking::QueryType::Semantic),
+            "auto" => {
+                let q_lower = query.to_lowercase();
+                let prose_keywords = ["how", "what", "where", "why", "who", "when", "can", "is", "explain", "describe", "find", "show"];
+                let is_natural_language = q_lower.split_whitespace().count() > 3 || 
+                                         prose_keywords.iter().any(|k| q_lower.contains(k));
+                
+                if is_natural_language {
+                    Some(lerecherche::ranking::QueryType::Text)
+                } else {
+                    Some(lerecherche::ranking::QueryType::Semantic)
+                }
+            },
+            _ => Some(lerecherche::ranking::QueryType::Semantic),
+        };
 
         let handle = registry.get_or_create(project_path).await?;
         let mut index = handle.lock().await;
+        let scope = resolve_scope(&args, index.project_path())?;
 
         if index.search_engine().is_empty() {
             return Err(JsonRpcError::project_not_indexed(
@@ -356,18 +412,32 @@ to auto-switch/auto-index projects."
 
         // Fetch top_k + offset results, then slice for pagination
         let all_results = index
-            .search(&query, top_k + offset)
+            .search(&query, top_k + offset, query_type)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
-        let page: Vec<_> = all_results.into_iter().skip(offset).collect();
+        let filtered: Vec<_> = all_results
+            .into_iter()
+            .filter(|r| match &scope {
+                Some(s) => r.file_path.starts_with(s),
+                None => true,
+            })
+            .collect();
+
+        let total_filtered = filtered.len();
+
+        let page: Vec<_> = filtered
+            .into_iter()
+            .skip(offset)
+            .take(top_k)
+            .collect();
         let total_returned = page.len();
 
-        Ok(serde_json::json!({
+        Ok(wrap_with_meta(serde_json::json!({
             "results": serde_json::to_value(&page).map_err(|e|
                 JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
             "offset": offset,
             "count": total_returned,
-            "has_more": total_returned == top_k,
+            "has_more": offset + total_returned < total_filtered,
             "scoring_explanation": {
                 "semantic": "TF-IDF cosine similarity (0-1) - measures conceptual relevance",
                 "text_match": "Token overlap ratio (0-1) - exact keyword matches",
@@ -378,7 +448,7 @@ to auto-switch/auto-index projects."
                 "score_0.5_to_0.79": "Moderately relevant - worth reviewing",
                 "score_below_0.5": "Low relevance - refine query or broaden context"
             }
-        }))
+        }), &index))
     }
 }
 
@@ -451,6 +521,7 @@ to auto-switch/auto-index projects."
 
         serde_json::to_value(result)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
+            .map(|v| wrap_with_meta(v, &writer))
     }
 }
 
@@ -523,6 +594,7 @@ without reading the entire file. Accepts project_path to auto-switch between pro
 
         serde_json::to_value(result)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
+            .map(|v| wrap_with_meta(v, &reader))
     }
 }
 
@@ -628,13 +700,17 @@ fn phase_analysis_schema() -> Value {
             },
             "include_docs": {
                 "type": "boolean",
-                "description": "Include Markdown/Text docs in phase analysis (default: false). \
-    Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
+                "description": "IMPORTANT: Enable to include prose/documentation files (README, docs/, *.md) \
+in the analysis. Without this, only source code files are analyzed. Set to true when you need \
+architectural docs, changelogs, or project documentation. Also accepts strings: 'true'/'false'.",
                 "default": false
             },
             "docs_mode": {
                 "type": "string",
                 "enum": ["off", "markdown", "text", "all"],
+                "description": "Controls which documentation files to include: 'off' (default, code only), \
+'markdown' (*.md files like README, CHANGELOG), 'text' (*.txt, *.rst), 'all' (all doc formats). \
+Use 'markdown' or 'all' to analyze project documentation alongside code.",
                 "default": "off"
             }
         },
@@ -871,7 +947,8 @@ async fn execute_phase_analysis(
         );
     }
 
-    Ok(report_value)
+    let index_for_meta = handle.lock().await;
+    Ok(wrap_with_meta(report_value, &index_for_meta))
 }
 
 /// Handler for leindex_diagnostics
@@ -919,8 +996,46 @@ impl DiagnosticsHandler {
             JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e))
         })?;
 
-        serde_json::to_value(diagnostics)
-            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
+        let (changed, deleted) = reader.check_freshness().unwrap_or_else(|_| (vec![], vec![]));
+        let storage_path = reader.storage_path().display().to_string();
+        let db_size = std::fs::metadata(reader.storage_path().join("leindex.db"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let coverage = reader.coverage_report().ok();
+
+        let mut diag_json = serde_json::to_value(diagnostics)
+            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?;
+
+        if let Value::Object(ref mut map) = diag_json {
+            map.insert(
+                "storage_path".to_string(),
+                serde_json::json!(storage_path),
+            );
+            map.insert("db_size_bytes".to_string(), serde_json::json!(db_size));
+
+            let staleness = if changed.is_empty() && deleted.is_empty() {
+                serde_json::json!({
+                    "status": "fresh",
+                    "changed_files": 0,
+                    "deleted_files": 0,
+                })
+            } else {
+                serde_json::json!({
+                    "status": "stale",
+                    "changed_files": changed.len(),
+                    "deleted_files": deleted.len(),
+                    "changed_sample": changed.iter().take(10).map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                    "deleted_sample": deleted.iter().take(10).cloned().collect::<Vec<_>>(),
+                    "suggestion": "Call leindex_index with force_reindex=true to refresh",
+                })
+            };
+            map.insert("freshness".to_string(), staleness);
+            if let Some(cov) = coverage {
+                map.insert("coverage".to_string(), serde_json::to_value(cov).unwrap_or(Value::Null));
+            }
+        }
+
+        Ok(wrap_with_meta(diag_json, &reader))
     }
 }
 
@@ -937,6 +1052,71 @@ fn node_type_str(nt: &legraphe::pdg::NodeType) -> &'static str {
         legraphe::pdg::NodeType::Variable => "variable",
         legraphe::pdg::NodeType::Module => "module",
     }
+}
+
+/// Resolve and normalize a scope path for consistent filtering.
+/// Returns None if no scope was provided. Ensures directory scopes end with a separator.
+fn resolve_scope(args: &Value, project_root: &Path) -> Result<Option<String>, JsonRpcError> {
+    let raw = match args.get("scope").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(None),
+    };
+
+    let path = Path::new(raw);
+
+    // If relative, resolve against project root
+    let resolved = if path.is_relative() {
+        project_root.join(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    let canonical = resolved.canonicalize().map_err(|e| {
+        JsonRpcError::invalid_params_with_suggestion(
+            format!("Cannot resolve scope path '{}': {}", raw, e),
+            format!(
+                "Use an absolute path or a path relative to the project root: {}",
+                project_root.display()
+            ),
+        )
+    })?;
+
+    let mut s = canonical.to_string_lossy().to_string();
+    if canonical.is_dir()
+        && !s.ends_with(std::path::MAIN_SEPARATOR)
+        && !s.ends_with('/')
+    {
+        s.push(std::path::MAIN_SEPARATOR);
+    }
+
+    Ok(Some(s))
+}
+
+/// Attach meta information to tool responses about index staleness and context.
+fn wrap_with_meta(mut result: Value, index: &crate::leindex::LeIndex) -> Value {
+    let stale = index.is_stale_fast();
+    if let Some(obj) = result.as_object_mut() {
+        obj.insert(
+            "_meta".to_string(),
+            serde_json::json!({
+                "index_stale": stale,
+                "project_path": index.project_path().display().to_string(),
+                "storage_path": index.storage_path().display().to_string(),
+                "indexed_at": index.get_stats().indexing_time_ms,
+            }),
+        );
+        if stale {
+            obj.insert(
+                "_warning".to_string(),
+                Value::String(
+                    "Index may be stale. Results may not reflect recent file changes. \
+                     Call leindex_index with force_reindex=true to refresh."
+                        .to_string(),
+                ),
+            );
+        }
+    }
+    result
 }
 
 /// Read a source snippet from disk using the node's byte_range.
@@ -1155,14 +1335,14 @@ cross-file relationships that Read cannot provide."
             )
         };
 
-        Ok(serde_json::json!({
+        Ok(wrap_with_meta(serde_json::json!({
             "file_path": file_path,
             "language": language,
             "line_count": line_count,
             "symbol_count": symbols.len(),
             "symbols": symbols,
             "module_role": module_role
-        }))
+        }), &index))
     }
 }
 
@@ -1208,6 +1388,10 @@ a single structured response including cross-file relationships."
                     "description": "Max tokens for response (default: 1500)",
                     "default": 1500
                 },
+                "scope": {
+                    "type": "string",
+                    "description": "Optional path to limit lookup (absolute or relative to project root)"
+                },
                 "include_source": {
                     "type": "boolean",
                     "description": "Include source code of definition (default: false). \
@@ -1249,6 +1433,11 @@ a single structured response including cross-file relationships."
         let depth = extract_usize(&args, "depth", 2)?.min(5);
         let token_budget = extract_usize(&args, "token_budget", 1500)?;
         let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let scope = {
+            let handle = registry.get_or_create(project_path).await?;
+            let index = handle.lock().await;
+            resolve_scope(&args, index.project_path())?
+        };
 
         // Determine symbol list: single "symbol" or batch "symbols"
         let symbols: Vec<String> = if let Some(arr) = args.get("symbols").and_then(|v| v.as_array())
@@ -1282,6 +1471,7 @@ a single structured response including cross-file relationships."
                 match self.lookup_single_symbol(
                     pdg,
                     symbol,
+                    &scope,
                     include_source,
                     include_callers,
                     include_callees,
@@ -1296,24 +1486,27 @@ a single structured response including cross-file relationships."
                 }
             }
 
-            return Ok(serde_json::json!({
+            return Ok(wrap_with_meta(serde_json::json!({
                 "batch": true,
                 "count": results.len(),
                 "results": results
-            }));
+            }), &index));
         }
 
         // Single symbol mode
         let char_budget = token_budget * 4;
-        self.lookup_single_symbol(
+        let single = self.lookup_single_symbol(
             pdg,
             &symbols[0],
+            &scope,
             include_source,
             include_callers,
             include_callees,
             depth,
             char_budget,
-        )
+        )?;
+
+        Ok(wrap_with_meta(single, &index))
     }
 
     /// Resolve and return full structural context for a single symbol.
@@ -1321,17 +1514,28 @@ a single structured response including cross-file relationships."
         &self,
         pdg: &legraphe::pdg::ProgramDependenceGraph,
         symbol: &str,
+        scope: &Option<String>,
         include_source: bool,
         include_callers: bool,
         include_callees: bool,
         depth: usize,
         char_budget: usize,
     ) -> Result<Value, JsonRpcError> {
+        let in_scope = |node: &legraphe::pdg::Node| match scope {
+            Some(s) => node.file_path.starts_with(s),
+            None => true,
+        };
+
         // 1. Exact symbol lookup (by node.id in symbol_index)
         let node_id = if let Some(nid) = pdg.find_by_symbol(symbol) {
-            nid
+            pdg.get_node(nid)
+                .filter(|n| in_scope(*n))
+                .map(|_| nid)
+        } else {
+            None
+        }
         // 2. Exact name lookup (by node.name in name_index) — prefer non-module nodes
-        } else if let Some(nid) = {
+        .or_else(|| {
             let candidates = pdg.find_all_by_name(symbol);
             // Prefer class/function/method over module nodes
             candidates
@@ -1339,19 +1543,26 @@ a single structured response including cross-file relationships."
                 .copied()
                 .find(|&nid| {
                     pdg.get_node(nid)
-                        .map(|n| n.node_type != legraphe::pdg::NodeType::Module)
+                        .map(|n| n.node_type != legraphe::pdg::NodeType::Module && in_scope(n))
                         .unwrap_or(false)
                 })
-                .or_else(|| candidates.first().copied())
-        } {
-            nid
-        } else {
+                .or_else(|| {
+                    candidates
+                        .iter()
+                        .copied()
+                        .find(|&nid| pdg.get_node(nid).map(|n| in_scope(n)).unwrap_or(false))
+                })
+        })
+        .or_else(|| {
             // 3. Fuzzy match: substring, case-insensitive — prefer non-module nodes
             let sym_lower = symbol.to_lowercase();
             let mut best: Option<legraphe::pdg::NodeId> = None;
             let mut best_is_module = true;
             for nid in pdg.node_indices() {
                 let Some(n) = pdg.get_node(nid) else { continue };
+                if !in_scope(n) {
+                    continue;
+                }
                 let matches = n.name.to_lowercase().contains(&sym_lower)
                     || n.id.to_lowercase().contains(&sym_lower);
                 if !matches {
@@ -1367,13 +1578,14 @@ a single structured response including cross-file relationships."
                     } // non-module is best, stop early
                 }
             }
-            best.ok_or_else(|| {
-                JsonRpcError::invalid_params_with_suggestion(
-                    format!("Symbol '{}' not found in project index", symbol),
-                    "Check spelling, or use leindex_grep_symbols to search for partial matches",
-                )
-            })?
-        };
+            best
+        })
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params_with_suggestion(
+                format!("Symbol '{}' not found in project index", symbol),
+                "Check spelling, or use leindex_grep_symbols to search for partial matches",
+            )
+        })?;
 
         let node = pdg
             .get_node(node_id)
@@ -1548,26 +1760,25 @@ token efficient than Glob + directory reads."
         let index = handle.lock().await;
         let project_root = index.project_path().to_path_buf();
 
-        let scope_path = match args.get("path").and_then(|v| v.as_str()) {
-            Some(p) => {
-                // Canonicalize if possible, fall back to raw path
-                PathBuf::from(p)
-                    .canonicalize()
-                    .unwrap_or_else(|_| PathBuf::from(p))
+        // Allow legacy "path" param; map it into "scope" for resolution.
+        let mut args_with_scope = args.clone();
+        if let Some(obj) = args_with_scope.as_object_mut() {
+            if !obj.contains_key("scope") {
+                if let Some(p) = obj.get("path").cloned() {
+                    obj.insert("scope".to_string(), p);
+                }
             }
-            None => project_root.clone(),
-        };
-
-        // Ensure scope_path string ends with separator for proper prefix matching
-        // This prevents "/path/src" from matching "/path/src_backup/file.py"
-        let scope_str = {
-            let s = scope_path.to_string_lossy().to_string();
-            if s.ends_with(std::path::MAIN_SEPARATOR) || s.ends_with('/') {
-                s
-            } else {
-                format!("{}{}", s, std::path::MAIN_SEPARATOR)
+        }
+        let scope = resolve_scope(&args_with_scope, index.project_path())?;
+        let scope_str = scope.unwrap_or_else(|| {
+            let mut s = project_root.to_string_lossy().to_string();
+            if !s.ends_with(std::path::MAIN_SEPARATOR) {
+                s.push(std::path::MAIN_SEPARATOR);
             }
-        };
+            s
+        });
+        let scope_path = PathBuf::from(&scope_str);
+        let scope_base = PathBuf::from(scope_str.trim_end_matches(|c| c == '/' || c == std::path::MAIN_SEPARATOR));
 
         let pdg = index
             .pdg()
@@ -1601,7 +1812,7 @@ token efficient than Glob + directory reads."
             })
             .filter_map(|(fp, (count, complexity, syms))| {
                 let path = std::path::Path::new(fp);
-                let rel = path.strip_prefix(&scope_path).ok()?;
+                let rel = path.strip_prefix(&scope_base).ok()?;
                 // Check depth
                 if rel.components().count() > depth {
                     return None;
@@ -1665,7 +1876,7 @@ token efficient than Glob + directory reads."
             truncated_files.push(f);
         }
 
-        Ok(serde_json::json!({
+        Ok(wrap_with_meta(serde_json::json!({
             "project_root": project_root.display().to_string(),
             "scope": scope_path.display().to_string(),
             "total_files_in_scope": total_before_pagination,
@@ -1673,7 +1884,7 @@ token efficient than Glob + directory reads."
             "count": truncated_files.len(),
             "has_more": offset + truncated_files.len() < total_before_pagination,
             "files": truncated_files
-        }))
+        }), &index))
     }
 }
 
@@ -1692,9 +1903,9 @@ impl GrepSymbolsHandler {
     }
 
     pub fn description(&self) -> &str {
-        "Search for symbols across the indexed codebase with structural awareness. Unlike \
-text-based grep, results include each match's type (function/class/method) and its role \
-in the dependency graph. Supports exact match and substring search."
+        "Search for symbols across the codebase with structural awareness. Supports \
+        substring and regex patterns. Results include symbol type (function/class) and \
+        its role in the dependency graph."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -1755,10 +1966,6 @@ in the dependency graph. Supports exact match and substring search."
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let pattern = extract_string(&args, "pattern")?;
-        let scope_raw = args
-            .get("scope")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
         let type_filter = args
             .get("type_filter")
             .and_then(|v| v.as_str())
@@ -1772,26 +1979,12 @@ in the dependency graph. Supports exact match and substring search."
 
         let handle = registry.get_or_create(project_path).await?;
         let mut index = handle.lock().await;
-
-        // Validate and canonicalise scope path if provided
-        let scope = if let Some(raw) = scope_raw {
-            let p = std::path::Path::new(&raw);
-            let canonical = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-            let s = canonical.to_string_lossy().to_string();
-            // Ensure directory scopes end with separator for correct prefix matching
-            if canonical.is_dir() && !s.ends_with(std::path::MAIN_SEPARATOR) && !s.ends_with('/') {
-                Some(format!("{}{}", s, std::path::MAIN_SEPARATOR))
-            } else {
-                Some(s)
-            }
-        } else {
-            None
-        };
+        let scope = resolve_scope(&args, index.project_path())?;
 
         // Use indexed search to pre-filter candidates (avoids full O(N) PDG scans).
         let candidate_limit = (max_results + offset).saturating_mul(5).max(50);
         let candidate_results = index
-            .search(&pattern, candidate_limit)
+            .search(&pattern, candidate_limit, None)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
         let pdg = index.pdg().ok_or_else(|| {
@@ -1873,6 +2066,82 @@ in the dependency graph. Supports exact match and substring search."
             all_matches.push(entry);
         }
 
+        // If semantic search returned nothing useful or the pattern looks regex-y,
+        // fall back to a direct PDG scan that supports regex/pipes/wildcards.
+        let use_direct_scan = all_matches.is_empty()
+            || pattern.contains('|')
+            || pattern.contains('*')
+            || pattern.contains('?')
+            || pattern.contains('[');
+
+        if use_direct_scan && all_matches.len() < fetch_limit {
+            let re = RegexBuilder::new(&pattern)
+                .case_insensitive(true)
+                .build()
+                .ok();
+
+            for nid in pdg.node_indices() {
+                if all_matches.len() >= fetch_limit {
+                    break;
+                }
+
+                let Some(node) = pdg.get_node(nid) else {
+                    continue;
+                };
+
+                if type_filter != "all" && node_type_str(&node.node_type) != type_filter.as_str() {
+                    continue;
+                }
+
+                if let Some(ref s) = scope {
+                    if !node.file_path.starts_with(s.as_str())
+                        && node.file_path != s.trim_end_matches(std::path::MAIN_SEPARATOR)
+                    {
+                        continue;
+                    }
+                }
+
+                let matches = if let Some(ref re) = re {
+                    re.is_match(&node.name) || re.is_match(&node.id)
+                } else {
+                    node.name.to_lowercase().contains(&pattern_lower)
+                        || node.id.to_lowercase().contains(&pattern_lower)
+                };
+
+                if !matches || seen_ids.contains(&node.id) {
+                    continue;
+                }
+                seen_ids.insert(node.id.clone());
+
+                let caller_count = get_direct_callers(pdg, nid).len();
+                let dep_count = pdg.neighbors(nid).len();
+
+                let mut entry = serde_json::json!({
+                    "name": node.name,
+                    "type": node_type_str(&node.node_type),
+                    "file": node.file_path,
+                    "byte_range": node.byte_range,
+                    "complexity": node.complexity,
+                    "caller_count": caller_count,
+                    "dependency_count": dep_count,
+                    "language": node.language
+                });
+
+                if context_lines > 0 {
+                    if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
+                        let snippet: String = src
+                            .lines()
+                            .take(context_lines)
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        entry["context"] = Value::String(snippet);
+                    }
+                }
+
+                all_matches.push(entry);
+            }
+        }
+
         // Apply pagination
         let total_matched = all_matches.len();
         let page: Vec<Value> = all_matches.into_iter().skip(offset).collect();
@@ -1889,14 +2158,14 @@ in the dependency graph. Supports exact match and substring search."
             results.push(entry);
         }
 
-        Ok(serde_json::json!({
+        Ok(wrap_with_meta(serde_json::json!({
             "pattern": pattern,
             "offset": offset,
             "count": results.len(),
             "total_matched": total_matched,
             "has_more": offset + results.len() < total_matched,
             "results": results
-        }))
+        }), &index))
     }
 }
 
@@ -2102,7 +2371,7 @@ than reading an entire file. Supersedes targeted Read."
             .take(20)
             .collect();
 
-        Ok(serde_json::json!({
+        Ok(wrap_with_meta(serde_json::json!({
             "symbol": node.name,
             "type": node_type_str(&node.node_type),
             "file": node.file_path,
@@ -2113,7 +2382,7 @@ than reading an entire file. Supersedes targeted Read."
             "source": source,
             "dependencies": dep_signatures,
             "callers": callers
-        }))
+        }), &index))
     }
 }
 
@@ -2576,7 +2845,7 @@ leindex_edit_apply to understand the blast radius of your change."
             "low"
         };
 
-        Ok(serde_json::json!({
+        Ok(wrap_with_meta(serde_json::json!({
             "diff": diff,
             "affected_symbols": affected_nodes,
             "affected_files": affected_files.into_iter().collect::<Vec<_>>(),
@@ -2593,7 +2862,7 @@ leindex_edit_apply to understand the blast radius of your change."
                 "Run tests on impacted files",
                 "Consider using dry_run=true first"
             ]
-        }))
+        }), &index))
     }
 }
 
@@ -2673,19 +2942,21 @@ returns the preview without modifying any files."
         let modified = apply_changes_in_memory(&original, &changes)?;
 
         if modified == original {
-            return Ok(serde_json::json!({
+            let idx = handle.lock().await;
+            return Ok(wrap_with_meta(serde_json::json!({
                 "success": true,
                 "changes_applied": 0,
                 "files_modified": [],
                 "message": "No changes needed — content already matches"
-            }));
+            }), &idx));
         }
 
         std::fs::write(&file_path, modified.as_bytes()).map_err(|e| {
             JsonRpcError::internal_error(format!("Failed to write '{}': {}", file_path, e))
         })?;
 
-        Ok(serde_json::json!({
+        let idx = handle.lock().await;
+        Ok(wrap_with_meta(serde_json::json!({
             "success": true,
             "changes_applied": changes.len(),
             "files_modified": [file_path],
@@ -2699,7 +2970,7 @@ returns the preview without modifying any files."
                 "Run tests on impacted files",
                 "Consider using dry_run=true first"
             ]
-        }))
+        }), &idx))
     }
 }
 
@@ -2843,14 +3114,14 @@ Grep + multi-file Edit with a single atomic operation."
             }
         }
 
-        Ok(serde_json::json!({
+        Ok(wrap_with_meta(serde_json::json!({
             "old_name": old_name,
             "new_name": new_name,
             "files_affected": files_to_modify.len(),
             "preview_only": preview_only,
             "diffs": diffs,
             "applied": !preview_only
-        }))
+        }), &index))
     }
 }
 
@@ -2980,7 +3251,7 @@ to understand the blast radius of your change. No equivalent in standard tools."
             }
         };
 
-        Ok(serde_json::json!({
+        Ok(wrap_with_meta(serde_json::json!({
             "symbol": node.name,
             "file": node.file_path,
             "change_type": change_type,
@@ -3002,7 +3273,802 @@ to understand the blast radius of your change. No equivalent in standard tools."
                 "before_refactoring": "Run this first to understand blast radius",
                 "recommended_followup": "Use leindex_edit_preview after reviewing impact"
             }
-        }))
+        }), &index))
+    }
+}
+
+// ============================================================================
+// Phase E: Precision Tooling — PDG-enriched equivalents
+// ============================================================================
+
+// E.1 — leindex_text_search
+// ============================================================================
+
+/// Handler for leindex_text_search — PDG-enriched text content search.
+///
+/// Unlike plain `rg`, every match is annotated with the owning PDG symbol,
+/// its type, complexity score, caller count, and dependency count.
+#[derive(Clone)]
+pub struct TextSearchHandler;
+
+#[allow(missing_docs)]
+impl TextSearchHandler {
+    pub fn name(&self) -> &str {
+        "leindex_text_search"
+    }
+
+    pub fn description(&self) -> &str {
+        "Search file contents for exact or regex patterns with PDG enrichment. \
+Each match is annotated with the owning symbol, its type, complexity, and caller count — \
+showing not just WHERE text appears but HOW IMPORTANT the surrounding code is. \
+Supersedes rg/grep with structural awareness."
+    }
+
+    pub fn argument_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Text pattern to search for (literal or regex)"
+                },
+                "is_regex": {
+                    "type": "boolean",
+                    "description": "Treat query as regex (default: false = literal match)",
+                    "default": false
+                },
+                "case_sensitive": {
+                    "type": "boolean",
+                    "description": "Case-sensitive search (default: true)",
+                    "default": true
+                },
+                "include_globs": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Only search files matching these globs, e.g. [\"*.rs\", \"*.ts\"]"
+                },
+                "exclude_globs": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Exclude files matching these globs, e.g. [\"*_test.rs\"]"
+                },
+                "scope": {
+                    "type": "string",
+                    "description": "Restrict search to a directory path"
+                },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                },
+                "max_results": {
+                    "type": "integer",
+                    "description": "Maximum results to return (default: 50)",
+                    "default": 50,
+                    "minimum": 1,
+                    "maximum": 500
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": "Lines of context above/below each match (default: 2)",
+                    "default": 2,
+                    "minimum": 0,
+                    "maximum": 10
+                }
+            },
+            "required": ["query"]
+        })
+    }
+
+    pub async fn execute(
+        &self,
+        registry: &Arc<ProjectRegistry>,
+        args: Value,
+    ) -> Result<Value, JsonRpcError> {
+        let query = extract_string(&args, "query")?;
+        let is_regex = extract_bool(&args, "is_regex", false);
+        let case_sensitive = extract_bool(&args, "case_sensitive", true);
+        let max_results = extract_usize(&args, "max_results", 50)?.min(500);
+        let context_lines = extract_usize(&args, "context_lines", 2)?.min(10);
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+
+        let include_globs: Vec<String> = args
+            .get("include_globs")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let exclude_globs: Vec<String> = args
+            .get("exclude_globs")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let handle = registry.get_or_create(project_path).await?;
+        let index = handle.lock().await;
+        let scope = resolve_scope(&args, index.project_path())?;
+
+        // Build regex or literal matcher
+        let regex = if is_regex {
+            let re = RegexBuilder::new(&query)
+                .case_insensitive(!case_sensitive)
+                .build()
+                .map_err(|e| {
+                    JsonRpcError::invalid_params(format!("Invalid regex '{}': {}", query, e))
+                })?;
+            Some(re)
+        } else {
+            None
+        };
+
+        let search_query = if case_sensitive {
+            query.clone()
+        } else {
+            query.to_lowercase()
+        };
+
+        // Get PDG for enrichment (optional — works without it)
+        let pdg = index.pdg();
+
+        // Collect source files from the project
+        let project_root = index.project_path();
+        let mut results: Vec<Value> = Vec::new();
+
+        // Dirs to always skip
+        const SKIP_DIRS: &[&str] = &[
+            ".git", "node_modules", "target", "__pycache__", ".venv",
+            "venv", "dist", "build", ".next", ".nuxt", "vendor",
+        ];
+
+        for entry in walkdir::WalkDir::new(project_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|e| {
+                let name = e.file_name().to_string_lossy();
+                !SKIP_DIRS.iter().any(|s| name == *s)
+            })
+        {
+            if results.len() >= max_results {
+                break;
+            }
+
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            let file_path = entry.path();
+            let file_path_str = file_path.to_string_lossy();
+
+            // Apply scope filter
+            if let Some(ref s) = scope {
+                if !file_path_str.starts_with(s.as_str()) {
+                    continue;
+                }
+            }
+
+            // Apply include globs
+            if !include_globs.is_empty() {
+                let matches_any = include_globs.iter().any(|g| {
+                    glob_match(&file_path_str, g)
+                });
+                if !matches_any {
+                    continue;
+                }
+            }
+
+            // Apply exclude globs
+            if exclude_globs.iter().any(|g| glob_match(&file_path_str, g)) {
+                continue;
+            }
+
+            // Read file content
+            let content = match std::fs::read_to_string(file_path) {
+                Ok(c) => c,
+                Err(_) => continue, // Skip binary or unreadable files
+            };
+
+            let lines: Vec<&str> = content.lines().collect();
+
+            for (line_idx, line) in lines.iter().enumerate() {
+                if results.len() >= max_results {
+                    break;
+                }
+
+                let matched = if let Some(ref re) = regex {
+                    re.is_match(line)
+                } else if case_sensitive {
+                    line.contains(&search_query)
+                } else {
+                    line.to_lowercase().contains(&search_query)
+                };
+
+                if !matched {
+                    continue;
+                }
+
+                let line_number = line_idx + 1; // 1-indexed
+
+                // Collect context lines
+                let ctx_before: Vec<String> = (line_idx.saturating_sub(context_lines)..line_idx)
+                    .map(|i| format!("{}: {}", i + 1, lines[i]))
+                    .collect();
+                let ctx_after: Vec<String> = ((line_idx + 1)
+                    ..((line_idx + 1 + context_lines).min(lines.len())))
+                    .map(|i| format!("{}: {}", i + 1, lines[i]))
+                    .collect();
+
+                // PDG enrichment: find the owning symbol
+                let owning_symbol = pdg.and_then(|pdg| {
+                    // Calculate byte offset of this line
+                    let byte_offset: usize = lines[..line_idx]
+                        .iter()
+                        .map(|l| l.len() + 1) // +1 for newline
+                        .sum();
+
+                    // Find which symbol's byte_range contains this offset
+                    let nodes = pdg.nodes_in_file(&file_path_str);
+                    let mut best: Option<(legraphe::pdg::NodeId, usize)> = None;
+
+                    for nid in nodes {
+                        if let Some(node) = pdg.get_node(nid) {
+                            let (start, end) = node.byte_range;
+                            if byte_offset >= start && byte_offset < end {
+                                let range_size = end - start;
+                                // Prefer the most specific (smallest) enclosing symbol
+                                if best.map_or(true, |(_, sz)| range_size < sz) {
+                                    best = Some((nid, range_size));
+                                }
+                            }
+                        }
+                    }
+
+                    best.and_then(|(nid, _)| {
+                        let node = pdg.get_node(nid)?;
+                        let caller_count = get_direct_callers(pdg, nid).len();
+                        let dep_count = pdg.neighbors(nid).len();
+                        Some(serde_json::json!({
+                            "name": node.name,
+                            "type": node_type_str(&node.node_type),
+                            "complexity": node.complexity,
+                            "caller_count": caller_count,
+                            "dependency_count": dep_count,
+                        }))
+                    })
+                });
+
+                results.push(serde_json::json!({
+                    "file": file_path_str,
+                    "line_number": line_number,
+                    "line_content": line.trim(),
+                    "context_before": ctx_before,
+                    "context_after": ctx_after,
+                    "owning_symbol": owning_symbol,
+                }));
+            }
+        }
+
+        let total = results.len();
+
+        Ok(wrap_with_meta(serde_json::json!({
+            "query": query,
+            "is_regex": is_regex,
+            "count": total,
+            "max_results": max_results,
+            "pdg_enriched": pdg.is_some(),
+            "results": results,
+        }), &index))
+    }
+}
+
+/// Simple glob matching for include/exclude patterns.
+/// Supports `*` (any chars) and `?` (single char) at the end of patterns.
+fn glob_match(path: &str, pattern: &str) -> bool {
+    if pattern.starts_with("*.") {
+        // Extension match: *.rs matches any .rs file
+        let ext = &pattern[1..]; // ".rs"
+        path.ends_with(ext)
+    } else if pattern.contains('*') {
+        // Simple wildcard: convert to prefix/suffix match
+        let parts: Vec<&str> = pattern.split('*').collect();
+        if parts.len() == 2 {
+            path.contains(parts[0]) && path.ends_with(parts[1])
+        } else {
+            path.contains(pattern)
+        }
+    } else {
+        path.contains(pattern)
+    }
+}
+
+// ============================================================================
+// E.2 — leindex_read_file
+// ============================================================================
+
+/// Handler for leindex_read_file — PDG-annotated file read.
+///
+/// Unlike plain `cat`/`Read`, returns a symbol_map overlay showing
+/// which symbols span the visible lines, with callers, callees, and complexity.
+#[derive(Clone)]
+pub struct ReadFileHandler;
+
+#[allow(missing_docs)]
+impl ReadFileHandler {
+    pub fn name(&self) -> &str {
+        "leindex_read_file"
+    }
+
+    pub fn description(&self) -> &str {
+        "Read file contents with line numbers and a PDG symbol map overlay. \
+Shows which symbols span which lines, their type, complexity, callers, and callees. \
+One call replaces read_file + symbol_lookup. Far more context-aware than raw Read."
+    }
+
+    pub fn argument_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Absolute path to file to read"
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "Start line, 1-indexed (default: 1)",
+                    "default": 1,
+                    "minimum": 1
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "End line, 1-indexed inclusive (default: end of file)",
+                    "minimum": 1
+                },
+                "max_lines": {
+                    "type": "integer",
+                    "description": "Maximum lines to return (default: 500, safety cap)",
+                    "default": 500,
+                    "minimum": 1,
+                    "maximum": 2000
+                },
+                "include_symbol_map": {
+                    "type": "boolean",
+                    "description": "Include PDG symbol annotations (default: true). \
+Set false for raw content only.",
+                    "default": true
+                },
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                }
+            },
+            "required": ["file_path"]
+        })
+    }
+
+    pub async fn execute(
+        &self,
+        registry: &Arc<ProjectRegistry>,
+        args: Value,
+    ) -> Result<Value, JsonRpcError> {
+        let file_path = extract_string(&args, "file_path")?;
+        let start_line = extract_usize(&args, "start_line", 1)?.max(1);
+        let max_lines = extract_usize(&args, "max_lines", 500)?.min(2000);
+        let include_symbol_map = extract_bool(&args, "include_symbol_map", true);
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+
+        let handle = registry.get_or_create(project_path).await?;
+        let index = handle.lock().await;
+
+        // Validate file within project
+        validate_file_within_project(&file_path, index.project_path())?;
+
+        // Read file content
+        let content = std::fs::read_to_string(&file_path).map_err(|e| {
+            JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
+        })?;
+
+        let all_lines: Vec<&str> = content.lines().collect();
+        let total_lines = all_lines.len();
+
+        // Resolve end_line
+        let end_line_raw = extract_usize(&args, "end_line", total_lines)?;
+        let end_line = end_line_raw.min(total_lines).min(start_line + max_lines - 1);
+
+        if start_line > total_lines {
+            return Err(JsonRpcError::invalid_params(format!(
+                "start_line {} exceeds total lines {}",
+                start_line, total_lines
+            )));
+        }
+
+        // Build numbered content (1-indexed)
+        let visible_lines: Vec<String> = all_lines[(start_line - 1)..end_line.min(total_lines)]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{}: {}", start_line + i, line))
+            .collect();
+        let content_str = visible_lines.join("\n");
+
+        // Detect language from extension
+        let language = Path::new(&file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|ext| match ext {
+                "rs" => "rust",
+                "py" => "python",
+                "js" => "javascript",
+                "ts" => "typescript",
+                "tsx" => "typescriptreact",
+                "jsx" => "javascriptreact",
+                "go" => "go",
+                "java" => "java",
+                "c" | "h" => "c",
+                "cpp" | "hpp" | "cc" => "cpp",
+                "rb" => "ruby",
+                "php" => "php",
+                "swift" => "swift",
+                "kt" => "kotlin",
+                "cs" => "csharp",
+                "lua" => "lua",
+                "zig" => "zig",
+                "md" => "markdown",
+                "json" => "json",
+                "yaml" | "yml" => "yaml",
+                "toml" => "toml",
+                "html" => "html",
+                "css" => "css",
+                "scss" => "scss",
+                "sql" => "sql",
+                "sh" | "bash" => "shell",
+                other => other,
+            })
+            .unwrap_or("text");
+
+        // Build symbol map from PDG
+        let symbol_map: Vec<Value> = if include_symbol_map {
+            let pdg = index.pdg();
+            pdg.map(|pdg| {
+                let nodes = pdg.nodes_in_file(&file_path);
+                let mut symbols: Vec<Value> = Vec::new();
+
+                // Pre-compute cumulative byte offsets for line-to-byte mapping
+                let line_byte_offsets: Vec<usize> = {
+                    let mut offsets = Vec::with_capacity(all_lines.len() + 1);
+                    offsets.push(0);
+                    let mut acc: usize = 0;
+                    for line in &all_lines {
+                        acc += line.len() + 1; // +1 for newline
+                        offsets.push(acc);
+                    }
+                    offsets
+                };
+
+                // Visible byte range
+                let visible_start_byte = line_byte_offsets.get(start_line - 1).copied().unwrap_or(0);
+                let visible_end_byte = line_byte_offsets.get(end_line.min(total_lines)).copied().unwrap_or(content.len());
+
+                for nid in nodes {
+                    let Some(node) = pdg.get_node(nid) else { continue };
+                    let (sym_start, sym_end) = node.byte_range;
+
+                    // Check if symbol overlaps with visible range
+                    if sym_end <= visible_start_byte || sym_start >= visible_end_byte {
+                        continue;
+                    }
+
+                    // Convert byte range to line numbers
+                    let line_start = line_byte_offsets
+                        .iter()
+                        .position(|&off| off > sym_start)
+                        .unwrap_or(1); // 1-indexed
+                    let line_end = line_byte_offsets
+                        .iter()
+                        .position(|&off| off >= sym_end)
+                        .unwrap_or(total_lines);
+
+                    let caller_count = get_direct_callers(pdg, nid).len();
+                    let dep_count = pdg.neighbors(nid).len();
+
+                    // Get caller names (up to 5)
+                    let callers: Vec<String> = get_direct_callers(pdg, nid)
+                        .iter()
+                        .filter_map(|&cid| pdg.get_node(cid).map(|n| n.name.clone()))
+                        .take(5)
+                        .collect();
+
+                    // Get callee names (up to 5)
+                    let callees: Vec<String> = pdg
+                        .neighbors(nid)
+                        .iter()
+                        .filter_map(|&did| pdg.get_node(did).map(|n| n.name.clone()))
+                        .take(5)
+                        .collect();
+
+                    symbols.push(serde_json::json!({
+                        "name": node.name,
+                        "type": node_type_str(&node.node_type),
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "complexity": node.complexity,
+                        "caller_count": caller_count,
+                        "dependency_count": dep_count,
+                        "callers": callers,
+                        "callees": callees,
+                    }));
+                }
+
+                // Sort by line_start for readability
+                symbols.sort_by_key(|s| s.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0));
+                symbols
+            })
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        Ok(wrap_with_meta(serde_json::json!({
+            "file_path": file_path,
+            "language": language,
+            "total_lines": total_lines,
+            "start_line": start_line,
+            "end_line": end_line.min(total_lines),
+            "content": content_str,
+            "symbol_map": symbol_map,
+        }), &index))
+    }
+}
+
+// ============================================================================
+// E.3 — leindex_git_status
+// ============================================================================
+
+/// Handler for leindex_git_status — PDG-aware git status.
+///
+/// Unlike plain `git status`, maps changed files to affected PDG symbols
+/// and computes forward impact (blast radius).
+#[derive(Clone)]
+pub struct GitStatusHandler;
+
+#[allow(missing_docs)]
+impl GitStatusHandler {
+    pub fn name(&self) -> &str {
+        "leindex_git_status"
+    }
+
+    pub fn description(&self) -> &str {
+        "Show git working tree status enriched with PDG structural analysis. \
+Maps changed files to affected symbols, their callers, and transitive forward impact. \
+Turns a raw diff into a structural change summary with blast radius."
+    }
+
+    pub fn argument_schema(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "project_path": {
+                    "type": "string",
+                    "description": "Project directory (auto-indexes on first use; omit to use current project)"
+                },
+                "include_diff": {
+                    "type": "boolean",
+                    "description": "Include unified diff content for modified files (default: false)",
+                    "default": false
+                },
+                "diff_context_lines": {
+                    "type": "integer",
+                    "description": "Context lines for diff output (default: 3)",
+                    "default": 3,
+                    "minimum": 0,
+                    "maximum": 20
+                }
+            },
+            "required": []
+        })
+    }
+
+    pub async fn execute(
+        &self,
+        registry: &Arc<ProjectRegistry>,
+        args: Value,
+    ) -> Result<Value, JsonRpcError> {
+        let include_diff = extract_bool(&args, "include_diff", false);
+        let diff_context_lines = extract_usize(&args, "diff_context_lines", 3)?;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+
+        let handle = registry.get_or_create(project_path).await?;
+        let index = handle.lock().await;
+        let project_root = index.project_path().to_path_buf();
+
+        // Check if it's a git repo
+        let git_dir = project_root.join(".git");
+        if !git_dir.exists() {
+            return Ok(wrap_with_meta(serde_json::json!({
+                "is_git_repo": false,
+                "message": "Not a git repository"
+            }), &index));
+        }
+
+        // Run git status --porcelain
+        let status_output = std::process::Command::new("git")
+            .args(["status", "--porcelain", "-uall"])
+            .current_dir(&project_root)
+            .output()
+            .map_err(|e| {
+                JsonRpcError::internal_error(format!("Failed to run git status: {}", e))
+            })?;
+
+        if !status_output.status.success() {
+            return Err(JsonRpcError::internal_error(format!(
+                "git status failed: {}",
+                String::from_utf8_lossy(&status_output.stderr)
+            )));
+        }
+
+        let status_text = String::from_utf8_lossy(&status_output.stdout);
+
+        // Parse git status output
+        let mut modified_files: Vec<String> = Vec::new();
+        let mut staged_files: Vec<String> = Vec::new();
+        let mut untracked_files: Vec<String> = Vec::new();
+
+        for line in status_text.lines() {
+            if line.len() < 4 {
+                continue;
+            }
+            let status_code = &line[..2];
+            let file = line[3..].trim().to_string();
+
+            match status_code.trim() {
+                "M" | "MM" | "AM" => modified_files.push(file),
+                "A" | "A " => staged_files.push(file),
+                "??" => untracked_files.push(file),
+                "D" | "D " => staged_files.push(file),
+                s if s.starts_with('M') => staged_files.push(file),
+                s if s.ends_with('M') => modified_files.push(file),
+                _ => modified_files.push(file),
+            }
+        }
+
+        // Get current branch
+        let branch_output = std::process::Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&project_root)
+            .output()
+            .ok()
+            .and_then(|o| {
+                if o.status.success() {
+                    Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // PDG enrichment: map changed files to symbols
+        let pdg = index.pdg();
+        let mut changed_symbols: Vec<Value> = Vec::new();
+        let mut total_affected_symbols = 0usize;
+        let mut affected_files_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        if let Some(pdg) = pdg {
+            for file in modified_files.iter().chain(staged_files.iter()) {
+                // Resolve to absolute path for PDG lookup
+                let abs_path = if Path::new(file).is_absolute() {
+                    PathBuf::from(file)
+                } else {
+                    project_root.join(file)
+                };
+                let abs_str = abs_path.to_string_lossy().to_string();
+
+                let nodes = pdg.nodes_in_file(&abs_str);
+                if nodes.is_empty() {
+                    // Try with canonicalized path
+                    let canon = abs_path.canonicalize().unwrap_or(abs_path);
+                    let canon_str = canon.to_string_lossy().to_string();
+                    let nodes = pdg.nodes_in_file(&canon_str);
+                    if nodes.is_empty() {
+                        changed_symbols.push(serde_json::json!({
+                            "file": file,
+                            "status": if modified_files.contains(file) { "modified" } else { "staged" },
+                            "symbols": [],
+                            "note": "No indexed symbols in this file"
+                        }));
+                        continue;
+                    }
+                }
+
+                let mut file_symbols: Vec<Value> = Vec::new();
+                for nid in &nodes {
+                    if let Some(node) = pdg.get_node(*nid) {
+                        let caller_count = get_direct_callers(pdg, *nid).len();
+                        let forward_impact = pdg.get_forward_impact_bounded(*nid, 2);
+                        total_affected_symbols += forward_impact.len();
+
+                        // Track affected files
+                        for &fid in &forward_impact {
+                            if let Some(fnode) = pdg.get_node(fid) {
+                                affected_files_set.insert(fnode.file_path.clone());
+                            }
+                        }
+
+                        file_symbols.push(serde_json::json!({
+                            "name": node.name,
+                            "type": node_type_str(&node.node_type),
+                            "complexity": node.complexity,
+                            "caller_count": caller_count,
+                            "forward_impact_count": forward_impact.len(),
+                        }));
+                    }
+                }
+
+                let status = if modified_files.contains(file) {
+                    "modified"
+                } else {
+                    "staged"
+                };
+
+                changed_symbols.push(serde_json::json!({
+                    "file": file,
+                    "status": status,
+                    "symbols": file_symbols,
+                }));
+            }
+        }
+
+        // Optionally include diff
+        let diff_content: Option<String> = if include_diff {
+            std::process::Command::new("git")
+                .args([
+                    "diff",
+                    &format!("--unified={}", diff_context_lines),
+                    "--no-color",
+                ])
+                .current_dir(&project_root)
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        Some(String::from_utf8_lossy(&o.stdout).to_string())
+                    } else {
+                        None
+                    }
+                })
+        } else {
+            None
+        };
+
+        let affected_files: Vec<String> = affected_files_set.into_iter().collect();
+
+        Ok(wrap_with_meta(serde_json::json!({
+            "is_git_repo": true,
+            "branch": branch_output,
+            "summary": {
+                "modified": modified_files.len(),
+                "staged": staged_files.len(),
+                "untracked": untracked_files.len(),
+            },
+            "modified_files": modified_files,
+            "staged_files": staged_files,
+            "untracked_files": untracked_files,
+            "changed_symbols": changed_symbols,
+            "impact_summary": {
+                "total_affected_symbols": total_affected_symbols,
+                "affected_files": affected_files,
+                "pdg_enriched": pdg.is_some(),
+            },
+            "diff": diff_content,
+        }), &index))
     }
 }
 
