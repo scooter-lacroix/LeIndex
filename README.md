@@ -272,4 +272,4 @@ Database discovery (`LEINDEX_DISCOVERY_ROOTS`) is **opt-in only**. Sensitive dir
 
 ## License
 
-MIT OR Apache-2.0
+MIT
