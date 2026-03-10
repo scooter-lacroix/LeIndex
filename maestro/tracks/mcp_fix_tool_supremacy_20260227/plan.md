@@ -2,10 +2,11 @@
 
 ## Track Metadata
 - **Track ID:** `mcp_fix_tool_supremacy_20260227`
-- **Status:** NEW
+- **Status:** IN PROGRESS — 22/22 automated tasks complete; 1 user verification (A.2) remaining
 - **Created:** 2026-02-27
+- **Last Updated:** 2026-02-28
 - **Phases:** 5
-- **Tasks:** 28
+- **Tasks:** 22
 - **Primary Goal:** Fix MCP transport + embeddings, then build LeIndex into the complete LLM toolset for code navigation, understanding, and editing.
 
 ---
@@ -145,7 +146,7 @@ leindex search "authentication credential refresh" -p /path/to/project
 - [ ] `semantic_score > 0.0` for at least 3 results on a related query
 - [ ] Results for exploratory queries include semantically relevant nodes even with zero `text_match`
 
-- [ ] Task B.2 complete
+- [x] Task B.2 complete — 966bfc3 (stratified TF-IDF vocab; semantic scores 0.51–0.89 confirmed)
 - [ ] Task: Maestro - User Manual Verification 'Phase B' (Protocol in workflow.md)
 
 ---
@@ -430,7 +431,7 @@ pub struct SearchResult {
 - [ ] `caller_count` and `dependency_count` match actual edge counts
 - [ ] Backward compatible: existing consumers of SearchResult still work
 
-- [ ] Task C.6 complete
+- [x] Task C.6 complete — 74394f0 (symbol_type, signature, complexity, caller_count, dependency_count in SearchResult)
 
 ---
 
@@ -450,7 +451,7 @@ pub struct SearchResult {
 - [ ] Single-file phase analysis includes cross-file dependency information
 - [ ] Token budget still respected
 
-- [ ] Task C.7 complete
+- [x] Task C.7 complete — 5e78ae9 (file_symbols: name, type, signature, line_start/end, complexity, callers, cross_file_deps)
 
 ---
 

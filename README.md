@@ -94,9 +94,24 @@ Every tool call is **context-aware** — not atomic. When you look up a symbol, 
 
 ### Install
 
+**Via cargo (recommended):**
+
+```bash
+cargo install leindex
+```
+
+**Via install script:**
+
 ```bash
 curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh | bash
 ```
+
+**Environment Variables:**
+
+| Name | Required | Description | Default |
+|------|----------|-------------|---------|
+| `LEINDEX_HOME` | No | Override storage/index home directory | `~/.leindex` |
+| `LEINDEX_PORT` | No | Override HTTP server port | `47268` |
 
 ### Index and search
 
@@ -201,8 +216,214 @@ cargo install leindex
 ```bash
 git clone https://github.com/scooter-lacroix/leindex.git
 cd leindex
-cargo build --release --workspace
+cargo build --release
 ```
+
+**Feature flags:** Use `--features` to customize the build:
+- `full` (default) — All features enabled
+- `minimal` — Parse and search only (smaller binary)
+- `cli` — CLI + MCP server
+- `server` — HTTP server only
+
+### MCP Server Integration
+
+LeIndex runs as an **MCP server** for AI coding tools. First install LeIndex (via crates.io or source), then configure your tool:
+
+<details>
+<summary><b>Zed IDE</b></summary>
+
+Add to `~/.config/zed/settings.json`:
+
+```json
+{
+  "context_servers": {
+    "leindex": {
+      "command": {
+        "path": "leindex",
+        "args": ["mcp"]
+      }
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Cursor IDE</b></summary>
+
+Add to Cursor settings (`settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp"],
+      "env": {}
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>VS Code</b></summary>
+
+Requires the [Model Context Protocol](https://marketplace.visualstudio.com/items?itemName=modelcontextprotocol.vscode-mcp) extension.
+
+Configure in `settings.json`:
+
+```json
+{
+  "mcp.mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Claude Code</b></summary>
+
+Add to `~/.config/claude-code/mcp_servers.json`:
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp"],
+      "env": {}
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Amp CLI (Sourcegraph)</b></summary>
+
+Add to `~/.config/amp/settings.json`:
+
+```json
+{
+  "amp.mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>OpenCode</b></summary>
+
+Add to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "mcp": {
+    "leindex": {
+      "command": ["leindex", "mcp"],
+      "type": "local"
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Qwen CLI</b></summary>
+
+Add to `~/.qwen/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>iFlow CLI</b></summary>
+
+Add to `~/.iflow/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Droid (Factory)</b></summary>
+
+Add to `~/.factory/mcp.json` (note: requires `type: "stdio"`):
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "type": "stdio",
+      "command": "leindex",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Gemini CLI</b></summary>
+
+Add to `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+</details>
+
+<details>
+<summary><b>Claude Desktop</b></summary>
+
+macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+Linux: `~/.config/Claude/claude_desktop_config.json`
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "leindex",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+</details>
 
 ### Dashboard (optional)
 

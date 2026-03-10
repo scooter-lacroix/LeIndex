@@ -2,6 +2,52 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [Unreleased] - Crate Unification
+
+### 🏗️ **Unified Crate Structure**
+
+All 10 workspace crates have been merged into a single unified `leindex` crate.
+
+#### Added
+- Single `cargo install leindex` now works — no workspace complexity
+- Feature flags for selective module compilation:
+  - `parse` — Code parsing and AST generation
+  - `graph` — Dependency graph construction
+  - `storage` — Persistent storage layer
+  - `search` — Vector search engine with INT8 quantization
+  - `phase` — Multi-phase indexing pipeline
+  - `cli` — Command-line interface with MCP server
+  - `global` — Global operations
+  - `server` — HTTP API server
+  - `edit` — Code editing utilities
+  - `validation` — Index validation tools
+- `glama.json` for MCP catalog registration
+
+#### Changed
+- **BREAKING**: Import paths changed from `leparse::`, `legraphe::`, etc. to `leindex::parse::`, `leindex::graph::`
+- Backward compatibility aliases provided: `leindex::leparse`, `leindex::legraphe`, etc.
+- Workspace replaced with single crate structure
+- Unified version management (single version number for entire project)
+
+#### Migration Guide
+Users using individual crates should update imports:
+```rust
+// Before
+use leparse::Parser;
+use legraphe::GraphBuilder;
+use lerecherche::SearchEngine;
+
+// After (Option 1: New style)
+use leindex::parse::Parser;
+use leindex::graph::GraphBuilder;
+use leindex::search::SearchEngine;
+
+// After (Option 2: Backward compatible)
+use leindex::leparse::Parser;
+use leindex::legraphe::GraphBuilder;
+use leindex::lerecherche::SearchEngine;
+```
+
 ## [1.5.0] - 2026-03-02 - Multi-Project MCP, Dashboard Integration, Release Polish
 
 ### Added

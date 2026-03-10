@@ -1,0 +1,81 @@
+{
+  "name": "leindex",
+  "description": "High-performance semantic code search engine with INT8 quantization and HNSW indexing",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/scooter-lacroix/LeIndex.git"
+  },
+  "license": "MIT OR Apache-2.0",
+  "versionSource": "cargo",
+  "transports": [
+    {
+      "type": "stdio",
+      "command": "leindex mcp --stdio"
+    },
+    {
+      "type": "http",
+      "command": "leindex serve --host 127.0.0.1 --port 47268",
+      "url": "http://127.0.0.1:47268"
+    }
+  ],
+  "installation": [
+    {
+      "name": "cargo",
+      "description": "Install from crates.io",
+      "command": "cargo install leindex"
+    },
+    {
+      "name": "shell",
+      "description": "Linux install script",
+      "command": "curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh | bash"
+    },
+    {
+      "name": "macos",
+      "description": "macOS install script",
+      "command": "curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install_macos.sh | bash"
+    },
+    {
+      "name": "powershell",
+      "description": "Windows PowerShell install",
+      "command": "iwr -useb https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.ps1 | iex"
+    },
+    {
+      "name": "git",
+      "description": "Build from source",
+      "command": "git clone https://github.com/scooter-lacroix/leindex.git && cd leindex && cargo build --release"
+    }
+  ],
+  "runtime": {
+    "command": "leindex mcp --stdio",
+    "environmentVariables": [
+      {
+        "name": "LEINDEX_HOME",
+        "required": false,
+        "description": "Override storage/index home directory",
+        "default": "~/.leindex"
+      },
+      {
+        "name": "LEINDEX_PORT",
+        "required": false,
+        "description": "Override HTTP server port for leindex serve",
+        "default": "47268"
+      }
+    ]
+  },
+  "capabilities": {
+    "tools": true,
+    "prompts": true,
+    "resources": true
+  },
+  "keywords": [
+    "search",
+    "code",
+    "semantic",
+    "vector",
+    "indexing",
+    "hnsw",
+    "quantization",
+    "language-server",
+    "mcp"
+  ]
+}

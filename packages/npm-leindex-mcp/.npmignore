@@ -1,0 +1,25 @@
+# Tests
+test.js
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation (published separately)
+docs/
+
+# Source files (only need compiled binary)
+src/
+
+# Build artifacts
+*.log

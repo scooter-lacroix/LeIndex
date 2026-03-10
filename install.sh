@@ -48,6 +48,241 @@ TEMP_BACKUP_DIR="${HOME}/.leindex.tmp"
 INSTALL_BIN_DIR="/usr/local/bin"
 
 # ============================================================================
+# OS DETECTION & PACKAGE MANAGER SUPPORT
+# ============================================================================
+
+# Detect OS and distribution
+detect_os() {
+    if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        if [[ -f /etc/os-release ]]; then
+            . /etc/os-release
+            OS=$ID
+            OS_VERSION=$VERSION_ID
+            OS_NAME=$NAME
+        elif [[ -f /etc/redhat-release ]]; then
+            OS=$(cat /etc/redhat-release | awk '{print $1}' | tr '[:upper:]' '[:lower:]')
+            OS_VERSION=$(cat /etc/redhat-release | grep -oE '[0-9]+\.[0-9]+' | head -1)
+            OS_NAME=$(cat /etc/redhat-release)
+        elif [[ -f /etc/arch-release ]]; then
+            OS="arch"
+            OS_VERSION=""
+            OS_NAME="Arch Linux"
+        else
+            OS="linux"
+            OS_VERSION=""
+            OS_NAME="Unknown Linux"
+        fi
+    elif [[ "$OSTYPE" == "darwin"* ]]; then
+        OS="macos"
+        OS_VERSION=$(sw_vers -productVersion 2>/dev/null || echo "unknown")
+        OS_NAME="macOS"
+    else
+        OS="unknown"
+        OS_VERSION=""
+        OS_NAME="Unknown"
+    fi
+}
+
+# Detect package manager
+detect_package_manager() {
+    if command -v apt-get &> /dev/null; then
+        PKG_MANAGER="apt"
+        PKG_INSTALL="sudo apt-get install -y"
+        PKG_UPDATE="sudo apt-get update"
+    elif command -v nala &> /dev/null; then
+        PKG_MANAGER="nala"
+        PKG_INSTALL="sudo nala install -y"
+        PKG_UPDATE="sudo nala update"
+    elif command -v pacman &> /dev/null; then
+        PKG_MANAGER="pacman"
+        PKG_INSTALL="sudo pacman -S --noconfirm"
+        PKG_UPDATE="sudo pacman -Sy"
+    elif command -v yay &> /dev/null; then
+        PKG_MANAGER="yay"
+        PKG_INSTALL="yay -S --noconfirm"
+        PKG_UPDATE="yay -Sy"
+    elif command -v paru &> /dev/null; then
+        PKG_MANAGER="paru"
+        PKG_INSTALL="paru -S --noconfirm"
+        PKG_UPDATE="paru -Sy"
+    elif command -v dnf &> /dev/null; then
+        PKG_MANAGER="dnf"
+        PKG_INSTALL="sudo dnf install -y"
+        PKG_UPDATE="sudo dnf check-update"
+    elif command -v yum &> /dev/null; then
+        PKG_MANAGER="yum"
+        PKG_INSTALL="sudo yum install -y"
+        PKG_UPDATE="sudo yum check-update"
+    elif command -v apk &> /dev/null; then
+        PKG_MANAGER="apk"
+        PKG_INSTALL="sudo apk add"
+        PKG_UPDATE="sudo apk update"
+    elif command -v zypper &> /dev/null; then
+        PKG_MANAGER="zypper"
+        PKG_INSTALL="sudo zypper install -y"
+        PKG_UPDATE="sudo zypper refresh"
+    elif command -v brew &> /dev/null; then
+        PKG_MANAGER="brew"
+        PKG_INSTALL="brew install"
+        PKG_UPDATE="brew update"
+    else
+        PKG_MANAGER="unknown"
+        PKG_INSTALL=""
+        PKG_UPDATE=""
+    fi
+}
+
+# Install system dependencies based on OS
+install_system_deps() {
+    local deps=()
+    local optional_deps=()
+
+    # Core dependencies
+    deps+=("curl" "wget" "git")
+
+    # Optional but recommended
+    if [[ "$INSTALL_DASHBOARD" != "false" ]]; then
+        optional_deps+=("sqlite3")
+    fi
+
+    # Check which dependencies are missing
+    local missing_deps=()
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            missing_deps+=("$dep")
+        fi
+    done
+
+    local missing_optional=()
+    for dep in "${optional_deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            missing_optional+=("$dep")
+        fi
+    done
+
+    # If no package manager, warn and continue
+    if [[ "$PKG_MANAGER" == "unknown" ]]; then
+        if [[ ${#missing_deps[@]} -gt 0 ]]; then
+            log_warn "No supported package manager found. Please install manually: ${missing_deps[*]}"
+        fi
+        return 0
+    fi
+
+    # Update package list first (if not macOS)
+    if [[ "$OS" != "macos" ]] && [[ ${#missing_deps[@]} -gt 0 || ${#missing_optional[@]} -gt 0 ]]; then
+        log_info "Updating package lists..."
+        $PKG_UPDATE >> "$INSTALL_LOG" 2>&1 || true
+    fi
+
+    # Install missing required dependencies
+    if [[ ${#missing_deps[@]} -gt 0 ]]; then
+        log_info "Installing required dependencies: ${missing_deps[*]}"
+        if ! $PKG_INSTALL "${missing_deps[@]}" >> "$INSTALL_LOG" 2>&1; then
+            log_warn "Failed to install some dependencies. Continuing anyway..."
+        fi
+    fi
+
+    # Install optional dependencies
+    if [[ ${#missing_optional[@]} -gt 0 ]]; then
+        log_info "Installing optional dependencies: ${missing_optional[*]}"
+        if ! $PKG_INSTALL "${missing_optional[@]}" >> "$INSTALL_LOG" 2>&1; then
+            log_warn "Failed to install optional dependencies. Some features may be unavailable."
+        fi
+    fi
+}
+
+# Install Bun (required for dashboard)
+install_bun() {
+    if command -v bun &> /dev/null; then
+        log_success "Bun is already installed"
+        return 0
+    fi
+
+    log_info "Installing Bun..."
+
+    # Try system package manager first
+    case "$PKG_MANAGER" in
+        "pacman"|"yay"|"paru")
+            if $PKG_INSTALL bun >> "$INSTALL_LOG" 2>&1; then
+                log_success "Bun installed via $PKG_MANAGER"
+                return 0
+            fi
+            ;;
+        "brew")
+            if $PKG_INSTALL oven-sh/bun/bun >> "$INSTALL_LOG" 2>&1; then
+                log_success "Bun installed via Homebrew"
+                return 0
+            fi
+            ;;
+        "apk")
+            if $PKG_INSTALL bun >> "$INSTALL_LOG" 2>&1; then
+                log_success "Bun installed via apk"
+                return 0
+            fi
+            ;;
+    esac
+
+    # Fall back to official installer
+    if curl -fsSL https://bun.sh/install | bash >> "$INSTALL_LOG" 2>&1; then
+        # Source bun environment
+        if [[ -f "$HOME/.bashrc" ]]; then
+            source "$HOME/.bashrc"
+        fi
+        export PATH="$HOME/.bun/bin:$PATH"
+
+        if command -v bun &> /dev/null; then
+            log_success "Bun installed successfully"
+            return 0
+        fi
+    fi
+
+    log_warn "Failed to install Bun. Dashboard features will be unavailable."
+    return 1
+}
+
+# Install SQLite3 if missing
+install_sqlite3() {
+    if command -v sqlite3 &> /dev/null; then
+        return 0
+    fi
+
+    log_info "Installing SQLite3..."
+
+    case "$PKG_MANAGER" in
+        "apt"|"nala")
+            $PKG_INSTALL sqlite3 libsqlite3-dev >> "$INSTALL_LOG" 2>&1
+            ;;
+        "pacman"|"yay"|"paru")
+            $PKG_INSTALL sqlite >> "$INSTALL_LOG" 2>&1
+            ;;
+        "dnf"|"yum")
+            $PKG_INSTALL sqlite sqlite-devel >> "$INSTALL_LOG" 2>&1
+            ;;
+        "apk")
+            $PKG_INSTALL sqlite >> "$INSTALL_LOG" 2>&1
+            ;;
+        "zypper")
+            $PKG_INSTALL sqlite3 sqlite3-devel >> "$INSTALL_LOG" 2>&1
+            ;;
+        "brew")
+            $PKG_INSTALL sqlite >> "$INSTALL_LOG" 2>&1
+            ;;
+        *)
+            log_warn "Could not install SQLite3. Maestro integration will be unavailable."
+            return 1
+            ;;
+    esac
+
+    if command -v sqlite3 &> /dev/null; then
+        log_success "SQLite3 installed successfully"
+        return 0
+    else
+        log_warn "Failed to install SQLite3"
+        return 1
+    fi
+}
+
+# ============================================================================
 # COLOR OUTPUT
 # ============================================================================
 readonly RED=$'\033[0;31m'
@@ -177,7 +412,7 @@ install_rust() {
 # ============================================================================
 
 install_leindex() {
-    print_step 2 4 "Building LeIndex"
+    print_step 2 5 "Building LeIndex"
 
     local install_method=""
     local repo_dir=""
@@ -372,7 +607,7 @@ install_dashboard_assets() {
 }
 
 verify_installation() {
-    print_step 3 4 "Verifying Installation"
+    print_step 3 5 "Verifying Installation"
 
     local binary="$INSTALL_BIN_DIR/$PROJECT_SLUG"
 
@@ -422,7 +657,7 @@ verify_installation() {
 }
 
 setup_directories() {
-    print_step 4 4 "Setting up Directories"
+    print_step 4 5 "Setting up Directories"
 
     # Create LeIndex data directories (bin directory is created during install with sudo)
     for dir in "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$DASHBOARD_DIR"; do
@@ -2010,6 +2245,41 @@ main() {
     echo "  ${BOLD}Version:${NC}     $SCRIPT_VERSION"
     echo "  ${BOLD}Repository:${NC}  $REPO_URL"
     echo ""
+
+    # Step 0: Detect OS and install system dependencies
+    print_step 0 5 "Detecting Operating System"
+    detect_os
+    log_info "Detected OS: $OS_NAME"
+
+    detect_package_manager
+    if [[ "$PKG_MANAGER" != "unknown" ]]; then
+        log_info "Using package manager: $PKG_MANAGER"
+    else
+        log_warn "No supported package manager detected"
+    fi
+
+    install_system_deps
+
+    # Step 0.5: Install optional components
+    if [[ "$NONINTERACTIVE" != true ]]; then
+        echo ""
+        log_info "Optional components:"
+        read -p "Install SQLite3 for Maestro integration? [Y/n] " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            install_sqlite3
+        fi
+
+        read -p "Install Bun for dashboard support? [Y/n] " -n 1 -r
+        echo ""
+        if [[ ! $REPLY =~ ^[Nn]$ ]]; then
+            install_bun
+        fi
+    else
+        # In non-interactive mode, try to install optional deps but don't fail if they don't install
+        install_sqlite3 || true
+        install_bun || true
+    fi
 
     # Step 0: Purge existing installation
     purge_existing_installation
