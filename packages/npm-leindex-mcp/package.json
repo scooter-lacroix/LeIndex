@@ -2,6 +2,7 @@
   "name": "@leindex/mcp",
   "version": "1.5.0",
   "description": "LeIndex MCP Server - Semantic code search for AI tools (auto-installing binary wrapper)",
+  "private": false,
   "main": "index.js",
   "bin": {
     "leindex-mcp": "./bin/mcp-wrapper.js"
