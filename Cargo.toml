@@ -14,10 +14,7 @@ keywords = [
     "search",
     "code",
     "semantic",
-    "vector",
     "indexing",
-    "hnsw",
-    "quantization",
     "language-server",
 ]
 categories = [
