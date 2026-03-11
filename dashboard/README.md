@@ -1,4 +1,4 @@
-# LeIndex Dashboard (v1.5.1)
+# LeIndex Dashboard (v1.5.2)
 
 LeIndex dashboard is a Bun + React UI for operational visibility over indexed codebases.
 

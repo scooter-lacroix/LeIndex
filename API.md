@@ -1,4 +1,4 @@
-# LeIndex API Reference (v1.5.1)
+# LeIndex API Reference (v1.5.2)
 
 ## CLI
 

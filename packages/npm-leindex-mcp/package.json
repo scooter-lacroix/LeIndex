@@ -1,11 +1,11 @@
 {
   "name": "@leindex/mcp",
-  "version": "1.5.1",
+  "version": "1.5.2",
   "description": "LeIndex MCP Server - Semantic code search for AI tools (auto-installing binary wrapper)",
   "private": false,
   "main": "index.js",
   "bin": {
-    "leindex-mcp": "./bin/mcp-wrapper.js"
+    "leindex-mcp": "bin/mcp-wrapper.js"
   },
   "scripts": {
     "postinstall": "node install.js",
@@ -25,7 +25,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/scooter-lacroix/leindex.git",
+    "url": "git+https://github.com/scooter-lacroix/leindex.git",
     "directory": "packages/npm-leindex-mcp"
   },
   "bugs": {

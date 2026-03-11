@@ -1,4 +1,4 @@
-# LeIndex Architecture (v1.5.1)
+# LeIndex Architecture (v1.5.2)
 
 ## Overview
 
@@ -93,9 +93,9 @@ Dashboard assets live under `dashboard/` and are served in development via Bun.
 
 ## Removed Components Documentation
 
-### `leserve` Binary (Removed in v1.5.1)
+### `leserve` Binary (Removed in v1.5.2)
 
-The `leserve` binary was a standalone HTTP/WebSocket server for serving the dashboard without requiring Bun. It was removed in v1.5.1 when the crate was unified into a single `leindex` binary.
+The `leserve` binary was a standalone HTTP/WebSocket server for serving the dashboard without requiring Bun. It was removed in v1.5.2 when the crate was unified into a single `leindex` binary.
 
 **Functionality:**
 - Compiled Rust HTTP server using Axum
@@ -148,7 +148,7 @@ async fn main() -> anyhow::Result<()> {
 2. Option B: Restore `leserve` binary entry point in `Cargo.toml` and `src/bin/leserve.rs`
 3. Option C: Merge `LeIndexServer` functionality into `leindex serve` with `--dashboard` flag
 
-### `leedit` Binary (Removed in v1.5.1)
+### `leedit` Binary (Removed in v1.5.2)
 
 The `leedit` binary was a stub for code editing utilities. It was removed as it contained no implemented functionality.
 
