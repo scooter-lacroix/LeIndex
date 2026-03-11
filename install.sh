@@ -4,17 +4,20 @@
 # Version: 5.1.0 - Rust Edition + Dashboard Assets
 # Platform: Linux/Unix
 #
-# One-line installer:
-#   curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+# Installer:
+#   curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh -o install-leindex.sh
+#   bash install-leindex.sh
 #
 # Cargo install alternative:
 #   cargo install leindex
 #
 # Or with wget:
-#   wget -qO- https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+#   wget -O install-leindex.sh https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh
+#   bash install-leindex.sh
 #
 # Non-interactive mode:
-#   curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash -s -- --yes
+#   curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh -o install-leindex.sh
+#   bash install-leindex.sh --yes
 #############################################
 
 set -euo pipefail
@@ -386,15 +389,21 @@ install_rust() {
 
     log_info "Downloading rustup installer..."
 
+    local rustup_script
+    rustup_script="$(mktemp)"
+    trap 'rm -f "$rustup_script"' RETURN
+
     if command -v curl &> /dev/null; then
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs -o "$rustup_script"
     elif command -v wget &> /dev/null; then
-        wget -qO- https://sh.rustup.rs | sh -s -- -y
+        wget -qO "$rustup_script" https://sh.rustup.rs
     else
         log_error "Neither curl nor wget found. Please install Rust manually:"
         echo "  Visit: https://rustup.rs/"
         exit 1
     fi
+
+    sh "$rustup_script" -y
 
     # Source cargo environment
     source "$HOME/.cargo/env"
@@ -2281,11 +2290,11 @@ main() {
         install_bun || true
     fi
 
-    # Step 0: Purge existing installation
+    # Purge any existing installation before continuing
     purge_existing_installation
 
     # Step 1: Check Rust
-    print_step 1 4 "Checking Rust Toolchain"
+    print_step 1 5 "Checking Rust Toolchain"
 
     if ! detect_rust; then
         echo ""

@@ -103,7 +103,8 @@ cargo install leindex
 **Via install script:**
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh -o install-leindex.sh
+bash install-leindex.sh
 ```
 
 **Environment Variables:**
