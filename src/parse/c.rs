@@ -28,22 +28,12 @@ impl CParser {
         root: tree_sitter::Node<'_>,
     ) -> Vec<SignatureInfo> {
         let mut signatures = Vec::new();
+        let mut stack = vec![(root, Vec::<String>::new())];
 
-        fn visit_node(
-            node: &tree_sitter::Node<'_>,
-            source: &[u8],
-            signatures: &mut Vec<SignatureInfo>,
-            parent_path: &[String],
-        ) {
+        while let Some((node, parent_path)) = stack.pop() {
             match node.kind() {
-                "function_definition" => {
-                    if let Some(sig) = extract_function_signature(node, source, parent_path) {
-                        signatures.push(sig);
-                    }
-                }
-                "declaration" => {
-                    // Check if it's a function declaration (prototype)
-                    if let Some(sig) = extract_function_signature(node, source, parent_path) {
+                "function_definition" | "declaration" => {
+                    if let Some(sig) = extract_function_signature(&node, source, &parent_path) {
                         signatures.push(sig);
                     }
                 }
@@ -64,7 +54,7 @@ impl CParser {
                                 visibility: Visibility::Public,
                                 is_async: false,
                                 is_method: false,
-                                docstring: extract_docstring(node, source),
+                                docstring: extract_docstring(&node, source),
                                 calls: vec![],
                                 imports: vec![],
                                 byte_range: (node.start_byte(), node.end_byte()),
@@ -72,17 +62,23 @@ impl CParser {
                         }
                     }
                 }
-                _ => {
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        visit_node(&child, source, signatures, parent_path);
-                    }
-                }
+                _ => push_children_with_path(&mut stack, node, &parent_path),
             }
         }
 
-        visit_node(&root, source, &mut signatures, &[]);
         signatures
+    }
+}
+
+fn push_children_with_path<'tree>(
+    stack: &mut Vec<(tree_sitter::Node<'tree>, Vec<String>)>,
+    node: tree_sitter::Node<'tree>,
+    parent_path: &[String],
+) {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    for child in children.into_iter().rev() {
+        stack.push((child, parent_path.to_vec()));
     }
 }
 
@@ -237,23 +233,23 @@ fn extract_c_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportIn
         });
     }
 
-    fn visit(node: &tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<ImportInfo>) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
         if node.kind() == "preproc_include" {
             if let Ok(text) = node.utf8_text(source) {
                 let parts: Vec<_> = text.split_whitespace().collect();
                 if let Some(last) = parts.last() {
-                    add_import(imports, last, None);
+                    add_import(&mut imports, last, None);
                 }
             }
         }
 
         let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            visit(&child, source, imports);
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
         }
     }
-
-    visit(&root, source, &mut imports);
     imports
 }
 
@@ -264,9 +260,10 @@ fn extract_c_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
         raw.split('(').next().unwrap_or(raw).trim().to_string()
     }
 
-    fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
-        if node.kind() == "call_expression" {
-            if let Some(func) = node.child_by_field_name("function") {
+    let mut stack = vec![*node];
+    while let Some(current) = stack.pop() {
+        if current.kind() == "call_expression" {
+            if let Some(func) = current.child_by_field_name("function") {
                 if let Ok(text) = func.utf8_text(source) {
                     let name = clean_call_text(text);
                     if !name.is_empty() {
@@ -276,13 +273,12 @@ fn extract_c_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
             }
         }
 
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            find_calls(&child, source, calls);
+        let mut cursor = current.walk();
+        let children: Vec<_> = current.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
         }
     }
-
-    find_calls(node, source, &mut calls);
     calls
 }
 

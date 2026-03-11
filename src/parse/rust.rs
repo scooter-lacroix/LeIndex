@@ -28,54 +28,45 @@ impl RustParser {
         root: tree_sitter::Node<'_>,
     ) -> Vec<SignatureInfo> {
         let mut signatures = Vec::new();
+        let mut stack = vec![(root, Vec::<String>::new())];
 
-        fn visit_node(
-            node: &tree_sitter::Node<'_>,
-            source: &[u8],
-            signatures: &mut Vec<SignatureInfo>,
-            parent_path: &[String],
-        ) {
+        while let Some((node, parent_path)) = stack.pop() {
             match node.kind() {
                 "function_item" => {
-                    if let Some(sig) = extract_function_signature(node, source, parent_path) {
+                    if let Some(sig) = extract_function_signature(&node, source, &parent_path) {
                         signatures.push(sig);
                     }
-                    // Don't recurse into function bodies
+                    // Don't recurse into function bodies.
                 }
                 "mod_item" => {
                     if let Some(name) = node
                         .child_by_field_name("name")
                         .and_then(|n| n.utf8_text(source).ok())
                     {
-                        let mut new_path = parent_path.to_vec();
+                        let mut new_path = parent_path.clone();
                         new_path.push(name.to_string());
-
-                        let mut cursor = node.walk();
-                        for child in node.children(&mut cursor) {
-                            visit_node(&child, source, signatures, &new_path);
-                        }
+                        push_children_with_path(&mut stack, node, &new_path);
+                    } else {
+                        push_children_with_path(&mut stack, node, &parent_path);
                     }
                 }
                 "impl_item" => {
-                    // Extract methods from impl block
                     let mut cursor = node.walk();
                     for child in node.children(&mut cursor) {
-                        // Functions are inside declaration_list
                         if child.kind() == "declaration_list" {
                             let mut dcursor = child.walk();
                             for dc in child.children(&mut dcursor) {
                                 if dc.kind() == "function_item" {
                                     if let Some(sig) =
-                                        extract_function_signature(&dc, source, parent_path)
+                                        extract_function_signature(&dc, source, &parent_path)
                                     {
                                         signatures.push(sig);
                                     }
                                 }
                             }
                         } else if child.kind() == "function_item" {
-                            // Direct function_item (shouldn't happen but handle it)
                             if let Some(sig) =
-                                extract_function_signature(&child, source, parent_path)
+                                extract_function_signature(&child, source, &parent_path)
                             {
                                 signatures.push(sig);
                             }
@@ -98,21 +89,17 @@ impl RustParser {
                             qualified_name,
                             parameters: vec![],
                             return_type: Some("trait".to_string()),
-                            visibility: extract_visibility(node, source),
+                            visibility: extract_visibility(&node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
+                            docstring: extract_docstring(&node, source),
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
                         });
                     }
 
-                    // Recurse to extract trait methods
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        visit_node(&child, source, signatures, parent_path);
-                    }
+                    push_children_with_path(&mut stack, node, &parent_path);
                 }
                 "struct_item" => {
                     if let Some(name) = node
@@ -125,7 +112,6 @@ impl RustParser {
                             format!("{}.{}", parent_path.join("::"), name)
                         };
 
-                        // Extract type parameters
                         let type_params = node
                             .child_by_field_name("type_parameters")
                             .and_then(|tp| tp.utf8_text(source).ok())
@@ -142,10 +128,10 @@ impl RustParser {
                             qualified_name,
                             parameters: vec![],
                             return_type: Some(return_type),
-                            visibility: extract_visibility(node, source),
+                            visibility: extract_visibility(&node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
+                            docstring: extract_docstring(&node, source),
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
@@ -168,10 +154,10 @@ impl RustParser {
                             qualified_name,
                             parameters: vec![],
                             return_type: Some("enum".to_string()),
-                            visibility: extract_visibility(node, source),
+                            visibility: extract_visibility(&node, source),
                             is_async: false,
                             is_method: false,
-                            docstring: extract_docstring(node, source),
+                            docstring: extract_docstring(&node, source),
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
@@ -179,21 +165,29 @@ impl RustParser {
                     }
                 }
                 "use_declaration" => {
-                    if let Some(sig) = extract_import_signature(node, source, parent_path) {
+                    if let Some(sig) = extract_import_signature(&node, source, &parent_path) {
                         signatures.push(sig);
                     }
                 }
                 _ => {
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        visit_node(&child, source, signatures, parent_path);
-                    }
+                    push_children_with_path(&mut stack, node, &parent_path);
                 }
             }
         }
 
-        visit_node(&root, source, &mut signatures, &[]);
         signatures
+    }
+}
+
+fn push_children_with_path<'tree>(
+    stack: &mut Vec<(tree_sitter::Node<'tree>, Vec<String>)>,
+    node: tree_sitter::Node<'tree>,
+    parent_path: &[String],
+) {
+    let mut cursor = node.walk();
+    let children: Vec<_> = node.children(&mut cursor).collect();
+    for child in children.into_iter().rev() {
+        stack.push((child, parent_path.to_vec()));
     }
 }
 
@@ -316,20 +310,20 @@ fn extract_rust_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Impor
         }
     }
 
-    fn visit(node: &tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<ImportInfo>) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
         if node.kind() == "use_declaration" {
             if let Ok(text) = node.utf8_text(source) {
-                parse_use_text(imports, text);
+                parse_use_text(&mut imports, text);
             }
         }
 
         let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            visit(&child, source, imports);
+        let children: Vec<_> = node.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
         }
     }
-
-    visit(&root, source, &mut imports);
     imports
 }
 
@@ -401,10 +395,11 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
             .to_string()
     }
 
-    fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
-        match node.kind() {
+    let mut stack = vec![*node];
+    while let Some(current) = stack.pop() {
+        match current.kind() {
             "call_expression" => {
-                if let Some(func) = node.child_by_field_name("function") {
+                if let Some(func) = current.child_by_field_name("function") {
                     if let Ok(text) = func.utf8_text(source) {
                         let name = clean_call_text(text);
                         if !name.is_empty() {
@@ -414,11 +409,11 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                 }
             }
             "method_call_expression" => {
-                let receiver = node
+                let receiver = current
                     .child_by_field_name("receiver")
                     .and_then(|r| r.utf8_text(source).ok())
                     .map(|s| clean_call_text(s));
-                let method = node
+                let method = current
                     .child_by_field_name("method")
                     .and_then(|m| m.utf8_text(source).ok())
                     .map(|s| clean_call_text(s));
@@ -434,9 +429,9 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                 }
             }
             "macro_invocation" => {
-                if let Some(name_node) = node
+                if let Some(name_node) = current
                     .child_by_field_name("macro")
-                    .or_else(|| node.child_by_field_name("name"))
+                    .or_else(|| current.child_by_field_name("name"))
                 {
                     if let Ok(text) = name_node.utf8_text(source) {
                         let name = clean_call_text(text);
@@ -449,13 +444,12 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
             _ => {}
         }
 
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            find_calls(&child, source, calls);
+        let mut cursor = current.walk();
+        let children: Vec<_> = current.children(&mut cursor).collect();
+        for child in children.into_iter().rev() {
+            stack.push(child);
         }
     }
-
-    find_calls(node, source, &mut calls);
     calls
 }
 
