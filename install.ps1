@@ -4,7 +4,7 @@
 # Platform: Windows PowerShell
 #
 # One-line installer:
-#   iwr https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.ps1 -UseBasicParsing | iex
+#   iwr https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.ps1 -UseBasicParsing | iex
 #
 # Cargo install alternative:
 #   cargo install leindex

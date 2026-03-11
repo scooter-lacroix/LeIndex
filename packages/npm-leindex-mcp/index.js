@@ -7,7 +7,7 @@
  * The binary is automatically downloaded during installation.
  */
 
-const { execSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
@@ -33,7 +33,7 @@ function getBinaryPath() {
  */
 function exec(args = []) {
   const bin = getBinaryPath();
-  return execSync(`"${bin}" ${args.join(' ')}`, { encoding: 'utf8' });
+  return execFileSync(bin, args, { encoding: 'utf8' });
 }
 
 /**
@@ -41,7 +41,6 @@ function exec(args = []) {
  * @returns {ChildProcess} The spawned process
  */
 function startMcpServer() {
-  const { spawn } = require('child_process');
   const bin = getBinaryPath();
   
   return spawn(bin, ['mcp', '--stdio'], {

@@ -33,7 +33,7 @@ LeIndex is designed with the following security principles:
 
 ### Database Discovery (Opt-In Only)
 
-- The `leserve` HTTP server can auto-discover project databases, but this is **disabled by default**.
+- The `leindex serve` HTTP server can auto-discover project databases, but this is **disabled by default**.
 - You must explicitly set `LEINDEX_DISCOVERY_ROOTS` to enable it.
 - Sensitive directories are automatically excluded from scanning:
   - Cryptographic materials: `/.ssh/`, `/.gnupg/`, `/.config/gnupg/`

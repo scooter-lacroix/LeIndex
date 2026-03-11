@@ -13,11 +13,11 @@ use crate::server::handlers::{create_router, AppState};
 use crate::storage::Storage;
 use walkdir::WalkDir;
 
-/// LeServe HTTP/WebSocket server
+/// LeIndex HTTP/WebSocket server
 ///
 /// Manages Axum server lifecycle including startup,
 /// graceful shutdown, and connection management.
-pub struct LeServeServer {
+pub struct LeIndexServer {
     /// Server configuration
     config: ServerConfig,
 
@@ -25,7 +25,7 @@ pub struct LeServeServer {
     storage: Arc<Mutex<Storage>>,
 }
 
-impl LeServeServer {
+impl LeIndexServer {
     /// Create new server instance
     ///
     /// # Arguments
@@ -34,7 +34,7 @@ impl LeServeServer {
     ///
     /// # Returns
     ///
-    /// `Result<LeServeServer, ApiError>` - Server or error
+    /// `Result<LeIndexServer, ApiError>` - Server or error
     pub fn new(config: ServerConfig) -> Result<Self, ApiError> {
         // Validate config
         if let Err(e) = config.validate() {
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     fn test_server_default_config() {
         let config = ServerConfig::default();
-        let server = LeServeServer::new(config);
+        let server = LeIndexServer::new(config);
         assert!(server.is_ok());
     }
 }

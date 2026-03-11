@@ -120,7 +120,7 @@ LeIndex 由 5 个生产可用 Rust crate 组成：
 #### 一行安装脚本（Linux/macOS）
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh | bash
 ```
 
 #### Cargo（crates.io）

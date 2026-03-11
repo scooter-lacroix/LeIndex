@@ -1,4 +1,4 @@
-# LeIndex Dashboard (v1.5.0)
+# LeIndex Dashboard (v1.5.1)
 
 LeIndex dashboard is a Bun + React UI for operational visibility over indexed codebases.
 
@@ -28,7 +28,7 @@ bun run typecheck
 
 ## Backend Requirements
 
-Dashboard expects `leserve` endpoints on `http://127.0.0.1:47269`:
+Dashboard expects `leindex serve` endpoints on `http://127.0.0.1:47269`:
 
 - `GET /api/health`
 - `GET /api/dashboard/overview`

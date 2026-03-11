@@ -16,17 +16,17 @@ Both are first-class and kept up to date.
 
 **Linux**
 ```bash
-curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh | bash
 ```
 
 **macOS**
 ```bash
-curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install_macos.sh | bash
+curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install_macos.sh | bash
 ```
 
 **Windows (PowerShell)**
 ```powershell
-iwr https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.ps1 -UseBasicParsing | iex
+iwr https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.ps1 -UseBasicParsing | iex
 ```
 
 ### Cargo install (crates.io)

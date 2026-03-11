@@ -5,7 +5,7 @@
 # Platform: macOS
 #
 # One-line installer:
-#   curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install_macos.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install_macos.sh | bash
 #
 # Cargo install alternative:
 #   cargo install leindex

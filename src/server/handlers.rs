@@ -757,7 +757,7 @@ pub async fn search(
 pub async fn health_check(State(_state): State<AppState>) -> ApiResult<Json<serde_json::Value>> {
     Ok(Json(serde_json::json!({
         "status": "ok",
-        "service": "leserve",
+        "service": "leindex",
         "version": env!("CARGO_PKG_VERSION"),
         "active_connections": 0,
     })))

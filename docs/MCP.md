@@ -1696,5 +1696,5 @@ Or via the health endpoint:
 
 ```bash
 curl http://localhost:3000/health
-# {"status":"ok","service":"leserve","version":"1.5.0"}
+# {"status":"ok","service":"leindex","version":"1.5.1"}
 ```

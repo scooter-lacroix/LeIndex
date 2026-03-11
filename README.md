@@ -197,7 +197,7 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 - **5-phase analysis** — additive multi-pass codebase analysis pipeline
 - **Cross-project indexing** — search across multiple repos at once
 - **16 MCP tools** — read, analyze, edit preview/apply, rename, impact analysis
-- **HTTP + WebSocket server** — `leserve` with live event streaming
+- **HTTP + WebSocket server** — available through the unified `leindex` server modules and commands
 - **Dashboard** — Bun + React operational UI with project metrics and graph telemetry
 - **Low resource mode** — works on constrained hardware
 - **Built in Rust** — fast indexing, low memory, safe concurrency
@@ -221,10 +221,10 @@ cargo build --release
 ```
 
 **Feature flags:** Use `--features` to customize the build:
-- `full` (default) — All features enabled
-- `minimal` — Parse and search only (smaller binary)
-- `cli` — CLI + MCP server
-- `server` — HTTP server only
+- `full` (default) — Full library plus the `leindex` CLI binary
+- `minimal` — Library-focused parse/search build slice; does not produce the `leindex` binary by itself
+- `cli` — Required feature for the `leindex` binary target
+- `server` — Enables the HTTP/WebSocket server library modules; combine with `cli` for a runnable binary
 
 ### MCP Server Integration
 
@@ -475,22 +475,24 @@ leindex dashboard                     # Launch dashboard UI
 
 ---
 
-## Workspace Layout
+## Unified Module Layout
 
-LeIndex v1.5.0 is organized as a Rust workspace:
+LeIndex is now a single crate with feature-gated modules:
 
-| Crate | Role |
+| Module | Role |
 |-------|------|
-| `leparse` | Language parsing and signature extraction |
-| `legraphe` | Graph construction and traversal |
-| `lerecherche` | Retrieval, scoring, vector search |
-| `lestockage` | SQLite persistence + storage |
-| `lephase` | Additive phase analysis pipeline |
-| `lepasserelle` | CLI + MCP protocol handlers |
-| `leglobal` | Cross-project discovery/registry |
-| `leserve` | HTTP/WebSocket API server |
-| `leedit` | Edit preview/apply support |
-| `levalidation` | Validation and guardrails |
+| `parse` | Language parsing and signature extraction |
+| `graph` | Graph construction and traversal |
+| `search` | Retrieval, scoring, vector search |
+| `storage` | SQLite persistence + storage |
+| `phase` | Additive phase analysis pipeline |
+| `cli` | CLI + MCP protocol handlers |
+| `global` | Cross-project discovery/registry |
+| `server` | HTTP/WebSocket API server |
+| `edit` | Edit preview/apply support |
+| `validation` | Validation and guardrails |
+
+Legacy crate-style aliases remain available from `leindex::leparse`, `leindex::legraphe`, and similar compatibility re-exports.
 
 ---
 

@@ -25,7 +25,7 @@ cargo install leindex
 ### One-Line Installer (Linux/macOS)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh | bash
 ```
 
 ## Global Options

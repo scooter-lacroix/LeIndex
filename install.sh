@@ -5,18 +5,18 @@
 # Platform: Linux/Unix
 #
 # Installer:
-#   curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh -o install-leindex.sh
+#   curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh -o install-leindex.sh
 #   bash install-leindex.sh
 #
 # Cargo install alternative:
 #   cargo install leindex
 #
 # Or with wget:
-#   wget -O install-leindex.sh https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh
+#   wget -O install-leindex.sh https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh
 #   bash install-leindex.sh
 #
 # Non-interactive mode:
-#   curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh -o install-leindex.sh
+#   curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh -o install-leindex.sh
 #   bash install-leindex.sh --yes
 #############################################
 
@@ -38,6 +38,7 @@ PRESERVE_DATA=false
 PRESERVE_LOGS=false
 KEEP_ALL=false
 SELECTIVE_PURGE=false
+INSTALL_DASHBOARD="${INSTALL_DASHBOARD:-true}"
 
 # Installation paths
 LEINDEX_HOME="${LEINDEX_HOME:-$HOME/.leindex}"

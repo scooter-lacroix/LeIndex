@@ -1,6 +1,6 @@
-//! leserve - HTTP/WebSocket Server
+//! LeIndex server module
 //!
-//! *Le Serve* (The Server) - Axum-based HTTP/WebSocket server for LeIndex dashboard
+//! Axum-based HTTP/WebSocket server support for LeIndex.
 
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
@@ -25,9 +25,12 @@ pub mod server;
 
 pub use config::ServerConfig;
 pub use error::{ApiError, ApiResult};
-pub use server::LeServeServer;
+pub use server::LeIndexServer;
 
-/// leserve library initialization
+#[doc(hidden)]
+pub use server::LeIndexServer as LeServeServer;
+
+/// Initialize the server module.
 pub fn init() {
     let _ = tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
 }

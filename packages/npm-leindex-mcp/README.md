@@ -170,7 +170,13 @@ Add to Claude Desktop config:
 1. **On `npm install`**: The `postinstall` script downloads the appropriate LeIndex binary for your platform (macOS/Linux/Windows, x64/arm64)
 2. **Binary Storage**: Downloaded to `node_modules/@leindex/mcp/bin/`
 3. **MCP Mode**: When called via `npx @leindex/mcp`, launches LeIndex in MCP stdio mode
-4. **Updates**: Run `npm update @leindex/mcp` to get the latest binary
+4. **Updates**: By default the installer resolves the GitHub `latest` release and verifies the downloaded binary against `SHA256SUMS`
+
+To pin a specific binary release instead of `latest`:
+
+```bash
+LEINDEX_BINARY_VERSION=1.5.2 npm install @leindex/mcp
+```
 
 ---
 
@@ -255,4 +261,4 @@ MIT - See [LICENSE](../../LICENSE)
 
 - [GitHub Repository](https://github.com/scooter-lacroix/leindex)
 - [Full Documentation](https://github.com/scooter-lacroix/leindex#readme)
-- [MCP Documentation](https://github.com/scooter-lacroix/leindex/blob/main/docs/MCP.md)
+- [MCP Documentation](https://github.com/scooter-lacroix/leindex/blob/master/docs/MCP.md)
