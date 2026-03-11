@@ -1,6 +1,6 @@
 [package]
 name = "leindex"
-version = "1.5.0"
+version = "1.5.1"
 edition = "2021"
 rust-version = "1.75"
 authors = ["LeIndex Contributors"]
@@ -266,18 +266,6 @@ rand = "0.8"
 name = "leindex"
 path = "src/bin/leindex.rs"
 required-features = ["cli"]
-doc = false
-
-[[bin]]
-name = "leserve"
-path = "src/bin/leserve.rs"
-required-features = ["server"]
-doc = false
-
-[[bin]]
-name = "leedit"
-path = "src/bin/leedit.rs"
-required-features = ["edit"]
 doc = false
 
 [[bench]]

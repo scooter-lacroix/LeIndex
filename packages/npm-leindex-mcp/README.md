@@ -145,7 +145,7 @@ Add to Claude Desktop config:
 | **Dashboard** | ❌ No | ✅ Yes (`leindex dashboard`) |
 | **HTTP Server** | ❌ No | ✅ Yes (`leindex serve`) |
 | **CLI Tools** | ❌ No | ✅ Yes (`leindex search`, `index`, etc.) |
-| **Binary Size** | ~150MB | ~192MB (+ dashboard assets) |
+| **Binary Size** | ~32MB (single binary with all features) | ~32MB (single binary with all features) |
 | **Update Method** | `npm update` | `cargo install leindex` |
 | **Best For** | AI tool integration | Full development workflow |
 
