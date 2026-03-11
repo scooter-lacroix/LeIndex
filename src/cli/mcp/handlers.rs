@@ -442,17 +442,7 @@ to auto-switch/auto-index projects."
                     JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
                 "offset": offset,
                 "count": total_returned,
-                "has_more": offset + total_returned < total_filtered,
-                "scoring_explanation": {
-                    "semantic": "TF-IDF cosine similarity (0-1) - measures conceptual relevance",
-                    "text_match": "Token overlap ratio (0-1) - exact keyword matches",
-                    "structural": "PDG centrality score (0-1) - importance in call graph"
-                },
-                "example_interpretation": {
-                    "score_0.8_plus": "Highly relevant - likely what you're looking for",
-                    "score_0.5_to_0.79": "Moderately relevant - worth reviewing",
-                    "score_below_0.5": "Low relevance - refine query or broaden context"
-                }
+                "has_more": offset + total_returned < total_filtered
             }),
             &index,
         ))
@@ -474,8 +464,7 @@ impl DeepAnalyzeHandler {
     /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
         "Deep analysis: semantic search + PDG traversal for definition, callers, callees, \
-data flow, and impact radius. Supersedes Grep + multiple Read. Accepts project_path \
-to auto-switch/auto-index projects."
+data flow, and impact radius. Use for broad codebase understanding queries."
     }
 
     /// Returns the JSON schema for the arguments of this RPC method
@@ -1102,21 +1091,11 @@ fn resolve_scope(args: &Value, project_root: &Path) -> Result<Option<String>, Js
 fn wrap_with_meta(mut result: Value, index: &crate::cli::leindex::LeIndex) -> Value {
     let stale = index.is_stale_fast();
     if let Some(obj) = result.as_object_mut() {
-        obj.insert(
-            "_meta".to_string(),
-            serde_json::json!({
-                "index_stale": stale,
-                "project_path": index.project_path().display().to_string(),
-                "storage_path": index.storage_path().display().to_string(),
-                "indexed_at": index.get_stats().indexing_time_ms,
-            }),
-        );
         if stale {
             obj.insert(
                 "_warning".to_string(),
                 Value::String(
-                    "Index may be stale. Results may not reflect recent file changes. \
-                     Call leindex_index with force_reindex=true to refresh."
+                    "Index may be stale. Call leindex_index with force_reindex=true to refresh."
                         .to_string(),
                 ),
             );
@@ -1139,6 +1118,37 @@ fn read_source_snippet(file_path: &str, byte_range: (usize, usize)) -> Option<St
         return None;
     }
     Some(String::from_utf8_lossy(&bytes[start..end]).into_owned())
+}
+
+/// Convert a byte range to a 1-indexed line range.
+fn byte_range_to_line_range(content: &str, byte_range: (usize, usize)) -> (usize, usize) {
+    let (start, end) = byte_range;
+    let bytes = content.as_bytes();
+    let mut line = 1usize;
+    let mut start_line = 1usize;
+    let mut end_line = 1usize;
+    let mut found_start = false;
+
+    for (idx, b) in bytes.iter().enumerate() {
+        if idx == start {
+            start_line = line;
+            found_start = true;
+        }
+        if idx >= end {
+            end_line = line;
+            break;
+        }
+        if *b == b'\n' {
+            line += 1;
+        }
+    }
+    if !found_start {
+        start_line = line;
+    }
+    if end >= bytes.len() {
+        end_line = line;
+    }
+    (start_line, end_line.max(start_line))
 }
 
 /// Collect the NodeIds of all nodes that have a direct edge pointing *to*
@@ -1168,10 +1178,10 @@ impl FileSummaryHandler {
     }
 
     pub fn description(&self) -> &str {
-        "Structural analysis of a file: all symbols, signatures, complexity scores, \
-cross-file deps/dependents, and module role. 5-10x more token efficient than Read — \
-returns what you need to understand a file without reading raw content. Includes \
-cross-file relationships that Read cannot provide."
+        "File overview: symbol inventory, complexity scores, cross-file dependencies, \
+and module role. Use for understanding structure without reading raw content. \
+For exact file contents use leindex_read_file; for a specific implementation \
+use leindex_read_symbol."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -1370,9 +1380,9 @@ impl SymbolLookupHandler {
     }
 
     pub fn description(&self) -> &str {
-        "Look up a symbol and get its full structural context: definition, signature, callers, \
-callees, data dependencies, and impact radius. Replaces Grep + multiple Read calls with \
-a single structured response including cross-file relationships."
+        "Symbol relationship lookup: callers, callees, data dependencies, and impact radius. \
+Use for understanding how a symbol connects to the rest of the codebase. \
+For the exact source implementation use leindex_read_symbol."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -1436,7 +1446,8 @@ a single structured response including cross-file relationships."
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let include_source = extract_bool(&args, "include_source", false);
+        let is_batch = args.get("symbols").and_then(|v| v.as_array()).map_or(false, |a| a.len() > 1);
+        let include_source = extract_bool(&args, "include_source", !is_batch);
         let include_callers = extract_bool(&args, "include_callers", true);
         let include_callees = extract_bool(&args, "include_callees", true);
         let depth = extract_usize(&args, "depth", 2)?.min(5);
@@ -1694,10 +1705,9 @@ impl ProjectMapHandler {
     }
 
     pub fn description(&self) -> &str {
-        "Annotated project structure map: files, directories, symbol counts, complexity \
-hotspots, and inter-module dependency arrows. Unlike Glob's flat file lists, shows \
-architecture — which modules depend on which and where complexity lives. 5x more \
-token efficient than Glob + directory reads."
+        "Project structure map — use instead of Glob/ls for directory listing. Shows files \
+with symbol counts, complexity hotspots, and inter-module dependency arrows. Supports \
+scoping to subdirectories, sorting, and pagination."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -2208,9 +2218,9 @@ impl ReadSymbolHandler {
     }
 
     pub fn description(&self) -> &str {
-        "Read the source code of a specific symbol with its doc comment and the signatures \
-of its dependencies and dependents. Reads exactly what you need — far more token efficient \
-than reading an entire file. Supersedes targeted Read."
+        "PRIMARY symbol reader — returns exact source code with line numbers, doc comments, \
+and compact caller/callee locations (file:line). Use instead of Read for specific \
+functions, methods, classes, or types. Set include_dependencies=true for full signatures."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -2231,14 +2241,14 @@ than reading an entire file. Supersedes targeted Read."
                 },
                 "include_dependencies": {
                     "type": "boolean",
-                    "description": "Include dependency signatures (default: true). \
+                    "description": "Include dependency signatures (default: false). \
         Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
-                    "default": true
+                    "default": false
                 },
                 "token_budget": {
                     "type": "integer",
-                    "description": "Max tokens for response (default: 2000)",
-                    "default": 2000
+                    "description": "Max tokens for response (default: 8000)",
+                    "default": 8000
                 }
             },
             "required": ["symbol"]
@@ -2255,8 +2265,8 @@ than reading an entire file. Supersedes targeted Read."
             .get("file_path")
             .and_then(|v| v.as_str())
             .map(str::to_owned);
-        let include_dependencies = extract_bool(&args, "include_dependencies", true);
-        let token_budget = extract_usize(&args, "token_budget", 2000)?;
+        let include_dependencies = extract_bool(&args, "include_dependencies", false);
+        let token_budget = extract_usize(&args, "token_budget", 8000)?;
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
@@ -2297,7 +2307,7 @@ than reading an entire file. Supersedes targeted Read."
 
         // Read source code
         let source = read_source_snippet(&node.file_path, node.byte_range)
-            .map(|s| s.chars().take(char_budget / 2).collect::<String>());
+            .map(|s| s.chars().take(char_budget).collect::<String>());
 
         // Extract doc comment: read lines above byte_range and look for `///`, `//!`,
         // or proper `/** ... */` blocks only.
@@ -2389,11 +2399,47 @@ than reading an entire file. Supersedes targeted Read."
             Vec::new()
         };
 
-        let callers: Vec<String> = get_direct_callers(pdg, node_id)
+        // Callers with file:line — eliminates follow-up Grep for "who calls this?"
+        let callers: Vec<Value> = get_direct_callers(pdg, node_id)
             .iter()
-            .filter_map(|&cid| pdg.get_node(cid).map(|n| n.name.clone()))
-            .take(20)
+            .filter_map(|&cid| {
+                let cn = pdg.get_node(cid)?;
+                let caller_line = {
+                    let fc = std::fs::read_to_string(&cn.file_path).unwrap_or_default();
+                    byte_range_to_line_range(&fc, cn.byte_range).0
+                };
+                Some(serde_json::json!({
+                    "name": cn.name,
+                    "file": cn.file_path,
+                    "line": caller_line
+                }))
+            })
+            .take(15)
             .collect();
+
+        // Callees with file:line — eliminates follow-up Grep for "what does this call?"
+        let callees: Vec<Value> = pdg.neighbors(node_id)
+            .iter()
+            .filter_map(|&did| {
+                let dn = pdg.get_node(did)?;
+                let callee_line = {
+                    let fc = std::fs::read_to_string(&dn.file_path).unwrap_or_default();
+                    byte_range_to_line_range(&fc, dn.byte_range).0
+                };
+                Some(serde_json::json!({
+                    "name": dn.name,
+                    "file": dn.file_path,
+                    "line": callee_line
+                }))
+            })
+            .take(15)
+            .collect();
+
+        // Compute line range from byte range
+        let (line_start, line_end) = {
+            let file_content = std::fs::read_to_string(&node.file_path).unwrap_or_default();
+            byte_range_to_line_range(&file_content, node.byte_range)
+        };
 
         Ok(wrap_with_meta(
             serde_json::json!({
@@ -2402,11 +2448,13 @@ than reading an entire file. Supersedes targeted Read."
                 "file": node.file_path,
                 "language": node.language,
                 "complexity": node.complexity,
-                "byte_range": node.byte_range,
+                "line_start": line_start,
+                "line_end": line_end,
                 "doc_comment": doc_comment,
                 "source": source,
-                "dependencies": dep_signatures,
-                "callers": callers
+                "callers": callers,
+                "callees": callees,
+                "dependencies": dep_signatures
             }),
             &index,
         ))
@@ -2435,15 +2483,26 @@ fn parse_edit_changes(
 
     let mut result = Vec::new();
     for (i, item) in arr.iter().enumerate() {
-        let change_type = item.get("type").and_then(|v| v.as_str()).ok_or_else(|| {
-            JsonRpcError::invalid_params(format!("changes[{}]: missing 'type'", i))
-        })?;
+        let change_type = item.get("type").and_then(|v| v.as_str())
+            .or_else(|| {
+                if item.get("old_text").is_some() || item.get("old_str").is_some() {
+                    Some("replace_text")
+                } else if item.get("old_name").is_some() && item.get("new_name").is_some() {
+                    Some("rename_symbol")
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                JsonRpcError::invalid_params(format!("changes[{}]: missing 'type' — use 'replace_text' or 'rename_symbol', or provide old_text+new_text", i))
+            })?;
 
         let change = match change_type {
             "replace_text" => {
-                let old_text = item.get("old_text").and_then(|v| v.as_str()).unwrap_or("");
+                let old_text = item.get("old_text").or_else(|| item.get("old_str"))
+                    .and_then(|v| v.as_str()).unwrap_or("");
                 let new_text = item
-                    .get("new_text")
+                    .get("new_text").or_else(|| item.get("new_str"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| {
                         JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_text'", i))
@@ -2776,17 +2835,25 @@ leindex_edit_apply to understand the blast radius of your change."
                     "type": "string",
                     "description": "Absolute path to the file to edit"
                 },
+                "old_text": {
+                    "type": "string",
+                    "description": "Simple mode: text to find and replace (exact match)"
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "Simple mode: replacement text"
+                },
                 "project_path": {
                     "type": "string",
                     "description": "Project directory (auto-indexes on first use; omit to use current project)"
                 },
                 "changes": {
                     "type": "array",
-                    "description": "List of changes to preview. Each change has 'type' (replace_text/rename_symbol) and type-specific fields.",
+                    "description": "Advanced mode: list of changes to preview. Each has 'type' (replace_text/rename_symbol) and type-specific fields.",
                     "items": { "type": "object" }
                 }
             },
-            "required": ["file_path", "changes"]
+            "required": ["file_path"]
         })
     }
 
@@ -2796,10 +2863,26 @@ leindex_edit_apply to understand the blast radius of your change."
         args: Value,
     ) -> Result<Value, JsonRpcError> {
         let file_path = extract_string(&args, "file_path")?;
-        let changes_val = args
-            .get("changes")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(vec![]));
+
+        // Support simple mode: top-level old_text/new_text (or old_str/new_str aliases)
+        let changes_val = if let Some(changes) = args.get("changes").cloned() {
+            changes
+        } else {
+            let old_text = args.get("old_text").or_else(|| args.get("old_str"))
+                .and_then(|v| v.as_str());
+            let new_text = args.get("new_text").or_else(|| args.get("new_str"))
+                .and_then(|v| v.as_str());
+            match (old_text, new_text) {
+                (Some(old), Some(new)) => {
+                    serde_json::json!([{
+                        "type": "replace_text",
+                        "old_text": old,
+                        "new_text": new
+                    }])
+                }
+                _ => Value::Array(vec![])
+            }
+        };
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
@@ -2885,17 +2968,7 @@ leindex_edit_apply to understand the blast radius of your change."
                 "affected_files": affected_files.into_iter().collect::<Vec<_>>(),
                 "breaking_changes": breaking_changes,
                 "risk_level": risk,
-                "change_count": changes.len(),
-                "breaking_change_examples": {
-                    "signature_change": "Function parameters modified - callers may break",
-                    "return_type_change": "Return type altered - dependent code affected",
-                    "symbol_removal": "Symbol deleted - all references will fail"
-                },
-                "safety_checklist": [
-                    "Review all affected symbols before applying",
-                    "Run tests on impacted files",
-                    "Consider using dry_run=true first"
-                ]
+                "change_count": changes.len()
             }),
             &index,
         ))
@@ -2909,9 +2982,9 @@ impl EditApplyHandler {
     }
 
     pub fn description(&self) -> &str {
-        "Apply code edits to files with optional dry-run mode and impact reporting. \
-Always run leindex_edit_preview first to understand the impact. With dry_run=true, \
-returns the preview without modifying any files."
+        "PRIMARY file editor — use instead of edit_file. Simple mode: provide file_path + \
+old_text + new_text for exact replacement. Advanced mode: use changes[] array for \
+multiple or byte-offset edits. Supports dry_run=true for preview."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -2922,13 +2995,29 @@ returns the preview without modifying any files."
                     "type": "string",
                     "description": "Absolute path to the file to edit"
                 },
+                "old_text": {
+                    "type": "string",
+                    "description": "Simple mode: text to find and replace (exact match)"
+                },
+                "old_str": {
+                    "type": "string",
+                    "description": "Alias for old_text (compatibility with edit_file)"
+                },
+                "new_text": {
+                    "type": "string",
+                    "description": "Simple mode: replacement text"
+                },
+                "new_str": {
+                    "type": "string",
+                    "description": "Alias for new_text (compatibility with edit_file)"
+                },
                 "project_path": {
                     "type": "string",
                     "description": "Project directory (auto-indexes on first use; omit to use current project)"
                 },
                 "changes": {
                     "type": "array",
-                    "description": "List of changes to apply",
+                    "description": "Advanced mode: list of changes to apply. Each has type (replace_text/rename_symbol) and type-specific fields.",
                     "items": { "type": "object" }
                 },
                 "dry_run": {
@@ -2938,7 +3027,7 @@ returns the preview without modifying any files."
                     "default": false
                 }
             },
-            "required": ["file_path", "changes"]
+            "required": ["file_path"]
         })
     }
 
@@ -2955,10 +3044,30 @@ returns the preview without modifying any files."
         }
 
         let file_path = extract_string(&args, "file_path")?;
-        let changes_val = args
-            .get("changes")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(vec![]));
+
+        // Support simple mode: top-level old_text/new_text (or old_str/new_str aliases)
+        let changes_val = if let Some(changes) = args.get("changes").cloned() {
+            changes
+        } else {
+            let old_text = args.get("old_text").or_else(|| args.get("old_str"))
+                .and_then(|v| v.as_str());
+            let new_text = args.get("new_text").or_else(|| args.get("new_str"))
+                .and_then(|v| v.as_str());
+            match (old_text, new_text) {
+                (Some(old), Some(new)) => {
+                    serde_json::json!([{
+                        "type": "replace_text",
+                        "old_text": old,
+                        "new_text": new
+                    }])
+                }
+                _ => {
+                    return Err(JsonRpcError::invalid_params(
+                        "Provide either 'changes' array or 'old_text'+'new_text' for simple replacement"
+                    ));
+                }
+            }
+        };
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
@@ -2994,22 +3103,56 @@ returns the preview without modifying any files."
             JsonRpcError::internal_error(format!("Failed to write '{}': {}", file_path, e))
         })?;
 
+        // Build verification context: show the edited region so LLM doesn't need to Read
+        let modified_lines: Vec<&str> = modified.lines().collect();
+
+        // Find the first differing line to show relevant context
+        let original_lines: Vec<&str> = original.lines().collect();
+        let first_diff_line = original_lines
+            .iter()
+            .zip(modified_lines.iter())
+            .position(|(a, b)| a != b)
+            .unwrap_or(0);
+
+        // Show ±5 lines around the edit point
+        let ctx_start = first_diff_line.saturating_sub(5);
+        let ctx_end = (first_diff_line + 10).min(modified_lines.len());
+        let edit_region: Vec<String> = modified_lines[ctx_start..ctx_end]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{}: {}", ctx_start + i + 1, line))
+            .collect();
+
+        // Compact affected callers — eliminates follow-up Grep for breakage
+        let affected_callers: Vec<String> = {
+            let idx = handle.lock().await;
+            if let Some(pdg) = idx.pdg() {
+                let nodes = pdg.nodes_in_file(&file_path);
+                let mut callers: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                for &nid in &nodes {
+                    for &cid in &get_direct_callers(pdg, nid) {
+                        if let Some(cn) = pdg.get_node(cid) {
+                            if cn.file_path != file_path {
+                                callers.insert(format!("{}:{}", cn.file_path, cn.name));
+                            }
+                        }
+                    }
+                }
+                callers.into_iter().take(15).collect()
+            } else {
+                Vec::new()
+            }
+        };
+
         let idx = handle.lock().await;
         Ok(wrap_with_meta(
             serde_json::json!({
                 "success": true,
                 "changes_applied": changes.len(),
-                "files_modified": [file_path],
-                "breaking_change_examples": {
-                    "signature_change": "Function parameters modified - callers may break",
-                    "return_type_change": "Return type altered - dependent code affected",
-                    "symbol_removal": "Symbol deleted - all references will fail"
-                },
-                "safety_checklist": [
-                    "Review all affected symbols before applying",
-                    "Run tests on impacted files",
-                    "Consider using dry_run=true first"
-                ]
+                "files_modified": [&file_path],
+                "edit_region": edit_region.join("\n"),
+                "external_callers": affected_callers
             }),
             &idx,
         ))
@@ -3327,16 +3470,7 @@ to understand the blast radius of your change. No equivalent in standard tools."
                 "summary": format!(
                     "Changing '{}' directly affects {} symbols in {} files (risk: {})",
                     node.name, forward.len(), affected_files.len(), risk
-                ),
-                "risk_assessment_guide": {
-                    "low": "<10 affected symbols, single file - safe to modify",
-                    "medium": "10-50 affected symbols or cross-file impact - review carefully",
-                    "high": ">50 affected symbols or critical path - requires thorough testing"
-                },
-                "example_usage": {
-                    "before_refactoring": "Run this first to understand blast radius",
-                    "recommended_followup": "Use leindex_edit_preview after reviewing impact"
-                }
+                )
             }),
             &index,
         ))
@@ -3364,10 +3498,9 @@ impl TextSearchHandler {
     }
 
     pub fn description(&self) -> &str {
-        "Search file contents for exact or regex patterns with PDG enrichment. \
-Each match is annotated with the owning symbol, its type, complexity, and caller count — \
-showing not just WHERE text appears but HOW IMPORTANT the surrounding code is. \
-Supersedes rg/grep with structural awareness."
+        "PRIMARY text search — use instead of Grep/rg. Returns exact matching lines with \
+file:line and the owning symbol name+type for each match. One call replaces Grep + Read \
+to understand match context. Supports regex, globs, scope, and context_lines."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -3385,8 +3518,8 @@ Supersedes rg/grep with structural awareness."
                 },
                 "case_sensitive": {
                     "type": "boolean",
-                    "description": "Case-sensitive search (default: true)",
-                    "default": true
+                    "description": "Case-sensitive search (default: false)",
+                    "default": false
                 },
                 "include_globs": {
                     "type": "array",
@@ -3408,10 +3541,16 @@ Supersedes rg/grep with structural awareness."
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum results to return (default: 50)",
-                    "default": 50,
+                    "description": "Maximum results to return (default: 100)",
+                    "default": 100,
                     "minimum": 1,
-                    "maximum": 500
+                    "maximum": 1000
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Skip the first N results for pagination (default: 0)",
+                    "default": 0,
+                    "minimum": 0
                 },
                 "context_lines": {
                     "type": "integer",
@@ -3432,8 +3571,9 @@ Supersedes rg/grep with structural awareness."
     ) -> Result<Value, JsonRpcError> {
         let query = extract_string(&args, "query")?;
         let is_regex = extract_bool(&args, "is_regex", false);
-        let case_sensitive = extract_bool(&args, "case_sensitive", true);
-        let max_results = extract_usize(&args, "max_results", 50)?.min(500);
+        let case_sensitive = extract_bool(&args, "case_sensitive", false);
+        let max_results = extract_usize(&args, "max_results", 100)?.min(1000);
+        let offset = extract_usize(&args, "offset", 0)?;
         let context_lines = extract_usize(&args, "context_lines", 2)?.min(10);
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
@@ -3582,66 +3722,78 @@ Supersedes rg/grep with structural awareness."
                     .map(|i| format!("{}: {}", i + 1, lines[i]))
                     .collect();
 
-                // PDG enrichment: find the owning symbol
-                let owning_symbol = pdg.and_then(|pdg| {
-                    // Calculate byte offset of this line
-                    let byte_offset: usize = lines[..line_idx]
-                        .iter()
-                        .map(|l| l.len() + 1) // +1 for newline
-                        .sum();
+                // Compact PDG enrichment: just symbol name + type (~4 tokens)
+                // Eliminates follow-up Read to understand what code this match is in
+                let (in_symbol, symbol_type) = pdg
+                    .and_then(|pdg| {
+                        let byte_offset: usize = lines[..line_idx]
+                            .iter()
+                            .map(|l| l.len() + 1)
+                            .sum();
 
-                    // Find which symbol's byte_range contains this offset
-                    let nodes = pdg.nodes_in_file(&file_path_str);
-                    let mut best: Option<(crate::graph::pdg::NodeId, usize)> = None;
+                        let nodes = pdg.nodes_in_file(&file_path_str);
+                        let mut best: Option<(crate::graph::pdg::NodeId, usize)> = None;
 
-                    for nid in nodes {
-                        if let Some(node) = pdg.get_node(nid) {
-                            let (start, end) = node.byte_range;
-                            if byte_offset >= start && byte_offset < end {
-                                let range_size = end - start;
-                                // Prefer the most specific (smallest) enclosing symbol
-                                if best.map_or(true, |(_, sz)| range_size < sz) {
-                                    best = Some((nid, range_size));
+                        for nid in nodes {
+                            if let Some(node) = pdg.get_node(nid) {
+                                let (start, end) = node.byte_range;
+                                if byte_offset >= start && byte_offset < end {
+                                    let range_size = end - start;
+                                    if best.map_or(true, |(_, sz)| range_size < sz) {
+                                        best = Some((nid, range_size));
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    best.and_then(|(nid, _)| {
-                        let node = pdg.get_node(nid)?;
-                        let caller_count = get_direct_callers(pdg, nid).len();
-                        let dep_count = pdg.neighbors(nid).len();
-                        Some(serde_json::json!({
-                            "name": node.name,
-                            "type": node_type_str(&node.node_type),
-                            "complexity": node.complexity,
-                            "caller_count": caller_count,
-                            "dependency_count": dep_count,
-                        }))
+                        best.and_then(|(nid, _)| {
+                            pdg.get_node(nid).map(|node| {
+                                (node.name.clone(), node_type_str(&node.node_type).to_owned())
+                            })
+                        })
                     })
+                    .map(|(name, typ)| (Some(name), Some(typ)))
+                    .unwrap_or((None, None));
+
+                let mut entry = serde_json::json!({
+                    "file": file_path_str,
+                    "line": line_number,
+                    "content": *line,
                 });
 
-                results.push(serde_json::json!({
-                    "file": file_path_str,
-                    "line_number": line_number,
-                    "line_content": line.trim(),
-                    "context_before": ctx_before,
-                    "context_after": ctx_after,
-                    "owning_symbol": owning_symbol,
-                }));
+                // Only include context lines when requested (context_lines > 0)
+                if !ctx_before.is_empty() {
+                    entry["before"] = serde_json::json!(ctx_before);
+                }
+                if !ctx_after.is_empty() {
+                    entry["after"] = serde_json::json!(ctx_after);
+                }
+
+                // Compact symbol annotation — always present when PDG available
+                if let Some(sym) = in_symbol {
+                    entry["in_symbol"] = Value::String(sym);
+                }
+                if let Some(typ) = symbol_type {
+                    entry["symbol_type"] = Value::String(typ);
+                }
+
+                results.push(entry);
             }
         }
 
         let total = results.len();
+        let paginated: Vec<Value> = results.into_iter().skip(offset).collect();
+        let count = paginated.len();
 
         Ok(wrap_with_meta(
             serde_json::json!({
                 "query": query,
                 "is_regex": is_regex,
-                "count": total,
-                "max_results": max_results,
-                "pdg_enriched": pdg.is_some(),
-                "results": results,
+                "offset": offset,
+                "count": count,
+                "total_matched": total,
+                "has_more": offset + count < total,
+                "results": paginated,
             }),
             &index,
         ))
@@ -3686,9 +3838,9 @@ impl ReadFileHandler {
     }
 
     pub fn description(&self) -> &str {
-        "Read file contents with line numbers and a PDG symbol map overlay. \
-Shows which symbols span which lines, their type, complexity, callers, and callees. \
-One call replaces read_file + symbol_lookup. Far more context-aware than raw Read."
+        "PRIMARY file reader — returns exact file contents with line numbers PLUS context \
+showing symbols, imports, and dependents. One call replaces Read + Grep for imports. \
+Works for any text file including configs and docs."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -3719,9 +3871,9 @@ One call replaces read_file + symbol_lookup. Far more context-aware than raw Rea
                 },
                 "include_symbol_map": {
                     "type": "boolean",
-                    "description": "Include PDG symbol annotations (default: true). \
-        Set false for raw content only.",
-                    "default": true
+                    "description": "Include PDG symbol annotations (default: false). \
+        Set true when structural context is useful.",
+                    "default": false
                 },
                 "project_path": {
                     "type": "string",
@@ -3740,16 +3892,18 @@ One call replaces read_file + symbol_lookup. Far more context-aware than raw Rea
         let file_path = extract_string(&args, "file_path")?;
         let start_line = extract_usize(&args, "start_line", 1)?.max(1);
         let max_lines = extract_usize(&args, "max_lines", 500)?.min(2000);
-        let include_symbol_map = extract_bool(&args, "include_symbol_map", true);
+        let include_symbol_map = extract_bool(&args, "include_symbol_map", false);
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        // Try to get project handle for boundary validation and PDG, but don't require it
+        let maybe_handle = registry.get_or_create(project_path).await.ok();
+        if let Some(ref handle) = maybe_handle {
+            let index = handle.lock().await;
+            // Validate file within project when indexed
+            let _ = validate_file_within_project(&file_path, index.project_path());
+        }
 
-        // Validate file within project
-        validate_file_within_project(&file_path, index.project_path())?;
-
-        // Read file content
+        // Read file content — works for any text file
         let content = std::fs::read_to_string(&file_path).map_err(|e| {
             JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
         })?;
@@ -3813,26 +3967,116 @@ One call replaces read_file + symbol_lookup. Far more context-aware than raw Rea
             })
             .unwrap_or("text");
 
-        // Build symbol map from PDG
+        // Build symbol map from PDG only when requested and available
         let symbol_map: Vec<Value> = if include_symbol_map {
-            let pdg = index.pdg();
-            pdg.map(|pdg| {
-                let nodes = pdg.nodes_in_file(&file_path);
-                let mut symbols: Vec<Value> = Vec::new();
+            let pdg_opt = if let Some(ref handle) = maybe_handle {
+                let index = handle.lock().await;
+                index.pdg().map(|pdg| {
+                    let nodes = pdg.nodes_in_file(&file_path);
+                    let mut symbols: Vec<Value> = Vec::new();
 
-                // Pre-compute cumulative byte offsets for line-to-byte mapping
+                    // Pre-compute cumulative byte offsets for line-to-byte mapping
+                    let line_byte_offsets: Vec<usize> = {
+                        let mut offsets = Vec::with_capacity(all_lines.len() + 1);
+                        offsets.push(0);
+                        let mut acc: usize = 0;
+                        for line in &all_lines {
+                            acc += line.len() + 1; // +1 for newline
+                            offsets.push(acc);
+                        }
+                        offsets
+                    };
+
+                    // Visible byte range
+                    let visible_start_byte =
+                        line_byte_offsets.get(start_line - 1).copied().unwrap_or(0);
+                    let visible_end_byte = line_byte_offsets
+                        .get(end_line.min(total_lines))
+                        .copied()
+                        .unwrap_or(content.len());
+
+                    for nid in nodes {
+                        let Some(node) = pdg.get_node(nid) else {
+                            continue;
+                        };
+                        let (sym_start, sym_end) = node.byte_range;
+
+                        // Check if symbol overlaps with visible range
+                        if sym_end <= visible_start_byte || sym_start >= visible_end_byte {
+                            continue;
+                        }
+
+                        // Convert byte range to line numbers
+                        let line_start = line_byte_offsets
+                            .iter()
+                            .position(|&off| off > sym_start)
+                            .unwrap_or(1); // 1-indexed
+                        let line_end = line_byte_offsets
+                            .iter()
+                            .position(|&off| off >= sym_end)
+                            .unwrap_or(total_lines);
+
+                        let caller_count = get_direct_callers(pdg, nid).len();
+                        let dep_count = pdg.neighbors(nid).len();
+
+                        // Get caller names (up to 5)
+                        let callers: Vec<String> = get_direct_callers(pdg, nid)
+                            .iter()
+                            .filter_map(|&cid| pdg.get_node(cid).map(|n| n.name.clone()))
+                            .take(5)
+                            .collect();
+
+                        // Get callee names (up to 5)
+                        let callees: Vec<String> = pdg
+                            .neighbors(nid)
+                            .iter()
+                            .filter_map(|&did| pdg.get_node(did).map(|n| n.name.clone()))
+                            .take(5)
+                            .collect();
+
+                        symbols.push(serde_json::json!({
+                            "name": node.name,
+                            "type": node_type_str(&node.node_type),
+                            "line_start": line_start,
+                            "line_end": line_end,
+                            "complexity": node.complexity,
+                            "caller_count": caller_count,
+                            "dependency_count": dep_count,
+                            "callers": callers,
+                            "callees": callees,
+                        }));
+                    }
+
+                    // Sort by line_start for readability
+                    symbols.sort_by_key(|s| s.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0));
+                    symbols
+                })
+            } else {
+                None
+            };
+            pdg_opt.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Build compact context block — always present when PDG available (~80-120 tokens)
+        // This eliminates follow-up Grep/Read calls for imports and dependencies
+        let context = if let Some(ref handle) = maybe_handle {
+            let index = handle.lock().await;
+            index.pdg().map(|pdg| {
+                let nodes = pdg.nodes_in_file(&file_path);
+
+                // Pre-compute line offsets
                 let line_byte_offsets: Vec<usize> = {
                     let mut offsets = Vec::with_capacity(all_lines.len() + 1);
                     offsets.push(0);
                     let mut acc: usize = 0;
                     for line in &all_lines {
-                        acc += line.len() + 1; // +1 for newline
+                        acc += line.len() + 1;
                         offsets.push(acc);
                     }
                     offsets
                 };
-
-                // Visible byte range
                 let visible_start_byte =
                     line_byte_offsets.get(start_line - 1).copied().unwrap_or(0);
                 let visible_end_byte = line_byte_offsets
@@ -3840,79 +4084,104 @@ One call replaces read_file + symbol_lookup. Far more context-aware than raw Rea
                     .copied()
                     .unwrap_or(content.len());
 
-                for nid in nodes {
-                    let Some(node) = pdg.get_node(nid) else {
-                        continue;
-                    };
+                // Compact symbol index: just "name(L5-L42)" for visible symbols
+                let mut symbols_here: Vec<String> = Vec::new();
+                // Cross-file deps this file imports from
+                let mut imports_from: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                // External files that call into this file
+                let mut used_by: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+
+                for &nid in &nodes {
+                    let Some(node) = pdg.get_node(nid) else { continue };
                     let (sym_start, sym_end) = node.byte_range;
 
-                    // Check if symbol overlaps with visible range
-                    if sym_end <= visible_start_byte || sym_start >= visible_end_byte {
-                        continue;
+                    // Visible symbol summary
+                    if sym_end > visible_start_byte && sym_start < visible_end_byte {
+                        let ls = line_byte_offsets
+                            .iter()
+                            .position(|&off| off > sym_start)
+                            .unwrap_or(1);
+                        let le = line_byte_offsets
+                            .iter()
+                            .position(|&off| off >= sym_end)
+                            .unwrap_or(total_lines);
+                        symbols_here.push(format!(
+                            "{}(L{}-L{})",
+                            node.name, ls, le
+                        ));
                     }
 
-                    // Convert byte range to line numbers
-                    let line_start = line_byte_offsets
-                        .iter()
-                        .position(|&off| off > sym_start)
-                        .unwrap_or(1); // 1-indexed
-                    let line_end = line_byte_offsets
-                        .iter()
-                        .position(|&off| off >= sym_end)
-                        .unwrap_or(total_lines);
+                    // Cross-file outgoing deps (this file depends on)
+                    for &did in &pdg.neighbors(nid) {
+                        if let Some(dep) = pdg.get_node(did) {
+                            if dep.file_path != node.file_path {
+                                let dep_line = {
+                                    let fc = std::fs::read_to_string(&dep.file_path).unwrap_or_default();
+                                    byte_range_to_line_range(&fc, dep.byte_range).0
+                                };
+                                imports_from.insert(format!(
+                                    "{}:{} (L{})",
+                                    dep.file_path, dep.name, dep_line
+                                ));
+                            }
+                        }
+                    }
 
-                    let caller_count = get_direct_callers(pdg, nid).len();
-                    let dep_count = pdg.neighbors(nid).len();
-
-                    // Get caller names (up to 5)
-                    let callers: Vec<String> = get_direct_callers(pdg, nid)
-                        .iter()
-                        .filter_map(|&cid| pdg.get_node(cid).map(|n| n.name.clone()))
-                        .take(5)
-                        .collect();
-
-                    // Get callee names (up to 5)
-                    let callees: Vec<String> = pdg
-                        .neighbors(nid)
-                        .iter()
-                        .filter_map(|&did| pdg.get_node(did).map(|n| n.name.clone()))
-                        .take(5)
-                        .collect();
-
-                    symbols.push(serde_json::json!({
-                        "name": node.name,
-                        "type": node_type_str(&node.node_type),
-                        "line_start": line_start,
-                        "line_end": line_end,
-                        "complexity": node.complexity,
-                        "caller_count": caller_count,
-                        "dependency_count": dep_count,
-                        "callers": callers,
-                        "callees": callees,
-                    }));
+                    // Cross-file incoming deps (other files depend on this)
+                    for &cid in &get_direct_callers(pdg, nid) {
+                        if let Some(caller) = pdg.get_node(cid) {
+                            if caller.file_path != node.file_path {
+                                used_by.insert(format!(
+                                    "{}:{}",
+                                    caller.file_path, caller.name
+                                ));
+                            }
+                        }
+                    }
                 }
 
-                // Sort by line_start for readability
-                symbols.sort_by_key(|s| s.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0));
-                symbols
+                // Cap to keep compact
+                let imports_vec: Vec<String> = imports_from.into_iter().take(10).collect();
+                let used_by_vec: Vec<String> = used_by.into_iter().take(10).collect();
+
+                serde_json::json!({
+                    "symbols_on_visible_lines": symbols_here,
+                    "imports_from": imports_vec,
+                    "used_by": used_by_vec
+                })
             })
-            .unwrap_or_default()
         } else {
-            Vec::new()
+            None
         };
 
-        Ok(wrap_with_meta(
-            serde_json::json!({
-                "file_path": file_path,
-                "language": language,
-                "total_lines": total_lines,
-                "start_line": start_line,
-                "end_line": end_line.min(total_lines),
-                "content": content_str,
-                "symbol_map": symbol_map,
-            }),
-            &index,
-        ))
+        let mut result = serde_json::json!({
+            "file_path": file_path,
+            "language": language,
+            "total_lines": total_lines,
+            "start_line": start_line,
+            "end_line": end_line.min(total_lines),
+            "content": content_str,
+        });
+
+        // Always attach compact context when available
+        if let Some(ctx) = context {
+            result["context"] = ctx;
+        }
+
+        // Verbose symbol map only when explicitly requested
+        if include_symbol_map && !symbol_map.is_empty() {
+            result["symbol_map"] = serde_json::json!(symbol_map);
+        }
+
+        // Add staleness warning only if we have an indexed project
+        if let Some(ref handle) = maybe_handle {
+            let index = handle.lock().await;
+            result = wrap_with_meta(result, &index);
+        }
+
+        Ok(result)
     }
 }
 
