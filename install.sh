@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 5.2.0 - Rust Edition + Dashboard Assets
+# Version: 1.5.2 - Rust Edition + Dashboard Assets
 # Platform: Linux/Unix
 #
 # Installer:
@@ -25,7 +25,7 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="5.2.0"
+readonly SCRIPT_VERSION="1.5.2"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
@@ -65,9 +65,9 @@ detect_os() {
     if [[ "$OSTYPE" == "linux-gnu"* ]]; then
         if [[ -f /etc/os-release ]]; then
             . /etc/os-release
-            OS=$ID
-            OS_VERSION=$VERSION_ID
-            OS_NAME=$NAME
+            OS="${ID:-linux}"
+            OS_VERSION="${VERSION_ID:-unknown}"
+            OS_NAME="${NAME:-${PRETTY_NAME:-Unknown Linux}}"
         elif [[ -f /etc/redhat-release ]]; then
             OS=$(cat /etc/redhat-release | awk '{print $1}' | tr '[:upper:]' '[:lower:]')
             OS_VERSION=$(cat /etc/redhat-release | grep -oE '[0-9]+\.[0-9]+' | head -1)

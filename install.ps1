@@ -1,6 +1,6 @@
 #############################################
 # LeIndex Windows Installer
-# Version: 5.2.0
+# Version: 1.5.2
 # Platform: Windows PowerShell
 #
 # Installer:
@@ -21,7 +21,7 @@ $ProgressPreference = "SilentlyContinue"
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-$ScriptVersion = "5.2.0"
+$ScriptVersion = "1.5.2"
 $ProjectName = "LeIndex"
 $ProjectSlug = "leindex"
 $ExpectedVersion = "1.5.2"
