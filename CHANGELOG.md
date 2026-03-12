@@ -2,6 +2,61 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [1.5.2] - 2026-03-11 - Unified Crate Release Hardening
+
+### 🏗️ **Unified Crate Structure**
+
+All 10 workspace crates have been merged into a single unified `leindex` crate.
+
+#### Added
+- Single `cargo install leindex` now works — no workspace complexity
+- Feature flags for selective module compilation:
+  - `parse` — Code parsing and AST generation
+  - `graph` — Dependency graph construction
+  - `storage` — Persistent storage layer
+  - `search` — Vector search engine with INT8 quantization
+  - `phase` — Multi-phase indexing pipeline
+  - `cli` — Command-line interface with MCP server
+  - `global` — Global operations
+  - `server` — HTTP API server
+  - `edit` — Code editing utilities
+  - `validation` — Index validation tools
+- `glama.json` for MCP catalog registration
+
+#### Changed
+- **BREAKING**: Import paths changed from `leparse::`, `legraphe::`, etc. to `leindex::parse::`, `leindex::graph::`
+- Backward compatibility aliases provided: `leindex::leparse`, `leindex::legraphe`, etc.
+- Workspace replaced with single crate structure
+- Unified version management (single version number for entire project)
+- Runtime/server naming normalized around `leindex` while preserving hidden compatibility aliases for legacy imports
+- npm MCP distribution now resolves the GitHub `latest` release channel and verifies downloaded binaries against published checksums
+- Cargo packaging now uses a restrictive allowlist so published artifacts exclude repo internals and runtime debris
+
+#### Fixed
+- Stack overflow aborts during indexing for deeply nested Rust, C, and C++ source trees by replacing recursive parser descent hot paths with iterative traversal
+- Installer `set -u` regression from an uninitialized `INSTALL_DASHBOARD` variable
+- npm MCP wrapper shell interpolation and stale bundled binary packaging
+- Release/install documentation drift from `main` and `leserve` era naming
+
+#### Migration Guide
+Users using individual crates should update imports:
+```rust
+// Before
+use leparse::Parser;
+use legraphe::GraphBuilder;
+use lerecherche::SearchEngine;
+
+// After (Option 1: New style)
+use leindex::parse::Parser;
+use leindex::graph::GraphBuilder;
+use leindex::search::SearchEngine;
+
+// After (Option 2: Backward compatible)
+use leindex::leparse::Parser;
+use leindex::legraphe::GraphBuilder;
+use leindex::lerecherche::SearchEngine;
+```
+
 ## [1.5.0] - 2026-03-02 - Multi-Project MCP, Dashboard Integration, Release Polish
 
 ### Added

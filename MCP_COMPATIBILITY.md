@@ -11,11 +11,11 @@ LeIndex includes a built-in MCP server that provides AI assistants (like Claude 
 ### Quick Start
 
 ```bash
-# Start the MCP server
-leindex mcp
+# Recommended published MCP entrypoint
+npx -y @leindex/mcp
 ```
 
-Configure your MCP client to connect to the LeIndex MCP server.
+If you installed the full Rust binary and want to run it directly, `leindex mcp` still works.
 
 ---
 
@@ -32,8 +32,8 @@ Add to your Claude Code MCP configuration:
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"],
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"],
       "env": {}
     }
   }
@@ -48,8 +48,8 @@ Add to Cursor settings (`settings.json`):
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"],
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"],
       "env": {}
     }
   }
@@ -64,8 +64,8 @@ Add to Windsurf MCP configuration:
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"],
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"],
       "env": {}
     }
   }

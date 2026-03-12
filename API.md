@@ -1,4 +1,4 @@
-# LeIndex API Reference (v1.5.0)
+# LeIndex API Reference (v1.5.2)
 
 ## CLI
 
@@ -54,7 +54,7 @@ Transport:
 - Non-notification calls should include an `id`.
 - Boolean-like tool args accept both JSON boolean and string forms where applicable.
 
-## HTTP + WebSocket (`leserve`)
+## HTTP + WebSocket (`leindex serve`)
 
 Base default: `http://127.0.0.1:47269`
 
@@ -79,11 +79,11 @@ Install from crates.io:
 cargo install leindex
 ```
 
-Workspace publishing is versioned from root `Cargo.toml` (`[workspace.package].version`).
+The unified crate version is defined in the root `Cargo.toml` under `[package].version`.
 
 ## Dashboard Integration
 
-Dashboard consumes `leserve` APIs and WebSocket events.
+Dashboard consumes the `leindex serve` APIs and WebSocket events.
 
 Dashboard path lookup used by `leindex dashboard`:
 

@@ -34,9 +34,9 @@ bash: leindex: command not found
 ```
 
 **Causes:**
-1. `~/.local/bin` not in PATH
-2. LeIndex not installed correctly
-3. Using wrong Python environment
+1. `~/.cargo/bin` not in PATH
+2. The PyPI bootstrap wrapper is installed, but the Rust binary has not been installed yet
+3. LeIndex is installed in a different Python environment
 
 **Solutions:**
 
@@ -45,44 +45,23 @@ bash: leindex: command not found
    pip show leindex
    ```
 
-2. If installed, add to PATH:
+2. Make sure the Rust binary location is on PATH:
    ```bash
    # Add to ~/.bashrc or ~/.zshrc
-   export PATH="$HOME/.local/bin:$PATH"
+   export PATH="$HOME/.cargo/bin:$PATH"
    # Reload shell
    source ~/.bashrc
    ```
 
-3. Reinstall if needed:
+3. Trigger the bootstrap wrapper explicitly:
+   ```bash
+   leindex --version
+   ```
+
+4. Reinstall the wrapper if needed:
    ```bash
    pip uninstall leindex
    pip install leindex
-   ```
-
----
-
-### "Module not found: leann"
-
-**Symptoms:**
-```python
-ImportError: No module named 'leann'
-```
-
-**Solutions:**
-
-1. Reinstall LeIndex:
-   ```bash
-   pip install --force-reinstall leindex
-   ```
-
-2. Install LEANN manually:
-   ```bash
-   pip install leann --upgrade
-   ```
-
-3. Check Python version (requires 3.10+):
-   ```bash
-   python --version
    ```
 
 ---
@@ -101,6 +80,13 @@ ImportError: No module named 'leann'
 2. Or use `--user` flag:
    ```bash
    pip install --user leindex
+   ```
+
+3. If the wrapper cannot install the Rust binary, install Rust/Cargo first:
+   ```bash
+   curl -fsSL https://sh.rustup.rs -o rustup.sh
+   sh rustup.sh -y
+   cargo install leindex
    ```
 
 ---
@@ -436,12 +422,15 @@ ImportError: No module named 'leann'
    {
      "mcpServers": {
        "leindex": {
-         "command": "leindex",
-         "args": ["mcp"]
+         "command": "npx",
+         "args": ["-y", "@leindex/mcp"]
        }
      }
    }
    ```
+
+   If you installed the full Rust binary directly, `"command": "leindex", "args": ["mcp"]`
+   is still a valid fallback.
 
 3. Restart MCP client
 
@@ -623,7 +612,7 @@ ls -la ~/.leindex/data/analytics.db
 
 | Error | Cause | Solution |
 |-------|-------|----------|
-| `ImportError: No module named 'leann'` | LEANN not installed | `pip install leann --upgrade` |
+| `LeIndex bootstrap failed: Cargo is required...` | Rust/Cargo not installed yet | Install Rust from `https://rustup.rs/`, then rerun `leindex` |
 | `Permission denied` | File permissions | Run with appropriate permissions |
 | `MemoryError` | Out of memory | Reduce memory_limit_mb in config |
 | `FileNotFoundError` | File not found | Check file path and permissions |

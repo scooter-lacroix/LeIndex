@@ -1,60 +1,322 @@
-[workspace]
-resolver = "2"
-members = [
-    "crates/leparse",
-    "crates/legraphe",
-    "crates/lerecherche",
-    "crates/lestockage",
-    "crates/lephase",
-    "crates/lepasserelle",
-    "crates/leglobal",
-    "crates/leserve",
-    "crates/leedit",
-    "crates/levalidation",
+[package]
+name = "leindex"
+version = "1.5.2"
+edition = "2021"
+rust-version = "1.75"
+authors = ["LeIndex Contributors"]
+description = "LeIndex MCP and semantic code search engine for AI tools and large codebases"
+documentation = "https://docs.rs/leindex"
+readme = "README.md"
+homepage = "https://github.com/scooter-lacroix/LeIndex"
+repository = "https://github.com/scooter-lacroix/LeIndex.git"
+license = "MIT OR Apache-2.0"
+keywords = [
+    "search",
+    "code",
+    "semantic",
+    "indexing",
+    "language-server",
+]
+categories = [
+    "development-tools",
+    "text-processing",
+    "data-structures",
+    "algorithms",
+]
+include = [
+    "/src/lib.rs",
+    "/src/bin/**",
+    "/src/cli/**",
+    "/src/edit/**",
+    "/src/global/**",
+    "/src/graph/**",
+    "/src/parse/**",
+    "/src/phase/**",
+    "/src/search/**",
+    "/src/server/**",
+    "/src/storage/**",
+    "/src/validation/**",
+    "/tests/**",
+    "/benches/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/leindex.jpeg",
+    "/docs/MCP.md",
+    "/docs/TOOL_SUPREMACY_BENCHMARKS.md",
 ]
 
-[workspace.package]
-version = "1.5.0"
-edition = "2021"
-authors = ["LeIndex Contributors"]
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/scooter-lacroix/LeIndex"
-rust-version = "1.75"
+[features]
+default = ["full"]
 
-[workspace.dependencies]
-# Core dependencies
-tree-sitter = "0.24"
-petgraph = { version = "0.7", features = ["serde"] }
-rayon = "1.10"
-blake3 = "1.5"
+# Full feature set - everything included
+full = [
+    "parse",
+    "graph",
+    "storage",
+    "search",
+    "phase",
+    "cli",
+    "global",
+    "server",
+    "edit",
+    "validation",
+]
 
-# Serialization
+# Minimal feature set (parsing and search only)
+minimal = ["parse", "search"]
+
+# Individual modules (follows dependency DAG)
+# Parse is base, no internal dependencies
+parse = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-javascript",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-java",
+    "dep:tree-sitter-cpp",
+    "dep:tree-sitter-c-sharp",
+    "dep:tree-sitter-ruby",
+    "dep:tree-sitter-php",
+    "dep:tree-sitter-c",
+    "dep:tree-sitter-bash",
+    "dep:tree-sitter-json",
+    "dep:tree-sitter-lua",
+    "dep:tree-sitter-scala",
+    "dep:rayon",
+    "dep:once_cell",
+]
+
+# Graph depends on parse
+graph = ["parse", "dep:petgraph"]
+
+# Storage depends on parse and graph
+storage = [
+    "parse",
+    "graph",
+    "dep:rusqlite",
+    "dep:libsql",
+    "dep:rusqlite_migration",
+]
+
+# Search depends on parse and graph
+search = [
+    "parse",
+    "graph",
+    "dep:regex",
+    "dep:hnsw_rs",
+    "dep:lru",
+    "dep:bytemuck",
+    "dep:wide",
+    "dep:unicode-normalization",
+]
+
+# Phase depends on parse, graph, search, storage
+phase = [
+    "parse",
+    "graph",
+    "search",
+    "storage",
+    "dep:walkdir",
+]
+
+# CLI depends on all core modules
+cli = [
+    "parse",
+    "graph",
+    "search",
+    "storage",
+    "phase",
+    "edit",
+    "mcp-server",
+    "dep:clap",
+    "dep:toml",
+    "dep:walkdir",
+    "dep:dirs",
+    "dep:notify",
+    "dep:psutil",
+    "dep:diffy",
+]
+
+# MCP server feature for CLI
+mcp-server = [
+    "dep:axum-06",
+    "dep:tower-04",
+    "dep:tower-http-04",
+    "dep:tokio-stream",
+    "dep:futures-util",
+    "dep:bytes",
+    "dep:http-body-util",
+    "dep:http",
+]
+
+# Global depends on storage
+global = [
+    "storage",
+    "dep:walkdir",
+    "dep:notify",
+]
+
+# Server depends on storage, graph, search
+server = [
+    "storage",
+    "graph",
+    "search",
+    "dep:axum",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:http",
+    "dep:futures",
+    "dep:tokio-tungstenite",
+    "dep:walkdir",
+]
+
+# Edit depends on storage, graph, parse
+edit = [
+    "storage",
+    "graph",
+    "parse",
+    "dep:git2",
+    "dep:diffy",
+]
+
+# Validation depends on parse, storage, graph
+validation = [
+    "parse",
+    "storage",
+    "graph",
+]
+
+[dependencies]
+# Core dependencies (used by most modules)
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-bincode = "1.3"
-
-# Error handling
 thiserror = "2.0"
 anyhow = "1.0"
-
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Async (future use)
 tokio = { version = "1.40", features = ["full"] }
-
-# Testing
-rstest = "0.23"
-
-# Storage
-rusqlite = { version = "0.32", features = ["bundled"] }
-psutil = "3"
-
-# Time
+blake3 = "1.5"
 chrono = "0.4"
 
-# Dev utilities
+# Serialization
+bincode = "1.3"
+
+# Parse feature dependencies
+tree-sitter = { version = "0.24", optional = true }
+tree-sitter-python = { version = "0.23", optional = true }
+tree-sitter-javascript = { version = "0.23", optional = true }
+tree-sitter-typescript = { version = "0.23", optional = true }
+tree-sitter-go = { version = "0.23", optional = true }
+tree-sitter-rust = { version = "0.23", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
+tree-sitter-c-sharp = { version = "0.23", optional = true }
+tree-sitter-ruby = { version = "0.23", optional = true }
+tree-sitter-php = { version = "0.23", optional = true }
+tree-sitter-c = { version = "0.23", optional = true }
+tree-sitter-bash = { version = "0.23", optional = true }
+tree-sitter-json = { version = "0.23", optional = true }
+tree-sitter-lua = { version = "0.2", optional = true }
+tree-sitter-scala = { version = "0.24", optional = true }
+rayon = { version = "1.10", optional = true }
+once_cell = { version = "1.19", optional = true }
+
+# Graph feature dependencies
+petgraph = { version = "0.7", features = ["serde"], optional = true }
+
+# Storage feature dependencies
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+libsql = { version = "0.5.0", optional = true }
+rusqlite_migration = { version = "1.0.0", optional = true }
+
+# Search feature dependencies
+regex = { version = "1.10", optional = true }
+hnsw_rs = { version = "0.1.0", optional = true }
+lru = { version = "0.12", optional = true }
+bytemuck = { version = "1.15", optional = true }
+wide = { version = "0.7", optional = true }
+unicode-normalization = { version = "0.1", optional = true }
+
+# Phase/CLI/Global/Server/Edit feature dependencies
+walkdir = { version = "2.5", optional = true }
+notify = { version = "6.0", optional = true }
+
+# CLI feature dependencies
+clap = { version = "4.5", features = ["derive"], optional = true }
+toml = { version = "0.8", optional = true }
+dirs = { version = "5", optional = true }
+psutil = { version = "3", optional = true }
+diffy = { version = "0.3", optional = true }
+
+# CLI MCP server dependencies (axum 0.6 for libsql compatibility)
+# The MCP transport still depends on the 0.6-compatible stack while the HTTP server
+# has already moved to axum/tower 0.7/0.5.
+# Follow-up plan:
+# 1. Port src/cli/mcp/* handlers and middleware to axum 0.7/tower-http 0.5.
+# 2. Run the MCP stdio and HTTP smoke tests on the unified stack.
+# 3. Remove these aliased 0.6 dependencies once parity is confirmed.
+axum-06 = { package = "axum", version = "0.6", features = ["json", "headers"], optional = true }
+tower-04 = { package = "tower", version = "0.4", features = ["full"], optional = true }
+tower-http-04 = { package = "tower-http", version = "0.4", features = ["cors", "trace", "limit"], optional = true }
+tokio-stream = { version = "0.1", optional = true }
+futures-util = { version = "0.3", optional = true }
+bytes = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+http = { version = "1", optional = true }
+
+# Server feature dependencies (axum 0.7)
+axum = { version = "0.7", features = ["ws"], optional = true }
+tower = { version = "0.5", features = ["full"], optional = true }
+tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
+futures = { version = "0.3", optional = true }
+tokio-tungstenite = { version = "0.21", optional = true }
+
+# Edit feature dependencies
+git2 = { version = "0.18", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tokio-test = "0.4"
 tempfile = "3.13"
-criterion = "0.5"
-pprof = { version = "0.14", features = ["flamegraph", "criterion"] }
+rstest = "0.23"
+proptest = "1.6"
+rand = "0.8"
+
+# Binary targets
+[[bin]]
+name = "leindex"
+path = "src/bin/leindex.rs"
+required-features = ["cli"]
+doc = false
+
+[[bench]]
+name = "simd_benchmarks"
+path = "benches/simd_benchmarks.rs"
+harness = false
+required-features = ["search"]
+
+[[bench]]
+name = "search_benchmarks"
+path = "benches/search_benchmarks.rs"
+harness = false
+required-features = ["search"]
+
+[[bench]]
+name = "phase_bench"
+path = "benches/phase_bench.rs"
+harness = false
+required-features = ["phase"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[profile.bench]
+debug = true

@@ -8,7 +8,7 @@ LeIndex provides a command-line interface for indexing, searching, and analyzing
 
 ```bash
 # Clone and build
-git clone https://github.com/scooter-lacroix/leindex.git
+git clone https://github.com/scooter-lacroix/LeIndex.git
 cd leindex
 cargo build --release
 
@@ -25,8 +25,18 @@ cargo install leindex
 ### One-Line Installer (Linux/macOS)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/install.sh -o install-leindex.sh
+bash install-leindex.sh
 ```
+
+### Via PyPI Wrapper
+
+```bash
+pip install leindex
+```
+
+The PyPI package installs a Python launcher that ensures the Rust binary is present in
+`~/.cargo/bin` and then forwards commands to the real `leindex` executable.
 
 ## Global Options
 
@@ -540,8 +550,8 @@ Add to `~/.claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"]
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -553,11 +563,25 @@ Add to `~/.claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp", "-p", "/path/to/project"]
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
+```
+
+If you installed the full Rust binary and want to bypass npm, the direct fallback is
+`"command": "leindex", "args": ["mcp"]`.
+
+#### MCP Tool CLI Bridge
+
+Every MCP tool is also runnable from the CLI:
+
+```bash
+leindex tools list
+leindex tools help leindex_project_map
+leindex tools schema leindex_rename_symbol
+leindex tools run leindex_project_map --args '{"path":"src","depth":2}'
 ```
 
 #### Output (to stderr)
