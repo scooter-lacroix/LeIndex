@@ -13,7 +13,7 @@ LeIndex v0.1.0 is a **complete rewrite** from Python to Rust. This document help
 | Aspect | Python v2.0.2 | Rust v0.1.0 |
 |--------|---------------|-------------|
 | **Language** | Python 3.10+ | Rust 1.75+ |
-| **Installation** | `pip install leindex` | `cargo build --release` |
+| **Installation** | `pip install leindex` (legacy Python package) | `cargo install leindex` or `pip install leindex` (Rust bootstrap wrapper) |
 | **Vector Search** | LEANN (file-based) | HNSW (in-memory, temporary) |
 | **Full-Text Search** | Tantivy-py | Not yet implemented |
 | **Metadata Storage** | SQLite | Turso/libsql (planned) |
@@ -34,8 +34,10 @@ pip install leindex
 
 **After (Rust):**
 ```bash
-cargo build --release --bins
-# Or use the installer
+cargo install leindex
+# Or use the PyPI bootstrap wrapper
+pip install leindex
+# Or use the installer script
 ./install.sh
 ```
 
@@ -239,7 +241,7 @@ rm -rf ~/.leindex
 pip install leindex==2.0.2
 
 # Or from source
-git clone https://github.com/scooter-lacroix/leindex.git
+git clone https://github.com/scooter-lacroix/LeIndex.git
 cd leindex
 git checkout python-v2.0.2
 pip install -e .

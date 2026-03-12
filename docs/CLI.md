@@ -25,8 +25,18 @@ cargo install leindex
 ### One-Line Installer (Linux/macOS)
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/install.sh -o install-leindex.sh
+bash install-leindex.sh
 ```
+
+### Via PyPI Wrapper
+
+```bash
+pip install leindex
+```
+
+The PyPI package installs a Python launcher that ensures the Rust binary is present in
+`~/.cargo/bin` and then forwards commands to the real `leindex` executable.
 
 ## Global Options
 

@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "leindex"
+version = "1.5.2"
+description = "Python bootstrap wrapper for the Rust LeIndex binary"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT OR Apache-2.0"
+authors = [
+  { name = "LeIndex Contributors" }
+]
+keywords = ["search", "code", "semantic", "indexing", "mcp"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Software Development",
+  "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/scooter-lacroix/LeIndex"
+Repository = "https://github.com/scooter-lacroix/LeIndex.git"
+Issues = "https://github.com/scooter-lacroix/LeIndex/issues"
+Documentation = "https://docs.rs/leindex"
+
+[project.scripts]
+leindex = "leindex.bootstrap:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+leindex = ["py.typed"]
