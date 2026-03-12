@@ -215,7 +215,7 @@ cargo install leindex
 ### From source
 
 ```bash
-git clone https://github.com/scooter-lacroix/leindex.git
+git clone https://github.com/scooter-lacroix/LeIndex.git
 cd leindex
 cargo build --release
 ```

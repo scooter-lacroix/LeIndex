@@ -17,7 +17,7 @@ lestockage = "1.5"
 ### After (Unified)
 ```toml
 [dependencies]
-leindex = "2.0"
+leindex = "1.5.2"
 ```
 
 ## Import Path Changes
@@ -55,16 +55,16 @@ Use features to reduce compile time and binary size:
 ```toml
 [dependencies]
 # Full functionality (default)
-leindex = "2.0"
+leindex = "1.5.2"
 
 # Library use only (smaller)
-leindex = { version = "2.0", default-features = false, features = ["parse", "search"] }
+leindex = { version = "1.5.2", default-features = false, features = ["parse", "search"] }
 
 # CLI only
-leindex = { version = "2.0", default-features = false, features = ["cli"] }
+leindex = { version = "1.5.2", default-features = false, features = ["cli"] }
 
-# Server only
-leindex = { version = "2.0", default-features = false, features = ["server"] }
+# CLI plus HTTP server modules
+leindex = { version = "1.5.2", default-features = false, features = ["cli", "server"] }
 ```
 
 ### Available Features
@@ -84,11 +84,14 @@ leindex = { version = "2.0", default-features = false, features = ["server"] }
 
 ## Binary Changes
 
-The binaries remain the same:
+The unified crate now distributes a single binary:
 
-- `leindex` — CLI tool (requires `cli` feature)
-- `leserve` — HTTP server (requires `server` feature)
-- `leedit` — Editor (requires `edit` feature)
+- `leindex` — main CLI entrypoint
+
+Legacy `leserve` and `leedit` behavior now lives behind `leindex` subcommands and modules:
+
+- `leindex serve` replaces the old standalone HTTP server entrypoint
+- editing functionality remains available through the unified crate modules, not a separate shipped binary
 
 ### Installation
 
@@ -148,7 +151,7 @@ error: could not find `X` in `leindex`
 Make sure the feature is enabled:
 ```toml
 [dependencies]
-leindex = { version = "2.0", features = ["cli", "server"] }
+leindex = { version = "1.5.2", features = ["cli", "server"] }
 ```
 
 ### Import errors
@@ -161,12 +164,11 @@ If your old imports don't work:
 
 If `cargo install leindex` doesn't install binaries:
 ```bash
-# Install with all features
-cargo install leindex --features full
-
-# Or specific binaries
+# Install the unified CLI binary explicitly
 cargo install leindex --bin leindex --features cli
-cargo install leindex --bin leserve --features server
+
+# Add server modules when you need `leindex serve`
+cargo install leindex --bin leindex --features "cli server"
 ```
 
 ## Rollback

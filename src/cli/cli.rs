@@ -9,11 +9,18 @@ use crate::cli::registry::{ProjectRegistry, DEFAULT_MAX_PROJECTS};
 use crate::phase::{run_phase_analysis, DocsMode, FormatMode, PhaseOptions, PhaseSelection};
 use anyhow::Context;
 use anyhow::Result as AnyhowResult;
-use clap::{Parser, Subcommand};
+use clap::{error::ErrorKind, Parser, Subcommand};
+use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tracing::{info, warn};
+
+const POST_INSTALL_SKIP_ENV: &str = "LEINDEX_SKIP_POST_INSTALL_HOOK";
+const POST_INSTALL_STAR_MARKER: &str = ".github-starred";
+const POST_INSTALL_VERSION_MARKER: &str = ".post-install-version";
+const REPO_STAR_ENDPOINT: &str = "user/starred/scooter-lacroix/LeIndex";
 
 /// LeIndex - Code Search and Analysis Engine
 #[derive(Parser, Debug)]
@@ -178,6 +185,8 @@ impl Cli {
             self.command.unwrap_or(Commands::Mcp { stdio: false })
         };
 
+        maybe_complete_post_install_actions(&command);
+
         match command {
             Commands::Index {
                 path,
@@ -242,6 +251,228 @@ fn init_logging_impl(verbose: bool) {
         .finish();
 
     let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+fn maybe_complete_post_install_actions(command: &Commands) {
+    if std::env::var_os(POST_INSTALL_SKIP_ENV).is_some()
+        || matches!(command, Commands::Mcp { .. })
+        || !running_from_cargo_bin()
+    {
+        return;
+    }
+
+    let leindex_home = match resolve_leindex_home() {
+        Ok(path) => path,
+        Err(error) => {
+            warn!("Post-install actions skipped: {}", error);
+            return;
+        }
+    };
+
+    if post_install_is_current(&leindex_home) {
+        return;
+    }
+
+    if let Err(error) = complete_post_install_actions(command, &leindex_home) {
+        warn!("Post-install actions skipped: {}", error);
+    }
+}
+
+fn complete_post_install_actions(
+    command: &Commands,
+    leindex_home: &std::path::Path,
+) -> AnyhowResult<()> {
+    fs::create_dir_all(&leindex_home).context("failed to create LEINDEX_HOME")?;
+    cleanup_legacy_user_installations(&leindex_home);
+
+    let marker_path = leindex_home.join(POST_INSTALL_STAR_MARKER);
+    if !marker_path.exists() {
+        emit_post_install_message(command, "Thank you for installing LeIndex.");
+
+        if try_star_repo() {
+            emit_post_install_message(command, "Starred scooter-lacroix/LeIndex on GitHub.");
+            fs::write(&marker_path, b"starred\n").context("failed to persist star marker")?;
+        } else {
+            emit_post_install_message(
+                command,
+                "Could not star the GitHub repo automatically. If GitHub CLI is signed in, run: gh api -X PUT user/starred/scooter-lacroix/LeIndex",
+            );
+            fs::write(&marker_path, b"prompted\n").context("failed to persist star marker")?;
+        }
+    }
+
+    warn_if_path_is_shadowed(command);
+    write_post_install_version_marker(leindex_home)?;
+
+    Ok(())
+}
+
+fn resolve_leindex_home() -> AnyhowResult<PathBuf> {
+    if let Ok(path) = std::env::var("LEINDEX_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let home = dirs::home_dir().context("HOME is not available")?;
+    Ok(home.join(".leindex"))
+}
+
+fn post_install_is_current(leindex_home: &std::path::Path) -> bool {
+    let marker_path = leindex_home.join(POST_INSTALL_VERSION_MARKER);
+    match fs::read_to_string(marker_path) {
+        Ok(version) => version.trim() == env!("CARGO_PKG_VERSION"),
+        Err(_) => false,
+    }
+}
+
+fn write_post_install_version_marker(leindex_home: &std::path::Path) -> AnyhowResult<()> {
+    let marker_path = leindex_home.join(POST_INSTALL_VERSION_MARKER);
+    fs::write(marker_path, format!("{}\n", env!("CARGO_PKG_VERSION")))
+        .context("failed to persist post-install marker")
+}
+
+fn cleanup_legacy_user_installations(leindex_home: &std::path::Path) {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+
+    let binary_name = platform_binary_name("leindex");
+    let legacy_local_bin = home.join(".local").join("bin").join(&binary_name);
+    if legacy_local_bin.exists() {
+        match fs::remove_file(&legacy_local_bin) {
+            Ok(_) => info!("Removed legacy install at {}", legacy_local_bin.display()),
+            Err(error) => warn!(
+                "Failed to remove legacy install at {}: {}",
+                legacy_local_bin.display(),
+                error
+            ),
+        }
+    }
+
+    let legacy_home_bin = leindex_home.join("bin").join(binary_name);
+    if legacy_home_bin.exists() {
+        match fs::remove_file(&legacy_home_bin) {
+            Ok(_) => info!("Removed legacy install at {}", legacy_home_bin.display()),
+            Err(error) => warn!(
+                "Failed to remove legacy install at {}: {}",
+                legacy_home_bin.display(),
+                error
+            ),
+        }
+    }
+}
+
+fn running_from_cargo_bin() -> bool {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return false;
+    };
+
+    let cargo_home = cargo_home_dir();
+
+    let Some(cargo_home) = cargo_home else {
+        return false;
+    };
+
+    current_exe == cargo_home.join("bin").join(platform_binary_name("leindex"))
+}
+
+fn resolve_path_binary(binary_name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for entry in std::env::split_paths(&path_var) {
+        let candidate = entry.join(binary_name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+
+        if cfg!(windows) {
+            let exe_candidate = entry.join(platform_binary_name(binary_name));
+            if exe_candidate.is_file() {
+                return Some(exe_candidate);
+            }
+        }
+    }
+    None
+}
+
+fn warn_if_path_is_shadowed(command: &Commands) {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return;
+    };
+
+    let Some(resolved) = resolve_path_binary("leindex") else {
+        return;
+    };
+
+    if resolved == current_exe {
+        return;
+    }
+
+    emit_post_install_message(
+        command,
+        &format!(
+            "`leindex` currently resolves to {} instead of {}. Remove the older binary or move {} earlier in PATH.",
+            resolved.display(),
+            current_exe.display(),
+            cargo_bin_dir()
+                .unwrap_or_else(|| current_exe.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf())
+                .display()
+        ),
+    );
+}
+
+fn cargo_home_dir() -> Option<PathBuf> {
+    std::env::var("CARGO_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| dirs::home_dir().map(|home| home.join(".cargo")))
+}
+
+fn cargo_bin_dir() -> Option<PathBuf> {
+    cargo_home_dir().map(|cargo_home| cargo_home.join("bin"))
+}
+
+fn platform_binary_name(binary_name: &str) -> String {
+    if cfg!(windows) {
+        format!("{}.exe", binary_name)
+    } else {
+        binary_name.to_string()
+    }
+}
+
+fn try_star_repo() -> bool {
+    let auth_ok = Command::new("gh")
+        .args(["auth", "status"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+
+    if !auth_ok {
+        return false;
+    }
+
+    Command::new("gh")
+        .args([
+            "api",
+            "-X",
+            "PUT",
+            "-H",
+            "Accept: application/vnd.github+json",
+            REPO_STAR_ENDPOINT,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn emit_post_install_message(command: &Commands, message: &str) {
+    if matches!(command, Commands::Serve { .. } | Commands::Dashboard { .. }) {
+        info!("{}", message);
+    } else {
+        eprintln!("{}", message);
+    }
 }
 
 /// Get project path from explicit path or current directory
@@ -926,8 +1157,18 @@ async fn handle_mcp_request(
 
 /// Main entry point for the CLI
 pub async fn main() -> AnyhowResult<()> {
-    let cli = Cli::parse();
-    cli.run().await
+    match Cli::try_parse() {
+        Ok(cli) => cli.run().await,
+        Err(err) => {
+            if matches!(
+                err.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                maybe_complete_post_install_actions(&Commands::Diagnostics);
+            }
+            err.exit()
+        }
+    }
 }
 
 #[cfg(test)]

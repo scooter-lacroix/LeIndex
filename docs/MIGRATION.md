@@ -603,7 +603,7 @@ Document any custom configuration changes:
 - **[docs/MEMORY_MANAGEMENT.md](MEMORY_MANAGEMENT.md)** - Memory management guide
 - **[docs/CONFIGURATION.md](CONFIGURATION.md)** - Configuration reference
 - **[examples/config_migration.py](../examples/config_migration.py)** - Migration examples
-- **GitHub Issues**: [https://github.com/scooter-lacroix/leindex/issues](https://github.com/scooter-lacroix/leindex/issues)
+- **GitHub Issues**: [https://github.com/scooter-lacroix/LeIndex/issues](https://github.com/scooter-lacroix/LeIndex/issues)
 
 ## Support
 

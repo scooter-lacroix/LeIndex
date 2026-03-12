@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 5.1.0 - Rust Edition + Dashboard Assets
+# Version: 5.2.0 - Rust Edition + Dashboard Assets
 # Platform: Linux/Unix
 #
 # Installer:
-#   curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh -o install-leindex.sh
+#   curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/install.sh -o install-leindex.sh
 #   bash install-leindex.sh
 #
 # Cargo install alternative:
 #   cargo install leindex
 #
 # Or with wget:
-#   wget -O install-leindex.sh https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh
+#   wget -O install-leindex.sh https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/install.sh
 #   bash install-leindex.sh
 #
 # Non-interactive mode:
-#   curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/leindex/master/install.sh -o install-leindex.sh
+#   curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/install.sh -o install-leindex.sh
 #   bash install-leindex.sh --yes
 #############################################
 
@@ -25,12 +25,12 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="5.1.0"
+readonly SCRIPT_VERSION="5.2.0"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
 readonly MIN_RUST_MINOR=75
-readonly REPO_URL="https://github.com/scooter-lacroix/leindex"
+readonly REPO_URL="https://github.com/scooter-lacroix/LeIndex"
 NONINTERACTIVE=false
 PRESERVE_BINARY=false
 PRESERVE_CONFIG=false
@@ -47,9 +47,14 @@ DATA_DIR="${LEINDEX_HOME}/data"
 LOG_DIR="${LEINDEX_HOME}/logs"
 DASHBOARD_DIR="${LEINDEX_HOME}/dashboard"
 TEMP_BACKUP_DIR="${HOME}/.leindex.tmp"
-# Install to standard system-wide location (requires sudo)
-# This ensures leindex is accessible to all AI tools regardless of PATH
-INSTALL_BIN_DIR="/usr/local/bin"
+CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
+CARGO_ENV_FILE="${CARGO_HOME_DIR}/env"
+INSTALL_BIN_DIR="${CARGO_HOME_DIR}/bin"
+INSTALL_BIN_PATH="${INSTALL_BIN_DIR}/${PROJECT_SLUG}"
+LEGACY_LOCAL_BIN_PATH="${HOME}/.local/bin/${PROJECT_SLUG}"
+LEGACY_LEINDEX_HOME_BIN_PATH="${LEINDEX_HOME}/bin/${PROJECT_SLUG}"
+LEGACY_SYSTEM_BIN_PATH="/usr/local/bin/${PROJECT_SLUG}"
+STAR_MARKER_PATH="${LEINDEX_HOME}/.github-starred"
 
 # ============================================================================
 # OS DETECTION & PACKAGE MANAGER SUPPORT
@@ -227,7 +232,20 @@ install_bun() {
     esac
 
     # Fall back to official installer
-    if curl -fsSL https://bun.sh/install | bash >> "$INSTALL_LOG" 2>&1; then
+    local bun_script
+    bun_script="$(mktemp)"
+
+    if command -v curl &> /dev/null; then
+        curl -fsSL https://bun.sh/install -o "$bun_script"
+    elif command -v wget &> /dev/null; then
+        wget -qO "$bun_script" https://bun.sh/install
+    else
+        rm -f "$bun_script"
+        log_warn "Neither curl nor wget is available for Bun installation."
+        return 1
+    fi
+
+    if bash "$bun_script" >> "$INSTALL_LOG" 2>&1; then
         # Source bun environment
         if [[ -f "$HOME/.bashrc" ]]; then
             source "$HOME/.bashrc"
@@ -235,10 +253,13 @@ install_bun() {
         export PATH="$HOME/.bun/bin:$PATH"
 
         if command -v bun &> /dev/null; then
+            rm -f "$bun_script"
             log_success "Bun installed successfully"
             return 0
         fi
     fi
+
+    rm -f "$bun_script"
 
     log_warn "Failed to install Bun. Dashboard features will be unavailable."
     return 1
@@ -337,6 +358,110 @@ log_success() {
     printf "${GREEN}[SUCCESS]${NC} %s\n" "$msg"
 }
 
+source_cargo_env_if_present() {
+    if [[ -f "$CARGO_ENV_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$CARGO_ENV_FILE"
+    fi
+}
+
+ensure_cargo_home_ready() {
+    source_cargo_env_if_present
+
+    if ! command -v cargo &> /dev/null; then
+        log_warn "Cargo is not available and $INSTALL_BIN_DIR does not exist yet."
+        echo ""
+        if [[ "$NONINTERACTIVE" == true ]]; then
+            log_info "Non-interactive mode implies approval to install Rust/Cargo."
+            install_rust
+        else
+            read -p "Install Rust/Cargo and create $INSTALL_BIN_DIR now? [y/N] " -n 1 -r
+            echo ""
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                install_rust
+            else
+                log_error "Cargo is required to install LeIndex into $INSTALL_BIN_DIR"
+                exit 1
+            fi
+        fi
+    fi
+
+    mkdir -p "$INSTALL_BIN_DIR"
+}
+
+remove_binary_at_path() {
+    local binary_path="$1"
+
+    if [[ ! -f "$binary_path" ]] || [[ "$binary_path" == "$INSTALL_BIN_PATH" ]]; then
+        return 0
+    fi
+
+    if [[ "$binary_path" == "$LEGACY_SYSTEM_BIN_PATH" ]]; then
+        if sudo rm -f "$binary_path" 2>/dev/null || rm -f "$binary_path" 2>/dev/null; then
+            log_success "Removed legacy install: $binary_path"
+        else
+            log_warn "Could not remove legacy install: $binary_path"
+        fi
+        return 0
+    fi
+
+    if rm -f "$binary_path" 2>/dev/null; then
+        log_success "Removed legacy install: $binary_path"
+    else
+        log_warn "Could not remove legacy install: $binary_path"
+    fi
+}
+
+cleanup_legacy_binary_locations() {
+    remove_binary_at_path "$LEGACY_LOCAL_BIN_PATH"
+    remove_binary_at_path "$LEGACY_LEINDEX_HOME_BIN_PATH"
+    remove_binary_at_path "$LEGACY_SYSTEM_BIN_PATH"
+}
+
+report_path_resolution() {
+    local resolved_path
+    resolved_path="$(command -v "$PROJECT_SLUG" 2>/dev/null || true)"
+
+    if [[ -z "$resolved_path" ]]; then
+        print_warning "$PROJECT_SLUG is not currently resolvable on PATH"
+        echo "  Remediation: source \"$CARGO_ENV_FILE\" or add $INSTALL_BIN_DIR to PATH"
+        return 0
+    fi
+
+    if [[ "$resolved_path" == "$INSTALL_BIN_PATH" ]]; then
+        log_success "$PROJECT_SLUG resolves to the installed cargo binary"
+        return 0
+    fi
+
+    print_warning "$PROJECT_SLUG currently resolves to $resolved_path instead of $INSTALL_BIN_PATH"
+    echo "  Remediation: remove the older binary or put $INSTALL_BIN_DIR earlier in PATH"
+    echo "  Check duplicates with: which -a $PROJECT_SLUG"
+}
+
+maybe_star_repo() {
+    mkdir -p "$LEINDEX_HOME"
+
+    echo ""
+    log_info "Thank you for installing LeIndex."
+
+    if [[ -f "$STAR_MARKER_PATH" ]]; then
+        log_success "GitHub star already recorded for this installation."
+        return 0
+    fi
+
+    if command -v gh &> /dev/null && gh auth status >/dev/null 2>&1; then
+        if gh api -X PUT \
+            -H "Accept: application/vnd.github+json" \
+            "user/starred/scooter-lacroix/LeIndex" >/dev/null 2>&1; then
+            : > "$STAR_MARKER_PATH"
+            log_success "Starred scooter-lacroix/LeIndex on GitHub"
+            return 0
+        fi
+    fi
+
+    log_warn "Could not star the repository automatically. You can star it here: $REPO_URL"
+}
+
 print_header() {
     local title="$1"
     echo ""
@@ -407,7 +532,7 @@ install_rust() {
     sh "$rustup_script" -y
 
     # Source cargo environment
-    source "$HOME/.cargo/env"
+    source_cargo_env_if_present
 
     if detect_rust; then
         log_success "Rust installed successfully"
@@ -422,25 +547,14 @@ install_rust() {
 # ============================================================================
 
 install_leindex() {
-    print_step 2 5 "Building LeIndex"
+    print_step 5 7 "Building LeIndex"
 
     local install_method=""
     local repo_dir=""
     local should_cleanup=false
 
-    # Check if we're in the LeIndex repository (local development)
-    # First check for direct package with name = "leindex"
+    # Check if we're in the unified LeIndex repository (local development)
     if [[ -f "Cargo.toml" ]] && grep -q 'name = "'"$PROJECT_SLUG"'"' Cargo.toml 2>/dev/null; then
-        log_info "Building from local LeIndex repository..."
-        install_method="local"
-        repo_dir="$(pwd)"
-    # Check for workspace project (LeIndex uses a workspace structure)
-    elif [[ -f "Cargo.toml" ]] && grep -q "\[workspace\]" Cargo.toml 2>/dev/null; then
-        log_info "Building from local LeIndex workspace repository..."
-        install_method="workspace"
-        repo_dir="$(pwd)"
-    # Check if we have a leindex crate in crates/ directory
-    elif [[ -d "crates" ]] && [[ -f "crates/lepasserelle/Cargo.toml" ]] && grep -q "name = \"lepasserelle\"" crates/lepasserelle/Cargo.toml 2>/dev/null; then
         log_info "Building from local LeIndex repository..."
         install_method="local"
         repo_dir="$(pwd)"
@@ -528,24 +642,16 @@ install_leindex() {
     # Install binary
     local binary="target/release/$PROJECT_SLUG"
     if [[ -f "$binary" ]]; then
-        log_info "Installing to system directory: $INSTALL_BIN_DIR"
+        log_info "Installing to cargo bin: $INSTALL_BIN_DIR"
         echo ""
 
-        # /usr/local/bin should exist on all Unix systems, but check first
-        if [[ ! -d "$INSTALL_BIN_DIR" ]]; then
-            log_info "Creating $INSTALL_BIN_DIR (requires sudo)..."
-            if ! sudo mkdir -p "$INSTALL_BIN_DIR" 2>/dev/null; then
-                log_error "Failed to create $INSTALL_BIN_DIR (sudo required)"
-                log_error "Please run: sudo mkdir -p $INSTALL_BIN_DIR"
-                exit 1
-            fi
-        fi
+        ensure_cargo_home_ready
 
-        # Copy binary with sudo
-        if sudo cp "$binary" "$INSTALL_BIN_DIR/" && sudo chmod +x "$INSTALL_BIN_DIR/$PROJECT_SLUG"; then
-            log_success "Binary installed to: $INSTALL_BIN_DIR/$PROJECT_SLUG"
+        if cp "$binary" "$INSTALL_BIN_PATH" && chmod +x "$INSTALL_BIN_PATH"; then
+            log_success "Binary installed to: $INSTALL_BIN_PATH"
+            cleanup_legacy_binary_locations
         else
-            log_error "Failed to install binary (sudo required)"
+            log_error "Failed to install binary to $INSTALL_BIN_PATH"
             exit 1
         fi
     else
@@ -617,9 +723,9 @@ install_dashboard_assets() {
 }
 
 verify_installation() {
-    print_step 3 5 "Verifying Installation"
+    print_step 6 7 "Verifying Installation"
 
-    local binary="$INSTALL_BIN_DIR/$PROJECT_SLUG"
+    local binary="$INSTALL_BIN_PATH"
 
     if [[ ! -f "$binary" ]]; then
         log_error "Binary not found: $binary"
@@ -631,17 +737,24 @@ verify_installation() {
         return 1
     fi
 
-    local version=$($binary --version 2>&1 || echo "unknown")
+    local version expected_version
+    version=$($binary --version 2>&1 || echo "unknown")
+    expected_version="$(grep -E '^version = ' Cargo.toml | head -1 | cut -d '"' -f2)"
     log_success "Binary check passed: $version"
 
+    if [[ -n "$expected_version" ]] && [[ "$version" != *"$expected_version"* ]]; then
+        log_error "Installed binary version mismatch. Expected $expected_version, got: $version"
+        return 1
+    fi
+
     # Ensure additive lephase and MCP command surfaces are present.
-    if ! $binary phase --help &> /dev/null; then
+    if ! LEINDEX_SKIP_POST_INSTALL_HOOK=1 $binary phase --help &> /dev/null; then
         log_error "Installed binary does not expose 'phase' command"
         return 1
     fi
     print_bullet "Phase command detected"
 
-    if ! $binary mcp --help &> /dev/null; then
+    if ! LEINDEX_SKIP_POST_INSTALL_HOOK=1 $binary mcp --help &> /dev/null; then
         log_error "Installed binary does not expose 'mcp' command"
         return 1
     fi
@@ -653,7 +766,7 @@ verify_installation() {
     mkdir -p "$tmp_project/src"
     printf "pub fn installer_smoke()->i32{1}\n" > "$tmp_project/src/lib.rs"
 
-    if $binary phase --phase 1 --path "$tmp_project" --max-files 10 --max-chars 800 > /dev/null 2>&1; then
+    if LEINDEX_SKIP_POST_INSTALL_HOOK=1 $binary phase --phase 1 --path "$tmp_project" --max-files 10 --max-chars 800 > /dev/null 2>&1; then
         print_bullet "Phase-analysis smoke test passed"
     else
         log_error "Phase-analysis smoke test failed"
@@ -667,9 +780,9 @@ verify_installation() {
 }
 
 setup_directories() {
-    print_step 4 5 "Setting up Directories"
+    print_step 7 7 "Setting up Directories"
 
-    # Create LeIndex data directories (bin directory is created during install with sudo)
+    # Create LeIndex data directories (bin directory is created during install)
     for dir in "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$DASHBOARD_DIR"; do
         if [[ ! -d "$dir" ]]; then
             mkdir -p "$dir"
@@ -681,21 +794,20 @@ setup_directories() {
 update_path() {
     print_header "Installation Location"
 
-    # Binary is installed to /usr/local/bin which is always in PATH
-    log_info "Binary installed to /usr/local/bin (system-wide location)"
-    log_info "This location is in the standard PATH for all Unix-like systems"
+    log_info "Binary installed to $INSTALL_BIN_PATH"
 
-    # Verify /usr/local/bin is in PATH
-    if echo ":$PATH:" | grep -q ":/usr/local/bin:"; then
-        log_success "/usr/local/bin is in PATH"
+    if echo ":$PATH:" | grep -q ":$INSTALL_BIN_DIR:"; then
+        log_success "$INSTALL_BIN_DIR is in PATH"
     else
-        print_warning "/usr/local/bin is not in your PATH"
+        print_warning "$INSTALL_BIN_DIR is not in your PATH"
         echo ""
-        echo "This is unusual. Add the following to your shell configuration:"
-        echo "  export PATH=\"/usr/local/bin:\$PATH\""
-        echo ""
-        echo "Then restart your shell or run:"
-        echo "  source ~/.bashrc  # or ~/.zshrc"
+        if [[ -f "$CARGO_ENV_FILE" ]]; then
+            echo "Rust installed a shell helper for Cargo. Load it with:"
+            echo "  source \"$CARGO_ENV_FILE\""
+        else
+            echo "Add the following to your shell configuration:"
+            echo "  export PATH=\"$INSTALL_BIN_DIR:\$PATH\""
+        fi
     fi
 }
 
@@ -1541,7 +1653,7 @@ offer_start_server() {
             echo ""
             echo "Starting stdio mode..."
             # Start server in stdio mode for testing
-            exec "$INSTALL_BIN_DIR/$PROJECT_SLUG" mcp
+            exec "$INSTALL_BIN_PATH" mcp
             ;;
         2)
             log_info "Starting LeIndex MCP HTTP server (legacy mode)..."
@@ -1560,7 +1672,7 @@ offer_start_server() {
             mkdir -p "$LOG_DIR"
 
             # Start HTTP server in background
-            nohup "$INSTALL_BIN_DIR/$PROJECT_SLUG" serve > "$LOG_DIR/server.log" 2>&1 &
+            nohup "$INSTALL_BIN_PATH" serve > "$LOG_DIR/server.log" 2>&1 &
             local server_pid=$!
 
             # Wait a bit and check if server started successfully
@@ -1922,8 +2034,8 @@ restore_backup_data() {
     # Restore binary
     if [[ -f "$TEMP_BACKUP_DIR/binary/$PROJECT_SLUG" ]]; then
         log_info "Restoring binary..."
-        if sudo cp "$TEMP_BACKUP_DIR/binary/$PROJECT_SLUG" "$INSTALL_BIN_DIR/" && \
-           sudo chmod +x "$INSTALL_BIN_DIR/$PROJECT_SLUG" 2>/dev/null; then
+        if cp "$TEMP_BACKUP_DIR/binary/$PROJECT_SLUG" "$INSTALL_BIN_PATH" 2>/dev/null && \
+           chmod +x "$INSTALL_BIN_PATH" 2>/dev/null; then
             log_success "Binary restored"
             restore_success=true
         else
@@ -2256,8 +2368,8 @@ main() {
     echo "  ${BOLD}Repository:${NC}  $REPO_URL"
     echo ""
 
-    # Step 0: Detect OS and install system dependencies
-    print_step 0 5 "Detecting Operating System"
+    # Step 1: Detect OS and install system dependencies
+    print_step 1 7 "Detecting Operating System"
     detect_os
     log_info "Detected OS: $OS_NAME"
 
@@ -2270,7 +2382,8 @@ main() {
 
     install_system_deps
 
-    # Step 0.5: Install optional components
+    # Step 2: Install optional components
+    print_step 2 7 "Installing Optional Components"
     if [[ "$NONINTERACTIVE" != true ]]; then
         echo ""
         log_info "Optional components:"
@@ -2291,11 +2404,12 @@ main() {
         install_bun || true
     fi
 
-    # Purge any existing installation before continuing
+    # Step 3: Prepare any existing installation before continuing
+    print_step 3 7 "Preparing Existing Installation"
     purge_existing_installation
 
-    # Step 1: Check Rust
-    print_step 1 5 "Checking Rust Toolchain"
+    # Step 4: Check Rust
+    print_step 4 7 "Checking Rust Toolchain"
 
     if ! detect_rust; then
         echo ""
@@ -2316,23 +2430,28 @@ main() {
         fi
     fi
 
-    # Step 2: Build LeIndex
+    ensure_cargo_home_ready
+
+    # Step 5: Build LeIndex
     install_leindex
 
-    # Step 3: Verify
+    # Step 6: Verify
     if ! verify_installation; then
         log_error "Installation verification failed"
         exit 1
     fi
 
-    # Step 4: Setup directories
+    # Step 7: Setup directories
     setup_directories
 
     # Update PATH
     update_path
+    report_path_resolution
 
     # Detect AI tools
     detect_ai_tools
+
+    maybe_star_repo
 
     # Offer to start LeIndex server
     if [[ "$NONINTERACTIVE" != true ]]; then
@@ -2344,7 +2463,7 @@ main() {
 
     log_success "LeIndex has been installed successfully!"
     echo ""
-    echo "  ${BOLD}Binary:${NC}       $INSTALL_BIN_DIR/$PROJECT_SLUG"
+    echo "  ${BOLD}Binary:${NC}       $INSTALL_BIN_PATH"
     echo "  ${BOLD}Config:${NC}       $CONFIG_DIR"
     echo "  ${BOLD}Data:${NC}         $DATA_DIR"
     echo "  ${BOLD}Dashboard:${NC}    $DASHBOARD_DIR"

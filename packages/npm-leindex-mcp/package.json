@@ -25,13 +25,13 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/scooter-lacroix/leindex.git",
+    "url": "git+https://github.com/scooter-lacroix/LeIndex.git",
     "directory": "packages/npm-leindex-mcp"
   },
   "bugs": {
-    "url": "https://github.com/scooter-lacroix/leindex/issues"
+    "url": "https://github.com/scooter-lacroix/LeIndex/issues"
   },
-  "homepage": "https://github.com/scooter-lacroix/leindex#readme",
+  "homepage": "https://github.com/scooter-lacroix/LeIndex#readme",
   "engines": {
     "node": ">=16.0.0"
   },

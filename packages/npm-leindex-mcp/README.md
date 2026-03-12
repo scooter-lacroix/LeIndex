@@ -259,6 +259,6 @@ MIT - See [LICENSE](../../LICENSE)
 
 ## Links
 
-- [GitHub Repository](https://github.com/scooter-lacroix/leindex)
-- [Full Documentation](https://github.com/scooter-lacroix/leindex#readme)
-- [MCP Documentation](https://github.com/scooter-lacroix/leindex/blob/master/docs/MCP.md)
+- [GitHub Repository](https://github.com/scooter-lacroix/LeIndex)
+- [Full Documentation](https://github.com/scooter-lacroix/LeIndex#readme)
+- [MCP Documentation](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/MCP.md)

@@ -810,5 +810,4 @@ mod tests {
         let data_user_neighbors = loaded.neighbors(data_user_id);
         assert!(data_user_neighbors.contains(&child_id));
     }
-
 }

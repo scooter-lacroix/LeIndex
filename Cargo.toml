@@ -144,7 +144,6 @@ cli = [
 
 # MCP server feature for CLI
 mcp-server = [
-    "cli",
     "dep:axum-06",
     "dep:tower-04",
     "dep:tower-http-04",
@@ -256,7 +255,11 @@ diffy = { version = "0.3", optional = true }
 
 # CLI MCP server dependencies (axum 0.6 for libsql compatibility)
 # The MCP transport still depends on the 0.6-compatible stack while the HTTP server
-# has already moved to axum/tower 0.7/0.5. Keep both until the MCP path is migrated.
+# has already moved to axum/tower 0.7/0.5.
+# Follow-up plan:
+# 1. Port src/cli/mcp/* handlers and middleware to axum 0.7/tower-http 0.5.
+# 2. Run the MCP stdio and HTTP smoke tests on the unified stack.
+# 3. Remove these aliased 0.6 dependencies once parity is confirmed.
 axum-06 = { package = "axum", version = "0.6", features = ["json", "headers"], optional = true }
 tower-04 = { package = "tower", version = "0.4", features = ["full"], optional = true }
 tower-http-04 = { package = "tower-http", version = "0.4", features = ["cors", "trace", "limit"], optional = true }

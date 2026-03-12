@@ -1446,7 +1446,10 @@ For the exact source implementation use leindex_read_symbol."
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let is_batch = args.get("symbols").and_then(|v| v.as_array()).map_or(false, |a| a.len() > 1);
+        let is_batch = args
+            .get("symbols")
+            .and_then(|v| v.as_array())
+            .map_or(false, |a| a.len() > 1);
         let include_source = extract_bool(&args, "include_source", !is_batch);
         let include_callers = extract_bool(&args, "include_callers", true);
         let include_callees = extract_bool(&args, "include_callees", true);
@@ -2418,7 +2421,8 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
             .collect();
 
         // Callees with file:line — eliminates follow-up Grep for "what does this call?"
-        let callees: Vec<Value> = pdg.neighbors(node_id)
+        let callees: Vec<Value> = pdg
+            .neighbors(node_id)
             .iter()
             .filter_map(|&did| {
                 let dn = pdg.get_node(did)?;
@@ -2499,10 +2503,14 @@ fn parse_edit_changes(
 
         let change = match change_type {
             "replace_text" => {
-                let old_text = item.get("old_text").or_else(|| item.get("old_str"))
-                    .and_then(|v| v.as_str()).unwrap_or("");
+                let old_text = item
+                    .get("old_text")
+                    .or_else(|| item.get("old_str"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
                 let new_text = item
-                    .get("new_text").or_else(|| item.get("new_str"))
+                    .get("new_text")
+                    .or_else(|| item.get("new_str"))
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| {
                         JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_text'", i))
@@ -2868,9 +2876,13 @@ leindex_edit_apply to understand the blast radius of your change."
         let changes_val = if let Some(changes) = args.get("changes").cloned() {
             changes
         } else {
-            let old_text = args.get("old_text").or_else(|| args.get("old_str"))
+            let old_text = args
+                .get("old_text")
+                .or_else(|| args.get("old_str"))
                 .and_then(|v| v.as_str());
-            let new_text = args.get("new_text").or_else(|| args.get("new_str"))
+            let new_text = args
+                .get("new_text")
+                .or_else(|| args.get("new_str"))
                 .and_then(|v| v.as_str());
             match (old_text, new_text) {
                 (Some(old), Some(new)) => {
@@ -2880,7 +2892,7 @@ leindex_edit_apply to understand the blast radius of your change."
                         "new_text": new
                     }])
                 }
-                _ => Value::Array(vec![])
+                _ => Value::Array(vec![]),
             }
         };
         let project_path = args.get("project_path").and_then(|v| v.as_str());
@@ -3049,9 +3061,13 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
         let changes_val = if let Some(changes) = args.get("changes").cloned() {
             changes
         } else {
-            let old_text = args.get("old_text").or_else(|| args.get("old_str"))
+            let old_text = args
+                .get("old_text")
+                .or_else(|| args.get("old_str"))
                 .and_then(|v| v.as_str());
-            let new_text = args.get("new_text").or_else(|| args.get("new_str"))
+            let new_text = args
+                .get("new_text")
+                .or_else(|| args.get("new_str"))
                 .and_then(|v| v.as_str());
             match (old_text, new_text) {
                 (Some(old), Some(new)) => {
@@ -3726,10 +3742,8 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                 // Eliminates follow-up Read to understand what code this match is in
                 let (in_symbol, symbol_type) = pdg
                     .and_then(|pdg| {
-                        let byte_offset: usize = lines[..line_idx]
-                            .iter()
-                            .map(|l| l.len() + 1)
-                            .sum();
+                        let byte_offset: usize =
+                            lines[..line_idx].iter().map(|l| l.len() + 1).sum();
 
                         let nodes = pdg.nodes_in_file(&file_path_str);
                         let mut best: Option<(crate::graph::pdg::NodeId, usize)> = None;
@@ -4048,7 +4062,8 @@ Works for any text file including configs and docs."
                     }
 
                     // Sort by line_start for readability
-                    symbols.sort_by_key(|s| s.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0));
+                    symbols
+                        .sort_by_key(|s| s.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0));
                     symbols
                 })
             } else {
@@ -4094,7 +4109,9 @@ Works for any text file including configs and docs."
                     std::collections::BTreeSet::new();
 
                 for &nid in &nodes {
-                    let Some(node) = pdg.get_node(nid) else { continue };
+                    let Some(node) = pdg.get_node(nid) else {
+                        continue;
+                    };
                     let (sym_start, sym_end) = node.byte_range;
 
                     // Visible symbol summary
@@ -4107,10 +4124,7 @@ Works for any text file including configs and docs."
                             .iter()
                             .position(|&off| off >= sym_end)
                             .unwrap_or(total_lines);
-                        symbols_here.push(format!(
-                            "{}(L{}-L{})",
-                            node.name, ls, le
-                        ));
+                        symbols_here.push(format!("{}(L{}-L{})", node.name, ls, le));
                     }
 
                     // Cross-file outgoing deps (this file depends on)
@@ -4118,7 +4132,8 @@ Works for any text file including configs and docs."
                         if let Some(dep) = pdg.get_node(did) {
                             if dep.file_path != node.file_path {
                                 let dep_line = {
-                                    let fc = std::fs::read_to_string(&dep.file_path).unwrap_or_default();
+                                    let fc =
+                                        std::fs::read_to_string(&dep.file_path).unwrap_or_default();
                                     byte_range_to_line_range(&fc, dep.byte_range).0
                                 };
                                 imports_from.insert(format!(
@@ -4133,10 +4148,7 @@ Works for any text file including configs and docs."
                     for &cid in &get_direct_callers(pdg, nid) {
                         if let Some(caller) = pdg.get_node(cid) {
                             if caller.file_path != node.file_path {
-                                used_by.insert(format!(
-                                    "{}:{}",
-                                    caller.file_path, caller.name
-                                ));
+                                used_by.insert(format!("{}:{}", caller.file_path, caller.name));
                             }
                         }
                     }
