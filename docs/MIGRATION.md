@@ -355,8 +355,8 @@ Update MCP client configuration if needed:
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"],
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"],
       "env": {
         "LEINDEX_MEMORY_TOTAL_BUDGET_MB": "3072"
       }

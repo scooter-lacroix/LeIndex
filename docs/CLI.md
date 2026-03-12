@@ -550,8 +550,8 @@ Add to `~/.claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"]
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -563,11 +563,25 @@ Add to `~/.claude/claude_desktop_config.json`:
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp", "-p", "/path/to/project"]
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
+```
+
+If you installed the full Rust binary and want to bypass npm, the direct fallback is
+`"command": "leindex", "args": ["mcp"]`.
+
+#### MCP Tool CLI Bridge
+
+Every MCP tool is also runnable from the CLI:
+
+```bash
+leindex tools list
+leindex tools help leindex_project_map
+leindex tools schema leindex_rename_symbol
+leindex tools run leindex_project_map --args '{"path":"src","depth":2}'
 ```
 
 #### Output (to stderr)

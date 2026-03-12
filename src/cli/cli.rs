@@ -3,6 +3,7 @@
 // This module provides the command-line interface for LeIndex.
 
 use crate::cli::leindex::LeIndex;
+use crate::cli::mcp::handlers::{all_tool_handlers, ToolHandler};
 use crate::cli::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::cli::mcp::McpServer;
 use crate::cli::registry::{ProjectRegistry, DEFAULT_MAX_PROJECTS};
@@ -10,6 +11,7 @@ use crate::phase::{run_phase_analysis, DocsMode, FormatMode, PhaseOptions, Phase
 use anyhow::Context;
 use anyhow::Result as AnyhowResult;
 use clap::{error::ErrorKind, Parser, Subcommand};
+use serde_json::{Map, Value};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -52,6 +54,7 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Index a project for code search and analysis
+    #[command(visible_alias = "leindex_index")]
     Index {
         /// Path to the project directory
         #[arg(value_name = "PATH")]
@@ -67,6 +70,7 @@ pub enum Commands {
     },
 
     /// Search indexed code
+    #[command(visible_alias = "leindex_search")]
     Search {
         /// Search query
         #[arg(value_name = "QUERY")]
@@ -78,6 +82,7 @@ pub enum Commands {
     },
 
     /// Perform deep analysis with context expansion
+    #[command(visible_alias = "leindex_deep_analyze")]
     Analyze {
         /// Analysis query
         #[arg(value_name = "QUERY")]
@@ -88,7 +93,20 @@ pub enum Commands {
         token_budget: usize,
     },
 
+    /// Expand context around a symbol or node
+    #[command(visible_alias = "leindex_context")]
+    Context {
+        /// Symbol or node ID to expand
+        #[arg(value_name = "NODE_ID")]
+        node_id: String,
+
+        /// Maximum tokens for context expansion
+        #[arg(long = "tokens", default_value = "2000")]
+        token_budget: usize,
+    },
+
     /// Run additive 5-phase analysis workflow
+    #[command(visible_aliases = ["leindex_phase_analysis", "phase_analysis"])]
     Phase {
         /// Specific phase to run (1..5)
         #[arg(long = "phase")]
@@ -136,7 +154,16 @@ pub enum Commands {
     },
 
     /// Show system diagnostics
+    #[command(visible_alias = "leindex_diagnostics")]
     Diagnostics,
+
+    /// List, inspect, or run the MCP tool surface directly from the CLI
+    #[command(disable_help_subcommand = true)]
+    Tools {
+        /// Tool action to perform
+        #[command(subcommand)]
+        command: ToolCommands,
+    },
 
     /// Start MCP server for AI assistant integration
     Serve {
@@ -165,6 +192,39 @@ pub enum Commands {
         /// Build for production instead of dev server
         #[arg(long = "prod")]
         prod: bool,
+    },
+}
+
+/// Subcommands for inspecting and executing MCP tools from the CLI.
+#[derive(Subcommand, Debug)]
+pub enum ToolCommands {
+    /// List every MCP/CLI tool name and description
+    List,
+
+    /// Show comprehensive help for a tool
+    Help {
+        /// Tool name (for example: leindex_project_map, project_map, or project-map)
+        name: String,
+    },
+
+    /// Print the JSON argument schema for a tool
+    Schema {
+        /// Tool name (for example: leindex_project_map, project_map, or project-map)
+        name: String,
+    },
+
+    /// Execute a tool by name with JSON arguments
+    Run {
+        /// Tool name (for example: leindex_project_map, project_map, or project-map)
+        name: String,
+
+        /// JSON object of tool arguments
+        #[arg(long = "args", default_value = "{}")]
+        args_json: String,
+
+        /// Additional key=value arguments merged on top of --args
+        #[arg(long = "set", value_name = "KEY=VALUE")]
+        set: Vec<String>,
     },
 }
 
@@ -200,6 +260,10 @@ impl Cli {
                 query,
                 token_budget,
             } => cmd_analyze_impl(query, token_budget, global_project).await,
+            Commands::Context {
+                node_id,
+                token_budget,
+            } => cmd_context_impl(node_id, token_budget, global_project).await,
             Commands::Phase {
                 phase,
                 all,
@@ -230,6 +294,7 @@ impl Cli {
                 .await
             }
             Commands::Diagnostics => cmd_diagnostics_impl(global_project).await,
+            Commands::Tools { command } => cmd_tools_impl(command, global_project).await,
             Commands::Serve { host, port } => cmd_serve_impl(host, port).await,
             Commands::Mcp { .. } => cmd_mcp_stdio_impl(global_project).await,
             Commands::Dashboard { port, prod } => cmd_dashboard_impl(port, prod).await,
@@ -610,6 +675,26 @@ async fn cmd_analyze_impl(
     Ok(())
 }
 
+/// Context command implementation
+async fn cmd_context_impl(
+    node_id: String,
+    token_budget: usize,
+    project: Option<PathBuf>,
+) -> AnyhowResult<()> {
+    let args = merge_tool_args(
+        serde_json::json!({
+            "node_id": node_id,
+            "token_budget": token_budget
+        }),
+        &[],
+        project.as_ref(),
+    )?;
+
+    let value = execute_tool_handler("leindex_context", args, project).await?;
+    print_json_value(&value)?;
+    Ok(())
+}
+
 /// Phase command implementation
 #[allow(clippy::too_many_arguments)]
 async fn cmd_phase_impl(
@@ -742,6 +827,39 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     Ok(())
 }
 
+async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> AnyhowResult<()> {
+    match command {
+        ToolCommands::List => {
+            for handler in all_tool_handlers() {
+                println!("{}\t{}", handler.name(), handler.description());
+            }
+            Ok(())
+        }
+        ToolCommands::Help { name } => {
+            let handler = find_tool_handler(&name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown tool '{}'", name))?;
+            print_tool_help(&handler);
+            Ok(())
+        }
+        ToolCommands::Schema { name } => {
+            let handler = find_tool_handler(&name)
+                .ok_or_else(|| anyhow::anyhow!("Unknown tool '{}'", name))?;
+            print_json_value(&handler.argument_schema())?;
+            Ok(())
+        }
+        ToolCommands::Run {
+            name,
+            args_json,
+            set,
+        } => {
+            let args = merge_tool_args(parse_tool_args_json(&args_json)?, &set, project.as_ref())?;
+            let value = execute_tool_handler(&name, args, project).await?;
+            print_json_value(&value)?;
+            Ok(())
+        }
+    }
+}
+
 /// Serve command implementation - Start MCP server
 async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
     // Check for environment variable override (for customization via LEINDEX_PORT)
@@ -785,13 +903,6 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
 /// MCP stdio command implementation - Run MCP server in stdio mode
 /// This mode allows AI tools to start LeIndex as a subprocess for automatic integration
 async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
-    use crate::cli::mcp::handlers::{
-        ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, EditApplyHandler,
-        EditPreviewHandler, FileSummaryHandler, GitStatusHandler, GrepSymbolsHandler,
-        ImpactAnalysisHandler, IndexHandler, PhaseAnalysisAliasHandler, PhaseAnalysisHandler,
-        ProjectMapHandler, ReadFileHandler, ReadSymbolHandler, RenameSymbolHandler, SearchHandler,
-        SymbolLookupHandler, TextSearchHandler,
-    };
     use crate::cli::mcp::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse};
     use std::io::{self, BufRead, Read, Write};
 
@@ -819,30 +930,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     let _ = crate::cli::mcp::server::SERVER_STATE.set(registry.clone());
 
     // Initialize handlers
-    let _ = crate::cli::mcp::server::HANDLERS.set(vec![
-        crate::cli::mcp::handlers::ToolHandler::DeepAnalyze(DeepAnalyzeHandler),
-        crate::cli::mcp::handlers::ToolHandler::Diagnostics(DiagnosticsHandler),
-        crate::cli::mcp::handlers::ToolHandler::Index(IndexHandler),
-        crate::cli::mcp::handlers::ToolHandler::Context(ContextHandler),
-        crate::cli::mcp::handlers::ToolHandler::Search(SearchHandler),
-        crate::cli::mcp::handlers::ToolHandler::PhaseAnalysis(PhaseAnalysisHandler),
-        crate::cli::mcp::handlers::ToolHandler::PhaseAnalysisAlias(PhaseAnalysisAliasHandler),
-        // Phase C: Tool Supremacy
-        crate::cli::mcp::handlers::ToolHandler::FileSummary(FileSummaryHandler),
-        crate::cli::mcp::handlers::ToolHandler::SymbolLookup(SymbolLookupHandler),
-        crate::cli::mcp::handlers::ToolHandler::ProjectMap(ProjectMapHandler),
-        crate::cli::mcp::handlers::ToolHandler::GrepSymbols(GrepSymbolsHandler),
-        crate::cli::mcp::handlers::ToolHandler::ReadSymbol(ReadSymbolHandler),
-        // Phase D: Context-Aware Editing
-        crate::cli::mcp::handlers::ToolHandler::EditPreview(EditPreviewHandler),
-        crate::cli::mcp::handlers::ToolHandler::EditApply(EditApplyHandler),
-        crate::cli::mcp::handlers::ToolHandler::RenameSymbol(RenameSymbolHandler),
-        crate::cli::mcp::handlers::ToolHandler::ImpactAnalysis(ImpactAnalysisHandler),
-        // Phase E: Precision Tooling
-        crate::cli::mcp::handlers::ToolHandler::TextSearch(TextSearchHandler),
-        crate::cli::mcp::handlers::ToolHandler::ReadFile(ReadFileHandler),
-        crate::cli::mcp::handlers::ToolHandler::GitStatus(GitStatusHandler),
-    ]);
+    let _ = crate::cli::mcp::server::HANDLERS.set(all_tool_handlers());
 
     eprintln!("[INFO] LeIndex MCP stdio server starting");
     eprintln!("[INFO] Project: {}", canonical_path.display());
@@ -980,6 +1068,205 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     }
 
     Ok(())
+}
+
+fn parse_tool_args_json(args_json: &str) -> AnyhowResult<Value> {
+    let value: Value =
+        serde_json::from_str(args_json).context("Tool arguments must be valid JSON")?;
+    if !value.is_object() {
+        anyhow::bail!("Tool arguments must be a JSON object");
+    }
+    Ok(value)
+}
+
+fn merge_tool_args(
+    args: Value,
+    set_args: &[String],
+    project: Option<&PathBuf>,
+) -> AnyhowResult<Value> {
+    let mut object = match args {
+        Value::Object(map) => map,
+        _ => Map::new(),
+    };
+
+    for entry in set_args {
+        let (key, raw_value) = entry
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("Invalid --set '{}'. Use KEY=VALUE", entry))?;
+        let value = serde_json::from_str(raw_value)
+            .unwrap_or_else(|_| Value::String(raw_value.to_string()));
+        object.insert(key.to_string(), value);
+    }
+
+    if let Some(project) = project {
+        if !object.contains_key("project_path") {
+            let canonical = project.canonicalize().unwrap_or_else(|_| project.clone());
+            object.insert(
+                "project_path".to_string(),
+                Value::String(canonical.display().to_string()),
+            );
+        }
+    }
+
+    Ok(Value::Object(object))
+}
+
+fn print_json_value(value: &Value) -> AnyhowResult<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).context("Failed to format JSON output")?
+    );
+    Ok(())
+}
+
+fn print_tool_help(handler: &ToolHandler) {
+    let schema = handler.argument_schema();
+    let normalized = normalize_tool_name(handler.name());
+    let short_name = normalized
+        .strip_prefix("leindex_")
+        .unwrap_or(normalized.as_str())
+        .to_string();
+    let kebab_short = short_name.replace('_', "-");
+    let kebab_full = normalized.replace('_', "-");
+
+    println!("{}", handler.name());
+    println!("{}", handler.description());
+    println!();
+    println!("Aliases:");
+    println!("  {}", handler.name());
+    if short_name != handler.name() {
+        println!("  {}", short_name);
+    }
+    if kebab_short != short_name {
+        println!("  {}", kebab_short);
+    }
+    if kebab_full != normalized && kebab_full != kebab_short {
+        println!("  {}", kebab_full);
+    }
+    println!();
+    println!("Usage:");
+    println!("  leindex tools help {}", handler.name());
+    println!("  leindex tools schema {}", handler.name());
+    println!(
+        "  leindex tools run {} --args '<json-object>'",
+        handler.name()
+    );
+    println!(
+        "  leindex tools run {} --set key=value --set other=true",
+        handler.name()
+    );
+
+    if let Some(properties) = schema.get("properties").and_then(|v| v.as_object()) {
+        println!();
+        println!("Arguments:");
+
+        let required = schema
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default();
+
+        for (name, property) in properties {
+            let required_marker = if required.contains(name.as_str()) {
+                "required"
+            } else {
+                "optional"
+            };
+            let property_type = property
+                .get("type")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    property
+                        .get("oneOf")
+                        .and_then(|v| v.as_array())
+                        .map(|_| "multiple")
+                })
+                .unwrap_or("value");
+            let description = property
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let default = property.get("default");
+
+            println!("  {} ({}, {})", name, property_type, required_marker);
+            if !description.is_empty() {
+                println!("    {}", description);
+            }
+            if let Some(default) = default {
+                println!("    default: {}", default);
+            }
+        }
+    }
+
+    println!();
+    println!("Schema:");
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&schema).unwrap_or_else(|_| "{}".to_string())
+    );
+}
+
+fn normalize_tool_name(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn find_tool_handler(name: &str) -> Option<ToolHandler> {
+    let normalized = normalize_tool_name(name);
+
+    all_tool_handlers().into_iter().find(|handler| {
+        let handler_name = normalize_tool_name(handler.name());
+        handler_name == normalized
+            || handler_name
+                .strip_prefix("leindex_")
+                .map(|short| short == normalized)
+                .unwrap_or(false)
+    })
+}
+
+async fn execute_tool_handler(
+    name: &str,
+    args: Value,
+    project: Option<PathBuf>,
+) -> AnyhowResult<Value> {
+    let handler =
+        find_tool_handler(name).ok_or_else(|| anyhow::anyhow!("Unknown tool '{}'", name))?;
+    let registry = build_tool_registry(project)?;
+    handler
+        .execute(&registry, args)
+        .await
+        .map_err(|error| anyhow::anyhow!("{}", error))
+}
+
+fn build_tool_registry(project: Option<PathBuf>) -> AnyhowResult<Arc<ProjectRegistry>> {
+    let initial = get_project_path(project);
+    let canonical = initial.canonicalize().with_context(|| {
+        format!(
+            "Failed to canonicalize project path '{}'",
+            initial.display()
+        )
+    })?;
+    let project_root = if canonical.is_file() {
+        canonical
+            .parent()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("File path '{}' has no parent", canonical.display()))?
+    } else {
+        canonical
+    };
+
+    let mut leindex =
+        LeIndex::new(&project_root).context("Failed to create LeIndex instance for tool run")?;
+    let _ = leindex.load_from_storage();
+
+    Ok(Arc::new(ProjectRegistry::with_initial_project(
+        DEFAULT_MAX_PROJECTS,
+        leindex,
+    )))
 }
 
 /// Dashboard command implementation - Start the frontend dashboard
@@ -1255,5 +1542,54 @@ mod tests {
             }
             _ => panic!("Expected Dashboard command"),
         }
+    }
+
+    #[test]
+    fn test_tools_help_command_parsing() {
+        let cli = Cli::try_parse_from(["leindex", "tools", "help", "project_map"]).unwrap();
+        match cli.command {
+            Some(Commands::Tools {
+                command: ToolCommands::Help { name },
+            }) => assert_eq!(name, "project_map"),
+            _ => panic!("Expected tools help command"),
+        }
+    }
+
+    #[test]
+    fn test_tools_run_command_parsing() {
+        let cli = Cli::try_parse_from([
+            "leindex",
+            "tools",
+            "run",
+            "project_map",
+            "--args",
+            "{\"depth\":1}",
+            "--set",
+            "include_symbols=true",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Some(Commands::Tools {
+                command:
+                    ToolCommands::Run {
+                        name,
+                        args_json,
+                        set,
+                    },
+            }) => {
+                assert_eq!(name, "project_map");
+                assert_eq!(args_json, "{\"depth\":1}");
+                assert_eq!(set, vec!["include_symbols=true"]);
+            }
+            _ => panic!("Expected tools run command"),
+        }
+    }
+
+    #[test]
+    fn test_find_tool_handler_accepts_short_and_full_names() {
+        assert!(find_tool_handler("leindex_project_map").is_some());
+        assert!(find_tool_handler("project_map").is_some());
+        assert!(find_tool_handler("project-map").is_some());
     }
 }

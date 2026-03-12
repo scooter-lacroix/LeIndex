@@ -119,6 +119,12 @@ the real Rust `leindex` binary in `~/.cargo/bin` via `cargo install leindex`. If
 is missing, the launcher explains the requirement and prompts to install Rust/Cargo when
 automatic setup is supported on the current platform.
 
+**Via npm MCP wrapper (recommended for AI tools):**
+
+```bash
+npm install -g @leindex/mcp
+```
+
 **Environment Variables:**
 
 | Name | Required | Description | Default |
@@ -250,7 +256,31 @@ cargo build --release
 
 ### MCP Server Integration
 
-LeIndex runs as an **MCP server** for AI coding tools. First install LeIndex (via crates.io or source), then configure your tool:
+For AI coding tools, the recommended integration path is the npm MCP wrapper so the client
+resolves the published MCP entrypoint directly:
+
+```json
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
+    }
+  }
+}
+```
+
+If you intentionally installed the full Rust binary via `cargo install leindex`,
+`install.sh`, or the PyPI bootstrapper, you can replace `npx -y @leindex/mcp`
+with `leindex mcp`.
+
+Every MCP tool is also available from the CLI bridge:
+
+```bash
+leindex tools list
+leindex tools help leindex_project_map
+leindex tools run leindex_project_map --args '{"path":"src","depth":2}'
+```
 
 <details>
 <summary><b>Zed IDE</b></summary>
@@ -262,8 +292,8 @@ Add to `~/.config/zed/settings.json`:
   "context_servers": {
     "leindex": {
       "command": {
-        "path": "leindex",
-        "args": ["mcp"]
+        "path": "npx",
+        "args": ["-y", "@leindex/mcp"]
       }
     }
   }
@@ -280,8 +310,8 @@ Add to Cursor settings (`settings.json`):
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"],
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"],
       "env": {}
     }
   }
@@ -300,8 +330,8 @@ Configure in `settings.json`:
 {
   "mcp.mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"]
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -317,8 +347,8 @@ Add to `~/.config/claude-code/mcp_servers.json`:
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"],
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"],
       "env": {}
     }
   }
@@ -335,8 +365,8 @@ Add to `~/.config/amp/settings.json`:
 {
   "amp.mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"]
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -352,7 +382,7 @@ Add to `~/.config/opencode/opencode.json`:
 {
   "mcp": {
     "leindex": {
-      "command": ["leindex", "mcp"],
+      "command": ["npx", "-y", "@leindex/mcp"],
       "type": "local"
     }
   }
@@ -369,8 +399,8 @@ Add to `~/.qwen/settings.json`:
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"]
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -386,8 +416,8 @@ Add to `~/.iflow/settings.json`:
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"]
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -404,8 +434,8 @@ Add to `~/.factory/mcp.json` (note: requires `type: "stdio"`):
   "mcpServers": {
     "leindex": {
       "type": "stdio",
-      "command": "leindex",
-      "args": ["mcp"]
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -421,8 +451,8 @@ Add to `~/.gemini/settings.json`:
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"]
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -440,8 +470,8 @@ Linux: `~/.config/Claude/claude_desktop_config.json`
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"]
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }

@@ -3,13 +3,7 @@
 // This module implements the MCP (Model Context Protocol) JSON-RPC server
 // using axum for HTTP handling.
 
-use super::handlers::{
-    ContextHandler, DeepAnalyzeHandler, DiagnosticsHandler, EditApplyHandler, EditPreviewHandler,
-    FileSummaryHandler, GitStatusHandler, GrepSymbolsHandler, ImpactAnalysisHandler, IndexHandler,
-    PhaseAnalysisAliasHandler, PhaseAnalysisHandler, ProjectMapHandler, ReadFileHandler,
-    ReadSymbolHandler, RenameSymbolHandler, SearchHandler, SymbolLookupHandler, TextSearchHandler,
-    ToolHandler,
-};
+use super::handlers::{all_tool_handlers, ToolHandler};
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::cli::registry::ProjectRegistry;
 use anyhow::Context;
@@ -104,30 +98,7 @@ impl McpServer {
             .map_err(|_| anyhow::anyhow!("Server state already initialized"))?;
 
         // Initialize handlers
-        let handlers: Vec<ToolHandler> = vec![
-            ToolHandler::DeepAnalyze(DeepAnalyzeHandler),
-            ToolHandler::Diagnostics(DiagnosticsHandler),
-            ToolHandler::Index(IndexHandler),
-            ToolHandler::Context(ContextHandler),
-            ToolHandler::Search(SearchHandler),
-            ToolHandler::PhaseAnalysis(PhaseAnalysisHandler),
-            ToolHandler::PhaseAnalysisAlias(PhaseAnalysisAliasHandler),
-            // Phase C: Tool Supremacy
-            ToolHandler::FileSummary(FileSummaryHandler),
-            ToolHandler::SymbolLookup(SymbolLookupHandler),
-            ToolHandler::ProjectMap(ProjectMapHandler),
-            ToolHandler::GrepSymbols(GrepSymbolsHandler),
-            ToolHandler::ReadSymbol(ReadSymbolHandler),
-            // Phase D: Context-Aware Editing
-            ToolHandler::EditPreview(EditPreviewHandler),
-            ToolHandler::EditApply(EditApplyHandler),
-            ToolHandler::RenameSymbol(RenameSymbolHandler),
-            ToolHandler::ImpactAnalysis(ImpactAnalysisHandler),
-            // Phase E: Precision Tooling
-            ToolHandler::TextSearch(TextSearchHandler),
-            ToolHandler::ReadFile(ReadFileHandler),
-            ToolHandler::GitStatus(GitStatusHandler),
-        ];
+        let handlers: Vec<ToolHandler> = all_tool_handlers();
         HANDLERS
             .set(handlers)
             .map_err(|_| anyhow::anyhow!("Handlers already initialized"))?;

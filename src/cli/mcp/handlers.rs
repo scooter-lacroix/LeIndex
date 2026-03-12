@@ -62,6 +62,32 @@ pub enum ToolHandler {
     GitStatus(GitStatusHandler),
 }
 
+/// Build the full MCP/CLI tool surface in one place so stdio, HTTP, and CLI bridges
+/// all stay in sync as new tools are added.
+pub fn all_tool_handlers() -> Vec<ToolHandler> {
+    vec![
+        ToolHandler::DeepAnalyze(DeepAnalyzeHandler),
+        ToolHandler::Diagnostics(DiagnosticsHandler),
+        ToolHandler::Index(IndexHandler),
+        ToolHandler::Context(ContextHandler),
+        ToolHandler::Search(SearchHandler),
+        ToolHandler::PhaseAnalysis(PhaseAnalysisHandler),
+        ToolHandler::PhaseAnalysisAlias(PhaseAnalysisAliasHandler),
+        ToolHandler::FileSummary(FileSummaryHandler),
+        ToolHandler::SymbolLookup(SymbolLookupHandler),
+        ToolHandler::ProjectMap(ProjectMapHandler),
+        ToolHandler::GrepSymbols(GrepSymbolsHandler),
+        ToolHandler::ReadSymbol(ReadSymbolHandler),
+        ToolHandler::EditPreview(EditPreviewHandler),
+        ToolHandler::EditApply(EditApplyHandler),
+        ToolHandler::RenameSymbol(RenameSymbolHandler),
+        ToolHandler::ImpactAnalysis(ImpactAnalysisHandler),
+        ToolHandler::TextSearch(TextSearchHandler),
+        ToolHandler::ReadFile(ReadFileHandler),
+        ToolHandler::GitStatus(GitStatusHandler),
+    ]
+}
+
 impl ToolHandler {
     /// Get the tool name
     pub fn name(&self) -> &str {

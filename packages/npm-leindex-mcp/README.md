@@ -31,7 +31,7 @@ Add to your MCP configuration in your AI tool:
   "mcpServers": {
     "leindex": {
       "command": "npx",
-      "args": ["@leindex/mcp"]
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -62,7 +62,7 @@ Add to Cursor settings (`~/.cursor/mcp.json` or Settings → MCP):
   "mcpServers": {
     "leindex": {
       "command": "npx",
-      "args": ["@leindex/mcp"]
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -77,7 +77,7 @@ Add to `~/.config/claude-code/mcp_servers.json`:
   "mcpServers": {
     "leindex": {
       "command": "npx",
-      "args": ["@leindex/mcp"]
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -93,7 +93,7 @@ Add to `~/.config/zed/settings.json`:
     "leindex": {
       "command": {
         "path": "npx",
-        "args": ["@leindex/mcp"]
+        "args": ["-y", "@leindex/mcp"]
       }
     }
   }
@@ -109,7 +109,7 @@ Add to `.vscode/settings.json`:
   "mcp.mcpServers": {
     "leindex": {
       "command": "npx",
-      "args": ["@leindex/mcp"]
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -128,7 +128,7 @@ Add to Claude Desktop config:
   "mcpServers": {
     "leindex": {
       "command": "npx",
-      "args": ["@leindex/mcp"]
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -169,7 +169,7 @@ Add to Claude Desktop config:
 
 1. **On `npm install`**: The `postinstall` script downloads the appropriate LeIndex binary for your platform (macOS/Linux/Windows, x64/arm64)
 2. **Binary Storage**: Downloaded to `node_modules/@leindex/mcp/bin/`
-3. **MCP Mode**: When called via `npx @leindex/mcp`, launches LeIndex in MCP stdio mode
+3. **MCP Mode**: When called via `npx -y @leindex/mcp`, launches LeIndex in MCP stdio mode
 4. **Updates**: By default the installer resolves the GitHub `latest` release and verifies the downloaded binary against `SHA256SUMS`
 
 To pin a specific binary release instead of `latest`:

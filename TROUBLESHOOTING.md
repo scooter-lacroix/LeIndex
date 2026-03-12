@@ -422,12 +422,15 @@ bash: leindex: command not found
    {
      "mcpServers": {
        "leindex": {
-         "command": "leindex",
-         "args": ["mcp"]
+         "command": "npx",
+         "args": ["-y", "@leindex/mcp"]
        }
      }
    }
    ```
+
+   If you installed the full Rust binary directly, `"command": "leindex", "args": ["mcp"]`
+   is still a valid fallback.
 
 3. Restart MCP client
 

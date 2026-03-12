@@ -107,8 +107,8 @@ leindex search "authentication"
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"]
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"]
     }
   }
 }
@@ -192,21 +192,25 @@ exclude_patterns = [
 
 ## MCP Configuration
 
-### No Changes Required
+### Recommended Update
 
-Good news! The MCP configuration **doesn't need to change** because the binary name is still `leindex`:
+For MCP clients, the recommended command is now the npm wrapper so the tool resolves the
+published MCP entrypoint directly:
 
 ```json
 {
   "mcpServers": {
     "leindex": {
-      "command": "leindex",
-      "args": ["mcp"],
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"],
       "env": {}
     }
   }
 }
 ```
+
+If you already installed the full Rust binary via cargo, the install script, or the PyPI
+bootstrapper, `"command": "leindex", "args": ["mcp"]` remains a supported direct fallback.
 
 However, the available MCP tools have changed:
 
