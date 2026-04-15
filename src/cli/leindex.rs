@@ -1139,14 +1139,14 @@ impl LeIndex {
                 continue;
             }
 
+            if project_config.should_exclude(path) {
+                continue;
+            }
+
             if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
                 if Self::is_dependency_manifest_name(name) {
                     manifest_paths.push(path.to_path_buf());
                 }
-            }
-
-            if project_config.should_exclude(path) {
-                continue;
             }
 
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -1595,10 +1595,28 @@ impl LeIndex {
 
     /// Quick staleness check without computing hashes—uses mtime only.
     pub fn is_stale_fast(&self) -> bool {
-        match self.check_freshness() {
-            Ok((changed, deleted)) => !changed.is_empty() || !deleted.is_empty(),
-            Err(_) => true,
+        let indexed_files =
+            crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
+                .unwrap_or_default();
+
+        // Use cached scan for a quick file-count comparison
+        let source_count = match &self.project_scan {
+            Some(cache) => cache.source_paths.len(),
+            None => return true, // No cache — assume stale
+        };
+
+        if source_count != indexed_files.len() {
+            return true;
         }
+
+        // Quick spot-check: any indexed file deleted since last scan?
+        for indexed_path in indexed_files.keys() {
+            if !self.project_path.join(indexed_path).exists() {
+                return true;
+            }
+        }
+
+        false
     }
 
     // ========================================================================
@@ -1817,7 +1835,7 @@ impl LeIndex {
         let indexed_files =
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .unwrap_or_default();
-        let source_files = self.collect_source_file_paths(false)?;
+        let source_files = self.collect_source_file_paths(true)?;
 
         let indexed_set: HashSet<String> = indexed_files.keys().cloned().collect();
         let source_set: HashSet<String> = source_files
@@ -2012,6 +2030,10 @@ impl LeIndex {
 
         // Re-use the index_nodes logic to ensure consistent embedding generation
         self.index_nodes(&pdg)?;
+
+        // Rebuild file stats cache after vector rebuild so the fast path stays warm
+        self.build_file_stats_cache();
+
         let indexed_count = self.search_engine.node_count();
 
         // Restore PDG

@@ -35,7 +35,8 @@ impl RustParser {
                 "function_item" => {
                     if let Some(mut sig) = extract_function_signature(&node, source, &parent_path) {
                         // Extract and populate cyclomatic complexity
-                        let complexity_metrics = self.extract_complexity(&node);
+                        let body_node = node.child_by_field_name("body").unwrap_or(node);
+                        let complexity_metrics = self.extract_complexity(&body_node);
                         sig.cyclomatic_complexity = complexity_metrics.cyclomatic.max(1) as u32;
                         signatures.push(sig);
                     }
@@ -64,7 +65,8 @@ impl RustParser {
                                         extract_function_signature(&dc, source, &parent_path)
                                     {
                                         // Extract and populate cyclomatic complexity
-                                        let complexity_metrics = self.extract_complexity(&dc);
+                                        let body_node = dc.child_by_field_name("body").unwrap_or(dc);
+                                        let complexity_metrics = self.extract_complexity(&body_node);
                                         sig.cyclomatic_complexity = complexity_metrics.cyclomatic.max(1) as u32;
                                         signatures.push(sig);
                                     }
@@ -75,7 +77,8 @@ impl RustParser {
                                 extract_function_signature(&child, source, &parent_path)
                             {
                                 // Extract and populate cyclomatic complexity
-                                let complexity_metrics = self.extract_complexity(&child);
+                                let body_node = child.child_by_field_name("body").unwrap_or(child);
+                                let complexity_metrics = self.extract_complexity(&body_node);
                                 sig.cyclomatic_complexity = complexity_metrics.cyclomatic.max(1) as u32;
                                 signatures.push(sig);
                             }
@@ -424,10 +427,7 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                     if func.kind() == "scoped_identifier" {
                         if let Some(path_node) = func.child_by_field_name("path") {
                             if let Ok(path_text) = path_node.utf8_text(source) {
-                                let type_name = path_text.to_string();
-                                if !type_name.is_empty()
-                                    && type_name.chars().next().map_or(false, |c| c.is_uppercase())
-                                {
+                                if let Some(type_name) = normalize_type_ref(path_text) {
                                     calls.push(type_name);
                                 }
                             }
@@ -471,7 +471,9 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
             "struct_expression" => {
                 if let Some(name_node) = current.child_by_field_name("name") {
                     if let Ok(name) = name_node.utf8_text(source) {
-                        calls.push(name.to_string());
+                        if let Some(type_name) = normalize_type_ref(name) {
+                            calls.push(type_name);
+                        }
                     }
                 }
             }
@@ -885,6 +887,15 @@ impl<'a> CfgBuilder<'a> {
             exit_blocks: vec![self.next_block_id.saturating_sub(1)],
         }
     }
+}
+
+/// Normalize a type reference: strip turbofish generics (`::<...>`),
+/// take the terminal segment after the last `::`, and verify it starts uppercase.
+fn normalize_type_ref(raw: &str) -> Option<String> {
+    let stripped = raw.split("::<").next().unwrap_or(raw);
+    let last = stripped.rsplit("::").next().unwrap_or(stripped).trim();
+    last.chars().next().filter(|c| c.is_uppercase())?;
+    Some(last.to_string())
 }
 
 #[cfg(test)]

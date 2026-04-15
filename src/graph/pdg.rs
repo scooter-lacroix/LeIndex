@@ -783,7 +783,10 @@ impl ProgramDependenceGraph {
 
     /// Returns the total number of files indexed in the graph.
     pub fn file_count(&self) -> usize {
-        self.file_index.len()
+        self.file_index
+            .values()
+            .filter(|node_ids| !node_ids.is_empty())
+            .count()
     }
 
     /// Returns an iterator over all node IDs in the graph.

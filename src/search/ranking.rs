@@ -58,11 +58,7 @@ impl HybridScorer {
     /// - structural: 0.15 (moderate complexity signal)
     /// - text: 0.60 (strong keyword matching)
     pub fn new() -> Self {
-        Self {
-            semantic_weight: 0.25,
-            structural_weight: 0.15,
-            text_weight: 0.60,
-        }
+        Self::for_code()
     }
 
     /// Scorer tuned for code symbol search (text-dominant)

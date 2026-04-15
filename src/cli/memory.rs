@@ -836,7 +836,7 @@ impl CacheSpiller {
                 .cloned()
                 .collect()),
             WarmStrategy::RecentFirst => {
-                // Sort by file modification time (most recent first)
+                // Sort by cache key priority, then by file modification time (most recent first) as tie-breaker
                 let mut keyed: Vec<(String, std::time::SystemTime)> = Vec::new();
 
                 for key in keys {

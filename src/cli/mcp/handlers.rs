@@ -2136,7 +2136,7 @@ impl GrepSymbolsHandler {
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Use (file_path, byte_range) as dedup key to correctly handle distinct nodes
         // with the same name in the same file (e.g., different impl blocks, overloaded methods)
-        let mut seen_names: std::collections::HashSet<(String, (usize, usize))> = std::collections::HashSet::new();
+        let mut seen_names: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
         let mut all_matches: Vec<Value> = Vec::new();
 
         for sr in candidate_results {
@@ -2180,12 +2180,12 @@ impl GrepSymbolsHandler {
             // Use (file_path, byte_range) as dedup key instead of (name, file_path)
             // to correctly handle distinct nodes with the same name in the same file
             // (e.g., different impl blocks, overloaded methods)
-            let location_key = (node.file_path.clone(), node.byte_range);
-            if !matches || seen_ids.contains(&node.id) || seen_names.contains(&location_key) {
+            let name_key = (node.name.clone(), node.file_path.clone());
+            if !matches || seen_ids.contains(&node.id) || seen_names.contains(&name_key) {
                 continue;
             }
             seen_ids.insert(node.id.clone());
-            seen_names.insert(location_key);
+            seen_names.insert(name_key);
 
             let caller_count = get_direct_callers(pdg, nid).len();
             let dep_count = pdg.neighbors(nid).len();
@@ -2214,7 +2214,8 @@ impl GrepSymbolsHandler {
 
             if include_source {
                 if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
-                    entry["source"] = Value::String(src);
+                    let truncated: String = src.chars().take(4000).collect();
+                    entry["source"] = Value::String(truncated);
                 }
             }
 
@@ -2265,12 +2266,12 @@ impl GrepSymbolsHandler {
                 // Use (file_path, byte_range) as dedup key instead of (name, file_path)
                 // to correctly handle distinct nodes with the same name in the same file
                 // (e.g., different impl blocks, overloaded methods)
-                let location_key = (node.file_path.clone(), node.byte_range);
-                if !matches || seen_ids.contains(&node.id) || seen_names.contains(&location_key) {
+                let name_key = (node.name.clone(), node.file_path.clone());
+                if !matches || seen_ids.contains(&node.id) || seen_names.contains(&name_key) {
                     continue;
                 }
                 seen_ids.insert(node.id.clone());
-                seen_names.insert(location_key);
+                seen_names.insert(name_key);
 
                 let caller_count = get_direct_callers(pdg, nid).len();
                 let dep_count = pdg.neighbors(nid).len();
@@ -2299,7 +2300,8 @@ impl GrepSymbolsHandler {
 
                 if include_source {
                     if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
-                        entry["source"] = Value::String(src);
+                        let truncated: String = src.chars().take(4000).collect();
+                        entry["source"] = Value::String(truncated);
                     }
                 }
 
@@ -4779,6 +4781,10 @@ mod tests {
         assert_eq!(
             node_type_str(&crate::graph::pdg::NodeType::Module),
             "module"
+        );
+        assert_eq!(
+            node_type_str(&crate::graph::pdg::NodeType::External),
+            "external"
         );
     }
 

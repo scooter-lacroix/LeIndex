@@ -209,7 +209,11 @@ mod tests {
         let cases = [
             ("test.py", "python"),
             ("test.js", "javascript"),
+            ("test.mjs", "javascript"),
+            ("test.cjs", "javascript"),
             ("test.ts", "typescript"),
+            ("test.mts", "typescript"),
+            ("test.cts", "typescript"),
             ("test.go", "go"),
             ("test.rs", "rust"),
             ("test.java", "java"),

@@ -360,7 +360,6 @@ impl EditEngine {
         file_path: &Path,
     ) -> Result<String> {
         let patch = diffy::create_patch(original, modified);
-        // Prepend file path header for clarity
         let patch_str = patch.to_string();
         if patch_str.is_empty() {
             Ok(format!(
@@ -369,12 +368,13 @@ impl EditEngine {
                 file_path.display()
             ))
         } else {
-            Ok(format!(
-                "--- {}\n+++ {}\n{}",
-                file_path.display(),
-                file_path.display(),
-                patch_str
-            ))
+            // Replace diffy's default "--- original" / "+++ modified" headers with file-path labels
+            let lines: Vec<&str> = patch_str.lines().collect();
+            let mut result = format!("--- {}\n+++ {}", file_path.display(), file_path.display());
+            for line in lines.iter().skip(2) {
+                result.push_str(&format!("\n{}", line));
+            }
+            Ok(result)
         }
     }
 
@@ -856,13 +856,18 @@ impl WorktreeSession {
             tracked_files,
         } = self;
 
-        let mut backups: Vec<(PathBuf, Option<String>)> = Vec::new();
+        let mut backups: Vec<(PathBuf, bool, Option<String>)> = Vec::new();
         let mut staged_entries: Vec<(PathBuf, PathBuf)> = tracked_files.into_iter().collect();
         staged_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
         for (original, staged) in &staged_entries {
-            let backup = std::fs::read_to_string(original).ok();
-            backups.push((original.clone(), backup));
+            let file_existed = original.exists();
+            let backup = if file_existed {
+                std::fs::read_to_string(original).ok()
+            } else {
+                None
+            };
+            backups.push((original.clone(), file_existed, backup));
 
             let content = std::fs::read_to_string(staged).map_err(|e| {
                 EditError::WorktreeError(format!(
@@ -883,14 +888,13 @@ impl WorktreeSession {
             }
 
             if let Err(e) = std::fs::write(original, content.as_bytes()) {
-                for (backup_path, backup_content) in backups.iter().rev() {
-                    match backup_content {
-                        Some(previous) => {
-                            let _ = std::fs::write(backup_path, previous.as_bytes());
-                        }
-                        None => {
-                            let _ = std::fs::remove_file(backup_path);
-                        }
+                for (backup_path, file_existed, backup_content) in backups.iter().rev() {
+                    if !file_existed {
+                        // File didn't exist before merge — remove it
+                        let _ = std::fs::remove_file(backup_path);
+                    } else if let Some(previous) = backup_content {
+                        // File existed — restore from backup
+                        let _ = std::fs::write(backup_path, previous.as_bytes());
                     }
                 }
                 return Err(EditError::WorktreeError(format!(
@@ -1090,13 +1094,17 @@ impl Refactor {
         let mut files: HashSet<PathBuf> = HashSet::new();
         if let Some(node_id) = exact_node {
             if let Some(node) = engine.pdg.get_node(node_id) {
-                files.insert(PathBuf::from(&node.file_path));
+                if node.node_type != crate::graph::pdg::NodeType::External {
+                    files.insert(PathBuf::from(&node.file_path));
+                }
             }
         }
 
         for nid in node_ids {
             if let Some(node) = engine.pdg.get_node(nid) {
-                files.insert(PathBuf::from(&node.file_path));
+                if node.node_type != crate::graph::pdg::NodeType::External {
+                    files.insert(PathBuf::from(&node.file_path));
+                }
             }
         }
 
@@ -1109,11 +1117,13 @@ impl Refactor {
             });
         }
 
-        // 4. Apply replace_whole_word to each file
+        // 4. Apply replace_whole_word to each file (two-phase: collect then write)
         let mut total_changes = 0usize;
-        let mut modified_files = Vec::new();
+        let mut modified_files: Vec<(PathBuf, String)> = Vec::new(); // (path, original)
         let mut errors = Vec::new();
 
+        // Phase 1: collect all modifications (no writes yet)
+        let mut pending_writes: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, modified)
         for file_path in &files {
             let original = match std::fs::read_to_string(file_path) {
                 Ok(content) => content,
@@ -1123,28 +1133,26 @@ impl Refactor {
                 }
             };
 
-            let modified = if let Some(node_id) = exact_node {
-                if let Some(node) = engine.pdg.get_node(node_id) {
-                    if PathBuf::from(&node.file_path) == *file_path {
-                        replace_whole_word(&original, old_name, new_name)
-                    } else {
-                        replace_whole_word(&original, old_name, new_name)
-                    }
-                } else {
-                    replace_whole_word(&original, old_name, new_name)
-                }
-            } else {
-                replace_whole_word(&original, old_name, new_name)
-            };
+            let modified = replace_whole_word(&original, old_name, new_name);
             if modified != original {
-                match std::fs::write(file_path, modified.as_bytes()) {
-                    Ok(()) => {
-                        total_changes += 1;
-                        modified_files.push(file_path.clone());
+                pending_writes.push((file_path.clone(), original, modified));
+            }
+        }
+
+        // Phase 2: write all files, rollback on failure
+        for (file_path, original_content, modified) in &pending_writes {
+            match std::fs::write(file_path, modified.as_bytes()) {
+                Ok(()) => {
+                    total_changes += 1;
+                    modified_files.push((file_path.clone(), original_content.clone()));
+                }
+                Err(e) => {
+                    errors.push(format!("Failed to write '{}': {}", file_path.display(), e));
+                    // Rollback all previously written files
+                    for (prev_path, prev_original) in &modified_files {
+                        let _ = std::fs::write(prev_path, prev_original.as_bytes());
                     }
-                    Err(e) => {
-                        errors.push(format!("Failed to write '{}': {}", file_path.display(), e));
-                    }
+                    break;
                 }
             }
         }
@@ -1152,7 +1160,7 @@ impl Refactor {
         Ok(EditResult {
             success: errors.is_empty(),
             changes_applied: total_changes,
-            files_modified: modified_files,
+            files_modified: modified_files.into_iter().map(|(p, _)| p).collect(),
             error: if errors.is_empty() {
                 None
             } else {
@@ -1224,12 +1232,13 @@ impl Diff {
                 file_path.display()
             ))
         } else {
-            Ok(format!(
-                "--- {}\n+++ {}\n{}",
-                file_path.display(),
-                file_path.display(),
-                patch_str
-            ))
+            // Replace diffy's default headers with file-path labels
+            let lines: Vec<&str> = patch_str.lines().collect();
+            let mut result = format!("--- {}\n+++ {}", file_path.display(), file_path.display());
+            for line in lines.iter().skip(2) {
+                result.push_str(&format!("\n{}", line));
+            }
+            Ok(result)
         }
     }
 
@@ -1257,6 +1266,7 @@ impl Impact {
     ///
     /// Uses PDG forward traversal from all nodes matching `symbol` to find
     /// downstream dependents. Returns `file:symbol` strings for each impacted node.
+    /// Excludes external nodes from traversal.
     pub fn analyze_forward_impact(pdg: &PDG, symbol: &str) -> Result<Vec<String>> {
         let node_ids = pdg.find_all_by_name(symbol);
         if node_ids.is_empty() {
@@ -1271,7 +1281,7 @@ impl Impact {
                 crate::graph::pdg::EdgeType::DataDependency,
                 crate::graph::pdg::EdgeType::Inheritance,
             ]),
-            excluded_node_types: None,
+            excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
             min_complexity: None,
             min_edge_confidence: 0.0,
         };
@@ -1297,6 +1307,7 @@ impl Impact {
     ///
     /// Uses PDG backward traversal from all nodes matching `symbol` to find
     /// upstream dependencies. Returns `file:symbol` strings for each dependency.
+    /// Excludes external nodes from traversal.
     pub fn analyze_backward_impact(pdg: &PDG, symbol: &str) -> Result<Vec<String>> {
         let node_ids = pdg.find_all_by_name(symbol);
         if node_ids.is_empty() {
@@ -1311,7 +1322,7 @@ impl Impact {
                 crate::graph::pdg::EdgeType::DataDependency,
                 crate::graph::pdg::EdgeType::Inheritance,
             ]),
-            excluded_node_types: None,
+            excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
             min_complexity: None,
             min_edge_confidence: 0.0,
         };

@@ -677,6 +677,16 @@ mod tests {
             convert_storage_node_type(&StorageNodeType::Module),
             PDGNodeType::Module
         );
+
+        // External node type round-trip
+        assert_eq!(
+            convert_node_type(&PDGNodeType::External),
+            StorageNodeType::External
+        );
+        assert_eq!(
+            convert_storage_node_type(&StorageNodeType::External),
+            PDGNodeType::External
+        );
     }
 
     #[test]
