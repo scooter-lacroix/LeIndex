@@ -702,18 +702,32 @@ impl WorktreeManager {
                 e
             )))?;
 
-        let session_dir = self.base_path.join(format!(
-            "{}-{}-{}",
-            sanitize_session_component(session_name),
-            chrono::Utc::now().timestamp_millis(),
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&session_dir).map_err(|e| {
-            EditError::WorktreeError(format!(
-                "Failed to create session worktree '{}': {}",
-                session_dir.display(),
-                e
-            ))
+        let mut session_dir = None;
+        for attempt in 0..16 {
+            let candidate = self.base_path.join(format!(
+                "{}-{}-{}-{}",
+                sanitize_session_component(session_name),
+                chrono::Utc::now().timestamp_micros(),
+                std::process::id(),
+                attempt
+            ));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => {
+                    session_dir = Some(candidate);
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => {
+                    return Err(EditError::WorktreeError(format!(
+                        "Failed to create session worktree '{}': {}",
+                        candidate.display(),
+                        e
+                    )));
+                }
+            }
+        }
+        let session_dir = session_dir.ok_or_else(|| {
+            EditError::WorktreeError("Failed to allocate unique session worktree".to_string())
         })?;
 
         Ok(WorktreeSession {
@@ -759,10 +773,19 @@ impl WorktreeManager {
             // (they contain timestamp suffixes)
             if path.is_dir() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    // Session names end with timestamp-millis: session-1234567890-1234
-                    // Extract the timestamp if present
-                    if let Some(timestamp_str) = name.rsplit('-').nth(1) {
-                        if let Ok(timestamp_millis) = timestamp_str.parse::<i64>() {
+                    // Session names end with timestamp-pid: prefix-1234567890123-1234
+                    // Validate all three parts before treating as a session directory
+                    let mut parts = name.rsplitn(3, '-');
+                    let pid_part = parts.next();
+                    let ts_part = parts.next();
+                    let prefix_part = parts.next();
+                    if let (Some(pid_str), Some(timestamp_str), Some(_prefix)) =
+                        (pid_part, ts_part, prefix_part)
+                    {
+                        if pid_str.parse::<u32>().is_ok()
+                            && timestamp_str.parse::<i64>().is_ok()
+                        {
+                            let timestamp_millis = timestamp_str.parse::<i64>().unwrap();
                             let session_time = chrono::DateTime::<chrono::Utc>::from_timestamp(
                                 timestamp_millis / 1000,
                                 ((timestamp_millis % 1000) * 1_000_000) as u32,

@@ -109,7 +109,8 @@ impl EditChange {
             return lang;
         }
 
-        match self.extension() {
+        let ext = self.extension().map(|e| e.to_ascii_lowercase());
+        match ext.as_deref() {
             Some("py") => "python",
             Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => "javascript",
             Some("ts") | Some("tsx") | Some("mts") | Some("cts") => "typescript",
@@ -210,7 +211,11 @@ mod tests {
             ("test.py", "python"),
             ("test.js", "javascript"),
             ("test.mjs", "javascript"),
+            ("test.MJS", "javascript"),
             ("test.cjs", "javascript"),
+            ("test.ts", "typescript"),
+            ("test.mts", "typescript"),
+            ("test.MTS", "typescript"),
             ("test.ts", "typescript"),
             ("test.mts", "typescript"),
             ("test.cts", "typescript"),

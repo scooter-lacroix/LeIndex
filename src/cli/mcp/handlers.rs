@@ -1907,6 +1907,12 @@ scoping to subdirectories, sorting, and pagination."
 
             for nid in pdg.node_indices() {
                 if let Some(node) = pdg.get_node(nid) {
+                    // Skip external and phantom nodes
+                    if matches!(node.node_type, crate::graph::pdg::NodeType::External)
+                        || node.byte_range == (0, 0)
+                    {
+                        continue;
+                    }
                     let entry = map
                         .entry(node.file_path.clone())
                         .or_insert((0, 0, Vec::new()));
@@ -2087,7 +2093,7 @@ impl GrepSymbolsHandler {
                 },
                 "include_source": {
                     "type": "boolean",
-                    "description": "Include full symbol source code in results (default: false)",
+                    "description": "Include up to 4000 chars of symbol source code in results (default: false)",
                     "default": false
                 }
             },
@@ -2216,7 +2222,11 @@ impl GrepSymbolsHandler {
             if include_source {
                 if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
                     let truncated: String = src.chars().take(4000).collect();
+                    let was_truncated = src.chars().count() > 4000;
                     entry["source"] = Value::String(truncated);
+                    if was_truncated {
+                        entry["source_truncated"] = Value::Bool(true);
+                    }
                 }
             }
 
@@ -2303,7 +2313,11 @@ impl GrepSymbolsHandler {
                 if include_source {
                     if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
                         let truncated: String = src.chars().take(4000).collect();
+                        let was_truncated = src.chars().count() > 4000;
                         entry["source"] = Value::String(truncated);
+                        if was_truncated {
+                            entry["source_truncated"] = Value::Bool(true);
+                        }
                     }
                 }
 

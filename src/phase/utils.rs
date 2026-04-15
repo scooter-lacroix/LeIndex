@@ -40,9 +40,10 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
             }
 
             if let Some(ext) = candidate.extension().and_then(|e| e.to_str()) {
-                if code_exts.contains(&ext) {
+                let ext = ext.to_ascii_lowercase();
+                if code_exts.contains(&ext.as_str()) {
                     collected.code_files.push(candidate.clone());
-                } else if options.include_docs && include_docs_extension(ext, options.docs_mode) {
+                } else if options.include_docs && include_docs_extension(&ext, options.docs_mode) {
                     collected.docs_files.push(candidate.clone());
                 }
             }
@@ -85,7 +86,8 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
         }
 
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if code_exts.contains(&ext) {
+            let ext = ext.to_ascii_lowercase();
+            if code_exts.contains(&ext.as_str()) {
                 collected.code_files.push(path.to_path_buf());
                 if collected.code_files.len() >= options.max_files {
                     break;
@@ -93,7 +95,7 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
                 continue;
             }
 
-            if options.include_docs && include_docs_extension(ext, options.docs_mode) {
+            if options.include_docs && include_docs_extension(&ext, options.docs_mode) {
                 collected.docs_files.push(path.to_path_buf());
             }
         }

@@ -1701,6 +1701,12 @@ impl LeIndex {
         let mut cache: HashMap<String, FileStats> = HashMap::new();
         for nid in pdg.node_indices() {
             if let Some(node) = pdg.get_node(nid) {
+                // Skip external and phantom nodes (synthetic (0,0) byte range)
+                if matches!(node.node_type, crate::graph::pdg::NodeType::External)
+                    || node.byte_range == (0, 0)
+                {
+                    continue;
+                }
                 let entry = cache.entry(node.file_path.clone()).or_insert_with(|| FileStats {
                     symbol_count: 0,
                     total_complexity: 0,
