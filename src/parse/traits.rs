@@ -81,6 +81,7 @@ pub struct SignatureInfo {
     pub byte_range: (usize, usize),
 
     /// Cyclomatic complexity extracted from AST
+    #[serde(default)]
     pub cyclomatic_complexity: u32,
 }
 

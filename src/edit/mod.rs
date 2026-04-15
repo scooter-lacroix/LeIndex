@@ -606,6 +606,14 @@ impl EditEngine {
                             error: Some(format!("Failed to restore '{}': {}", file_path.display(), e)),
                         });
                     }
+                } else {
+                    // No pre-image was captured — cannot reliably undo
+                    return Ok(EditResult {
+                        success: false,
+                        changes_applied: 0,
+                        files_modified: vec![],
+                        error: Some(format!("Cannot undo '{}': original content was not captured", file_path.display())),
+                    });
                 }
                 Ok(EditResult {
                     success: true,
@@ -707,7 +715,7 @@ impl WorktreeManager {
             let candidate = self.base_path.join(format!(
                 "{}-{}-{}-{}",
                 sanitize_session_component(session_name),
-                chrono::Utc::now().timestamp_micros(),
+                chrono::Utc::now().timestamp_millis(),
                 std::process::id(),
                 attempt
             ));
@@ -775,14 +783,18 @@ impl WorktreeManager {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     // Session names end with timestamp-pid: prefix-1234567890123-1234
                     // Validate all three parts before treating as a session directory
-                    let mut parts = name.rsplitn(3, '-');
+                    // Session names: {prefix}-{timestamp_millis}-{pid}-{attempt}
+                    // Use rsplitn to extract the numeric segments from the right
+                    let mut parts = name.rsplitn(4, '-');
+                    let attempt_part = parts.next();
                     let pid_part = parts.next();
                     let ts_part = parts.next();
                     let prefix_part = parts.next();
-                    if let (Some(pid_str), Some(timestamp_str), Some(_prefix)) =
-                        (pid_part, ts_part, prefix_part)
+                    if let (Some(_attempt_str), Some(pid_str), Some(timestamp_str), Some(_prefix)) =
+                        (attempt_part, pid_part, ts_part, prefix_part)
                     {
-                        if pid_str.parse::<u32>().is_ok()
+                        if _attempt_str.parse::<u32>().is_ok()
+                            && pid_str.parse::<u32>().is_ok()
                             && timestamp_str.parse::<i64>().is_ok()
                         {
                             let timestamp_millis = timestamp_str.parse::<i64>().unwrap();
@@ -936,13 +948,14 @@ impl WorktreeSession {
         }
 
         if path.exists() {
-            std::fs::remove_dir_all(&path).map_err(|e| {
-                EditError::WorktreeError(format!(
+            if let Err(e) = std::fs::remove_dir_all(&path) {
+                // Post-commit cleanup failure — log but don't fail the merge
+                tracing::warn!(
                     "Failed to clean up worktree '{}': {}",
                     path.display(),
                     e
-                ))
-            })?;
+                );
+            }
         }
         Ok(())
     }
@@ -1147,13 +1160,17 @@ impl Refactor {
         }
 
         // 4. Apply replace_whole_word to each file (two-phase: collect then write)
+        // Sort files for deterministic processing order
+        let mut sorted_files: Vec<_> = files.into_iter().collect();
+        sorted_files.sort();
+
         let mut total_changes = 0usize;
         let mut modified_files: Vec<(PathBuf, String)> = Vec::new(); // (path, original)
         let mut errors = Vec::new();
 
         // Phase 1: collect all modifications (no writes yet)
         let mut pending_writes: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, modified)
-        for file_path in &files {
+        for file_path in &sorted_files {
             let original = match std::fs::read_to_string(file_path) {
                 Ok(content) => content,
                 Err(e) => {
@@ -1166,6 +1183,16 @@ impl Refactor {
             if modified != original {
                 pending_writes.push((file_path.clone(), original, modified));
             }
+        }
+
+        // If discovery/read failed for any candidate, do not write anything (all-or-nothing).
+        if !errors.is_empty() {
+            return Ok(EditResult {
+                success: false,
+                changes_applied: 0,
+                files_modified: vec![],
+                error: Some(errors.join("; ")),
+            });
         }
 
         // Phase 2: write all files, rollback on failure

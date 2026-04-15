@@ -4940,14 +4940,15 @@ mod tests {
         });
         let result = ProjectMapHandler.execute(&registry, args).await.unwrap();
         let files = result["files"].as_array().unwrap();
-        let relative_paths: Vec<&str> = files
+        let relative_paths: Vec<String> = files
             .iter()
             .filter_map(|entry| entry["relative_path"].as_str())
+            .map(|p| p.replace('\\', "/"))
             .collect();
 
-        assert!(relative_paths.contains(&"main.rs"));
-        assert!(relative_paths.contains(&"src/empty.rs"));
-        assert!(relative_paths.contains(&"src/nested/mod.rs"));
+        assert!(relative_paths.iter().any(|p| p == "main.rs"));
+        assert!(relative_paths.iter().any(|p| p == "src/empty.rs"));
+        assert!(relative_paths.iter().any(|p| p == "src/nested/mod.rs"));
     }
 
     #[tokio::test]

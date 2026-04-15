@@ -19,10 +19,9 @@ pub struct Score {
 }
 
 impl Score {
-    /// Create a new score
+    /// Create a new score using default code-search weights
     pub fn new(semantic: f32, structural: f32, text_match: f32) -> Self {
-        // Combine with weighted average
-        let overall = semantic * 0.5 + structural * 0.3 + text_match * 0.2;
+        let overall = HybridScorer::new().score(semantic, structural, text_match).overall;
         Self {
             overall,
             semantic,

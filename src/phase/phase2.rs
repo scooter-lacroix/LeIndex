@@ -38,7 +38,9 @@ pub fn run(context: &PhaseExecutionContext) -> Phase2Summary {
             continue;
         };
 
-        if matches!(target.node_type, NodeType::External) {
+        let is_external =
+            matches!(target.node_type, NodeType::External) || target.language == "external";
+        if is_external {
             external += 1;
             unresolved_modules.insert(target.name.clone());
         } else {

@@ -713,6 +713,10 @@ fn calculate_complexity(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        // Skip nested function_item nodes — their complexity belongs to themselves
+        if child.kind() == "function_item" {
+            continue;
+        }
         calculate_complexity(&child, metrics, depth + 1);
     }
 }

@@ -1151,7 +1151,8 @@ impl LeIndex {
             }
 
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if SOURCE_FILE_EXTENSIONS.contains(&ext) {
+                let ext_lower = ext.to_ascii_lowercase();
+                if SOURCE_FILE_EXTENSIONS.contains(&ext_lower.as_str()) {
                     source_paths.push(path.to_path_buf());
                 }
             }
@@ -1601,7 +1602,6 @@ impl LeIndex {
                 .unwrap_or_default();
 
         // Use in-memory scan cache for a quick file-count comparison
-        // If cache is cold, we can't cheaply determine staleness — defer to full check
         let source_count = match &self.project_scan {
             Some(cache) => cache.source_paths.len(),
             None => return false, // No cache — can't determine quickly, assume not stale
@@ -1612,10 +1612,28 @@ impl LeIndex {
         }
 
         // Quick spot-check: any indexed file deleted since last scan?
+        // Also sample mtimes for up to 50 indexed files to detect content changes
+        let mut checked = 0;
         for indexed_path in indexed_files.keys() {
-            if !self.project_path.join(indexed_path).exists() {
+            let full_path = self.project_path.join(indexed_path);
+            if !full_path.exists() {
                 return true;
             }
+            if checked < 50 {
+                if let Ok(metadata) = std::fs::metadata(&full_path) {
+                    if let Ok(modified) = metadata.modified() {
+                        // If file was modified after the scan cache was built, it's stale
+                        // We check if the file is newer than a recent threshold
+                        if let Ok(elapsed) = modified.elapsed() {
+                            if elapsed.as_secs() < 1 {
+                                // File modified within the last second — likely stale
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            checked += 1;
         }
 
         false
@@ -1714,7 +1732,9 @@ impl LeIndex {
                 });
                 entry.symbol_count += 1;
                 entry.total_complexity += node.complexity;
-                entry.symbol_names.push(node.name.clone());
+                if entry.symbol_names.len() < 5 {
+                    entry.symbol_names.push(node.name.clone());
+                }
             }
         }
         self.file_stats_cache = Some(cache);
