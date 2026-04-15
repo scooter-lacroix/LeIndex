@@ -588,13 +588,13 @@ fn sanitize_key(key: &str) -> String {
 }
 
 fn cache_key_priority(key: &str) -> u8 {
-    if key.starts_with("pdg:") {
+    if key.starts_with("pdg:") || key.starts_with("pdg_") {
         0
-    } else if key.starts_with("search:") {
+    } else if key.starts_with("search:") || key.starts_with("search_") {
         1
-    } else if key.starts_with("project_scan:") {
+    } else if key.starts_with("project_scan:") || key.starts_with("project_scan_") {
         2
-    } else if key.starts_with("analysis:") {
+    } else if key.starts_with("analysis:") || key.starts_with("analysis_") {
         3
     } else {
         4

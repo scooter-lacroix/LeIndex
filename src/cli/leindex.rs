@@ -1146,6 +1146,7 @@ impl LeIndex {
             if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
                 if Self::is_dependency_manifest_name(name) {
                     manifest_paths.push(path.to_path_buf());
+                    continue; // Don't also add manifests to source_paths
                 }
             }
 
@@ -1599,10 +1600,11 @@ impl LeIndex {
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .unwrap_or_default();
 
-        // Use cached scan for a quick file-count comparison
+        // Use in-memory scan cache for a quick file-count comparison
+        // If cache is cold, we can't cheaply determine staleness — defer to full check
         let source_count = match &self.project_scan {
             Some(cache) => cache.source_paths.len(),
-            None => return true, // No cache — assume stale
+            None => return false, // No cache — can't determine quickly, assume not stale
         };
 
         if source_count != indexed_files.len() {
@@ -2031,13 +2033,13 @@ impl LeIndex {
         // Re-use the index_nodes logic to ensure consistent embedding generation
         self.index_nodes(&pdg)?;
 
-        // Rebuild file stats cache after vector rebuild so the fast path stays warm
-        self.build_file_stats_cache();
-
         let indexed_count = self.search_engine.node_count();
 
-        // Restore PDG
+        // Restore PDG first so build_file_stats_cache can read from it
         self.pdg = Some(pdg);
+
+        // Rebuild file stats cache after vector rebuild so the fast path stays warm
+        self.build_file_stats_cache();
 
         info!("Rebuilt vector index from PDG: {} nodes", indexed_count);
 

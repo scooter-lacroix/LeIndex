@@ -863,7 +863,13 @@ impl WorktreeSession {
         for (original, staged) in &staged_entries {
             let file_existed = original.exists();
             let backup = if file_existed {
-                std::fs::read_to_string(original).ok()
+                Some(std::fs::read_to_string(original).map_err(|e| {
+                    EditError::WorktreeError(format!(
+                        "Failed to back up original file '{}': {}",
+                        original.display(),
+                        e
+                    ))
+                })?)
             } else {
                 None
             };

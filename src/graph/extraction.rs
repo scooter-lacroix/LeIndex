@@ -995,22 +995,26 @@ pub fn extract_call_edges(
                 }
             }
 
-            // Also link caller → struct node if the callee name matches a class node
+            // Also link caller → struct/class node if the callee name matches a type node
             // This handles cases like `DeepThoughtManager::new()` where we want to link
             // to both the `new` method and the `DeepThoughtManager` struct
             let callee_name = normalize_symbol(call_target);
             if let Some((scoped_prefix, _member)) = callee_name.rsplit_once('.') {
                 let bare_type = scoped_prefix.rsplit('.').next().unwrap_or(scoped_prefix);
-                // Try exact scoped match first, then last-segment match
-                let struct_nid = node_ids
-                    .get(scoped_prefix)
-                    .or_else(|| node_ids.get(bare_type))
-                    .or_else(|| last_map.get(bare_type).and_then(|v| v.first()));
-                if let Some(&snid) = struct_nid {
-                    let pair = (caller_id, snid);
-                    if !seen.contains(&pair) {
-                        seen.insert(pair);
-                        edges.push(pair);
+                // Only look up if bare_type looks like a type name (starts uppercase)
+                let looks_like_type = bare_type.chars().next().map_or(false, |c| c.is_uppercase());
+                if looks_like_type {
+                    // Try exact scoped match first, then last-segment match
+                    let struct_nid = node_ids
+                        .get(scoped_prefix)
+                        .or_else(|| node_ids.get(bare_type))
+                        .or_else(|| last_map.get(bare_type).and_then(|v| v.first()));
+                    if let Some(&snid) = struct_nid {
+                        let pair = (caller_id, snid);
+                        if !seen.contains(&pair) {
+                            seen.insert(pair);
+                            edges.push(pair);
+                        }
                     }
                 }
             }
