@@ -190,7 +190,7 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
             entry
                 .path()
                 .extension()
-                .and_then(|ext| ext.to_str().map(|s| s.to_string()))
+                .and_then(|ext| ext.to_str().map(|s| s.to_ascii_lowercase()))
         })
         .collect();
 

@@ -483,6 +483,10 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
         let mut cursor = current.walk();
         let children: Vec<_> = current.children(&mut cursor).collect();
         for child in children.into_iter().rev() {
+            // Skip nested function_item nodes — their calls belong to themselves
+            if child.kind() == "function_item" {
+                continue;
+            }
             stack.push(child);
         }
     }

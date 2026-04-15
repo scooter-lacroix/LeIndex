@@ -1206,7 +1206,13 @@ impl Refactor {
                     errors.push(format!("Failed to write '{}': {}", file_path.display(), e));
                     // Rollback all previously written files
                     for (prev_path, prev_original) in &modified_files {
-                        let _ = std::fs::write(prev_path, prev_original.as_bytes());
+                        if let Err(restore_err) = std::fs::write(prev_path, prev_original.as_bytes()) {
+                            tracing::error!(
+                                "CRITICAL: Failed to restore '{}' during rollback: {}",
+                                prev_path.display(),
+                                restore_err
+                            );
+                        }
                     }
                     break;
                 }

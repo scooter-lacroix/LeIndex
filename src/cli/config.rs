@@ -283,17 +283,10 @@ impl Default for ExclusionConfig {
                 ".leindex".into(),
             ],
             file_patterns: vec![
-                "Cargo.lock".into(),
-                "package-lock.json".into(),
-                "npm-shrinkwrap.json".into(),
-                "yarn.lock".into(),
-                "pnpm-lock.yaml".into(),
-                "bun.lock".into(),
-                "bun.lockb".into(),
-                "composer.lock".into(),
-                "Pipfile.lock".into(),
-                "poetry.lock".into(),
-                "Gemfile.lock".into(),
+                // Note: lockfiles (Cargo.lock, package-lock.json, etc.) are intentionally
+                // NOT excluded here because scan_project_files() collects them as
+                // dependency manifests before checking exclusions. Excluding them
+                // would break external dependency resolution.
                 "*.min.js".into(),
                 "*.min.css".into(),
                 "*.pb.go".into(), // Generated protobuf files

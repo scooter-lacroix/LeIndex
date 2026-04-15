@@ -1604,31 +1604,33 @@ impl LeIndex {
         // Use in-memory scan cache for a quick file-count comparison
         let source_count = match &self.project_scan {
             Some(cache) => cache.source_paths.len(),
-            None => return false, // No cache — can't determine quickly, assume not stale
+            None => return true, // No cache — stale until proven otherwise
         };
 
         if source_count != indexed_files.len() {
             return true;
         }
 
-        // Quick spot-check: any indexed file deleted since last scan?
-        // Also sample mtimes for up to 50 indexed files to detect content changes
+        // Get the DB modification time for mtime comparison
+        let db_time = self.storage_path
+            .join("leindex.db")
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok();
+
+        // Quick spot-check: any indexed file deleted or modified since last index?
         let mut checked = 0;
         for indexed_path in indexed_files.keys() {
             let full_path = self.project_path.join(indexed_path);
             if !full_path.exists() {
                 return true;
             }
+            // Compare file mtime against DB mtime for a sample of files
             if checked < 50 {
-                if let Ok(metadata) = std::fs::metadata(&full_path) {
+                if let (Some(db_t), Ok(metadata)) = (db_time, std::fs::metadata(&full_path)) {
                     if let Ok(modified) = metadata.modified() {
-                        // If file was modified after the scan cache was built, it's stale
-                        // We check if the file is newer than a recent threshold
-                        if let Ok(elapsed) = modified.elapsed() {
-                            if elapsed.as_secs() < 1 {
-                                // File modified within the last second — likely stale
-                                return true;
-                            }
+                        if modified > db_t {
+                            return true;
                         }
                     }
                 }

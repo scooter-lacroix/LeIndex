@@ -1869,13 +1869,9 @@ scoping to subdirectories, sorting, and pagination."
         // Use cached file stats if available, otherwise build from PDG
         let file_map: std::collections::HashMap<String, (usize, u32, Vec<String>)> = if let Some(cache) = index.file_stats() {
             // Fast path: use cached statistics
-            // Collect cache data into owned vectors to avoid borrow issues
-            let cached_data: Vec<(String, usize, u32, Vec<String>)> = cache.iter().map(|(path, stats)| {
-                let symbol_names = stats.symbol_names.iter()
-                    .take(5)
-                    .cloned()
-                    .collect();
-                (path.clone(), stats.symbol_count, stats.total_complexity, symbol_names)
+            // Collect cache data first to avoid borrow conflicts with source_file_paths()
+            let cached_data: Vec<_> = cache.iter().map(|(path, stats)| {
+                (path.clone(), stats.symbol_count, stats.total_complexity, stats.symbol_names.clone())
             }).collect();
 
             // Start with all source files (including those without symbols)
@@ -1886,9 +1882,10 @@ scoping to subdirectories, sorting, and pagination."
                 .map(|path| (path.display().to_string(), (0, 0, Vec::new())))
                 .collect();
 
-            // Overlay cached statistics
+            // Overlay cached statistics, capping symbol_names to top 5
             for (path, symbol_count, complexity, symbol_names) in cached_data {
-                map.insert(path, (symbol_count, complexity, symbol_names));
+                let capped: Vec<String> = symbol_names.into_iter().take(5).collect();
+                map.insert(path, (symbol_count, complexity, capped));
             }
             map
         } else {

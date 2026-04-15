@@ -216,8 +216,6 @@ mod tests {
             ("test.ts", "typescript"),
             ("test.mts", "typescript"),
             ("test.MTS", "typescript"),
-            ("test.ts", "typescript"),
-            ("test.mts", "typescript"),
             ("test.cts", "typescript"),
             ("test.go", "go"),
             ("test.rs", "rust"),
