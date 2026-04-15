@@ -44,7 +44,11 @@ impl CodeIntelligence for KotlinParser {
                                 found
                             },
                             is_method: false,
-                            docstring: None, byte_range: (0, 0) cyclomatic_complexity: 0,
+                            docstring: None,
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (0, 0),
+                            cyclomatic_complexity: 0,
                             });
                     }
                 }
@@ -58,7 +62,11 @@ impl CodeIntelligence for KotlinParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: None, byte_range: (0, 0) cyclomatic_complexity: 0,
+                            docstring: None,
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (0, 0),
+                            cyclomatic_complexity: 0,
                             });
                     }
                 }

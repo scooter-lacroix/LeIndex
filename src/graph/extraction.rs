@@ -999,10 +999,12 @@ pub fn extract_call_edges(
             // This handles cases like `DeepThoughtManager::new()` where we want to link
             // to both the `new` method and the `DeepThoughtManager` struct
             let callee_name = normalize_symbol(call_target);
-            let bare_type = callee_name.split('.').next().unwrap_or(&callee_name);
-            if bare_type != callee_name {
-                // Try exact match first, then last-segment match
-                let struct_nid = node_ids.get(bare_type)
+            if let Some((scoped_prefix, _member)) = callee_name.rsplit_once('.') {
+                let bare_type = scoped_prefix.rsplit('.').next().unwrap_or(scoped_prefix);
+                // Try exact scoped match first, then last-segment match
+                let struct_nid = node_ids
+                    .get(scoped_prefix)
+                    .or_else(|| node_ids.get(bare_type))
                     .or_else(|| last_map.get(bare_type).and_then(|v| v.first()));
                 if let Some(&snid) = struct_nid {
                     let pair = (caller_id, snid);

@@ -93,11 +93,29 @@ impl ExternalDependencyRegistry {
     pub fn from_project(root: &Path) -> Self {
         Self::from_manifest_paths(root, &discover_dependency_manifests(root))
     }
+}
 
+/// Lockfiles (priority 1) override manifest-derived ranges (priority 0).
+fn source_priority(file_name: &str) -> u8 {
+    match file_name {
+        "Cargo.toml" | "package.json" | "pyproject.toml" | "go.mod" => 0,
+        _ => 1, // lockfiles and fully resolved metadata
+    }
+}
+
+impl ExternalDependencyRegistry {
     /// Build the registry from an already-discovered manifest list.
     pub fn from_manifest_paths(root: &Path, manifest_paths: &[PathBuf]) -> Self {
         let mut registry = Self::new();
-        for manifest_path in manifest_paths {
+        // Sort so lockfiles (priority 1) are parsed AFTER manifests (priority 0),
+        // ensuring lockfile versions overwrite the looser manifest-derived ranges.
+        let mut sorted_paths = manifest_paths.to_vec();
+        sorted_paths.sort_by(|a, b| {
+            let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            source_priority(a_name).cmp(&source_priority(b_name))
+        });
+        for manifest_path in &sorted_paths {
             let path = if manifest_path.is_absolute() {
                 manifest_path.clone()
             } else {
@@ -113,7 +131,7 @@ impl ExternalDependencyRegistry {
             match file_name {
                 "Cargo.lock" => registry.parse_cargo_lock(&content),
                 "Cargo.toml" => registry.parse_cargo_toml(&content),
-                "package-lock.json" => registry.parse_package_lock_json(&content),
+                "package-lock.json" | "npm-shrinkwrap.json" => registry.parse_package_lock_json(&content),
                 "package.json" => registry.parse_package_json(&content),
                 "yarn.lock" => registry.parse_yarn_lock(&content),
                 "pnpm-lock.yaml" => registry.parse_pnpm_lock(&content),
@@ -1080,6 +1098,7 @@ pub fn discover_dependency_manifests(root: &Path) -> Vec<std::path::PathBuf> {
         "Cargo.lock",
         "Cargo.toml",
         "package-lock.json",
+        "npm-shrinkwrap.json",
         "package.json",
         "yarn.lock",
         "pnpm-lock.yaml",

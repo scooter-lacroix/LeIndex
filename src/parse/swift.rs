@@ -34,7 +34,11 @@ impl CodeIntelligence for SwiftParser {
                             visibility: Visibility::Public,
                             is_async: node.children(&mut node.walk()).any(|c| c.utf8_text(source).ok().map_or(false, |t| t.contains("async"))),
                             is_method: node.kind() == "method_declaration",
-                            docstring: None, byte_range: (0, 0) cyclomatic_complexity: 0,
+                            docstring: None,
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (0, 0),
+                            cyclomatic_complexity: 0,
                             });
                     }
                 }
