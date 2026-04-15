@@ -10,5 +10,5 @@
 - The automated release workflow is `.github/workflows/release.yml`.
 - It triggers on pushes to `master` and detects new versions by checking if a `v{version}` tag already exists.
 - The pipeline builds cross-platform binaries (Linux x86_64/ARM64, macOS x86_64/ARM64, Windows x86_64), creates a GitHub Release with SHA256 checksums, then publishes to crates.io, npm, and PyPI in parallel.
-- Required secrets: `CARGO_REGISTRY_TOKEN`, `NPM_TOKEN`, `PYPI_TOKEN`.
+- Required secrets: `CARGO_REGISTRY_TOKEN` (required), `PYPI_TOKEN` (required), `NPM_TOKEN` (optional — npm publish is skipped gracefully if not set).
 - Version parity is enforced at CI time — the npm and PyPI jobs validate their `package.json` / `pyproject.toml` versions match `Cargo.toml` before publishing.

@@ -3,11 +3,12 @@ name: Release
 on:
   push:
     branches: [master]
-    paths-ignore:
-      - '.github/workflows/**'
-      - 'docs/**'
-      - '**.md'
-      - 'LICENSE*'
+    paths:
+      # Only trigger when version-carrying or publishable files change
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'packages/**'
 
 permissions:
   contents: write
@@ -219,25 +220,38 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
-  # ── Publish npm package ──────────────────────────────────────────────
+  # ── Publish npm package (optional — skips if NPM_TOKEN not set) ─────
   npm:
     name: Publish npm
     needs: [detect, github-release]
     if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
+    continue-on-error: true
     defaults:
       run:
         working-directory: packages/npm-leindex-mcp
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check NPM_TOKEN availability
+        id: check_token
+        run: |
+          if [ -z "${{ secrets.NPM_TOKEN }}" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ NPM_TOKEN not set — skipping npm publish"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup Node.js
+        if: steps.check_token.outputs.available == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Verify version parity
+        if: steps.check_token.outputs.available == 'true'
         run: |
           CARGO_VERSION=$(grep '^version =' ../../Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           NPM_VERSION=$(node -p "require('./package.json').version")
@@ -248,11 +262,12 @@ jobs:
           echo "Versions match: v${CARGO_VERSION}"
 
       - name: Publish to npm
+        if: steps.check_token.outputs.available == 'true'
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
-  # ── Publish PyPI package ─────────────────────────────────────────────
+  # ── Publish PyPI package (thin wrapper — installs binary via cargo) ──
   pypi:
     name: Publish PyPI
     needs: [detect, github-release]
@@ -301,7 +316,7 @@ jobs:
       - name: Print summary
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
-          echo "## 🚀 Release v${VERSION} Complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "## 🚀 Release v${VERSION} Pipeline" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Step | Status |" >> "$GITHUB_STEP_SUMMARY"
           echo "|------|--------|" >> "$GITHUB_STEP_SUMMARY"
@@ -309,3 +324,8 @@ jobs:
           echo "| crates.io | ${{ needs.crates-io.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| npm | ${{ needs.npm.result }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| PyPI | ${{ needs.pypi.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Registry notes" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **crates.io**: Publishes the Rust crate (required)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **PyPI**: Thin Python wrapper that bootstraps cargo install (required)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **npm**: Binary wrapper with GH Release download (optional — needs NPM_TOKEN)" >> "$GITHUB_STEP_SUMMARY"
