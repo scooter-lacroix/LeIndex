@@ -463,7 +463,8 @@ to auto-switch/auto-index projects."
         let total_returned = page.len();
 
         // Check for zero results and provide helpful suggestion
-        if page.is_empty() {
+        // Only emit suggestion when there are truly no matches, not when offset is past total
+        if total_filtered == 0 {
             return Ok(wrap_with_meta(
                 serde_json::json!({
                     "results": [],
@@ -2133,7 +2134,9 @@ impl GrepSymbolsHandler {
         // Fetch max_results + offset matches, then paginate
         let fetch_limit = max_results + offset;
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut seen_names: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        // Use (file_path, byte_range) as dedup key to correctly handle distinct nodes
+        // with the same name in the same file (e.g., different impl blocks, overloaded methods)
+        let mut seen_names: std::collections::HashSet<(String, (usize, usize))> = std::collections::HashSet::new();
         let mut all_matches: Vec<Value> = Vec::new();
 
         for sr in candidate_results {
@@ -2174,12 +2177,15 @@ impl GrepSymbolsHandler {
             let matches = node.name.to_lowercase().contains(&pattern_lower)
                 || node.id.to_lowercase().contains(&pattern_lower);
 
-            let name_file_key = (node.name.clone(), node.file_path.clone());
-            if !matches || seen_ids.contains(&node.id) || seen_names.contains(&name_file_key) {
+            // Use (file_path, byte_range) as dedup key instead of (name, file_path)
+            // to correctly handle distinct nodes with the same name in the same file
+            // (e.g., different impl blocks, overloaded methods)
+            let location_key = (node.file_path.clone(), node.byte_range);
+            if !matches || seen_ids.contains(&node.id) || seen_names.contains(&location_key) {
                 continue;
             }
             seen_ids.insert(node.id.clone());
-            seen_names.insert(name_file_key);
+            seen_names.insert(location_key);
 
             let caller_count = get_direct_callers(pdg, nid).len();
             let dep_count = pdg.neighbors(nid).len();
@@ -2256,12 +2262,15 @@ impl GrepSymbolsHandler {
                         || node.id.to_lowercase().contains(&pattern_lower)
                 };
 
-                let name_file_key = (node.name.clone(), node.file_path.clone());
-                if !matches || seen_ids.contains(&node.id) || seen_names.contains(&name_file_key) {
+                // Use (file_path, byte_range) as dedup key instead of (name, file_path)
+                // to correctly handle distinct nodes with the same name in the same file
+                // (e.g., different impl blocks, overloaded methods)
+                let location_key = (node.file_path.clone(), node.byte_range);
+                if !matches || seen_ids.contains(&node.id) || seen_names.contains(&location_key) {
                     continue;
                 }
                 seen_ids.insert(node.id.clone());
-                seen_names.insert(name_file_key);
+                seen_names.insert(location_key);
 
                 let caller_count = get_direct_callers(pdg, nid).len();
                 let dep_count = pdg.neighbors(nid).len();
@@ -2303,7 +2312,8 @@ impl GrepSymbolsHandler {
         let page: Vec<Value> = all_matches.into_iter().skip(offset).collect();
 
         // Check for zero results and provide helpful suggestion
-        if page.is_empty() {
+        // Only emit suggestion when there are truly no matches, not when offset is past total
+        if total_matched == 0 {
             let pdg = index.pdg().unwrap();
             return Ok(wrap_with_meta(
                 serde_json::json!({
