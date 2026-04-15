@@ -1139,15 +1139,18 @@ impl LeIndex {
                 continue;
             }
 
-            if project_config.should_exclude(path) {
-                continue;
-            }
-
+            // Check for dependency manifests BEFORE exclusions so lockfiles
+            // (Cargo.lock, package-lock.json, etc.) are always collected
+            // regardless of any exclusion patterns.
             if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
                 if Self::is_dependency_manifest_name(name) {
                     manifest_paths.push(path.to_path_buf());
                     continue; // Don't also add manifests to source_paths
                 }
+            }
+
+            if project_config.should_exclude(path) {
+                continue;
             }
 
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
@@ -1596,15 +1599,33 @@ impl LeIndex {
     }
 
     /// Quick staleness check without computing hashes—uses mtime only.
+    ///
+    /// Falls back gracefully if no in-memory cache is available by checking
+    /// the persistent cache store. Returns `true` (stale) only when it can
+    /// positively confirm staleness (file count mismatch, deleted files,
+    /// or mtime newer than DB).
     pub fn is_stale_fast(&self) -> bool {
         let indexed_files =
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .unwrap_or_default();
 
-        // Use in-memory scan cache for a quick file-count comparison
+        // Use in-memory scan cache for a quick file-count comparison.
+        // If not in memory, try to deserialize from the persistent cache_spiller.
         let source_count = match &self.project_scan {
             Some(cache) => cache.source_paths.len(),
-            None => return true, // No cache — stale until proven otherwise
+            None => {
+                // Try persistent cache before declaring stale
+                let cache_key = crate::cli::memory::project_scan_cache_key(&self.project_id);
+                if let Some(entry) = self.cache_spiller.store().peek(&cache_key) {
+                    if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
+                        if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(serialized_data) {
+                            return scan.source_paths.len() != indexed_files.len();
+                        }
+                    }
+                }
+                // No cache at all — can't confirm freshness, defer to full check
+                return false;
+            }
         };
 
         if source_count != indexed_files.len() {

@@ -1133,11 +1133,34 @@ impl Refactor {
         let node_ids = engine.pdg.find_all_by_name(old_name);
         let exact_node = engine.pdg.find_by_symbol(old_name);
 
+        // Collect files containing the symbol definition AND all files that
+        // reference it (call sites, type usages) via PDG forward/backward edges.
         let mut files: HashSet<PathBuf> = HashSet::new();
+
+        let config = crate::graph::pdg::TraversalConfig::for_impact_analysis();
+
         if let Some(node_id) = exact_node {
             if let Some(node) = engine.pdg.get_node(node_id) {
                 if node.node_type != crate::graph::pdg::NodeType::External {
                     files.insert(PathBuf::from(&node.file_path));
+
+                    // Add files that reference this symbol via PDG edges
+                    let impacted = engine.pdg.forward_impact(node_id, &config);
+                    for imp_id in impacted {
+                        if let Some(imp_node) = engine.pdg.get_node(imp_id) {
+                            if imp_node.node_type != crate::graph::pdg::NodeType::External {
+                                files.insert(PathBuf::from(&imp_node.file_path));
+                            }
+                        }
+                    }
+                    let backward = engine.pdg.backward_impact(node_id, &config);
+                    for back_id in backward {
+                        if let Some(back_node) = engine.pdg.get_node(back_id) {
+                            if back_node.node_type != crate::graph::pdg::NodeType::External {
+                                files.insert(PathBuf::from(&back_node.file_path));
+                            }
+                        }
+                    }
                 }
             }
         }

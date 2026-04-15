@@ -277,6 +277,11 @@ impl CacheStore {
         found
     }
 
+    /// Peek at an entry without updating recency (read-only).
+    pub fn peek(&self, key: &str) -> Option<&CacheEntry> {
+        self.cache.peek(key)
+    }
+
     /// Get an entry from memory cache, or restore from disk if available.
     pub fn get_or_load(&mut self, key: &str) -> Result<Option<CacheEntry>, Error> {
         if let Some(entry) = self.cache.get(key).cloned() {
