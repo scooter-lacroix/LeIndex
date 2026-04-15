@@ -219,7 +219,7 @@ pub fn relink_external_import_edges(pdg: &mut ProgramDependenceGraph, config: &R
         let Some(node) = pdg.get_node(node_idx) else {
             continue;
         };
-        if node.node_type == NodeType::Module && node.language == "external" {
+        if matches!(node.node_type, NodeType::External) {
             continue;
         }
         for key in candidate_keys_for_node(node) {
@@ -246,7 +246,7 @@ pub fn relink_external_import_edges(pdg: &mut ProgramDependenceGraph, config: &R
         let Some(target) = pdg.get_node(to) else {
             continue;
         };
-        if !(target.node_type == NodeType::Module && target.language == "external") {
+        if !matches!(target.node_type, NodeType::External) {
             continue;
         }
 
@@ -309,8 +309,7 @@ pub fn relink_external_import_edges(pdg: &mut ProgramDependenceGraph, config: &R
             let Some(node) = pdg.get_node(nid) else {
                 return false;
             };
-            node.node_type == NodeType::Module
-                && node.language == "external"
+            matches!(node.node_type, NodeType::External)
                 && pdg.predecessors(nid).is_empty()
                 && pdg.neighbors(nid).is_empty()
         })
@@ -508,6 +507,7 @@ mod tests {
             calls: Vec::new(),
             imports,
             byte_range: (0, 10),
+            cyclomatic_complexity: 0,
         }
     }
 
@@ -560,7 +560,7 @@ mod tests {
                 }
                 let (_, to) = pdg.edge_endpoints(idx)?;
                 let target = pdg.get_node(to)?;
-                (target.node_type == NodeType::Module && target.language == "external")
+                matches!(target.node_type, NodeType::External)
                     .then_some(())
             })
             .count();

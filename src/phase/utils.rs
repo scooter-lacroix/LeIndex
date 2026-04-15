@@ -18,7 +18,7 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
     // All file extensions supported by the parse module.
     // Must stay in sync with crate::parse::grammar::LanguageId::from_extension.
     let code_exts = [
-        "rs", "py", "js", "jsx", "ts", "tsx", // Main languages
+        "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", // Main languages
         "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Systems languages
         "cs",  // C#
         "rb", "php", "lua", "scala", "sc", // Scripting languages

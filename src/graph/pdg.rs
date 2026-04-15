@@ -91,6 +91,9 @@ pub enum NodeType {
 
     /// A module, namespace, or package.
     Module,
+
+    /// Imported/referenced symbol not defined in this project
+    External,
 }
 
 /// Edge types — now includes Containment for structural (non-semantic) relationships.
@@ -776,6 +779,11 @@ impl ProgramDependenceGraph {
     /// Returns the total number of edges in the graph.
     pub fn edge_count(&self) -> usize {
         self.graph.edge_count()
+    }
+
+    /// Returns the total number of files indexed in the graph.
+    pub fn file_count(&self) -> usize {
+        self.file_index.len()
     }
 
     /// Returns an iterator over all node IDs in the graph.

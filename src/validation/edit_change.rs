@@ -111,10 +111,8 @@ impl EditChange {
 
         match self.extension() {
             Some("py") => "python",
-            Some("js") => "javascript",
-            Some("jsx") => "javascript",
-            Some("ts") => "typescript",
-            Some("tsx") => "typescript",
+            Some("js") | Some("jsx") | Some("mjs") | Some("cjs") => "javascript",
+            Some("ts") | Some("tsx") | Some("mts") | Some("cts") => "typescript",
             Some("go") => "go",
             Some("rs") => "rust",
             Some("java") => "java",

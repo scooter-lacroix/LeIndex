@@ -5,7 +5,7 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
@@ -234,6 +234,22 @@ fn replace_whole_word(content: &str, old: &str, new: &str) -> String {
     result
 }
 
+fn sanitize_session_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "session".to_string()
+    } else {
+        out
+    }
+}
+
 impl EditEngine {
     /// Create a new edit engine
     pub fn new(pdg: Arc<PDG>, _storage: Arc<Storage>) -> Result<Self> {
@@ -282,6 +298,9 @@ impl EditEngine {
             )
             .await?;
 
+        // Capture original content for undo
+        let original_content = std::fs::read_to_string(&request.file_path).ok();
+
         // Apply changes in worktree
         let mut changes_applied = 0;
         let mut files_modified = Vec::new();
@@ -322,6 +341,7 @@ impl EditEngine {
             file_path: request.file_path.clone(),
             changes: request.changes.clone(),
             timestamp: chrono::Utc::now(),
+            original_content,
         });
 
         Ok(EditResult {
@@ -555,6 +575,8 @@ impl EditEngine {
         std::fs::write(&target_path, modified.as_bytes())
             .map_err(|e| EditError::Generic(format!("Failed to write {:?}: {}", target_path, e)))?;
 
+        session.track_file(file_path.to_path_buf(), target_path);
+
         Ok(true)
     }
 
@@ -573,9 +595,18 @@ impl EditEngine {
     pub async fn undo(&self) -> Result<EditResult> {
         let mut history = self.history.lock().await;
         match history.undo() {
-            Some(EditCommand::Edit { file_path, .. }) => {
-                // In full implementation, we'd need to store the original content
-                // to properly undo changes
+            Some(EditCommand::Edit { file_path, original_content, .. }) => {
+                // Restore original content if available
+                if let Some(content) = original_content {
+                    if let Err(e) = std::fs::write(&file_path, content.as_bytes()) {
+                        return Ok(EditResult {
+                            success: false,
+                            changes_applied: 0,
+                            files_modified: vec![],
+                            error: Some(format!("Failed to restore '{}': {}", file_path.display(), e)),
+                        });
+                    }
+                }
                 Ok(EditResult {
                     success: true,
                     changes_applied: 1,
@@ -662,22 +693,104 @@ impl WorktreeManager {
     pub async fn create_session(
         &self,
         _project_id: &UniqueProjectId,
-        _session_name: &str,
+        session_name: &str,
     ) -> Result<WorktreeSession> {
-        // In full implementation, this would:
-        // 1. Get project path from storage
-        // 2. Create git worktree using git2
-        // 3. Return session handle
+        std::fs::create_dir_all(&self.base_path)
+            .map_err(|e| EditError::WorktreeError(format!(
+                "Failed to create worktree base '{}': {}",
+                self.base_path.display(),
+                e
+            )))?;
+
+        let session_dir = self.base_path.join(format!(
+            "{}-{}-{}",
+            sanitize_session_component(session_name),
+            chrono::Utc::now().timestamp_millis(),
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&session_dir).map_err(|e| {
+            EditError::WorktreeError(format!(
+                "Failed to create session worktree '{}': {}",
+                session_dir.display(),
+                e
+            ))
+        })?;
 
         Ok(WorktreeSession {
-            path: self.base_path.join("session"),
+            path: session_dir,
+            tracked_files: HashMap::new(),
         })
     }
 
-    /// Clean up old worktrees
-    pub async fn cleanup_old(&self, _older_than: chrono::Duration) -> Result<usize> {
-        // Cleanup implementation
-        Ok(0)
+    /// Clean up old worktrees older than the specified duration.
+    ///
+    /// Scans the base worktree directory for session directories that were
+    /// created more than `older_than` ago and removes them. Each session
+    /// directory name includes a timestamp suffix for this purpose.
+    ///
+    /// Returns the number of worktree directories removed.
+    pub async fn cleanup_old(&self, older_than: chrono::Duration) -> Result<usize> {
+        if !self.base_path.exists() {
+            return Ok(0);
+        }
+
+        let cutoff_time = chrono::Utc::now() - older_than;
+        let mut removed_count = 0;
+
+        let entries = std::fs::read_dir(&self.base_path).map_err(|e| {
+            EditError::WorktreeError(format!(
+                "Failed to read worktree base directory '{}': {}",
+                self.base_path.display(),
+                e
+            ))
+        })?;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| {
+                EditError::WorktreeError(format!(
+                    "Failed to read worktree directory entry: {}",
+                    e
+                ))
+            })?;
+
+            let path = entry.path();
+
+            // Only process directories that look like session directories
+            // (they contain timestamp suffixes)
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    // Session names end with timestamp-millis: session-1234567890-1234
+                    // Extract the timestamp if present
+                    if let Some(timestamp_str) = name.rsplit('-').nth(1) {
+                        if let Ok(timestamp_millis) = timestamp_str.parse::<i64>() {
+                            let session_time = chrono::DateTime::<chrono::Utc>::from_timestamp(
+                                timestamp_millis / 1000,
+                                ((timestamp_millis % 1000) * 1_000_000) as u32,
+                            );
+
+                            if let Some(session_time) = session_time {
+                                if session_time < cutoff_time {
+                                    // Remove the old worktree directory
+                                    match std::fs::remove_dir_all(&path) {
+                                        Ok(_) => removed_count += 1,
+                                        Err(e) => {
+                                            // Log but don't fail - continue cleaning up others
+                                            tracing::warn!(
+                                                "Failed to remove old worktree '{}': {}",
+                                                path.display(),
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(removed_count)
     }
 }
 
@@ -685,6 +798,9 @@ impl WorktreeManager {
 pub struct WorktreeSession {
     /// Path to the worktree directory
     pub path: PathBuf,
+
+    /// Mapping from original file path to staged worktree path.
+    tracked_files: HashMap<PathBuf, PathBuf>,
 }
 
 impl WorktreeSession {
@@ -693,15 +809,108 @@ impl WorktreeSession {
         &self.path
     }
 
+    /// Track a file that was materialized in the worktree.
+    fn track_file(&mut self, original: PathBuf, staged: PathBuf) {
+        self.tracked_files.insert(original, staged);
+    }
+
     /// Discard the worktree without merging
     pub async fn discard(self) -> Result<()> {
-        // Remove worktree directory
+        if self.path.exists() {
+            std::fs::remove_dir_all(&self.path).map_err(|e| {
+                EditError::WorktreeError(format!(
+                    "Failed to discard worktree '{}': {}",
+                    self.path.display(),
+                    e
+                ))
+            })?;
+        }
         Ok(())
     }
 
-    /// Merge worktree back to main and cleanup
+    /// Merge worktree changes back to original files and cleanup the worktree.
+    ///
+    /// # Semantics
+    ///
+    /// This uses **best-effort compensating rollback** on failure, not true
+    /// transactional atomicity. Specifically:
+    ///
+    /// 1. Original files are backed up in memory before any writes
+    /// 2. Staged files are merged in sorted order
+    /// 3. On write failure, previous backups are restored to their original state
+    /// 4. The worktree is cleaned up on success
+    ///
+    /// # Limitations
+    ///
+    /// - Backups are in-memory only (lost if process crashes mid-merge)
+    /// - No file-level locking (concurrent writes can cause conflicts)
+    /// - Rollback is best-effort (individual restoration failures are ignored)
+    /// - Not atomic across all files (files are written one at a time)
+    ///
+    /// For true transactional semantics, use git worktrees or a proper transaction
+    /// coordinator. This implementation provides reasonable isolation for editing
+    /// sessions but cannot guarantee full atomicity.
     pub async fn merge(self) -> Result<()> {
-        // Merge changes and cleanup
+        let WorktreeSession {
+            path,
+            tracked_files,
+        } = self;
+
+        let mut backups: Vec<(PathBuf, Option<String>)> = Vec::new();
+        let mut staged_entries: Vec<(PathBuf, PathBuf)> = tracked_files.into_iter().collect();
+        staged_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (original, staged) in &staged_entries {
+            let backup = std::fs::read_to_string(original).ok();
+            backups.push((original.clone(), backup));
+
+            let content = std::fs::read_to_string(staged).map_err(|e| {
+                EditError::WorktreeError(format!(
+                    "Failed to read staged file '{}': {}",
+                    staged.display(),
+                    e
+                ))
+            })?;
+
+            if let Some(parent) = original.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    EditError::WorktreeError(format!(
+                        "Failed to create destination directory '{}': {}",
+                        parent.display(),
+                        e
+                    ))
+                })?;
+            }
+
+            if let Err(e) = std::fs::write(original, content.as_bytes()) {
+                for (backup_path, backup_content) in backups.iter().rev() {
+                    match backup_content {
+                        Some(previous) => {
+                            let _ = std::fs::write(backup_path, previous.as_bytes());
+                        }
+                        None => {
+                            let _ = std::fs::remove_file(backup_path);
+                        }
+                    }
+                }
+                return Err(EditError::WorktreeError(format!(
+                    "Failed to merge staged file '{}' into '{}': {}",
+                    staged.display(),
+                    original.display(),
+                    e
+                )));
+            }
+        }
+
+        if path.exists() {
+            std::fs::remove_dir_all(&path).map_err(|e| {
+                EditError::WorktreeError(format!(
+                    "Failed to clean up worktree '{}': {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+        }
         Ok(())
     }
 }
@@ -811,6 +1020,9 @@ pub enum EditCommand {
 
         /// Timestamp of the edit operation
         timestamp: chrono::DateTime<chrono::Utc>,
+
+        /// Original file content before the edit (for undo).
+        original_content: Option<String>,
     },
 
     /// Rollback point
@@ -827,23 +1039,125 @@ pub enum EditCommand {
 pub struct Refactor;
 
 impl Refactor {
-    /// Rename a symbol across all files
+    /// Rename a symbol across all files using PDG-guided file discovery and whole-word replacement.
+    ///
+    /// # Implementation Details
+    ///
+    /// This is **NOT** a full AST/reference-aware rename. It uses a hybrid approach:
+    ///
+    /// 1. **File discovery via PDG**: Uses `pdg.find_by_symbol()` and `pdg.find_all_by_name()`
+    ///    to discover which files contain nodes matching `old_name`
+    ///
+    /// 2. **Whole-word replacement**: Within each discovered file, applies `replace_whole_word()`
+    ///    which replaces occurrences bounded by word boundaries (alphanumeric or underscore)
+    ///
+    /// # Limitations
+    ///
+    /// - Does NOT parse AST or resolve semantic references
+    /// - Does NOT distinguish between type names, variable names, or string literals
+    /// - May rename occurrences in comments, strings, or documentation
+    /// - Does NOT handle language-specific scoping or namespacing
+    /// - Relies on PDG symbol names which may not capture all references
+    ///
+    /// # Future Work
+    ///
+    /// For true AST/reference-aware rename, this should be replaced with:
+    /// - Language-specific tree-sitter queries for semantic rename
+    /// - Or LSP-based rename operations (if language server is available)
+    /// - The upstream-first policy requires implementing this in LeIndex first
+    ///
+    /// # Returns
+    ///
+    /// Count of files modified and list of modified file paths.
     pub async fn rename_symbol(
-        _engine: &EditEngine,
-        _old_name: &str,
-        _new_name: &str,
+        engine: &EditEngine,
+        old_name: &str,
+        new_name: &str,
     ) -> Result<EditResult> {
-        // In full implementation:
-        // 1. Find symbol in PDG
-        // 2. Find all references
-        // 3. Update each reference using tree-sitter
-        // 4. Return result
+        if old_name.is_empty() || new_name.is_empty() {
+            return Ok(EditResult {
+                success: false,
+                changes_applied: 0,
+                files_modified: vec![],
+                error: Some("old_name and new_name must be non-empty".to_string()),
+            });
+        }
+
+        // 1. Resolve the PDG symbol candidates and prefer exact symbol hits.
+        let node_ids = engine.pdg.find_all_by_name(old_name);
+        let exact_node = engine.pdg.find_by_symbol(old_name);
+
+        let mut files: HashSet<PathBuf> = HashSet::new();
+        if let Some(node_id) = exact_node {
+            if let Some(node) = engine.pdg.get_node(node_id) {
+                files.insert(PathBuf::from(&node.file_path));
+            }
+        }
+
+        for nid in node_ids {
+            if let Some(node) = engine.pdg.get_node(nid) {
+                files.insert(PathBuf::from(&node.file_path));
+            }
+        }
+
+        if files.is_empty() {
+            return Ok(EditResult {
+                success: true,
+                changes_applied: 0,
+                files_modified: vec![],
+                error: None,
+            });
+        }
+
+        // 4. Apply replace_whole_word to each file
+        let mut total_changes = 0usize;
+        let mut modified_files = Vec::new();
+        let mut errors = Vec::new();
+
+        for file_path in &files {
+            let original = match std::fs::read_to_string(file_path) {
+                Ok(content) => content,
+                Err(e) => {
+                    errors.push(format!("Failed to read '{}': {}", file_path.display(), e));
+                    continue;
+                }
+            };
+
+            let modified = if let Some(node_id) = exact_node {
+                if let Some(node) = engine.pdg.get_node(node_id) {
+                    if PathBuf::from(&node.file_path) == *file_path {
+                        replace_whole_word(&original, old_name, new_name)
+                    } else {
+                        replace_whole_word(&original, old_name, new_name)
+                    }
+                } else {
+                    replace_whole_word(&original, old_name, new_name)
+                }
+            } else {
+                replace_whole_word(&original, old_name, new_name)
+            };
+            if modified != original {
+                match std::fs::write(file_path, modified.as_bytes()) {
+                    Ok(()) => {
+                        total_changes += 1;
+                        modified_files.push(file_path.clone());
+                    }
+                    Err(e) => {
+                        errors.push(format!("Failed to write '{}': {}", file_path.display(), e));
+                    }
+                }
+            }
+        }
 
         Ok(EditResult {
-            success: true,
-            changes_applied: 1,
-            files_modified: vec![],
-            error: None,
+            success: errors.is_empty(),
+            changes_applied: total_changes,
+            files_modified: modified_files,
+            error: if errors.is_empty() {
+                None
+            } else {
+                Some(errors.join("; "))
+            },
         })
     }
 
@@ -897,22 +1211,41 @@ pub struct Diff;
 impl Diff {
     /// Generate a unified diff
     pub fn generate_unified_diff(
-        _original: &str,
-        _modified: &str,
-        _file_path: &Path,
+        original: &str,
+        modified: &str,
+        file_path: &Path,
     ) -> Result<String> {
-        // In full implementation, this would use diffy
-        Ok(String::new())
+        let patch = diffy::create_patch(original, modified);
+        let patch_str = patch.to_string();
+        if patch_str.is_empty() {
+            Ok(format!(
+                "--- {}\n+++ {}\n(no changes)\n",
+                file_path.display(),
+                file_path.display()
+            ))
+        } else {
+            Ok(format!(
+                "--- {}\n+++ {}\n{}",
+                file_path.display(),
+                file_path.display(),
+                patch_str
+            ))
+        }
     }
 
     /// Generate a side-by-side diff
     pub fn generate_side_by_side_diff(
-        _original: &str,
-        _modified: &str,
-        _file_path: &Path,
+        original: &str,
+        modified: &str,
+        file_path: &Path,
     ) -> Result<(String, String)> {
-        // In full implementation, this would use diffy
-        Ok((String::new(), String::new()))
+        let patch = diffy::create_patch(original, modified);
+        let patch_str = patch.to_string();
+        if patch_str.is_empty() {
+            Ok((format!("{} (unchanged)", file_path.display()), String::new()))
+        } else {
+            Ok((format!("--- {}", file_path.display()), format!("+++ {}\n{}", file_path.display(), patch_str)))
+        }
     }
 }
 
@@ -921,13 +1254,83 @@ pub struct Impact;
 
 impl Impact {
     /// Analyze forward impact (what depends on this change)
-    pub fn analyze_forward_impact(_pdg: &PDG, _symbol: &str) -> Result<Vec<String>> {
-        Ok(Vec::new())
+    ///
+    /// Uses PDG forward traversal from all nodes matching `symbol` to find
+    /// downstream dependents. Returns `file:symbol` strings for each impacted node.
+    pub fn analyze_forward_impact(pdg: &PDG, symbol: &str) -> Result<Vec<String>> {
+        let node_ids = pdg.find_all_by_name(symbol);
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let config = crate::graph::pdg::TraversalConfig {
+            max_depth: Some(5),
+            max_nodes: Some(150),
+            allowed_edge_types: Some(vec![
+                crate::graph::pdg::EdgeType::Call,
+                crate::graph::pdg::EdgeType::DataDependency,
+                crate::graph::pdg::EdgeType::Inheritance,
+            ]),
+            excluded_node_types: None,
+            min_complexity: None,
+            min_edge_confidence: 0.0,
+        };
+
+        let mut impacted: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for &start_id in &node_ids {
+            let forward = pdg.forward_impact(start_id, &config);
+            for nid in forward {
+                if seen.insert(nid) {
+                    if let Some(node) = pdg.get_node(nid) {
+                        impacted.push(format!("{}:{}", node.file_path, node.name));
+                    }
+                }
+            }
+        }
+
+        Ok(impacted)
     }
 
     /// Analyze backward impact (what this change depends on)
-    pub fn analyze_backward_impact(_pdg: &PDG, _symbol: &str) -> Result<Vec<String>> {
-        Ok(Vec::new())
+    ///
+    /// Uses PDG backward traversal from all nodes matching `symbol` to find
+    /// upstream dependencies. Returns `file:symbol` strings for each dependency.
+    pub fn analyze_backward_impact(pdg: &PDG, symbol: &str) -> Result<Vec<String>> {
+        let node_ids = pdg.find_all_by_name(symbol);
+        if node_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let config = crate::graph::pdg::TraversalConfig {
+            max_depth: Some(5),
+            max_nodes: Some(150),
+            allowed_edge_types: Some(vec![
+                crate::graph::pdg::EdgeType::Call,
+                crate::graph::pdg::EdgeType::DataDependency,
+                crate::graph::pdg::EdgeType::Inheritance,
+            ]),
+            excluded_node_types: None,
+            min_complexity: None,
+            min_edge_confidence: 0.0,
+        };
+
+        let mut impacted: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for &start_id in &node_ids {
+            let backward = pdg.backward_impact(start_id, &config);
+            for nid in backward {
+                if seen.insert(nid) {
+                    if let Some(node) = pdg.get_node(nid) {
+                        impacted.push(format!("{}:{}", node.file_path, node.name));
+                    }
+                }
+            }
+        }
+
+        Ok(impacted)
     }
 }
 
@@ -1050,6 +1453,7 @@ mod tests {
             file_path: PathBuf::from("test.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
+        original_content: None,
         };
 
         history.record_command(command);
@@ -1067,6 +1471,7 @@ mod tests {
             file_path: PathBuf::from("test.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
+        original_content: None,
         };
 
         history.record_command(command.clone());
@@ -1092,6 +1497,7 @@ mod tests {
             file_path: PathBuf::from("test.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
+        original_content: None,
         };
 
         history.record_command(command.clone());
@@ -1121,6 +1527,7 @@ mod tests {
                 file_path: PathBuf::from(format!("test{}.py", i)),
                 changes: vec![],
                 timestamp: chrono::Utc::now(),
+            original_content: None,
             };
             history.record_command(command);
         }
@@ -1135,6 +1542,7 @@ mod tests {
             file_path: PathBuf::from("test3.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
+        original_content: None,
         };
         history.record_command(command);
         assert_eq!(history.current_index(), 4);
@@ -1163,6 +1571,7 @@ mod tests {
                 file_path: PathBuf::from(format!("test{}.py", i)),
                 changes: vec![],
                 timestamp: chrono::Utc::now(),
+            original_content: None,
             };
             history.record_command(command);
         }
@@ -1178,6 +1587,7 @@ mod tests {
             file_path: PathBuf::from("new.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
+        original_content: None,
         };
         history.record_command(command);
 
@@ -1363,6 +1773,7 @@ mod tests {
             file_path: PathBuf::from("test.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
+        original_content: None,
         };
 
         assert!(matches!(command, EditCommand::Edit { .. }));

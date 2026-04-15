@@ -79,6 +79,9 @@ pub struct SignatureInfo {
 
     /// Byte range in source code
     pub byte_range: (usize, usize),
+
+    /// Cyclomatic complexity extracted from AST
+    pub cyclomatic_complexity: u32,
 }
 
 /// Function parameter
@@ -300,7 +303,7 @@ pub mod languages {
         /// JavaScript language configuration.
         pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
             name: "JavaScript".to_string(),
-            extensions: vec!["js".to_string(), "jsx".to_string()],
+            extensions: vec!["js".to_string(), "jsx".to_string(), "mjs".to_string(), "cjs".to_string()],
             queries: LanguageConfig::default_queries(),
         });
 
@@ -318,7 +321,7 @@ pub mod languages {
         /// TypeScript language configuration.
         pub static CONFIG: Lazy<LanguageConfig> = Lazy::new(|| LanguageConfig {
             name: "TypeScript".to_string(),
-            extensions: vec!["ts".to_string(), "tsx".to_string()],
+            extensions: vec!["ts".to_string(), "tsx".to_string(), "mts".to_string(), "cts".to_string()],
             queries: LanguageConfig::default_queries(),
         });
 

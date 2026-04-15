@@ -115,6 +115,7 @@ mod tests {
                 Vec::new()
             },
             byte_range: if with_range { (1, 3) } else { (0, 0) },
+            cyclomatic_complexity: 0,
         }
     }
 

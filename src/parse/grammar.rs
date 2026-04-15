@@ -169,8 +169,8 @@ impl LanguageId {
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext.to_lowercase().as_str() {
             "py" => Some(LanguageId::Python),
-            "js" | "jsx" => Some(LanguageId::JavaScript),
-            "ts" | "tsx" => Some(LanguageId::TypeScript),
+            "js" | "mjs" | "cjs" | "jsx" => Some(LanguageId::JavaScript),
+            "ts" | "tsx" | "mts" | "cts" => Some(LanguageId::TypeScript),
             "go" => Some(LanguageId::Go),
             "rs" => Some(LanguageId::Rust),
             "java" => Some(LanguageId::Java),

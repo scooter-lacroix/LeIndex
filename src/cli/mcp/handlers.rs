@@ -462,6 +462,25 @@ to auto-switch/auto-index projects."
         let page: Vec<_> = filtered.into_iter().skip(offset).take(top_k).collect();
         let total_returned = page.len();
 
+        // Check for zero results and provide helpful suggestion
+        if page.is_empty() {
+            return Ok(wrap_with_meta(
+                serde_json::json!({
+                    "results": [],
+                    "offset": offset,
+                    "count": 0,
+                    "has_more": false,
+                    "suggestion": format!(
+                        "No semantic matches found for '{}'. The project contains {} indexed files. \
+                        Try: rephrase query, use different keywords, or try leindex_grep_symbols for exact symbol names.",
+                        query,
+                        index.source_file_paths().map(|p| p.len()).unwrap_or(0)
+                    )
+                }),
+                &index,
+            ));
+        }
+
         Ok(wrap_with_meta(
             serde_json::json!({
                 "results": serde_json::to_value(&page).map_err(|e|
@@ -1012,7 +1031,7 @@ impl DiagnosticsHandler {
     ) -> Result<Value, JsonRpcError> {
         let project_path = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path).await?;
-        let reader = handle.lock().await;
+        let mut reader = handle.lock().await;
 
         let diagnostics = reader.get_diagnostics().map_err(|e| {
             JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e))
@@ -1075,6 +1094,7 @@ fn node_type_str(nt: &crate::graph::pdg::NodeType) -> &'static str {
         crate::graph::pdg::NodeType::Method => "method",
         crate::graph::pdg::NodeType::Variable => "variable",
         crate::graph::pdg::NodeType::Module => "module",
+        crate::graph::pdg::NodeType::External => "external",
     }
 }
 
@@ -1121,7 +1141,7 @@ fn wrap_with_meta(mut result: Value, index: &crate::cli::leindex::LeIndex) -> Va
             obj.insert(
                 "_warning".to_string(),
                 Value::String(
-                    "Index may be stale. Call leindex_index with force_reindex=true to refresh."
+                    "Index may be stale. Call leindex_index with force_reindex=true for fresh results."
                         .to_string(),
                 ),
             );
@@ -1631,9 +1651,17 @@ For the exact source implementation use leindex_read_symbol."
             best
         })
         .ok_or_else(|| {
+            let total_symbols = pdg.node_count();
+            let total_files = pdg.file_count();
+            let suggestion = format!(
+                "Symbol '{}' not found among {} indexed symbols across {} files. Try: \
+                check spelling, use leindex_grep_symbols for partial matches, \
+                or leindex_text_search for raw content search.",
+                symbol, total_symbols, total_files
+            );
             JsonRpcError::invalid_params_with_suggestion(
                 format!("Symbol '{}' not found in project index", symbol),
-                "Check spelling, or use leindex_grep_symbols to search for partial matches",
+                &suggestion
             )
         })?;
 
@@ -1812,7 +1840,7 @@ scoping to subdirectories, sorting, and pagination."
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
         let project_root = index.project_path().to_path_buf();
 
         // Allow legacy "path" param; map it into "scope" for resolution.
@@ -1837,26 +1865,64 @@ scoping to subdirectories, sorting, and pagination."
             scope_str.trim_end_matches(|c| c == '/' || c == std::path::MAIN_SEPARATOR),
         );
 
-        let pdg = index
-            .pdg()
-            .ok_or_else(|| JsonRpcError::project_not_indexed(project_root.display().to_string()))?;
+        // Use cached file stats if available, otherwise build from PDG
+        let file_map: std::collections::HashMap<String, (usize, u32, Vec<String>)> = if let Some(cache) = index.file_stats() {
+            // Fast path: use cached statistics
+            // Collect cache data into owned vectors to avoid borrow issues
+            let cached_data: Vec<(String, usize, u32, Vec<String>)> = cache.iter().map(|(path, stats)| {
+                let symbol_names = stats.symbol_names.iter()
+                    .take(5)
+                    .cloned()
+                    .collect();
+                (path.clone(), stats.symbol_count, stats.total_complexity, symbol_names)
+            }).collect();
 
-        // Build file info from PDG nodes
-        let mut file_map: std::collections::HashMap<String, (usize, u32, Vec<String>)> =
-            std::collections::HashMap::new(); // file → (node_count, total_complexity, symbol_names)
+            // Start with all source files (including those without symbols)
+            let mut map: std::collections::HashMap<String, (usize, u32, Vec<String>)> = index
+                .source_file_paths()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|path| (path.display().to_string(), (0, 0, Vec::new())))
+                .collect();
 
-        for nid in pdg.node_indices() {
-            if let Some(node) = pdg.get_node(nid) {
-                let entry = file_map
-                    .entry(node.file_path.clone())
-                    .or_insert((0, 0, Vec::new()));
-                entry.0 += 1;
-                entry.1 += node.complexity;
-                if entry.2.len() < 5 {
-                    entry.2.push(node.name.clone());
+            // Overlay cached statistics
+            for (path, symbol_count, complexity, symbol_names) in cached_data {
+                map.insert(path, (symbol_count, complexity, symbol_names));
+            }
+            map
+        } else {
+            // Fallback: build from PDG (should rarely happen after first index)
+            // Collect source paths first to avoid borrow conflicts
+            let source_paths = index.source_file_paths().unwrap_or_default();
+
+            let pdg = index
+                .pdg()
+                .ok_or_else(|| JsonRpcError::project_not_indexed(project_root.display().to_string()))?;
+
+            let mut map: std::collections::HashMap<String, (usize, u32, Vec<String>)> = source_paths
+                .into_iter()
+                .map(|path| (path.display().to_string(), (0, 0, Vec::new())))
+                .collect();
+
+            for nid in pdg.node_indices() {
+                if let Some(node) = pdg.get_node(nid) {
+                    let entry = map
+                        .entry(node.file_path.clone())
+                        .or_insert((0, 0, Vec::new()));
+                    entry.0 += 1;
+                    entry.1 += node.complexity;
+                    if entry.2.len() < 5 {
+                        entry.2.push(node.name.clone());
+                    }
                 }
             }
-        }
+            map
+        }; // file → (node_count, total_complexity, symbol_names)
+
+        // Get PDG for later use (needed even with cache)
+        let _pdg = index
+            .pdg()
+            .ok_or_else(|| JsonRpcError::project_not_indexed(project_root.display().to_string()))?;
 
         // Filter to scope path and respect depth.
         // Files must either be exactly in the scope directory or in a subdirectory.
@@ -1870,8 +1936,11 @@ scoping to subdirectories, sorting, and pagination."
             .filter_map(|(fp, (count, complexity, syms))| {
                 let path = std::path::Path::new(fp);
                 let rel = path.strip_prefix(&scope_base).ok()?;
-                // Check depth
-                if rel.components().count() > depth {
+                let directory_depth = rel
+                    .parent()
+                    .map(|parent| parent.components().count())
+                    .unwrap_or(0);
+                if directory_depth > depth {
                     return None;
                 }
                 let mut entry = serde_json::json!({
@@ -2014,6 +2083,11 @@ impl GrepSymbolsHandler {
                     "description": "Skip the first N results for pagination (default: 0)",
                     "default": 0,
                     "minimum": 0
+                },
+                "include_source": {
+                    "type": "boolean",
+                    "description": "Include full symbol source code in results (default: false)",
+                    "default": false
                 }
             },
             "required": ["pattern"]
@@ -2035,6 +2109,7 @@ impl GrepSymbolsHandler {
         let max_results = extract_usize(&args, "max_results", 20)?.min(200);
         let context_lines = extract_usize(&args, "include_context_lines", 0)?.min(10);
         let offset = extract_usize(&args, "offset", 0)?;
+        let include_source = extract_bool(&args, "include_source", false);
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
@@ -2058,6 +2133,7 @@ impl GrepSymbolsHandler {
         // Fetch max_results + offset matches, then paginate
         let fetch_limit = max_results + offset;
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut seen_names: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
         let mut all_matches: Vec<Value> = Vec::new();
 
         for sr in candidate_results {
@@ -2072,6 +2148,11 @@ impl GrepSymbolsHandler {
                 Some(n) => n,
                 None => continue,
             };
+
+            // Skip phantom external-reference nodes (no source location)
+            if matches!(node.node_type, crate::graph::pdg::NodeType::External) && node.byte_range == (0, 0) {
+                continue;
+            }
 
             // Type filter
             if type_filter != "all" {
@@ -2093,10 +2174,12 @@ impl GrepSymbolsHandler {
             let matches = node.name.to_lowercase().contains(&pattern_lower)
                 || node.id.to_lowercase().contains(&pattern_lower);
 
-            if !matches || seen_ids.contains(&node.id) {
+            let name_file_key = (node.name.clone(), node.file_path.clone());
+            if !matches || seen_ids.contains(&node.id) || seen_names.contains(&name_file_key) {
                 continue;
             }
             seen_ids.insert(node.id.clone());
+            seen_names.insert(name_file_key);
 
             let caller_count = get_direct_callers(pdg, nid).len();
             let dep_count = pdg.neighbors(nid).len();
@@ -2123,18 +2206,18 @@ impl GrepSymbolsHandler {
                 }
             }
 
+            if include_source {
+                if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
+                    entry["source"] = Value::String(src);
+                }
+            }
+
             all_matches.push(entry);
         }
 
-        // If semantic search returned nothing useful or the pattern looks regex-y,
-        // fall back to a direct PDG scan that supports regex/pipes/wildcards.
-        let use_direct_scan = all_matches.is_empty()
-            || pattern.contains('|')
-            || pattern.contains('*')
-            || pattern.contains('?')
-            || pattern.contains('[');
-
-        if use_direct_scan && all_matches.len() < fetch_limit {
+        // Always try direct PDG scan when we haven't hit the fetch_limit.
+        // This merges semantic pre-filter results with direct symbol scans.
+        if all_matches.len() < fetch_limit {
             let re = RegexBuilder::new(&pattern)
                 .case_insensitive(true)
                 .build()
@@ -2148,6 +2231,11 @@ impl GrepSymbolsHandler {
                 let Some(node) = pdg.get_node(nid) else {
                     continue;
                 };
+
+                // Skip phantom external-reference nodes (no source location)
+                if matches!(node.node_type, crate::graph::pdg::NodeType::External) && node.byte_range == (0, 0) {
+                    continue;
+                }
 
                 if type_filter != "all" && node_type_str(&node.node_type) != type_filter.as_str() {
                     continue;
@@ -2168,10 +2256,12 @@ impl GrepSymbolsHandler {
                         || node.id.to_lowercase().contains(&pattern_lower)
                 };
 
-                if !matches || seen_ids.contains(&node.id) {
+                let name_file_key = (node.name.clone(), node.file_path.clone());
+                if !matches || seen_ids.contains(&node.id) || seen_names.contains(&name_file_key) {
                     continue;
                 }
                 seen_ids.insert(node.id.clone());
+                seen_names.insert(name_file_key);
 
                 let caller_count = get_direct_callers(pdg, nid).len();
                 let dep_count = pdg.neighbors(nid).len();
@@ -2198,6 +2288,12 @@ impl GrepSymbolsHandler {
                     }
                 }
 
+                if include_source {
+                    if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
+                        entry["source"] = Value::String(src);
+                    }
+                }
+
                 all_matches.push(entry);
             }
         }
@@ -2205,6 +2301,28 @@ impl GrepSymbolsHandler {
         // Apply pagination
         let total_matched = all_matches.len();
         let page: Vec<Value> = all_matches.into_iter().skip(offset).collect();
+
+        // Check for zero results and provide helpful suggestion
+        if page.is_empty() {
+            let pdg = index.pdg().unwrap();
+            return Ok(wrap_with_meta(
+                serde_json::json!({
+                    "pattern": pattern,
+                    "offset": offset,
+                    "count": 0,
+                    "total_matched": 0,
+                    "has_more": false,
+                    "results": [],
+                    "suggestion": format!(
+                        "No symbols matching '{}' found in {} indexed symbols across {} files. Try: broader substring, check case, or use leindex_text_search for raw text.",
+                        pattern,
+                        pdg.node_count(),
+                        pdg.file_count()
+                    )
+                }),
+                &index,
+            ));
+        }
 
         // Truncate to token budget
         let mut results: Vec<Value> = Vec::new();
@@ -3979,8 +4097,8 @@ Works for any text file including configs and docs."
             .map(|ext| match ext {
                 "rs" => "rust",
                 "py" => "python",
-                "js" => "javascript",
-                "ts" => "typescript",
+                "js" | "mjs" | "cjs" => "javascript",
+                "ts" | "mts" | "cts" => "typescript",
                 "tsx" => "typescriptreact",
                 "jsx" => "javascriptreact",
                 "go" => "go",
@@ -4774,6 +4892,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_project_map_includes_nested_and_symbol_less_files_with_directory_depth() {
+        let dir = tempdir().unwrap();
+        let nested_dir = dir.path().join("src").join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.path().join("src").join("empty.rs"), "\n").unwrap();
+        std::fs::write(nested_dir.join("mod.rs"), "pub fn helper() {}\n").unwrap();
+
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({
+            "depth": 2,
+            "sort_by": "name",
+            "token_budget": 10_000
+        });
+        let result = ProjectMapHandler.execute(&registry, args).await.unwrap();
+        let files = result["files"].as_array().unwrap();
+        let relative_paths: Vec<&str> = files
+            .iter()
+            .filter_map(|entry| entry["relative_path"].as_str())
+            .collect();
+
+        assert!(relative_paths.contains(&"main.rs"));
+        assert!(relative_paths.contains(&"src/empty.rs"));
+        assert!(relative_paths.contains(&"src/nested/mod.rs"));
+    }
+
+    #[tokio::test]
     async fn test_grep_symbols_auto_indexes_returns_empty() {
         // With auto-indexing, a project with no matching symbols returns empty results
         let dir = tempdir().unwrap();
@@ -4786,6 +4931,29 @@ mod tests {
         assert!(result.is_ok(), "auto-indexing should succeed");
         let val = result.unwrap();
         assert_eq!(val["count"].as_u64().unwrap_or(0), 0);
+        // Verify suggestion field is present for zero results
+        assert!(val.get("suggestion").is_some(), "zero results should include suggestion");
+        let suggestion = val["suggestion"].as_str().unwrap();
+        assert!(suggestion.contains("No symbols matching"), "suggestion should mention no symbols found");
+    }
+
+    #[tokio::test]
+    async fn test_search_handler_zero_results_includes_suggestion() {
+        // Test that semantic search with no matches returns helpful suggestion
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(&src, "pub fn hello() {}\n").unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "query": "nonexistent_function_xyz" });
+        let result = SearchHandler.execute(&registry, args).await;
+        // Should succeed but with 0 matches
+        assert!(result.is_ok(), "search should succeed");
+        let val = result.unwrap();
+        assert_eq!(val["count"].as_i64().unwrap_or(0), 0);
+        // Verify suggestion field is present for zero results
+        assert!(val.get("suggestion").is_some(), "zero results should include suggestion");
+        let suggestion = val["suggestion"].as_str().unwrap();
+        assert!(suggestion.contains("No semantic matches"), "suggestion should mention no semantic matches");
     }
 
     #[tokio::test]

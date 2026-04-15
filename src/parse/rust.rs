@@ -33,7 +33,10 @@ impl RustParser {
         while let Some((node, parent_path)) = stack.pop() {
             match node.kind() {
                 "function_item" => {
-                    if let Some(sig) = extract_function_signature(&node, source, &parent_path) {
+                    if let Some(mut sig) = extract_function_signature(&node, source, &parent_path) {
+                        // Extract and populate cyclomatic complexity
+                        let complexity_metrics = self.extract_complexity(&node);
+                        sig.cyclomatic_complexity = complexity_metrics.cyclomatic.max(1) as u32;
                         signatures.push(sig);
                     }
                     // Don't recurse into function bodies.
@@ -57,17 +60,23 @@ impl RustParser {
                             let mut dcursor = child.walk();
                             for dc in child.children(&mut dcursor) {
                                 if dc.kind() == "function_item" {
-                                    if let Some(sig) =
+                                    if let Some(mut sig) =
                                         extract_function_signature(&dc, source, &parent_path)
                                     {
+                                        // Extract and populate cyclomatic complexity
+                                        let complexity_metrics = self.extract_complexity(&dc);
+                                        sig.cyclomatic_complexity = complexity_metrics.cyclomatic.max(1) as u32;
                                         signatures.push(sig);
                                     }
                                 }
                             }
                         } else if child.kind() == "function_item" {
-                            if let Some(sig) =
+                            if let Some(mut sig) =
                                 extract_function_signature(&child, source, &parent_path)
                             {
+                                // Extract and populate cyclomatic complexity
+                                let complexity_metrics = self.extract_complexity(&child);
+                                sig.cyclomatic_complexity = complexity_metrics.cyclomatic.max(1) as u32;
                                 signatures.push(sig);
                             }
                         }
@@ -96,6 +105,7 @@ impl RustParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
+                            cyclomatic_complexity: 0,
                         });
                     }
 
@@ -135,6 +145,7 @@ impl RustParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
+                            cyclomatic_complexity: 0,
                         });
                     }
                 }
@@ -161,6 +172,7 @@ impl RustParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
+                            cyclomatic_complexity: 0,
                         });
                     }
                 }
@@ -378,6 +390,7 @@ fn extract_function_signature(
 
         imports: vec![],
         byte_range: (node.start_byte(), node.end_byte()),
+        cyclomatic_complexity: 0, // Will be populated by caller with extract_complexity
     })
 }
 
@@ -404,6 +417,20 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                         let name = clean_call_text(text);
                         if !name.is_empty() {
                             calls.push(name);
+                        }
+                    }
+
+                    // NEW: extract the type prefix from scoped calls like Foo::new()
+                    if func.kind() == "scoped_identifier" {
+                        if let Some(path_node) = func.child_by_field_name("path") {
+                            if let Ok(path_text) = path_node.utf8_text(source) {
+                                let type_name = path_text.to_string();
+                                if !type_name.is_empty()
+                                    && type_name.chars().next().map_or(false, |c| c.is_uppercase())
+                                {
+                                    calls.push(type_name);
+                                }
+                            }
                         }
                     }
                 }
@@ -438,6 +465,13 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                         if !name.is_empty() {
                             calls.push(name);
                         }
+                    }
+                }
+            }
+            "struct_expression" => {
+                if let Some(name_node) = current.child_by_field_name("name") {
+                    if let Ok(name) = name_node.utf8_text(source) {
+                        calls.push(name.to_string());
                     }
                 }
             }
@@ -489,6 +523,7 @@ fn extract_import_signature(
         calls: vec![],
         imports: vec![],
         byte_range: (0, 0),
+        cyclomatic_complexity: 0,
     })
 }
 
@@ -654,6 +689,19 @@ fn calculate_complexity(
         | "match_expression"
         | "match_arm"
         | "if_expression_else" => {
+            metrics.cyclomatic += 1;
+        }
+        "binary_expression" => {
+            if let Some(op) = node.child_by_field_name("operator") {
+                match op.kind() {
+                    "&&" | "||" => {
+                        metrics.cyclomatic += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        "try_expression" => {
             metrics.cyclomatic += 1;
         }
         _ => {}
@@ -1061,5 +1109,216 @@ fn main() {}";
 
         assert!(metrics.cyclomatic > 1);
         assert!(metrics.nesting_depth > 0);
+    }
+
+    #[test]
+    fn test_rust_complexity_with_boolean_operators() {
+        let source = b"fn boolean_ops(x: i32, y: i32) -> bool {
+    if x > 0 && y > 0 {
+        return true;
+    }
+    if x < 0 || y < 0 {
+        return false;
+    }
+    x > 0 && y > 0 || x == 0 && y == 0
+}";
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        let rust_parser = RustParser::new();
+        let metrics = rust_parser.extract_complexity(&root);
+
+        // Base complexity (1) + 2 if expressions (2) + 5 boolean operators (5) = 8
+        assert!(metrics.cyclomatic >= 8, "Expected cyclomatic complexity >= 8, got {}", metrics.cyclomatic);
+    }
+
+    #[test]
+    fn test_rust_complexity_with_try_expressions() {
+        let source = b"fn try_ops(result: Result<i32, Error>) -> Result<i32, Error> {
+    let x = result?;
+    let y = Some(2).ok_or(Error::NotFound)?;
+    Ok(x + y)
+}";
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        let rust_parser = RustParser::new();
+        let metrics = rust_parser.extract_complexity(&root);
+
+        // Base complexity (1) + 2 try expressions (2) = 3
+        assert!(metrics.cyclomatic >= 3, "Expected cyclomatic complexity >= 3, got {}", metrics.cyclomatic);
+    }
+
+    #[test]
+    fn test_rust_complexity_combined() {
+        let source = b"fn combined(x: i32, y: i32) -> i32 {
+    if x > 0 && y > 0 {
+        return x + y;
+    }
+    if x < 0 || y < 0 {
+        return x - y;
+    }
+    0
+}";
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        let rust_parser = RustParser::new();
+        let metrics = rust_parser.extract_complexity(&root);
+
+        // Base complexity (1) + 2 if expressions (2) + 2 boolean operators (2) = 5
+        // Note: tree-sitter might parse complex boolean expressions as nested binary expressions
+        assert_eq!(metrics.cyclomatic, 5, "Expected cyclomatic complexity = 5, got {}", metrics.cyclomatic);
+    }
+
+    #[test]
+    fn test_rust_complexity_with_try_and_bool() {
+        let source = b"fn try_and_bool(x: Result<i32, Error>, y: Result<i32, Error>) -> Result<i32, Error> {
+    let a = x?;
+    let b = y?;
+    if a > 0 && b > 0 {
+        return Ok(a + b);
+    }
+    Ok(a - b)
+}";
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_rust::LANGUAGE.into())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let root = tree.root_node();
+
+        let rust_parser = RustParser::new();
+        let metrics = rust_parser.extract_complexity(&root);
+
+        // Base complexity (1) + 1 if expression (1) + 1 boolean operator (1) + 2 try expressions (2) = 5
+        assert_eq!(metrics.cyclomatic, 5, "Expected cyclomatic complexity = 5, got {}", metrics.cyclomatic);
+    }
+
+    #[test]
+    fn test_rust_cyclomatic_complexity_populated_in_signature() {
+        let source = b"fn complex_fn(x: i32) -> i32 {
+    if x > 0 {
+        return x * 2;
+    }
+    x + 1
+}";
+
+        let parser = RustParser::new();
+        let signatures = parser.get_signatures(source).unwrap();
+
+        assert_eq!(signatures.len(), 1);
+        let sig = &signatures[0];
+        assert_eq!(sig.name, "complex_fn");
+
+        // Verify that cyclomatic_complexity is populated
+        // The function has 1 if expression, so cyclomatic complexity should be 2 (base 1 + 1 if)
+        assert!(
+            sig.cyclomatic_complexity >= 1,
+            "cyclomatic_complexity should be >= 1, got {}",
+            sig.cyclomatic_complexity
+        );
+    }
+
+    #[test]
+    fn test_rust_struct_instantiation_calls() {
+        let source = b"fn create_structs() {
+    let x = MyStruct { field: 1 };
+    let y = AnotherStruct { value: compute() };
+    let z = GenericStruct::<i32> { data: 42 };
+}
+
+fn compute() -> i32 {
+    42
+}";
+
+        let parser = RustParser::new();
+        let signatures = parser.get_signatures(source).unwrap();
+
+        let create_structs_fn = signatures.iter().find(|s| s.name == "create_structs");
+        assert!(create_structs_fn.is_some(), "create_structs function not found");
+
+        let fn_sig = create_structs_fn.unwrap();
+
+        // Should detect struct instantiations
+        assert!(
+            fn_sig.calls.iter().any(|c| c.contains("MyStruct")),
+            "Should detect MyStruct instantiation, got calls: {:?}",
+            fn_sig.calls
+        );
+        assert!(
+            fn_sig.calls.iter().any(|c| c.contains("AnotherStruct")),
+            "Should detect AnotherStruct instantiation, got calls: {:?}",
+            fn_sig.calls
+        );
+        assert!(
+            fn_sig.calls.iter().any(|c| c.contains("GenericStruct")),
+            "Should detect GenericStruct instantiation, got calls: {:?}",
+            fn_sig.calls
+        );
+
+        // Should also detect function calls within struct fields
+        assert!(
+            fn_sig.calls.iter().any(|c| c.contains("compute")),
+            "Should detect compute() call within struct field, got calls: {:?}",
+            fn_sig.calls
+        );
+    }
+
+    #[test]
+    fn test_rust_scoped_identifier_extraction() {
+        let source = b"
+struct DeepThoughtManager {
+    answer: i32,
+}
+
+impl DeepThoughtManager {
+    fn new() -> Self {
+        DeepThoughtManager { answer: 42 }
+    }
+}
+
+fn test_function() {
+    let manager = DeepThoughtManager::new();
+    let another = DeepThoughtManager::new();
+}";
+
+        let parser = RustParser::new();
+        let signatures = parser.get_signatures(source).unwrap();
+
+        let test_fn = signatures.iter().find(|s| s.name == "test_function");
+        assert!(test_fn.is_some(), "test_function not found");
+
+        let fn_sig = test_fn.unwrap();
+
+        // Should detect the scoped function call DeepThoughtManager::new
+        assert!(
+            fn_sig.calls.iter().any(|c| c.contains("DeepThoughtManager::new")),
+            "Should detect DeepThoughtManager::new call, got calls: {:?}",
+            fn_sig.calls
+        );
+
+        // Should also detect just the type prefix DeepThoughtManager
+        assert!(
+            fn_sig.calls.iter().any(|c| c == "DeepThoughtManager"),
+            "Should detect DeepThoughtManager type prefix, got calls: {:?}",
+            fn_sig.calls
+        );
     }
 }

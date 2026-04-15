@@ -560,6 +560,7 @@ mod tests {
             calls: vec![],
             imports: vec![],
             byte_range: (0, 14),
+            cyclomatic_complexity: 0,
         };
 
         let location = analyzer.find_signature_location(&change, &sig);

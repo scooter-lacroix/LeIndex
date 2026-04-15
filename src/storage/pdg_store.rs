@@ -69,6 +69,7 @@ fn convert_node_type(node_type: &PDGNodeType) -> StorageNodeType {
         PDGNodeType::Method => StorageNodeType::Method,
         PDGNodeType::Variable => StorageNodeType::Variable,
         PDGNodeType::Module => StorageNodeType::Module,
+        PDGNodeType::External => StorageNodeType::External,
     }
 }
 
@@ -80,6 +81,7 @@ fn convert_storage_node_type(node_type: &StorageNodeType) -> PDGNodeType {
         StorageNodeType::Method => PDGNodeType::Method,
         StorageNodeType::Variable => PDGNodeType::Variable,
         StorageNodeType::Module => PDGNodeType::Module,
+        StorageNodeType::External => PDGNodeType::External,
     }
 }
 

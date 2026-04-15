@@ -46,7 +46,8 @@ impl CodeIntelligence for DartParser {
                                 found
                             },
                             is_method: false,
-                            docstring: None, byte_range: (0, 0) });
+                            docstring: None, byte_range: (0, 0) cyclomatic_complexity: 0,
+                            });
                     }
                 }
                 "class_definition" => {
@@ -59,7 +60,8 @@ impl CodeIntelligence for DartParser {
                             visibility: Visibility::Public,
                             is_async: false,
                             is_method: false,
-                            docstring: None, byte_range: (0, 0) });
+                            docstring: None, byte_range: (0, 0) cyclomatic_complexity: 0,
+                            });
                     }
                 }
                 _ => { let mut c = node.walk(); for ch in node.children(&mut c) { visit(&ch, source, sigs); } }

@@ -38,7 +38,7 @@ pub fn run(context: &PhaseExecutionContext) -> Phase2Summary {
             continue;
         };
 
-        if target.node_type == NodeType::Module && target.language == "external" {
+        if matches!(target.node_type, NodeType::External) {
             external += 1;
             unresolved_modules.insert(target.name.clone());
         } else {
@@ -96,7 +96,7 @@ mod tests {
         });
         let external_target = pdg.add_node(Node {
             id: "src/main.rs:__external__:third.party.lib".to_string(),
-            node_type: NodeType::Module,
+            node_type: NodeType::External,
             name: "third.party.lib".to_string(),
             file_path: "src/main.rs".to_string(),
             byte_range: (0, 0),

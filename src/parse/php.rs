@@ -63,6 +63,7 @@ impl PhpParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (0, 0),
+                            cyclomatic_complexity: 0,
                         });
                     }
 
@@ -94,6 +95,7 @@ impl PhpParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (0, 0),
+                            cyclomatic_complexity: 0,
                         });
                     }
                 }
@@ -272,6 +274,7 @@ fn extract_function_signature(
 
         imports: vec![],
         byte_range: (0, 0),
+        cyclomatic_complexity: 0,
     })
 }
 

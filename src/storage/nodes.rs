@@ -53,6 +53,8 @@ pub enum NodeType {
     Variable,
     /// A module or file
     Module,
+    /// Imported/referenced symbol not defined in this project
+    External,
 }
 
 impl NodeType {
@@ -64,6 +66,7 @@ impl NodeType {
             NodeType::Method => "method",
             NodeType::Variable => "variable",
             NodeType::Module => "module",
+            NodeType::External => "external",
         }
     }
 
@@ -75,6 +78,7 @@ impl NodeType {
             "method" => Some(NodeType::Method),
             "variable" => Some(NodeType::Variable),
             "module" => Some(NodeType::Module),
+            "external" => Some(NodeType::External),
             _ => None,
         }
     }

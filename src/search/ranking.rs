@@ -52,11 +52,40 @@ pub struct HybridScorer {
 
 impl HybridScorer {
     /// Create a new hybrid scorer
+    ///
+    /// Default weights are optimized for code search:
+    /// - semantic: 0.25 (de-weighted embeddings)
+    /// - structural: 0.15 (moderate complexity signal)
+    /// - text: 0.60 (strong keyword matching)
     pub fn new() -> Self {
         Self {
-            semantic_weight: 0.5,
-            structural_weight: 0.1,
-            text_weight: 0.4,
+            semantic_weight: 0.25,
+            structural_weight: 0.15,
+            text_weight: 0.60,
+        }
+    }
+
+    /// Scorer tuned for code symbol search (text-dominant)
+    ///
+    /// Optimized for finding code symbols where exact name matching
+    /// and keyword overlap are most important.
+    pub fn for_code() -> Self {
+        Self {
+            semantic_weight: 0.25,
+            structural_weight: 0.15,
+            text_weight: 0.60,
+        }
+    }
+
+    /// Scorer tuned for natural-language/prose search
+    ///
+    /// Optimized for searching documentation, READMEs, and other
+    /// prose where semantic understanding is more valuable.
+    pub fn for_prose() -> Self {
+        Self {
+            semantic_weight: 0.50,
+            structural_weight: 0.10,
+            text_weight: 0.40,
         }
     }
 
@@ -168,13 +197,31 @@ mod tests {
     fn test_hybrid_scorer() {
         let scorer = HybridScorer::new();
         let score = scorer.score(0.8, 0.6, 0.4);
-        assert!((score.overall - 0.62).abs() < 0.01);
+        // New default weights: 0.25 * 0.8 + 0.15 * 0.6 + 0.60 * 0.4 = 0.53
+        assert!((score.overall - 0.53).abs() < 0.01);
     }
 
     #[test]
     fn test_custom_weights() {
         let scorer = HybridScorer::new().with_weights(0.3, 0.5, 0.2);
         let score = scorer.score(0.8, 0.6, 0.4);
+        // Custom weights: 0.3 * 0.8 + 0.5 * 0.6 + 0.2 * 0.4 = 0.62
+        assert!((score.overall - 0.62).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_for_code_scorer() {
+        let scorer = HybridScorer::for_code();
+        let score = scorer.score(0.8, 0.6, 0.4);
+        // Code weights: 0.25 * 0.8 + 0.15 * 0.6 + 0.60 * 0.4 = 0.53
+        assert!((score.overall - 0.53).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_for_prose_scorer() {
+        let scorer = HybridScorer::for_prose();
+        let score = scorer.score(0.8, 0.6, 0.4);
+        // Prose weights: 0.50 * 0.8 + 0.10 * 0.6 + 0.40 * 0.4 = 0.62
         assert!((score.overall - 0.62).abs() < 0.01);
     }
 }
