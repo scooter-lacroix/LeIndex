@@ -234,7 +234,6 @@ jobs:
     needs: [detect, github-release]
     if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
-    continue-on-error: true
     defaults:
       run:
         working-directory: packages/npm-leindex-mcp

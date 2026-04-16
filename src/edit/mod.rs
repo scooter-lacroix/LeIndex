@@ -200,6 +200,57 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
+/// Replace `old` with `new` only within windows around known definition byte ranges.
+/// Each window extends from the definition start minus a context buffer to the end
+/// plus a buffer, covering nearby references that the PDG traversal identified.
+/// Falls back gracefully for files without usable byte ranges.
+fn replace_near_definitions(
+    content: &str,
+    old: &str,
+    new: &str,
+    def_ranges: &[(usize, usize)],
+) -> String {
+    if old.is_empty() || def_ranges.is_empty() {
+        return content.to_owned();
+    }
+
+    // Build sorted, non-overlapping windows around each definition
+    let ctx = 2048; // bytes of context around each definition
+    let mut windows: Vec<(usize, usize)> = def_ranges
+        .iter()
+        .map(|&(s, e)| (s.saturating_sub(ctx), (e + ctx).min(content.len())))
+        .collect();
+    windows.sort_by_key(|w| w.0);
+
+    // Merge overlapping windows
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for w in windows {
+        if let Some(last) = merged.last_mut() {
+            if w.0 <= last.1 {
+                last.1 = last.1.max(w.1);
+                continue;
+            }
+        }
+        merged.push(w);
+    }
+
+    // Build result: copy regions outside windows verbatim, replace within windows
+    let mut result = String::with_capacity(content.len());
+    let mut pos = 0usize;
+    for (win_start, win_end) in &merged {
+        if *win_start > pos {
+            result.push_str(&content[pos..*win_start]);
+        }
+        let window_content = &content[*win_start..*win_end];
+        result.push_str(&replace_whole_word(window_content, old, new));
+        pos = *win_end;
+    }
+    if pos < content.len() {
+        result.push_str(&content[pos..]);
+    }
+    result
+}
+
 fn replace_whole_word(content: &str, old: &str, new: &str) -> String {
     if old.is_empty() {
         return content.to_owned();
@@ -909,10 +960,21 @@ impl WorktreeSession {
     /// coordinator. This implementation provides reasonable isolation for editing
     /// sessions but cannot guarantee full atomicity.
     pub async fn merge(self) -> Result<()> {
+        // Spawn blocking since merge performs synchronous file I/O
+        tokio::task::spawn_blocking(move || Self::merge_blocking(self))
+            .await
+            .map_err(|e| EditError::WorktreeError(format!("Merge task panicked: {}", e)))?
+    }
+
+    /// Synchronous merge implementation — performs file I/O.
+    /// Separated from the async wrapper to avoid blocking the executor.
+    fn merge_blocking(
+        session: WorktreeSession,
+    ) -> Result<()> {
         let WorktreeSession {
             path,
             tracked_files,
-        } = self;
+        } = session;
 
         let mut staged_entries: Vec<(PathBuf, PathBuf)> = tracked_files.into_iter().collect();
         staged_entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1128,6 +1190,12 @@ pub struct Refactor;
 impl Refactor {
     /// Rename a symbol across all files using PDG-guided file discovery and whole-word replacement.
     ///
+    /// This operates directly on project source files (not through WorktreeManager)
+    /// because renames are PDG-scoped global operations that must touch all impacted
+    /// files atomically. WorktreeManager is designed for single-file edit sessions
+    /// with review/discard workflow. A future enhancement could add a staging mode
+    /// where rename results are written to a worktree for review before merging.
+    ///
     /// # Implementation Details
     ///
     /// This is **NOT** a full AST/reference-aware rename. It uses a hybrid approach:
@@ -1273,11 +1341,25 @@ impl Refactor {
                 }
             };
 
-        // TODO: replace_whole_word operates on the entire file content, which risks
-        // over-replacement for common symbol names. The PDG stores byte_range per node,
-        // so a future enhancement should collect byte ranges from all matched/impacted
-        // nodes and perform targeted replacements at those exact offsets instead.
-        let modified = replace_whole_word(&original, old_name, new_name);
+        // Collect byte ranges from matched PDG nodes to restrict replacements to
+        // regions near known symbol definitions (avoids blind whole-file replacement
+        // in comments/strings/unrelated code).
+        let mut def_ranges: Vec<(usize, usize)> = Vec::new();
+        for node_id in &seed_ids {
+            if let Some(node) = engine.pdg.get_node(*node_id) {
+                if node.byte_range != (0, 0) {
+                    def_ranges.push(node.byte_range);
+                }
+            }
+        }
+
+        let modified = if def_ranges.is_empty() {
+            // No byte ranges available — fall back to whole-file replacement
+            replace_whole_word(&original, old_name, new_name)
+        } else {
+            // Targeted replacement: only replace within expanded windows around definitions
+            replace_near_definitions(&original, old_name, new_name, &def_ranges)
+        };
             if modified != original {
                 pending_writes.push((file_path.clone(), original, modified));
             }

@@ -1711,6 +1711,26 @@ impl LeIndex {
             }
             paths
         };
+
+        // If we couldn't load manifest paths from any cache, we can't verify
+        // dependency freshness — treat as stale to be safe
+        if manifest_paths.is_empty() && self.project_scan.is_none() {
+            // Try a quick filesystem scan for common manifest files
+            let quick_manifests = [
+                "Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+                "poetry.lock", "Gemfile.lock", "go.sum",
+            ];
+            for name in &quick_manifests {
+                let p = self.project_path.join(name);
+                if let Ok(metadata) = std::fs::metadata(&p) {
+                    if let Ok(modified) = metadata.modified() {
+                        if modified > db_time {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
         for manifest_path in &manifest_paths {
             if let Ok(metadata) = std::fs::metadata(manifest_path) {
                 if let Ok(modified) = metadata.modified() {
@@ -1805,10 +1825,9 @@ impl LeIndex {
         // First pass: collect symbol counts and complexity
         for nid in pdg.node_indices() {
             if let Some(node) = pdg.get_node(nid) {
-                // Skip external and phantom nodes (synthetic (0,0) byte range)
-                if matches!(node.node_type, crate::graph::pdg::NodeType::External)
-                    || node.byte_range == (0, 0)
-                {
+                // Skip external nodes (synthetic/phantom); keep (0,0) range nodes
+                // since many non-Rust parsers legitimately emit zero ranges for real symbols
+                if matches!(node.node_type, crate::graph::pdg::NodeType::External) {
                     continue;
                 }
                 let entry = cache.entry(node.file_path.clone()).or_insert_with(|| FileStats {
