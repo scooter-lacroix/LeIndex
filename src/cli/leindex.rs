@@ -1639,20 +1639,21 @@ impl LeIndex {
             .and_then(|m| m.modified())
             .ok();
 
-        // Quick spot-check: any indexed file deleted or modified since last index?
+        // Quick spot-check: sample up to 50 indexed files for deletion or modification
         let mut checked = 0;
         for indexed_path in indexed_files.keys() {
+            if checked >= 50 {
+                break;
+            }
             let full_path = self.project_path.join(indexed_path);
             if !full_path.exists() {
                 return true;
             }
-            // Compare file mtime against DB mtime for a sample of files
-            if checked < 50 {
-                if let (Some(db_t), Ok(metadata)) = (db_time, std::fs::metadata(&full_path)) {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified > db_t {
-                            return true;
-                        }
+            // Compare file mtime against DB mtime
+            if let (Some(db_t), Ok(metadata)) = (db_time, std::fs::metadata(&full_path)) {
+                if let Ok(modified) = metadata.modified() {
+                    if modified > db_t {
+                        return true;
                     }
                 }
             }

@@ -1867,32 +1867,24 @@ scoping to subdirectories, sorting, and pagination."
         );
 
         // Use cached file stats if available, otherwise build from PDG
+        // Collect source paths first to avoid borrow conflicts with file_stats()/pdg()
+        let source_paths = index.source_file_paths().unwrap_or_default();
+
         let file_map: std::collections::HashMap<String, (usize, u32, Vec<String>)> = if let Some(cache) = index.file_stats() {
             // Fast path: use cached statistics
-            // Collect cache data first to avoid borrow conflicts with source_file_paths()
-            let cached_data: Vec<_> = cache.iter().map(|(path, stats)| {
-                (path.clone(), stats.symbol_count, stats.total_complexity, stats.symbol_names.clone())
-            }).collect();
-
-            // Start with all source files (including those without symbols)
-            let mut map: std::collections::HashMap<String, (usize, u32, Vec<String>)> = index
-                .source_file_paths()
-                .unwrap_or_default()
+            let mut map: std::collections::HashMap<String, (usize, u32, Vec<String>)> = source_paths
                 .into_iter()
                 .map(|path| (path.display().to_string(), (0, 0, Vec::new())))
                 .collect();
 
             // Overlay cached statistics, capping symbol_names to top 5
-            for (path, symbol_count, complexity, symbol_names) in cached_data {
-                let capped: Vec<String> = symbol_names.into_iter().take(5).collect();
-                map.insert(path, (symbol_count, complexity, capped));
+            for (path, stats) in cache.iter() {
+                let capped: Vec<String> = stats.symbol_names.iter().take(5).cloned().collect();
+                map.insert(path.clone(), (stats.symbol_count, stats.total_complexity, capped));
             }
             map
         } else {
             // Fallback: build from PDG (should rarely happen after first index)
-            // Collect source paths first to avoid borrow conflicts
-            let source_paths = index.source_file_paths().unwrap_or_default();
-
             let pdg = index
                 .pdg()
                 .ok_or_else(|| JsonRpcError::project_not_indexed(project_root.display().to_string()))?;
