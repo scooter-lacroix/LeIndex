@@ -1054,28 +1054,26 @@ impl LeIndex {
     }
 
     fn get_project_scan(&mut self, refresh: bool) -> Result<ProjectFileScan> {
-        if refresh {
-            let scan = self.scan_project_files()?;
-            self.cache_project_scan(&scan);
-            self.project_scan = Some(scan.clone());
-            return Ok(scan);
-        }
+        if !refresh {
+            // Check in-memory cache first
+            if let Some(scan) = &self.project_scan {
+                return Ok(scan.clone());
+            }
 
-        if let Some(scan) = &self.project_scan {
-            return Ok(scan.clone());
-        }
-
-        let cache_key = project_scan_cache_key(&self.project_id);
-        if let Some(CacheEntry::Binary {
-            serialized_data, ..
-        }) = self.cache_spiller.store_mut().get_or_load(&cache_key)?
-        {
-            if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
-                self.project_scan = Some(scan.clone());
-                return Ok(scan);
+            // Try persistent cache
+            let cache_key = project_scan_cache_key(&self.project_id);
+            if let Some(CacheEntry::Binary {
+                serialized_data, ..
+            }) = self.cache_spiller.store_mut().get_or_load(&cache_key)?
+            {
+                if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
+                    self.project_scan = Some(scan.clone());
+                    return Ok(scan);
+                }
             }
         }
 
+        // Cache miss or forced refresh — scan and cache
         let scan = self.scan_project_files()?;
         self.cache_project_scan(&scan);
         self.project_scan = Some(scan.clone());
@@ -1609,35 +1607,49 @@ impl LeIndex {
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .unwrap_or_default();
 
+        // If no indexed files at all, definitely stale
+        if indexed_files.is_empty() {
+            return true;
+        }
+
+        // Get the DB modification time for mtime comparison
+        // If the DB file is missing, the index is stale
+        let db_time = match self.storage_path
+            .join("leindex.db")
+            .metadata()
+            .and_then(|m| m.modified())
+        {
+            Ok(t) => t,
+            Err(_) => return true, // No DB file — stale
+        };
+
         // Use in-memory scan cache for a quick file-count comparison.
         // If not in memory, try to deserialize from the persistent cache_spiller.
         let source_count = match &self.project_scan {
             Some(cache) => cache.source_paths.len(),
             None => {
-                // Try persistent cache before declaring stale
+                // Try persistent cache
                 let cache_key = crate::cli::memory::project_scan_cache_key(&self.project_id);
                 if let Some(entry) = self.cache_spiller.store().peek(&cache_key) {
                     if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
                         if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(serialized_data) {
-                            return scan.source_paths.len() != indexed_files.len();
+                            if scan.source_paths.len() != indexed_files.len() {
+                                return true;
+                            }
+                            // Fall through to mtime sampling below
                         }
                     }
+                } else {
+                    // No cache at all — can't confirm file count, but still check mtimes
                 }
-                // No cache at all — can't confirm freshness, defer to full check
-                return false;
+                // Count unknown — continue to mtime sampling as a baseline check
+                usize::MAX // sentinel: skip count-mismatch check
             }
         };
 
         if source_count != indexed_files.len() {
             return true;
         }
-
-        // Get the DB modification time for mtime comparison
-        let db_time = self.storage_path
-            .join("leindex.db")
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok();
 
         // Quick spot-check: sample up to 50 indexed files for deletion or modification
         let mut checked = 0;
@@ -1650,9 +1662,9 @@ impl LeIndex {
                 return true;
             }
             // Compare file mtime against DB mtime
-            if let (Some(db_t), Ok(metadata)) = (db_time, std::fs::metadata(&full_path)) {
+            if let Ok(metadata) = std::fs::metadata(&full_path) {
                 if let Ok(modified) = metadata.modified() {
-                    if modified > db_t {
+                    if modified > db_time {
                         return true;
                     }
                 }
