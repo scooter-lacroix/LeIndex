@@ -1834,14 +1834,20 @@ impl LeIndex {
             for nid in &nodes {
                 for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Outgoing) {
                     if let Some(dep) = pdg.get_node(dep_id) {
-                        if dep.file_path != *file_path {
+                        if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
+                            && dep.byte_range != (0, 0)
+                            && dep.file_path != *file_path
+                        {
                             outgoing_files.insert(dep.file_path.clone());
                         }
                     }
                 }
                 for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Incoming) {
                     if let Some(dep) = pdg.get_node(dep_id) {
-                        if dep.file_path != *file_path {
+                        if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
+                            && dep.byte_range != (0, 0)
+                            && dep.file_path != *file_path
+                        {
                             incoming_files.insert(dep.file_path.clone());
                         }
                     }

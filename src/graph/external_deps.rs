@@ -1036,7 +1036,10 @@ pub fn annotate_external_nodes(
         .node_indices()
         .filter(|&idx| {
             pdg.get_node(idx)
-                .map(|n| matches!(n.node_type, NodeType::External))
+                .map(|n| {
+                    matches!(n.node_type, NodeType::External)
+                        || n.language == "external" // Legacy compat
+                })
                 .unwrap_or(false)
         })
         .collect();

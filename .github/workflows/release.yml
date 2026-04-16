@@ -142,11 +142,11 @@ jobs:
           path: ${{ env.ASSET }}
           if-no-files-found: error
 
-  # ── Create GitHub Release ────────────────────────────────────────────
+  # ── Create GitHub Release (draft) ────────────────────────────────────
   github-release:
     name: GitHub Release
-    needs: [detect, build, crates-io, pypi]
-    if: needs.detect.outputs.changed == 'true' && needs.crates-io.result == 'success' && needs.pypi.result == 'success'
+    needs: [detect, build]
+    if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -186,13 +186,13 @@ jobs:
             echo "Initial release." >> CHANGELOG.md
           fi
 
-      - name: Create GitHub Release
+      - name: Create GitHub Release (draft)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.detect.outputs.version }}
           name: v${{ needs.detect.outputs.version }}
           body_path: CHANGELOG.md
-          draft: false
+          draft: true
           prerelease: false
           files: |
             release-artifacts/leindex-*
@@ -203,7 +203,7 @@ jobs:
   # ── Publish to crates.io ─────────────────────────────────────────────
   crates-io:
     name: Publish crates.io
-    needs: [detect, build]
+    needs: [detect, github-release]
     if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -231,7 +231,7 @@ jobs:
   # ── Publish npm package (optional — skips if NPM_TOKEN not set) ─────
   npm:
     name: Publish npm
-    needs: [detect, build]
+    needs: [detect, github-release]
     if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -278,7 +278,7 @@ jobs:
   # ── Publish PyPI package (thin wrapper — installs binary via cargo) ──
   pypi:
     name: Publish PyPI
-    needs: [detect, build]
+    needs: [detect, github-release]
     if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
     defaults:
@@ -321,6 +321,18 @@ jobs:
     if: always() && needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Publish draft release
+        if: needs.crates-io.result == 'success' && needs.pypi.result == 'success'
+        run: |
+          VERSION="${{ needs.detect.outputs.version }}"
+          gh release edit "v${VERSION}" --draft=false
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Print summary
         run: |
           VERSION="${{ needs.detect.outputs.version }}"

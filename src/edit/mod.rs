@@ -1293,6 +1293,14 @@ impl Refactor {
                 }
                 Err(e) => {
                     errors.push(format!("Failed to write '{}': {}", file_path.display(), e));
+                    // Restore the failed file first — write() may have truncated it
+                    if let Err(restore_err) = std::fs::write(file_path, original_content.as_bytes()) {
+                        tracing::error!(
+                            "CRITICAL: Failed to restore failed file '{}' during rollback: {}",
+                            file_path.display(),
+                            restore_err
+                        );
+                    }
                     // Rollback all previously written files
                     for (prev_path, prev_original) in &modified_files {
                         if let Err(restore_err) = std::fs::write(prev_path, prev_original.as_bytes()) {
