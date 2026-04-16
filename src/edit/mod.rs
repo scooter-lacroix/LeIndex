@@ -960,8 +960,8 @@ impl WorktreeSession {
         let mut written: usize = 0;
         for (original, content) in &prepared {
             if let Err(e) = std::fs::write(original, content.as_bytes()) {
-                // Roll back all previously written files
-                for (backup_path, file_existed, backup_content) in backups.iter().take(written).rev() {
+                // Roll back all previously written files AND the failed file
+                for (backup_path, file_existed, backup_content) in backups.iter().take(written + 1).rev() {
                     if !file_existed {
                         let _ = std::fs::remove_file(backup_path);
                     } else if let Some(previous) = backup_content {
@@ -1198,6 +1198,8 @@ impl Refactor {
             }
         }
 
+        let mut total_traversed: usize = 0;
+
         // For each seed, collect definition file + forward/backward impact files
         for node_id in &seed_ids {
             if let Some(node) = engine.pdg.get_node(*node_id) {
@@ -1206,6 +1208,7 @@ impl Refactor {
 
                     // Add files that reference this symbol via PDG edges
                     let impacted = engine.pdg.forward_impact(*node_id, &config);
+                    total_traversed += impacted.len();
                     for imp_id in impacted {
                         if let Some(imp_node) = engine.pdg.get_node(imp_id) {
                             if imp_node.node_type != crate::graph::pdg::NodeType::External {
@@ -1214,6 +1217,7 @@ impl Refactor {
                         }
                     }
                     let backward = engine.pdg.backward_impact(*node_id, &config);
+                    total_traversed += backward.len();
                     for back_id in backward {
                         if let Some(back_node) = engine.pdg.get_node(back_id) {
                             if back_node.node_type != crate::graph::pdg::NodeType::External {
@@ -1235,12 +1239,6 @@ impl Refactor {
         }
 
         // Warn if the traversal hit the node limit — some references may have been missed
-        let total_traversed: usize = seed_ids.iter()
-            .map(|nid| {
-                engine.pdg.forward_impact(*nid, &config).len()
-                    + engine.pdg.backward_impact(*nid, &config).len()
-            })
-            .sum();
         let mut truncation_warning = None;
         if total_traversed >= max_nodes_limit {
             truncation_warning = Some(format!(

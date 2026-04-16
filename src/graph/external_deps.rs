@@ -1172,10 +1172,11 @@ pub fn discover_dependency_manifests(root: &Path, exclude_dirs: Option<&[String]
                     } else {
                         format!("{}/", relative)
                     };
+                    // Exact match: this directory equals the pattern
                     trimmed == relative
                         || trimmed == relative.trim_end_matches('/')
+                        // Prefix match: this directory is inside the excluded pattern
                         || dir_relative.starts_with(&format!("{}/", trimmed))
-                        || trimmed.starts_with(&format!("{}/", relative.trim_end_matches('/')))
                 }) {
                     walker.skip_current_dir();
                     continue;

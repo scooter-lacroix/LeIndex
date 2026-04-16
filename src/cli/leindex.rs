@@ -1689,9 +1689,28 @@ impl LeIndex {
 
         // Also check manifest file mtimes — dependency upgrades with no source
         // changes should still trigger re-indexing (external dep annotations).
-        let manifest_paths = self.project_scan.as_ref()
-            .map(|scan| scan.manifest_paths.clone())
-            .unwrap_or_default();
+        // If project_scan is cold, try loading manifest paths from cache.
+        let manifest_paths: Vec<PathBuf> = if let Some(scan) = &self.project_scan {
+            scan.manifest_paths.clone()
+        } else {
+            // Try to get manifest paths from cache (same path as the source_count branch)
+            let cache_key = crate::cli::memory::project_scan_cache_key(&self.project_id);
+            let mut paths = Vec::new();
+            if let Some(entry) = self.cache_spiller.store().peek(&cache_key) {
+                if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
+                    if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(serialized_data) {
+                        paths = scan.manifest_paths;
+                    }
+                }
+            } else if let Ok(entry) = self.cache_spiller.store().load_from_disk(&cache_key) {
+                if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
+                    if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
+                        paths = scan.manifest_paths;
+                    }
+                }
+            }
+            paths
+        };
         for manifest_path in &manifest_paths {
             if let Ok(metadata) = std::fs::metadata(manifest_path) {
                 if let Ok(modified) = metadata.modified() {

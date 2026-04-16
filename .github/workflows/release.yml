@@ -13,6 +13,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -141,8 +145,8 @@ jobs:
   # ── Create GitHub Release ────────────────────────────────────────────
   github-release:
     name: GitHub Release
-    needs: [detect, build]
-    if: needs.detect.outputs.changed == 'true'
+    needs: [detect, build, crates-io, pypi]
+    if: needs.detect.outputs.changed == 'true' && needs.crates-io.result == 'success' && needs.pypi.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -199,7 +203,7 @@ jobs:
   # ── Publish to crates.io ─────────────────────────────────────────────
   crates-io:
     name: Publish crates.io
-    needs: [detect, github-release]
+    needs: [detect, build]
     if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -227,7 +231,7 @@ jobs:
   # ── Publish npm package (optional — skips if NPM_TOKEN not set) ─────
   npm:
     name: Publish npm
-    needs: [detect, github-release]
+    needs: [detect, build]
     if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
     continue-on-error: true
@@ -274,7 +278,7 @@ jobs:
   # ── Publish PyPI package (thin wrapper — installs binary via cargo) ──
   pypi:
     name: Publish PyPI
-    needs: [detect, github-release]
+    needs: [detect, build]
     if: needs.detect.outputs.changed == 'true'
     runs-on: ubuntu-latest
     defaults:
