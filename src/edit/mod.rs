@@ -388,8 +388,10 @@ impl EditEngine {
             let lines: Vec<&str> = patch_str.lines().collect();
             let mut result = format!("--- {}\n+++ {}", file_path.display(), file_path.display());
             for line in lines.iter().skip(2) {
-                result.push_str(&format!("\n{}", line));
+                result.push('\n');
+                result.push_str(line);
             }
+            result.push('\n');
             Ok(result)
         }
     }
@@ -918,6 +920,9 @@ impl WorktreeSession {
         // Phase 1 (prepare): read all staged files, back up originals, create dirs.
         // If any prepare step fails, nothing has been written yet — just return the error.
         let mut backups: Vec<(PathBuf, bool, Option<String>)> = Vec::new();
+        // TODO: The two-phase approach reads all staged content into memory for
+        // rollback safety. For projects with very large files, consider a streaming
+        // approach with temp-file renames for atomicity without full buffering.
         let mut prepared: Vec<(PathBuf, String)> = Vec::new(); // (original, staged_content)
 
         for (original, staged) in &staged_entries {
@@ -1268,7 +1273,11 @@ impl Refactor {
                 }
             };
 
-            let modified = replace_whole_word(&original, old_name, new_name);
+        // TODO: replace_whole_word operates on the entire file content, which risks
+        // over-replacement for common symbol names. The PDG stores byte_range per node,
+        // so a future enhancement should collect byte ranges from all matched/impacted
+        // nodes and perform targeted replacements at those exact offsets instead.
+        let modified = replace_whole_word(&original, old_name, new_name);
             if modified != original {
                 pending_writes.push((file_path.clone(), original, modified));
             }
