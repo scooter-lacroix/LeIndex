@@ -1905,20 +1905,6 @@ scoping to subdirectories, sorting, and pagination."
             .pdg()
             .ok_or_else(|| JsonRpcError::project_not_indexed(project_root.display().to_string()))?;
 
-        // Enrich file_map with PDG edge counts (incoming + outgoing dependencies)
-        let mut file_degrees: std::collections::HashMap<String, (usize, usize)> =
-            std::collections::HashMap::new();
-        for file_path in file_map.keys() {
-            let nodes = pdg.nodes_in_file(file_path);
-            let mut in_deg = 0usize;
-            let mut out_deg = 0usize;
-            for nid in &nodes {
-                out_deg += pdg.graph.neighbors_directed(*nid, petgraph::Direction::Outgoing).count();
-                in_deg += pdg.graph.neighbors_directed(*nid, petgraph::Direction::Incoming).count();
-            }
-            file_degrees.insert(file_path.clone(), (in_deg, out_deg));
-        }
-
         // Filter to scope path and respect depth.
         // Files must either be exactly in the scope directory or in a subdirectory.
         let mut files: Vec<Value> = file_map
@@ -1938,17 +1924,35 @@ scoping to subdirectories, sorting, and pagination."
                 if directory_depth > depth {
                     return None;
                 }
-                let (in_deg, out_deg) = file_degrees
-                    .get(fp)
-                    .copied()
-                    .unwrap_or((0, 0));
+
+                // Compute cross-file dependency degree (unique other files, not raw edge count)
+                let mut incoming_files = std::collections::HashSet::new();
+                let mut outgoing_files = std::collections::HashSet::new();
+                let nodes = pdg.nodes_in_file(fp);
+                for nid in &nodes {
+                    for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Outgoing) {
+                        if let Some(dep) = pdg.get_node(dep_id) {
+                            if dep.file_path != *fp {
+                                outgoing_files.insert(dep.file_path.clone());
+                            }
+                        }
+                    }
+                    for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Incoming) {
+                        if let Some(dep) = pdg.get_node(dep_id) {
+                            if dep.file_path != *fp {
+                                incoming_files.insert(dep.file_path.clone());
+                            }
+                        }
+                    }
+                }
+
                 let mut entry = serde_json::json!({
                     "path": fp,
                     "relative_path": rel.display().to_string(),
                     "symbol_count": count,
                     "total_complexity": complexity,
-                    "incoming_dependencies": in_deg,
-                    "outgoing_dependencies": out_deg
+                    "incoming_dependencies": incoming_files.len(),
+                    "outgoing_dependencies": outgoing_files.len()
                 });
                 if include_symbols {
                     entry["top_symbols"] =

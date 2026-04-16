@@ -359,6 +359,22 @@ impl EditEngine {
         modified: &str,
         file_path: &Path,
     ) -> Result<String> {
+        Self::format_unified_diff(original, modified, file_path)
+    }
+
+    /// Generate a unified diff (public alias used by other call sites).
+    pub fn generate_unified_diff(
+        &self,
+        original: &str,
+        modified: &str,
+        file_path: &Path,
+    ) -> Result<String> {
+        Self::format_unified_diff(original, modified, file_path)
+    }
+
+    /// Shared implementation: create a diffy patch and replace its default
+    /// "--- original" / "+++ modified" headers with the actual file path.
+    fn format_unified_diff(original: &str, modified: &str, file_path: &Path) -> Result<String> {
         let patch = diffy::create_patch(original, modified);
         let patch_str = patch.to_string();
         if patch_str.is_empty() {
@@ -368,7 +384,7 @@ impl EditEngine {
                 file_path.display()
             ))
         } else {
-            // Replace diffy's default "--- original" / "+++ modified" headers with file-path labels
+            // Replace diffy's default headers with file-path labels
             let lines: Vec<&str> = patch_str.lines().collect();
             let mut result = format!("--- {}\n+++ {}", file_path.display(), file_path.display());
             for line in lines.iter().skip(2) {
@@ -1153,11 +1169,11 @@ impl Refactor {
         let mut files: HashSet<PathBuf> = HashSet::new();
 
         // Use exhaustive traversal for rename — missing any reference would break the build.
-        // Safety limits prevent OOM on pathological graphs while being generous enough
-        // for real-world projects (100 hops deep, 10K nodes).
+        // Generous safety limits prevent pathological O(M^2) blowup while ensuring
+        // completeness for any realistic project.
         let config = crate::graph::pdg::TraversalConfig {
-            max_depth: Some(100),
-            max_nodes: Some(10_000),
+            max_depth: Some(1000),
+            max_nodes: Some(100_000),
             allowed_edge_types: Some(vec![
                 crate::graph::pdg::EdgeType::Call,
                 crate::graph::pdg::EdgeType::DataDependency,
@@ -1168,13 +1184,22 @@ impl Refactor {
             min_edge_confidence: 0.0,
         };
 
-        if let Some(node_id) = exact_node {
-            if let Some(node) = engine.pdg.get_node(node_id) {
+        // Collect all matching seed node IDs
+        let mut seed_ids: Vec<_> = node_ids;
+        if let Some(exact) = exact_node {
+            if !seed_ids.contains(&exact) {
+                seed_ids.push(exact);
+            }
+        }
+
+        // For each seed, collect definition file + forward/backward impact files
+        for node_id in &seed_ids {
+            if let Some(node) = engine.pdg.get_node(*node_id) {
                 if node.node_type != crate::graph::pdg::NodeType::External {
                     files.insert(PathBuf::from(&node.file_path));
 
                     // Add files that reference this symbol via PDG edges
-                    let impacted = engine.pdg.forward_impact(node_id, &config);
+                    let impacted = engine.pdg.forward_impact(*node_id, &config);
                     for imp_id in impacted {
                         if let Some(imp_node) = engine.pdg.get_node(imp_id) {
                             if imp_node.node_type != crate::graph::pdg::NodeType::External {
@@ -1182,7 +1207,7 @@ impl Refactor {
                             }
                         }
                     }
-                    let backward = engine.pdg.backward_impact(node_id, &config);
+                    let backward = engine.pdg.backward_impact(*node_id, &config);
                     for back_id in backward {
                         if let Some(back_node) = engine.pdg.get_node(back_id) {
                             if back_node.node_type != crate::graph::pdg::NodeType::External {
@@ -1190,14 +1215,6 @@ impl Refactor {
                             }
                         }
                     }
-                }
-            }
-        }
-
-        for nid in node_ids {
-            if let Some(node) = engine.pdg.get_node(nid) {
-                if node.node_type != crate::graph::pdg::NodeType::External {
-                    files.insert(PathBuf::from(&node.file_path));
                 }
             }
         }
@@ -1337,23 +1354,7 @@ impl Diff {
         modified: &str,
         file_path: &Path,
     ) -> Result<String> {
-        let patch = diffy::create_patch(original, modified);
-        let patch_str = patch.to_string();
-        if patch_str.is_empty() {
-            Ok(format!(
-                "--- {}\n+++ {}\n(no changes)\n",
-                file_path.display(),
-                file_path.display()
-            ))
-        } else {
-            // Replace diffy's default headers with file-path labels
-            let lines: Vec<&str> = patch_str.lines().collect();
-            let mut result = format!("--- {}\n+++ {}", file_path.display(), file_path.display());
-            for line in lines.iter().skip(2) {
-                result.push_str(&format!("\n{}", line));
-            }
-            Ok(result)
-        }
+        EditEngine::format_unified_diff(original, modified, file_path)
     }
 
     /// Generate a side-by-side diff
