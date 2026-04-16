@@ -1915,10 +1915,24 @@ scoping to subdirectories, sorting, and pagination."
             map
         }; // file → (node_count, total_complexity, symbol_names)
 
-        // Get PDG for later use (needed even with cache)
-        let _pdg = index
+        // Get PDG for dependency enrichment (degree centrality per file)
+        let pdg = index
             .pdg()
             .ok_or_else(|| JsonRpcError::project_not_indexed(project_root.display().to_string()))?;
+
+        // Enrich file_map with PDG edge counts (incoming + outgoing dependencies)
+        let mut file_degrees: std::collections::HashMap<String, (usize, usize)> =
+            std::collections::HashMap::new();
+        for file_path in file_map.keys() {
+            let nodes = pdg.nodes_in_file(file_path);
+            let mut in_deg = 0usize;
+            let mut out_deg = 0usize;
+            for nid in &nodes {
+                out_deg += pdg.graph.neighbors_directed(*nid, petgraph::Direction::Outgoing).count();
+                in_deg += pdg.graph.neighbors_directed(*nid, petgraph::Direction::Incoming).count();
+            }
+            file_degrees.insert(file_path.clone(), (in_deg, out_deg));
+        }
 
         // Filter to scope path and respect depth.
         // Files must either be exactly in the scope directory or in a subdirectory.
@@ -1939,11 +1953,17 @@ scoping to subdirectories, sorting, and pagination."
                 if directory_depth > depth {
                     return None;
                 }
+                let (in_deg, out_deg) = file_degrees
+                    .get(fp)
+                    .copied()
+                    .unwrap_or((0, 0));
                 let mut entry = serde_json::json!({
                     "path": fp,
                     "relative_path": rel.display().to_string(),
                     "symbol_count": count,
-                    "total_complexity": complexity
+                    "total_complexity": complexity,
+                    "incoming_dependencies": in_deg,
+                    "outgoing_dependencies": out_deg
                 });
                 if include_symbols {
                     entry["top_symbols"] =
@@ -1967,7 +1987,14 @@ scoping to subdirectories, sorting, and pagination."
                     .unwrap_or("")
                     .cmp(b["relative_path"].as_str().unwrap_or(""))
             }),
-            "dependencies" | "size" => files.sort_by(|a, b| {
+            "dependencies" => files.sort_by(|a, b| {
+                let a_deg = a["incoming_dependencies"].as_u64().unwrap_or(0)
+                    + a["outgoing_dependencies"].as_u64().unwrap_or(0);
+                let b_deg = b["incoming_dependencies"].as_u64().unwrap_or(0)
+                    + b["outgoing_dependencies"].as_u64().unwrap_or(0);
+                b_deg.cmp(&a_deg)
+            }),
+            "size" => files.sort_by(|a, b| {
                 b["symbol_count"]
                     .as_u64()
                     .unwrap_or(0)
@@ -2321,7 +2348,6 @@ impl GrepSymbolsHandler {
         // Check for zero results and provide helpful suggestion
         // Only emit suggestion when there are truly no matches, not when offset is past total
         if total_matched == 0 {
-            let pdg = index.pdg().unwrap();
             return Ok(wrap_with_meta(
                 serde_json::json!({
                     "pattern": pattern,
