@@ -1137,7 +1137,19 @@ impl Refactor {
         // reference it (call sites, type usages) via PDG forward/backward edges.
         let mut files: HashSet<PathBuf> = HashSet::new();
 
-        let config = crate::graph::pdg::TraversalConfig::for_impact_analysis();
+        // Use unlimited traversal for rename — missing any reference would break the build.
+        let config = crate::graph::pdg::TraversalConfig {
+            max_depth: None,
+            max_nodes: None, // Exhaustive — must find ALL references
+            allowed_edge_types: Some(vec![
+                crate::graph::pdg::EdgeType::Call,
+                crate::graph::pdg::EdgeType::DataDependency,
+                crate::graph::pdg::EdgeType::Inheritance,
+            ]),
+            excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
+            min_complexity: None,
+            min_edge_confidence: 0.0,
+        };
 
         if let Some(node_id) = exact_node {
             if let Some(node) = engine.pdg.get_node(node_id) {

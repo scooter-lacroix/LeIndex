@@ -1884,32 +1884,17 @@ scoping to subdirectories, sorting, and pagination."
             }
             map
         } else {
-            // Fallback: build from PDG (should rarely happen after first index)
-            let pdg = index
-                .pdg()
-                .ok_or_else(|| JsonRpcError::project_not_indexed(project_root.display().to_string()))?;
-
+            // Fallback: build from PDG via the same method used at index time
+            index.build_file_stats_cache();
             let mut map: std::collections::HashMap<String, (usize, u32, Vec<String>)> = source_paths
                 .into_iter()
                 .map(|path| (path.display().to_string(), (0, 0, Vec::new())))
                 .collect();
 
-            for nid in pdg.node_indices() {
-                if let Some(node) = pdg.get_node(nid) {
-                    // Skip external and phantom nodes
-                    if matches!(node.node_type, crate::graph::pdg::NodeType::External)
-                        || node.byte_range == (0, 0)
-                    {
-                        continue;
-                    }
-                    let entry = map
-                        .entry(node.file_path.clone())
-                        .or_insert((0, 0, Vec::new()));
-                    entry.0 += 1;
-                    entry.1 += node.complexity;
-                    if entry.2.len() < 5 {
-                        entry.2.push(node.name.clone());
-                    }
+            if let Some(cache) = index.file_stats() {
+                for (path, stats) in cache.iter() {
+                    let capped: Vec<String> = stats.symbol_names.iter().take(5).cloned().collect();
+                    map.insert(path.clone(), (stats.symbol_count, stats.total_complexity, capped));
                 }
             }
             map

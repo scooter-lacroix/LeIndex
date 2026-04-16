@@ -1647,7 +1647,7 @@ impl LeIndex {
             }
         };
 
-        if source_count != indexed_files.len() {
+        if source_count != usize::MAX && source_count != indexed_files.len() {
             return true;
         }
 
@@ -1750,7 +1750,7 @@ impl LeIndex {
     }
 
     /// Build file statistics cache from PDG
-    fn build_file_stats_cache(&mut self) {
+    pub(crate) fn build_file_stats_cache(&mut self) {
         let Some(pdg) = self.pdg() else { return };
         let mut cache: HashMap<String, FileStats> = HashMap::new();
         for nid in pdg.node_indices() {

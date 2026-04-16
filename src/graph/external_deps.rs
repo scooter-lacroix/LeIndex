@@ -91,7 +91,7 @@ impl ExternalDependencyRegistry {
 
     /// Scan the project root for lock/manifest files and build the registry.
     pub fn from_project(root: &Path) -> Self {
-        Self::from_manifest_paths(root, &discover_dependency_manifests(root))
+        Self::from_manifest_paths(root, &discover_dependency_manifests(root, None))
     }
 }
 
@@ -1092,8 +1092,12 @@ pub struct AnnotationStats {
     pub unresolved: usize,
 }
 
-/// Discover dependency manifests and lockfiles while skipping common generated directories.
-pub fn discover_dependency_manifests(root: &Path) -> Vec<std::path::PathBuf> {
+/// Discover dependency manifests and lockfiles while respecting project exclusion config.
+///
+/// When `exclude_dirs` is provided, those directory names are skipped in addition to
+/// the default hidden-directory heuristic. This allows callers to pass the directory
+/// patterns from `ExclusionConfig` so that user-excluded directories are respected.
+pub fn discover_dependency_manifests(root: &Path, exclude_dirs: Option<&[String]>) -> Vec<std::path::PathBuf> {
     const MANIFEST_NAMES: &[&str] = &[
         "Cargo.lock",
         "Cargo.toml",
@@ -1147,8 +1151,22 @@ pub fn discover_dependency_manifests(root: &Path) -> Vec<std::path::PathBuf> {
         }
 
         if entry.file_type().is_dir() {
+            // Skip hardcoded common non-project directories
             if SKIP_DIRS.contains(&file_name.as_ref()) {
                 walker.skip_current_dir();
+                continue;
+            }
+            // Also skip any caller-provided exclusion patterns
+            if let Some(excluded) = exclude_dirs {
+                if excluded.iter().any(|p| {
+                    // Support glob-style patterns like "*/dirname/*"
+                    p.trim_matches('*').trim_matches('/')
+                        .split('/')
+                        .any(|segment| segment == file_name.as_ref())
+                }) {
+                    walker.skip_current_dir();
+                    continue;
+                }
             }
             continue;
         }
