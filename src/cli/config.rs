@@ -283,10 +283,12 @@ impl Default for ExclusionConfig {
                 ".leindex".into(),
             ],
             file_patterns: vec![
-                // Note: lockfiles (Cargo.lock, package-lock.json, etc.) are intentionally
-                // NOT excluded here because scan_project_files() collects them as
-                // dependency manifests before checking exclusions. Excluding them
-                // would break external dependency resolution.
+                // Note: lockfiles (Cargo.lock, package-lock.json, etc.) are NOT listed
+                // in file_patterns because scan_project_files() collects them as
+                // dependency manifests BEFORE checking exclusions. This ensures they
+                // are always available for external dependency resolution while still
+                // being excluded from source file indexing (the manifest check `continue`s
+                // before the source extension check).
                 "*.min.js".into(),
                 "*.min.css".into(),
                 "*.pb.go".into(), // Generated protobuf files
@@ -572,14 +574,17 @@ mod tests {
     #[test]
     fn test_exclusion_minified_and_generated_files() {
         let config = ExclusionConfig::default();
-        assert!(config.should_exclude("Cargo.lock"));
-        assert!(config.should_exclude("frontend/package-lock.json"));
-        assert!(config.should_exclude("api/yarn.lock"));
-        assert!(config.should_exclude("packages/web/pnpm-lock.yaml"));
-        assert!(config.should_exclude("backend/composer.lock"));
-        assert!(config.should_exclude("python/Pipfile.lock"));
-        assert!(config.should_exclude("python/poetry.lock"));
-        assert!(config.should_exclude("ruby/Gemfile.lock"));
+        // Lockfiles are NOT excluded — they are collected as manifests by scan_project_files()
+        // before the exclusion check runs.
+        assert!(!config.should_exclude("Cargo.lock"));
+        assert!(!config.should_exclude("frontend/package-lock.json"));
+        assert!(!config.should_exclude("api/yarn.lock"));
+        assert!(!config.should_exclude("packages/web/pnpm-lock.yaml"));
+        assert!(!config.should_exclude("backend/composer.lock"));
+        assert!(!config.should_exclude("python/Pipfile.lock"));
+        assert!(!config.should_exclude("python/poetry.lock"));
+        assert!(!config.should_exclude("ruby/Gemfile.lock"));
+        // Minified and generated files ARE excluded
         assert!(config.should_exclude("app.min.js"));
         assert!(config.should_exclude("styles.min.css"));
         assert!(config.should_exclude("service.pb.go"));

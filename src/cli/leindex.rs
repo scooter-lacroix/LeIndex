@@ -1651,10 +1651,12 @@ impl LeIndex {
             return true;
         }
 
-        // Quick spot-check: sample up to 50 indexed files for deletion or modification
+        // Quick spot-check: sample indexed files for deletion or modification.
+        // Use a percentage of total files (5-10%), clamped to [50, 500].
+        let sample_size = (indexed_files.len() / 20).max(50).min(500);
         let mut checked = 0;
         for indexed_path in indexed_files.keys() {
-            if checked >= 50 {
+            if checked >= sample_size {
                 break;
             }
             let full_path = self.project_path.join(indexed_path);

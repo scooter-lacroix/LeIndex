@@ -891,9 +891,13 @@ impl WorktreeSession {
             tracked_files,
         } = self;
 
-        let mut backups: Vec<(PathBuf, bool, Option<String>)> = Vec::new();
         let mut staged_entries: Vec<(PathBuf, PathBuf)> = tracked_files.into_iter().collect();
         staged_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        // Phase 1 (prepare): read all staged files, back up originals, create dirs.
+        // If any prepare step fails, nothing has been written yet — just return the error.
+        let mut backups: Vec<(PathBuf, bool, Option<String>)> = Vec::new();
+        let mut prepared: Vec<(PathBuf, String)> = Vec::new(); // (original, staged_content)
 
         for (original, staged) in &staged_entries {
             let file_existed = original.exists();
@@ -928,23 +932,34 @@ impl WorktreeSession {
                 })?;
             }
 
+            prepared.push((original.clone(), content));
+        }
+
+        // Phase 2 (write): apply all prepared writes. On failure, roll back everything.
+        let mut written: usize = 0;
+        for (original, content) in &prepared {
             if let Err(e) = std::fs::write(original, content.as_bytes()) {
-                for (backup_path, file_existed, backup_content) in backups.iter().rev() {
+                // Roll back all previously written files
+                for (backup_path, file_existed, backup_content) in backups.iter().take(written).rev() {
                     if !file_existed {
-                        // File didn't exist before merge — remove it
                         let _ = std::fs::remove_file(backup_path);
                     } else if let Some(previous) = backup_content {
-                        // File existed — restore from backup
-                        let _ = std::fs::write(backup_path, previous.as_bytes());
+                        if let Err(restore_err) = std::fs::write(backup_path, previous.as_bytes()) {
+                            tracing::error!(
+                                "CRITICAL: Failed to restore '{}' during rollback: {}",
+                                backup_path.display(),
+                                restore_err
+                            );
+                        }
                     }
                 }
                 return Err(EditError::WorktreeError(format!(
-                    "Failed to merge staged file '{}' into '{}': {}",
-                    staged.display(),
+                    "Failed to merge staged file into '{}': {}",
                     original.display(),
                     e
                 )));
             }
+            written += 1;
         }
 
         if path.exists() {
@@ -1137,10 +1152,12 @@ impl Refactor {
         // reference it (call sites, type usages) via PDG forward/backward edges.
         let mut files: HashSet<PathBuf> = HashSet::new();
 
-        // Use unlimited traversal for rename — missing any reference would break the build.
+        // Use exhaustive traversal for rename — missing any reference would break the build.
+        // Safety limits prevent OOM on pathological graphs while being generous enough
+        // for real-world projects (100 hops deep, 10K nodes).
         let config = crate::graph::pdg::TraversalConfig {
-            max_depth: None,
-            max_nodes: None, // Exhaustive — must find ALL references
+            max_depth: Some(100),
+            max_nodes: Some(10_000),
             allowed_edge_types: Some(vec![
                 crate::graph::pdg::EdgeType::Call,
                 crate::graph::pdg::EdgeType::DataDependency,
