@@ -28,13 +28,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
+          fetch-depth: 0  # Full history needed for tag listing and changelog
 
       - name: Extract version from Cargo.toml
         id: ver
         run: |
           VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # Fetch all tags explicitly (ensures tag list is accurate)
+          git fetch --tags
 
           # Check if a tag for this version already exists
           if git tag -l "v${VERSION}" | grep -q .; then
@@ -162,7 +165,7 @@ jobs:
         id: changelog
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
-          PREV_TAG=$(git tag --sort=-v:refname | head -2 | tail -1)
+          PREV_TAG=$(git tag --sort=-v:refname | head -1)
 
           echo "## What's Changed" > CHANGELOG.md
           echo "" >> CHANGELOG.md
