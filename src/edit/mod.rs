@@ -610,11 +610,15 @@ impl EditEngine {
     /// Undo last edit
     pub async fn undo(&self) -> Result<EditResult> {
         let mut history = self.history.lock().await;
-        match history.undo() {
+        // Extract the command data before potentially modifying history again
+        let cmd = history.undo().cloned();
+        match cmd {
             Some(EditCommand::Edit { file_path, original_content, .. }) => {
                 // Restore original content if available
                 if let Some(content) = original_content {
                     if let Err(e) = std::fs::write(&file_path, content.as_bytes()) {
+                        // Restore failed — revert the history cursor so undo/redo stay consistent
+                        history.redo();
                         return Ok(EditResult {
                             success: false,
                             changes_applied: 0,
@@ -623,7 +627,8 @@ impl EditEngine {
                         });
                     }
                 } else {
-                    // No pre-image was captured — cannot reliably undo
+                    // No pre-image was captured — revert cursor, cannot reliably undo
+                    history.redo();
                     return Ok(EditResult {
                         success: false,
                         changes_applied: 0,
@@ -1169,11 +1174,12 @@ impl Refactor {
         let mut files: HashSet<PathBuf> = HashSet::new();
 
         // Use exhaustive traversal for rename — missing any reference would break the build.
-        // Generous safety limits prevent pathological O(M^2) blowup while ensuring
-        // completeness for any realistic project.
+        // High limits ensure completeness for real projects; a post-traversal check warns
+        // if the limit was hit.
+        let max_nodes_limit = 1_000_000;
         let config = crate::graph::pdg::TraversalConfig {
             max_depth: Some(1000),
-            max_nodes: Some(100_000),
+            max_nodes: Some(max_nodes_limit),
             allowed_edge_types: Some(vec![
                 crate::graph::pdg::EdgeType::Call,
                 crate::graph::pdg::EdgeType::DataDependency,
@@ -1226,6 +1232,22 @@ impl Refactor {
                 files_modified: vec![],
                 error: None,
             });
+        }
+
+        // Warn if the traversal hit the node limit — some references may have been missed
+        let total_traversed: usize = seed_ids.iter()
+            .map(|nid| {
+                engine.pdg.forward_impact(*nid, &config).len()
+                    + engine.pdg.backward_impact(*nid, &config).len()
+            })
+            .sum();
+        let mut truncation_warning = None;
+        if total_traversed >= max_nodes_limit {
+            truncation_warning = Some(format!(
+                "Warning: rename traversal hit the node limit ({}). Some references may be missing — verify manually.",
+                max_nodes_limit
+            ));
+            tracing::warn!("{}", truncation_warning.as_ref().unwrap());
         }
 
         // 4. Apply replace_whole_word to each file (two-phase: collect then write)
@@ -1292,10 +1314,10 @@ impl Refactor {
             success: errors.is_empty(),
             changes_applied: total_changes,
             files_modified: modified_files.into_iter().map(|(p, _)| p).collect(),
-            error: if errors.is_empty() {
-                None
-            } else {
-                Some(errors.join("; "))
+            error: match (errors.is_empty(), &truncation_warning) {
+                (true, None) => None,
+                (true, Some(w)) => Some(w.clone()),
+                (false, _) => Some(errors.join("; ")),
             },
         })
     }

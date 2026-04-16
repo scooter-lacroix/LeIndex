@@ -1870,38 +1870,39 @@ scoping to subdirectories, sorting, and pagination."
         // Collect source paths first to avoid borrow conflicts with file_stats()/pdg()
         let source_paths = index.source_file_paths().unwrap_or_default();
 
-        let file_map: std::collections::HashMap<String, (usize, u32, Vec<String>)> = if let Some(cache) = index.file_stats() {
-            // Fast path: use cached statistics
-            let mut map: std::collections::HashMap<String, (usize, u32, Vec<String>)> = source_paths
+        // file → (symbol_count, total_complexity, symbol_names, incoming_deps, outgoing_deps)
+        let file_map: std::collections::HashMap<String, (usize, u32, Vec<String>, usize, usize)> = if let Some(cache) = index.file_stats() {
+            // Fast path: use cached statistics (includes pre-computed dep counts)
+            let mut map: std::collections::HashMap<String, (usize, u32, Vec<String>, usize, usize)> = source_paths
                 .into_iter()
-                .map(|path| (path.display().to_string(), (0, 0, Vec::new())))
+                .map(|path| (path.display().to_string(), (0, 0, Vec::new(), 0, 0)))
                 .collect();
 
             // Overlay cached statistics, capping symbol_names to top 5
             for (path, stats) in cache.iter() {
                 let capped: Vec<String> = stats.symbol_names.iter().take(5).cloned().collect();
-                map.insert(path.clone(), (stats.symbol_count, stats.total_complexity, capped));
+                map.insert(path.clone(), (stats.symbol_count, stats.total_complexity, capped, stats.incoming_deps, stats.outgoing_deps));
             }
             map
         } else {
             // Fallback: build from PDG via the same method used at index time
             index.build_file_stats_cache();
-            let mut map: std::collections::HashMap<String, (usize, u32, Vec<String>)> = source_paths
+            let mut map: std::collections::HashMap<String, (usize, u32, Vec<String>, usize, usize)> = source_paths
                 .into_iter()
-                .map(|path| (path.display().to_string(), (0, 0, Vec::new())))
+                .map(|path| (path.display().to_string(), (0, 0, Vec::new(), 0, 0)))
                 .collect();
 
             if let Some(cache) = index.file_stats() {
                 for (path, stats) in cache.iter() {
                     let capped: Vec<String> = stats.symbol_names.iter().take(5).cloned().collect();
-                    map.insert(path.clone(), (stats.symbol_count, stats.total_complexity, capped));
+                    map.insert(path.clone(), (stats.symbol_count, stats.total_complexity, capped, stats.incoming_deps, stats.outgoing_deps));
                 }
             }
             map
         }; // file → (node_count, total_complexity, symbol_names)
 
-        // Get PDG for dependency enrichment (degree centrality per file)
-        let pdg = index
+        // Get PDG for scope filtering (no degree computation needed — cached in file_map)
+        let _pdg = index
             .pdg()
             .ok_or_else(|| JsonRpcError::project_not_indexed(project_root.display().to_string()))?;
 
@@ -1914,7 +1915,7 @@ scoping to subdirectories, sorting, and pagination."
                 // or if the file IS the scope path (exact match for single-file scope)
                 fp.starts_with(&scope_str) || fp.as_str() == scope_path.to_str().unwrap_or("")
             })
-            .filter_map(|(fp, (count, complexity, syms))| {
+            .filter_map(|(fp, (count, complexity, syms, in_deg, out_deg))| {
                 let path = std::path::Path::new(fp);
                 let rel = path.strip_prefix(&scope_base).ok()?;
                 let directory_depth = rel
@@ -1925,34 +1926,13 @@ scoping to subdirectories, sorting, and pagination."
                     return None;
                 }
 
-                // Compute cross-file dependency degree (unique other files, not raw edge count)
-                let mut incoming_files = std::collections::HashSet::new();
-                let mut outgoing_files = std::collections::HashSet::new();
-                let nodes = pdg.nodes_in_file(fp);
-                for nid in &nodes {
-                    for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Outgoing) {
-                        if let Some(dep) = pdg.get_node(dep_id) {
-                            if dep.file_path != *fp {
-                                outgoing_files.insert(dep.file_path.clone());
-                            }
-                        }
-                    }
-                    for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Incoming) {
-                        if let Some(dep) = pdg.get_node(dep_id) {
-                            if dep.file_path != *fp {
-                                incoming_files.insert(dep.file_path.clone());
-                            }
-                        }
-                    }
-                }
-
                 let mut entry = serde_json::json!({
                     "path": fp,
                     "relative_path": rel.display().to_string(),
                     "symbol_count": count,
                     "total_complexity": complexity,
-                    "incoming_dependencies": incoming_files.len(),
-                    "outgoing_dependencies": outgoing_files.len()
+                    "incoming_dependencies": in_deg,
+                    "outgoing_dependencies": out_deg
                 });
                 if include_symbols {
                     entry["top_symbols"] =

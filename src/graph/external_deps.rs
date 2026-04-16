@@ -1159,10 +1159,23 @@ pub fn discover_dependency_manifests(root: &Path, exclude_dirs: Option<&[String]
             // Also skip any caller-provided exclusion patterns
             if let Some(excluded) = exclude_dirs {
                 if excluded.iter().any(|p| {
-                    // Support glob-style patterns like "*/dirname/*"
-                    p.trim_matches('*').trim_matches('/')
-                        .split('/')
-                        .any(|segment| segment == file_name.as_ref())
+                    // Match the directory name against the pattern's leaf segment.
+                    // For patterns like "target/debug", only match if the relative path
+                    // from root starts with the pattern — not if any segment equals the leaf.
+                    let trimmed = p.trim_matches('*').trim_matches('/');
+                    let relative = path.strip_prefix(root).ok()
+                        .and_then(|r| r.to_str())
+                        .unwrap_or("");
+                    // Check if the relative directory path matches or is a prefix
+                    let dir_relative = if relative.ends_with('/') {
+                        relative.to_string()
+                    } else {
+                        format!("{}/", relative)
+                    };
+                    trimmed == relative
+                        || trimmed == relative.trim_end_matches('/')
+                        || dir_relative.starts_with(&format!("{}/", trimmed))
+                        || trimmed.starts_with(&format!("{}/", relative.trim_end_matches('/')))
                 }) {
                     walker.skip_current_dir();
                     continue;

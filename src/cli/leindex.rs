@@ -400,7 +400,7 @@ struct ProjectFileScan {
 }
 
 /// Per-file statistics cached from PDG
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileStats {
     /// Number of symbols in this file
     pub symbol_count: usize,
@@ -408,6 +408,12 @@ pub struct FileStats {
     pub total_complexity: u32,
     /// Names of symbols in this file
     pub symbol_names: Vec<String>,
+    /// Number of distinct files this file depends on (cross-file outgoing edges)
+    #[serde(default)]
+    pub outgoing_deps: usize,
+    /// Number of distinct files that depend on this file (cross-file incoming edges)
+    #[serde(default)]
+    pub incoming_deps: usize,
 }
 
 /// Statistics from indexing operations
@@ -1628,7 +1634,7 @@ impl LeIndex {
         let source_count = match &self.project_scan {
             Some(cache) => cache.source_paths.len(),
             None => {
-                // Try persistent cache
+                // Try persistent cache — first in-memory (peek), then disk-spilled
                 let cache_key = crate::cli::memory::project_scan_cache_key(&self.project_id);
                 if let Some(entry) = self.cache_spiller.store().peek(&cache_key) {
                     if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
@@ -1639,8 +1645,15 @@ impl LeIndex {
                             // Fall through to mtime sampling below
                         }
                     }
-                } else {
-                    // No cache at all — can't confirm file count, but still check mtimes
+                } else if let Ok(entry) = self.cache_spiller.store().load_from_disk(&cache_key) {
+                    // Cache was spilled to disk — deserialize from there
+                    if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
+                        if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
+                            if scan.source_paths.len() != indexed_files.len() {
+                                return true;
+                            }
+                        }
+                    }
                 }
                 // Count unknown — continue to mtime sampling as a baseline check
                 usize::MAX // sentinel: skip count-mismatch check
@@ -1672,6 +1685,21 @@ impl LeIndex {
                 }
             }
             checked += 1;
+        }
+
+        // Also check manifest file mtimes — dependency upgrades with no source
+        // changes should still trigger re-indexing (external dep annotations).
+        let manifest_paths = self.project_scan.as_ref()
+            .map(|scan| scan.manifest_paths.clone())
+            .unwrap_or_default();
+        for manifest_path in &manifest_paths {
+            if let Ok(metadata) = std::fs::metadata(manifest_path) {
+                if let Ok(modified) = metadata.modified() {
+                    if modified > db_time {
+                        return true;
+                    }
+                }
+            }
         }
 
         false
@@ -1755,6 +1783,7 @@ impl LeIndex {
     pub(crate) fn build_file_stats_cache(&mut self) {
         let Some(pdg) = self.pdg() else { return };
         let mut cache: HashMap<String, FileStats> = HashMap::new();
+        // First pass: collect symbol counts and complexity
         for nid in pdg.node_indices() {
             if let Some(node) = pdg.get_node(nid) {
                 // Skip external and phantom nodes (synthetic (0,0) byte range)
@@ -1767,12 +1796,41 @@ impl LeIndex {
                     symbol_count: 0,
                     total_complexity: 0,
                     symbol_names: Vec::new(),
+                    outgoing_deps: 0,
+                    incoming_deps: 0,
                 });
                 entry.symbol_count += 1;
                 entry.total_complexity += node.complexity;
                 if entry.symbol_names.len() < 5 {
                     entry.symbol_names.push(node.name.clone());
                 }
+            }
+        }
+        // Second pass: compute cross-file dependency degrees
+        let file_paths: Vec<String> = cache.keys().cloned().collect();
+        for file_path in &file_paths {
+            let nodes = pdg.nodes_in_file(file_path);
+            let mut incoming_files = std::collections::HashSet::new();
+            let mut outgoing_files = std::collections::HashSet::new();
+            for nid in &nodes {
+                for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Outgoing) {
+                    if let Some(dep) = pdg.get_node(dep_id) {
+                        if dep.file_path != *file_path {
+                            outgoing_files.insert(dep.file_path.clone());
+                        }
+                    }
+                }
+                for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Incoming) {
+                    if let Some(dep) = pdg.get_node(dep_id) {
+                        if dep.file_path != *file_path {
+                            incoming_files.insert(dep.file_path.clone());
+                        }
+                    }
+                }
+            }
+            if let Some(entry) = cache.get_mut(file_path) {
+                entry.outgoing_deps = outgoing_files.len();
+                entry.incoming_deps = incoming_files.len();
             }
         }
         self.file_stats_cache = Some(cache);

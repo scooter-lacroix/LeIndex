@@ -109,6 +109,8 @@ jobs:
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
       - name: Build release binary
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Strip binary (Linux/macOS)
@@ -174,12 +176,11 @@ jobs:
             echo "Changes since ${PREV_TAG}:" >> CHANGELOG.md
             echo "" >> CHANGELOG.md
             git log "${PREV_TAG}..HEAD" --pretty=format:"- %s (%h)" --no-merges >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...v${VERSION}" >> CHANGELOG.md
           else
             echo "Initial release." >> CHANGELOG.md
           fi
-
-          echo "" >> CHANGELOG.md
-          echo "**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...v${VERSION}" >> CHANGELOG.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
