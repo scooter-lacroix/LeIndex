@@ -1287,12 +1287,25 @@ impl Refactor {
         // High limits ensure completeness for real projects; a post-traversal check warns
         // if the limit was hit.
         let max_nodes_limit = 1_000_000;
-        let config = crate::graph::pdg::TraversalConfig {
+        let forward_config = crate::graph::pdg::TraversalConfig {
             max_depth: Some(1000),
             max_nodes: Some(max_nodes_limit),
             allowed_edge_types: Some(vec![
                 crate::graph::pdg::EdgeType::Call,
                 crate::graph::pdg::EdgeType::DataDependency,
+                crate::graph::pdg::EdgeType::Inheritance,
+            ]),
+            excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
+            min_complexity: None,
+            min_edge_confidence: 0.0,
+        };
+        // Backward impact restricted to Inheritance only — renaming a parent method
+        // should update child overrides, but general backward traversal (dependencies
+        // the symbol uses) does NOT need renaming and risks over-inclusion.
+        let backward_config = crate::graph::pdg::TraversalConfig {
+            max_depth: Some(1000),
+            max_nodes: Some(max_nodes_limit),
+            allowed_edge_types: Some(vec![
                 crate::graph::pdg::EdgeType::Inheritance,
             ]),
             excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
@@ -1317,7 +1330,7 @@ impl Refactor {
                     files.insert(PathBuf::from(&node.file_path));
 
                     // Add files that reference this symbol via PDG edges
-                    let impacted = pdg.forward_impact(*node_id, &config);
+                    let impacted = pdg.forward_impact(*node_id, &forward_config);
                     total_traversed += impacted.len();
                     for imp_id in impacted {
                         if let Some(imp_node) = pdg.get_node(imp_id) {
@@ -1326,7 +1339,7 @@ impl Refactor {
                             }
                         }
                     }
-                    let backward = pdg.backward_impact(*node_id, &config);
+                    let backward = pdg.backward_impact(*node_id, &backward_config);
                     total_traversed += backward.len();
                     for back_id in backward {
                         if let Some(back_node) = pdg.get_node(back_id) {
@@ -1381,14 +1394,25 @@ impl Refactor {
                 }
             };
 
-        // Collect byte ranges from matched PDG nodes IN THIS FILE to restrict
-        // replacements to regions near known symbol definitions.
+        // Collect byte ranges from PDG nodes IN THIS FILE to restrict replacements
+        // to regions near known symbol definitions and references.
         let mut def_ranges: Vec<(usize, usize)> = Vec::new();
         let file_path_str = file_path.to_string_lossy();
         for node_id in &seed_ids {
             if let Some(node) = pdg.get_node(*node_id) {
                 if node.file_path == file_path_str && node.byte_range != (0, 0) {
                     def_ranges.push(node.byte_range);
+                }
+            }
+        }
+        // Also collect ranges from all nodes in this file that reference the symbol
+        // (forward/backward impact results) — improves precision for reference-only files.
+        for nid in pdg.find_all_by_name(old_name) {
+            if let Some(node) = pdg.get_node(nid) {
+                if node.file_path == file_path_str && node.byte_range != (0, 0) {
+                    if !def_ranges.contains(&node.byte_range) {
+                        def_ranges.push(node.byte_range);
+                    }
                 }
             }
         }

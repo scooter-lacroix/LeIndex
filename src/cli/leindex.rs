@@ -1715,9 +1715,10 @@ impl LeIndex {
             Vec::new()
         };
 
-        // If we couldn't load manifest paths from any cache, check cold scan results
-        if manifest_paths.is_empty() && self.project_scan.is_none() {
-            // No manifest paths from any source — try a quick filesystem scan
+        // Always probe for common manifest files — even when cached manifest_paths
+        // is populated, newly added lockfiles/manifests after indexing won't be in the
+        // cache. This is cheap (7 stat() calls at most).
+        {
             let quick_manifests = [
                 "Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
                 "poetry.lock", "Gemfile.lock", "go.sum",

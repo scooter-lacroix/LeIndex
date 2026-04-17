@@ -105,6 +105,11 @@ fn source_priority(file_name: &str) -> u8 {
 
 impl ExternalDependencyRegistry {
     /// Build the registry from an already-discovered manifest list.
+    /// Build a dependency registry from manifest/lockfile paths.
+    ///
+    /// TODO: In monorepos, `by_name` is keyed only by dependency name, so the same
+    /// package from different workspaces overwrites earlier entries. For multi-package
+    /// repos, entries should be scoped by manifest path to avoid version/source conflicts.
     pub fn from_manifest_paths(root: &Path, manifest_paths: &[PathBuf]) -> Self {
         let mut registry = Self::new();
         // Sort so lockfiles (priority 1) are parsed AFTER manifests (priority 0),
