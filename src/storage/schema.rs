@@ -65,6 +65,9 @@ impl Storage {
         // Initialize schema
         storage.initialize_schema()?;
 
+        // Run migrations
+        storage.run_migrations()?;
+
         Ok(storage)
     }
 
@@ -383,6 +386,44 @@ CREATE TABLE IF NOT EXISTS project_metadata (
         metadata
             .save(&self.conn)
             .map_err(|_| rusqlite::Error::InvalidQuery)
+    }
+
+    /// Current schema version. Increment when adding migrations.
+    const SCHEMA_VERSION: u32 = 1;
+
+    /// Run database migrations based on the stored schema version.
+    /// Creates the version tracking table if it doesn't exist.
+    fn run_migrations(&mut self) -> SqliteResult<()> {
+        // Create version tracking table
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                key TEXT PRIMARY KEY,
+                version INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
+        // Read current version
+        let current: u32 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version WHERE key = 'schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        // Add future migrations here:
+        // if current < 2 { self.migrate_v1_to_v2()?; }
+        // if current < 3 { self.migrate_v2_to_v3()?; }
+
+        // Update stored version
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_version (key, version) VALUES ('schema', ?1)",
+            [Self::SCHEMA_VERSION],
+        )?;
+
+        Ok(())
     }
 }
 
