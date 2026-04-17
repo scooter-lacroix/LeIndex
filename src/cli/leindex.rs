@@ -1791,6 +1791,8 @@ impl LeIndex {
         // like crates/*/Cargo.toml, packages/**/package.json).
         // Skip common excluded directories to avoid false stale from node_modules etc.
         {
+            // TODO: Consolidate this list with SKIP_DIRS in external_deps.rs
+            // and ExclusionConfig in config.rs into a single shared constant.
             let skip_dirs: &[&str] = &[
                 "node_modules", ".git", "target", "vendor", ".cargo",
                 "dist", "build", "__pycache__", ".tox", ".venv", "venv",
