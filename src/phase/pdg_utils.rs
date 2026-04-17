@@ -219,7 +219,9 @@ pub fn relink_external_import_edges(pdg: &mut ProgramDependenceGraph, config: &R
         let Some(node) = pdg.get_node(node_idx) else {
             continue;
         };
-        if matches!(node.node_type, NodeType::External) {
+        if matches!(node.node_type, NodeType::External)
+            || node.language == "external" // Legacy compat
+        {
             continue;
         }
         for key in candidate_keys_for_node(node) {

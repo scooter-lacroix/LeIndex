@@ -1632,40 +1632,48 @@ impl LeIndex {
         // Use in-memory scan cache for a quick file-count comparison.
         // If not in memory, try to deserialize from the persistent cache_spiller.
         let mut cold_manifest_paths: Option<Vec<PathBuf>> = None;
-        let source_count = match &self.project_scan {
-            Some(cache) => cache.source_paths.len(),
+        let mut source_count: Option<usize> = None;
+        let mut cached_manifest_paths: Option<Vec<PathBuf>> = None;
+        match &self.project_scan {
+            // Note: self.project_scan is populated during full indexing.
+            // Files added AFTER indexing won't be detected until the next full scan
+            // (cold-cache path) or until the mtime sampling catches a change.
+            // This is a deliberate tradeoff for fast-path performance.
+            Some(cache) => {
+                source_count = Some(cache.source_paths.len());
+            }
             None => {
                 // Try persistent cache — first in-memory (peek), then disk-spilled
                 let cache_key = crate::cli::memory::project_scan_cache_key(&self.project_id);
                 if let Some(entry) = self.cache_spiller.store().peek(&cache_key) {
                     if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
                         if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(serialized_data) {
-                            if scan.source_paths.len() != indexed_files.len() {
-                                return true;
-                            }
-                            // Fall through to mtime sampling below
+                            cached_manifest_paths = Some(scan.manifest_paths.clone());
+                            source_count = Some(scan.source_paths.len());
                         }
                     }
                 } else if let Ok(entry) = self.cache_spiller.store().load_from_disk(&cache_key) {
                     // Cache was spilled to disk — deserialize from there
                     if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
                         if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
-                            if scan.source_paths.len() != indexed_files.len() {
-                                return true;
-                            }
+                            cached_manifest_paths = Some(scan.manifest_paths.clone());
+                            source_count = Some(scan.source_paths.len());
                         }
                     }
                 }
                 // Cache cold — do a quick scan to count source files
-                match self.scan_project_files() {
-                    Ok(scan) => {
-                        cold_manifest_paths = Some(scan.manifest_paths.clone());
-                        scan.source_paths.len()
+                if source_count.is_none() {
+                    match self.scan_project_files() {
+                        Ok(scan) => {
+                            cold_manifest_paths = Some(scan.manifest_paths.clone());
+                            source_count = Some(scan.source_paths.len());
+                        }
+                        Err(_) => return true, // Unknown inventory → treat as stale
                     }
-                    Err(_) => return true, // Unknown inventory → treat as stale
                 }
             }
         };
+        let source_count = source_count.unwrap_or(indexed_files.len());
 
         if source_count != indexed_files.len() {
             return true;
@@ -1699,46 +1707,17 @@ impl LeIndex {
         // If project_scan is cold, try loading manifest paths from cache.
         let manifest_paths: Vec<PathBuf> = if let Some(scan) = &self.project_scan {
             scan.manifest_paths.clone()
+        } else if let Some(ref paths) = cached_manifest_paths {
+            paths.clone()
+        } else if let Some(ref paths) = cold_manifest_paths {
+            paths.clone()
         } else {
-            // Try to get manifest paths from cache (same path as the source_count branch)
-            let cache_key = crate::cli::memory::project_scan_cache_key(&self.project_id);
-            let mut paths = Vec::new();
-            if let Some(entry) = self.cache_spiller.store().peek(&cache_key) {
-                if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
-                    if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(serialized_data) {
-                        paths = scan.manifest_paths;
-                    }
-                }
-            } else if let Ok(entry) = self.cache_spiller.store().load_from_disk(&cache_key) {
-                if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
-                    if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
-                        paths = scan.manifest_paths;
-                    }
-                }
-            }
-            paths
+            Vec::new()
         };
 
         // If we couldn't load manifest paths from any cache, check cold scan results
         if manifest_paths.is_empty() && self.project_scan.is_none() {
-            if let Some(cold_paths) = &cold_manifest_paths {
-                // Use manifest_paths from the cold scan we just performed
-                for manifest_path in cold_paths {
-                    match std::fs::metadata(manifest_path) {
-                        Ok(metadata) => {
-                            if let Ok(modified) = metadata.modified() {
-                                if modified > db_time {
-                                    return true;
-                                }
-                            }
-                        }
-                        Err(_) => return true,
-                    }
-                }
-                // Cold scan had manifest_paths and none were stale — skip quick probe
-                return false;
-            }
-            // No cold scan either — try a quick filesystem scan for common manifest files
+            // No manifest paths from any source — try a quick filesystem scan
             let quick_manifests = [
                 "Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
                 "poetry.lock", "Gemfile.lock", "go.sum",

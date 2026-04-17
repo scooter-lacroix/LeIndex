@@ -1256,9 +1256,28 @@ impl Refactor {
             });
         }
 
+        // Clone Arc and strings for the blocking closure
+        let pdg = Arc::clone(&engine.pdg);
+        let old_name = old_name.to_owned();
+        let new_name = new_name.to_owned();
+
+        tokio::task::spawn_blocking(move || {
+            Self::rename_symbol_blocking(&pdg, &old_name, &new_name)
+        })
+        .await
+        .map_err(|e| EditError::WorktreeError(format!("Rename task panicked: {}", e)))?
+    }
+
+    /// Synchronous rename implementation — runs on blocking thread pool.
+    fn rename_symbol_blocking(
+        pdg: &PDG,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<EditResult> {
+
         // 1. Resolve the PDG symbol candidates and prefer exact symbol hits.
-        let node_ids = engine.pdg.find_all_by_name(old_name);
-        let exact_node = engine.pdg.find_by_symbol(old_name);
+        let node_ids = pdg.find_all_by_name(old_name);
+        let exact_node = pdg.find_by_symbol(old_name);
 
         // Collect files containing the symbol definition AND all files that
         // reference it (call sites, type usages) via PDG forward/backward edges.
@@ -1293,24 +1312,24 @@ impl Refactor {
 
         // For each seed, collect definition file + forward/backward impact files
         for node_id in &seed_ids {
-            if let Some(node) = engine.pdg.get_node(*node_id) {
+            if let Some(node) = pdg.get_node(*node_id) {
                 if node.node_type != crate::graph::pdg::NodeType::External {
                     files.insert(PathBuf::from(&node.file_path));
 
                     // Add files that reference this symbol via PDG edges
-                    let impacted = engine.pdg.forward_impact(*node_id, &config);
+                    let impacted = pdg.forward_impact(*node_id, &config);
                     total_traversed += impacted.len();
                     for imp_id in impacted {
-                        if let Some(imp_node) = engine.pdg.get_node(imp_id) {
+                        if let Some(imp_node) = pdg.get_node(imp_id) {
                             if imp_node.node_type != crate::graph::pdg::NodeType::External {
                                 files.insert(PathBuf::from(&imp_node.file_path));
                             }
                         }
                     }
-                    let backward = engine.pdg.backward_impact(*node_id, &config);
+                    let backward = pdg.backward_impact(*node_id, &config);
                     total_traversed += backward.len();
                     for back_id in backward {
-                        if let Some(back_node) = engine.pdg.get_node(back_id) {
+                        if let Some(back_node) = pdg.get_node(back_id) {
                             if back_node.node_type != crate::graph::pdg::NodeType::External {
                                 files.insert(PathBuf::from(&back_node.file_path));
                             }
@@ -1322,10 +1341,13 @@ impl Refactor {
 
         if files.is_empty() {
             return Ok(EditResult {
-                success: true,
+                success: false,
                 changes_applied: 0,
                 files_modified: vec![],
-                error: None,
+                error: Some(format!(
+                    "Symbol '{}' was not found in project sources",
+                    old_name
+                )),
             });
         }
 
@@ -1364,7 +1386,7 @@ impl Refactor {
         let mut def_ranges: Vec<(usize, usize)> = Vec::new();
         let file_path_str = file_path.to_string_lossy();
         for node_id in &seed_ids {
-            if let Some(node) = engine.pdg.get_node(*node_id) {
+            if let Some(node) = pdg.get_node(*node_id) {
                 if node.file_path == file_path_str && node.byte_range != (0, 0) {
                     def_ranges.push(node.byte_range);
                 }
