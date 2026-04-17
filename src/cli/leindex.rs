@@ -1154,7 +1154,7 @@ impl LeIndex {
             // (Cargo.toml, package.json, etc.) respect exclusion rules.
             if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
                 if Self::is_dependency_manifest_name(name) {
-                    let is_lockfile = name.contains("lock") || name.contains(".sum");
+                    let is_lockfile = name.contains("lock") || name.contains(".sum") || name == "npm-shrinkwrap.json";
                     if is_lockfile || !project_config.should_exclude(path) {
                         manifest_paths.push(path.to_path_buf());
                     }
@@ -1792,6 +1792,7 @@ impl LeIndex {
         // Skip common excluded directories to avoid false stale from node_modules etc.
         {
             for entry in walkdir::WalkDir::new(&self.project_path)
+                .max_depth(5) // Manifests rarely deeper than crates/*/Cargo.toml
                 .into_iter()
                 .filter_entry(|e| {
                     // Skip known excluded directories

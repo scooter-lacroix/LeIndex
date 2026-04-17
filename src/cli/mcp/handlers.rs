@@ -3485,14 +3485,20 @@ Grep + multi-file Edit with a single atomic operation."
             let apply_files = files_to_modify.clone();
             tokio::task::spawn_blocking(move || {
                 for file_path in &apply_files {
-                    if let Ok(original) = std::fs::read_to_string(file_path) {
-                        let modified = replace_whole_word(&original, &old_name_c, &new_name_c);
-                        let _ = std::fs::write(file_path, modified.as_bytes());
+                    let original = match std::fs::read_to_string(file_path) {
+                        Ok(o) => o,
+                        Err(e) => return Err(format!("Failed reading '{}': {}", file_path, e)),
+                    };
+                    let modified = replace_whole_word(&original, &old_name_c, &new_name_c);
+                    if let Err(e) = std::fs::write(file_path, modified.as_bytes()) {
+                        return Err(format!("Failed writing '{}': {}", file_path, e));
                     }
                 }
+                Ok(())
             })
             .await
-            .map_err(|e| JsonRpcError::internal_error(format!("Rename apply failed: {}", e)))?;
+            .map_err(|e| JsonRpcError::internal_error(format!("Rename apply task failed: {}", e)))?
+            .map_err(JsonRpcError::internal_error)?;
         }
 
         Ok(wrap_with_meta(

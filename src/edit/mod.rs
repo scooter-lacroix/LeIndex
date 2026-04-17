@@ -242,16 +242,44 @@ fn replace_near_definitions(
         merged.push(w);
     }
 
-    // Build result: copy regions outside windows verbatim, replace within windows
+    // Find all whole-word match positions on the FULL content first,
+    // then filter to matches within the merged windows.
+    // This avoids false word boundaries at slice edges.
+    let mut matches_in_windows: Vec<(usize, usize)> = Vec::new(); // (start, end)
+    for (start, matched) in content.match_indices(old) {
+        let end = start + matched.len();
+        let before_ok = start == 0
+            || content[..start]
+                .chars()
+                .last()
+                .map(|c| !is_word_char(c))
+                .unwrap_or(true);
+        let after_ok = end == content.len()
+            || content[end..]
+                .chars()
+                .next()
+                .map(|c| !is_word_char(c))
+                .unwrap_or(true);
+        if before_ok && after_ok {
+            // Check if this match falls within any merged window
+            for &(win_start, win_end) in &merged {
+                if start >= win_start && end <= win_end {
+                    matches_in_windows.push((start, end));
+                    break;
+                }
+            }
+        }
+    }
+
+    // Build result: replace matched positions, copy everything else verbatim
     let mut result = String::with_capacity(content.len());
     let mut pos = 0usize;
-    for (win_start, win_end) in &merged {
-        if *win_start > pos {
-            result.push_str(&content[pos..*win_start]);
+    for (start, end) in &matches_in_windows {
+        if *start > pos {
+            result.push_str(&content[pos..*start]);
         }
-        let window_content = &content[*win_start..*win_end];
-        result.push_str(&replace_whole_word(window_content, old, new));
-        pos = *win_end;
+        result.push_str(new);
+        pos = *end;
     }
     if pos < content.len() {
         result.push_str(&content[pos..]);
@@ -1318,29 +1346,35 @@ impl Refactor {
             }
         }
 
-        let mut total_traversed: usize = 0;
+        let mut hit_node_limit = false;
 
         // For each seed, collect definition file + forward/backward impact files
         for node_id in &seed_ids {
             if let Some(node) = pdg.get_node(*node_id) {
-                if node.node_type != crate::graph::pdg::NodeType::External {
+                if node.node_type != crate::graph::pdg::NodeType::External
+                    && node.language != "external" // Legacy compat
+                {
                     files.insert(PathBuf::from(&node.file_path));
 
                     // Add files that reference this symbol via PDG edges
                     let impacted = pdg.forward_impact(*node_id, &traversal_config);
-                    total_traversed += impacted.len();
+                    hit_node_limit |= impacted.len() >= max_nodes_limit;
                     for imp_id in impacted {
                         if let Some(imp_node) = pdg.get_node(imp_id) {
-                            if imp_node.node_type != crate::graph::pdg::NodeType::External {
+                            if imp_node.node_type != crate::graph::pdg::NodeType::External
+                                && imp_node.language != "external"
+                            {
                                 files.insert(PathBuf::from(&imp_node.file_path));
                             }
                         }
                     }
                     let backward = pdg.backward_impact(*node_id, &traversal_config);
-                    total_traversed += backward.len();
+                    hit_node_limit |= backward.len() >= max_nodes_limit;
                     for back_id in backward {
                         if let Some(back_node) = pdg.get_node(back_id) {
-                            if back_node.node_type != crate::graph::pdg::NodeType::External {
+                            if back_node.node_type != crate::graph::pdg::NodeType::External
+                                && back_node.language != "external"
+                            {
                                 files.insert(PathBuf::from(&back_node.file_path));
                             }
                         }
@@ -1363,7 +1397,7 @@ impl Refactor {
 
         // Warn if the traversal hit the node limit — some references may have been missed
         let mut truncation_warning = None;
-        if total_traversed >= max_nodes_limit {
+        if hit_node_limit {
             truncation_warning = Some(format!(
                 "Warning: rename traversal hit the node limit ({}). Some references may be missing — verify manually.",
                 max_nodes_limit
