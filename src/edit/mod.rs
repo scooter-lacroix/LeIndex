@@ -1354,7 +1354,6 @@ impl Refactor {
         for node_id in &seed_ids {
             if let Some(node) = pdg.get_node(*node_id) {
                 if node.node_type != crate::graph::pdg::NodeType::External
-                    && node.language != "external" // Legacy compat
                 {
                     files.insert(PathBuf::from(&node.file_path));
 
@@ -1364,7 +1363,6 @@ impl Refactor {
                     for imp_id in impacted {
                         if let Some(imp_node) = pdg.get_node(imp_id) {
                             if imp_node.node_type != crate::graph::pdg::NodeType::External
-                                && imp_node.language != "external"
                             {
                                 files.insert(PathBuf::from(&imp_node.file_path));
                                 // Collect byte ranges from impact nodes
@@ -1379,7 +1377,6 @@ impl Refactor {
                     for back_id in backward {
                         if let Some(back_node) = pdg.get_node(back_id) {
                             if back_node.node_type != crate::graph::pdg::NodeType::External
-                                && back_node.language != "external"
                             {
                                 files.insert(PathBuf::from(&back_node.file_path));
                                 // Collect byte ranges from impact nodes

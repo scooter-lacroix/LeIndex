@@ -1012,6 +1012,9 @@ impl LeIndex {
             external_deps_unresolved: ext_unresolved,
         };
 
+        // Normalize external nodes (legacy compat)
+        Self::normalize_external_nodes(&mut pdg);
+
         // Keep PDG in memory
         self.pdg = Some(pdg);
 
@@ -1534,7 +1537,7 @@ impl LeIndex {
         info!("Loading project from storage: {}", self.project_id);
 
         // Load PDG from storage
-        let pdg = pdg_store::load_pdg(&self.storage, &self.project_id)
+        let mut pdg = pdg_store::load_pdg(&self.storage, &self.project_id)
             .context("Failed to load PDG from storage")?;
 
         let pdg_node_count = pdg.node_count();
@@ -1544,6 +1547,9 @@ impl LeIndex {
             "Loaded PDG with {} nodes and {} edges",
             pdg_node_count, pdg_edge_count
         );
+
+        // Normalize external nodes (legacy compat)
+        Self::normalize_external_nodes(&mut pdg);
 
         // Rebuild search index from PDG
         self.index_nodes(&pdg)?;
@@ -2138,6 +2144,23 @@ impl LeIndex {
         }
 
         Ok(context)
+    }
+
+    /// Normalize external nodes: ensure any node with `language == "external"`
+    /// also has `NodeType::External`. Eliminates the dual-check bug class caused
+    /// by legacy PDG data that set language without the enum variant.
+    fn normalize_external_nodes(pdg: &mut ProgramDependenceGraph) {
+        use crate::graph::pdg::NodeType;
+        let mut migrated = 0usize;
+        for node in pdg.node_weights_mut() {
+            if node.language == "external" && node.node_type != NodeType::External {
+                node.node_type = NodeType::External;
+                migrated += 1;
+            }
+        }
+        if migrated > 0 {
+            info!("Normalized {} external nodes to NodeType::External", migrated);
+        }
     }
 
     /// Save PDG to storage

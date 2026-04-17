@@ -758,6 +758,12 @@ impl ProgramDependenceGraph {
         self.graph.node_weight_mut(id)
     }
 
+    /// Returns a mutable slice of all node weights.
+    /// Used for bulk node mutations (e.g., external node normalization).
+    pub fn node_weights_mut(&mut self) -> impl Iterator<Item = &mut Node> {
+        self.graph.node_weights_mut()
+    }
+
     /// Retrieves a reference to an edge by its ID.
     ///
     /// # Arguments
