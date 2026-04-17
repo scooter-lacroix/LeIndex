@@ -3852,19 +3852,7 @@ to understand match context. Supports regex, globs, scope, and context_lines."
         let mut results: Vec<Value> = Vec::new();
 
         // Dirs to always skip
-        const SKIP_DIRS: &[&str] = &[
-            ".git",
-            "node_modules",
-            "target",
-            "__pycache__",
-            ".venv",
-            "venv",
-            "dist",
-            "build",
-            ".next",
-            ".nuxt",
-            "vendor",
-        ];
+        use crate::cli::skip_dirs::SKIP_DIRS;
 
         for entry in walkdir::WalkDir::new(project_root)
             .follow_links(false)

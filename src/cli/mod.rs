@@ -98,6 +98,8 @@ pub mod registry;
 /// File watcher for auto-reindex.
 #[cfg(feature = "mcp-server")]
 pub mod watcher;
+/// Shared directory exclusion constants.
+pub mod skip_dirs;
 
 /// Model Context Protocol (MCP) server implementation.
 #[cfg(feature = "mcp-server")]

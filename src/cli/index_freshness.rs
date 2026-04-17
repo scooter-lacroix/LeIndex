@@ -5,7 +5,8 @@ use crate::storage::schema::Storage;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use super::leindex::{ProjectFileScan, ALWAYS_SKIP_DIRS, DEPENDENCY_MANIFEST_NAMES};
+use super::leindex::{ProjectFileScan, DEPENDENCY_MANIFEST_NAMES};
+use crate::cli::skip_dirs::SKIP_DIRS;
 
 /// Read-only context passed to freshness functions to avoid borrow conflicts.
 pub(crate) struct FreshnessContext<'a> {
@@ -253,7 +254,7 @@ pub(crate) fn is_stale_fast(ctx: &FreshnessContext<'_>, scan_fn: impl Fn() -> Re
             .into_iter()
             .filter_entry(|e| {
                 if let Some(name) = e.file_name().to_str() {
-                    if ALWAYS_SKIP_DIRS.contains(&name) && e.file_type().is_dir() {
+                    if SKIP_DIRS.contains(&name) && e.file_type().is_dir() {
                         return false;
                     }
                 }

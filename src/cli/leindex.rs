@@ -31,37 +31,7 @@ pub(crate) const SOURCE_FILE_EXTENSIONS: &[&str] = &[
 ];
 
 // Directories to always skip during source collection
-pub(crate) const ALWAYS_SKIP_DIRS: &[&str] = &[
-    // Version control
-    ".git",
-    ".hg",
-    ".svn",
-    // Build outputs
-    "target",
-    "build",
-    "dist",
-    "out",
-    ".next",
-    "coverage",
-    // Package managers / dependencies
-    "node_modules",
-    "vendor",
-    "bower_components",
-    // Python virtual environments & caches
-    ".venv",
-    "venv",
-    "env",
-    "__pycache__",
-    ".tox",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    // IDE / editor metadata
-    ".idea",
-    ".vscode",
-    // Misc generated
-    ".leindex",
-];
+pub(crate) use crate::cli::skip_dirs::SKIP_DIRS;
 
 pub(crate) const DEPENDENCY_MANIFEST_NAMES: &[&str] = &[
     "Cargo.lock",
@@ -1096,7 +1066,7 @@ impl LeIndex {
             }
 
             if entry.file_type().is_dir() {
-                if ALWAYS_SKIP_DIRS.contains(&file_name.as_ref())
+                if SKIP_DIRS.contains(&file_name.as_ref())
                     || project_config.should_exclude(path)
                 {
                     walker.skip_current_dir();

@@ -1123,24 +1123,7 @@ pub fn discover_dependency_manifests(root: &Path, exclude_dirs: Option<&[String]
         "requirements.txt",
         "yarn.lock",
     ];
-    const SKIP_DIRS: &[&str] = &[
-        ".git",
-        ".hg",
-        ".svn",
-        ".idea",
-        ".vscode",
-        "node_modules",
-        "target",
-        "dist",
-        "build",
-        "out",
-        "coverage",
-        ".venv",
-        "venv",
-        "env",
-        "__pycache__",
-        "vendor",
-    ];
+    use crate::cli::skip_dirs::SKIP_DIRS;
 
     let mut discovered = Vec::new();
 
