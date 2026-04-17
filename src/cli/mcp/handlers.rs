@@ -2193,6 +2193,8 @@ impl GrepSymbolsHandler {
                 "language": node.language
             });
 
+            // TODO: Cache file contents within handler execution — read_source_snippet
+            // does sync I/O per match, which can be slow for large result sets.
             if context_lines > 0 {
                 if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
                     let snippet: String = src

@@ -1382,8 +1382,30 @@ impl Refactor {
 
         // Phase 1: collect all modifications (no writes yet)
         let mut pending_writes: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, modified)
-        // Cache all PDG nodes matching old_name once — avoids redundant lookups per file
-        let all_name_matches: Vec<_> = pdg.find_all_by_name(old_name);
+        // Cache all PDG nodes matching old_name once — avoids redundant lookups per file.
+        // Pre-group by file path for O(Files + Matches) instead of O(Files * Matches).
+        let mut matches_by_file: std::collections::HashMap<String, Vec<(usize, usize)>> = std::collections::HashMap::new();
+        for nid in pdg.find_all_by_name(old_name) {
+            if let Some(node) = pdg.get_node(nid) {
+                if node.byte_range != (0, 0) {
+                    matches_by_file
+                        .entry(node.file_path.clone())
+                        .or_default()
+                        .push(node.byte_range);
+                }
+            }
+        }
+        // Also add seed_ids ranges to the per-file map
+        for node_id in &seed_ids {
+            if let Some(node) = pdg.get_node(*node_id) {
+                if node.byte_range != (0, 0) {
+                    let entry = matches_by_file.entry(node.file_path.clone()).or_default();
+                    if !entry.contains(&node.byte_range) {
+                        entry.push(node.byte_range);
+                    }
+                }
+            }
+        }
         for file_path in &sorted_files {
             let original = match std::fs::read_to_string(file_path) {
                 Ok(content) => content,
@@ -1393,28 +1415,11 @@ impl Refactor {
                 }
             };
 
-            // Collect byte ranges from PDG nodes IN THIS FILE to restrict replacements
-            // to regions near known symbol definitions and references.
-            let mut def_ranges: Vec<(usize, usize)> = Vec::new();
-            let file_path_str = file_path.to_string_lossy();
-            for node_id in &seed_ids {
-                if let Some(node) = pdg.get_node(*node_id) {
-                    if node.file_path == file_path_str && node.byte_range != (0, 0) {
-                        def_ranges.push(node.byte_range);
-                    }
-                }
-            }
-            // Also collect ranges from all nodes in this file that reference the symbol
-            // (forward/backward impact results) — improves precision for reference-only files.
-            for nid in &all_name_matches {
-                if let Some(node) = pdg.get_node(*nid) {
-                    if node.file_path == file_path_str && node.byte_range != (0, 0) {
-                        if !def_ranges.contains(&node.byte_range) {
-                            def_ranges.push(node.byte_range);
-                        }
-                    }
-                }
-            }
+            // Look up pre-grouped ranges for this file
+            let def_ranges: Vec<(usize, usize)> = matches_by_file
+                .get(file_path.to_str().unwrap_or(""))
+                .cloned()
+                .unwrap_or_default();
 
             let modified = if def_ranges.is_empty() {
                 // No byte ranges available — fall back to whole-file replacement

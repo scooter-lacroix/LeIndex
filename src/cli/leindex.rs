@@ -1640,13 +1640,14 @@ impl LeIndex {
             }
         };
 
+        // Track which paths came from the original scan (for deleted-stale detection)
+        let original_scan_paths: std::collections::HashSet<PathBuf> =
+            paths_to_check.iter().cloned().collect();
+
         // Also check top-level manifests (covers newly added ones not in cache)
-        let mut all_paths = paths_to_check.clone();
+        let mut all_paths: std::collections::HashSet<PathBuf> = paths_to_check.into_iter().collect();
         for name in DEPENDENCY_MANIFEST_NAMES {
-            let p = self.project_path.join(name);
-            if !all_paths.contains(&p) {
-                all_paths.push(p);
-            }
+            all_paths.insert(self.project_path.join(name));
         }
 
         for manifest_path in &all_paths {
@@ -1659,10 +1660,9 @@ impl LeIndex {
                     }
                 }
                 Err(_) => {
-                    // Only treat as deleted if it was in the original scan results
-                    // (paths_to_check from cache/discovery). Root-level probes
-                    // that don't exist are simply absent — not stale.
-                    if paths_to_check.contains(manifest_path) {
+                    // Only treat as deleted if it was in the original scan results.
+                    // Root-level probes that don't exist are simply absent — not stale.
+                    if original_scan_paths.contains(manifest_path) {
                         return true;
                     }
                 }
@@ -1791,18 +1791,12 @@ impl LeIndex {
         // like crates/*/Cargo.toml, packages/**/package.json).
         // Skip common excluded directories to avoid false stale from node_modules etc.
         {
-            // TODO: Consolidate this list with SKIP_DIRS in external_deps.rs
-            // and ExclusionConfig in config.rs into a single shared constant.
-            let skip_dirs: &[&str] = &[
-                "node_modules", ".git", "target", "vendor", ".cargo",
-                "dist", "build", "__pycache__", ".tox", ".venv", "venv",
-            ];
             for entry in walkdir::WalkDir::new(&self.project_path)
                 .into_iter()
                 .filter_entry(|e| {
                     // Skip known excluded directories
                     if let Some(name) = e.file_name().to_str() {
-                        if skip_dirs.contains(&name) && e.file_type().is_dir() {
+                        if ALWAYS_SKIP_DIRS.contains(&name) && e.file_type().is_dir() {
                             return false;
                         }
                     }
@@ -1986,6 +1980,11 @@ impl LeIndex {
     }
 
     /// Collect source files that belong to this project using the same exclusion rules as indexing.
+    /// Get the list of source file paths for the project.
+    ///
+    /// TODO: This reuses the cached scan — after file additions/deletions,
+    /// callers may get stale inventories until a forced refresh/reindex.
+    /// Consider adding an optional `refresh` parameter or invalidation on FS changes.
     pub fn source_file_paths(&mut self) -> Result<Vec<PathBuf>> {
         self.collect_source_file_paths(false)
     }
