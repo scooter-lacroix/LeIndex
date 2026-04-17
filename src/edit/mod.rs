@@ -1237,6 +1237,14 @@ impl Refactor {
                 error: Some("old_name and new_name must be non-empty".to_string()),
             });
         }
+        if old_name == new_name {
+            return Ok(EditResult {
+                success: true,
+                changes_applied: 0,
+                files_modified: vec![],
+                error: None,
+            });
+        }
 
         // 1. Resolve the PDG symbol candidates and prefer exact symbol hits.
         let node_ids = engine.pdg.find_all_by_name(old_name);
@@ -1407,6 +1415,16 @@ impl Refactor {
             }
         }
 
+        if !errors.is_empty() {
+            // Rollback was already performed in the loop — return clean zero metrics
+            return Ok(EditResult {
+                success: false,
+                changes_applied: 0,
+                files_modified: vec![],
+                error: Some(errors.join("; ")),
+            });
+        }
+
         Ok(EditResult {
             success: errors.is_empty(),
             changes_applied: total_changes,
@@ -1487,7 +1505,14 @@ impl Diff {
         if patch_str.is_empty() {
             Ok((format!("{} (unchanged)", file_path.display()), String::new()))
         } else {
-            Ok((format!("--- {}", file_path.display()), format!("+++ {}\n{}", file_path.display(), patch_str)))
+            // diffy's output already contains ---/+++ headers with generic labels;
+            // replace them with the actual file path
+            let lines: Vec<&str> = patch_str.lines().collect();
+            let body = lines.iter().skip(2).cloned().collect::<Vec<_>>().join("\n");
+            Ok((
+                format!("--- {}", file_path.display()),
+                format!("+++ {}\n{}", file_path.display(), body),
+            ))
         }
     }
 }

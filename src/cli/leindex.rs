@@ -1655,12 +1655,15 @@ impl LeIndex {
                         }
                     }
                 }
-                // Count unknown — continue to mtime sampling as a baseline check
-                usize::MAX // sentinel: skip count-mismatch check
+                // Cache cold — do a quick scan to count source files
+                match self.scan_project_files() {
+                    Ok(scan) => scan.source_paths.len(),
+                    Err(_) => return true, // Unknown inventory → treat as stale
+                }
             }
         };
 
-        if source_count != usize::MAX && source_count != indexed_files.len() {
+        if source_count != indexed_files.len() {
             return true;
         }
 
@@ -1732,11 +1735,17 @@ impl LeIndex {
             }
         }
         for manifest_path in &manifest_paths {
-            if let Ok(metadata) = std::fs::metadata(manifest_path) {
-                if let Ok(modified) = metadata.modified() {
-                    if modified > db_time {
-                        return true;
+            match std::fs::metadata(manifest_path) {
+                Ok(metadata) => {
+                    if let Ok(modified) = metadata.modified() {
+                        if modified > db_time {
+                            return true;
+                        }
                     }
+                }
+                Err(_) => {
+                    // Manifest existed at scan/index time but is now missing → stale
+                    return true;
                 }
             }
         }
@@ -1854,7 +1863,6 @@ impl LeIndex {
                 for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Outgoing) {
                     if let Some(dep) = pdg.get_node(dep_id) {
                         if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
-                            && dep.byte_range != (0, 0)
                             && dep.file_path != *file_path
                         {
                             outgoing_files.insert(dep.file_path.clone());
@@ -1864,7 +1872,6 @@ impl LeIndex {
                 for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Incoming) {
                     if let Some(dep) = pdg.get_node(dep_id) {
                         if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
-                            && dep.byte_range != (0, 0)
                             && dep.file_path != *file_path
                         {
                             incoming_files.insert(dep.file_path.clone());
