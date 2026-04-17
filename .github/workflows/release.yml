@@ -347,6 +347,24 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Verify HEAD matches release commit
+        if: >
+          needs.crates-io.result == 'success' &&
+          needs.pypi.result == 'success' &&
+          (needs.npm.result == 'success' || needs.npm.result == 'skipped')
+        run: |
+          VERSION="${{ needs.detect.outputs.version }}"
+          RELEASE_SHA=$(gh release view "v${VERSION}" --json targetCommitish --jq '.targetCommitish')
+          HEAD_SHA=$(git rev-parse HEAD)
+          if [ "$RELEASE_SHA" != "$HEAD_SHA" ]; then
+            echo "ERROR: Release SHA ($RELEASE_SHA) != HEAD ($HEAD_SHA)"
+            echo "New commits landed during release — aborting undraft."
+            exit 1
+          fi
+          echo "SHA verified: $HEAD_SHA"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Publish draft release
         if: >
           needs.crates-io.result == 'success' &&

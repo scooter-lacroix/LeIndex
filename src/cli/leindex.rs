@@ -1717,13 +1717,9 @@ impl LeIndex {
 
         // Always probe for common manifest files — even when cached manifest_paths
         // is populated, newly added lockfiles/manifests after indexing won't be in the
-        // cache. This is cheap (7 stat() calls at most).
+        // cache. Uses the same DEPENDENCY_MANIFEST_NAMES constant as discovery.
         {
-            let quick_manifests = [
-                "Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-                "poetry.lock", "Gemfile.lock", "go.sum",
-            ];
-            for name in &quick_manifests {
+            for name in DEPENDENCY_MANIFEST_NAMES {
                 let p = self.project_path.join(name);
                 if let Ok(metadata) = std::fs::metadata(&p) {
                     if let Ok(modified) = metadata.modified() {
