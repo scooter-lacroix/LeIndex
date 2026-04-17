@@ -396,9 +396,17 @@ pub struct LeIndex {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Result of scanning the project for source and manifest files.
+///
+/// `source_directories` tracks unique directories containing source files.
+/// When a new file is added, its directory's mtime changes, so checking
+/// these ~10-20 directories (instead of thousands of files) detects new
+/// additions in <1ms.
 struct ProjectFileScan {
     source_paths: Vec<PathBuf>,
     manifest_paths: Vec<PathBuf>,
+    #[serde(default)]
+    source_directories: Vec<PathBuf>,
 }
 
 /// Per-file statistics cached from PDG
@@ -1176,10 +1184,27 @@ impl LeIndex {
             }
         }
 
+        let source_directories = Self::extract_unique_dirs(&source_paths);
         Ok(ProjectFileScan {
             source_paths,
             manifest_paths,
+            source_directories,
         })
+    }
+
+    /// Extract sorted unique directories from a list of file paths.
+    /// Used to track which directories contain source files for fast
+    /// new-file detection via directory mtime checking.
+    fn extract_unique_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
+        let mut dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        for path in paths {
+            if let Some(parent) = path.parent() {
+                dirs.insert(parent.to_path_buf());
+            }
+        }
+        let mut result: Vec<PathBuf> = dirs.into_iter().collect();
+        result.sort();
+        result
     }
 
     fn hash_file(&self, path: &Path) -> Result<String> {
@@ -1675,11 +1700,15 @@ impl LeIndex {
 
     /// Fast-path freshness check that avoids full filesystem scan when possible.
     /// Samples indexed files for deletion or modification and checks manifest
-    /// mtimes. Returns true when the index is stale (needs reindexing).
+    /// Fast-path freshness check: O(1) for indexed files, O(D) for source
+    /// directories (typically 10-20), and O(M) for manifest files.
     ///
-    /// This is a heuristic: it samples a subset of indexed files to quickly
-    /// positively confirm staleness (file count mismatch, deleted files,
-    /// or mtime newer than DB).
+    /// Detection layers (in order):
+    /// 1. Source count mismatch (cached vs indexed)
+    /// 2. Directory mtime sentinel — detects new file additions in <1ms
+    ///    by checking the ~10-20 directories that contain source files
+    /// 3. Mtime sampling of 50-500 indexed files
+    /// 4. Manifest walkdir (depth-limited) for dependency changes
     pub fn is_stale_fast(&self) -> bool {
         let indexed_files =
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
@@ -1706,11 +1735,9 @@ impl LeIndex {
         let mut cold_manifest_paths: Option<Vec<PathBuf>> = None;
         let mut source_count: Option<usize> = None;
         let mut cached_manifest_paths: Option<Vec<PathBuf>> = None;
+        let mut cached_scan: Option<ProjectFileScan> = None;
         match &self.project_scan {
-            // Note: self.project_scan is populated during full indexing.
-            // Files added AFTER indexing won't be detected until the next full scan
-            // (cold-cache path) or until the mtime sampling catches a change.
-            // This is a deliberate tradeoff for fast-path performance.
+            // Hot cache from last full index — source_count + source_directories available
             Some(cache) => {
                 source_count = Some(cache.source_paths.len());
             }
@@ -1721,6 +1748,7 @@ impl LeIndex {
                     if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
                         if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(serialized_data) {
                             cached_manifest_paths = Some(scan.manifest_paths.clone());
+                            cached_scan = Some(scan.clone());
                             source_count = Some(scan.source_paths.len());
                         }
                     }
@@ -1729,6 +1757,7 @@ impl LeIndex {
                     if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
                         if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
                             cached_manifest_paths = Some(scan.manifest_paths.clone());
+                            cached_scan = Some(scan.clone());
                             source_count = Some(scan.source_paths.len());
                         }
                     }
@@ -1749,6 +1778,46 @@ impl LeIndex {
 
         if source_count != indexed_files.len() {
             return true;
+        }
+
+        // Directory mtime sentinel check: when a new file is created in a
+        // directory (or a new subdirectory is created), the directory's mtime
+        // changes. By checking only the ~10-20 directories that contained source
+        // files at index time, we detect new file additions in <1ms without a
+        // full tree walk.
+        let source_dirs: Vec<PathBuf> = if let Some(scan) = &self.project_scan {
+            scan.source_directories.clone()
+        } else if let Some(scan) = cached_scan.as_ref() {
+            scan.source_directories.clone()
+        } else {
+            // Cold cache — extract from indexed file paths (cheap, O(N) but rare)
+            let mut dirs: Vec<PathBuf> = indexed_files
+                .keys()
+                .filter_map(|p| PathBuf::from(p).parent().map(|d| d.to_path_buf()))
+                .collect();
+            dirs.sort();
+            dirs.dedup();
+            dirs
+        };
+        for dir in &source_dirs {
+            let full_path = if dir.is_absolute() {
+                dir.clone()
+            } else {
+                self.project_path.join(dir)
+            };
+            match std::fs::metadata(&full_path) {
+                Ok(metadata) => {
+                    if let Ok(modified) = metadata.modified() {
+                        if modified > db_time {
+                            return true; // Directory changed — new file added or removed
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Directory deleted — definitely stale
+                    return true;
+                }
+            }
         }
 
         // Quick spot-check: sample indexed files for deletion or modification.
