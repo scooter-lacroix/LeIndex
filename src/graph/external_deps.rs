@@ -1142,7 +1142,6 @@ pub fn discover_dependency_manifests(root: &Path, exclude_dirs: Option<&[String]
         "vendor",
     ];
 
-    let manifest_names: HashSet<&str> = MANIFEST_NAMES.iter().copied().collect();
     let mut discovered = Vec::new();
 
     let mut walker = walkdir::WalkDir::new(root).follow_links(false).into_iter();
@@ -1193,7 +1192,7 @@ pub fn discover_dependency_manifests(root: &Path, exclude_dirs: Option<&[String]
             continue;
         }
 
-        if entry.file_type().is_file() && manifest_names.contains(file_name.as_ref()) {
+        if entry.file_type().is_file() && MANIFEST_NAMES.binary_search(&file_name.as_ref()).is_ok() {
             discovered.push(path.to_path_buf());
         }
     }

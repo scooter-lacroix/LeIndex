@@ -214,8 +214,12 @@ fn replace_near_definitions(
         return content.to_owned();
     }
 
+    // Context buffer (bytes) around each definition for targeted replacement.
+    // Covers typical function bodies plus surrounding references.
+    const REPLACE_CONTEXT_BYTES: usize = 2048;
+
     // Build sorted, non-overlapping windows around each definition
-    let ctx = 2048; // bytes of context around each definition
+    let ctx = REPLACE_CONTEXT_BYTES;
     let mut windows: Vec<(usize, usize)> = def_ranges
         .iter()
         .map(|&(s, e)| {

@@ -1641,7 +1641,7 @@ impl LeIndex {
         };
 
         // Also check top-level manifests (covers newly added ones not in cache)
-        let mut all_paths = paths_to_check;
+        let mut all_paths = paths_to_check.clone();
         for name in DEPENDENCY_MANIFEST_NAMES {
             let p = self.project_path.join(name);
             if !all_paths.contains(&p) {
@@ -1659,8 +1659,12 @@ impl LeIndex {
                     }
                 }
                 Err(_) => {
-                    // Manifest was deleted — stale
-                    return true;
+                    // Only treat as deleted if it was in the original scan results
+                    // (paths_to_check from cache/discovery). Root-level probes
+                    // that don't exist are simply absent — not stale.
+                    if paths_to_check.contains(manifest_path) {
+                        return true;
+                    }
                 }
             }
         }
@@ -1785,9 +1789,23 @@ impl LeIndex {
         // is populated, newly added manifests after indexing won't be in the cache.
         // Walk the project tree to find ALL manifests (including nested workspace ones
         // like crates/*/Cargo.toml, packages/**/package.json).
+        // Skip common excluded directories to avoid false stale from node_modules etc.
         {
+            let skip_dirs: &[&str] = &[
+                "node_modules", ".git", "target", "vendor", ".cargo",
+                "dist", "build", "__pycache__", ".tox", ".venv", "venv",
+            ];
             for entry in walkdir::WalkDir::new(&self.project_path)
                 .into_iter()
+                .filter_entry(|e| {
+                    // Skip known excluded directories
+                    if let Some(name) = e.file_name().to_str() {
+                        if skip_dirs.contains(&name) && e.file_type().is_dir() {
+                            return false;
+                        }
+                    }
+                    true
+                })
                 .filter_map(|e| e.ok())
             {
                 let Some(name) = entry.file_name().to_str() else { continue };
