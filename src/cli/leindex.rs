@@ -875,8 +875,14 @@ impl LeIndex {
         );
 
         if files_to_parse.is_empty() && deleted_files.is_empty() && self.is_indexed() {
-            info!("No changes detected, skipping indexing");
-            return Ok(self.stats.clone());
+            // Source files unchanged — but check if manifest/lockfiles changed,
+            // which requires re-annotating external dependencies.
+            let manifest_dirty = self.check_manifest_stale();
+            if !manifest_dirty {
+                info!("No changes detected, skipping indexing");
+                return Ok(self.stats.clone());
+            }
+            info!("Manifest files changed — running external dependency annotation");
         }
 
         // Step 4: Parse changed files
@@ -1143,12 +1149,15 @@ impl LeIndex {
                 continue;
             }
 
-            // Check for dependency manifests BEFORE exclusions so lockfiles
-            // (Cargo.lock, package-lock.json, etc.) are always collected
-            // regardless of any exclusion patterns.
+            // Check for dependency manifests. Lockfiles (Cargo.lock, etc.) are
+            // always collected regardless of exclusion patterns. Workspace manifests
+            // (Cargo.toml, package.json, etc.) respect exclusion rules.
             if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
                 if Self::is_dependency_manifest_name(name) {
-                    manifest_paths.push(path.to_path_buf());
+                    let is_lockfile = name.contains("lock") || name.contains(".sum");
+                    if is_lockfile || !project_config.should_exclude(path) {
+                        manifest_paths.push(path.to_path_buf());
+                    }
                     continue; // Don't also add manifests to source_paths
                 }
             }
@@ -1606,6 +1615,63 @@ impl LeIndex {
     ///
     /// Falls back gracefully if no in-memory cache is available by checking
     /// the persistent cache store. Returns `true` (stale) only when it can
+    /// Check if any dependency manifest/lockfile has changed since last index.
+    /// Used to decide whether to re-run external dependency annotation even
+    /// when no source files changed.
+    fn check_manifest_stale(&self) -> bool {
+        let db_time = match self.storage_path
+            .join("leindex.db")
+            .metadata()
+            .and_then(|m| m.modified())
+        {
+            Ok(t) => t,
+            Err(_) => return true, // No DB file — stale
+        };
+
+        // Probe all known manifest paths (from cache or discovery)
+        let scan = self.project_scan.as_ref();
+        let paths_to_check: Vec<PathBuf> = if let Some(scan) = scan {
+            scan.manifest_paths.clone()
+        } else {
+            // Cold cache — do a quick filesystem scan
+            match self.scan_project_files() {
+                Ok(scan) => scan.manifest_paths,
+                Err(_) => return true,
+            }
+        };
+
+        // Also check top-level manifests (covers newly added ones not in cache)
+        let mut all_paths = paths_to_check;
+        for name in DEPENDENCY_MANIFEST_NAMES {
+            let p = self.project_path.join(name);
+            if !all_paths.contains(&p) {
+                all_paths.push(p);
+            }
+        }
+
+        for manifest_path in &all_paths {
+            match std::fs::metadata(manifest_path) {
+                Ok(metadata) => {
+                    if let Ok(modified) = metadata.modified() {
+                        if modified > db_time {
+                            return true;
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Manifest was deleted — stale
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Fast-path freshness check that avoids full filesystem scan when possible.
+    /// Samples indexed files for deletion or modification and checks manifest
+    /// mtimes. Returns true when the index is stale (needs reindexing).
+    ///
+    /// This is a heuristic: it samples a subset of indexed files to quickly
     /// positively confirm staleness (file count mismatch, deleted files,
     /// or mtime newer than DB).
     pub fn is_stale_fast(&self) -> bool {
@@ -1715,13 +1781,20 @@ impl LeIndex {
             Vec::new()
         };
 
-        // Always probe for common manifest files — even when cached manifest_paths
-        // is populated, newly added lockfiles/manifests after indexing won't be in the
-        // cache. Uses the same DEPENDENCY_MANIFEST_NAMES constant as discovery.
+        // Always probe for manifest files — even when cached manifest_paths
+        // is populated, newly added manifests after indexing won't be in the cache.
+        // Walk the project tree to find ALL manifests (including nested workspace ones
+        // like crates/*/Cargo.toml, packages/**/package.json).
         {
-            for name in DEPENDENCY_MANIFEST_NAMES {
-                let p = self.project_path.join(name);
-                if let Ok(metadata) = std::fs::metadata(&p) {
+            for entry in walkdir::WalkDir::new(&self.project_path)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let Some(name) = entry.file_name().to_str() else { continue };
+                if !DEPENDENCY_MANIFEST_NAMES.contains(&name) {
+                    continue;
+                }
+                if let Ok(metadata) = entry.metadata() {
                     if let Ok(modified) = metadata.modified() {
                         if modified > db_time {
                             return true;

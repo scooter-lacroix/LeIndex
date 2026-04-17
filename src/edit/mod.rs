@@ -1177,7 +1177,7 @@ pub enum EditCommand {
         timestamp: chrono::DateTime<chrono::Utc>,
 
         /// Original file content before the edit (for undo).
-        original_content: Option<String>,
+            original_content: Option<String>,
     },
 
     /// Rollback point
@@ -1378,6 +1378,8 @@ impl Refactor {
 
         // Phase 1: collect all modifications (no writes yet)
         let mut pending_writes: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, modified)
+        // Cache all PDG nodes matching old_name once — avoids redundant lookups per file
+        let all_name_matches: Vec<_> = pdg.find_all_by_name(old_name);
         for file_path in &sorted_files {
             let original = match std::fs::read_to_string(file_path) {
                 Ok(content) => content,
@@ -1400,8 +1402,8 @@ impl Refactor {
             }
             // Also collect ranges from all nodes in this file that reference the symbol
             // (forward/backward impact results) — improves precision for reference-only files.
-            for nid in pdg.find_all_by_name(old_name) {
-                if let Some(node) = pdg.get_node(nid) {
+            for nid in &all_name_matches {
+                if let Some(node) = pdg.get_node(*nid) {
                     if node.file_path == file_path_str && node.byte_range != (0, 0) {
                         if !def_ranges.contains(&node.byte_range) {
                             def_ranges.push(node.byte_range);
@@ -1543,7 +1545,12 @@ impl Diff {
         EditEngine::format_unified_diff(original, modified, file_path)
     }
 
-    /// Generate a side-by-side diff
+    /// Generate a split unified diff tuple (left header, right header + body).
+    ///
+    /// Despite the name, this returns a pair of strings representing the `---` and
+    /// `+++` sides of a unified diff (not a true side-by-side layout). The first
+    /// element is the `--- {file_path}` header; the second is `+++ {file_path}`
+    /// followed by the diff body lines.
     pub fn generate_side_by_side_diff(
         original: &str,
         modified: &str,
@@ -1772,7 +1779,7 @@ mod tests {
             file_path: PathBuf::from("test.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
-        original_content: None,
+            original_content: None,
         };
 
         history.record_command(command);
@@ -1790,7 +1797,7 @@ mod tests {
             file_path: PathBuf::from("test.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
-        original_content: None,
+            original_content: None,
         };
 
         history.record_command(command.clone());
@@ -1816,7 +1823,7 @@ mod tests {
             file_path: PathBuf::from("test.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
-        original_content: None,
+            original_content: None,
         };
 
         history.record_command(command.clone());
@@ -1846,7 +1853,7 @@ mod tests {
                 file_path: PathBuf::from(format!("test{}.py", i)),
                 changes: vec![],
                 timestamp: chrono::Utc::now(),
-            original_content: None,
+                original_content: None,
             };
             history.record_command(command);
         }
@@ -1861,7 +1868,7 @@ mod tests {
             file_path: PathBuf::from("test3.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
-        original_content: None,
+            original_content: None,
         };
         history.record_command(command);
         assert_eq!(history.current_index(), 4);
@@ -1890,7 +1897,7 @@ mod tests {
                 file_path: PathBuf::from(format!("test{}.py", i)),
                 changes: vec![],
                 timestamp: chrono::Utc::now(),
-            original_content: None,
+                original_content: None,
             };
             history.record_command(command);
         }
@@ -1906,7 +1913,7 @@ mod tests {
             file_path: PathBuf::from("new.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
-        original_content: None,
+            original_content: None,
         };
         history.record_command(command);
 
@@ -2092,7 +2099,7 @@ mod tests {
             file_path: PathBuf::from("test.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
-        original_content: None,
+            original_content: None,
         };
 
         assert!(matches!(command, EditCommand::Edit { .. }));
