@@ -24,8 +24,10 @@ use tracing::{debug, info, warn};
 // Supported source file extensions for indexing
 const SOURCE_FILE_EXTENSIONS: &[&str] = &[
     // Main languages
-    "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", // Systems languages
-    "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Others
+    "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts",
+    // Systems languages
+    "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp",
+    // Scripting & other
     "cs", "rb", "php", "lua", "scala", "sc", "sh", "bash", "json",
 ];
 
@@ -1792,7 +1794,7 @@ impl LeIndex {
         // Skip common excluded directories to avoid false stale from node_modules etc.
         {
             for entry in walkdir::WalkDir::new(&self.project_path)
-                .max_depth(5) // Manifests rarely deeper than crates/*/Cargo.toml
+                .max_depth(8) // Covers nested monorepos like packages/group/sub/Cargo.toml
                 .into_iter()
                 .filter_entry(|e| {
                     // Skip known excluded directories

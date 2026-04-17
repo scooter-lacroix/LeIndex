@@ -1347,6 +1347,8 @@ impl Refactor {
         }
 
         let mut hit_node_limit = false;
+        // Collect byte ranges from impact traversal for targeted replacements
+        let mut impact_ranges: std::collections::HashMap<String, Vec<(usize, usize)>> = std::collections::HashMap::new();
 
         // For each seed, collect definition file + forward/backward impact files
         for node_id in &seed_ids {
@@ -1365,6 +1367,10 @@ impl Refactor {
                                 && imp_node.language != "external"
                             {
                                 files.insert(PathBuf::from(&imp_node.file_path));
+                                // Collect byte ranges from impact nodes
+                                if imp_node.byte_range != (0, 0) {
+                                    impact_ranges.entry(imp_node.file_path.clone()).or_default().push(imp_node.byte_range);
+                                }
                             }
                         }
                     }
@@ -1376,6 +1382,10 @@ impl Refactor {
                                 && back_node.language != "external"
                             {
                                 files.insert(PathBuf::from(&back_node.file_path));
+                                // Collect byte ranges from impact nodes
+                                if back_node.byte_range != (0, 0) {
+                                    impact_ranges.entry(back_node.file_path.clone()).or_default().push(back_node.byte_range);
+                                }
                             }
                         }
                     }
@@ -1449,19 +1459,29 @@ impl Refactor {
                 }
             };
 
-            // Look up pre-grouped ranges for this file
-            let def_ranges: Vec<(usize, usize)> = matches_by_file
+            // Look up pre-grouped ranges for this file (includes PDG name matches + traversal impacts)
+            let mut def_ranges: Vec<(usize, usize)> = matches_by_file
                 .get(file_path.to_str().unwrap_or(""))
                 .cloned()
                 .unwrap_or_default();
+            // Also include ranges from traversal impact nodes in this file
+            if let Some(imp_ranges) = impact_ranges.get(file_path.to_str().unwrap_or("")) {
+                for r in imp_ranges {
+                    if !def_ranges.contains(r) {
+                        def_ranges.push(*r);
+                    }
+                }
+            }
 
-            let modified = if def_ranges.is_empty() {
-                // No byte ranges available — fall back to whole-file replacement
-                replace_whole_word(&original, old_name, new_name)
-            } else {
-                // Targeted replacement: only replace within expanded windows around definitions
-                replace_near_definitions(&original, old_name, new_name, &def_ranges)
-            };
+            if def_ranges.is_empty() {
+                // No local definition or reference ranges for this file — skip it.
+                // The file was reached via PDG traversal but may not contain the symbol.
+                // Whole-file replacement would risk corrupting unrelated same-name tokens.
+                continue;
+            }
+
+            // Targeted replacement: only replace within expanded windows around definitions
+            let modified = replace_near_definitions(&original, old_name, new_name, &def_ranges);
             if modified != original {
                 pending_writes.push((file_path.clone(), original, modified));
             }

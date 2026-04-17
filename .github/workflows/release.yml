@@ -298,7 +298,14 @@ jobs:
 
       - name: Publish to npm
         if: steps.check_token.outputs.available == 'true'
-        run: npm publish --access public
+        run: |
+          PKG_NAME=$(node -p "require('./packages/npm-leindex-mcp/package.json').name")
+          PKG_VER=$(node -p "require('./packages/npm-leindex-mcp/package.json').version")
+          if npm view "${PKG_NAME}@${PKG_VER}" version 2>/dev/null | grep -q "${PKG_VER}"; then
+            echo "Version ${PKG_VER} already published to npm — skipping"
+          else
+            npm publish --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
@@ -336,7 +343,14 @@ jobs:
         run: python -m build
 
       - name: Publish to PyPI
-        run: twine upload dist/* --non-interactive
+        run: |
+          PYPI_VER=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          PKG_NAME=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['name'])")
+          if pip install "${PKG_NAME}==${PYPI_VER}" --dry-run 2>&1 | grep -q "Would install"; then
+            echo "Version ${PYPI_VER} already on PyPI — skipping upload"
+          else
+            twine upload dist/* --non-interactive
+          fi
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
