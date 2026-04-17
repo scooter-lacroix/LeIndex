@@ -34,7 +34,7 @@ jobs:
           set -e
           CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
           NPM_VER=$(python3 -c "import json; print(json.load(open('packages/npm-leindex-mcp/package.json'))['version'])" 2>/dev/null || echo "MISSING")
-          PYPI_VER=$(python3 -c "import tomllib; print(tomllib.loads(open('packages/pypi-leindex/pyproject.toml','rb').read())['project']['version'])" 2>/dev/null || echo "MISSING")
+          PYPI_VER=$(python3 -c "import tomllib; print(tomllib.load(open('packages/pypi-leindex/pyproject.toml','rb'))['project']['version'])" 2>/dev/null || echo "MISSING")
           echo "Cargo: ${CARGO_VER}  npm: ${NPM_VER}  PyPI: ${PYPI_VER}"
           if [ "$CARGO_VER" != "$NPM_VER" ] || [ "$CARGO_VER" != "$PYPI_VER" ]; then
             echo "ERROR: Version mismatch! Cargo=$CARGO_VER npm=$NPM_VER PyPI=$PYPI_VER"
@@ -57,6 +57,8 @@ jobs:
 
       - name: Extract version from Cargo.toml
         id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -64,13 +66,13 @@ jobs:
           # Fetch all tags explicitly (ensures tag list is accurate)
           git fetch --tags
 
-          # Check if a tag for this version already exists
-          if git tag -l "v${VERSION}" | grep -q .; then
+          # Check if a published (non-draft) release for this version already exists
+          if gh release view "v${VERSION}" --json isDraft --jq '.isDraft' 2>/dev/null | grep -q false; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Tag v${VERSION} already exists — skipping release"
+            echo "Published release v${VERSION} already exists — skipping"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "New version detected: v${VERSION}"
+            echo "New version or draft-only: v${VERSION}"
           fi
 
   # ── Build native binaries ────────────────────────────────────────────
@@ -346,7 +348,10 @@ jobs:
           fetch-depth: 0
 
       - name: Publish draft release
-        if: needs.crates-io.result == 'success' && needs.pypi.result == 'success'
+        if: >
+          needs.crates-io.result == 'success' &&
+          needs.pypi.result == 'success' &&
+          (needs.npm.result == 'success' || needs.npm.result == 'skipped')
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           gh release edit "v${VERSION}" --draft=false

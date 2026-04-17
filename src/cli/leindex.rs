@@ -1631,6 +1631,7 @@ impl LeIndex {
 
         // Use in-memory scan cache for a quick file-count comparison.
         // If not in memory, try to deserialize from the persistent cache_spiller.
+        let mut cold_manifest_paths: Option<Vec<PathBuf>> = None;
         let source_count = match &self.project_scan {
             Some(cache) => cache.source_paths.len(),
             None => {
@@ -1657,7 +1658,10 @@ impl LeIndex {
                 }
                 // Cache cold — do a quick scan to count source files
                 match self.scan_project_files() {
-                    Ok(scan) => scan.source_paths.len(),
+                    Ok(scan) => {
+                        cold_manifest_paths = Some(scan.manifest_paths.clone());
+                        scan.source_paths.len()
+                    }
                     Err(_) => return true, // Unknown inventory → treat as stale
                 }
             }
@@ -1715,10 +1719,26 @@ impl LeIndex {
             paths
         };
 
-        // If we couldn't load manifest paths from any cache, we can't verify
-        // dependency freshness — treat as stale to be safe
+        // If we couldn't load manifest paths from any cache, check cold scan results
         if manifest_paths.is_empty() && self.project_scan.is_none() {
-            // Try a quick filesystem scan for common manifest files
+            if let Some(cold_paths) = &cold_manifest_paths {
+                // Use manifest_paths from the cold scan we just performed
+                for manifest_path in cold_paths {
+                    match std::fs::metadata(manifest_path) {
+                        Ok(metadata) => {
+                            if let Ok(modified) = metadata.modified() {
+                                if modified > db_time {
+                                    return true;
+                                }
+                            }
+                        }
+                        Err(_) => return true,
+                    }
+                }
+                // Cold scan had manifest_paths and none were stale — skip quick probe
+                return false;
+            }
+            // No cold scan either — try a quick filesystem scan for common manifest files
             let quick_manifests = [
                 "Cargo.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
                 "poetry.lock", "Gemfile.lock", "go.sum",
@@ -1848,6 +1868,10 @@ impl LeIndex {
                 });
                 entry.symbol_count += 1;
                 entry.total_complexity += node.complexity;
+                // Store top symbols by first-encountered order (PDG iteration).
+                // These are used for display; the most complex symbols aren't
+                // necessarily the most useful for a quick file overview.
+                // TODO: Consider sorting by complexity or importance.
                 if entry.symbol_names.len() < 5 {
                     entry.symbol_names.push(node.name.clone());
                 }

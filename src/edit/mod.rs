@@ -218,7 +218,11 @@ fn replace_near_definitions(
     let ctx = 2048; // bytes of context around each definition
     let mut windows: Vec<(usize, usize)> = def_ranges
         .iter()
-        .map(|&(s, e)| (s.saturating_sub(ctx), (e + ctx).min(content.len())))
+        .map(|&(s, e)| {
+            let start = clamp_to_char_boundary(content, s.saturating_sub(ctx));
+            let end = clamp_to_char_boundary(content, (e + ctx).min(content.len()));
+            (start, end)
+        })
         .collect();
     windows.sort_by_key(|w| w.0);
 
@@ -662,6 +666,8 @@ impl EditEngine {
 
     /// Undo last edit
     pub async fn undo(&self) -> Result<EditResult> {
+        // Note: single sync fs::write — acceptable overhead for a single file restore.
+        // If this evolves to multi-file undo, wrap in spawn_blocking.
         let mut history = self.history.lock().await;
         // Extract the command data before potentially modifying history again
         let cmd = history.undo().cloned();
@@ -1196,6 +1202,10 @@ impl Refactor {
     /// with review/discard workflow. A future enhancement could add a staging mode
     /// where rename results are written to a worktree for review before merging.
     ///
+    /// Note: This function performs synchronous file I/O. It uses
+    /// `tokio::task::block_in_place` to avoid blocking the executor in
+    /// multi-threaded contexts.
+    ///
     /// # Implementation Details
     ///
     /// This is **NOT** a full AST/reference-aware rename. It uses a hybrid approach:
@@ -1349,13 +1359,13 @@ impl Refactor {
                 }
             };
 
-        // Collect byte ranges from matched PDG nodes to restrict replacements to
-        // regions near known symbol definitions (avoids blind whole-file replacement
-        // in comments/strings/unrelated code).
+        // Collect byte ranges from matched PDG nodes IN THIS FILE to restrict
+        // replacements to regions near known symbol definitions.
         let mut def_ranges: Vec<(usize, usize)> = Vec::new();
+        let file_path_str = file_path.to_string_lossy();
         for node_id in &seed_ids {
             if let Some(node) = engine.pdg.get_node(*node_id) {
-                if node.byte_range != (0, 0) {
+                if node.file_path == file_path_str && node.byte_range != (0, 0) {
                     def_ranges.push(node.byte_range);
                 }
             }

@@ -3451,30 +3451,46 @@ Grep + multi-file Edit with a single atomic operation."
             })
             .collect();
 
-        // Generate per-file diffs
-        let mut diffs: Vec<Value> = Vec::new();
-        let mut files_to_modify: Vec<String> = Vec::new();
-
-        for file_path in &filtered_files {
-            let Ok(original) = std::fs::read_to_string(file_path) else {
-                continue;
-            };
-            let modified = replace_whole_word(&original, &old_name, &new_name);
-            if modified != original {
-                let diff = make_diff(&original, &modified, file_path);
-                diffs.push(serde_json::json!({ "file": file_path, "diff": diff }));
-                files_to_modify.push(file_path.clone());
+        // Generate per-file diffs (file I/O — offload to blocking thread)
+        let (diffs, files_to_modify) = tokio::task::spawn_blocking({
+            let filtered_files = filtered_files;
+            let old_name = old_name.clone();
+            let new_name = new_name.clone();
+            move || {
+                let mut diffs: Vec<Value> = Vec::new();
+                let mut files_to_modify: Vec<String> = Vec::new();
+                for file_path in &filtered_files {
+                    let Ok(original) = std::fs::read_to_string(file_path) else {
+                        continue;
+                    };
+                    let modified = replace_whole_word(&original, &old_name, &new_name);
+                    if modified != original {
+                        let diff = make_diff(&original, &modified, file_path);
+                        diffs.push(serde_json::json!({ "file": file_path, "diff": diff }));
+                        files_to_modify.push(file_path.clone());
+                    }
+                }
+                (diffs, files_to_modify)
             }
-        }
+        })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(format!("Rename task failed: {}", e)))?;
 
         if !preview_only {
-            // Apply changes to all files
-            for file_path in &files_to_modify {
-                if let Ok(original) = std::fs::read_to_string(file_path) {
-                    let modified = replace_whole_word(&original, &old_name, &new_name);
-                    let _ = std::fs::write(file_path, modified.as_bytes());
+            // Apply changes to all files (file I/O — offload to blocking thread)
+            let old_name_c = old_name.clone();
+            let new_name_c = new_name.clone();
+            let apply_files = files_to_modify.clone();
+            tokio::task::spawn_blocking(move || {
+                for file_path in &apply_files {
+                    if let Ok(original) = std::fs::read_to_string(file_path) {
+                        let modified = replace_whole_word(&original, &old_name_c, &new_name_c);
+                        let _ = std::fs::write(file_path, modified.as_bytes());
+                    }
                 }
-            }
+            })
+            .await
+            .map_err(|e| JsonRpcError::internal_error(format!("Rename apply failed: {}", e)))?;
         }
 
         Ok(wrap_with_meta(
