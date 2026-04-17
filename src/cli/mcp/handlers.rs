@@ -2179,8 +2179,20 @@ impl GrepSymbolsHandler {
                 seen_locations.insert(location_key);
             }
 
-            let caller_count = get_direct_callers(pdg, nid).len();
-            let dep_count = pdg.neighbors(nid).len();
+            let caller_ids = get_direct_callers(pdg, nid);
+            let caller_count = caller_ids.len();
+            let callers: Vec<String> = caller_ids
+                .iter()
+                .take(50)
+                .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
+                .collect();
+            let callee_ids = pdg.neighbors(nid);
+            let dep_count = callee_ids.len();
+            let callees: Vec<String> = callee_ids
+                .iter()
+                .take(50)
+                .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
+                .collect();
 
             let mut entry = serde_json::json!({
                 "name": node.name,
@@ -2190,6 +2202,8 @@ impl GrepSymbolsHandler {
                 "complexity": node.complexity,
                 "caller_count": caller_count,
                 "dependency_count": dep_count,
+                "callers": callers,
+                "callees": callees,
                 "language": node.language
             });
 
@@ -2272,8 +2286,20 @@ impl GrepSymbolsHandler {
                     seen_locations.insert(location_key);
                 }
 
-                let caller_count = get_direct_callers(pdg, nid).len();
-                let dep_count = pdg.neighbors(nid).len();
+                let caller_ids = get_direct_callers(pdg, nid);
+                let caller_count = caller_ids.len();
+                let callers: Vec<String> = caller_ids
+                    .iter()
+                    .take(50)
+                    .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
+                    .collect();
+                let callee_ids = pdg.neighbors(nid);
+                let dep_count = callee_ids.len();
+                let callees: Vec<String> = callee_ids
+                    .iter()
+                    .take(50)
+                    .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
+                    .collect();
 
                 let mut entry = serde_json::json!({
                     "name": node.name,
@@ -2283,6 +2309,8 @@ impl GrepSymbolsHandler {
                     "complexity": node.complexity,
                     "caller_count": caller_count,
                     "dependency_count": dep_count,
+                    "callers": callers,
+                    "callees": callees,
                     "language": node.language
                 });
 
@@ -4543,7 +4571,13 @@ Turns a raw diff into a structural change summary with blast radius."
                 let mut file_symbols: Vec<Value> = Vec::new();
                 for nid in &nodes {
                     if let Some(node) = pdg.get_node(*nid) {
-                        let caller_count = get_direct_callers(pdg, *nid).len();
+                        let caller_ids = get_direct_callers(pdg, *nid);
+                        let caller_count = caller_ids.len();
+                        let callers: Vec<String> = caller_ids
+                            .iter()
+                            .take(20)
+                            .filter_map(|&id| pdg.get_node(id).map(|n| n.name.clone()))
+                            .collect();
                         let forward_impact = pdg.forward_impact(
                             *nid,
                             &crate::graph::pdg::TraversalConfig {
@@ -4565,6 +4599,7 @@ Turns a raw diff into a structural change summary with blast radius."
                             "type": node_type_str(&node.node_type),
                             "complexity": node.complexity,
                             "caller_count": caller_count,
+                            "callers": callers,
                             "forward_impact_count": forward_impact.len(),
                         }));
                     }

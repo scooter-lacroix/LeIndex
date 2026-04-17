@@ -3,8 +3,7 @@
 // *L'Index* (The Index) - Unified API that brings together all LeIndex crates
 
 use crate::cli::memory::{
-    analysis_cache_key, pdg_cache_key, project_scan_cache_key, search_cache_key, CacheEntry,
-    CacheSpiller, MemoryConfig, WarmStrategy,
+    analysis_cache_key, search_cache_key, CacheEntry, WarmStrategy,
 };
 use crate::graph::{
     extract_pdg_from_signatures,
@@ -22,7 +21,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 // Supported source file extensions for indexing
-const SOURCE_FILE_EXTENSIONS: &[&str] = &[
+pub(crate) const SOURCE_FILE_EXTENSIONS: &[&str] = &[
     // Main languages
     "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts",
     // Systems languages
@@ -32,7 +31,7 @@ const SOURCE_FILE_EXTENSIONS: &[&str] = &[
 ];
 
 // Directories to always skip during source collection
-const ALWAYS_SKIP_DIRS: &[&str] = &[
+pub(crate) const ALWAYS_SKIP_DIRS: &[&str] = &[
     // Version control
     ".git",
     ".hg",
@@ -64,7 +63,7 @@ const ALWAYS_SKIP_DIRS: &[&str] = &[
     ".leindex",
 ];
 
-const DEPENDENCY_MANIFEST_NAMES: &[&str] = &[
+pub(crate) const DEPENDENCY_MANIFEST_NAMES: &[&str] = &[
     "Cargo.lock",
     "Cargo.toml",
     "package-lock.json",
@@ -378,8 +377,8 @@ pub struct LeIndex {
     /// Program Dependence Graph
     pdg: Option<ProgramDependenceGraph>,
 
-    /// Cache spiller for memory management
-    cache_spiller: CacheSpiller,
+    /// Cache subsystem (spiller, project scan, file stats)
+    cache: crate::cli::index_cache::IndexCache,
 
     /// Indexing statistics
     stats: IndexStats,
@@ -387,12 +386,6 @@ pub struct LeIndex {
     /// TF-IDF embedder, built from indexed node content.
     /// None until index_nodes() is called with a sufficient corpus.
     embedder: Option<TfIdfEmbedder>,
-
-    /// Cached project scan for fast source inventory and manifest reuse.
-    project_scan: Option<ProjectFileScan>,
-
-    /// Cached per-file statistics, invalidated on reindex
-    file_stats_cache: Option<HashMap<String, FileStats>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -402,11 +395,11 @@ pub struct LeIndex {
 /// When a new file is added, its directory's mtime changes, so checking
 /// these ~10-20 directories (instead of thousands of files) detects new
 /// additions in <1ms.
-struct ProjectFileScan {
-    source_paths: Vec<PathBuf>,
-    manifest_paths: Vec<PathBuf>,
+pub(crate) struct ProjectFileScan {
+    pub(crate) source_paths: Vec<PathBuf>,
+    pub(crate) manifest_paths: Vec<PathBuf>,
     #[serde(default)]
-    source_directories: Vec<PathBuf>,
+    pub(crate) source_directories: Vec<PathBuf>,
 }
 
 /// Per-file statistics cached from PDG
@@ -755,21 +748,9 @@ impl LeIndex {
         // Initialize search engine
         let search_engine = SearchEngine::new();
 
-        // Initialize cache spiller with project-specific cache directory
+        // Initialize cache subsystem
         let cache_dir = storage_path.join("cache");
-        let memory_config = MemoryConfig {
-            cache_dir,
-            ..Default::default()
-        };
-        let mut cache_spiller =
-            CacheSpiller::new(memory_config).context("Failed to initialize cache spiller")?;
-        if let Ok(restored) = cache_spiller.auto_restore() {
-            debug!(
-                "Cache auto-restore on startup: restored={} failed={}",
-                restored.entries_restored,
-                restored.entries_failed.len()
-            );
-        }
+        let cache = crate::cli::index_cache::IndexCache::new(cache_dir)?;
 
         Ok(Self {
             project_path,
@@ -779,7 +760,7 @@ impl LeIndex {
             storage,
             search_engine,
             pdg: None,
-            cache_spiller,
+            cache,
             stats: IndexStats {
                 total_files: 0,
                 files_parsed: 0,
@@ -795,8 +776,6 @@ impl LeIndex {
                 external_deps_unresolved: 0,
             },
             embedder: None,
-            project_scan: None,
-            file_stats_cache: None,
         })
     }
 
@@ -965,6 +944,7 @@ impl LeIndex {
 
         // Step 5b: Resolve external dependencies via lock files
         let manifest_paths = self
+            .cache
             .project_scan
             .as_ref()
             .map(|scan| scan.manifest_paths.clone())
@@ -1063,64 +1043,30 @@ impl LeIndex {
             .collect()
     }
 
-    fn collect_source_files_with_hashes_readonly(&self) -> Result<Vec<(PathBuf, String)>> {
-        let scan = self.scan_project_files()?;
-        scan.source_paths
-            .iter()
-            .map(|path| Ok((path.clone(), self.hash_file(path)?)))
-            .collect()
-    }
-
     fn collect_source_file_paths(&mut self, refresh: bool) -> Result<Vec<PathBuf>> {
         Ok(self.get_project_scan(refresh)?.source_paths)
     }
 
     fn get_project_scan(&mut self, refresh: bool) -> Result<ProjectFileScan> {
+        // Try cached result first (no scan needed)
         if !refresh {
-            // Check in-memory cache first
-            if let Some(scan) = &self.project_scan {
+            if let Some(scan) = &self.cache.project_scan {
                 return Ok(scan.clone());
             }
-
-            // Try persistent cache
-            let cache_key = project_scan_cache_key(&self.project_id);
-            if let Some(CacheEntry::Binary {
-                serialized_data, ..
-            }) = self.cache_spiller.store_mut().get_or_load(&cache_key)?
-            {
-                if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
-                    self.project_scan = Some(scan.clone());
-                    return Ok(scan);
-                }
-            }
         }
-
-        // Cache miss or forced refresh — scan and cache
+        // Need a scan — call it before borrowing self.cache mutably
         let scan = self.scan_project_files()?;
-        self.cache_project_scan(&scan);
-        self.project_scan = Some(scan.clone());
-        Ok(scan)
-    }
-
-    fn cache_project_scan(&mut self, scan: &ProjectFileScan) {
-        if let Ok(serialized) = bincode::serialize(scan) {
-            let entry = CacheEntry::Binary {
-                metadata: std::collections::HashMap::from([
-                    ("type".to_string(), "project_scan".to_string()),
-                    ("project_id".to_string(), self.project_id.clone()),
-                ]),
-                serialized_data: serialized,
-            };
-            let cache_key = project_scan_cache_key(&self.project_id);
-            if self
-                .cache_spiller
-                .store_mut()
-                .insert(cache_key.clone(), entry)
-                .is_ok()
-            {
-                let _ = self.cache_spiller.store_mut().persist_key(&cache_key);
+        let project_id = self.project_id.clone();
+        // Now use the cache to store/retrieve
+        if !refresh {
+            // Try persistent cache
+            if let result @ Ok(_) = self.cache.get_project_scan(&project_id, false, || Ok(scan.clone())) {
+                return result;
             }
         }
+        self.cache.cache_project_scan(&project_id, &scan);
+        self.cache.project_scan = Some(scan.clone());
+        Ok(scan)
     }
 
     fn scan_project_files(&self) -> Result<ProjectFileScan> {
@@ -1193,18 +1139,20 @@ impl LeIndex {
     }
 
     /// Extract sorted unique directories from a list of file paths.
-    /// Used to track which directories contain source files for fast
-    /// new-file detection via directory mtime checking.
     fn extract_unique_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
-        let mut dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        for path in paths {
-            if let Some(parent) = path.parent() {
-                dirs.insert(parent.to_path_buf());
-            }
+        crate::cli::index_freshness::extract_unique_dirs(paths)
+    }
+
+    /// Build a FreshnessContext for delegation to index_freshness module.
+    fn freshness_context(&self) -> crate::cli::index_freshness::FreshnessContext<'_> {
+        crate::cli::index_freshness::FreshnessContext {
+            project_path: &self.project_path,
+            storage_path: &self.storage_path,
+            project_id: &self.project_id,
+            storage: &self.storage,
+            project_scan: self.cache.project_scan.as_ref(),
+            cache_spiller: &self.cache.cache_spiller,
         }
-        let mut result: Vec<PathBuf> = dirs.into_iter().collect();
-        result.sort();
-        result
     }
 
     fn hash_file(&self, path: &Path) -> Result<String> {
@@ -1306,6 +1254,7 @@ impl LeIndex {
         if let Some(CacheEntry::Binary {
             serialized_data, ..
         }) = self
+            .cache
             .cache_spiller
             .store_mut()
             .get_or_load(&search_cache_key)?
@@ -1370,12 +1319,14 @@ impl LeIndex {
                 serialized_data: serialized,
             };
             if self
+                .cache
                 .cache_spiller
                 .store_mut()
                 .insert(search_cache_key.clone(), entry)
                 .is_ok()
             {
                 let _ = self
+                    .cache
                     .cache_spiller
                     .store_mut()
                     .persist_key(&search_cache_key);
@@ -1413,6 +1364,7 @@ impl LeIndex {
         if let Some(CacheEntry::Analysis {
             serialized_data, ..
         }) = self
+            .cache
             .cache_spiller
             .store_mut()
             .get_or_load(&analysis_cache_key)?
@@ -1469,12 +1421,14 @@ impl LeIndex {
                 serialized_data: serialized,
             };
             if self
+                .cache
                 .cache_spiller
                 .store_mut()
                 .insert(analysis_cache_key.clone(), entry)
                 .is_ok()
             {
                 let _ = self
+                    .cache
                     .cache_spiller
                     .store_mut()
                     .persist_key(&analysis_cache_key);
@@ -1498,12 +1452,13 @@ impl LeIndex {
     /// ```
     pub fn get_diagnostics(&self) -> Result<Diagnostics> {
         let memory_stats = self
+            .cache
             .cache_spiller
             .memory_stats()
             .context("Failed to get memory stats")?;
         let memory_percent = memory_stats.memory_percent();
-        let threshold_exceeded = self.cache_spiller.store().total_bytes() > 0
-            && self.cache_spiller.is_threshold_exceeded().unwrap_or(false);
+        let threshold_exceeded = self.cache.cache_spiller.store().total_bytes() > 0
+            && self.cache.cache_spiller.is_threshold_exceeded().unwrap_or(false);
 
         let pdg_loaded = self.pdg.is_some();
         let (pdg_nodes, pdg_edges) = self
@@ -1613,299 +1568,25 @@ impl LeIndex {
     /// Check which source files have changed since last index.
     /// Returns (changed_paths, deleted_paths).
     pub fn check_freshness(&self) -> Result<(Vec<PathBuf>, Vec<String>)> {
-        let indexed_files =
-            crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
-                .unwrap_or_default();
-
-        let current = self.collect_source_files_with_hashes_readonly()?;
-        let current_map: HashMap<String, String> = current
-            .iter()
-            .map(|(p, h)| (p.display().to_string(), h.clone()))
-            .collect();
-
-        let changed: Vec<PathBuf> = current
-            .iter()
-            .filter(|(p, h)| indexed_files.get(&p.display().to_string()) != Some(h))
-            .map(|(p, _)| p.clone())
-            .collect();
-
-        let deleted: Vec<String> = indexed_files
-            .keys()
-            .filter(|k| !current_map.contains_key(*k))
-            .cloned()
-            .collect();
-
-        Ok((changed, deleted))
+        let ctx = self.freshness_context();
+        crate::cli::index_freshness::check_freshness(
+            &ctx,
+            || self.scan_project_files(),
+            |p| self.hash_file(p),
+        )
     }
 
-    /// Quick staleness check without computing hashes—uses mtime only.
-    ///
-    /// Falls back gracefully if no in-memory cache is available by checking
-    /// the persistent cache store. Returns `true` (stale) only when it can
     /// Check if any dependency manifest/lockfile has changed since last index.
-    /// Used to decide whether to re-run external dependency annotation even
-    /// when no source files changed.
     fn check_manifest_stale(&self) -> bool {
-        let db_time = match self.storage_path
-            .join("leindex.db")
-            .metadata()
-            .and_then(|m| m.modified())
-        {
-            Ok(t) => t,
-            Err(_) => return true, // No DB file — stale
-        };
-
-        // Probe all known manifest paths (from cache or discovery)
-        let scan = self.project_scan.as_ref();
-        let paths_to_check: Vec<PathBuf> = if let Some(scan) = scan {
-            scan.manifest_paths.clone()
-        } else {
-            // Cold cache — do a quick filesystem scan
-            match self.scan_project_files() {
-                Ok(scan) => scan.manifest_paths,
-                Err(_) => return true,
-            }
-        };
-
-        // Track which paths came from the original scan (for deleted-stale detection)
-        let original_scan_paths: std::collections::HashSet<PathBuf> =
-            paths_to_check.iter().cloned().collect();
-
-        // Also check top-level manifests (covers newly added ones not in cache)
-        let mut all_paths: std::collections::HashSet<PathBuf> = paths_to_check.into_iter().collect();
-        for name in DEPENDENCY_MANIFEST_NAMES {
-            all_paths.insert(self.project_path.join(name));
-        }
-
-        for manifest_path in &all_paths {
-            match std::fs::metadata(manifest_path) {
-                Ok(metadata) => {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified > db_time {
-                            return true;
-                        }
-                    }
-                }
-                Err(_) => {
-                    // Only treat as deleted if it was in the original scan results.
-                    // Root-level probes that don't exist are simply absent — not stale.
-                    if original_scan_paths.contains(manifest_path) {
-                        return true;
-                    }
-                }
-            }
-        }
-        false
+        let ctx = self.freshness_context();
+        crate::cli::index_freshness::check_manifest_stale(&ctx, || self.scan_project_files())
     }
 
-    /// Fast-path freshness check that avoids full filesystem scan when possible.
-    /// Samples indexed files for deletion or modification and checks manifest
     /// Fast-path freshness check: O(1) for indexed files, O(D) for source
     /// directories (typically 10-20), and O(M) for manifest files.
-    ///
-    /// Detection layers (in order):
-    /// 1. Source count mismatch (cached vs indexed)
-    /// 2. Directory mtime sentinel — detects new file additions in <1ms
-    ///    by checking the ~10-20 directories that contain source files
-    /// 3. Mtime sampling of 50-500 indexed files
-    /// 4. Manifest walkdir (depth-limited) for dependency changes
     pub fn is_stale_fast(&self) -> bool {
-        let indexed_files =
-            crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
-                .unwrap_or_default();
-
-        // If no indexed files at all, definitely stale
-        if indexed_files.is_empty() {
-            return true;
-        }
-
-        // Get the DB modification time for mtime comparison
-        // If the DB file is missing, the index is stale
-        let db_time = match self.storage_path
-            .join("leindex.db")
-            .metadata()
-            .and_then(|m| m.modified())
-        {
-            Ok(t) => t,
-            Err(_) => return true, // No DB file — stale
-        };
-
-        // Use in-memory scan cache for a quick file-count comparison.
-        // If not in memory, try to deserialize from the persistent cache_spiller.
-        let mut cold_manifest_paths: Option<Vec<PathBuf>> = None;
-        let mut source_count: Option<usize> = None;
-        let mut cached_manifest_paths: Option<Vec<PathBuf>> = None;
-        let mut cached_scan: Option<ProjectFileScan> = None;
-        match &self.project_scan {
-            // Hot cache from last full index — source_count + source_directories available
-            Some(cache) => {
-                source_count = Some(cache.source_paths.len());
-            }
-            None => {
-                // Try persistent cache — first in-memory (peek), then disk-spilled
-                let cache_key = crate::cli::memory::project_scan_cache_key(&self.project_id);
-                if let Some(entry) = self.cache_spiller.store().peek(&cache_key) {
-                    if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
-                        if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(serialized_data) {
-                            cached_manifest_paths = Some(scan.manifest_paths.clone());
-                            cached_scan = Some(scan.clone());
-                            source_count = Some(scan.source_paths.len());
-                        }
-                    }
-                } else if let Ok(entry) = self.cache_spiller.store().load_from_disk(&cache_key) {
-                    // Cache was spilled to disk — deserialize from there
-                    if let crate::cli::memory::CacheEntry::Binary { serialized_data, .. } = entry {
-                        if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
-                            cached_manifest_paths = Some(scan.manifest_paths.clone());
-                            cached_scan = Some(scan.clone());
-                            source_count = Some(scan.source_paths.len());
-                        }
-                    }
-                }
-                // Cache cold — do a quick scan to count source files
-                if source_count.is_none() {
-                    match self.scan_project_files() {
-                        Ok(scan) => {
-                            cold_manifest_paths = Some(scan.manifest_paths.clone());
-                            source_count = Some(scan.source_paths.len());
-                        }
-                        Err(_) => return true, // Unknown inventory → treat as stale
-                    }
-                }
-            }
-        };
-        let source_count = source_count.unwrap_or(indexed_files.len());
-
-        if source_count != indexed_files.len() {
-            return true;
-        }
-
-        // Directory mtime sentinel check: when a new file is created in a
-        // directory (or a new subdirectory is created), the directory's mtime
-        // changes. By checking only the ~10-20 directories that contained source
-        // files at index time, we detect new file additions in <1ms without a
-        // full tree walk.
-        let source_dirs: Vec<PathBuf> = if let Some(scan) = &self.project_scan {
-            scan.source_directories.clone()
-        } else if let Some(scan) = cached_scan.as_ref() {
-            scan.source_directories.clone()
-        } else {
-            // Cold cache — extract from indexed file paths (cheap, O(N) but rare)
-            let mut dirs: Vec<PathBuf> = indexed_files
-                .keys()
-                .filter_map(|p| PathBuf::from(p).parent().map(|d| d.to_path_buf()))
-                .collect();
-            dirs.sort();
-            dirs.dedup();
-            dirs
-        };
-        for dir in &source_dirs {
-            let full_path = if dir.is_absolute() {
-                dir.clone()
-            } else {
-                self.project_path.join(dir)
-            };
-            match std::fs::metadata(&full_path) {
-                Ok(metadata) => {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified > db_time {
-                            return true; // Directory changed — new file added or removed
-                        }
-                    }
-                }
-                Err(_) => {
-                    // Directory deleted — definitely stale
-                    return true;
-                }
-            }
-        }
-
-        // Quick spot-check: sample indexed files for deletion or modification.
-        // Use a percentage of total files (5-10%), clamped to [50, 500].
-        let sample_size = (indexed_files.len() / 20).max(50).min(500);
-        let mut checked = 0;
-        for indexed_path in indexed_files.keys() {
-            if checked >= sample_size {
-                break;
-            }
-            let full_path = self.project_path.join(indexed_path);
-            if !full_path.exists() {
-                return true;
-            }
-            // Compare file mtime against DB mtime
-            if let Ok(metadata) = std::fs::metadata(&full_path) {
-                if let Ok(modified) = metadata.modified() {
-                    if modified > db_time {
-                        return true;
-                    }
-                }
-            }
-            checked += 1;
-        }
-
-        // Also check manifest file mtimes — dependency upgrades with no source
-        // changes should still trigger re-indexing (external dep annotations).
-        // If project_scan is cold, try loading manifest paths from cache.
-        let manifest_paths: Vec<PathBuf> = if let Some(scan) = &self.project_scan {
-            scan.manifest_paths.clone()
-        } else if let Some(ref paths) = cached_manifest_paths {
-            paths.clone()
-        } else if let Some(ref paths) = cold_manifest_paths {
-            paths.clone()
-        } else {
-            Vec::new()
-        };
-
-        // Always probe for manifest files — even when cached manifest_paths
-        // is populated, newly added manifests after indexing won't be in the cache.
-        // Walk the project tree to find ALL manifests (including nested workspace ones
-        // like crates/*/Cargo.toml, packages/**/package.json).
-        // Skip common excluded directories to avoid false stale from node_modules etc.
-        {
-            for entry in walkdir::WalkDir::new(&self.project_path)
-                .max_depth(8) // Covers nested monorepos like packages/group/sub/Cargo.toml
-                .into_iter()
-                .filter_entry(|e| {
-                    // Skip known excluded directories
-                    if let Some(name) = e.file_name().to_str() {
-                        if ALWAYS_SKIP_DIRS.contains(&name) && e.file_type().is_dir() {
-                            return false;
-                        }
-                    }
-                    true
-                })
-                .filter_map(|e| e.ok())
-            {
-                let Some(name) = entry.file_name().to_str() else { continue };
-                if !DEPENDENCY_MANIFEST_NAMES.contains(&name) {
-                    continue;
-                }
-                if let Ok(metadata) = entry.metadata() {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified > db_time {
-                            return true;
-                        }
-                    }
-                }
-            }
-        }
-        for manifest_path in &manifest_paths {
-            match std::fs::metadata(manifest_path) {
-                Ok(metadata) => {
-                    if let Ok(modified) = metadata.modified() {
-                        if modified > db_time {
-                            return true;
-                        }
-                    }
-                }
-                Err(_) => {
-                    // Manifest existed at scan/index time but is now missing → stale
-                    return true;
-                }
-            }
-        }
-
-        false
+        let ctx = self.freshness_context();
+        crate::cli::index_freshness::is_stale_fast(&ctx, || self.scan_project_files())
     }
 
     // ========================================================================
@@ -1984,71 +1665,14 @@ impl LeIndex {
 
     /// Build file statistics cache from PDG
     pub(crate) fn build_file_stats_cache(&mut self) {
-        let Some(pdg) = self.pdg() else { return };
-        let mut cache: HashMap<String, FileStats> = HashMap::new();
-        // First pass: collect symbol counts and complexity
-        for nid in pdg.node_indices() {
-            if let Some(node) = pdg.get_node(nid) {
-                // Skip external nodes (synthetic/phantom); keep (0,0) range nodes
-                // since many non-Rust parsers legitimately emit zero ranges for real symbols
-                if matches!(node.node_type, crate::graph::pdg::NodeType::External) {
-                    continue;
-                }
-                let entry = cache.entry(node.file_path.clone()).or_insert_with(|| FileStats {
-                    symbol_count: 0,
-                    total_complexity: 0,
-                    symbol_names: Vec::new(),
-                    outgoing_deps: 0,
-                    incoming_deps: 0,
-                });
-                entry.symbol_count += 1;
-                entry.total_complexity += node.complexity;
-                // Store top symbols by first-encountered order (PDG iteration).
-                // These are used for display; the most complex symbols aren't
-                // necessarily the most useful for a quick file overview.
-                // TODO: Consider sorting by complexity or importance.
-                if entry.symbol_names.len() < 5 {
-                    entry.symbol_names.push(node.name.clone());
-                }
-            }
+        if let Some(pdg) = &self.pdg {
+            self.cache.build_file_stats_cache(pdg);
         }
-        // Second pass: compute cross-file dependency degrees
-        let file_paths: Vec<String> = cache.keys().cloned().collect();
-        for file_path in &file_paths {
-            let nodes = pdg.nodes_in_file(file_path);
-            let mut incoming_files = std::collections::HashSet::new();
-            let mut outgoing_files = std::collections::HashSet::new();
-            for nid in &nodes {
-                for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Outgoing) {
-                    if let Some(dep) = pdg.get_node(dep_id) {
-                        if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
-                            && dep.file_path != *file_path
-                        {
-                            outgoing_files.insert(dep.file_path.clone());
-                        }
-                    }
-                }
-                for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Incoming) {
-                    if let Some(dep) = pdg.get_node(dep_id) {
-                        if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
-                            && dep.file_path != *file_path
-                        {
-                            incoming_files.insert(dep.file_path.clone());
-                        }
-                    }
-                }
-            }
-            if let Some(entry) = cache.get_mut(file_path) {
-                entry.outgoing_deps = outgoing_files.len();
-                entry.incoming_deps = incoming_files.len();
-            }
-        }
-        self.file_stats_cache = Some(cache);
     }
 
     /// Get file statistics cache
     pub fn file_stats(&self) -> Option<&HashMap<String, FileStats>> {
-        self.file_stats_cache.as_ref()
+        self.cache.file_stats()
     }
 
     /// Collect source files that belong to this project using the same exclusion rules as indexing.
@@ -2203,129 +1827,28 @@ impl LeIndex {
     // ========================================================================
 
     /// Check memory and spill cache if threshold exceeded
-    ///
-    /// This method should be called before memory-intensive operations
-    /// to ensure sufficient memory is available.
-    ///
-    /// # Returns
-    ///
-    /// `Result<bool>` - Ok(true) if spilling occurred, Ok(false) otherwise
     pub fn check_memory_and_spill(&mut self) -> Result<bool> {
-        if self.cache_spiller.is_threshold_exceeded()? {
-            info!("Memory threshold exceeded, initiating cache spilling");
-            let result = self.cache_spiller.check_and_spill()?;
-            info!(
-                "Spilled {} entries, freed {} bytes",
-                result.entries_spilled, result.memory_freed
-            );
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.cache.check_memory_and_spill()
     }
 
     /// Spill PDG cache to disk
-    ///
-    /// Drops the PDG from memory (it's already persisted to lestockage via save_pdg).
-    /// Creates a cache marker to track that the PDG was spilled.
-    /// The PDG can be reloaded later using `reload_pdg_from_cache()`.
-    ///
-    /// # Returns
-    ///
-    /// `Result<()>` - Success or error
     pub fn spill_pdg_cache(&mut self) -> Result<()> {
-        let pdg = self
-            .pdg
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("No PDG in memory to spill"))?;
-
-        let node_count = pdg.node_count();
-        let edge_count = pdg.edge_count();
-
-        // Note: PDG is already persisted to lestockage via save_pdg()
-        // We create a cache marker to track that it was spilled
-        let cache_key = pdg_cache_key(&self.project_id);
-        let entry = CacheEntry::PDG {
-            project_id: self.project_id.clone(),
-            node_count,
-            edge_count,
-            serialized_data: vec![], // Empty marker - actual data in lestockage
-        };
-
-        // Store marker in cache spiller
-        self.cache_spiller
-            .store_mut()
-            .insert(cache_key, entry)
-            .context("Failed to create PDG spill marker")?;
-
-        info!(
-            "Spilled PDG from memory: {} nodes, {} edges (persisted to lestockage)",
-            node_count, edge_count
-        );
-
-        Ok(())
+        self.cache.spill_pdg_cache(&self.project_id, &mut self.pdg)
     }
 
     /// Spill vector search cache to disk
-    ///
-    /// Serializes the HNSW vector index and stores it in the cache spill directory.
-    /// The index can be reloaded later using `reload_vector_cache()`.
-    ///
-    /// # Returns
-    ///
-    /// `Result<()>` - Success or error
     pub fn spill_vector_cache(&mut self) -> Result<()> {
-        // Note: The HNSW index doesn't support direct serialization
-        // Instead, we create a marker entry and track the state
-        // The actual vector data would need to be re-indexed from the PDG
-
-        let node_count = self.search_engine.node_count();
-
-        // Create a marker entry for the vector cache
-        let cache_key = search_cache_key(&self.project_id);
-        let entry = CacheEntry::SearchIndex {
-            project_id: self.project_id.clone(),
-            entry_count: node_count,
-            serialized_data: vec![], // Empty - vectors would be re-indexed from PDG
-        };
-
-        self.cache_spiller
-            .store_mut()
-            .insert(cache_key, entry)
-            .context("Failed to spill vector cache marker")?;
-
-        info!("Spilled vector cache marker: {} entries", node_count);
-
-        Ok(())
+        self.cache
+            .spill_vector_cache(&self.project_id, self.search_engine.node_count())
     }
 
     /// Spill all caches (PDG and vector) to disk
-    ///
-    /// This is useful for freeing memory before large operations
-    /// or when the project won't be used for a while.
-    ///
-    /// # Returns
-    ///
-    /// `Result<(usize, usize)>` - (PDG bytes spilled, vector bytes spilled)
     pub fn spill_all_caches(&mut self) -> Result<(usize, usize)> {
-        let mut pdg_bytes = 0;
-
-        // Spill PDG if in memory
-        if self.pdg.is_some() {
-            self.spill_pdg_cache()?;
-            pdg_bytes = self.cache_spiller.store().total_bytes();
-        }
-
-        // Spill vector cache marker
-        self.spill_vector_cache()?;
-        let vector_bytes = self.cache_spiller.store().total_bytes() - pdg_bytes;
-
-        info!(
-            "Spilled all caches: PDG ({} bytes), Vector ({} bytes)",
-            pdg_bytes, vector_bytes
-        );
-
-        Ok((pdg_bytes, vector_bytes))
+        self.cache.spill_all_caches(
+            &self.project_id,
+            &mut self.pdg,
+            self.search_engine.node_count(),
+        )
     }
 
     // ========================================================================
@@ -2384,24 +1907,11 @@ impl LeIndex {
     }
 
     /// Warm caches with frequently accessed data
-    ///
-    /// Loads spilled cache entries back into memory based on the specified strategy.
-    /// For PDG warming strategy, this will reload the PDG from lestockage.
-    ///
-    /// # Arguments
-    ///
-    /// * `strategy` - Warming strategy to use (PDGOnly, SearchIndexOnly, RecentFirst, All)
-    ///
-    /// # Returns
-    ///
-    /// `Result<WarmResult>` - Statistics about the warming operation
     pub fn warm_caches(
         &mut self,
         strategy: WarmStrategy,
     ) -> Result<crate::cli::memory::WarmResult> {
-        info!("Warming caches with strategy: {:?}", strategy);
-
-        let result = self.cache_spiller.warm_cache(strategy)?;
+        let result = self.cache.warm_cache(strategy)?;
 
         // If PDG warming was requested and PDG is not in memory, reload from storage
         if (strategy == crate::cli::memory::WarmStrategy::PDGOnly
@@ -2417,16 +1927,8 @@ impl LeIndex {
     }
 
     /// Get cache statistics
-    ///
-    /// Returns detailed statistics about cache usage and spilled data.
-    ///
-    /// # Returns
-    ///
-    /// `Result<MemoryStats>` - Cache statistics
     pub fn get_cache_stats(&self) -> Result<crate::cli::memory::MemoryStats> {
-        self.cache_spiller
-            .memory_stats()
-            .map_err(|e| anyhow::anyhow!("Failed to get cache stats: {}", e))
+        self.cache.get_cache_stats()
     }
 
     // ========================================================================
@@ -2488,7 +1990,7 @@ impl LeIndex {
     /// related code nodes, replacing the previous hash-based placeholder.
     fn index_nodes(&mut self, pdg: &ProgramDependenceGraph) -> Result<()> {
         // Invalidate file stats cache on reindex
-        self.file_stats_cache = None;
+        self.cache.file_stats_cache = None;
         // Read file contents once per file to avoid repeated I/O.
         // Cache is scoped to this function and shared across both passes.
         let mut file_cache: std::collections::HashMap<String, std::sync::Arc<String>> =
