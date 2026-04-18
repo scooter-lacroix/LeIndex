@@ -2133,7 +2133,9 @@ impl LeIndex {
         use crate::graph::pdg::NodeType;
         let mut migrated = 0usize;
         for node in pdg.node_weights_mut() {
-            if node.language == "external" && node.node_type != NodeType::External {
+            let is_external = node.language == "external"
+                || node.language.starts_with("external:");
+            if is_external && node.node_type != NodeType::External {
                 node.node_type = NodeType::External;
                 migrated += 1;
             }

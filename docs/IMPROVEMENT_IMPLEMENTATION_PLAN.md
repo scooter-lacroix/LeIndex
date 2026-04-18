@@ -14,7 +14,7 @@
 
 ## Dependency Graph
 
-```text
+```
 TASK-01 (callers/callees names)
   └── TASK-02 (semantic search mode)
         └── TASK-03 (project_map focus param)
@@ -25,7 +25,7 @@ TASK-06 (lazy PDG loading)
 TASK-07 (is_stale_fast TTL)
 TASK-08 (storage versioning)
 TASK-09 (skip dir consolidation)
-```text
+```
 Four independent chains. TASK-01→02→03 is sequential. All others are independent
 and can be done in any order or in parallel.
 
@@ -54,14 +54,14 @@ let mut entry = serde_json::json!({
     "dependency_count": dep_count,
     ...
 });
-```text
+```
 **Location B** — direct PDG scan results (line 2278-2289):
 Same pattern, identical code.
 
 ### Implementation steps
 
 1. **Location A** (line 2182): After `let dep_count = ...`, add:
-   ```rust
+```rust
    let callers: Vec<String> = get_direct_callers(pdg, nid)
        .iter()
        .take(50)
@@ -72,12 +72,12 @@ Same pattern, identical code.
        .take(50)
        .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
        .collect();
-   ```
+```
 2. Add to the `json!({})` macro:
-   ```rust
+```rust
    "callers": callers,
    "callees": callees,
-   ```
+```
 3. **Location B** (line 2278): Same two changes.
 
 ### Edge cases
@@ -89,7 +89,7 @@ Same pattern, identical code.
 ### Verification
 ```bash
 cargo check
-```text
+```
 ---
 
 ## TASK-02: Add semantic search mode to grep_symbols
@@ -109,7 +109,7 @@ let search_query = SearchQuery {
     threshold: Some(0.1),
     ..
 };
-```text
+```
 And `GrepSymbolsHandler::execute()` already calls `index.search(&pattern, ...)` for candidate
 pre-filtering (line 2114). So the infrastructure is all there.
 
@@ -123,14 +123,14 @@ The `mode` parameter to let the LLM choose between:
 
 1. **Schema** (`GrepSymbolsHandler::argument_schema()`, line ~2100):
    Add parameter:
-   ```json
+```json
    "mode": {
        "type": "string",
        "enum": ["exact", "semantic"],
        "description": "Search mode: 'exact' for name matching (default), 'semantic' for concept-based search",
        "default": "exact"
    }
-   ```
+```
 
 2. **Execute** (`GrepSymbolsHandler::execute()`, line 2089):
    - Parse `mode`: `let mode = args.get("mode").and_then(|v| v.as_str()).unwrap_or("exact").to_owned();`
@@ -141,9 +141,9 @@ The `mode` parameter to let the LLM choose between:
    - When `mode == "exact"`: current behavior unchanged
 
 3. **Output**: When semantic mode, add to each entry:
-   ```rust
+```rust
    "score": result.score,
-   ```
+```
 
 ### Blocking issue
 None. `SearchEngine::search()` returns `Vec<SearchResult>` which already has a `score` field.
@@ -152,7 +152,7 @@ The vector_index HNSW search is already populated during `index_nodes()`.
 ### Verification
 ```bash
 cargo check
-```text
+```
 ---
 
 ## TASK-03: Add focus parameter to project_map for semantic file ranking
@@ -170,24 +170,24 @@ has `symbol_names: Vec<String>` per file — we can embed those.
 
 1. **Schema** (`ProjectMapHandler::argument_schema()`, line ~1800):
    Add parameter:
-   ```json
+```json
    "focus": {
        "type": "string",
        "description": "Semantic focus area — ranks files by relevance to this topic (e.g., 'authentication', 'database layer')"
    }
-   ```
+```
 
 2. **Execute** (`ProjectMapHandler::execute()`, line ~1828):
    - Parse: `let focus = args.get("focus").and_then(|v| v.as_str()).map(String::from);`
    - After building `file_map` (line ~1875), if `focus` is Some:
      a. Generate focus embedding: `let focus_emb = index.generate_query_embedding(&focus);`
      b. For each file in `file_map`, compute relevance:
-        ```rust
+```rust
         // Embed concatenated symbol names for the file
         let file_text = syms.join(" ");
         let file_emb = index.generate_query_embedding(&file_text);
         let score = cosine_similarity(&focus_emb, &file_emb);
-        ```
+```
      c. Store score in entry: `entry["relevance_score"] = serde_json::json!(score);`
      d. Sort by `relevance_score` descending (overrides `sort_by`)
    - If `focus` is None: existing behavior unchanged.
@@ -205,7 +205,7 @@ Must add `pub`.
 ### Verification
 ```bash
 cargo check
-```text
+```
 ---
 
 ## TASK-04: Migrate external nodes on PDG load — eliminate dual-check bug class
@@ -220,7 +220,7 @@ cargo check
 pub fn get_node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
     self.graph.node_weight_mut(id)
 }
-```text
+```
 But we need to iterate ALL nodes, not access by specific ID. petgraph provides
 `graph.node_weights_mut()` which returns `&mut [Node]` — perfect for bulk mutation.
 
@@ -245,24 +245,24 @@ fn normalize_external_nodes(pdg: &mut ProgramDependenceGraph) {
         info!("Normalized {} external nodes to NodeType::External", migrated);
     }
 }
-```text
+```
 Check if `node_weights_mut()` exists on PDG. If not, use:
 ```rust
 for node_idx in pdg.node_indices() {
     if let Some(node) = pdg.get_node_mut(node_idx) { ... }
 }
-```text
+```
 **Phase B — Call at both PDG insertion points**:
 
 1. `load_from_storage()` (line 1586): After `let pdg = pdg_store::load_pdg(...)` and before `self.index_nodes(&pdg)`:
-   ```rust
+```rust
    Self::normalize_external_nodes(&mut pdg);  // needs pdg to be `let mut`
-   ```
+```
 
 2. `index_project()` (line 1036): Before `self.pdg = Some(pdg)`:
-   ```rust
+```rust
    Self::normalize_external_nodes(&mut pdg);
-   ```
+```
 
 **Phase C — Remove dual-check guards** (separate commit, after Phase B verified):
 
@@ -283,7 +283,7 @@ If not, add it as a pass-through to petgraph's `graph.node_weights_mut()`.
 cargo check  # after Phase A + B
 # Then after Phase C:
 cargo check
-```text
+```
 ---
 
 ## TASK-06: Lazy PDG loading for read-only queries
@@ -293,23 +293,23 @@ cargo check
 
 ### Current flow (the problem)
 
-```text
+```
 get_or_load() → LeIndex::new() → leindex.load_from_storage()
                                        ↓
                                  Loads entire PDG into memory
                                  (10-50MB for large projects)
                                  Rebuilds search index
                                  Builds file stats cache
-```text
+```
 This happens even for `leindex_read_file` which just reads a file from disk.
 
 ### Proposed flow
 
-```text
+```
 get_or_load() → LeIndex::new() → (no load)
                                        ↓
                                  First pdg() call triggers load_from_storage()
-```text
+```
 ### Implementation steps
 
 1. **In `registry.rs::create_and_insert()`** (line 229):
@@ -325,7 +325,7 @@ get_or_load() → LeIndex::new() → (no load)
    Problem: `pdg()` is `&self`. Can't call `load_from_storage(&mut self)` from it.
 
    Solution: Add a new method used by handlers:
-   ```rust
+```rust
    pub fn ensure_pdg_loaded(&mut self) -> Result<()> {
        if self.pdg.is_none() && !self.storage_path.join("leindex.db").exists() == false {
            // DB exists but PDG not loaded — lazy load
@@ -333,13 +333,13 @@ get_or_load() → LeIndex::new() → (no load)
        }
        Ok(())
    }
-   ```
+```
 
 3. **In handlers**: Replace `index.pdg().ok_or_else(...)` with:
-   ```rust
+```rust
    index.ensure_pdg_loaded().map_err(|e| JsonRpcError::...)?;
    let pdg = index.pdg().ok_or_else(|| ...)?;
-   ```
+```
    This affects ~16 handler locations.
 
 4. **For `get_or_create()` staleness check** (registry.rs:134):
@@ -355,7 +355,7 @@ the first handler call pays the load cost. This is the intended tradeoff.
 ### Verification
 ```bash
 cargo check
-```text
+```
 ---
 
 ## TASK-07: Cache is_stale_fast result with 2-second TTL
@@ -381,7 +381,7 @@ Can't cache inside `is_stale_fast(&self)` — need mutation. Two options:
 ```rust
 // In ProjectRegistry, add:
 stale_cache: RwLock<HashMap<PathBuf, (std::time::Instant, bool)>>,
-```text
+```
 In `get_or_create()`:
 ```rust
 let stale = {
@@ -403,11 +403,11 @@ let stale = {
         fresh
     }
 };
-```text
+```
 **Option B**: Cache in `LeIndex` using interior mutability:
 ```rust
 stale_cache: std::sync::RwLock<Option<(std::time::Instant, bool)>>,
-```text
+```
 Option A is cleaner because `ProjectRegistry` already has `RwLock` infrastructure.
 
 ### Implementation steps (Option A)
@@ -419,7 +419,7 @@ Option A is cleaner because `ProjectRegistry` already has `RwLock` infrastructur
 ### Verification
 ```bash
 cargo check
-```text
+```
 ---
 
 ## TASK-08: Version the PDG storage format
@@ -436,17 +436,17 @@ block.
 ### Implementation steps
 
 1. **Add `schema_version` table** in `initialize_schema()` (before other tables):
-   ```sql
+```sql
    CREATE TABLE IF NOT EXISTS schema_version (
        key TEXT PRIMARY KEY,
        version INTEGER NOT NULL
    );
    INSERT OR IGNORE INTO schema_version (key, version) VALUES ('schema', 1);
-   ```
+```
    Current schema = version 1. All existing DBs get version 1 auto-inserted.
 
 2. **Add `run_migrations()` method** on `Storage`:
-   ```rust
+```rust
    fn run_migrations(&mut self) -> SqliteResult<()> {
        let current: u32 = self.conn.query_row(
            "SELECT COALESCE(MAX(version), 0) FROM schema_version WHERE key = 'schema'",
@@ -466,14 +466,14 @@ block.
        )?;
        Ok(())
    }
-   ```
+```
 
 3. **Call in `open_with_config()`** after `initialize_schema()`:
-   ```rust
+```rust
    storage.initialize_schema()?;
    storage.run_migrations()?;  // NEW
    Ok(storage)
-   ```
+```
 
 4. **Define constant**: `const CURRENT_SCHEMA_VERSION: u32 = 1;`
 
@@ -488,11 +488,11 @@ block.
 //     )?;
 //     Ok(())
 // }
-```text
+```
 ### Verification
 ```bash
 cargo check
-```text
+```
 ---
 
 ## TASK-09: Consolidate skip directory lists into one shared constant
@@ -502,15 +502,15 @@ cargo check
 
 ### Delta analysis
 
-```text
+```
 Union of all lists: 24 entries
 leindex.rs (most comprehensive): 23 entries
 Missing from leindex.rs: ".nuxt"  (only in handlers.rs)
-```text
+```
 ### Implementation steps
 
 1. **Create `src/cli/skip_dirs.rs`**:
-   ```rust
+```rust
    //! Shared directory exclusion list for source file scanning, text search,
    //! and dependency manifest discovery. One place to update.
 
@@ -534,7 +534,7 @@ Missing from leindex.rs: ".nuxt"  (only in handlers.rs)
        // Version control
        ".git", ".hg", ".svn",
    ];
-   ```
+```
 
 2. **Register in `src/cli/mod.rs`**: Add `pub mod skip_dirs;`
 
@@ -558,7 +558,7 @@ Missing from leindex.rs: ".nuxt"  (only in handlers.rs)
 cargo check
 # Then verify same file count:
 # Build the binary, index the project itself, compare file count
-```text
+```
 ---
 
 ## Summary: Blocking Execution Order
