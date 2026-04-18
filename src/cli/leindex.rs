@@ -1027,16 +1027,15 @@ impl LeIndex {
                 return Ok(scan.clone());
             }
         }
-        // Need a scan — call it before borrowing self.cache mutably
-        let scan = self.scan_project_files()?;
+        // Try persistent cache first (avoids full walkdir)
         let project_id = self.project_id.clone();
-        // Now use the cache to store/retrieve
         if !refresh {
-            // Try persistent cache
-            if let result @ Ok(_) = self.cache.get_project_scan(&project_id, false, || Ok(scan.clone())) {
+            if let result @ Ok(_) = self.cache.get_project_scan(&project_id, false, || Err(anyhow::anyhow!("cache miss"))) {
                 return result;
             }
         }
+        // Cache miss — scan filesystem
+        let scan = self.scan_project_files()?;
         self.cache.cache_project_scan(&project_id, &scan);
         self.cache.project_scan = Some(scan.clone());
         Ok(scan)

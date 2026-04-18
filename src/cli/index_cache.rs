@@ -243,12 +243,14 @@ impl IndexCache {
         let mut pdg_bytes = 0;
 
         if pdg.is_some() {
+            let before = self.cache_spiller.store().total_bytes();
             self.spill_pdg_cache(project_id, pdg)?;
-            pdg_bytes = self.cache_spiller.store().total_bytes();
+            pdg_bytes = self.cache_spiller.store().total_bytes() - before;
         }
 
+        let before_vec = self.cache_spiller.store().total_bytes();
         self.spill_vector_cache(project_id, search_node_count)?;
-        let vector_bytes = self.cache_spiller.store().total_bytes() - pdg_bytes;
+        let vector_bytes = self.cache_spiller.store().total_bytes() - before_vec;
 
         info!(
             "Spilled all caches: PDG ({} bytes), Vector ({} bytes)",

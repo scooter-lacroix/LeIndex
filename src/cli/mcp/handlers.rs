@@ -1849,6 +1849,7 @@ scoping to subdirectories, sorting, and pagination."
 
         let handle = registry.get_or_create(project_path).await?;
         let mut index = handle.lock().await;
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let project_root = index.project_path().to_path_buf();
 
         // Allow legacy "path" param; map it into "scope" for resolution.
@@ -2194,7 +2195,7 @@ impl GrepSymbolsHandler {
                 // Apply scope and type filters (separator-aware)
                 if let Some(ref s) = scope {
                     let scope_base = s.trim_end_matches(std::path::MAIN_SEPARATOR);
-                    if !(node.file_path.starts_with(&format!("{}/", scope_base)) || node.file_path == scope_base) {
+                    if !(node.file_path.starts_with(&format!("{}{}", scope_base, std::path::MAIN_SEPARATOR)) || node.file_path == scope_base) {
                         continue;
                     }
                 }

@@ -1,8 +1,8 @@
 # LeIndex Improvements — Blocking Implementation Plan
 
-> **Scope**: 9 tasks (recommendations #1-#4 and #6-#10 from the assessment).
-> Recommendation #5 (LeIndex modularization) is covered separately in
-> `docs/LEINDEX_REFACTORING_GUIDE.md` and is NOT part of this plan.
+> **Scope**: 8 tasks from the systematic assessment.
+> Recommendation #5 (LeIndex modularization) and #6 (handlers.rs split) are covered separately in
+> `docs/LEINDEX_REFACTORING_GUIDE.md` and are NOT part of this plan.
 >
 > **Branch**: `feature/unified-crate`
 > **Verification**: `cargo check` after every task. No `cargo test` (LLVM linker segfault).
