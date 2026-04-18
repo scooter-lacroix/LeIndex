@@ -226,7 +226,8 @@ impl ProjectRegistry {
         let mut leindex = LeIndex::new(&canonical).map_err(|e| {
             JsonRpcError::init_failed(&canonical.display().to_string(), &e.to_string())
         })?;
-        let _ = leindex.load_from_storage();
+        // PDG loading is deferred to first actual query (lazy loading).
+        // This avoids loading 10-50MB PDG on operations that only check staleness.
 
         // Corruption detection and auto-repair
         let corruption =

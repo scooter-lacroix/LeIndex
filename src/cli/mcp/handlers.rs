@@ -1278,11 +1278,12 @@ use leindex_read_symbol."
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
 
         // Enforce project boundary
         let _ = validate_file_within_project(&file_path, index.project_path())?;
 
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -1525,8 +1526,9 @@ For the exact source implementation use leindex_read_symbol."
         };
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
 
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -2156,6 +2158,7 @@ impl GrepSymbolsHandler {
             .search(&pattern, candidate_limit, None)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -2585,7 +2588,8 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -3210,11 +3214,12 @@ leindex_edit_apply to understand the blast radius of your change."
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
 
         // Enforce project boundary
         let _ = validate_file_within_project(&file_path, index.project_path())?;
 
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -3545,7 +3550,8 @@ Grep + multi-file Edit with a single atomic operation."
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -3726,7 +3732,8 @@ to understand the blast radius of your change. No equivalent in standard tools."
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;

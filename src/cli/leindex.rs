@@ -1634,6 +1634,16 @@ impl LeIndex {
         self.pdg.as_ref()
     }
 
+    /// Ensure the PDG is loaded from storage. Called by handlers that need PDG access
+    /// before their first query. Defers the 10-50MB load cost from project registration
+    /// to first actual use.
+    pub fn ensure_pdg_loaded(&mut self) -> Result<()> {
+        if self.pdg.is_none() && self.storage_path.join("leindex.db").exists() {
+            self.load_from_storage()?;
+        }
+        Ok(())
+    }
+
     /// Get the current indexing statistics
     pub fn get_stats(&self) -> &IndexStats {
         &self.stats
