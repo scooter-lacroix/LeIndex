@@ -2080,6 +2080,12 @@ impl GrepSymbolsHandler {
                     "type": "boolean",
                     "description": "Include up to 4000 chars of symbol source code in results (default: false)",
                     "default": false
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["exact", "semantic"],
+                    "description": "Search mode: 'exact' for name substring matching (default), 'semantic' for concept-based similarity search using TF-IDF embeddings",
+                    "default": "exact"
                 }
             },
             "required": ["pattern"]
@@ -2102,6 +2108,11 @@ impl GrepSymbolsHandler {
         let context_lines = extract_usize(&args, "include_context_lines", 0)?.min(10);
         let offset = extract_usize(&args, "offset", 0)?;
         let include_source = extract_bool(&args, "include_source", false);
+        let mode = args
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("exact")
+            .to_owned();
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
@@ -2128,6 +2139,90 @@ impl GrepSymbolsHandler {
         // Use (file_path, byte_range) for location dedup, but skip dedup for synthetic (0,0) ranges
         let mut seen_locations: std::collections::HashSet<(String, (usize, usize))> = std::collections::HashSet::new();
         let mut all_matches: Vec<Value> = Vec::new();
+
+        // Semantic mode: return results directly from the search engine, ranked by
+        // cosine similarity. No text matching — finds conceptually related symbols.
+        if mode == "semantic" {
+            for result in &candidate_results {
+                if all_matches.len() >= fetch_limit {
+                    break;
+                }
+                // Look up PDG node for enrichment
+                let nid = match pdg.find_by_id(&result.node_id) {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let node = match pdg.get_node(nid) {
+                    Some(n) => n,
+                    None => continue,
+                };
+
+                // Apply scope and type filters
+                if let Some(ref s) = scope {
+                    if !node.file_path.starts_with(s.trim_end_matches(std::path::MAIN_SEPARATOR)) {
+                        continue;
+                    }
+                }
+                if type_filter != "all" && node_type_str(&node.node_type) != type_filter {
+                    continue;
+                }
+
+                let caller_ids = get_direct_callers(pdg, nid);
+                let callers: Vec<String> = caller_ids.iter().take(50).filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone())).collect();
+                let callee_ids = pdg.neighbors(nid);
+                let callees: Vec<String> = callee_ids.iter().take(50).filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone())).collect();
+
+                let mut entry = serde_json::json!({
+                    "name": node.name,
+                    "type": node_type_str(&node.node_type),
+                    "file": node.file_path,
+                    "byte_range": node.byte_range,
+                    "complexity": node.complexity,
+                    "caller_count": caller_ids.len(),
+                    "dependency_count": callee_ids.len(),
+                    "callers": callers,
+                    "callees": callees,
+                    "language": node.language,
+                    "score": result.score,
+                });
+
+                if context_lines > 0 {
+                    if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
+                        let snippet: String = src.lines().take(context_lines).collect::<Vec<_>>().join("\n");
+                        entry["context"] = Value::String(snippet);
+                    }
+                }
+                if include_source {
+                    if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
+                        let truncated: String = src.chars().take(4000).collect();
+                        let was_truncated = src.chars().count() > 4000;
+                        entry["source"] = Value::String(truncated);
+                        if was_truncated {
+                            entry["source_truncated"] = Value::Bool(true);
+                        }
+                    }
+                }
+                all_matches.push(entry);
+            }
+
+            // Paginate and format
+            let total_matches = all_matches.len();
+            let paginated: Vec<Value> = all_matches.into_iter().skip(offset).take(max_results).collect();
+            let used_chars: usize = paginated.iter().map(|v| v.to_string().len()).sum();
+
+            let mut response = serde_json::json!({
+                "results": paginated,
+                "total_matches": total_matches,
+                "shown": total_matches.saturating_sub(offset).min(max_results),
+                "offset": offset,
+                "mode": "semantic",
+                "truncated": used_chars > char_budget,
+            });
+            response = wrap_with_meta(response, &index);
+            return Ok(response);
+        }
+
+        // Exact mode: current behavior — text matching with semantic pre-filter
 
         for sr in candidate_results {
             if all_matches.len() >= fetch_limit {
