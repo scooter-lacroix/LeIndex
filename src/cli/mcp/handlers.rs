@@ -1814,6 +1814,10 @@ scoping to subdirectories, sorting, and pagination."
                     "type": "integer",
                     "description": "Maximum number of files to return (default: unlimited, subject to token_budget)",
                     "minimum": 1
+                },
+                "focus": {
+                    "type": "string",
+                    "description": "Semantic focus area — ranks files by relevance to this topic (e.g., 'authentication', 'database layer', 'payment flow')"
                 }
             },
             "required": []
@@ -1838,6 +1842,7 @@ scoping to subdirectories, sorting, and pagination."
             .get("limit")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
+        let focus = args.get("focus").and_then(|v| v.as_str()).map(String::from);
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
@@ -1934,7 +1939,7 @@ scoping to subdirectories, sorting, and pagination."
                     "incoming_dependencies": in_deg,
                     "outgoing_dependencies": out_deg
                 });
-                if include_symbols {
+                if include_symbols || focus.is_some() {
                     entry["top_symbols"] =
                         Value::Array(syms.iter().map(|s| Value::String(s.clone())).collect());
                 }
@@ -1970,6 +1975,32 @@ scoping to subdirectories, sorting, and pagination."
                     .cmp(&a["symbol_count"].as_u64().unwrap_or(0))
             }),
             _ => {}
+        }
+
+        // Semantic focus ranking: when focus is provided, re-rank files by
+        // cosine similarity between the focus embedding and per-file symbol embeddings.
+        if let Some(ref focus_text) = focus {
+            let focus_emb = index.generate_query_embedding(focus_text);
+            for entry in &mut files {
+                let syms = entry["top_symbols"].as_array();
+                let file_text = syms
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                let file_emb = index.generate_query_embedding(&file_text);
+                let score = crate::search::vector::cosine_similarity(&focus_emb, &file_emb);
+                entry["relevance_score"] = serde_json::json!(score);
+            }
+            files.sort_by(|a, b| {
+                let sa = a["relevance_score"].as_f64().unwrap_or(0.0);
+                let sb = b["relevance_score"].as_f64().unwrap_or(0.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            // Remove top_symbols from output if not requested
+            if !include_symbols {
+                for entry in &mut files {
+                    entry.as_object_mut().map(|o| o.remove("top_symbols"));
+                }
+            }
         }
 
         // Apply pagination: offset + limit
