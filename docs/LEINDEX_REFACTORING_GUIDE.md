@@ -13,11 +13,10 @@
 
 ### 1.1 Structural Overview
 
-```
+```text
 src/cli/leindex.rs  — 3022 lines, 50 methods, 12 fields
 src/cli/mcp/handlers.rs — 5345 lines, 20 handler structs
-```
-
+```text
 `LeIndex` is the central orchestrator. It owns:
 - Project identity (`project_path`, `project_id`, `unique_id`, `storage_path`)
 - Storage (`storage: Storage`)
@@ -30,22 +29,20 @@ src/cli/mcp/handlers.rs — 5345 lines, 20 handler structs
 ### 1.2 Method Classification by Mutability
 
 **Read-only (`&self`) — 14 methods:**
-```
+```text
 project_path, storage_path, project_id, unique_id, display_name,
 search_engine, pdg, get_stats, is_indexed, is_stale_fast,
 file_stats, check_freshness, check_manifest_stale,
 collect_source_files_with_hashes_readonly, generate_query_embedding
-```
-
+```text
 **Mutable (`&mut self`) — 24 methods:**
-```
+```text
 index_project, load_from_storage, analyze, close, coverage_report,
 check_memory_and_spill, spill_pdg_cache, spill_vector_cache,
 spill_all_caches, reload_pdg_from_cache, reload_vector_from_pdg,
 source_file_paths, build_file_stats_cache, warm_caches,
 get_project_scan, cache_project_scan, collect_source_file_paths
-```
-
+```text
 ### 1.3 Field Coupling Matrix
 
 | Field | # Methods Accessing It | Heaviest Users |
@@ -80,7 +77,7 @@ These method pairs share mutable state and CANNOT be trivially split:
 
 ### 2.1 Module Structure
 
-```
+```text
 src/cli/
 ├── leindex.rs          # Facade: LeIndex struct, delegates to modules
 ├── index_freshness.rs  # is_stale_fast, check_freshness, check_manifest_stale
@@ -107,8 +104,7 @@ src/cli/
     ├── read_file.rs    # ReadFileHandler
     ├── git_status.rs   # GitStatusHandler
     └── helpers.rs      # extract_string, resolve_scope, wrap_with_meta, etc.
-```
-
+```text
 ### 2.2 LeIndex Facade (Target)
 
 ```rust
@@ -149,8 +145,7 @@ impl LeIndex {
     pub fn index_project(&mut self, force: bool) -> Result<IndexStats> { ... }
     // etc.
 }
-```
-
+```text
 ### 2.3 New `IndexCache` Struct
 
 Holds all caching logic: `cache_spiller`, `project_scan`, `file_stats_cache`.
@@ -172,8 +167,7 @@ impl IndexCache {
     pub fn build_file_stats_cache(&mut self, pdg: &ProgramDependenceGraph) { ... }
     // spill/reload/warm methods...
 }
-```
-
+```text
 ### 2.4 Context Structs (Avoid Borrow Conflicts)
 
 The current design passes `&self` / `&mut self` everywhere, which causes borrow conflicts when a method needs both `self.pdg` and `self.cache_spiller`. The fix:
@@ -205,8 +199,7 @@ impl LeIndex {
         }
     }
 }
-```
-
+```text
 ---
 
 ## 3. Execution Plan: Step-by-Step Refactoring
@@ -220,15 +213,13 @@ impl LeIndex {
 touch src/cli/index_freshness.rs
 touch src/cli/index_builder.rs
 touch src/cli/index_cache.rs
-```
-
+```text
 Register modules in `src/cli/mod.rs`:
 ```rust
 pub mod index_freshness;
 pub mod index_builder;
 pub mod index_cache;
-```
-
+```text
 **Verify**: `cargo check` — empty modules, no changes.
 
 ### Step 1: Extract `IndexFreshness` (LOW RISK)
@@ -403,8 +394,7 @@ cargo check  # after creating empty modules
 cargo check  # after moving first method
 cargo check  # after updating delegation
 cargo check  # after each handler split
-```
-
+```text
 ### Rule 5: Test At Natural Checkpoints
 
 - After Step 1: Call `leindex_grep_symbols` via MCP

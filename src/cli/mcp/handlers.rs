@@ -2191,13 +2191,19 @@ impl GrepSymbolsHandler {
                     None => continue,
                 };
 
-                // Apply scope and type filters
+                // Apply scope and type filters (separator-aware)
                 if let Some(ref s) = scope {
-                    if !node.file_path.starts_with(s.trim_end_matches(std::path::MAIN_SEPARATOR)) {
+                    let scope_base = s.trim_end_matches(std::path::MAIN_SEPARATOR);
+                    if !(node.file_path.starts_with(&format!("{}/", scope_base)) || node.file_path == scope_base) {
                         continue;
                     }
                 }
                 if type_filter != "all" && node_type_str(&node.node_type) != type_filter {
+                    continue;
+                }
+
+                // Skip external/phantom nodes (same filter as exact mode)
+                if matches!(node.node_type, crate::graph::pdg::NodeType::External) && node.byte_range == (0, 0) {
                     continue;
                 }
 
@@ -2220,16 +2226,22 @@ impl GrepSymbolsHandler {
                     "score": result.score,
                 });
 
+                // Read source once for both context and source fields
+                let source = if context_lines > 0 || include_source {
+                    read_source_snippet(&node.file_path, node.byte_range)
+                } else {
+                    None
+                };
                 if context_lines > 0 {
-                    if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
+                    if let Some(ref src) = source {
                         let snippet: String = src.lines().take(context_lines).collect::<Vec<_>>().join("\n");
                         entry["context"] = Value::String(snippet);
                     }
                 }
                 if include_source {
-                    if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
+                    if let Some(ref src) = source {
                         let truncated: String = src.chars().take(4000).collect();
-                        let was_truncated = src.chars().count() > 4000;
+                        let was_truncated = src.char_indices().nth(4000).is_some();
                         entry["source"] = Value::String(truncated);
                         if was_truncated {
                             entry["source_truncated"] = Value::Bool(true);
@@ -2239,18 +2251,30 @@ impl GrepSymbolsHandler {
                 all_matches.push(entry);
             }
 
-            // Paginate and format
+            // Paginate and format with char_budget truncation
             let total_matches = all_matches.len();
             let paginated: Vec<Value> = all_matches.into_iter().skip(offset).take(max_results).collect();
-            let used_chars: usize = paginated.iter().map(|v| v.to_string().len()).sum();
+
+            // Enforce token_budget — same truncation as exact mode
+            let mut truncated_results: Vec<Value> = Vec::new();
+            let mut used_chars: usize = 0;
+            for entry in paginated {
+                let entry_chars = entry.to_string().len();
+                if used_chars + entry_chars > char_budget {
+                    break;
+                }
+                used_chars += entry_chars;
+                truncated_results.push(entry);
+            }
+            let shown = truncated_results.len();
 
             let mut response = serde_json::json!({
-                "results": paginated,
+                "results": truncated_results,
                 "total_matches": total_matches,
-                "shown": total_matches.saturating_sub(offset).min(max_results),
+                "shown": shown,
                 "offset": offset,
                 "mode": "semantic",
-                "truncated": used_chars > char_budget,
+                "truncated": total_matches.saturating_sub(offset).min(max_results) > shown,
             });
             response = wrap_with_meta(response, &index);
             return Ok(response);
@@ -2352,7 +2376,7 @@ impl GrepSymbolsHandler {
             if include_source {
                 if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
                     let truncated: String = src.chars().take(4000).collect();
-                    let was_truncated = src.chars().count() > 4000;
+                    let was_truncated = src.char_indices().nth(4000).is_some();
                     entry["source"] = Value::String(truncated);
                     if was_truncated {
                         entry["source_truncated"] = Value::Bool(true);
@@ -2457,7 +2481,7 @@ impl GrepSymbolsHandler {
                 if include_source {
                     if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
                         let truncated: String = src.chars().take(4000).collect();
-                        let was_truncated = src.chars().count() > 4000;
+                        let was_truncated = src.char_indices().nth(4000).is_some();
                         entry["source"] = Value::String(truncated);
                         if was_truncated {
                             entry["source_truncated"] = Value::Bool(true);

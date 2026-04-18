@@ -14,7 +14,7 @@
 
 ## Dependency Graph
 
-```
+```text
 TASK-01 (callers/callees names)
   └── TASK-02 (semantic search mode)
         └── TASK-03 (project_map focus param)
@@ -25,8 +25,7 @@ TASK-06 (lazy PDG loading)
 TASK-07 (is_stale_fast TTL)
 TASK-08 (storage versioning)
 TASK-09 (skip dir consolidation)
-```
-
+```text
 Four independent chains. TASK-01→02→03 is sequential. All others are independent
 and can be done in any order or in parallel.
 
@@ -55,8 +54,7 @@ let mut entry = serde_json::json!({
     "dependency_count": dep_count,
     ...
 });
-```
-
+```text
 **Location B** — direct PDG scan results (line 2278-2289):
 Same pattern, identical code.
 
@@ -91,8 +89,7 @@ Same pattern, identical code.
 ### Verification
 ```bash
 cargo check
-```
-
+```text
 ---
 
 ## TASK-02: Add semantic search mode to grep_symbols
@@ -112,8 +109,7 @@ let search_query = SearchQuery {
     threshold: Some(0.1),
     ..
 };
-```
-
+```text
 And `GrepSymbolsHandler::execute()` already calls `index.search(&pattern, ...)` for candidate
 pre-filtering (line 2114). So the infrastructure is all there.
 
@@ -156,8 +152,7 @@ The vector_index HNSW search is already populated during `index_nodes()`.
 ### Verification
 ```bash
 cargo check
-```
-
+```text
 ---
 
 ## TASK-03: Add focus parameter to project_map for semantic file ranking
@@ -210,8 +205,7 @@ Must add `pub`.
 ### Verification
 ```bash
 cargo check
-```
-
+```text
 ---
 
 ## TASK-04: Migrate external nodes on PDG load — eliminate dual-check bug class
@@ -226,8 +220,7 @@ cargo check
 pub fn get_node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
     self.graph.node_weight_mut(id)
 }
-```
-
+```text
 But we need to iterate ALL nodes, not access by specific ID. petgraph provides
 `graph.node_weights_mut()` which returns `&mut [Node]` — perfect for bulk mutation.
 
@@ -252,15 +245,13 @@ fn normalize_external_nodes(pdg: &mut ProgramDependenceGraph) {
         info!("Normalized {} external nodes to NodeType::External", migrated);
     }
 }
-```
-
+```text
 Check if `node_weights_mut()` exists on PDG. If not, use:
 ```rust
 for node_idx in pdg.node_indices() {
     if let Some(node) = pdg.get_node_mut(node_idx) { ... }
 }
-```
-
+```text
 **Phase B — Call at both PDG insertion points**:
 
 1. `load_from_storage()` (line 1586): After `let pdg = pdg_store::load_pdg(...)` and before `self.index_nodes(&pdg)`:
@@ -292,8 +283,7 @@ If not, add it as a pass-through to petgraph's `graph.node_weights_mut()`.
 cargo check  # after Phase A + B
 # Then after Phase C:
 cargo check
-```
-
+```text
 ---
 
 ## TASK-06: Lazy PDG loading for read-only queries
@@ -303,25 +293,23 @@ cargo check
 
 ### Current flow (the problem)
 
-```
+```text
 get_or_load() → LeIndex::new() → leindex.load_from_storage()
                                        ↓
                                  Loads entire PDG into memory
                                  (10-50MB for large projects)
                                  Rebuilds search index
                                  Builds file stats cache
-```
-
+```text
 This happens even for `leindex_read_file` which just reads a file from disk.
 
 ### Proposed flow
 
-```
+```text
 get_or_load() → LeIndex::new() → (no load)
                                        ↓
                                  First pdg() call triggers load_from_storage()
-```
-
+```text
 ### Implementation steps
 
 1. **In `registry.rs::create_and_insert()`** (line 229):
@@ -367,8 +355,7 @@ the first handler call pays the load cost. This is the intended tradeoff.
 ### Verification
 ```bash
 cargo check
-```
-
+```text
 ---
 
 ## TASK-07: Cache is_stale_fast result with 2-second TTL
@@ -394,8 +381,7 @@ Can't cache inside `is_stale_fast(&self)` — need mutation. Two options:
 ```rust
 // In ProjectRegistry, add:
 stale_cache: RwLock<HashMap<PathBuf, (std::time::Instant, bool)>>,
-```
-
+```text
 In `get_or_create()`:
 ```rust
 let stale = {
@@ -417,13 +403,11 @@ let stale = {
         fresh
     }
 };
-```
-
+```text
 **Option B**: Cache in `LeIndex` using interior mutability:
 ```rust
 stale_cache: std::sync::RwLock<Option<(std::time::Instant, bool)>>,
-```
-
+```text
 Option A is cleaner because `ProjectRegistry` already has `RwLock` infrastructure.
 
 ### Implementation steps (Option A)
@@ -435,8 +419,7 @@ Option A is cleaner because `ProjectRegistry` already has `RwLock` infrastructur
 ### Verification
 ```bash
 cargo check
-```
-
+```text
 ---
 
 ## TASK-08: Version the PDG storage format
@@ -505,13 +488,11 @@ block.
 //     )?;
 //     Ok(())
 // }
-```
-
+```text
 ### Verification
 ```bash
 cargo check
-```
-
+```text
 ---
 
 ## TASK-09: Consolidate skip directory lists into one shared constant
@@ -521,12 +502,11 @@ cargo check
 
 ### Delta analysis
 
-```
+```text
 Union of all lists: 24 entries
 leindex.rs (most comprehensive): 23 entries
 Missing from leindex.rs: ".nuxt"  (only in handlers.rs)
-```
-
+```text
 ### Implementation steps
 
 1. **Create `src/cli/skip_dirs.rs`**:
@@ -578,8 +558,7 @@ Missing from leindex.rs: ".nuxt"  (only in handlers.rs)
 cargo check
 # Then verify same file count:
 # Build the binary, index the project itself, compare file count
-```
-
+```text
 ---
 
 ## Summary: Blocking Execution Order

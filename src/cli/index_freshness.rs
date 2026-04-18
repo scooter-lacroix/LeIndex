@@ -257,6 +257,10 @@ pub(crate) fn is_stale_fast(ctx: &FreshnessContext<'_>, scan_fn: impl Fn() -> Re
                     if SKIP_DIRS.contains(&name) && e.file_type().is_dir() {
                         return false;
                     }
+                    // Skip non-root hidden directories (mirrors external_deps.rs)
+                    if e.path() != ctx.project_path && name.starts_with('.') && e.file_type().is_dir() {
+                        return false;
+                    }
                 }
                 true
             })
