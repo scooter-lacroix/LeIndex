@@ -55,6 +55,10 @@ pub struct ProjectRegistry {
 
     /// File watchers per project (kept alive by registry).
     watchers: Mutex<HashMap<PathBuf, IndexWatcher>>,
+
+    /// Per-project staleness cache: (timestamp, stale_result).
+    /// Avoids re-computing is_stale_fast on every tool call within a 2-second window.
+    stale_cache: RwLock<HashMap<PathBuf, (std::time::Instant, bool)>>,
 }
 
 impl ProjectRegistry {
@@ -67,6 +71,7 @@ impl ProjectRegistry {
             index_slots: Mutex::new(HashMap::new()),
             max_projects,
             watchers: Mutex::new(HashMap::new()),
+            stale_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -97,6 +102,7 @@ impl ProjectRegistry {
             index_slots: Mutex::new(slots),
             max_projects,
             watchers: Mutex::new(watchers),
+            stale_cache: RwLock::new(HashMap::new()),
         }
     }
 
@@ -128,18 +134,51 @@ impl ProjectRegistry {
     ) -> Result<ProjectHandle, JsonRpcError> {
         let handle = self.get_or_load(project_path).await?;
 
+        // Get canonical path for stale cache key
+        let canonical = {
+            let idx = handle.lock().await;
+            idx.project_path().to_path_buf()
+        };
+
         let (needs_index, needs_refresh) = {
             let idx = handle.lock().await;
             let not_indexed = !idx.is_indexed();
-            let stale = !not_indexed && idx.is_stale_fast();
+
+            // Check stale cache first (2-second TTL)
+            let stale = if not_indexed {
+                false
+            } else {
+                let cache = self.stale_cache.read().await;
+                if let Some((ts, result)) = cache.get(&canonical) {
+                    if ts.elapsed() < std::time::Duration::from_secs(2) {
+                        *result
+                    } else {
+                        // Cache expired — compute fresh
+                        drop(cache);
+                        let fresh = idx.is_stale_fast();
+                        self.stale_cache.write().await.insert(canonical.clone(), (std::time::Instant::now(), fresh));
+                        fresh
+                    }
+                } else {
+                    // No cache entry — compute and cache
+                    drop(cache);
+                    let fresh = idx.is_stale_fast();
+                    self.stale_cache.write().await.insert(canonical.clone(), (std::time::Instant::now(), fresh));
+                    fresh
+                }
+            };
             (not_indexed, stale)
         };
 
         if needs_index {
             let _ = self.index_handle(&handle, false).await?;
+            // Invalidate stale cache after reindex
+            self.stale_cache.write().await.remove(&canonical);
         } else if needs_refresh {
             let _ = self.index_handle(&handle, false).await?;
             debug!("Auto-refreshed stale index");
+            // Invalidate stale cache after reindex
+            self.stale_cache.write().await.remove(&canonical);
         }
 
         Ok(handle)
