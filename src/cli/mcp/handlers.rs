@@ -445,17 +445,38 @@ to auto-switch/auto-index projects."
         }
 
         // Fetch top_k + offset results, then slice for pagination
-        let all_results = index
-            .search(&query, top_k + offset, query_type)
+        let mut fetch_k = top_k + offset;
+        let mut all_results = index
+            .search(&query, fetch_k, query_type)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
-        let filtered: Vec<_> = all_results
-            .into_iter()
+        let mut filtered: Vec<_> = all_results
+            .iter()
             .filter(|r| match &scope {
                 Some(s) => r.file_path.starts_with(s),
                 None => true,
             })
+            .cloned()
             .collect();
+
+        // Retry with expanded window if scope eliminated everything.
+        // The initial fetch may miss lower-ranked in-scope results.
+        if filtered.is_empty() && scope.is_some() && !all_results.is_empty() {
+            fetch_k = (fetch_k * 10).min(1000);
+            if fetch_k > top_k + offset {
+                all_results = index
+                    .search(&query, fetch_k, query_type)
+                    .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
+                filtered = all_results
+                    .iter()
+                    .filter(|r| match &scope {
+                        Some(s) => r.file_path.starts_with(s),
+                        None => true,
+                    })
+                    .cloned()
+                    .collect();
+            }
+        }
 
         let total_filtered = filtered.len();
 
@@ -3652,13 +3673,12 @@ Grep + multi-file Edit with a single atomic operation."
             let filtered_files = filtered_files;
             let old_name = old_name.clone();
             let new_name = new_name.clone();
-            move || {
+            move || -> Result<(Vec<Value>, Vec<String>), String> {
                 let mut diffs: Vec<Value> = Vec::new();
                 let mut files_to_modify: Vec<String> = Vec::new();
                 for file_path in &filtered_files {
-                    let Ok(original) = std::fs::read_to_string(file_path) else {
-                        continue;
-                    };
+                    let original = std::fs::read_to_string(file_path)
+                        .map_err(|e| format!("Failed reading '{}': {}", file_path, e))?;
                     let modified = replace_whole_word(&original, &old_name, &new_name);
                     if modified != original {
                         let diff = make_diff(&original, &modified, file_path);
@@ -3666,11 +3686,12 @@ Grep + multi-file Edit with a single atomic operation."
                         files_to_modify.push(file_path.clone());
                     }
                 }
-                (diffs, files_to_modify)
+                Ok((diffs, files_to_modify))
             }
         })
         .await
-        .map_err(|e| JsonRpcError::internal_error(format!("Rename task failed: {}", e)))?;
+        .map_err(|e| JsonRpcError::internal_error(format!("Rename task failed: {}", e)))?
+        .map_err(JsonRpcError::internal_error)?;
 
         if !preview_only {
             // Apply changes to all files (file I/O — offload to blocking thread)
