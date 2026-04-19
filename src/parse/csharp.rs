@@ -65,6 +65,7 @@ impl CSharpParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (0, 0),
+                            cyclomatic_complexity: 0,
                         });
                     }
 
@@ -96,6 +97,7 @@ impl CSharpParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (0, 0),
+                            cyclomatic_complexity: 0,
                         });
                     }
                 }
@@ -122,6 +124,7 @@ impl CSharpParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (0, 0),
+                            cyclomatic_complexity: 0,
                         });
                     }
                 }
@@ -148,6 +151,7 @@ impl CSharpParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (0, 0),
+                            cyclomatic_complexity: 0,
                         });
                     }
                 }
@@ -346,6 +350,7 @@ fn extract_method_signature(
 
         imports: vec![],
         byte_range: (0, 0),
+        cyclomatic_complexity: 0,
     })
 }
 

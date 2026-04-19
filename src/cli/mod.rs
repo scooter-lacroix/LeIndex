@@ -82,6 +82,12 @@ pub mod cli;
 pub mod config;
 /// Error types and error handling logic.
 pub mod errors;
+/// Indexing pipeline: project parsing, PDG building, search indexing.
+pub mod index_builder;
+/// Cache subsystem: CacheSpiller, project scan, file stats cache.
+pub mod index_cache;
+/// Staleness detection: is_stale_fast, check_freshness, check_manifest_stale.
+pub mod index_freshness;
 /// Core orchestration logic for indexing and search.
 pub mod leindex;
 /// Memory management and cache orchestration.
@@ -92,6 +98,8 @@ pub mod registry;
 /// File watcher for auto-reindex.
 #[cfg(feature = "mcp-server")]
 pub mod watcher;
+/// Shared directory exclusion constants.
+pub mod skip_dirs;
 
 /// Model Context Protocol (MCP) server implementation.
 #[cfg(feature = "mcp-server")]

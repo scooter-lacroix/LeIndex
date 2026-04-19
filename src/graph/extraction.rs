@@ -130,6 +130,14 @@ fn infer_class_nodes_and_containment(
             .next()
             .unwrap_or(class_name)
             .to_string();
+
+        // Sum the complexities of all member methods instead of just counting them
+        let class_complexity: u32 = method_nids
+            .iter()
+            .filter_map(|&mnid| pdg.get_node(mnid))
+            .map(|node| node.complexity)
+            .sum();
+
         let class_node = Node {
             id: format!("{}:{}", file_path, class_name),
             node_type: NodeType::Class,
@@ -143,7 +151,7 @@ fn infer_class_nodes_and_containment(
                 },
                 max_end,
             ),
-            complexity: method_nids.len() as u32,
+            complexity: if class_complexity > 0 { class_complexity } else { method_nids.len() as u32 },
             language: language.to_string(),
         };
         let class_nid = pdg.add_node(class_node);
@@ -986,6 +994,30 @@ pub fn extract_call_edges(
                     edges.push((caller_id, target_id));
                 }
             }
+
+            // Also link caller → struct/class node if the callee name matches a type node
+            // This handles cases like `DeepThoughtManager::new()` where we want to link
+            // to both the `new` method and the `DeepThoughtManager` struct
+            let callee_name = normalize_symbol(call_target);
+            if let Some((scoped_prefix, _member)) = callee_name.rsplit_once('.') {
+                let bare_type = scoped_prefix.rsplit('.').next().unwrap_or(scoped_prefix);
+                // Only look up if bare_type looks like a type name (starts uppercase)
+                let looks_like_type = bare_type.chars().next().map_or(false, |c| c.is_uppercase());
+                if looks_like_type {
+                    // Try exact scoped match first, then last-segment match
+                    let struct_nid = node_ids
+                        .get(scoped_prefix)
+                        .or_else(|| node_ids.get(bare_type))
+                        .or_else(|| last_map.get(bare_type).and_then(|v| v.first()));
+                    if let Some(&snid) = struct_nid {
+                        let pair = (caller_id, snid);
+                        if !seen.contains(&pair) {
+                            seen.insert(pair);
+                            edges.push(pair);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1445,7 +1477,7 @@ fn extract_import_edges(
             let eid = *external_nodes.entry(path.clone()).or_insert_with(|| {
                 pdg.add_node(Node {
                     id: format!("{}:__external__:{}", file_path, path),
-                    node_type: NodeType::Module,
+                    node_type: NodeType::External,
                     name: path.clone(),
                     file_path: file_path.to_string(),
                     byte_range: (0, 0),
@@ -1557,7 +1589,11 @@ fn signature_to_node(sig: &SignatureInfo, file_path: &str, language: &str) -> No
     } else {
         NodeType::Function
     };
-    let complexity = 1u32 + sig.parameters.len() as u32;
+    let complexity = if sig.cyclomatic_complexity > 0 {
+        sig.cyclomatic_complexity
+    } else {
+        1u32 + sig.parameters.len() as u32
+    };
     Node {
         id: format!("{}:{}", file_path, sig.qualified_name),
         node_type,
@@ -1591,6 +1627,7 @@ mod tests {
             calls: vec![],
             imports: vec![],
             byte_range: (0, 100),
+            cyclomatic_complexity: 0,
         }
     }
 
@@ -1620,6 +1657,7 @@ mod tests {
             calls: vec![],
             imports: vec![],
             byte_range: (0, 100),
+            cyclomatic_complexity: 0,
         }
     }
 
@@ -1697,7 +1735,7 @@ mod tests {
 
     #[test]
     fn inheritance_super_call_signal() {
-        let mut parent_speak = sig("speak", "Animal::speak", true);
+        let parent_speak = sig("speak", "Animal::speak", true);
         let mut child_speak = sig("speak", "Dog::speak", true);
         child_speak.calls.push("super.speak".to_string());
 
@@ -1747,5 +1785,62 @@ mod tests {
         let source = b"import {\n  useState,\n  useEffect,\n  useCallback\n} from 'react';\n";
         let imports = extract_import_paths_from_source(source, "typescript");
         assert!(imports.contains("react"));
+    }
+
+    #[test]
+    fn cyclomatic_complexity_wiring_from_signature_to_node() {
+        use crate::parse::traits::{Parameter, SignatureInfo, Visibility};
+
+        // Test 1: cyclomatic_complexity = 0 should use parameter count fallback
+        let sig_simple = SignatureInfo {
+            name: "simple".to_string(),
+            qualified_name: "simple".to_string(),
+            parameters: vec![],
+            return_type: None,
+            visibility: Visibility::Public,
+            is_async: false,
+            is_method: false,
+            docstring: None,
+            calls: vec![],
+            imports: vec![],
+            byte_range: (0, 10),
+            cyclomatic_complexity: 0,
+        };
+
+        let node = signature_to_node(&sig_simple, "test.rs", "rust");
+        assert_eq!(node.complexity, 1, "Simple: no params → complexity 1");
+
+        // Test 2: cyclomatic_complexity > 0 should use that value
+        let sig_complex = SignatureInfo {
+            cyclomatic_complexity: 5,
+            ..sig_simple.clone()
+        };
+
+        let node = signature_to_node(&sig_complex, "test.rs", "rust");
+        assert_eq!(node.complexity, 5, "Complex: cyclomatic=5 → complexity 5");
+
+        // Test 3: parameters without cyclomatic should use 1 + param_count
+        let sig_params = SignatureInfo {
+            name: "with_params".to_string(),
+            qualified_name: "with_params".to_string(),
+            parameters: vec![
+                Parameter { name: "a".into(), type_annotation: None, default_value: None },
+                Parameter { name: "b".into(), type_annotation: None, default_value: None },
+            ],
+            cyclomatic_complexity: 0,
+            ..sig_simple
+        };
+
+        let node = signature_to_node(&sig_params, "test.rs", "rust");
+        assert_eq!(node.complexity, 3, "Params: 2 params → complexity 3");
+
+        // Test 4: cyclomatic should override parameter count
+        let sig_both = SignatureInfo {
+            cyclomatic_complexity: 10,
+            ..sig_params
+        };
+
+        let node = signature_to_node(&sig_both, "test.rs", "rust");
+        assert_eq!(node.complexity, 10, "Both: cyclomatic=10 overrides param count");
     }
 }

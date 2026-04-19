@@ -24,8 +24,8 @@
 //! | PHP        | `composer.lock`               | name, version             |
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 /// A resolved external dependency with package metadata.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,111 +91,85 @@ impl ExternalDependencyRegistry {
 
     /// Scan the project root for lock/manifest files and build the registry.
     pub fn from_project(root: &Path) -> Self {
+        Self::from_manifest_paths(root, &discover_dependency_manifests(root, None))
+    }
+}
+
+/// Lockfiles (priority 1) override manifest-derived ranges (priority 0).
+fn source_priority(file_name: &str) -> u8 {
+    match file_name {
+        "Cargo.toml" | "package.json" | "pyproject.toml" | "go.mod" => 0,
+        _ => 1, // lockfiles and fully resolved metadata
+    }
+}
+
+impl ExternalDependencyRegistry {
+    /// Build the registry from an already-discovered manifest list.
+    /// Build a dependency registry from manifest/lockfile paths.
+    ///
+    /// In monorepos, manifests are grouped by workspace directory before merging,
+    /// so lockfile versions from one workspace don't overwrite entries from another.
+    /// The final merge still uses last-wins across workspaces, but each workspace's
+    /// lockfile entries take precedence over that workspace's manifest entries.
+    pub fn from_manifest_paths(root: &Path, manifest_paths: &[PathBuf]) -> Self {
+        // Sort so lockfiles (priority 1) are parsed AFTER manifests (priority 0),
+        // ensuring lockfile versions overwrite the looser manifest-derived ranges.
+        let mut sorted_paths = manifest_paths.to_vec();
+        sorted_paths.sort_by(|a, b| {
+            let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            source_priority(a_name).cmp(&source_priority(b_name))
+        });
+
+        // Group manifests by their parent directory (workspace root).
+        // Within each workspace, parse with local priority ordering, then merge
+        // all workspaces into a single registry.
+        let mut workspaces: std::collections::BTreeMap<PathBuf, Vec<PathBuf>> = std::collections::BTreeMap::new();
+        for manifest_path in &sorted_paths {
+            let path = if manifest_path.is_absolute() {
+                manifest_path.clone()
+            } else {
+                root.join(manifest_path)
+            };
+            let ws_root = path.parent().unwrap_or(root).to_path_buf();
+            workspaces.entry(ws_root).or_default().push(path);
+        }
+
         let mut registry = Self::new();
+        for (_ws_root, paths) in workspaces {
+            // Parse each workspace's manifests into a local registry,
+            // then merge into the global one.
+            let mut local = Self::new();
+            for path in &paths {
+                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let Ok(content) = std::fs::read_to_string(path) else {
+                    continue;
+                };
 
-        // Rust
-        let cargo_lock = root.join("Cargo.lock");
-        if cargo_lock.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&cargo_lock) {
-                registry.parse_cargo_lock(&content);
+                match file_name {
+                    "Cargo.lock" => local.parse_cargo_lock(&content),
+                    "Cargo.toml" => local.parse_cargo_toml(&content),
+                    "package-lock.json" | "npm-shrinkwrap.json" => local.parse_package_lock_json(&content),
+                    "package.json" => local.parse_package_json(&content),
+                    "yarn.lock" => local.parse_yarn_lock(&content),
+                    "pnpm-lock.yaml" => local.parse_pnpm_lock(&content),
+                    "requirements.txt" => local.parse_requirements_txt(&content),
+                    "Pipfile.lock" => local.parse_pipfile_lock(&content),
+                    "pyproject.toml" => local.parse_pyproject_toml(&content),
+                    "poetry.lock" => local.parse_poetry_lock(&content),
+                    "go.mod" => local.parse_go_mod(&content),
+                    "go.sum" => local.parse_go_sum(&content),
+                    "Gemfile.lock" => local.parse_gemfile_lock(&content),
+                    "composer.lock" => local.parse_composer_lock(&content),
+                    _ => {}
+                }
             }
-        }
-        // Rust fallback manifest
-        let cargo_toml = root.join("Cargo.toml");
-        if cargo_toml.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&cargo_toml) {
-                registry.parse_cargo_toml(&content);
-            }
-        }
-
-        // Node.js — package-lock.json
-        let pkg_lock = root.join("package-lock.json");
-        if pkg_lock.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&pkg_lock) {
-                registry.parse_package_lock_json(&content);
-            }
-        }
-        // Node.js — package.json fallback
-        let package_json = root.join("package.json");
-        if package_json.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&package_json) {
-                registry.parse_package_json(&content);
-            }
-        }
-
-        // Node.js — yarn.lock
-        let yarn_lock = root.join("yarn.lock");
-        if yarn_lock.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&yarn_lock) {
-                registry.parse_yarn_lock(&content);
-            }
-        }
-        // Node.js — pnpm-lock.yaml
-        let pnpm_lock = root.join("pnpm-lock.yaml");
-        if pnpm_lock.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&pnpm_lock) {
-                registry.parse_pnpm_lock(&content);
-            }
-        }
-
-        // Python — requirements.txt
-        let requirements = root.join("requirements.txt");
-        if requirements.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&requirements) {
-                registry.parse_requirements_txt(&content);
-            }
-        }
-
-        // Python — Pipfile.lock
-        let pipfile_lock = root.join("Pipfile.lock");
-        if pipfile_lock.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&pipfile_lock) {
-                registry.parse_pipfile_lock(&content);
-            }
-        }
-        // Python — pyproject.toml
-        let pyproject_toml = root.join("pyproject.toml");
-        if pyproject_toml.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&pyproject_toml) {
-                registry.parse_pyproject_toml(&content);
-            }
-        }
-        // Python — poetry.lock
-        let poetry_lock = root.join("poetry.lock");
-        if poetry_lock.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&poetry_lock) {
-                registry.parse_poetry_lock(&content);
-            }
-        }
-
-        // Go — go.sum
-        let go_mod = root.join("go.mod");
-        if go_mod.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&go_mod) {
-                registry.parse_go_mod(&content);
-            }
-        }
-        let go_sum = root.join("go.sum");
-        if go_sum.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&go_sum) {
-                registry.parse_go_sum(&content);
-            }
-        }
-
-        // Ruby — Gemfile.lock
-        let gemfile_lock = root.join("Gemfile.lock");
-        if gemfile_lock.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&gemfile_lock) {
-                registry.parse_gemfile_lock(&content);
-            }
-        }
-
-        // PHP — composer.lock
-        let composer_lock = root.join("composer.lock");
-        if composer_lock.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&composer_lock) {
-                registry.parse_composer_lock(&content);
-            }
+            // Merge local workspace into the global registry.
+            // Each workspace's lockfile entries override earlier entries for
+            // the same package name, which is correct within-workspace.
+            registry.merge(local);
         }
 
         registry
@@ -214,6 +188,18 @@ impl ExternalDependencyRegistry {
     /// List all known dependencies.
     pub fn all_dependencies(&self) -> Vec<&ExternalDependency> {
         self.by_name.values().collect()
+    }
+
+    /// Merge another registry into this one. Entries from `other` overwrite
+    /// entries with the same key in `self`, preserving lockfile-derived entries
+    /// over manifest-derived ranges within each workspace.
+    pub fn merge(&mut self, other: ExternalDependencyRegistry) {
+        for (name, dep) in other.by_name {
+            self.by_name.insert(name, dep);
+        }
+        for (prefix, canonical) in other.prefix_map {
+            self.prefix_map.insert(prefix, canonical);
+        }
     }
 
     /// Resolve an import path to a known external dependency.
@@ -1081,12 +1067,16 @@ pub fn annotate_external_nodes(
 ) -> AnnotationStats {
     use crate::graph::pdg::NodeType;
     let mut stats = AnnotationStats::default();
+    let mut unresolved_imports = HashSet::new();
 
     let external_nodes: Vec<crate::graph::pdg::NodeId> = pdg
         .node_indices()
         .filter(|&idx| {
             pdg.get_node(idx)
-                .map(|n| n.node_type == NodeType::Module && n.language == "external")
+                .map(|n| {
+                    matches!(n.node_type, NodeType::External)
+                        || n.language == "external" // Legacy compat
+                })
                 .unwrap_or(false)
         })
         .collect();
@@ -1121,10 +1111,11 @@ pub fn annotate_external_nodes(
                 node.language = "external:system".to_string();
             }
         } else {
-            stats.unresolved += 1;
+            unresolved_imports.insert(import_name);
         }
     }
 
+    stats.unresolved = unresolved_imports.len();
     stats
 }
 
@@ -1137,8 +1128,105 @@ pub struct AnnotationStats {
     pub resolved: usize,
     /// Recognized as builtin/system modules.
     pub builtin: usize,
-    /// Still unresolved.
+    /// Unique external imports still unresolved after manifest/lockfile matching.
     pub unresolved: usize,
+}
+
+/// Discover dependency manifests and lockfiles while respecting project exclusion config.
+///
+/// When `exclude_dirs` is provided, those directory names are skipped in addition to
+/// the default hidden-directory heuristic. This allows callers to pass the directory
+/// patterns from `ExclusionConfig` so that user-excluded directories are respected.
+pub fn discover_dependency_manifests(root: &Path, exclude_dirs: Option<&[String]>) -> Vec<std::path::PathBuf> {
+    const MANIFEST_NAMES: &[&str] = &[
+        "Cargo.lock",
+        "Cargo.toml",
+        "Gemfile.lock",
+        "Pipfile.lock",
+        "composer.lock",
+        "go.mod",
+        "go.sum",
+        "npm-shrinkwrap.json",
+        "package-lock.json",
+        "package.json",
+        "pnpm-lock.yaml",
+        "poetry.lock",
+        "pyproject.toml",
+        "requirements.txt",
+        "yarn.lock",
+    ];
+    use crate::cli::skip_dirs::SKIP_DIRS;
+
+    let mut discovered = Vec::new();
+
+    let mut walker = walkdir::WalkDir::new(root).follow_links(false).into_iter();
+    while let Some(entry) = walker.next() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let file_name = entry.file_name().to_string_lossy();
+
+        if path != root && file_name.starts_with('.') && entry.file_type().is_dir() {
+            walker.skip_current_dir();
+            continue;
+        }
+
+        if entry.file_type().is_dir() {
+            // Skip hardcoded common non-project directories
+            if SKIP_DIRS.contains(&file_name.as_ref()) {
+                walker.skip_current_dir();
+                continue;
+            }
+            // Also skip any caller-provided exclusion patterns
+            if let Some(excluded) = exclude_dirs {
+                if excluded.iter().any(|p| {
+                    // Match the directory name against the pattern's leaf segment.
+                    // For patterns like "target/debug", only match if the relative path
+                    // from root starts with the pattern — not if any segment equals the leaf.
+                    let trimmed = p.trim_matches('*').trim_matches('/');
+                    let relative = path.strip_prefix(root).ok()
+                        .and_then(|r| r.to_str())
+                        .unwrap_or("");
+                    // Check if the relative directory path matches or is a prefix
+                    let dir_relative = if relative.ends_with('/') {
+                        relative.to_string()
+                    } else {
+                        format!("{}/", relative)
+                    };
+                    // Leaf-name match: any directory component equals the pattern
+                    // (consistent with SKIP_DIRS behavior — matches anywhere in tree)
+                    file_name.as_ref() == trimmed
+                        // Exact match: this directory equals the pattern
+                        || trimmed == relative
+                        || trimmed == relative.trim_end_matches('/')
+                        // Prefix match: this directory is inside the excluded pattern
+                        || dir_relative.starts_with(&format!("{}/", trimmed))
+                }) {
+                    walker.skip_current_dir();
+                    continue;
+                }
+            }
+            continue;
+        }
+
+        if entry.file_type().is_file() && MANIFEST_NAMES.binary_search(&file_name.as_ref()).is_ok() {
+            discovered.push(path.to_path_buf());
+        }
+    }
+
+    discovered.sort_by(|a, b| {
+        let a_depth = a
+            .strip_prefix(root)
+            .map(|p| p.components().count())
+            .unwrap_or(usize::MAX);
+        let b_depth = b
+            .strip_prefix(root)
+            .map(|p| p.components().count())
+            .unwrap_or(usize::MAX);
+        a_depth.cmp(&b_depth).then_with(|| a.cmp(b))
+    });
+    discovered
 }
 
 #[cfg(test)]
@@ -1464,7 +1552,7 @@ PLATFORMS
         let ext_id = pdg.add_node(Node {
             id: "serde".to_string(),
             name: "serde".to_string(),
-            node_type: NodeType::Module,
+            node_type: NodeType::External,
             file_path: "".to_string(),
             byte_range: (0, 0),
             language: "external".to_string(),
@@ -1567,6 +1655,22 @@ PLATFORMS
     }
 
     #[test]
+    fn from_project_discovers_nested_workspace_manifests() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("packages").join("web");
+        std::fs::create_dir_all(&nested).expect("mkdir");
+        std::fs::write(
+            nested.join("package.json"),
+            r#"{"dependencies":{"react":"^18.2.0","zod":"^3.23.8"}}"#,
+        )
+        .expect("write");
+
+        let registry = ExternalDependencyRegistry::from_project(dir.path());
+        assert!(registry.resolve("react").is_some());
+        assert!(registry.resolve("zod").is_some());
+    }
+
+    #[test]
     fn from_project_with_go_mod() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(
@@ -1587,7 +1691,7 @@ PLATFORMS
         let ext_id = pdg.add_node(Node {
             id: "std".to_string(),
             name: "std".to_string(),
-            node_type: NodeType::Module,
+            node_type: NodeType::External,
             file_path: "".to_string(),
             byte_range: (0, 0),
             language: "external".to_string(),
@@ -1601,5 +1705,35 @@ PLATFORMS
         assert_eq!(stats.builtin, 1);
         assert_eq!(stats.unresolved, 0);
         assert_eq!(pdg.get_node(ext_id).unwrap().language, "external:system");
+    }
+
+    #[test]
+    fn annotate_external_nodes_deduplicates_unresolved_import_names() {
+        use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
+
+        let mut pdg = ProgramDependenceGraph::new();
+        pdg.add_node(Node {
+            id: "src/main.rs:__external__:react".to_string(),
+            name: "react".to_string(),
+            node_type: NodeType::External,
+            file_path: "src/main.rs".to_string(),
+            byte_range: (0, 0),
+            language: "external".to_string(),
+            complexity: 0,
+        });
+        pdg.add_node(Node {
+            id: "src/app.ts:__external__:react".to_string(),
+            name: "react".to_string(),
+            node_type: NodeType::External,
+            file_path: "src/app.ts".to_string(),
+            byte_range: (0, 0),
+            language: "external".to_string(),
+            complexity: 0,
+        });
+
+        let registry = ExternalDependencyRegistry::new();
+        let stats = annotate_external_nodes(&mut pdg, &registry);
+        assert_eq!(stats.total_external, 2);
+        assert_eq!(stats.unresolved, 1);
     }
 }

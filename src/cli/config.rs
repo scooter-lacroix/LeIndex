@@ -173,7 +173,7 @@ impl LanguageConfig {
         // Must stay in sync with crate::parse::grammar::LanguageId::from_extension
         // and crate::cli::leindex::collect_source_files_with_hashes.
         let all_extensions = [
-            "rs", "py", "js", "ts", "tsx", "jsx", // Main languages
+            "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", // Main languages
             "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Systems languages
             "cs",  // C#
             "rb", "php", "lua", "scala", "sc", // Scripting languages
@@ -212,8 +212,8 @@ impl LanguageConfig {
         match lang.to_lowercase().as_str() {
             "rust" => vec!["rs"],
             "python" => vec!["py"],
-            "javascript" => vec!["js", "jsx"],
-            "typescript" => vec!["ts", "tsx"],
+            "javascript" => vec!["js", "jsx", "mjs", "cjs"],
+            "typescript" => vec!["ts", "tsx", "mts", "cts"],
             "go" => vec!["go"],
             "java" => vec!["java"],
             "cpp" | "c++" => vec!["cpp", "cc", "cxx", "c", "h", "hpp"],
@@ -283,6 +283,12 @@ impl Default for ExclusionConfig {
                 ".leindex".into(),
             ],
             file_patterns: vec![
+                // Note: lockfiles (Cargo.lock, package-lock.json, etc.) are NOT listed
+                // in file_patterns because scan_project_files() collects them as
+                // dependency manifests BEFORE checking exclusions. This ensures they
+                // are always available for external dependency resolution while still
+                // being excluded from source file indexing (the manifest check `continue`s
+                // before the source extension check).
                 "*.min.js".into(),
                 "*.min.css".into(),
                 "*.pb.go".into(), // Generated protobuf files
@@ -568,6 +574,17 @@ mod tests {
     #[test]
     fn test_exclusion_minified_and_generated_files() {
         let config = ExclusionConfig::default();
+        // Lockfiles are NOT excluded — they are collected as manifests by scan_project_files()
+        // before the exclusion check runs.
+        assert!(!config.should_exclude("Cargo.lock"));
+        assert!(!config.should_exclude("frontend/package-lock.json"));
+        assert!(!config.should_exclude("api/yarn.lock"));
+        assert!(!config.should_exclude("packages/web/pnpm-lock.yaml"));
+        assert!(!config.should_exclude("backend/composer.lock"));
+        assert!(!config.should_exclude("python/Pipfile.lock"));
+        assert!(!config.should_exclude("python/poetry.lock"));
+        assert!(!config.should_exclude("ruby/Gemfile.lock"));
+        // Minified and generated files ARE excluded
         assert!(config.should_exclude("app.min.js"));
         assert!(config.should_exclude("styles.min.css"));
         assert!(config.should_exclude("service.pb.go"));
@@ -575,6 +592,9 @@ mod tests {
         assert!(config.should_exclude("vendor.bundle.js"));
         assert!(config.should_exclude("main.chunk.js"));
         // Normal files should NOT be excluded
+        assert!(!config.should_exclude("package.json"));
+        assert!(!config.should_exclude("Cargo.toml"));
+        assert!(!config.should_exclude("pyproject.toml"));
         assert!(!config.should_exclude("app.js"));
         assert!(!config.should_exclude("service.go"));
     }
@@ -585,7 +605,7 @@ mod tests {
         let exts = config.enabled_extensions();
         // All extensions supported by leparse
         for ext in &[
-            "rs", "py", "js", "ts", "tsx", "jsx", "go", "java", "cpp", "cc", "cxx", "c", "h",
+            "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "go", "java", "cpp", "cc", "cxx", "c", "h",
             "hpp", "cs", "rb", "php", "lua", "scala", "sc", "sh", "bash", "json",
         ] {
             assert!(exts.contains(*ext), "Extension '{}' should be enabled", ext);
@@ -598,8 +618,8 @@ mod tests {
         let cases = vec![
             ("rust", vec!["rs"]),
             ("python", vec!["py"]),
-            ("javascript", vec!["js", "jsx"]),
-            ("typescript", vec!["ts", "tsx"]),
+            ("javascript", vec!["js", "jsx", "mjs", "cjs"]),
+            ("typescript", vec!["ts", "tsx", "mts", "cts"]),
             ("csharp", vec!["cs"]),
             ("c#", vec!["cs"]),
             ("bash", vec!["sh", "bash"]),

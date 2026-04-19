@@ -18,7 +18,7 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
     // All file extensions supported by the parse module.
     // Must stay in sync with crate::parse::grammar::LanguageId::from_extension.
     let code_exts = [
-        "rs", "py", "js", "jsx", "ts", "tsx", // Main languages
+        "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", // Main languages
         "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Systems languages
         "cs",  // C#
         "rb", "php", "lua", "scala", "sc", // Scripting languages
@@ -40,9 +40,10 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
             }
 
             if let Some(ext) = candidate.extension().and_then(|e| e.to_str()) {
-                if code_exts.contains(&ext) {
+                let ext = ext.to_ascii_lowercase();
+                if code_exts.contains(&ext.as_str()) {
                     collected.code_files.push(candidate.clone());
-                } else if options.include_docs && include_docs_extension(ext, options.docs_mode) {
+                } else if options.include_docs && include_docs_extension(&ext, options.docs_mode) {
                     collected.docs_files.push(candidate.clone());
                 }
             }
@@ -85,7 +86,8 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
         }
 
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if code_exts.contains(&ext) {
+            let ext = ext.to_ascii_lowercase();
+            if code_exts.contains(&ext.as_str()) {
                 collected.code_files.push(path.to_path_buf());
                 if collected.code_files.len() >= options.max_files {
                     break;
@@ -93,7 +95,7 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
                 continue;
             }
 
-            if options.include_docs && include_docs_extension(ext, options.docs_mode) {
+            if options.include_docs && include_docs_extension(&ext, options.docs_mode) {
                 collected.docs_files.push(path.to_path_buf());
             }
         }

@@ -3,12 +3,11 @@
 // *L'Index* (The Index) - Unified API that brings together all LeIndex crates
 
 use crate::cli::memory::{
-    analysis_cache_key, pdg_cache_key, search_cache_key, CacheEntry, CacheSpiller, MemoryConfig,
-    WarmStrategy,
+    analysis_cache_key, search_cache_key, CacheEntry, WarmStrategy,
 };
 use crate::graph::{
     extract_pdg_from_signatures,
-    pdg::ProgramDependenceGraph,
+    pdg::{EdgeType, NodeType, ProgramDependenceGraph},
     traversal::{GravityTraversal, TraversalConfig},
 };
 use crate::parse::parallel::ParallelParser;
@@ -22,44 +21,34 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 // Supported source file extensions for indexing
-const SOURCE_FILE_EXTENSIONS: &[&str] = &[
+pub(crate) const SOURCE_FILE_EXTENSIONS: &[&str] = &[
     // Main languages
-    "rs", "py", "js", "ts", "tsx", "jsx", // Systems languages
-    "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Others
+    "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts",
+    // Systems languages
+    "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp",
+    // Scripting & other
     "cs", "rb", "php", "lua", "scala", "sc", "sh", "bash", "json",
 ];
 
 // Directories to always skip during source collection
-const ALWAYS_SKIP_DIRS: &[&str] = &[
-    // Version control
-    ".git",
-    ".hg",
-    ".svn",
-    // Build outputs
-    "target",
-    "build",
-    "dist",
-    "out",
-    ".next",
-    "coverage",
-    // Package managers / dependencies
-    "node_modules",
-    "vendor",
-    "bower_components",
-    // Python virtual environments & caches
-    ".venv",
-    "venv",
-    "env",
-    "__pycache__",
-    ".tox",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    // IDE / editor metadata
-    ".idea",
-    ".vscode",
-    // Misc generated
-    ".leindex",
+pub(crate) use crate::cli::skip_dirs::SKIP_DIRS;
+
+pub(crate) const DEPENDENCY_MANIFEST_NAMES: &[&str] = &[
+    "Cargo.lock",
+    "Cargo.toml",
+    "package-lock.json",
+    "package.json",
+    "npm-shrinkwrap.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "requirements.txt",
+    "Pipfile.lock",
+    "pyproject.toml",
+    "poetry.lock",
+    "go.mod",
+    "go.sum",
+    "Gemfile.lock",
+    "composer.lock",
 ];
 
 // ============================================================================
@@ -358,8 +347,8 @@ pub struct LeIndex {
     /// Program Dependence Graph
     pdg: Option<ProgramDependenceGraph>,
 
-    /// Cache spiller for memory management
-    cache_spiller: CacheSpiller,
+    /// Cache subsystem (spiller, project scan, file stats)
+    cache: crate::cli::index_cache::IndexCache,
 
     /// Indexing statistics
     stats: IndexStats,
@@ -367,6 +356,42 @@ pub struct LeIndex {
     /// TF-IDF embedder, built from indexed node content.
     /// None until index_nodes() is called with a sufficient corpus.
     embedder: Option<TfIdfEmbedder>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Result of scanning the project for source and manifest files.
+///
+/// `source_directories` tracks unique directories containing source files.
+/// When a new file is added, its directory's mtime changes, so checking
+/// these ~10-20 directories (instead of thousands of files) detects new
+/// additions in <1ms.
+pub(crate) struct ProjectFileScan {
+    pub(crate) source_paths: Vec<PathBuf>,
+    pub(crate) manifest_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub(crate) source_directories: Vec<PathBuf>,
+    /// Hashes of manifest/lockfile contents at scan time, used for
+    /// incremental reindex when only dependencies changed.
+    /// Format: manifest_path → blake3 hex hash
+    #[serde(default)]
+    pub(crate) manifest_hashes: std::collections::HashMap<String, String>,
+}
+
+/// Per-file statistics cached from PDG
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FileStats {
+    /// Number of symbols in this file
+    pub symbol_count: usize,
+    /// Total complexity of all symbols in this file
+    pub total_complexity: u32,
+    /// Names of symbols in this file
+    pub symbol_names: Vec<String>,
+    /// Number of distinct files this file depends on (cross-file outgoing edges)
+    #[serde(default)]
+    pub outgoing_deps: usize,
+    /// Number of distinct files that depend on this file (cross-file incoming edges)
+    #[serde(default)]
+    pub incoming_deps: usize,
 }
 
 /// Statistics from indexing operations
@@ -407,7 +432,7 @@ pub struct IndexStats {
     #[serde(default)]
     pub external_deps_resolved: usize,
 
-    /// Number of external module nodes still unresolved
+    /// Number of unique external imports still unresolved after manifest matching
     #[serde(default)]
     pub external_deps_unresolved: usize,
 }
@@ -698,21 +723,9 @@ impl LeIndex {
         // Initialize search engine
         let search_engine = SearchEngine::new();
 
-        // Initialize cache spiller with project-specific cache directory
+        // Initialize cache subsystem
         let cache_dir = storage_path.join("cache");
-        let memory_config = MemoryConfig {
-            cache_dir,
-            ..Default::default()
-        };
-        let mut cache_spiller =
-            CacheSpiller::new(memory_config).context("Failed to initialize cache spiller")?;
-        if let Ok(restored) = cache_spiller.auto_restore() {
-            debug!(
-                "Cache auto-restore on startup: restored={} failed={}",
-                restored.entries_restored,
-                restored.entries_failed.len()
-            );
-        }
+        let cache = crate::cli::index_cache::IndexCache::new(cache_dir)?;
 
         Ok(Self {
             project_path,
@@ -722,7 +735,7 @@ impl LeIndex {
             storage,
             search_engine,
             pdg: None,
-            cache_spiller,
+            cache,
             stats: IndexStats {
                 total_files: 0,
                 files_parsed: 0,
@@ -787,8 +800,11 @@ impl LeIndex {
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .unwrap_or_default();
 
-        // Step 2: Collect all source files and compute hashes
-        let source_files_with_hashes = self.collect_source_files_with_hashes()?;
+        // Step 2: Collect all source files and compute hashes.
+        // Snapshot the OLD manifest hashes BEFORE the refresh overwrites the cache,
+        // so detect_changed_manifests() can compare against the previous baseline.
+        let old_scan = self.get_project_scan(false).ok();
+        let source_files_with_hashes = self.collect_source_files_with_hashes(true)?;
         info!("Found {} source files", source_files_with_hashes.len());
 
         // Step 3: Identify changed/new/deleted files
@@ -826,8 +842,50 @@ impl LeIndex {
         );
 
         if files_to_parse.is_empty() && deleted_files.is_empty() && self.is_indexed() {
-            info!("No changes detected, skipping indexing");
-            return Ok(self.stats.clone());
+            // Source files unchanged — but check if manifest/lockfiles changed,
+            // which requires re-annotating external dependencies.
+            let manifest_dirty = self.check_manifest_stale();
+            if !manifest_dirty {
+                // Also check if manifest content hashes changed (more precise than mtime).
+                // Use the OLD scan snapshot (before refresh overwrote the cache) as baseline.
+                let scan = self.get_project_scan(false)?;
+                let changed_manifests = match &old_scan {
+                    Some(old) => {
+                        // Compare current manifests against the pre-refresh baseline
+                        let mut changed = Vec::new();
+                        for mp in &scan.manifest_paths {
+                            let key = mp.display().to_string();
+                            let new_hash = scan.manifest_hashes.get(&key);
+                            let old_hash = old.manifest_hashes.get(&key);
+                            if new_hash != old_hash {
+                                let path_str = key.to_lowercase();
+                                let skip = path_str.contains("node_modules")
+                                    || path_str.contains("/build/")
+                                    || path_str.contains("\\build\\")
+                                    || path_str.contains("/dist/")
+                                    || path_str.contains("\\dist\\")
+                                    || path_str.contains("/target/")
+                                    || path_str.contains(".cache");
+                                if !skip {
+                                    changed.push(mp.clone());
+                                }
+                            }
+                        }
+                        changed
+                    }
+                    None => self.detect_changed_manifests(&scan),
+                };
+                if changed_manifests.is_empty() {
+                    info!("No changes detected, skipping indexing");
+                    return Ok(self.stats.clone());
+                }
+                info!(
+                    "Manifest content changed ({} files) — re-annotating",
+                    changed_manifests.len()
+                );
+            } else {
+                info!("Manifest files changed — running external dependency annotation");
+            }
         }
 
         // Step 4: Parse changed files
@@ -899,8 +957,16 @@ impl LeIndex {
         }
 
         // Step 5b: Resolve external dependencies via lock files
-        let ext_registry =
-            crate::graph::ExternalDependencyRegistry::from_project(&self.project_path);
+        let manifest_paths = self
+            .cache
+            .project_scan
+            .as_ref()
+            .map(|scan| scan.manifest_paths.clone())
+            .unwrap_or_default();
+        let ext_registry = crate::graph::ExternalDependencyRegistry::from_manifest_paths(
+            &self.project_path,
+            &manifest_paths,
+        );
         let annotation_stats = crate::graph::annotate_external_nodes(&mut pdg, &ext_registry);
         if !ext_registry.is_empty() {
             info!(
@@ -960,8 +1026,14 @@ impl LeIndex {
             external_deps_unresolved: ext_unresolved,
         };
 
+        // Normalize external nodes (legacy compat)
+        Self::normalize_external_nodes(&mut pdg);
+
         // Keep PDG in memory
         self.pdg = Some(pdg);
+
+        // Build file stats cache for performance
+        self.build_file_stats_cache();
 
         info!("Indexing completed in {}ms", self.stats.indexing_time_ms);
 
@@ -977,72 +1049,47 @@ impl LeIndex {
         Ok(())
     }
 
-    fn collect_source_files_with_hashes(&self) -> Result<Vec<(PathBuf, String)>> {
-        let mut source_files = Vec::new();
-
-        // Load project config for exclusion patterns.
-        // Falls back to the comprehensive defaults defined in config::ExclusionConfig
-        // which covers: target, node_modules, vendor, dist, build, out, .venv, venv,
-        // env, __pycache__, *.min.js, *.min.css, *.pb.go, *.generated.rs
-        let project_config =
-            crate::cli::config::ProjectConfig::load(&self.project_path).unwrap_or_default();
-
-        // Walk the project directory efficiently
-        let mut walker = walkdir::WalkDir::new(&self.project_path).into_iter();
-
-        while let Some(entry) = walker.next() {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            let path = entry.path();
-            let file_name = entry.file_name().to_string_lossy();
-
-            // Skip hidden files and directories (starting with '.')
-            // Do not skip the project root itself, even if its directory name is hidden.
-            if path != self.project_path && file_name.starts_with('.') && file_name != "." {
-                if entry.file_type().is_dir() {
-                    walker.skip_current_dir();
-                }
-                continue;
-            }
-
-            // Skip excluded directories (fast-path + config-based)
-            if entry.file_type().is_dir() {
-                if ALWAYS_SKIP_DIRS.contains(&file_name.as_ref()) {
-                    walker.skip_current_dir();
-                    continue;
-                }
-                // Config-based directory exclusion (user-customizable via .leindex/config.toml)
-                if project_config.should_exclude(path) {
-                    walker.skip_current_dir();
-                    continue;
-                }
-                continue;
-            }
-
-            // Check if file has a supported source extension and isn't excluded
-            if entry.file_type().is_file() {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if SOURCE_FILE_EXTENSIONS.contains(&ext) && !project_config.should_exclude(path)
-                    {
-                        let hash = self.hash_file(path)?;
-                        source_files.push((path.to_path_buf(), hash));
-                    }
-                }
-            }
-        }
-
-        Ok(source_files)
+    fn collect_source_files_with_hashes(
+        &mut self,
+        refresh: bool,
+    ) -> Result<Vec<(PathBuf, String)>> {
+        let scan = self.get_project_scan(refresh)?;
+        scan.source_paths
+            .iter()
+            .map(|path| Ok((path.clone(), self.hash_file(path)?)))
+            .collect()
     }
 
-    fn collect_source_file_paths(&self) -> Result<Vec<PathBuf>> {
-        let mut source_files = Vec::new();
+    fn collect_source_file_paths(&mut self, refresh: bool) -> Result<Vec<PathBuf>> {
+        Ok(self.get_project_scan(refresh)?.source_paths)
+    }
 
+    fn get_project_scan(&mut self, refresh: bool) -> Result<ProjectFileScan> {
+        // Try cached result first (no scan needed)
+        if !refresh {
+            if let Some(scan) = &self.cache.project_scan {
+                return Ok(scan.clone());
+            }
+        }
+        // Try persistent cache first (avoids full walkdir)
+        let project_id = self.project_id.clone();
+        if !refresh {
+            if let result @ Ok(_) = self.cache.get_project_scan(&project_id, false, || Err(anyhow::anyhow!("cache miss"))) {
+                return result;
+            }
+        }
+        // Cache miss — scan filesystem
+        let scan = self.scan_project_files()?;
+        self.cache.cache_project_scan(&project_id, &scan);
+        self.cache.project_scan = Some(scan.clone());
+        Ok(scan)
+    }
+
+    fn scan_project_files(&self) -> Result<ProjectFileScan> {
         let project_config =
             crate::cli::config::ProjectConfig::load(&self.project_path).unwrap_or_default();
-
+        let mut source_paths = Vec::new();
+        let mut manifest_paths = Vec::new();
         let mut walker = walkdir::WalkDir::new(&self.project_path).into_iter();
 
         while let Some(entry) = walker.next() {
@@ -1062,28 +1109,81 @@ impl LeIndex {
             }
 
             if entry.file_type().is_dir() {
-                if ALWAYS_SKIP_DIRS.contains(&file_name.as_ref()) {
+                // Only hard-skip universally-ignored directories.
+                // Project-excluded dirs are NOT skipped here so that the
+                // file-level branch below can still collect lockfiles/manifests
+                // that live inside excluded paths.
+                if SKIP_DIRS.contains(&file_name.as_ref()) {
                     walker.skip_current_dir();
-                    continue;
-                }
-                if project_config.should_exclude(path) {
-                    walker.skip_current_dir();
-                    continue;
                 }
                 continue;
             }
 
-            if entry.file_type().is_file() {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if SOURCE_FILE_EXTENSIONS.contains(&ext) && !project_config.should_exclude(path)
-                    {
-                        source_files.push(path.to_path_buf());
+            if !entry.file_type().is_file() {
+                continue;
+            }
+
+            // Check for dependency manifests. Lockfiles (Cargo.lock, etc.) are
+            // always collected regardless of exclusion patterns. Workspace manifests
+            // (Cargo.toml, package.json, etc.) respect exclusion rules.
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                if Self::is_dependency_manifest_name(name) {
+                    let is_lockfile = name.contains("lock") || name.contains(".sum") || name == "npm-shrinkwrap.json";
+                    if is_lockfile || !project_config.should_exclude(path) {
+                        manifest_paths.push(path.to_path_buf());
                     }
+                    continue; // Don't also add manifests to source_paths
+                }
+            }
+
+            if project_config.should_exclude(path) {
+                continue;
+            }
+
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                let ext_lower = ext.to_ascii_lowercase();
+                if SOURCE_FILE_EXTENSIONS.contains(&ext_lower.as_str()) {
+                    source_paths.push(path.to_path_buf());
                 }
             }
         }
 
-        Ok(source_files)
+        let source_directories = Self::extract_unique_dirs(&source_paths);
+
+        // Compute lightweight hashes for manifest/lockfile content.
+        // Used to detect dependency changes that require re-annotating external nodes
+        // without re-scanning every source file.
+        let mut manifest_hashes = std::collections::HashMap::new();
+        for mp in &manifest_paths {
+            if let Ok(bytes) = std::fs::read(mp) {
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                manifest_hashes.insert(mp.display().to_string(), hash);
+            }
+        }
+
+        Ok(ProjectFileScan {
+            source_paths,
+            manifest_paths,
+            source_directories,
+            manifest_hashes,
+        })
+    }
+
+    /// Extract sorted unique directories from a list of file paths.
+    fn extract_unique_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
+        crate::cli::index_freshness::extract_unique_dirs(paths)
+    }
+
+    /// Build a FreshnessContext for delegation to index_freshness module.
+    fn freshness_context(&self) -> crate::cli::index_freshness::FreshnessContext<'_> {
+        crate::cli::index_freshness::FreshnessContext {
+            project_path: &self.project_path,
+            storage_path: &self.storage_path,
+            project_id: &self.project_id,
+            storage: &self.storage,
+            project_scan: self.cache.project_scan.as_ref(),
+            cache_spiller: &self.cache.cache_spiller,
+        }
     }
 
     fn hash_file(&self, path: &Path) -> Result<String> {
@@ -1114,6 +1214,10 @@ impl LeIndex {
         }
     }
 
+    fn is_dependency_manifest_name(name: &str) -> bool {
+        DEPENDENCY_MANIFEST_NAMES.contains(&name)
+    }
+
     fn index_fingerprint(&self) -> String {
         format!(
             "{}:{}:{}",
@@ -1127,13 +1231,19 @@ impl LeIndex {
         format!("{}:{}", self.project_id, &hash[..12])
     }
 
-    fn search_cache_key_for(&self, query: &str, top_k: usize) -> String {
+    fn search_cache_key_for(
+        &self,
+        query: &str,
+        top_k: usize,
+        query_type: Option<&crate::search::ranking::QueryType>,
+    ) -> String {
         search_cache_key(&format!(
-            "query:{}:{}:{}:{}",
+            "query:{}:{}:{}:{}:{:?}",
             self.stable_project_cache_id(),
             self.index_fingerprint(),
             top_k,
-            query.trim().to_lowercase()
+            query.trim().to_lowercase(),
+            query_type,
         ))
     }
 
@@ -1177,10 +1287,11 @@ impl LeIndex {
             return Ok(Vec::new());
         }
 
-        let search_cache_key = self.search_cache_key_for(query, top_k);
+        let search_cache_key = self.search_cache_key_for(query, top_k, query_type.as_ref());
         if let Some(CacheEntry::Binary {
             serialized_data, ..
         }) = self
+            .cache
             .cache_spiller
             .store_mut()
             .get_or_load(&search_cache_key)?
@@ -1225,6 +1336,7 @@ impl LeIndex {
                             crate::graph::pdg::NodeType::Method => "method".to_string(),
                             crate::graph::pdg::NodeType::Variable => "variable".to_string(),
                             crate::graph::pdg::NodeType::Module => "module".to_string(),
+                            crate::graph::pdg::NodeType::External => "external".to_string(),
                         });
                     }
                     result.caller_count = Some(pdg.predecessor_count(node_idx));
@@ -1244,12 +1356,14 @@ impl LeIndex {
                 serialized_data: serialized,
             };
             if self
+                .cache
                 .cache_spiller
                 .store_mut()
                 .insert(search_cache_key.clone(), entry)
                 .is_ok()
             {
                 let _ = self
+                    .cache
                     .cache_spiller
                     .store_mut()
                     .persist_key(&search_cache_key);
@@ -1287,6 +1401,7 @@ impl LeIndex {
         if let Some(CacheEntry::Analysis {
             serialized_data, ..
         }) = self
+            .cache
             .cache_spiller
             .store_mut()
             .get_or_load(&analysis_cache_key)?
@@ -1343,12 +1458,14 @@ impl LeIndex {
                 serialized_data: serialized,
             };
             if self
+                .cache
                 .cache_spiller
                 .store_mut()
                 .insert(analysis_cache_key.clone(), entry)
                 .is_ok()
             {
                 let _ = self
+                    .cache
                     .cache_spiller
                     .store_mut()
                     .persist_key(&analysis_cache_key);
@@ -1372,12 +1489,13 @@ impl LeIndex {
     /// ```
     pub fn get_diagnostics(&self) -> Result<Diagnostics> {
         let memory_stats = self
+            .cache
             .cache_spiller
             .memory_stats()
             .context("Failed to get memory stats")?;
         let memory_percent = memory_stats.memory_percent();
-        let threshold_exceeded = self.cache_spiller.store().total_bytes() > 0
-            && self.cache_spiller.is_threshold_exceeded().unwrap_or(false);
+        let threshold_exceeded = self.cache.cache_spiller.store().total_bytes() > 0
+            && self.cache.cache_spiller.is_threshold_exceeded().unwrap_or(false);
 
         let pdg_loaded = self.pdg.is_some();
         let (pdg_nodes, pdg_edges) = self
@@ -1453,7 +1571,7 @@ impl LeIndex {
         info!("Loading project from storage: {}", self.project_id);
 
         // Load PDG from storage
-        let pdg = pdg_store::load_pdg(&self.storage, &self.project_id)
+        let mut pdg = pdg_store::load_pdg(&self.storage, &self.project_id)
             .context("Failed to load PDG from storage")?;
 
         let pdg_node_count = pdg.node_count();
@@ -1463,6 +1581,9 @@ impl LeIndex {
             "Loaded PDG with {} nodes and {} edges",
             pdg_node_count, pdg_edge_count
         );
+
+        // Normalize external nodes (legacy compat)
+        Self::normalize_external_nodes(&mut pdg);
 
         // Rebuild search index from PDG
         self.index_nodes(&pdg)?;
@@ -1478,62 +1599,139 @@ impl LeIndex {
         // Keep PDG in memory
         self.pdg = Some(pdg);
 
+        // Build file stats cache for performance
+        self.build_file_stats_cache();
+
         Ok(())
     }
 
     /// Check which source files have changed since last index.
     /// Returns (changed_paths, deleted_paths).
     pub fn check_freshness(&self) -> Result<(Vec<PathBuf>, Vec<String>)> {
-        let indexed_files =
-            crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
-                .unwrap_or_default();
-
-        let current = self.collect_source_files_with_hashes()?;
-        let current_map: HashMap<String, String> = current
-            .iter()
-            .map(|(p, h)| (p.display().to_string(), h.clone()))
-            .collect();
-
-        let changed: Vec<PathBuf> = current
-            .iter()
-            .filter(|(p, h)| indexed_files.get(&p.display().to_string()) != Some(h))
-            .map(|(p, _)| p.clone())
-            .collect();
-
-        let deleted: Vec<String> = indexed_files
-            .keys()
-            .filter(|k| !current_map.contains_key(*k))
-            .cloned()
-            .collect();
-
-        Ok((changed, deleted))
+        let ctx = self.freshness_context();
+        crate::cli::index_freshness::check_freshness(
+            &ctx,
+            || self.scan_project_files(),
+            |p| self.hash_file(p),
+        )
     }
 
-    /// Quick staleness check without computing hashes—uses mtime only.
-    pub fn is_stale_fast(&self) -> bool {
-        let index_mtime = self
-            .storage_path
-            .join("leindex.db")
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok();
+    /// Check if any dependency manifest/lockfile has changed since last index.
+    fn check_manifest_stale(&self) -> bool {
+        let ctx = self.freshness_context();
+        crate::cli::index_freshness::check_manifest_stale(&ctx, || self.scan_project_files())
+    }
 
-        let Some(db_time) = index_mtime else {
-            return true;
-        };
+    /// Compare current manifest hashes against the persisted scan's hashes.
+    /// Returns the set of manifest file paths whose content has changed.
+    /// Filters out node_modules, build artifacts, and ignored paths.
+    fn detect_changed_manifests(&self, current_scan: &ProjectFileScan) -> Vec<PathBuf> {
+        // Try to read persisted scan from cache spiller
+        let cache_key = crate::cli::memory::project_scan_cache_key(&self.project_id);
+        let old_hashes: std::collections::HashMap<String, String> = self
+            .cache
+            .cache_spiller
+            .store()
+            .peek(&cache_key)
+            .and_then(|entry| match entry {
+                crate::cli::memory::CacheEntry::Binary { serialized_data, .. } => {
+                    bincode::deserialize::<ProjectFileScan>(serialized_data).ok()
+                }
+                _ => None,
+            })
+            .map(|scan| scan.manifest_hashes)
+            .unwrap_or_default();
 
-        let files = self.collect_source_file_paths().unwrap_or_default();
-        if files.is_empty() {
-            return false;
+        let mut changed = Vec::new();
+        for mp in &current_scan.manifest_paths {
+            let key = mp.display().to_string();
+            let new_hash = current_scan.manifest_hashes.get(&key);
+            let old_hash = old_hashes.get(&key);
+
+            if new_hash != old_hash {
+                // Filter: skip node_modules, build artifacts, and common
+                // generated paths that would cause false-positive reindexes.
+                let path_str = key.to_lowercase();
+                let skip = path_str.contains("node_modules")
+                    || path_str.contains("/build/")
+                    || path_str.contains("\\build\\")
+                    || path_str.contains("/dist/")
+                    || path_str.contains("\\dist\\")
+                    || path_str.contains("/target/")
+                    || path_str.contains(".cache");
+                if !skip {
+                    changed.push(mp.clone());
+                }
+            }
+        }
+        changed
+    }
+
+    /// Given a set of changed manifests, find which source files import
+    /// from packages defined in those manifests. Returns file paths that
+    /// should be re-parsed to update external node annotations.
+    #[allow(dead_code)] // Used by manifest-aware incremental reindex
+    fn files_importing_from_manifests(
+        &self,
+        changed_manifests: &[PathBuf],
+        all_source_paths: &[PathBuf],
+        pdg: &ProgramDependenceGraph,
+    ) -> Vec<PathBuf> {
+        if changed_manifests.is_empty() {
+            return Vec::new();
         }
 
-        let sample_size = (files.len() / 10).max(5).min(files.len());
-        files.iter().take(sample_size).any(|f| {
-            f.metadata()
-                .and_then(|m| m.modified())
-                .map(|t| t > db_time)
-                .unwrap_or(false)
-        })
+        // Extract package names from changed manifests
+        let changed_dirs: HashSet<PathBuf> = changed_manifests
+            .iter()
+            .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+            .collect();
+
+        // Find source files in the same workspace directories as changed manifests
+        let mut affected: Vec<PathBuf> = Vec::new();
+        for sp in all_source_paths {
+            if let Some(parent) = sp.parent() {
+                // File is in or under a workspace that had a manifest change
+                for dir in &changed_dirs {
+                    if sp.starts_with(dir) || parent.starts_with(dir) {
+                        affected.push(sp.clone());
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Also: files that import external packages (from PDG external nodes)
+        // whose file_path matches a source file not yet captured.
+        let affected_set: HashSet<String> =
+            affected.iter().map(|p| p.display().to_string()).collect();
+
+        // Convert source paths to a HashSet for O(1) lookups per PDG node.
+        let source_set: HashSet<String> =
+            all_source_paths.iter().map(|p| p.display().to_string()).collect();
+
+        for nid in pdg.node_indices() {
+            if let Some(node) = pdg.get_node(nid) {
+                if node.node_type == NodeType::External {
+                    // External node's file_path is the importing file
+                    if !affected_set.contains(&node.file_path) {
+                        // Check if this file exists in source_paths
+                        if source_set.contains(&node.file_path) {
+                            affected.push(PathBuf::from(&node.file_path));
+                        }
+                    }
+                }
+            }
+        }
+
+        affected
+    }
+
+    /// Fast-path freshness check: O(1) for indexed files, O(D) for source
+    /// directories (typically 10-20), and O(M) for manifest files.
+    pub fn is_stale_fast(&self) -> bool {
+        let ctx = self.freshness_context();
+        crate::cli::index_freshness::is_stale_fast(&ctx, || self.scan_project_files())
     }
 
     // ========================================================================
@@ -1605,9 +1803,49 @@ impl LeIndex {
         self.pdg.as_ref()
     }
 
+    /// Ensure the PDG is loaded from storage. Called by handlers that need PDG access
+    /// before their first query. Defers the 10-50MB load cost from project registration
+    /// to first actual use.
+    pub fn ensure_pdg_loaded(&mut self) -> Result<()> {
+        if self.pdg.is_none() {
+            // Guard: only load if there are actual indexed files in storage.
+            // LeIndex::new() creates leindex.db eagerly, so DB existence alone
+            // would cause a useless load_from_storage on brand-new projects.
+            let has_content = crate::storage::pdg_store::has_indexed_files(
+                &self.storage, &self.project_id,
+            );
+            if has_content {
+                self.load_from_storage()?;
+            }
+        }
+        Ok(())
+    }
+
     /// Get the current indexing statistics
     pub fn get_stats(&self) -> &IndexStats {
         &self.stats
+    }
+
+    /// Build file statistics cache from PDG
+    pub(crate) fn build_file_stats_cache(&mut self) {
+        if let Some(pdg) = &self.pdg {
+            self.cache.build_file_stats_cache(pdg);
+        }
+    }
+
+    /// Get file statistics cache
+    pub fn file_stats(&self) -> Option<&HashMap<String, FileStats>> {
+        self.cache.file_stats()
+    }
+
+    /// Collect source files that belong to this project using the same exclusion rules as indexing.
+    /// Get the list of source file paths for the project.
+    ///
+    /// TODO: This reuses the cached scan — after file additions/deletions,
+    /// callers may get stale inventories until a forced refresh/reindex.
+    /// Consider adding an optional `refresh` parameter or invalidation on FS changes.
+    pub fn source_file_paths(&mut self) -> Result<Vec<PathBuf>> {
+        self.collect_source_file_paths(false)
     }
 
     /// Expand context around a specific node.
@@ -1719,11 +1957,11 @@ impl LeIndex {
     }
 
     /// Report which files are indexed and which are not.
-    pub fn coverage_report(&self) -> Result<CoverageReport> {
+    pub fn coverage_report(&mut self) -> Result<CoverageReport> {
         let indexed_files =
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .unwrap_or_default();
-        let source_files = self.collect_source_file_paths()?;
+        let source_files = self.collect_source_file_paths(true)?;
 
         let indexed_set: HashSet<String> = indexed_files.keys().cloned().collect();
         let source_set: HashSet<String> = source_files
@@ -1733,6 +1971,7 @@ impl LeIndex {
 
         let missing: Vec<String> = source_set.difference(&indexed_set).cloned().collect();
         let orphaned: Vec<String> = indexed_set.difference(&source_set).cloned().collect();
+        let indexed_present = indexed_set.intersection(&source_set).count();
 
         Ok(CoverageReport {
             total_source_files: source_files.len(),
@@ -1742,7 +1981,7 @@ impl LeIndex {
             coverage_pct: if source_files.is_empty() {
                 100.0
             } else {
-                (indexed_files.len() as f64 / source_files.len() as f64) * 100.0
+                (indexed_present as f64 / source_files.len() as f64) * 100.0
             },
         })
     }
@@ -1752,129 +1991,28 @@ impl LeIndex {
     // ========================================================================
 
     /// Check memory and spill cache if threshold exceeded
-    ///
-    /// This method should be called before memory-intensive operations
-    /// to ensure sufficient memory is available.
-    ///
-    /// # Returns
-    ///
-    /// `Result<bool>` - Ok(true) if spilling occurred, Ok(false) otherwise
     pub fn check_memory_and_spill(&mut self) -> Result<bool> {
-        if self.cache_spiller.is_threshold_exceeded()? {
-            info!("Memory threshold exceeded, initiating cache spilling");
-            let result = self.cache_spiller.check_and_spill()?;
-            info!(
-                "Spilled {} entries, freed {} bytes",
-                result.entries_spilled, result.memory_freed
-            );
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+        self.cache.check_memory_and_spill()
     }
 
     /// Spill PDG cache to disk
-    ///
-    /// Drops the PDG from memory (it's already persisted to lestockage via save_pdg).
-    /// Creates a cache marker to track that the PDG was spilled.
-    /// The PDG can be reloaded later using `reload_pdg_from_cache()`.
-    ///
-    /// # Returns
-    ///
-    /// `Result<()>` - Success or error
     pub fn spill_pdg_cache(&mut self) -> Result<()> {
-        let pdg = self
-            .pdg
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("No PDG in memory to spill"))?;
-
-        let node_count = pdg.node_count();
-        let edge_count = pdg.edge_count();
-
-        // Note: PDG is already persisted to lestockage via save_pdg()
-        // We create a cache marker to track that it was spilled
-        let cache_key = pdg_cache_key(&self.project_id);
-        let entry = CacheEntry::PDG {
-            project_id: self.project_id.clone(),
-            node_count,
-            edge_count,
-            serialized_data: vec![], // Empty marker - actual data in lestockage
-        };
-
-        // Store marker in cache spiller
-        self.cache_spiller
-            .store_mut()
-            .insert(cache_key, entry)
-            .context("Failed to create PDG spill marker")?;
-
-        info!(
-            "Spilled PDG from memory: {} nodes, {} edges (persisted to lestockage)",
-            node_count, edge_count
-        );
-
-        Ok(())
+        self.cache.spill_pdg_cache(&self.project_id, &mut self.pdg)
     }
 
     /// Spill vector search cache to disk
-    ///
-    /// Serializes the HNSW vector index and stores it in the cache spill directory.
-    /// The index can be reloaded later using `reload_vector_cache()`.
-    ///
-    /// # Returns
-    ///
-    /// `Result<()>` - Success or error
     pub fn spill_vector_cache(&mut self) -> Result<()> {
-        // Note: The HNSW index doesn't support direct serialization
-        // Instead, we create a marker entry and track the state
-        // The actual vector data would need to be re-indexed from the PDG
-
-        let node_count = self.search_engine.node_count();
-
-        // Create a marker entry for the vector cache
-        let cache_key = search_cache_key(&self.project_id);
-        let entry = CacheEntry::SearchIndex {
-            project_id: self.project_id.clone(),
-            entry_count: node_count,
-            serialized_data: vec![], // Empty - vectors would be re-indexed from PDG
-        };
-
-        self.cache_spiller
-            .store_mut()
-            .insert(cache_key, entry)
-            .context("Failed to spill vector cache marker")?;
-
-        info!("Spilled vector cache marker: {} entries", node_count);
-
-        Ok(())
+        self.cache
+            .spill_vector_cache(&self.project_id, self.search_engine.node_count())
     }
 
     /// Spill all caches (PDG and vector) to disk
-    ///
-    /// This is useful for freeing memory before large operations
-    /// or when the project won't be used for a while.
-    ///
-    /// # Returns
-    ///
-    /// `Result<(usize, usize)>` - (PDG bytes spilled, vector bytes spilled)
     pub fn spill_all_caches(&mut self) -> Result<(usize, usize)> {
-        let mut pdg_bytes = 0;
-
-        // Spill PDG if in memory
-        if self.pdg.is_some() {
-            self.spill_pdg_cache()?;
-            pdg_bytes = self.cache_spiller.store().total_bytes();
-        }
-
-        // Spill vector cache marker
-        self.spill_vector_cache()?;
-        let vector_bytes = self.cache_spiller.store().total_bytes() - pdg_bytes;
-
-        info!(
-            "Spilled all caches: PDG ({} bytes), Vector ({} bytes)",
-            pdg_bytes, vector_bytes
-        );
-
-        Ok((pdg_bytes, vector_bytes))
+        self.cache.spill_all_caches(
+            &self.project_id,
+            &mut self.pdg,
+            self.search_engine.node_count(),
+        )
     }
 
     // ========================================================================
@@ -1918,10 +2056,14 @@ impl LeIndex {
 
         // Re-use the index_nodes logic to ensure consistent embedding generation
         self.index_nodes(&pdg)?;
+
         let indexed_count = self.search_engine.node_count();
 
-        // Restore PDG
+        // Restore PDG first so build_file_stats_cache can read from it
         self.pdg = Some(pdg);
+
+        // Rebuild file stats cache after vector rebuild so the fast path stays warm
+        self.build_file_stats_cache();
 
         info!("Rebuilt vector index from PDG: {} nodes", indexed_count);
 
@@ -1929,24 +2071,11 @@ impl LeIndex {
     }
 
     /// Warm caches with frequently accessed data
-    ///
-    /// Loads spilled cache entries back into memory based on the specified strategy.
-    /// For PDG warming strategy, this will reload the PDG from lestockage.
-    ///
-    /// # Arguments
-    ///
-    /// * `strategy` - Warming strategy to use (PDGOnly, SearchIndexOnly, RecentFirst, All)
-    ///
-    /// # Returns
-    ///
-    /// `Result<WarmResult>` - Statistics about the warming operation
     pub fn warm_caches(
         &mut self,
         strategy: WarmStrategy,
     ) -> Result<crate::cli::memory::WarmResult> {
-        info!("Warming caches with strategy: {:?}", strategy);
-
-        let result = self.cache_spiller.warm_cache(strategy)?;
+        let result = self.cache.warm_cache(strategy)?;
 
         // If PDG warming was requested and PDG is not in memory, reload from storage
         if (strategy == crate::cli::memory::WarmStrategy::PDGOnly
@@ -1962,16 +2091,8 @@ impl LeIndex {
     }
 
     /// Get cache statistics
-    ///
-    /// Returns detailed statistics about cache usage and spilled data.
-    ///
-    /// # Returns
-    ///
-    /// `Result<MemoryStats>` - Cache statistics
     pub fn get_cache_stats(&self) -> Result<crate::cli::memory::MemoryStats> {
-        self.cache_spiller
-            .memory_stats()
-            .map_err(|e| anyhow::anyhow!("Failed to get cache stats: {}", e))
+        self.cache.get_cache_stats()
     }
 
     // ========================================================================
@@ -2032,6 +2153,8 @@ impl LeIndex {
     /// it to embed each node. This produces meaningful cosine similarity between
     /// related code nodes, replacing the previous hash-based placeholder.
     fn index_nodes(&mut self, pdg: &ProgramDependenceGraph) -> Result<()> {
+        // Invalidate file stats cache on reindex
+        self.cache.file_stats_cache = None;
         // Read file contents once per file to avoid repeated I/O.
         // Cache is scoped to this function and shared across both passes.
         let mut file_cache: std::collections::HashMap<String, std::sync::Arc<String>> =
@@ -2040,6 +2163,16 @@ impl LeIndex {
         // --- Pass 1: collect all node content for TF-IDF corpus building ---
         let mut corpus: Vec<(String, String)> = Vec::new();
         let mut raw_nodes: Vec<(_, String)> = Vec::new();
+
+        // Shared traversal config for computing caller/callee counts — allocated once.
+        let connectivity_config = crate::graph::pdg::TraversalConfig {
+            max_depth: Some(1),
+            max_nodes: Some(1000),
+            allowed_edge_types: Some(vec![EdgeType::Call, EdgeType::DataDependency]),
+            excluded_node_types: Some(vec![NodeType::External]),
+            min_complexity: None,
+            min_edge_confidence: 0.0,
+        };
 
         for node_idx in pdg.node_indices() {
             if let Some(node) = pdg.get_node(node_idx) {
@@ -2057,6 +2190,35 @@ impl LeIndex {
 
                 // Extract node-specific content for better text matching.
                 // Use byte-safe slicing to avoid panics on invalid UTF-8 char boundaries.
+                //
+                // Enrichment: prepend semantic tags that improve TF-IDF matching:
+                //   - node type (function, class, method, etc.)
+                //   - PDG connectivity context (caller/callee counts)
+                // This makes semantic search more accurate without requiring LLM embeddings.
+                let mut enrichment = format!(
+                    "// type:{} lang:{}",
+                    match node.node_type {
+                        NodeType::Function => "function",
+                        NodeType::Class => "class",
+                        NodeType::Method => "method",
+                        NodeType::Variable => "variable",
+                        NodeType::Module => "module",
+                        NodeType::External => "external",
+                    },
+                    node.language,
+                );
+
+                // Add connectivity context — how many callers/callees this symbol has.
+                // TraversalConfig is reused for all nodes (allocated once, outside loop).
+                let callers = pdg.backward_impact(node_idx, &connectivity_config);
+                let callees = pdg.forward_impact(node_idx, &connectivity_config);
+                enrichment.push_str(&format!(
+                    " callers:{} callees:{} complexity:{}",
+                    callers.len().min(50),
+                    callees.len().min(50),
+                    node.complexity,
+                ));
+
                 let node_content = if !content.is_empty() && node.byte_range.1 > node.byte_range.0 {
                     let content_bytes = content.as_bytes();
                     let start = node.byte_range.0.min(content_bytes.len());
@@ -2064,17 +2226,17 @@ impl LeIndex {
 
                     if start < end {
                         let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
-                        format!("// {} in {}\n{}", node.name, node.file_path, snippet)
+                        format!("{}\n// {} in {}\n{}", enrichment, node.name, node.file_path, snippet)
                     } else {
                         format!(
-                            "// {} in {}\n{}",
-                            node.name, node.file_path, "// [No source code available]"
+                            "{}\n// {} in {}\n{}",
+                            enrichment, node.name, node.file_path, "// [No source code available]"
                         )
                     }
                 } else {
                     format!(
-                        "// {} in {}\n{}",
-                        node.name, node.file_path, "// [No source code available]"
+                        "{}\n// {} in {}\n{}",
+                        enrichment, node.name, node.file_path, "// [No source code available]"
                     )
                 };
 
@@ -2181,6 +2343,25 @@ impl LeIndex {
         Ok(context)
     }
 
+    /// Normalize external nodes: ensure any node with `language == "external"`
+    /// also has `NodeType::External`. Eliminates the dual-check bug class caused
+    /// by legacy PDG data that set language without the enum variant.
+    fn normalize_external_nodes(pdg: &mut ProgramDependenceGraph) {
+        use crate::graph::pdg::NodeType;
+        let mut migrated = 0usize;
+        for node in pdg.node_weights_mut() {
+            let is_external = node.language == "external"
+                || node.language.starts_with("external:");
+            if is_external && node.node_type != NodeType::External {
+                node.node_type = NodeType::External;
+                migrated += 1;
+            }
+        }
+        if migrated > 0 {
+            info!("Normalized {} external nodes to NodeType::External", migrated);
+        }
+    }
+
     /// Save PDG to storage
     fn save_to_storage(&mut self, pdg: &ProgramDependenceGraph) -> Result<()> {
         pdg_store::save_pdg(&mut self.storage, &self.project_id, pdg)
@@ -2195,6 +2376,65 @@ impl LeIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_project_scan_excludes_lockfiles_from_source_but_keeps_manifests() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"react":"^18.2.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            r#"{"name":"demo","lockfileVersion":3}"#,
+        )
+        .unwrap();
+
+        let mut index = LeIndex::new(dir.path()).unwrap();
+        let scan = index.get_project_scan(true).unwrap();
+
+        assert!(scan
+            .source_paths
+            .iter()
+            .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("main.rs")));
+        assert!(scan
+            .source_paths
+            .iter()
+            .all(
+                |path| path.file_name().and_then(|name| name.to_str()) != Some("package-lock.json")
+            ));
+        assert!(scan
+            .manifest_paths
+            .iter()
+            .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("package.json")));
+        assert!(scan.manifest_paths.iter().any(|path| {
+            path.file_name().and_then(|name| name.to_str()) == Some("package-lock.json")
+        }));
+    }
+
+    #[test]
+    fn test_project_scan_is_restored_from_cache_across_instances() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+
+        let mut first = LeIndex::new(dir.path()).unwrap();
+        let first_scan = first.get_project_scan(true).unwrap();
+        drop(first);
+
+        let mut second = LeIndex::new(dir.path()).unwrap();
+        let second_scan = second.get_project_scan(false).unwrap();
+
+        assert_eq!(first_scan.source_paths, second_scan.source_paths);
+        assert_eq!(first_scan.manifest_paths, second_scan.manifest_paths);
+    }
 
     #[test]
     fn test_stats_serialization() {

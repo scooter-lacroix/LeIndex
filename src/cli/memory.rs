@@ -277,6 +277,11 @@ impl CacheStore {
         found
     }
 
+    /// Peek at an entry without updating recency (read-only).
+    pub fn peek(&self, key: &str) -> Option<&CacheEntry> {
+        self.cache.peek(key)
+    }
+
     /// Get an entry from memory cache, or restore from disk if available.
     pub fn get_or_load(&mut self, key: &str) -> Result<Option<CacheEntry>, Error> {
         if let Some(entry) = self.cache.get(key).cloned() {
@@ -587,6 +592,20 @@ fn sanitize_key(key: &str) -> String {
         .collect()
 }
 
+fn cache_key_priority(key: &str) -> u8 {
+    if key.starts_with("pdg:") || key.starts_with("pdg_") {
+        0
+    } else if key.starts_with("search:") || key.starts_with("search_") {
+        1
+    } else if key.starts_with("project_scan:") || key.starts_with("project_scan_") {
+        2
+    } else if key.starts_with("analysis:") || key.starts_with("analysis_") {
+        3
+    } else {
+        4
+    }
+}
+
 // ============================================================================
 // CACHE SPILLER
 // ============================================================================
@@ -806,7 +825,11 @@ impl CacheSpiller {
         strategy: WarmStrategy,
     ) -> Result<Vec<String>, Error> {
         match strategy {
-            WarmStrategy::All => Ok(keys.to_vec()),
+            WarmStrategy::All => {
+                let mut prioritized = keys.to_vec();
+                prioritized.sort_by_key(|key| cache_key_priority(key));
+                Ok(prioritized)
+            }
             WarmStrategy::PDGOnly => Ok(keys
                 .iter()
                 .filter(|k| k.starts_with("pdg:"))
@@ -818,7 +841,7 @@ impl CacheSpiller {
                 .cloned()
                 .collect()),
             WarmStrategy::RecentFirst => {
-                // Sort by file modification time (most recent first)
+                // Sort by cache key priority, then by file modification time (most recent first) as tie-breaker
                 let mut keyed: Vec<(String, std::time::SystemTime)> = Vec::new();
 
                 for key in keys {
@@ -833,7 +856,11 @@ impl CacheSpiller {
                     }
                 }
 
-                keyed.sort_by(|a, b| b.1.cmp(&a.1));
+                keyed.sort_by(|a, b| {
+                    cache_key_priority(&a.0)
+                        .cmp(&cache_key_priority(&b.0))
+                        .then_with(|| b.1.cmp(&a.1))
+                });
                 Ok(keyed.into_iter().map(|(k, _)| k).collect())
             }
         }
@@ -1207,6 +1234,11 @@ pub fn search_cache_key(project_id: &str) -> String {
     format!("search:{}", project_id)
 }
 
+/// Generate cache key for a cached project scan.
+pub fn project_scan_cache_key(project_id: &str) -> String {
+    format!("project_scan:{}", project_id)
+}
+
 /// Generate cache key for an analysis result
 pub fn analysis_cache_key(query: &str) -> String {
     format!("analysis:{}", sanitize_key(query))
@@ -1311,6 +1343,10 @@ mod tests {
     fn test_cache_key_generation() {
         assert_eq!(pdg_cache_key("myproject"), "pdg:myproject");
         assert_eq!(search_cache_key("myproject"), "search:myproject");
+        assert_eq!(
+            project_scan_cache_key("myproject"),
+            "project_scan:myproject"
+        );
         assert!(analysis_cache_key("how does auth work").starts_with("analysis:"));
     }
 

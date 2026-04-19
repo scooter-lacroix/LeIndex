@@ -190,7 +190,7 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
             entry
                 .path()
                 .extension()
-                .and_then(|ext| ext.to_str().map(|s| s.to_string()))
+                .and_then(|ext| ext.to_str().map(|s| s.to_ascii_lowercase()))
         })
         .collect();
 
@@ -208,7 +208,8 @@ fn detect_language(path: &std::path::Path) -> Option<String> {
             "rs" => Some("rust".to_string()),
             "go" => Some("go".to_string()),
             "py" => Some("python".to_string()),
-            "ts" | "tsx" | "js" => Some("typescript".to_string()),
+            "js" | "jsx" | "mjs" | "cjs" => Some("javascript".to_string()),
+            "ts" | "tsx" | "mts" | "cts" => Some("typescript".to_string()),
             "java" => Some("java".to_string()),
             "cpp" | "cc" | "cxx" | "h" => Some("cpp".to_string()),
             "c" => Some("c".to_string()),

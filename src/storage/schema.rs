@@ -62,7 +62,11 @@ impl Storage {
 
         let mut storage = Self { conn, config };
 
-        // Initialize schema
+        // Check schema version BEFORE any DDL — reject newer databases early
+        // so an older binary cannot corrupt a schema it doesn't understand.
+        storage.run_migrations()?;
+
+        // Initialize schema (CREATE TABLE IF NOT EXISTS — safe after version check)
         storage.initialize_schema()?;
 
         Ok(storage)
@@ -383,6 +387,53 @@ CREATE TABLE IF NOT EXISTS project_metadata (
         metadata
             .save(&self.conn)
             .map_err(|_| rusqlite::Error::InvalidQuery)
+    }
+
+    /// Current schema version. Increment when adding migrations.
+    const SCHEMA_VERSION: u32 = 1;
+
+    /// Run database migrations based on the stored schema version.
+    /// Creates the version tracking table if it doesn't exist.
+    fn run_migrations(&mut self) -> SqliteResult<()> {
+        // Create version tracking table
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version (
+                key TEXT PRIMARY KEY,
+                version INTEGER NOT NULL
+            )",
+            [],
+        )?;
+
+        // Read current version
+        let current: u32 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM schema_version WHERE key = 'schema'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        // Reject databases from newer versions — they may contain data
+        // this version cannot interpret.
+        if current > Self::SCHEMA_VERSION {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "Database schema v{} is newer than this version (v{}). Please upgrade LeIndex.",
+                current, Self::SCHEMA_VERSION
+            )));
+        }
+
+        // Add future migrations here:
+        // if current < 2 { self.migrate_v1_to_v2()?; }
+        // if current < 3 { self.migrate_v2_to_v3()?; }
+
+        // Update stored version
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_version (key, version) VALUES ('schema', ?1)",
+            [Self::SCHEMA_VERSION],
+        )?;
+
+        Ok(())
     }
 }
 

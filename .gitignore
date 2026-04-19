@@ -157,3 +157,4 @@ Cargo.lock
 *.so
 *.dylib
 *.dll
+.nexus/

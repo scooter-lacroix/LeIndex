@@ -444,23 +444,77 @@ to auto-switch/auto-index projects."
             ));
         }
 
-        // Fetch top_k + offset results, then slice for pagination
-        let all_results = index
-            .search(&query, top_k + offset, query_type)
+        // Fetch top_k + offset results, then slice for pagination.
+        // Cap to prevent pathological fan-out from large offsets.
+        const MAX_FETCH_K: usize = 1000;
+        let mut fetch_k = (top_k + offset).min(MAX_FETCH_K);
+        let mut all_results = index
+            .search(&query, fetch_k, query_type)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
-        let filtered: Vec<_> = all_results
-            .into_iter()
-            .filter(|r| match &scope {
-                Some(s) => r.file_path.starts_with(s),
-                None => true,
-            })
+        // Separator-aware scope filter: exact match for file paths,
+        // prefix match for directory paths.
+        let in_scope = |file_path: &str| match &scope {
+            Some(s) => {
+                // If scope looks like a file (has extension, no trailing separator),
+                // require exact match. Otherwise prefix match.
+                let scope_str = s.trim_end_matches(std::path::MAIN_SEPARATOR);
+                if std::path::Path::new(scope_str).extension().is_some() {
+                    file_path == scope_str
+                } else {
+                    file_path.starts_with(&format!("{}{}", scope_str, std::path::MAIN_SEPARATOR))
+                        || file_path == scope_str
+                }
+            }
+            None => true,
+        };
+
+        let mut filtered: Vec<_> = all_results
+            .iter()
+            .filter(|r| in_scope(&r.file_path))
+            .cloned()
             .collect();
+
+        // Retry with expanded window if scope eliminated everything.
+        // The initial fetch may miss lower-ranked in-scope results.
+        if filtered.is_empty() && scope.is_some() && !all_results.is_empty() {
+            fetch_k = (fetch_k * 10).min(MAX_FETCH_K * 10);
+            if fetch_k > top_k + offset {
+                all_results = index
+                    .search(&query, fetch_k, query_type)
+                    .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
+                filtered = all_results
+                    .iter()
+                    .filter(|r| in_scope(&r.file_path))
+                    .cloned()
+                    .collect();
+            }
+        }
 
         let total_filtered = filtered.len();
 
         let page: Vec<_> = filtered.into_iter().skip(offset).take(top_k).collect();
         let total_returned = page.len();
+
+        // Check for zero results and provide helpful suggestion
+        // Only emit suggestion when there are truly no matches, not when offset is past total
+        if total_filtered == 0 {
+            return Ok(wrap_with_meta(
+                serde_json::json!({
+                    "results": [],
+                    "offset": offset,
+                    "count": 0,
+                    "has_more": false,
+                    "suggestion": format!(
+                        "No semantic matches found for '{}'. The project contains {} indexed files. \
+                        Try: rephrase query, use different keywords, or try leindex_grep_symbols for exact symbol names.",
+                        query,
+                        index.source_file_paths().map(|p| p.len()).unwrap_or(0)
+                    )
+                }),
+                &index,
+            ));
+        }
 
         Ok(wrap_with_meta(
             serde_json::json!({
@@ -1012,7 +1066,7 @@ impl DiagnosticsHandler {
     ) -> Result<Value, JsonRpcError> {
         let project_path = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path).await?;
-        let reader = handle.lock().await;
+        let mut reader = handle.lock().await;
 
         let diagnostics = reader.get_diagnostics().map_err(|e| {
             JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e))
@@ -1075,6 +1129,7 @@ fn node_type_str(nt: &crate::graph::pdg::NodeType) -> &'static str {
         crate::graph::pdg::NodeType::Method => "method",
         crate::graph::pdg::NodeType::Variable => "variable",
         crate::graph::pdg::NodeType::Module => "module",
+        crate::graph::pdg::NodeType::External => "external",
     }
 }
 
@@ -1121,7 +1176,7 @@ fn wrap_with_meta(mut result: Value, index: &crate::cli::leindex::LeIndex) -> Va
             obj.insert(
                 "_warning".to_string(),
                 Value::String(
-                    "Index may be stale. Call leindex_index with force_reindex=true to refresh."
+                    "Index may be stale. Call leindex_index with force_reindex=true for fresh results."
                         .to_string(),
                 ),
             );
@@ -1257,11 +1312,12 @@ use leindex_read_symbol."
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
 
         // Enforce project boundary
         let _ = validate_file_within_project(&file_path, index.project_path())?;
 
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -1504,8 +1560,9 @@ For the exact source implementation use leindex_read_symbol."
         };
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
 
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -1631,9 +1688,17 @@ For the exact source implementation use leindex_read_symbol."
             best
         })
         .ok_or_else(|| {
+            let total_symbols = pdg.node_count();
+            let total_files = pdg.file_count();
+            let suggestion = format!(
+                "Symbol '{}' not found among {} indexed symbols across {} files. Try: \
+                check spelling, use leindex_grep_symbols for partial matches, \
+                or leindex_text_search for raw content search.",
+                symbol, total_symbols, total_files
+            );
             JsonRpcError::invalid_params_with_suggestion(
                 format!("Symbol '{}' not found in project index", symbol),
-                "Check spelling, or use leindex_grep_symbols to search for partial matches",
+                &suggestion
             )
         })?;
 
@@ -1785,6 +1850,10 @@ scoping to subdirectories, sorting, and pagination."
                     "type": "integer",
                     "description": "Maximum number of files to return (default: unlimited, subject to token_budget)",
                     "minimum": 1
+                },
+                "focus": {
+                    "type": "string",
+                    "description": "Semantic focus area — ranks files by relevance to this topic (e.g., 'authentication', 'database layer', 'payment flow')"
                 }
             },
             "required": []
@@ -1809,10 +1878,12 @@ scoping to subdirectories, sorting, and pagination."
             .get("limit")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
+        let focus = args.get("focus").and_then(|v| v.as_str()).map(String::from);
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let project_root = index.project_path().to_path_buf();
 
         // Allow legacy "path" param; map it into "scope" for resolution.
@@ -1837,26 +1908,45 @@ scoping to subdirectories, sorting, and pagination."
             scope_str.trim_end_matches(|c| c == '/' || c == std::path::MAIN_SEPARATOR),
         );
 
-        let pdg = index
-            .pdg()
-            .ok_or_else(|| JsonRpcError::project_not_indexed(project_root.display().to_string()))?;
+        // Use cached file stats if available, otherwise build from PDG
+        // Collect source paths first to avoid borrow conflicts with file_stats()/pdg()
+        let source_paths = index.source_file_paths().unwrap_or_default();
 
-        // Build file info from PDG nodes
-        let mut file_map: std::collections::HashMap<String, (usize, u32, Vec<String>)> =
-            std::collections::HashMap::new(); // file → (node_count, total_complexity, symbol_names)
+        // file → (symbol_count, total_complexity, symbol_names, incoming_deps, outgoing_deps)
+        let file_map: std::collections::HashMap<String, (usize, u32, Vec<String>, usize, usize)> = if let Some(cache) = index.file_stats() {
+            // Fast path: use cached statistics (includes pre-computed dep counts)
+            let mut map: std::collections::HashMap<String, (usize, u32, Vec<String>, usize, usize)> = source_paths
+                .into_iter()
+                .map(|path| (path.display().to_string(), (0, 0, Vec::new(), 0, 0)))
+                .collect();
 
-        for nid in pdg.node_indices() {
-            if let Some(node) = pdg.get_node(nid) {
-                let entry = file_map
-                    .entry(node.file_path.clone())
-                    .or_insert((0, 0, Vec::new()));
-                entry.0 += 1;
-                entry.1 += node.complexity;
-                if entry.2.len() < 5 {
-                    entry.2.push(node.name.clone());
+            // Overlay cached statistics, capping symbol_names to top 5
+            for (path, stats) in cache.iter() {
+                let capped: Vec<String> = stats.symbol_names.iter().take(5).cloned().collect();
+                map.insert(path.clone(), (stats.symbol_count, stats.total_complexity, capped, stats.incoming_deps, stats.outgoing_deps));
+            }
+            map
+        } else {
+            // Fallback: build from PDG via the same method used at index time
+            index.build_file_stats_cache();
+            let mut map: std::collections::HashMap<String, (usize, u32, Vec<String>, usize, usize)> = source_paths
+                .into_iter()
+                .map(|path| (path.display().to_string(), (0, 0, Vec::new(), 0, 0)))
+                .collect();
+
+            if let Some(cache) = index.file_stats() {
+                for (path, stats) in cache.iter() {
+                    let capped: Vec<String> = stats.symbol_names.iter().take(5).cloned().collect();
+                    map.insert(path.clone(), (stats.symbol_count, stats.total_complexity, capped, stats.incoming_deps, stats.outgoing_deps));
                 }
             }
-        }
+            map
+        }; // file → (node_count, total_complexity, symbol_names)
+
+        // Get PDG for scope filtering (no degree computation needed — cached in file_map)
+        let _pdg = index
+            .pdg()
+            .ok_or_else(|| JsonRpcError::project_not_indexed(project_root.display().to_string()))?;
 
         // Filter to scope path and respect depth.
         // Files must either be exactly in the scope directory or in a subdirectory.
@@ -1867,20 +1957,26 @@ scoping to subdirectories, sorting, and pagination."
                 // or if the file IS the scope path (exact match for single-file scope)
                 fp.starts_with(&scope_str) || fp.as_str() == scope_path.to_str().unwrap_or("")
             })
-            .filter_map(|(fp, (count, complexity, syms))| {
+            .filter_map(|(fp, (count, complexity, syms, in_deg, out_deg))| {
                 let path = std::path::Path::new(fp);
                 let rel = path.strip_prefix(&scope_base).ok()?;
-                // Check depth
-                if rel.components().count() > depth {
+                let directory_depth = rel
+                    .parent()
+                    .map(|parent| parent.components().count())
+                    .unwrap_or(0);
+                if directory_depth > depth {
                     return None;
                 }
+
                 let mut entry = serde_json::json!({
                     "path": fp,
                     "relative_path": rel.display().to_string(),
                     "symbol_count": count,
-                    "total_complexity": complexity
+                    "total_complexity": complexity,
+                    "incoming_dependencies": in_deg,
+                    "outgoing_dependencies": out_deg
                 });
-                if include_symbols {
+                if include_symbols || focus.is_some() {
                     entry["top_symbols"] =
                         Value::Array(syms.iter().map(|s| Value::String(s.clone())).collect());
                 }
@@ -1902,13 +1998,55 @@ scoping to subdirectories, sorting, and pagination."
                     .unwrap_or("")
                     .cmp(b["relative_path"].as_str().unwrap_or(""))
             }),
-            "dependencies" | "size" => files.sort_by(|a, b| {
+            "dependencies" => files.sort_by(|a, b| {
+                let a_deg = a["incoming_dependencies"].as_u64().unwrap_or(0)
+                    + a["outgoing_dependencies"].as_u64().unwrap_or(0);
+                let b_deg = b["incoming_dependencies"].as_u64().unwrap_or(0)
+                    + b["outgoing_dependencies"].as_u64().unwrap_or(0);
+                b_deg.cmp(&a_deg)
+            }),
+            "size" => files.sort_by(|a, b| {
                 b["symbol_count"]
                     .as_u64()
                     .unwrap_or(0)
                     .cmp(&a["symbol_count"].as_u64().unwrap_or(0))
             }),
             _ => {}
+        }
+
+        // Semantic focus ranking: when focus is provided, re-rank files by
+        // cosine similarity between the focus embedding and per-file symbol embeddings.
+        if let Some(ref focus_text) = focus {
+            let focus_emb = index.generate_query_embedding(focus_text);
+            // Cache file embeddings by symbol text to avoid recomputing
+            // for files with identical symbol sets.
+            let mut emb_cache: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+            for entry in &mut files {
+                let syms = entry["top_symbols"].as_array();
+                let file_text = syms
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                if file_text.is_empty() {
+                    entry["relevance_score"] = serde_json::json!(0.0);
+                    continue;
+                }
+                let file_emb = emb_cache
+                    .entry(file_text.clone())
+                    .or_insert_with(|| index.generate_query_embedding(&file_text));
+                let score = crate::search::vector::cosine_similarity(&focus_emb, file_emb);
+                entry["relevance_score"] = serde_json::json!(score);
+            }
+            files.sort_by(|a, b| {
+                let sa = a["relevance_score"].as_f64().unwrap_or(0.0);
+                let sb = b["relevance_score"].as_f64().unwrap_or(0.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            // Remove top_symbols from output if not requested
+            if !include_symbols {
+                for entry in &mut files {
+                    entry.as_object_mut().map(|o| o.remove("top_symbols"));
+                }
+            }
         }
 
         // Apply pagination: offset + limit
@@ -1986,7 +2124,7 @@ impl GrepSymbolsHandler {
                 },
                 "type_filter": {
                     "type": "string",
-                    "enum": ["function", "class", "method", "variable", "module", "all"],
+                    "enum": ["function", "class", "method", "variable", "module", "external", "all"],
                     "description": "Filter by symbol type (default: all)",
                     "default": "all"
                 },
@@ -2014,6 +2152,17 @@ impl GrepSymbolsHandler {
                     "description": "Skip the first N results for pagination (default: 0)",
                     "default": 0,
                     "minimum": 0
+                },
+                "include_source": {
+                    "type": "boolean",
+                    "description": "Include up to 4000 chars of symbol source code in results (default: false)",
+                    "default": false
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["exact", "semantic"],
+                    "description": "Search mode: 'exact' for name substring matching (default), 'semantic' for concept-based similarity search using TF-IDF embeddings",
+                    "default": "exact"
                 }
             },
             "required": ["pattern"]
@@ -2035,6 +2184,12 @@ impl GrepSymbolsHandler {
         let max_results = extract_usize(&args, "max_results", 20)?.min(200);
         let context_lines = extract_usize(&args, "include_context_lines", 0)?.min(10);
         let offset = extract_usize(&args, "offset", 0)?;
+        let include_source = extract_bool(&args, "include_source", false);
+        let mode = args
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("exact")
+            .to_owned();
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
@@ -2042,23 +2197,172 @@ impl GrepSymbolsHandler {
         let scope = resolve_scope(&args, index.project_path())?;
 
         // Use indexed search to pre-filter candidates (avoids full O(N) PDG scans).
-        let candidate_limit = (max_results + offset).saturating_mul(5).max(50);
-        let candidate_results = index
+        // Bound the initial candidate limit to prevent pathological fan-out from large offsets.
+        const MAX_CANDIDATE_LIMIT: usize = 1000;
+        let effective_fetch = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
+        let mut candidate_limit = effective_fetch.saturating_mul(5).clamp(50, MAX_CANDIDATE_LIMIT);
+        let mut candidate_results = index
             .search(&pattern, candidate_limit, None)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
-        let pdg = index.pdg().ok_or_else(|| {
-            JsonRpcError::project_not_indexed(index.project_path().display().to_string())
-        })?;
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+        if index.pdg().is_none() {
+            return Err(JsonRpcError::project_not_indexed(index.project_path().display().to_string()));
+        }
 
         let pattern_lower = pattern.to_lowercase();
         let char_budget = token_budget * 4;
 
         // Collect matches from pre-filtered candidates
         // Fetch max_results + offset matches, then paginate
-        let fetch_limit = max_results + offset;
+        let fetch_limit = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Use (file_path, byte_range) for location dedup, but skip dedup for synthetic (0,0) ranges
+        let mut seen_locations: std::collections::HashSet<(String, (usize, usize))> = std::collections::HashSet::new();
         let mut all_matches: Vec<Value> = Vec::new();
+
+        // Semantic mode: return results directly from the search engine, ranked by
+        // cosine similarity. No text matching — finds conceptually related symbols.
+        // Includes retry with expanded window when scope/type filters eliminate all results.
+        // Precompute scope prefix for separator-aware matching (avoids per-result format!()).
+        let scope_prefix: Option<String> = scope.as_ref().map(|s| {
+            let base = s.trim_end_matches(std::path::MAIN_SEPARATOR);
+            format!("{}{}", base, std::path::MAIN_SEPARATOR)
+        });
+        let scope_exact: Option<String> = scope.as_ref().map(|s| s.trim_end_matches(std::path::MAIN_SEPARATOR).to_string());
+
+        if mode == "semantic" {
+            'semantic_retry: for _attempt in 0..2 {
+                all_matches.clear();
+                seen_ids.clear();
+                seen_locations.clear();
+
+                // (Re-)load PDG for this iteration
+                index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+
+                for result in &candidate_results {
+                    if all_matches.len() >= fetch_limit {
+                        break;
+                    }
+                    // Look up PDG node for enrichment
+                    let nid = match index.pdg().and_then(|pdg| pdg.find_by_id(&result.node_id)) {
+                        Some(id) => id,
+                        None => continue,
+                    };
+                    let node = match index.pdg().and_then(|pdg| pdg.get_node(nid).cloned()) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+
+                    // Apply scope filter (separator-aware, using precomputed prefix)
+                    if let Some(ref prefix) = scope_prefix {
+                        if !(node.file_path.starts_with(prefix) || node.file_path == *scope_exact.as_ref().unwrap()) {
+                            continue;
+                        }
+                    }
+                    if type_filter != "all" && node_type_str(&node.node_type) != type_filter {
+                        continue;
+                    }
+
+                    // Skip external/import nodes unless the user explicitly filtered for them
+                    if matches!(node.node_type, crate::graph::pdg::NodeType::External) && type_filter != "external" {
+                        continue;
+                    }
+
+                let (caller_ids, callers, callees) = if let Some(pdg) = index.pdg() {
+                    let caller_ids = get_direct_callers(pdg, nid);
+                    let callers: Vec<String> = caller_ids.iter().take(50).filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone())).collect();
+                    let callee_ids = pdg.neighbors(nid);
+                    let callees: Vec<String> = callee_ids.iter().take(50).filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone())).collect();
+                    (caller_ids, callers, callees)
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new())
+                };
+
+                let mut entry = serde_json::json!({
+                    "name": node.name,
+                    "type": node_type_str(&node.node_type),
+                    "file": node.file_path,
+                    "byte_range": node.byte_range,
+                    "complexity": node.complexity,
+                    "caller_count": caller_ids.len(),
+                    "dependency_count": callees.len(),
+                    "callers": callers,
+                    "callees": callees,
+                    "language": node.language,
+                    "score": result.score,
+                });
+
+                // Read source once for both context and source fields
+                let source = if context_lines > 0 || include_source {
+                    read_source_snippet(&node.file_path, node.byte_range)
+                } else {
+                    None
+                };
+                if context_lines > 0 {
+                    if let Some(ref src) = source {
+                        let snippet: String = src.lines().take(context_lines).collect::<Vec<_>>().join("\n");
+                        entry["context"] = Value::String(snippet);
+                    }
+                }
+                if include_source {
+                    if let Some(ref src) = source {
+                        let truncated: String = src.chars().take(4000).collect();
+                        let was_truncated = src.char_indices().nth(4000).is_some();
+                        entry["source"] = Value::String(truncated);
+                        if was_truncated {
+                            entry["source_truncated"] = Value::Bool(true);
+                        }
+                    }
+                }
+                all_matches.push(entry);
+            }
+
+            // Retry with expanded window if scope/type eliminated everything.
+            if all_matches.is_empty() && !candidate_results.is_empty() {
+                let expanded = (candidate_limit * 10).min(1000);
+                if expanded > candidate_limit {
+                    candidate_limit = expanded;
+                    candidate_results = index
+                        .search(&pattern, candidate_limit, None)
+                        .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
+                    continue 'semantic_retry;
+                }
+            }
+            break 'semantic_retry;
+        }
+
+        // Paginate and format with char_budget truncation
+        let total_matches = all_matches.len();
+        let paginated: Vec<Value> = all_matches.into_iter().skip(offset).take(max_results).collect();
+
+        // Enforce token_budget — same truncation as exact mode
+        let mut truncated_results: Vec<Value> = Vec::new();
+        let mut used_chars: usize = 0;
+        for entry in paginated {
+            let entry_chars = entry.to_string().len();
+            if used_chars + entry_chars > char_budget {
+                break;
+            }
+            used_chars += entry_chars;
+            truncated_results.push(entry);
+        }
+        let shown = truncated_results.len();
+
+        let mut response = serde_json::json!({
+            "results": truncated_results,
+            "total_matches": total_matches,
+            "shown": shown,
+            "offset": offset,
+            "mode": "semantic",
+            "truncated": total_matches.saturating_sub(offset).min(max_results) > shown,
+        });
+        response = wrap_with_meta(response, &index);
+        return Ok(response);
+    }
+
+        // Exact mode: current behavior — text matching with semantic pre-filter
+        let pdg = index.pdg().unwrap(); // checked above
 
         for sr in candidate_results {
             if all_matches.len() >= fetch_limit {
@@ -2072,6 +2376,11 @@ impl GrepSymbolsHandler {
                 Some(n) => n,
                 None => continue,
             };
+
+            // Skip external/import nodes unless the user explicitly filtered for them
+            if matches!(node.node_type, crate::graph::pdg::NodeType::External) && type_filter != "external" {
+                continue;
+            }
 
             // Type filter
             if type_filter != "all" {
@@ -2093,13 +2402,32 @@ impl GrepSymbolsHandler {
             let matches = node.name.to_lowercase().contains(&pattern_lower)
                 || node.id.to_lowercase().contains(&pattern_lower);
 
-            if !matches || seen_ids.contains(&node.id) {
+            // Use (file_path, byte_range) for location dedup, but skip dedup for synthetic (0,0) ranges
+            // which don't represent real source positions
+            let location_key = (node.file_path.clone(), node.byte_range);
+            let is_duplicate_location = node.byte_range != (0, 0) && seen_locations.contains(&location_key);
+            if !matches || seen_ids.contains(&node.id) || is_duplicate_location {
                 continue;
             }
             seen_ids.insert(node.id.clone());
+            if node.byte_range != (0, 0) {
+                seen_locations.insert(location_key);
+            }
 
-            let caller_count = get_direct_callers(pdg, nid).len();
-            let dep_count = pdg.neighbors(nid).len();
+            let caller_ids = get_direct_callers(pdg, nid);
+            let caller_count = caller_ids.len();
+            let callers: Vec<String> = caller_ids
+                .iter()
+                .take(50)
+                .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
+                .collect();
+            let callee_ids = pdg.neighbors(nid);
+            let dep_count = callee_ids.len();
+            let callees: Vec<String> = callee_ids
+                .iter()
+                .take(50)
+                .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
+                .collect();
 
             let mut entry = serde_json::json!({
                 "name": node.name,
@@ -2109,9 +2437,13 @@ impl GrepSymbolsHandler {
                 "complexity": node.complexity,
                 "caller_count": caller_count,
                 "dependency_count": dep_count,
+                "callers": callers,
+                "callees": callees,
                 "language": node.language
             });
 
+            // TODO: Cache file contents within handler execution — read_source_snippet
+            // does sync I/O per match, which can be slow for large result sets.
             if context_lines > 0 {
                 if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
                     let snippet: String = src
@@ -2123,18 +2455,23 @@ impl GrepSymbolsHandler {
                 }
             }
 
+            if include_source {
+                if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
+                    let truncated: String = src.chars().take(4000).collect();
+                    let was_truncated = src.char_indices().nth(4000).is_some();
+                    entry["source"] = Value::String(truncated);
+                    if was_truncated {
+                        entry["source_truncated"] = Value::Bool(true);
+                    }
+                }
+            }
+
             all_matches.push(entry);
         }
 
-        // If semantic search returned nothing useful or the pattern looks regex-y,
-        // fall back to a direct PDG scan that supports regex/pipes/wildcards.
-        let use_direct_scan = all_matches.is_empty()
-            || pattern.contains('|')
-            || pattern.contains('*')
-            || pattern.contains('?')
-            || pattern.contains('[');
-
-        if use_direct_scan && all_matches.len() < fetch_limit {
+        // Always try direct PDG scan when we haven't hit the fetch_limit.
+        // This merges semantic pre-filter results with direct symbol scans.
+        if all_matches.len() < fetch_limit {
             let re = RegexBuilder::new(&pattern)
                 .case_insensitive(true)
                 .build()
@@ -2148,6 +2485,11 @@ impl GrepSymbolsHandler {
                 let Some(node) = pdg.get_node(nid) else {
                     continue;
                 };
+
+                // Skip external/import nodes unless the user explicitly filtered for them
+                if matches!(node.node_type, crate::graph::pdg::NodeType::External) && type_filter != "external" {
+                    continue;
+                }
 
                 if type_filter != "all" && node_type_str(&node.node_type) != type_filter.as_str() {
                     continue;
@@ -2168,13 +2510,31 @@ impl GrepSymbolsHandler {
                         || node.id.to_lowercase().contains(&pattern_lower)
                 };
 
-                if !matches || seen_ids.contains(&node.id) {
+                // Use (file_path, byte_range) for location dedup, skip synthetic (0,0) ranges
+                let location_key = (node.file_path.clone(), node.byte_range);
+                let is_duplicate_location = node.byte_range != (0, 0) && seen_locations.contains(&location_key);
+                if !matches || seen_ids.contains(&node.id) || is_duplicate_location {
                     continue;
                 }
                 seen_ids.insert(node.id.clone());
+                if node.byte_range != (0, 0) {
+                    seen_locations.insert(location_key);
+                }
 
-                let caller_count = get_direct_callers(pdg, nid).len();
-                let dep_count = pdg.neighbors(nid).len();
+                let caller_ids = get_direct_callers(pdg, nid);
+                let caller_count = caller_ids.len();
+                let callers: Vec<String> = caller_ids
+                    .iter()
+                    .take(50)
+                    .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
+                    .collect();
+                let callee_ids = pdg.neighbors(nid);
+                let dep_count = callee_ids.len();
+                let callees: Vec<String> = callee_ids
+                    .iter()
+                    .take(50)
+                    .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
+                    .collect();
 
                 let mut entry = serde_json::json!({
                     "name": node.name,
@@ -2184,6 +2544,8 @@ impl GrepSymbolsHandler {
                     "complexity": node.complexity,
                     "caller_count": caller_count,
                     "dependency_count": dep_count,
+                    "callers": callers,
+                    "callees": callees,
                     "language": node.language
                 });
 
@@ -2198,6 +2560,17 @@ impl GrepSymbolsHandler {
                     }
                 }
 
+                if include_source {
+                    if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
+                        let truncated: String = src.chars().take(4000).collect();
+                        let was_truncated = src.char_indices().nth(4000).is_some();
+                        entry["source"] = Value::String(truncated);
+                        if was_truncated {
+                            entry["source_truncated"] = Value::Bool(true);
+                        }
+                    }
+                }
+
                 all_matches.push(entry);
             }
         }
@@ -2205,6 +2578,28 @@ impl GrepSymbolsHandler {
         // Apply pagination
         let total_matched = all_matches.len();
         let page: Vec<Value> = all_matches.into_iter().skip(offset).collect();
+
+        // Check for zero results and provide helpful suggestion
+        // Only emit suggestion when there are truly no matches, not when offset is past total
+        if total_matched == 0 {
+            return Ok(wrap_with_meta(
+                serde_json::json!({
+                    "pattern": pattern,
+                    "offset": offset,
+                    "count": 0,
+                    "total_matched": 0,
+                    "has_more": false,
+                    "results": [],
+                    "suggestion": format!(
+                        "No symbols matching '{}' found in {} indexed symbols across {} files. Try: broader substring, check case, or use leindex_text_search for raw text.",
+                        pattern,
+                        pdg.node_count(),
+                        pdg.file_count()
+                    )
+                }),
+                &index,
+            ));
+        }
 
         // Truncate to token budget
         let mut results: Vec<Value> = Vec::new();
@@ -2299,7 +2694,8 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -2924,11 +3320,12 @@ leindex_edit_apply to understand the blast radius of your change."
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
 
         // Enforce project boundary
         let _ = validate_file_within_project(&file_path, index.project_path())?;
 
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -3259,7 +3656,8 @@ Grep + multi-file Edit with a single atomic operation."
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -3321,41 +3719,71 @@ Grep + multi-file Edit with a single atomic operation."
             })
             .collect();
 
-        // Generate per-file diffs
-        let mut diffs: Vec<Value> = Vec::new();
-        let mut files_to_modify: Vec<String> = Vec::new();
+        // Release the mutex before spawning blocking I/O.
+        // All PDG data has been extracted into filtered_files above.
+        drop(index);
 
-        for file_path in &filtered_files {
-            let Ok(original) = std::fs::read_to_string(file_path) else {
-                continue;
-            };
-            let modified = replace_whole_word(&original, &old_name, &new_name);
-            if modified != original {
-                let diff = make_diff(&original, &modified, file_path);
-                diffs.push(serde_json::json!({ "file": file_path, "diff": diff }));
-                files_to_modify.push(file_path.clone());
+        // Generate per-file diffs (file I/O — offload to blocking thread)
+        let (diffs, files_to_modify) = tokio::task::spawn_blocking({
+            let filtered_files = filtered_files;
+            let old_name = old_name.clone();
+            let new_name = new_name.clone();
+            move || -> Result<(Vec<Value>, Vec<String>), String> {
+                let mut diffs: Vec<Value> = Vec::new();
+                let mut files_to_modify: Vec<String> = Vec::new();
+                for file_path in &filtered_files {
+                    let original = std::fs::read_to_string(file_path)
+                        .map_err(|e| format!("Failed reading '{}': {}", file_path, e))?;
+                    let modified = replace_whole_word(&original, &old_name, &new_name);
+                    if modified != original {
+                        let diff = make_diff(&original, &modified, file_path);
+                        diffs.push(serde_json::json!({ "file": file_path, "diff": diff }));
+                        files_to_modify.push(file_path.clone());
+                    }
+                }
+                Ok((diffs, files_to_modify))
             }
-        }
+        })
+        .await
+        .map_err(|e| JsonRpcError::internal_error(format!("Rename task failed: {}", e)))?
+        .map_err(JsonRpcError::internal_error)?;
 
         if !preview_only {
-            // Apply changes to all files
-            for file_path in &files_to_modify {
-                if let Ok(original) = std::fs::read_to_string(file_path) {
-                    let modified = replace_whole_word(&original, &old_name, &new_name);
-                    let _ = std::fs::write(file_path, modified.as_bytes());
+            // Apply changes to all files (file I/O — offload to blocking thread)
+            let old_name_c = old_name.clone();
+            let new_name_c = new_name.clone();
+            let apply_files = files_to_modify.clone();
+            tokio::task::spawn_blocking(move || {
+                for file_path in &apply_files {
+                    let original = match std::fs::read_to_string(file_path) {
+                        Ok(o) => o,
+                        Err(e) => return Err(format!("Failed reading '{}': {}", file_path, e)),
+                    };
+                    let modified = replace_whole_word(&original, &old_name_c, &new_name_c);
+                    if let Err(e) = std::fs::write(file_path, modified.as_bytes()) {
+                        return Err(format!("Failed writing '{}': {}", file_path, e));
+                    }
                 }
-            }
+                Ok(())
+            })
+            .await
+            .map_err(|e| JsonRpcError::internal_error(format!("Rename apply task failed: {}", e)))?
+            .map_err(JsonRpcError::internal_error)?;
         }
 
+        let response_data = serde_json::json!({
+            "old_name": old_name,
+            "new_name": new_name,
+            "files_affected": files_to_modify.len(),
+            "preview_only": preview_only,
+            "diffs": diffs,
+            "applied": !preview_only
+        });
+
+        // Re-acquire the lock for wrap_with_meta (released before spawn_blocking)
+        let index = handle.lock().await;
         Ok(wrap_with_meta(
-            serde_json::json!({
-                "old_name": old_name,
-                "new_name": new_name,
-                "files_affected": files_to_modify.len(),
-                "preview_only": preview_only,
-                "diffs": diffs,
-                "applied": !preview_only
-            }),
+            response_data,
             &index,
         ))
     }
@@ -3418,7 +3846,8 @@ to understand the blast radius of your change. No equivalent in standard tools."
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut index = handle.lock().await;
+        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -3670,19 +4099,7 @@ to understand match context. Supports regex, globs, scope, and context_lines."
         let mut results: Vec<Value> = Vec::new();
 
         // Dirs to always skip
-        const SKIP_DIRS: &[&str] = &[
-            ".git",
-            "node_modules",
-            "target",
-            "__pycache__",
-            ".venv",
-            "venv",
-            "dist",
-            "build",
-            ".next",
-            ".nuxt",
-            "vendor",
-        ];
+        use crate::cli::skip_dirs::SKIP_DIRS;
 
         for entry in walkdir::WalkDir::new(project_root)
             .follow_links(false)
@@ -3972,15 +4389,17 @@ Works for any text file including configs and docs."
             .collect();
         let content_str = visible_lines.join("\n");
 
-        // Detect language from extension
-        let language = Path::new(&file_path)
+        // Detect language from extension (case-insensitive)
+        let ext_lower = Path::new(&file_path)
             .extension()
             .and_then(|e| e.to_str())
+            .map(|ext| ext.to_ascii_lowercase());
+        let language = ext_lower.as_deref()
             .map(|ext| match ext {
                 "rs" => "rust",
                 "py" => "python",
-                "js" => "javascript",
-                "ts" => "typescript",
+                "js" | "mjs" | "cjs" => "javascript",
+                "ts" | "mts" | "cts" => "typescript",
                 "tsx" => "typescriptreact",
                 "jsx" => "javascriptreact",
                 "go" => "go",
@@ -4389,7 +4808,13 @@ Turns a raw diff into a structural change summary with blast radius."
                 let mut file_symbols: Vec<Value> = Vec::new();
                 for nid in &nodes {
                     if let Some(node) = pdg.get_node(*nid) {
-                        let caller_count = get_direct_callers(pdg, *nid).len();
+                        let caller_ids = get_direct_callers(pdg, *nid);
+                        let caller_count = caller_ids.len();
+                        let callers: Vec<String> = caller_ids
+                            .iter()
+                            .take(20)
+                            .filter_map(|&id| pdg.get_node(id).map(|n| n.name.clone()))
+                            .collect();
                         let forward_impact = pdg.forward_impact(
                             *nid,
                             &crate::graph::pdg::TraversalConfig {
@@ -4411,6 +4836,7 @@ Turns a raw diff into a structural change summary with blast radius."
                             "type": node_type_str(&node.node_type),
                             "complexity": node.complexity,
                             "caller_count": caller_count,
+                            "callers": callers,
                             "forward_impact_count": forward_impact.len(),
                         }));
                     }
@@ -4652,6 +5078,10 @@ mod tests {
             node_type_str(&crate::graph::pdg::NodeType::Module),
             "module"
         );
+        assert_eq!(
+            node_type_str(&crate::graph::pdg::NodeType::External),
+            "external"
+        );
     }
 
     #[test]
@@ -4774,6 +5204,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_project_map_includes_nested_and_symbol_less_files_with_directory_depth() {
+        let dir = tempdir().unwrap();
+        let nested_dir = dir.path().join("src").join("nested");
+        std::fs::create_dir_all(&nested_dir).unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.path().join("src").join("empty.rs"), "\n").unwrap();
+        std::fs::write(nested_dir.join("mod.rs"), "pub fn helper() {}\n").unwrap();
+
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({
+            "depth": 2,
+            "sort_by": "name",
+            "token_budget": 10_000
+        });
+        let result = ProjectMapHandler.execute(&registry, args).await.unwrap();
+        let files = result["files"].as_array().unwrap();
+        let relative_paths: Vec<String> = files
+            .iter()
+            .filter_map(|entry| entry["relative_path"].as_str())
+            .map(|p| p.replace('\\', "/"))
+            .collect();
+
+        assert!(relative_paths.iter().any(|p| p == "main.rs"));
+        assert!(relative_paths.iter().any(|p| p == "src/empty.rs"));
+        assert!(relative_paths.iter().any(|p| p == "src/nested/mod.rs"));
+    }
+
+    #[tokio::test]
     async fn test_grep_symbols_auto_indexes_returns_empty() {
         // With auto-indexing, a project with no matching symbols returns empty results
         let dir = tempdir().unwrap();
@@ -4786,6 +5244,29 @@ mod tests {
         assert!(result.is_ok(), "auto-indexing should succeed");
         let val = result.unwrap();
         assert_eq!(val["count"].as_u64().unwrap_or(0), 0);
+        // Verify suggestion field is present for zero results
+        assert!(val.get("suggestion").is_some(), "zero results should include suggestion");
+        let suggestion = val["suggestion"].as_str().unwrap();
+        assert!(suggestion.contains("No symbols matching"), "suggestion should mention no symbols found");
+    }
+
+    #[tokio::test]
+    async fn test_search_handler_zero_results_includes_suggestion() {
+        // Test that semantic search with no matches returns helpful suggestion
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(&src, "pub fn hello() {}\n").unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "query": "nonexistent_function_xyz" });
+        let result = SearchHandler.execute(&registry, args).await;
+        // Should succeed but with 0 matches
+        assert!(result.is_ok(), "search should succeed");
+        let val = result.unwrap();
+        assert_eq!(val["count"].as_i64().unwrap_or(0), 0);
+        // Verify suggestion field is present for zero results
+        assert!(val.get("suggestion").is_some(), "zero results should include suggestion");
+        let suggestion = val["suggestion"].as_str().unwrap();
+        assert!(suggestion.contains("No semantic matches"), "suggestion should mention no semantic matches");
     }
 
     #[tokio::test]

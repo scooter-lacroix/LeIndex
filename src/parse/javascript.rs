@@ -72,6 +72,7 @@ impl JavaScriptParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
+                            cyclomatic_complexity: 0,
                         });
 
                         let mut cursor = node.walk();
@@ -264,6 +265,7 @@ impl TypeScriptParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
+                            cyclomatic_complexity: 0,
                         });
                     }
 
@@ -298,6 +300,7 @@ impl TypeScriptParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
+                            cyclomatic_complexity: 0,
                         });
 
                         let mut cursor = node.walk();
@@ -542,6 +545,7 @@ fn extract_function_signature(
 
         imports: vec![],
         byte_range: (node.start_byte(), node.end_byte()),
+                cyclomatic_complexity: 0,
     })
 }
 
@@ -591,6 +595,7 @@ fn extract_ts_function_signature(
 
         imports: vec![],
         byte_range: (node.start_byte(), node.end_byte()),
+                cyclomatic_complexity: 0,
     })
 }
 

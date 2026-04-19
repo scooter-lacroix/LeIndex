@@ -91,6 +91,9 @@ pub enum NodeType {
 
     /// A module, namespace, or package.
     Module,
+
+    /// Imported/referenced symbol not defined in this project
+    External,
 }
 
 /// Edge types — now includes Containment for structural (non-semantic) relationships.
@@ -755,6 +758,12 @@ impl ProgramDependenceGraph {
         self.graph.node_weight_mut(id)
     }
 
+    /// Returns a mutable slice of all node weights.
+    /// Used for bulk node mutations (e.g., external node normalization).
+    pub fn node_weights_mut(&mut self) -> impl Iterator<Item = &mut Node> {
+        self.graph.node_weights_mut()
+    }
+
     /// Retrieves a reference to an edge by its ID.
     ///
     /// # Arguments
@@ -776,6 +785,14 @@ impl ProgramDependenceGraph {
     /// Returns the total number of edges in the graph.
     pub fn edge_count(&self) -> usize {
         self.graph.edge_count()
+    }
+
+    /// Returns the total number of files indexed in the graph.
+    pub fn file_count(&self) -> usize {
+        self.file_index
+            .values()
+            .filter(|node_ids| !node_ids.is_empty())
+            .count()
     }
 
     /// Returns an iterator over all node IDs in the graph.
