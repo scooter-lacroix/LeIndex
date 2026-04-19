@@ -7,7 +7,7 @@ use crate::cli::memory::{
 };
 use crate::graph::{
     extract_pdg_from_signatures,
-    pdg::ProgramDependenceGraph,
+    pdg::{EdgeType, NodeType, ProgramDependenceGraph},
     traversal::{GravityTraversal, TraversalConfig},
 };
 use crate::parse::parallel::ParallelParser;
@@ -370,6 +370,11 @@ pub(crate) struct ProjectFileScan {
     pub(crate) manifest_paths: Vec<PathBuf>,
     #[serde(default)]
     pub(crate) source_directories: Vec<PathBuf>,
+    /// Hashes of manifest/lockfile contents at scan time, used for
+    /// incremental reindex when only dependencies changed.
+    /// Format: manifest_path → blake3 hex hash
+    #[serde(default)]
+    pub(crate) manifest_hashes: std::collections::HashMap<String, String>,
 }
 
 /// Per-file statistics cached from PDG
@@ -838,10 +843,20 @@ impl LeIndex {
             // which requires re-annotating external dependencies.
             let manifest_dirty = self.check_manifest_stale();
             if !manifest_dirty {
-                info!("No changes detected, skipping indexing");
-                return Ok(self.stats.clone());
+                // Also check if manifest content hashes changed (more precise than mtime)
+                let scan = self.get_project_scan(false)?;
+                let changed_manifests = self.detect_changed_manifests(&scan);
+                if changed_manifests.is_empty() {
+                    info!("No changes detected, skipping indexing");
+                    return Ok(self.stats.clone());
+                }
+                info!(
+                    "Manifest content changed ({} files) — re-annotating",
+                    changed_manifests.len()
+                );
+            } else {
+                info!("Manifest files changed — running external dependency annotation");
             }
-            info!("Manifest files changed — running external dependency annotation");
         }
 
         // Step 4: Parse changed files
@@ -1105,10 +1120,23 @@ impl LeIndex {
         }
 
         let source_directories = Self::extract_unique_dirs(&source_paths);
+
+        // Compute lightweight hashes for manifest/lockfile content.
+        // Used to detect dependency changes that require re-annotating external nodes
+        // without re-scanning every source file.
+        let mut manifest_hashes = std::collections::HashMap::new();
+        for mp in &manifest_paths {
+            if let Ok(bytes) = std::fs::read(mp) {
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                manifest_hashes.insert(mp.display().to_string(), hash);
+            }
+        }
+
         Ok(ProjectFileScan {
             source_paths,
             manifest_paths,
             source_directories,
+            manifest_hashes,
         })
     }
 
@@ -1565,6 +1593,109 @@ impl LeIndex {
         crate::cli::index_freshness::check_manifest_stale(&ctx, || self.scan_project_files())
     }
 
+    /// Compare current manifest hashes against the persisted scan's hashes.
+    /// Returns the set of manifest file paths whose content has changed.
+    /// Filters out node_modules, build artifacts, and ignored paths.
+    fn detect_changed_manifests(&self, current_scan: &ProjectFileScan) -> Vec<PathBuf> {
+        // Try to read persisted scan from cache spiller
+        let cache_key = crate::cli::memory::project_scan_cache_key(&self.project_id);
+        let old_hashes: std::collections::HashMap<String, String> = self
+            .cache
+            .cache_spiller
+            .store()
+            .peek(&cache_key)
+            .and_then(|entry| match entry {
+                crate::cli::memory::CacheEntry::Binary { serialized_data, .. } => {
+                    bincode::deserialize::<ProjectFileScan>(serialized_data).ok()
+                }
+                _ => None,
+            })
+            .map(|scan| scan.manifest_hashes)
+            .unwrap_or_default();
+
+        let mut changed = Vec::new();
+        for mp in &current_scan.manifest_paths {
+            let key = mp.display().to_string();
+            let new_hash = current_scan.manifest_hashes.get(&key);
+            let old_hash = old_hashes.get(&key);
+
+            if new_hash != old_hash {
+                // Filter: skip node_modules, build artifacts, and common
+                // generated paths that would cause false-positive reindexes.
+                let path_str = key.to_lowercase();
+                let skip = path_str.contains("node_modules")
+                    || path_str.contains("/build/")
+                    || path_str.contains("\\build\\")
+                    || path_str.contains("/dist/")
+                    || path_str.contains("\\dist\\")
+                    || path_str.contains("/target/")
+                    || path_str.contains(".cache");
+                if !skip {
+                    changed.push(mp.clone());
+                }
+            }
+        }
+        changed
+    }
+
+    /// Given a set of changed manifests, find which source files import
+    /// from packages defined in those manifests. Returns file paths that
+    /// should be re-parsed to update external node annotations.
+    fn files_importing_from_manifests(
+        &self,
+        changed_manifests: &[PathBuf],
+        all_source_paths: &[PathBuf],
+        pdg: &ProgramDependenceGraph,
+    ) -> Vec<PathBuf> {
+        if changed_manifests.is_empty() {
+            return Vec::new();
+        }
+
+        // Extract package names from changed manifests
+        let changed_dirs: HashSet<PathBuf> = changed_manifests
+            .iter()
+            .filter_map(|p| p.parent().map(|d| d.to_path_buf()))
+            .collect();
+
+        // Find source files in the same workspace directories as changed manifests
+        let mut affected: Vec<PathBuf> = Vec::new();
+        for sp in all_source_paths {
+            if let Some(parent) = sp.parent() {
+                // File is in or under a workspace that had a manifest change
+                for dir in &changed_dirs {
+                    if sp.starts_with(dir) || parent.starts_with(dir) {
+                        affected.push(sp.clone());
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Also: files that import external packages (from PDG external nodes)
+        // whose file_path matches a source file not yet captured.
+        let affected_set: HashSet<String> =
+            affected.iter().map(|p| p.display().to_string()).collect();
+
+        for nid in pdg.node_indices() {
+            if let Some(node) = pdg.get_node(nid) {
+                if node.node_type == NodeType::External {
+                    // External node's file_path is the importing file
+                    if !affected_set.contains(&node.file_path) {
+                        // Check if this file exists in source_paths
+                        if all_source_paths
+                            .iter()
+                            .any(|sp| sp.display().to_string() == node.file_path)
+                        {
+                            affected.push(PathBuf::from(&node.file_path));
+                        }
+                    }
+                }
+            }
+        }
+
+        affected
+    }
+
     /// Fast-path freshness check: O(1) for indexed files, O(D) for source
     /// directories (typically 10-20), and O(M) for manifest files.
     pub fn is_stale_fast(&self) -> bool {
@@ -2018,6 +2149,48 @@ impl LeIndex {
 
                 // Extract node-specific content for better text matching.
                 // Use byte-safe slicing to avoid panics on invalid UTF-8 char boundaries.
+                //
+                // Enrichment: prepend semantic tags that improve TF-IDF matching:
+                //   - node type (function, class, method, etc.)
+                //   - PDG connectivity context (caller/callee counts)
+                // This makes semantic search more accurate without requiring LLM embeddings.
+                let mut enrichment = format!(
+                    "// type:{} lang:{}",
+                    match node.node_type {
+                        NodeType::Function => "function",
+                        NodeType::Class => "class",
+                        NodeType::Method => "method",
+                        NodeType::Variable => "variable",
+                        NodeType::Module => "module",
+                        NodeType::External => "external",
+                    },
+                    node.language,
+                );
+
+                // Add connectivity context — how many callers/callees this symbol has
+                let callers = pdg.backward_impact(node_idx, &crate::graph::pdg::TraversalConfig {
+                    max_depth: Some(1),
+                    max_nodes: Some(1000),
+                    allowed_edge_types: Some(vec![EdgeType::Call, EdgeType::DataDependency]),
+                    excluded_node_types: Some(vec![NodeType::External]),
+                    min_complexity: None,
+                    min_edge_confidence: 0.0,
+                });
+                let callees = pdg.forward_impact(node_idx, &crate::graph::pdg::TraversalConfig {
+                    max_depth: Some(1),
+                    max_nodes: Some(1000),
+                    allowed_edge_types: Some(vec![EdgeType::Call, EdgeType::DataDependency]),
+                    excluded_node_types: Some(vec![NodeType::External]),
+                    min_complexity: None,
+                    min_edge_confidence: 0.0,
+                });
+                enrichment.push_str(&format!(
+                    " callers:{} callees:{} complexity:{}",
+                    callers.len().min(50),
+                    callees.len().min(50),
+                    node.complexity,
+                ));
+
                 let node_content = if !content.is_empty() && node.byte_range.1 > node.byte_range.0 {
                     let content_bytes = content.as_bytes();
                     let start = node.byte_range.0.min(content_bytes.len());
@@ -2025,17 +2198,17 @@ impl LeIndex {
 
                     if start < end {
                         let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
-                        format!("// {} in {}\n{}", node.name, node.file_path, snippet)
+                        format!("{}\n// {} in {}\n{}", enrichment, node.name, node.file_path, snippet)
                     } else {
                         format!(
-                            "// {} in {}\n{}",
-                            node.name, node.file_path, "// [No source code available]"
+                            "{}\n// {} in {}\n{}",
+                            enrichment, node.name, node.file_path, "// [No source code available]"
                         )
                     }
                 } else {
                     format!(
-                        "// {} in {}\n{}",
-                        node.name, node.file_path, "// [No source code available]"
+                        "{}\n// {} in {}\n{}",
+                        enrichment, node.name, node.file_path, "// [No source code available]"
                     )
                 };
 
