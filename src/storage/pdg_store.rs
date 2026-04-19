@@ -507,6 +507,19 @@ pub fn get_indexed_files(
     Ok(result)
 }
 
+/// Check if any indexed files exist for a project (lightweight query)
+pub fn has_indexed_files(storage: &Storage, project_id: &str) -> bool {
+    storage
+        .conn()
+        .query_row(
+            "SELECT COUNT(*) FROM indexed_files WHERE project_id = ?1 LIMIT 1",
+            params![project_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0
+}
+
 /// Update indexed file record
 pub fn update_indexed_file(
     storage: &mut Storage,

@@ -1984,13 +1984,22 @@ scoping to subdirectories, sorting, and pagination."
         // cosine similarity between the focus embedding and per-file symbol embeddings.
         if let Some(ref focus_text) = focus {
             let focus_emb = index.generate_query_embedding(focus_text);
+            // Cache file embeddings by symbol text to avoid recomputing
+            // for files with identical symbol sets.
+            let mut emb_cache: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
             for entry in &mut files {
                 let syms = entry["top_symbols"].as_array();
                 let file_text = syms
                     .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "))
                     .unwrap_or_default();
-                let file_emb = index.generate_query_embedding(&file_text);
-                let score = crate::search::vector::cosine_similarity(&focus_emb, &file_emb);
+                if file_text.is_empty() {
+                    entry["relevance_score"] = serde_json::json!(0.0);
+                    continue;
+                }
+                let file_emb = emb_cache
+                    .entry(file_text.clone())
+                    .or_insert_with(|| index.generate_query_embedding(&file_text));
+                let score = crate::search::vector::cosine_similarity(&focus_emb, file_emb);
                 entry["relevance_score"] = serde_json::json!(score);
             }
             files.sort_by(|a, b| {

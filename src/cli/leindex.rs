@@ -1637,8 +1637,16 @@ impl LeIndex {
     /// before their first query. Defers the 10-50MB load cost from project registration
     /// to first actual use.
     pub fn ensure_pdg_loaded(&mut self) -> Result<()> {
-        if self.pdg.is_none() && self.storage_path.join("leindex.db").exists() {
-            self.load_from_storage()?;
+        if self.pdg.is_none() {
+            // Guard: only load if there are actual indexed files in storage.
+            // LeIndex::new() creates leindex.db eagerly, so DB existence alone
+            // would cause a useless load_from_storage on brand-new projects.
+            let has_content = crate::storage::pdg_store::has_indexed_files(
+                &self.storage, &self.project_id,
+            );
+            if has_content {
+                self.load_from_storage()?;
+            }
         }
         Ok(())
     }

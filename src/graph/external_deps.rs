@@ -1162,8 +1162,11 @@ pub fn discover_dependency_manifests(root: &Path, exclude_dirs: Option<&[String]
                     } else {
                         format!("{}/", relative)
                     };
-                    // Exact match: this directory equals the pattern
-                    trimmed == relative
+                    // Leaf-name match: any directory component equals the pattern
+                    // (consistent with SKIP_DIRS behavior — matches anywhere in tree)
+                    file_name.as_ref() == trimmed
+                        // Exact match: this directory equals the pattern
+                        || trimmed == relative
                         || trimmed == relative.trim_end_matches('/')
                         // Prefix match: this directory is inside the excluded pattern
                         || dir_relative.starts_with(&format!("{}/", trimmed))
