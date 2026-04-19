@@ -129,7 +129,7 @@ impl IndexCache {
             let mut incoming_files = std::collections::HashSet::new();
             let mut outgoing_files = std::collections::HashSet::new();
             for nid in &nodes {
-                for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Outgoing) {
+                for dep_id in pdg.neighbors(*nid) {
                     if let Some(dep) = pdg.get_node(dep_id) {
                         if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
                             && dep.file_path != *file_path
@@ -138,7 +138,7 @@ impl IndexCache {
                         }
                     }
                 }
-                for dep_id in pdg.graph.neighbors_directed(*nid, petgraph::Direction::Incoming) {
+                for dep_id in pdg.predecessors(*nid) {
                     if let Some(dep) = pdg.get_node(dep_id) {
                         if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
                             && dep.file_path != *file_path

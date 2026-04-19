@@ -444,8 +444,10 @@ to auto-switch/auto-index projects."
             ));
         }
 
-        // Fetch top_k + offset results, then slice for pagination
-        let mut fetch_k = top_k + offset;
+        // Fetch top_k + offset results, then slice for pagination.
+        // Cap to prevent pathological fan-out from large offsets.
+        const MAX_FETCH_K: usize = 1000;
+        let mut fetch_k = (top_k + offset).min(MAX_FETCH_K);
         let mut all_results = index
             .search(&query, fetch_k, query_type)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
@@ -2184,7 +2186,10 @@ impl GrepSymbolsHandler {
         let scope = resolve_scope(&args, index.project_path())?;
 
         // Use indexed search to pre-filter candidates (avoids full O(N) PDG scans).
-        let mut candidate_limit = (max_results + offset).saturating_mul(5).max(50);
+        // Bound the initial candidate limit to prevent pathological fan-out from large offsets.
+        const MAX_CANDIDATE_LIMIT: usize = 1000;
+        let effective_fetch = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
+        let mut candidate_limit = effective_fetch.saturating_mul(5).clamp(50, MAX_CANDIDATE_LIMIT);
         let mut candidate_results = index
             .search(&pattern, candidate_limit, None)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
@@ -2199,7 +2204,7 @@ impl GrepSymbolsHandler {
 
         // Collect matches from pre-filtered candidates
         // Fetch max_results + offset matches, then paginate
-        let fetch_limit = max_results + offset;
+        let fetch_limit = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         // Use (file_path, byte_range) for location dedup, but skip dedup for synthetic (0,0) ranges
         let mut seen_locations: std::collections::HashSet<(String, (usize, usize))> = std::collections::HashSet::new();
@@ -2208,6 +2213,13 @@ impl GrepSymbolsHandler {
         // Semantic mode: return results directly from the search engine, ranked by
         // cosine similarity. No text matching — finds conceptually related symbols.
         // Includes retry with expanded window when scope/type filters eliminate all results.
+        // Precompute scope prefix for separator-aware matching (avoids per-result format!()).
+        let scope_prefix: Option<String> = scope.as_ref().map(|s| {
+            let base = s.trim_end_matches(std::path::MAIN_SEPARATOR);
+            format!("{}{}", base, std::path::MAIN_SEPARATOR)
+        });
+        let scope_exact: Option<String> = scope.as_ref().map(|s| s.trim_end_matches(std::path::MAIN_SEPARATOR).to_string());
+
         if mode == "semantic" {
             'semantic_retry: for _attempt in 0..2 {
                 all_matches.clear();
@@ -2231,10 +2243,9 @@ impl GrepSymbolsHandler {
                         None => continue,
                     };
 
-                    // Apply scope and type filters (separator-aware)
-                    if let Some(ref s) = scope {
-                        let scope_base = s.trim_end_matches(std::path::MAIN_SEPARATOR);
-                        if !(node.file_path.starts_with(&format!("{}{}", scope_base, std::path::MAIN_SEPARATOR)) || node.file_path == scope_base) {
+                    // Apply scope filter (separator-aware, using precomputed prefix)
+                    if let Some(ref prefix) = scope_prefix {
+                        if !(node.file_path.starts_with(prefix) || node.file_path == *scope_exact.as_ref().unwrap()) {
                             continue;
                         }
                     }
@@ -2242,8 +2253,8 @@ impl GrepSymbolsHandler {
                         continue;
                     }
 
-                    // Skip ALL external/import nodes — they are not user-defined symbols
-                    if matches!(node.node_type, crate::graph::pdg::NodeType::External) {
+                    // Skip external/import nodes unless the user explicitly filtered for them
+                    if matches!(node.node_type, crate::graph::pdg::NodeType::External) && type_filter != "external" {
                         continue;
                     }
 
@@ -2355,8 +2366,8 @@ impl GrepSymbolsHandler {
                 None => continue,
             };
 
-            // Skip ALL external/import nodes — they are not user-defined symbols
-            if matches!(node.node_type, crate::graph::pdg::NodeType::External) {
+            // Skip external/import nodes unless the user explicitly filtered for them
+            if matches!(node.node_type, crate::graph::pdg::NodeType::External) && type_filter != "external" {
                 continue;
             }
 
@@ -2464,8 +2475,8 @@ impl GrepSymbolsHandler {
                     continue;
                 };
 
-                // Skip ALL external/import nodes — they are not user-defined symbols
-                if matches!(node.node_type, crate::graph::pdg::NodeType::External) {
+                // Skip external/import nodes unless the user explicitly filtered for them
+                if matches!(node.node_type, crate::graph::pdg::NodeType::External) && type_filter != "external" {
                     continue;
                 }
 

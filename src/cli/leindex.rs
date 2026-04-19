@@ -800,7 +800,10 @@ impl LeIndex {
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .unwrap_or_default();
 
-        // Step 2: Collect all source files and compute hashes
+        // Step 2: Collect all source files and compute hashes.
+        // Snapshot the OLD manifest hashes BEFORE the refresh overwrites the cache,
+        // so detect_changed_manifests() can compare against the previous baseline.
+        let old_scan = self.get_project_scan(false).ok();
         let source_files_with_hashes = self.collect_source_files_with_hashes(true)?;
         info!("Found {} source files", source_files_with_hashes.len());
 
@@ -843,9 +846,35 @@ impl LeIndex {
             // which requires re-annotating external dependencies.
             let manifest_dirty = self.check_manifest_stale();
             if !manifest_dirty {
-                // Also check if manifest content hashes changed (more precise than mtime)
+                // Also check if manifest content hashes changed (more precise than mtime).
+                // Use the OLD scan snapshot (before refresh overwrote the cache) as baseline.
                 let scan = self.get_project_scan(false)?;
-                let changed_manifests = self.detect_changed_manifests(&scan);
+                let changed_manifests = match &old_scan {
+                    Some(old) => {
+                        // Compare current manifests against the pre-refresh baseline
+                        let mut changed = Vec::new();
+                        for mp in &scan.manifest_paths {
+                            let key = mp.display().to_string();
+                            let new_hash = scan.manifest_hashes.get(&key);
+                            let old_hash = old.manifest_hashes.get(&key);
+                            if new_hash != old_hash {
+                                let path_str = key.to_lowercase();
+                                let skip = path_str.contains("node_modules")
+                                    || path_str.contains("/build/")
+                                    || path_str.contains("\\build\\")
+                                    || path_str.contains("/dist/")
+                                    || path_str.contains("\\dist\\")
+                                    || path_str.contains("/target/")
+                                    || path_str.contains(".cache");
+                                if !skip {
+                                    changed.push(mp.clone());
+                                }
+                            }
+                        }
+                        changed
+                    }
+                    None => self.detect_changed_manifests(&scan),
+                };
                 if changed_manifests.is_empty() {
                     info!("No changes detected, skipping indexing");
                     return Ok(self.stats.clone());
@@ -1641,6 +1670,7 @@ impl LeIndex {
     /// Given a set of changed manifests, find which source files import
     /// from packages defined in those manifests. Returns file paths that
     /// should be re-parsed to update external node annotations.
+    #[allow(dead_code)] // Used by manifest-aware incremental reindex
     fn files_importing_from_manifests(
         &self,
         changed_manifests: &[PathBuf],
@@ -1676,16 +1706,17 @@ impl LeIndex {
         let affected_set: HashSet<String> =
             affected.iter().map(|p| p.display().to_string()).collect();
 
+        // Convert source paths to a HashSet for O(1) lookups per PDG node.
+        let source_set: HashSet<String> =
+            all_source_paths.iter().map(|p| p.display().to_string()).collect();
+
         for nid in pdg.node_indices() {
             if let Some(node) = pdg.get_node(nid) {
                 if node.node_type == NodeType::External {
                     // External node's file_path is the importing file
                     if !affected_set.contains(&node.file_path) {
                         // Check if this file exists in source_paths
-                        if all_source_paths
-                            .iter()
-                            .any(|sp| sp.display().to_string() == node.file_path)
-                        {
+                        if source_set.contains(&node.file_path) {
                             affected.push(PathBuf::from(&node.file_path));
                         }
                     }
@@ -2133,6 +2164,16 @@ impl LeIndex {
         let mut corpus: Vec<(String, String)> = Vec::new();
         let mut raw_nodes: Vec<(_, String)> = Vec::new();
 
+        // Shared traversal config for computing caller/callee counts — allocated once.
+        let connectivity_config = crate::graph::pdg::TraversalConfig {
+            max_depth: Some(1),
+            max_nodes: Some(1000),
+            allowed_edge_types: Some(vec![EdgeType::Call, EdgeType::DataDependency]),
+            excluded_node_types: Some(vec![NodeType::External]),
+            min_complexity: None,
+            min_edge_confidence: 0.0,
+        };
+
         for node_idx in pdg.node_indices() {
             if let Some(node) = pdg.get_node(node_idx) {
                 // Get file content (cached per unique file path)
@@ -2167,23 +2208,10 @@ impl LeIndex {
                     node.language,
                 );
 
-                // Add connectivity context — how many callers/callees this symbol has
-                let callers = pdg.backward_impact(node_idx, &crate::graph::pdg::TraversalConfig {
-                    max_depth: Some(1),
-                    max_nodes: Some(1000),
-                    allowed_edge_types: Some(vec![EdgeType::Call, EdgeType::DataDependency]),
-                    excluded_node_types: Some(vec![NodeType::External]),
-                    min_complexity: None,
-                    min_edge_confidence: 0.0,
-                });
-                let callees = pdg.forward_impact(node_idx, &crate::graph::pdg::TraversalConfig {
-                    max_depth: Some(1),
-                    max_nodes: Some(1000),
-                    allowed_edge_types: Some(vec![EdgeType::Call, EdgeType::DataDependency]),
-                    excluded_node_types: Some(vec![NodeType::External]),
-                    min_complexity: None,
-                    min_edge_confidence: 0.0,
-                });
+                // Add connectivity context — how many callers/callees this symbol has.
+                // TraversalConfig is reused for all nodes (allocated once, outside loop).
+                let callers = pdg.backward_impact(node_idx, &connectivity_config);
+                let callees = pdg.forward_impact(node_idx, &connectivity_config);
                 enrichment.push_str(&format!(
                     " callers:{} callees:{} complexity:{}",
                     callers.len().min(50),

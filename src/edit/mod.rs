@@ -152,6 +152,12 @@ pub struct EditResult {
     /// Used internally to record undo history. `None` for single-file edits
     /// (which capture original_content in EditCommand::Edit directly).
     pub original_contents: Option<HashMap<String, String>>,
+
+    /// Map of file_path → content after the operation.
+    /// Used internally to record redo history. `None` for single-file edits.
+    /// Stores the exact post-rename content (result of `replace_near_definitions`)
+    /// so redo can restore the precise state without re-running replacement.
+    pub modified_contents: Option<HashMap<String, String>>,
 }
 
 /// Impact analysis for an edit
@@ -423,6 +429,7 @@ impl EditEngine {
                         success: false,
                         changes_applied: 0,
                         files_modified: vec![],
+                        modified_contents: None,
                         original_contents: None,
                         error: Some(e.to_string()),
                     });
@@ -447,6 +454,7 @@ impl EditEngine {
             success: true,
             changes_applied,
             files_modified,
+            modified_contents: None,
             original_contents: None,
             error: None,
         })
@@ -727,6 +735,7 @@ impl EditEngine {
                             success: false,
                             changes_applied: 0,
                             files_modified: vec![],
+                            modified_contents: None,
                             original_contents: None,
                             error: Some(format!("Failed to restore '{}': {}", file_path.display(), e)),
                         });
@@ -738,6 +747,7 @@ impl EditEngine {
                         success: false,
                         changes_applied: 0,
                         files_modified: vec![],
+                        modified_contents: None,
                         original_contents: None,
                         error: Some(format!("Cannot undo '{}': original content was not captured", file_path.display())),
                     });
@@ -746,12 +756,15 @@ impl EditEngine {
                     success: true,
                     changes_applied: 1,
                     files_modified: vec![file_path.clone()],
+                    modified_contents: None,
                     original_contents: None,
                     error: None,
                 })
             }
             Some(EditCommand::Rename { original_contents, .. }) => {
-                // Restore all files to their pre-rename state (best-effort)
+                // Restore all files to their pre-rename state (all-or-nothing).
+                // On partial failure, leave cursor in the undone state (don't revert
+                // to "renamed") so the user can retry or manually fix.
                 let mut restored = Vec::new();
                 let mut errors = Vec::new();
                 for (file_path, content) in original_contents {
@@ -761,19 +774,22 @@ impl EditEngine {
                     }
                 }
                 if !errors.is_empty() {
-                    history.redo(); // revert cursor on partial undo
+                    // Leave cursor in undone state — don't call history.redo().
+                    // The files are partially restored; the user needs to resolve manually.
                     return Ok(EditResult {
                         success: false,
                         changes_applied: restored.len(),
                         files_modified: restored,
+                        modified_contents: None,
                         original_contents: None,
-                        error: Some(format!("Partial undo: {}", errors.join("; "))),
+                        error: Some(format!("Partial undo (cursor left in undone state): {}", errors.join("; "))),
                     });
                 }
                 Ok(EditResult {
                     success: true,
                     changes_applied: restored.len(),
                     files_modified: restored,
+                    modified_contents: None,
                     original_contents: None,
                     error: None,
                 })
@@ -782,6 +798,7 @@ impl EditEngine {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                modified_contents: None,
                 original_contents: None,
                 error: Some("No edit to undo".to_string()),
             }),
@@ -796,24 +813,46 @@ impl EditEngine {
                 success: true,
                 changes_applied: 1,
                 files_modified: vec![file_path.clone()],
+                modified_contents: None,
                 original_contents: None,
                 error: None,
             }),
-            Some(EditCommand::Rename { new_name, old_name, original_contents, .. }) => {
-                // Re-apply the rename to all files
+            Some(EditCommand::Rename { modified_contents, original_contents, .. }) => {
+                // Re-apply the exact post-rename content for each file.
+                // Uses modified_contents (the precise result of replace_near_definitions)
+                // rather than re-running replace_whole_word which could corrupt
+                // comments, strings, or unrelated same-name tokens.
+                // All-or-nothing semantics: on any I/O failure, rollback to originals.
                 let mut re_applied = Vec::new();
-                for (file_path, _original) in original_contents {
-                    if let Ok(current) = std::fs::read_to_string(file_path) {
-                        let modified = replace_whole_word(&current, &old_name, &new_name);
-                        if let Ok(()) = std::fs::write(file_path, modified.as_bytes()) {
-                            re_applied.push(PathBuf::from(file_path));
-                        }
+                let mut failed = None;
+                for (file_path, post_rename_content) in modified_contents {
+                    match std::fs::write(&file_path, post_rename_content.as_bytes()) {
+                        Ok(()) => re_applied.push(PathBuf::from(file_path)),
+                        Err(e) => { failed = Some(e); break; }
                     }
                 }
+
+                if let Some(_) = failed {
+                    // Rollback: restore all successfully written files to their pre-redo state
+                    // (original_contents holds the pre-rename content, which is the undone state)
+                    for (fp, content) in original_contents {
+                        let _ = std::fs::write(&fp, content.as_bytes());
+                    }
+                    return Ok(EditResult {
+                        success: false,
+                        changes_applied: 0,
+                        files_modified: vec![],
+                        modified_contents: None,
+                        original_contents: None,
+                        error: Some("Redo failed: I/O error during rename re-application, rolled back".to_string()),
+                    });
+                }
+
                 Ok(EditResult {
                     success: true,
                     changes_applied: re_applied.len(),
                     files_modified: re_applied,
+                    modified_contents: None,
                     original_contents: None,
                     error: None,
                 })
@@ -822,6 +861,7 @@ impl EditEngine {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                modified_contents: None,
                 original_contents: None,
                 error: Some("No edit to redo".to_string()),
             }),
@@ -843,6 +883,7 @@ impl EditEngine {
                 success: true,
                 changes_applied: 1,
                 files_modified: vec![],
+                modified_contents: None,
                 original_contents: None,
                 error: None,
             }),
@@ -850,6 +891,7 @@ impl EditEngine {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                modified_contents: None,
                 original_contents: None,
                 error: Some(format!("Rollback point '{}' not found", name)),
             }),
@@ -1281,7 +1323,8 @@ pub enum EditCommand {
     },
 
     /// Multi-file rename operation with full rollback support.
-    /// Original contents of all modified files are captured for atomic undo.
+    /// Original and modified contents of all files are captured for precise
+    /// undo (restore originals) and redo (restore modifieds).
     Rename {
         /// Project identifier
         project_id: UniqueProjectId,
@@ -1297,6 +1340,12 @@ pub enum EditCommand {
 
         /// Map of file path → original content before rename (for undo)
         original_contents: HashMap<String, String>,
+
+        /// Map of file path → content after rename (for redo).
+        /// Stored as the exact post-rename content so redo restores the precise
+        /// result of `replace_near_definitions` rather than re-running
+        /// `replace_whole_word` which could corrupt comments/strings.
+        modified_contents: HashMap<String, String>,
     },
 
     /// Rollback point
@@ -1363,6 +1412,7 @@ impl Refactor {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                modified_contents: None,
                 original_contents: None,
                 error: Some("old_name and new_name must be non-empty".to_string()),
             });
@@ -1372,6 +1422,7 @@ impl Refactor {
                 success: true,
                 changes_applied: 0,
                 files_modified: vec![],
+                modified_contents: None,
                 original_contents: None,
                 error: None,
             });
@@ -1390,7 +1441,7 @@ impl Refactor {
 
         // Record in edit history for undo support.
         if result.success {
-            if let Some(ref originals) = result.original_contents {
+            if let (Some(ref originals), Some(ref modifieds)) = (&result.original_contents, &result.modified_contents) {
                 let mut history = engine.history.lock().await;
                 history.record_command(EditCommand::Rename {
                     project_id: UniqueProjectId::new("_rename".to_string(), "".to_string(), 0),
@@ -1398,6 +1449,7 @@ impl Refactor {
                     new_name: new_name.to_owned(),
                     timestamp: chrono::Utc::now(),
                     original_contents: originals.clone(),
+                    modified_contents: modifieds.clone(),
                 });
             }
         }
@@ -1500,6 +1552,7 @@ impl Refactor {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                modified_contents: None,
                 original_contents: None,
                 error: Some(format!(
                     "Symbol '{}' was not found in project sources",
@@ -1524,7 +1577,7 @@ impl Refactor {
         sorted_files.sort();
 
         let mut total_changes = 0usize;
-        let mut modified_files: Vec<(PathBuf, String)> = Vec::new(); // (path, original)
+        let mut modified_files: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, modified)
         let mut errors = Vec::new();
 
         // Phase 1: collect all modifications (no writes yet)
@@ -1596,6 +1649,7 @@ impl Refactor {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                modified_contents: None,
                 original_contents: None,
                 error: Some(errors.join("; ")),
             });
@@ -1606,7 +1660,7 @@ impl Refactor {
             match std::fs::write(file_path, modified.as_bytes()) {
                 Ok(()) => {
                     total_changes += 1;
-                    modified_files.push((file_path.clone(), original_content.clone()));
+                    modified_files.push((file_path.clone(), original_content.clone(), modified.clone()));
                 }
                 Err(e) => {
                     errors.push(format!("Failed to write '{}': {}", file_path.display(), e));
@@ -1619,7 +1673,7 @@ impl Refactor {
                         );
                     }
                     // Rollback all previously written files
-                    for (prev_path, prev_original) in &modified_files {
+                    for (prev_path, prev_original, _prev_modified) in &modified_files {
                         if let Err(restore_err) = std::fs::write(prev_path, prev_original.as_bytes()) {
                             tracing::error!(
                                 "CRITICAL: Failed to restore '{}' during rollback: {}",
@@ -1639,6 +1693,7 @@ impl Refactor {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                modified_contents: None,
                 original_contents: None,
                 error: Some(errors.join("; ")),
             });
@@ -1647,9 +1702,12 @@ impl Refactor {
         Ok(EditResult {
             success: errors.is_empty(),
             changes_applied: total_changes,
-            files_modified: modified_files.iter().map(|(p, _)| p.clone()).collect(),
+            files_modified: modified_files.iter().map(|(p, _, _)| p.clone()).collect(),
+            modified_contents: Some(
+                modified_files.iter().map(|(p, _, modified)| (p.display().to_string(), modified.clone())).collect()
+            ),
             original_contents: Some(
-                modified_files.into_iter().map(|(p, orig)| (p.display().to_string(), orig)).collect()
+                modified_files.into_iter().map(|(p, orig, _)| (p.display().to_string(), orig)).collect()
             ),
             error: match (errors.is_empty(), &truncation_warning) {
                 (true, None) => None,
@@ -1677,6 +1735,7 @@ impl Refactor {
             success: true,
             changes_applied: 1,
             files_modified: vec![],
+            modified_contents: None,
             original_contents: None,
             error: None,
         })
@@ -1699,6 +1758,7 @@ impl Refactor {
             success: true,
             changes_applied: 1,
             files_modified: vec![],
+            modified_contents: None,
             original_contents: None,
             error: None,
         })
@@ -2136,6 +2196,7 @@ mod tests {
             success: false,
             changes_applied: 0,
             files_modified: vec![],
+            modified_contents: None,
             original_contents: None,
             error: None,
         };
@@ -2152,6 +2213,7 @@ mod tests {
             success: true,
             changes_applied: 5,
             files_modified: vec![PathBuf::from("test.py")],
+            modified_contents: None,
             original_contents: None,
             error: None,
         };
@@ -2354,6 +2416,7 @@ mod tests {
             success: true,
             changes_applied: 1,
             files_modified: vec![PathBuf::from("test.py")],
+            modified_contents: None,
             original_contents: None,
             error: None,
         };

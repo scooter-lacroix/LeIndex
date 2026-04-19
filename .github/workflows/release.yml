@@ -299,8 +299,8 @@ jobs:
       - name: Publish to npm
         if: steps.check_token.outputs.available == 'true'
         run: |
-          PKG_NAME=$(node -p "require('./packages/npm-leindex-mcp/package.json').name")
-          PKG_VER=$(node -p "require('./packages/npm-leindex-mcp/package.json').version")
+          PKG_NAME=$(node -p "require('./package.json').name")
+          PKG_VER=$(node -p "require('./package.json').version")
           if npm view "${PKG_NAME}@${PKG_VER}" version 2>/dev/null | grep -q "${PKG_VER}"; then
             echo "Version ${PKG_VER} already published to npm — skipping"
           else

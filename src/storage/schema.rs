@@ -404,7 +404,7 @@ CREATE TABLE IF NOT EXISTS project_metadata (
         )?;
 
         // Read current version
-        let _current: u32 = self
+        let current: u32 = self
             .conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_version WHERE key = 'schema'",
@@ -412,6 +412,15 @@ CREATE TABLE IF NOT EXISTS project_metadata (
                 |row| row.get(0),
             )
             .unwrap_or(0);
+
+        // Reject databases from newer versions — they may contain data
+        // this version cannot interpret.
+        if current > Self::SCHEMA_VERSION {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "Database schema v{} is newer than this version (v{}). Please upgrade LeIndex.",
+                current, Self::SCHEMA_VERSION
+            )));
+        }
 
         // Add future migrations here:
         // if current < 2 { self.migrate_v1_to_v2()?; }
