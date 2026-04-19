@@ -1065,9 +1065,11 @@ impl LeIndex {
             }
 
             if entry.file_type().is_dir() {
-                if SKIP_DIRS.contains(&file_name.as_ref())
-                    || project_config.should_exclude(path)
-                {
+                // Only hard-skip universally-ignored directories.
+                // Project-excluded dirs are NOT skipped here so that the
+                // file-level branch below can still collect lockfiles/manifests
+                // that live inside excluded paths.
+                if SKIP_DIRS.contains(&file_name.as_ref()) {
                     walker.skip_current_dir();
                 }
                 continue;
@@ -1172,13 +1174,19 @@ impl LeIndex {
         format!("{}:{}", self.project_id, &hash[..12])
     }
 
-    fn search_cache_key_for(&self, query: &str, top_k: usize) -> String {
+    fn search_cache_key_for(
+        &self,
+        query: &str,
+        top_k: usize,
+        query_type: Option<&crate::search::ranking::QueryType>,
+    ) -> String {
         search_cache_key(&format!(
-            "query:{}:{}:{}:{}",
+            "query:{}:{}:{}:{}:{:?}",
             self.stable_project_cache_id(),
             self.index_fingerprint(),
             top_k,
-            query.trim().to_lowercase()
+            query.trim().to_lowercase(),
+            query_type,
         ))
     }
 
@@ -1222,7 +1230,7 @@ impl LeIndex {
             return Ok(Vec::new());
         }
 
-        let search_cache_key = self.search_cache_key_for(query, top_k);
+        let search_cache_key = self.search_cache_key_for(query, top_k, query_type.as_ref());
         if let Some(CacheEntry::Binary {
             serialized_data, ..
         }) = self
@@ -1801,6 +1809,7 @@ impl LeIndex {
 
         let missing: Vec<String> = source_set.difference(&indexed_set).cloned().collect();
         let orphaned: Vec<String> = indexed_set.difference(&source_set).cloned().collect();
+        let indexed_present = indexed_set.intersection(&source_set).count();
 
         Ok(CoverageReport {
             total_source_files: source_files.len(),
@@ -1810,7 +1819,7 @@ impl LeIndex {
             coverage_pct: if source_files.is_empty() {
                 100.0
             } else {
-                (indexed_files.len() as f64 / source_files.len() as f64) * 100.0
+                (indexed_present as f64 / source_files.len() as f64) * 100.0
             },
         })
     }

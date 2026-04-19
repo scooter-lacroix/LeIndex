@@ -385,8 +385,14 @@ impl EditEngine {
             )
             .await?;
 
-        // Capture original content for undo
-        let original_content = std::fs::read_to_string(&request.file_path).ok();
+        // Capture original content for undo — fail fast if pre-image unreadable
+        let original_content = Some(std::fs::read_to_string(&request.file_path).map_err(|e| {
+            EditError::Generic(format!(
+                "Failed to capture original content for '{}': {}",
+                request.file_path.display(),
+                e
+            ))
+        })?);
 
         // Apply changes in worktree
         let mut changes_applied = 0;

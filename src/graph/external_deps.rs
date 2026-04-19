@@ -107,11 +107,11 @@ impl ExternalDependencyRegistry {
     /// Build the registry from an already-discovered manifest list.
     /// Build a dependency registry from manifest/lockfile paths.
     ///
-    /// TODO: In monorepos, `by_name` is keyed only by dependency name, so the same
-    /// package from different workspaces overwrites earlier entries. For multi-package
-    /// repos, entries should be scoped by manifest path to avoid version/source conflicts.
+    /// In monorepos, manifests are grouped by workspace directory before merging,
+    /// so lockfile versions from one workspace don't overwrite entries from another.
+    /// The final merge still uses last-wins across workspaces, but each workspace's
+    /// lockfile entries take precedence over that workspace's manifest entries.
     pub fn from_manifest_paths(root: &Path, manifest_paths: &[PathBuf]) -> Self {
-        let mut registry = Self::new();
         // Sort so lockfiles (priority 1) are parsed AFTER manifests (priority 0),
         // ensuring lockfile versions overwrite the looser manifest-derived ranges.
         let mut sorted_paths = manifest_paths.to_vec();
@@ -120,36 +120,56 @@ impl ExternalDependencyRegistry {
             let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
             source_priority(a_name).cmp(&source_priority(b_name))
         });
+
+        // Group manifests by their parent directory (workspace root).
+        // Within each workspace, parse with local priority ordering, then merge
+        // all workspaces into a single registry.
+        let mut workspaces: std::collections::BTreeMap<PathBuf, Vec<PathBuf>> = std::collections::BTreeMap::new();
         for manifest_path in &sorted_paths {
             let path = if manifest_path.is_absolute() {
                 manifest_path.clone()
             } else {
                 root.join(manifest_path)
             };
-            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                continue;
-            };
+            let ws_root = path.parent().unwrap_or(root).to_path_buf();
+            workspaces.entry(ws_root).or_default().push(path);
+        }
 
-            match file_name {
-                "Cargo.lock" => registry.parse_cargo_lock(&content),
-                "Cargo.toml" => registry.parse_cargo_toml(&content),
-                "package-lock.json" | "npm-shrinkwrap.json" => registry.parse_package_lock_json(&content),
-                "package.json" => registry.parse_package_json(&content),
-                "yarn.lock" => registry.parse_yarn_lock(&content),
-                "pnpm-lock.yaml" => registry.parse_pnpm_lock(&content),
-                "requirements.txt" => registry.parse_requirements_txt(&content),
-                "Pipfile.lock" => registry.parse_pipfile_lock(&content),
-                "pyproject.toml" => registry.parse_pyproject_toml(&content),
-                "poetry.lock" => registry.parse_poetry_lock(&content),
-                "go.mod" => registry.parse_go_mod(&content),
-                "go.sum" => registry.parse_go_sum(&content),
-                "Gemfile.lock" => registry.parse_gemfile_lock(&content),
-                "composer.lock" => registry.parse_composer_lock(&content),
-                _ => {}
+        let mut registry = Self::new();
+        for (_ws_root, paths) in workspaces {
+            // Parse each workspace's manifests into a local registry,
+            // then merge into the global one.
+            let mut local = Self::new();
+            for path in &paths {
+                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                let Ok(content) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+
+                match file_name {
+                    "Cargo.lock" => local.parse_cargo_lock(&content),
+                    "Cargo.toml" => local.parse_cargo_toml(&content),
+                    "package-lock.json" | "npm-shrinkwrap.json" => local.parse_package_lock_json(&content),
+                    "package.json" => local.parse_package_json(&content),
+                    "yarn.lock" => local.parse_yarn_lock(&content),
+                    "pnpm-lock.yaml" => local.parse_pnpm_lock(&content),
+                    "requirements.txt" => local.parse_requirements_txt(&content),
+                    "Pipfile.lock" => local.parse_pipfile_lock(&content),
+                    "pyproject.toml" => local.parse_pyproject_toml(&content),
+                    "poetry.lock" => local.parse_poetry_lock(&content),
+                    "go.mod" => local.parse_go_mod(&content),
+                    "go.sum" => local.parse_go_sum(&content),
+                    "Gemfile.lock" => local.parse_gemfile_lock(&content),
+                    "composer.lock" => local.parse_composer_lock(&content),
+                    _ => {}
+                }
             }
+            // Merge local workspace into the global registry.
+            // Each workspace's lockfile entries override earlier entries for
+            // the same package name, which is correct within-workspace.
+            registry.merge(local);
         }
 
         registry
@@ -168,6 +188,18 @@ impl ExternalDependencyRegistry {
     /// List all known dependencies.
     pub fn all_dependencies(&self) -> Vec<&ExternalDependency> {
         self.by_name.values().collect()
+    }
+
+    /// Merge another registry into this one. Entries from `other` overwrite
+    /// entries with the same key in `self`, preserving lockfile-derived entries
+    /// over manifest-derived ranges within each workspace.
+    pub fn merge(&mut self, other: ExternalDependencyRegistry) {
+        for (name, dep) in other.by_name {
+            self.by_name.insert(name, dep);
+        }
+        for (prefix, canonical) in other.prefix_map {
+            self.prefix_map.insert(prefix, canonical);
+        }
     }
 
     /// Resolve an import path to a known external dependency.

@@ -2111,7 +2111,7 @@ impl GrepSymbolsHandler {
                 },
                 "type_filter": {
                     "type": "string",
-                    "enum": ["function", "class", "method", "variable", "module", "all"],
+                    "enum": ["function", "class", "method", "variable", "module", "external", "all"],
                     "description": "Filter by symbol type (default: all)",
                     "default": "all"
                 },
@@ -2184,15 +2184,15 @@ impl GrepSymbolsHandler {
         let scope = resolve_scope(&args, index.project_path())?;
 
         // Use indexed search to pre-filter candidates (avoids full O(N) PDG scans).
-        let candidate_limit = (max_results + offset).saturating_mul(5).max(50);
-        let candidate_results = index
+        let mut candidate_limit = (max_results + offset).saturating_mul(5).max(50);
+        let mut candidate_results = index
             .search(&pattern, candidate_limit, None)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
         index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
-        let pdg = index.pdg().ok_or_else(|| {
-            JsonRpcError::project_not_indexed(index.project_path().display().to_string())
-        })?;
+        if index.pdg().is_none() {
+            return Err(JsonRpcError::project_not_indexed(index.project_path().display().to_string()));
+        }
 
         let pattern_lower = pattern.to_lowercase();
         let char_budget = token_budget * 4;
@@ -2207,41 +2207,55 @@ impl GrepSymbolsHandler {
 
         // Semantic mode: return results directly from the search engine, ranked by
         // cosine similarity. No text matching — finds conceptually related symbols.
+        // Includes retry with expanded window when scope/type filters eliminate all results.
         if mode == "semantic" {
-            for result in &candidate_results {
-                if all_matches.len() >= fetch_limit {
-                    break;
-                }
-                // Look up PDG node for enrichment
-                let nid = match pdg.find_by_id(&result.node_id) {
-                    Some(id) => id,
-                    None => continue,
-                };
-                let node = match pdg.get_node(nid) {
-                    Some(n) => n,
-                    None => continue,
-                };
+            'semantic_retry: for _attempt in 0..2 {
+                all_matches.clear();
+                seen_ids.clear();
+                seen_locations.clear();
 
-                // Apply scope and type filters (separator-aware)
-                if let Some(ref s) = scope {
-                    let scope_base = s.trim_end_matches(std::path::MAIN_SEPARATOR);
-                    if !(node.file_path.starts_with(&format!("{}{}", scope_base, std::path::MAIN_SEPARATOR)) || node.file_path == scope_base) {
+                // (Re-)load PDG for this iteration
+                index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+
+                for result in &candidate_results {
+                    if all_matches.len() >= fetch_limit {
+                        break;
+                    }
+                    // Look up PDG node for enrichment
+                    let nid = match index.pdg().and_then(|pdg| pdg.find_by_id(&result.node_id)) {
+                        Some(id) => id,
+                        None => continue,
+                    };
+                    let node = match index.pdg().and_then(|pdg| pdg.get_node(nid).cloned()) {
+                        Some(n) => n,
+                        None => continue,
+                    };
+
+                    // Apply scope and type filters (separator-aware)
+                    if let Some(ref s) = scope {
+                        let scope_base = s.trim_end_matches(std::path::MAIN_SEPARATOR);
+                        if !(node.file_path.starts_with(&format!("{}{}", scope_base, std::path::MAIN_SEPARATOR)) || node.file_path == scope_base) {
+                            continue;
+                        }
+                    }
+                    if type_filter != "all" && node_type_str(&node.node_type) != type_filter {
                         continue;
                     }
-                }
-                if type_filter != "all" && node_type_str(&node.node_type) != type_filter {
-                    continue;
-                }
 
-                // Skip external/phantom nodes (same filter as exact mode)
-                if matches!(node.node_type, crate::graph::pdg::NodeType::External) && node.byte_range == (0, 0) {
-                    continue;
-                }
+                    // Skip ALL external/import nodes — they are not user-defined symbols
+                    if matches!(node.node_type, crate::graph::pdg::NodeType::External) {
+                        continue;
+                    }
 
-                let caller_ids = get_direct_callers(pdg, nid);
-                let callers: Vec<String> = caller_ids.iter().take(50).filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone())).collect();
-                let callee_ids = pdg.neighbors(nid);
-                let callees: Vec<String> = callee_ids.iter().take(50).filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone())).collect();
+                let (caller_ids, callers, callees) = if let Some(pdg) = index.pdg() {
+                    let caller_ids = get_direct_callers(pdg, nid);
+                    let callers: Vec<String> = caller_ids.iter().take(50).filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone())).collect();
+                    let callee_ids = pdg.neighbors(nid);
+                    let callees: Vec<String> = callee_ids.iter().take(50).filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone())).collect();
+                    (caller_ids, callers, callees)
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new())
+                };
 
                 let mut entry = serde_json::json!({
                     "name": node.name,
@@ -2250,7 +2264,7 @@ impl GrepSymbolsHandler {
                     "byte_range": node.byte_range,
                     "complexity": node.complexity,
                     "caller_count": caller_ids.len(),
-                    "dependency_count": callee_ids.len(),
+                    "dependency_count": callees.len(),
                     "callers": callers,
                     "callees": callees,
                     "language": node.language,
@@ -2282,36 +2296,51 @@ impl GrepSymbolsHandler {
                 all_matches.push(entry);
             }
 
-            // Paginate and format with char_budget truncation
-            let total_matches = all_matches.len();
-            let paginated: Vec<Value> = all_matches.into_iter().skip(offset).take(max_results).collect();
-
-            // Enforce token_budget — same truncation as exact mode
-            let mut truncated_results: Vec<Value> = Vec::new();
-            let mut used_chars: usize = 0;
-            for entry in paginated {
-                let entry_chars = entry.to_string().len();
-                if used_chars + entry_chars > char_budget {
-                    break;
+            // Retry with expanded window if scope/type eliminated everything.
+            if all_matches.is_empty() && !candidate_results.is_empty() {
+                let expanded = (candidate_limit * 10).min(1000);
+                if expanded > candidate_limit {
+                    candidate_limit = expanded;
+                    candidate_results = index
+                        .search(&pattern, candidate_limit, None)
+                        .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
+                    continue 'semantic_retry;
                 }
-                used_chars += entry_chars;
-                truncated_results.push(entry);
             }
-            let shown = truncated_results.len();
-
-            let mut response = serde_json::json!({
-                "results": truncated_results,
-                "total_matches": total_matches,
-                "shown": shown,
-                "offset": offset,
-                "mode": "semantic",
-                "truncated": total_matches.saturating_sub(offset).min(max_results) > shown,
-            });
-            response = wrap_with_meta(response, &index);
-            return Ok(response);
+            break 'semantic_retry;
         }
 
+        // Paginate and format with char_budget truncation
+        let total_matches = all_matches.len();
+        let paginated: Vec<Value> = all_matches.into_iter().skip(offset).take(max_results).collect();
+
+        // Enforce token_budget — same truncation as exact mode
+        let mut truncated_results: Vec<Value> = Vec::new();
+        let mut used_chars: usize = 0;
+        for entry in paginated {
+            let entry_chars = entry.to_string().len();
+            if used_chars + entry_chars > char_budget {
+                break;
+            }
+            used_chars += entry_chars;
+            truncated_results.push(entry);
+        }
+        let shown = truncated_results.len();
+
+        let mut response = serde_json::json!({
+            "results": truncated_results,
+            "total_matches": total_matches,
+            "shown": shown,
+            "offset": offset,
+            "mode": "semantic",
+            "truncated": total_matches.saturating_sub(offset).min(max_results) > shown,
+        });
+        response = wrap_with_meta(response, &index);
+        return Ok(response);
+    }
+
         // Exact mode: current behavior — text matching with semantic pre-filter
+        let pdg = index.pdg().unwrap(); // checked above
 
         for sr in candidate_results {
             if all_matches.len() >= fetch_limit {
@@ -2326,8 +2355,8 @@ impl GrepSymbolsHandler {
                 None => continue,
             };
 
-            // Skip phantom external-reference nodes (no source location)
-            if matches!(node.node_type, crate::graph::pdg::NodeType::External) && node.byte_range == (0, 0) {
+            // Skip ALL external/import nodes — they are not user-defined symbols
+            if matches!(node.node_type, crate::graph::pdg::NodeType::External) {
                 continue;
             }
 
@@ -2435,8 +2464,8 @@ impl GrepSymbolsHandler {
                     continue;
                 };
 
-                // Skip phantom external-reference nodes (no source location)
-                if matches!(node.node_type, crate::graph::pdg::NodeType::External) && node.byte_range == (0, 0) {
+                // Skip ALL external/import nodes — they are not user-defined symbols
+                if matches!(node.node_type, crate::graph::pdg::NodeType::External) {
                     continue;
                 }
 
@@ -3668,6 +3697,10 @@ Grep + multi-file Edit with a single atomic operation."
             })
             .collect();
 
+        // Release the mutex before spawning blocking I/O.
+        // All PDG data has been extracted into filtered_files above.
+        drop(index);
+
         // Generate per-file diffs (file I/O — offload to blocking thread)
         let (diffs, files_to_modify) = tokio::task::spawn_blocking({
             let filtered_files = filtered_files;
@@ -3716,15 +3749,19 @@ Grep + multi-file Edit with a single atomic operation."
             .map_err(JsonRpcError::internal_error)?;
         }
 
+        let response_data = serde_json::json!({
+            "old_name": old_name,
+            "new_name": new_name,
+            "files_affected": files_to_modify.len(),
+            "preview_only": preview_only,
+            "diffs": diffs,
+            "applied": !preview_only
+        });
+
+        // Re-acquire the lock for wrap_with_meta (released before spawn_blocking)
+        let index = handle.lock().await;
         Ok(wrap_with_meta(
-            serde_json::json!({
-                "old_name": old_name,
-                "new_name": new_name,
-                "files_affected": files_to_modify.len(),
-                "preview_only": preview_only,
-                "diffs": diffs,
-                "applied": !preview_only
-            }),
+            response_data,
             &index,
         ))
     }
@@ -4330,10 +4367,12 @@ Works for any text file including configs and docs."
             .collect();
         let content_str = visible_lines.join("\n");
 
-        // Detect language from extension
-        let language = Path::new(&file_path)
+        // Detect language from extension (case-insensitive)
+        let ext_lower = Path::new(&file_path)
             .extension()
             .and_then(|e| e.to_str())
+            .map(|ext| ext.to_ascii_lowercase());
+        let language = ext_lower.as_deref()
             .map(|ext| match ext {
                 "rs" => "rust",
                 "py" => "python",

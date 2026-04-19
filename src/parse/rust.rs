@@ -717,8 +717,9 @@ fn calculate_complexity(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        // Skip nested function_item nodes — their complexity belongs to themselves
-        if child.kind() == "function_item" {
+        // Skip nested function_item nodes that appear inside a block (function body).
+        // Top-level function_items (children of source_file) are always traversed.
+        if child.kind() == "function_item" && node.kind() == "block" {
             continue;
         }
         calculate_complexity(&child, metrics, depth + 1);

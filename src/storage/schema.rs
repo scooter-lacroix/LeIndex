@@ -404,7 +404,7 @@ CREATE TABLE IF NOT EXISTS project_metadata (
         )?;
 
         // Read current version
-        let current: u32 = self
+        let _current: u32 = self
             .conn
             .query_row(
                 "SELECT COALESCE(MAX(version), 0) FROM schema_version WHERE key = 'schema'",

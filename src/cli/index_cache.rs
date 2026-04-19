@@ -1,7 +1,7 @@
 // Index Cache — cache subsystem extracted from LeIndex
 
 use crate::cli::memory::{
-    analysis_cache_key, pdg_cache_key, project_scan_cache_key, search_cache_key, CacheEntry,
+    pdg_cache_key, project_scan_cache_key, search_cache_key, CacheEntry,
     CacheSpiller, MemoryConfig, WarmStrategy,
 };
 use crate::graph::pdg::ProgramDependenceGraph;
@@ -182,12 +182,12 @@ impl IndexCache {
         project_id: &str,
         pdg: &mut Option<ProgramDependenceGraph>,
     ) -> Result<()> {
-        let taken_pdg = pdg
-            .take()
+        let pdg_ref = pdg
+            .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No PDG in memory to spill"))?;
 
-        let node_count = taken_pdg.node_count();
-        let edge_count = taken_pdg.edge_count();
+        let node_count = pdg_ref.node_count();
+        let edge_count = pdg_ref.edge_count();
 
         let cache_key = pdg_cache_key(project_id);
         let entry = CacheEntry::PDG {
@@ -197,10 +197,14 @@ impl IndexCache {
             serialized_data: vec![],
         };
 
+        // Insert the spill marker *before* taking the PDG so a failed insert
+        // does not discard the in-memory graph.
         self.cache_spiller
             .store_mut()
             .insert(cache_key, entry)
             .context("Failed to create PDG spill marker")?;
+
+        pdg.take();
 
         info!(
             "Spilled PDG from memory: {} nodes, {} edges (persisted to lestockage)",

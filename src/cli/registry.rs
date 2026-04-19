@@ -172,13 +172,11 @@ impl ProjectRegistry {
 
         if needs_index {
             let _ = self.index_handle(&handle, false).await?;
-            // Invalidate stale cache after reindex
-            self.stale_cache.write().await.remove(&canonical);
+            // stale_cache is invalidated inside index_handle() after successful swap
         } else if needs_refresh {
             let _ = self.index_handle(&handle, false).await?;
             debug!("Auto-refreshed stale index");
-            // Invalidate stale cache after reindex
-            self.stale_cache.write().await.remove(&canonical);
+            // stale_cache is invalidated inside index_handle() after successful swap
         }
 
         Ok(handle)
@@ -386,6 +384,11 @@ impl ProjectRegistry {
             let mut idx = handle.lock().await;
             *idx = fresh;
         }
+
+        // Invalidate stale-cache entry so get_or_create() won't reuse
+        // the pre-indexing staleness result.
+        let canonical = project_path.canonicalize().unwrap_or_else(|_| project_path.clone());
+        self.stale_cache.write().await.remove(&canonical);
 
         Ok(stats)
     }
