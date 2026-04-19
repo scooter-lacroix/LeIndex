@@ -147,6 +147,11 @@ pub struct EditResult {
 
     /// Error message if failed
     pub error: Option<String>,
+
+    /// Map of file_path → original content before the operation.
+    /// Used internally to record undo history. `None` for single-file edits
+    /// (which capture original_content in EditCommand::Edit directly).
+    pub original_contents: Option<HashMap<String, String>>,
 }
 
 /// Impact analysis for an edit
@@ -418,6 +423,7 @@ impl EditEngine {
                         success: false,
                         changes_applied: 0,
                         files_modified: vec![],
+                        original_contents: None,
                         error: Some(e.to_string()),
                     });
                 }
@@ -441,6 +447,7 @@ impl EditEngine {
             success: true,
             changes_applied,
             files_modified,
+            original_contents: None,
             error: None,
         })
     }
@@ -720,6 +727,7 @@ impl EditEngine {
                             success: false,
                             changes_applied: 0,
                             files_modified: vec![],
+                            original_contents: None,
                             error: Some(format!("Failed to restore '{}': {}", file_path.display(), e)),
                         });
                     }
@@ -730,6 +738,7 @@ impl EditEngine {
                         success: false,
                         changes_applied: 0,
                         files_modified: vec![],
+                        original_contents: None,
                         error: Some(format!("Cannot undo '{}': original content was not captured", file_path.display())),
                     });
                 }
@@ -737,13 +746,43 @@ impl EditEngine {
                     success: true,
                     changes_applied: 1,
                     files_modified: vec![file_path.clone()],
+                    original_contents: None,
                     error: None,
                 })
             }
-            Some(_) | None => Ok(EditResult {
+            Some(EditCommand::Rename { original_contents, .. }) => {
+                // Restore all files to their pre-rename state (best-effort)
+                let mut restored = Vec::new();
+                let mut errors = Vec::new();
+                for (file_path, content) in original_contents {
+                    match std::fs::write(&file_path, content.as_bytes()) {
+                        Ok(()) => restored.push(PathBuf::from(file_path)),
+                        Err(e) => errors.push(format!("Failed to restore '{}': {}", file_path, e)),
+                    }
+                }
+                if !errors.is_empty() {
+                    history.redo(); // revert cursor on partial undo
+                    return Ok(EditResult {
+                        success: false,
+                        changes_applied: restored.len(),
+                        files_modified: restored,
+                        original_contents: None,
+                        error: Some(format!("Partial undo: {}", errors.join("; "))),
+                    });
+                }
+                Ok(EditResult {
+                    success: true,
+                    changes_applied: restored.len(),
+                    files_modified: restored,
+                    original_contents: None,
+                    error: None,
+                })
+            }
+            Some(EditCommand::RollbackPoint { .. }) | None => Ok(EditResult {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                original_contents: None,
                 error: Some("No edit to undo".to_string()),
             }),
         }
@@ -757,12 +796,33 @@ impl EditEngine {
                 success: true,
                 changes_applied: 1,
                 files_modified: vec![file_path.clone()],
+                original_contents: None,
                 error: None,
             }),
+            Some(EditCommand::Rename { new_name, old_name, original_contents, .. }) => {
+                // Re-apply the rename to all files
+                let mut re_applied = Vec::new();
+                for (file_path, _original) in original_contents {
+                    if let Ok(current) = std::fs::read_to_string(file_path) {
+                        let modified = replace_whole_word(&current, &old_name, &new_name);
+                        if let Ok(()) = std::fs::write(file_path, modified.as_bytes()) {
+                            re_applied.push(PathBuf::from(file_path));
+                        }
+                    }
+                }
+                Ok(EditResult {
+                    success: true,
+                    changes_applied: re_applied.len(),
+                    files_modified: re_applied,
+                    original_contents: None,
+                    error: None,
+                })
+            }
             Some(_) | None => Ok(EditResult {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                original_contents: None,
                 error: Some("No edit to redo".to_string()),
             }),
         }
@@ -783,12 +843,14 @@ impl EditEngine {
                 success: true,
                 changes_applied: 1,
                 files_modified: vec![],
+                original_contents: None,
                 error: None,
             }),
             None => Ok(EditResult {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                original_contents: None,
                 error: Some(format!("Rollback point '{}' not found", name)),
             }),
         }
@@ -1218,6 +1280,25 @@ pub enum EditCommand {
             original_content: Option<String>,
     },
 
+    /// Multi-file rename operation with full rollback support.
+    /// Original contents of all modified files are captured for atomic undo.
+    Rename {
+        /// Project identifier
+        project_id: UniqueProjectId,
+
+        /// Old symbol name
+        old_name: String,
+
+        /// New symbol name
+        new_name: String,
+
+        /// Timestamp of the rename operation
+        timestamp: chrono::DateTime<chrono::Utc>,
+
+        /// Map of file path → original content before rename (for undo)
+        original_contents: HashMap<String, String>,
+    },
+
     /// Rollback point
     RollbackPoint {
         /// Name of the rollback point
@@ -1282,6 +1363,7 @@ impl Refactor {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                original_contents: None,
                 error: Some("old_name and new_name must be non-empty".to_string()),
             });
         }
@@ -1290,20 +1372,37 @@ impl Refactor {
                 success: true,
                 changes_applied: 0,
                 files_modified: vec![],
+                original_contents: None,
                 error: None,
             });
         }
 
         // Clone Arc and strings for the blocking closure
         let pdg = Arc::clone(&engine.pdg);
-        let old_name = old_name.to_owned();
-        let new_name = new_name.to_owned();
+        let old_name_c = old_name.to_owned();
+        let new_name_c = new_name.to_owned();
 
-        tokio::task::spawn_blocking(move || {
-            Self::rename_symbol_blocking(&pdg, &old_name, &new_name)
+        let result = tokio::task::spawn_blocking(move || {
+            Self::rename_symbol_blocking(&pdg, &old_name_c, &new_name_c)
         })
         .await
-        .map_err(|e| EditError::WorktreeError(format!("Rename task panicked: {}", e)))?
+        .map_err(|e| EditError::WorktreeError(format!("Rename task panicked: {}", e)))??;
+
+        // Record in edit history for undo support.
+        if result.success {
+            if let Some(ref originals) = result.original_contents {
+                let mut history = engine.history.lock().await;
+                history.record_command(EditCommand::Rename {
+                    project_id: UniqueProjectId::new("_rename".to_string(), "".to_string(), 0),
+                    old_name: old_name.to_owned(),
+                    new_name: new_name.to_owned(),
+                    timestamp: chrono::Utc::now(),
+                    original_contents: originals.clone(),
+                });
+            }
+        }
+
+        Ok(result)
     }
 
     /// Synchronous rename implementation — runs on blocking thread pool.
@@ -1401,6 +1500,7 @@ impl Refactor {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                original_contents: None,
                 error: Some(format!(
                     "Symbol '{}' was not found in project sources",
                     old_name
@@ -1496,6 +1596,7 @@ impl Refactor {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                original_contents: None,
                 error: Some(errors.join("; ")),
             });
         }
@@ -1538,6 +1639,7 @@ impl Refactor {
                 success: false,
                 changes_applied: 0,
                 files_modified: vec![],
+                original_contents: None,
                 error: Some(errors.join("; ")),
             });
         }
@@ -1545,7 +1647,10 @@ impl Refactor {
         Ok(EditResult {
             success: errors.is_empty(),
             changes_applied: total_changes,
-            files_modified: modified_files.into_iter().map(|(p, _)| p).collect(),
+            files_modified: modified_files.iter().map(|(p, _)| p.clone()).collect(),
+            original_contents: Some(
+                modified_files.into_iter().map(|(p, orig)| (p.display().to_string(), orig)).collect()
+            ),
             error: match (errors.is_empty(), &truncation_warning) {
                 (true, None) => None,
                 (true, Some(w)) => Some(w.clone()),
@@ -1572,6 +1677,7 @@ impl Refactor {
             success: true,
             changes_applied: 1,
             files_modified: vec![],
+            original_contents: None,
             error: None,
         })
     }
@@ -1593,6 +1699,7 @@ impl Refactor {
             success: true,
             changes_applied: 1,
             files_modified: vec![],
+            original_contents: None,
             error: None,
         })
     }
@@ -2029,6 +2136,7 @@ mod tests {
             success: false,
             changes_applied: 0,
             files_modified: vec![],
+            original_contents: None,
             error: None,
         };
 
@@ -2044,6 +2152,7 @@ mod tests {
             success: true,
             changes_applied: 5,
             files_modified: vec![PathBuf::from("test.py")],
+            original_contents: None,
             error: None,
         };
 
@@ -2245,6 +2354,7 @@ mod tests {
             success: true,
             changes_applied: 1,
             files_modified: vec![PathBuf::from("test.py")],
+            original_contents: None,
             error: None,
         };
         let cloned = result.clone();
