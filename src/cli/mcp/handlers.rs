@@ -452,29 +452,40 @@ to auto-switch/auto-index projects."
             .search(&query, fetch_k, query_type)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
+        // Separator-aware scope filter: exact match for file paths,
+        // prefix match for directory paths.
+        let in_scope = |file_path: &str| match &scope {
+            Some(s) => {
+                // If scope looks like a file (has extension, no trailing separator),
+                // require exact match. Otherwise prefix match.
+                let scope_str = s.trim_end_matches(std::path::MAIN_SEPARATOR);
+                if std::path::Path::new(scope_str).extension().is_some() {
+                    file_path == scope_str
+                } else {
+                    file_path.starts_with(&format!("{}{}", scope_str, std::path::MAIN_SEPARATOR))
+                        || file_path == scope_str
+                }
+            }
+            None => true,
+        };
+
         let mut filtered: Vec<_> = all_results
             .iter()
-            .filter(|r| match &scope {
-                Some(s) => r.file_path.starts_with(s),
-                None => true,
-            })
+            .filter(|r| in_scope(&r.file_path))
             .cloned()
             .collect();
 
         // Retry with expanded window if scope eliminated everything.
         // The initial fetch may miss lower-ranked in-scope results.
         if filtered.is_empty() && scope.is_some() && !all_results.is_empty() {
-            fetch_k = (fetch_k * 10).min(1000);
+            fetch_k = (fetch_k * 10).min(MAX_FETCH_K * 10);
             if fetch_k > top_k + offset {
                 all_results = index
                     .search(&query, fetch_k, query_type)
                     .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
                 filtered = all_results
                     .iter()
-                    .filter(|r| match &scope {
-                        Some(s) => r.file_path.starts_with(s),
-                        None => true,
-                    })
+                    .filter(|r| in_scope(&r.file_path))
                     .cloned()
                     .collect();
             }

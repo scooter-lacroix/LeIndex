@@ -62,11 +62,12 @@ impl Storage {
 
         let mut storage = Self { conn, config };
 
-        // Initialize schema
-        storage.initialize_schema()?;
-
-        // Run migrations
+        // Check schema version BEFORE any DDL — reject newer databases early
+        // so an older binary cannot corrupt a schema it doesn't understand.
         storage.run_migrations()?;
+
+        // Initialize schema (CREATE TABLE IF NOT EXISTS — safe after version check)
+        storage.initialize_schema()?;
 
         Ok(storage)
     }

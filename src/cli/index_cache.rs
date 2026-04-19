@@ -201,8 +201,12 @@ impl IndexCache {
         // does not discard the in-memory graph.
         self.cache_spiller
             .store_mut()
-            .insert(cache_key, entry)
+            .insert(cache_key.clone(), entry)
             .context("Failed to create PDG spill marker")?;
+        self.cache_spiller
+            .store_mut()
+            .persist_key(&cache_key)
+            .context("Failed to persist PDG spill marker")?;
 
         pdg.take();
 
@@ -229,8 +233,12 @@ impl IndexCache {
 
         self.cache_spiller
             .store_mut()
-            .insert(cache_key, entry)
+            .insert(cache_key.clone(), entry)
             .context("Failed to spill vector cache marker")?;
+        self.cache_spiller
+            .store_mut()
+            .persist_key(&cache_key)
+            .context("Failed to persist vector cache marker")?;
 
         info!("Spilled vector cache marker: {} entries", search_node_count);
 
@@ -249,12 +257,14 @@ impl IndexCache {
         if pdg.is_some() {
             let before = self.cache_spiller.store().total_bytes();
             self.spill_pdg_cache(project_id, pdg)?;
-            pdg_bytes = self.cache_spiller.store().total_bytes() - before;
+            let after = self.cache_spiller.store().total_bytes();
+            pdg_bytes = after.saturating_sub(before);
         }
 
         let before_vec = self.cache_spiller.store().total_bytes();
         self.spill_vector_cache(project_id, search_node_count)?;
-        let vector_bytes = self.cache_spiller.store().total_bytes() - before_vec;
+        let after_vec = self.cache_spiller.store().total_bytes();
+        let vector_bytes = after_vec.saturating_sub(before_vec);
 
         info!(
             "Spilled all caches: PDG ({} bytes), Vector ({} bytes)",

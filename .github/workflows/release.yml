@@ -374,13 +374,13 @@ jobs:
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           RELEASE_SHA=$(gh release view "v${VERSION}" --json targetCommitish --jq '.targetCommitish')
-          HEAD_SHA=$(git rev-parse HEAD)
-          if [ "$RELEASE_SHA" != "$HEAD_SHA" ]; then
-            echo "ERROR: Release SHA ($RELEASE_SHA) != HEAD ($HEAD_SHA)"
+          BRANCH_HEAD_SHA=$(git ls-remote origin "refs/heads/${GITHUB_REF_NAME}" | awk '{print $1}')
+          if [ "$RELEASE_SHA" != "$BRANCH_HEAD_SHA" ]; then
+            echo "ERROR: Release SHA ($RELEASE_SHA) != ${GITHUB_REF_NAME} HEAD ($BRANCH_HEAD_SHA)"
             echo "New commits landed during release — aborting undraft."
             exit 1
           fi
-          echo "SHA verified: $HEAD_SHA"
+          echo "SHA verified: $BRANCH_HEAD_SHA"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
