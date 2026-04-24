@@ -115,9 +115,15 @@ jobs:
           # PowerShell installer
           if [ -f "install.ps1" ]; then
             sed -i "s/^\$ScriptVersion = \".*\"/\$ScriptVersion = \"${NEW_VERSION}\"/" install.ps1
+            sed -i "s/^\$ExpectedVersion = \".*\"/\$ExpectedVersion = \"${NEW_VERSION}\"/" install.ps1
             ACTUAL=$(grep 'ScriptVersion' install.ps1 | head -1 | sed 's/.*"\(.*\)".*/\1/')
             if [ "$ACTUAL" != "$NEW_VERSION" ]; then
-              echo "::error::install.ps1 ScriptVersion mismatch: got '${ACTUAL}', expected '${NEW_VERSION}'"
+              echo "::error::install.ps1 Script_VERSION mismatch: got '${ACTUAL}', expected '${NEW_VERSION}'"
+              exit 1
+            fi
+            EXPECTED=$(grep 'ExpectedVersion' install.ps1 | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            if [ "$EXPECTED" != "$NEW_VERSION" ]; then
+              echo "::error::install.ps1 ExpectedVersion mismatch: got '${EXPECTED}', expected '${NEW_VERSION}'"
               exit 1
             fi
             echo "install.ps1 → ${NEW_VERSION}"

@@ -163,9 +163,9 @@ impl TfIdfEmbedder {
         // Count document frequency per token
         let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for (_, tokens) in documents {
-            let toks: std::collections::HashSet<String> = tokens.iter().cloned().collect();
+            let toks: std::collections::HashSet<&str> = tokens.iter().map(|s| s.as_str()).collect();
             for tok in toks {
-                *df.entry(tok).or_insert(0) += 1;
+                *df.entry(tok.to_string()).or_insert(0) += 1;
             }
         }
 
@@ -394,12 +394,14 @@ pub(crate) fn collect_source_files_with_hashes(
 }
 
 /// Merge a source PDG into a target PDG.
+///
+/// Assumes source and target have disjoint node sets (e.g., merging a
+/// per-file PDG into the global index). Does not deduplicate by symbol
+/// name to preserve overloaded methods that share the same qualified name.
 pub(crate) fn merge_pdgs(target: &mut ProgramDependenceGraph, source: ProgramDependenceGraph) {
     for node_idx in source.node_indices() {
         if let Some(node) = source.get_node(node_idx) {
-            if target.find_by_symbol(&node.id).is_none() {
-                target.add_node(node.clone());
-            }
+            target.add_node(node.clone());
         }
     }
 
@@ -655,11 +657,13 @@ pub(crate) fn files_importing_from_manifests(
     let source_set: HashSet<String> =
         all_source_paths.iter().map(|p| p.display().to_string()).collect();
 
+    let mut affected_set = affected_set;
     for nid in pdg.node_indices() {
         if let Some(node) = pdg.get_node(nid) {
             if node.node_type == NodeType::External {
                 if !affected_set.contains(&node.file_path) {
                     if source_set.contains(&node.file_path) {
+                        affected_set.insert(node.file_path.clone());
                         affected.push(PathBuf::from(&node.file_path));
                     }
                 }
