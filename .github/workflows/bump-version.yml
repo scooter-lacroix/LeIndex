@@ -1,0 +1,197 @@
+name: Bump Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "New semver version (e.g. 1.6.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bump-version
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    name: Bump version to ${{ github.event.inputs.version }}
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
+    steps:
+      - name: Validate REPO_PAT secret
+        run: |
+          if [ -z "${{ secrets.REPO_PAT }}" ]; then
+            echo "::error::REPO_PAT secret is not configured. This workflow requires a Personal Access Token with write access to push the version bump commit."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.REPO_PAT }}
+
+      - name: Validate semver format
+        env:
+          NEW_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if ! echo "$NEW_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::Invalid version format '${NEW_VERSION}'. Expected: X.Y.Z (e.g. 1.6.0)"
+            exit 1
+          fi
+          echo "Version format valid: ${NEW_VERSION}"
+
+      - name: Extract current version
+        id: current
+        run: |
+          CURRENT=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=${CURRENT}" >> "$GITHUB_OUTPUT"
+          echo "Current version: ${CURRENT}"
+
+      - name: Validate version is higher than current
+        env:
+          CURRENT_VERSION: ${{ steps.current.outputs.version }}
+          NEW_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          if [ "$CURRENT_VERSION" = "$NEW_VERSION" ]; then
+            echo "::error::Version ${NEW_VERSION} is the same as current version. No change needed."
+            exit 1
+          fi
+          # Use sort -V: higher version sorts last
+          HIGHEST=$(printf '%s\n%s\n' "$CURRENT_VERSION" "$NEW_VERSION" | sort -V | tail -1)
+          if [ "$HIGHEST" != "$NEW_VERSION" ]; then
+            echo "::error::Version ${NEW_VERSION} is not higher than current ${CURRENT_VERSION}. Downgrades not allowed."
+            exit 1
+          fi
+          echo "Version ${NEW_VERSION} > ${CURRENT_VERSION} — OK"
+
+      - name: Bump version in Cargo.toml
+        env:
+          NEW_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${NEW_VERSION}\"/" Cargo.toml
+          ACTUAL=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$ACTUAL" != "$NEW_VERSION" ]; then
+            echo "::error::Cargo.toml version mismatch after sed: got '${ACTUAL}', expected '${NEW_VERSION}'"
+            exit 1
+          fi
+          echo "Cargo.toml → ${NEW_VERSION}"
+
+      - name: Bump version in npm package.json
+        env:
+          NEW_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          sed -i "s/\"version\": \".*\"/\"version\": \"${NEW_VERSION}\"/" packages/npm-leindex-mcp/package.json
+          ACTUAL=$(grep '"version"' packages/npm-leindex-mcp/package.json | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$ACTUAL" != "$NEW_VERSION" ]; then
+            echo "::error::package.json version mismatch after sed: got '${ACTUAL}', expected '${NEW_VERSION}'"
+            exit 1
+          fi
+          echo "package.json → ${NEW_VERSION}"
+
+      - name: Bump version in PyPI pyproject.toml
+        env:
+          NEW_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          sed -i "s/^version = \".*\"/version = \"${NEW_VERSION}\"/" packages/pypi-leindex/pyproject.toml
+          ACTUAL=$(grep '^version =' packages/pypi-leindex/pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$ACTUAL" != "$NEW_VERSION" ]; then
+            echo "::error::pyproject.toml version mismatch after sed: got '${ACTUAL}', expected '${NEW_VERSION}'"
+            exit 1
+          fi
+          echo "pyproject.toml → ${NEW_VERSION}"
+
+      - name: Bump version in installer scripts
+        env:
+          NEW_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          # Shell installers (SCRIPT_VERSION)
+          for script in install.sh install_macos.sh; do
+            if [ -f "$script" ]; then
+              sed -i "s/^readonly SCRIPT_VERSION=\".*\"/readonly SCRIPT_VERSION=\"${NEW_VERSION}\"/" "$script"
+              ACTUAL=$(grep 'SCRIPT_VERSION' "$script" | head -1 | sed 's/.*"\(.*\)".*/\1/')
+              if [ "$ACTUAL" != "$NEW_VERSION" ]; then
+                echo "::error::$script SCRIPT_VERSION mismatch: got '${ACTUAL}', expected '${NEW_VERSION}'"
+                exit 1
+              fi
+              echo "$script → ${NEW_VERSION}"
+            fi
+          done
+          # PowerShell installer
+          if [ -f "install.ps1" ]; then
+            sed -i "s/^\$ScriptVersion = \".*\"/\$ScriptVersion = \"${NEW_VERSION}\"/" install.ps1
+            sed -i "s/^\$ExpectedVersion = \".*\"/\$ExpectedVersion = \"${NEW_VERSION}\"/" install.ps1
+            ACTUAL=$(grep 'ScriptVersion' install.ps1 | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            if [ "$ACTUAL" != "$NEW_VERSION" ]; then
+              echo "::error::install.ps1 Script_VERSION mismatch: got '${ACTUAL}', expected '${NEW_VERSION}'"
+              exit 1
+            fi
+            EXPECTED=$(grep 'ExpectedVersion' install.ps1 | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            if [ "$EXPECTED" != "$NEW_VERSION" ]; then
+              echo "::error::install.ps1 ExpectedVersion mismatch: got '${EXPECTED}', expected '${NEW_VERSION}'"
+              exit 1
+            fi
+            echo "install.ps1 → ${NEW_VERSION}"
+          fi
+
+      - name: Bump version in Python __init__.py
+        env:
+          NEW_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          INIT_FILE="packages/pypi-leindex/src/leindex/__init__.py"
+          if [ -f "$INIT_FILE" ]; then
+            sed -i "s/^__version__ = \".*\"/__version__ = \"${NEW_VERSION}\"/" "$INIT_FILE"
+            ACTUAL=$(grep '^__version__' "$INIT_FILE" | sed 's/.*"\(.*\)".*/\1/')
+            if [ "$ACTUAL" != "$NEW_VERSION" ]; then
+              echo "::error::__init__.py version mismatch: got '${ACTUAL}', expected '${NEW_VERSION}'"
+              exit 1
+            fi
+            echo "__init__.py → ${NEW_VERSION}"
+          fi
+
+      - name: Verify version parity
+        env:
+          NEW_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          CARGO=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          NPM=$(grep '"version"' packages/npm-leindex-mcp/package.json | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          PYPI=$(grep '^version =' packages/pypi-leindex/pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$CARGO" != "$NEW_VERSION" ] || [ "$NPM" != "$NEW_VERSION" ] || [ "$PYPI" != "$NEW_VERSION" ]; then
+            echo "::error::Version parity check failed: Cargo=${CARGO} npm=${NPM} PyPI=${PYPI} expected=${NEW_VERSION}"
+            exit 1
+          fi
+          echo "All versions match: ${NEW_VERSION}"
+
+      - name: Commit and push
+        env:
+          NEW_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml packages/npm-leindex-mcp/package.json packages/pypi-leindex/pyproject.toml
+          [ -f install.sh ] && git add install.sh
+          [ -f install_macos.sh ] && git add install_macos.sh
+          [ -f install.ps1 ] && git add install.ps1
+          [ -f packages/pypi-leindex/src/leindex/__init__.py ] && git add packages/pypi-leindex/src/leindex/__init__.py
+          git commit -m "chore(release): bump version to ${NEW_VERSION}"
+          git push
+
+      - name: Print summary
+        env:
+          OLD_VERSION: ${{ steps.current.outputs.version }}
+          NEW_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          echo "## Version Bump: ${OLD_VERSION} → ${NEW_VERSION}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Files changed:**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`Cargo.toml\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`packages/npm-leindex-mcp/package.json\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`packages/pypi-leindex/pyproject.toml\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`install.sh\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`install_macos.sh\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`install.ps1\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`packages/pypi-leindex/src/leindex/__init__.py\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The \`release.yml\` workflow will now detect this version change and handle building, publishing, and GitHub release creation." >> "$GITHUB_STEP_SUMMARY"
