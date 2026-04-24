@@ -48,7 +48,7 @@ This file tracks all major tracks for the project. Each track has its own detail
 ---
 
 ## [x] Track: Timeout Root Cause Fixes with Activity-Based Monitoring ✅ COMPLETE
-*Link: [./maestro/archive/timeout_fix_20260111/](./maestro/archive/timeout_fix_20260111/)*
+*Link: [./archive/timeout_fix_20260111/](./archive/timeout_fix_20260111/)*
 
 **Description:** Fixed root causes of 7 timeout-prone MCP operations. All operations now complete successfully without hanging.
 

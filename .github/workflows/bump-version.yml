@@ -21,6 +21,13 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/master'
     steps:
+      - name: Validate REPO_PAT secret
+        run: |
+          if [ -z "${{ secrets.REPO_PAT }}" ]; then
+            echo "::error::REPO_PAT secret is not configured. This workflow requires a Personal Access Token with write access to push the version bump commit."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0

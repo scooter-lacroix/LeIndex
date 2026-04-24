@@ -149,7 +149,7 @@ impl TfIdfEmbedder {
 
     /// Build a TF-IDF embedder from pre-tokenized documents.
     pub(crate) fn build_from_tokens(documents: &[(String, Vec<String>)]) -> Self {
-        const TARGET_DIM: usize = 768;
+        const TARGET_DIM: usize = crate::search::search::DEFAULT_EMBEDDING_DIMENSION;
         let n = documents.len();
 
         if n == 0 {
