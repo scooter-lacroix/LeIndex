@@ -5,12 +5,12 @@ This file tracks all major tracks for the project. Each track has its own detail
 ---
 
 ## [x] Track: LeIndex Performance Optimization - Complete I/O Refactoring
-*Link: [./maestro/tracks/perf_opt_20260107/](./maestro/tracks/perf_opt_20260107/)*
+*Link: [./tracks/perf_opt_20260107/](./tracks/perf_opt_20260107/)*
 
 ---
 
 ## [x] Track: Search Enhancement, Global Index, and Memory Management ✅ COMPLETE
-*Link: [./maestro/tracks/search_enhance_20260108/](./maestro/tracks/search_enhance_20260108/)*
+*Link: [./tracks/search_enhance_20260108/](./tracks/search_enhance_20260108/)*
 
 **Description:** Three major enhancements - ALL COMPLETE:
 - Task 0: Fixed critical search parameter mismatch bug ✅
@@ -29,7 +29,7 @@ This file tracks all major tracks for the project. Each track has its own detail
 ---
 
 ## [x] Track: Fix Critical MCP Tool Bugs ✅ COMPLETE
-*Link: [./maestro/tracks/mcp_bugs_fix_20260110/](./maestro/tracks/mcp_bugs_fix_20260110/)*
+*Link: [./tracks/mcp_bugs_fix_20260110/](./tracks/mcp_bugs_fix_20260110/)*
 
 **Description:** Fix 6 critical bugs in the LeIndex MCP server causing runtime errors across core functionality (dashboard, search, cross-project search, project listing, memory eviction).
 
@@ -83,7 +83,7 @@ This file tracks all major tracks for the project. Each track has its own detail
 ---
 
 ## [x] Track: lerecherche - Search & Analysis Fusion ✅ COMPLETE
-*Link: [./maestro/tracks/lerecherche_20250125/](./maestro/tracks/lerecherche_20250125/)*
+*Link: [./tracks/lerecherche_20250125/](./tracks/lerecherche_20250125/)*
 
 **Description:** Implement node-level semantic search with vector-AST synergy for LeIndex Rust Renaissance.
 
@@ -129,7 +129,7 @@ This file tracks all major tracks for the project. Each track has its own detail
 ---
 
 ## [~] Track: lepasserelle - Integration & API Layer 🦀 IN PROGRESS
-*Link: [./maestro/tracks/lepasserelle_20250125/](./maestro/tracks/lepasserelle_20250125/)*
+*Link: [./tracks/lepasserelle_20250125/](./tracks/lepasserelle_20250125/)*
 
 **Description:** Pure Rust orchestration, CLI, and MCP server that brings together leparse, legraphe, lerecherche, and lestockage into a unified LeIndex system.
 
@@ -180,7 +180,7 @@ This file tracks all major tracks for the project. Each track has its own detail
 ---
 
 ## [x] Track: lephase - 5-Phase Analysis System Integration ✅ COMPLETE
-*Link: [./maestro/tracks/lephase_5phase_20260205/](./maestro/tracks/lephase_5phase_20260205/)*
+*Link: [./tracks/lephase_5phase_20260205/](./tracks/lephase_5phase_20260205/)*
 
 **Description:** Integrate Maestro's 5-phase code analysis system into LeIndexer as a new `lephase` crate, leveraging LeIndexer's superior parsing infrastructure while adopting Maestro's token-efficient, LLM-oriented output architecture.
 
@@ -210,15 +210,15 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 **Reference Documents:**
 - [Integration Plan](../docs/5PHASE_INTEGRATION_PLAN.md)
-- [Spec](./maestro/tracks/lephase_5phase_20260205/spec.md)
-- [Plan](./maestro/tracks/lephase_5phase_20260205/plan.md)
+- [Spec](./tracks/lephase_5phase_20260205/spec.md)
+- [Plan](./tracks/lephase_5phase_20260205/plan.md)
 
 **Estimated Duration:** 9 weeks
 
 ---
 
 ## [x] Track: LeIndex Rust Renaissance 🦀 MASTER TRACK ✅ COMPLETE
-*Link: [./maestro/tracks/leindex_rust_refactor_20250125/](./maestro/tracks/leindex_rust_refactor_20250125/)*
+*Link: [./tracks/leindex_rust_refactor_20250125/](./tracks/leindex_rust_refactor_20250125/)*
 
 **Description:** Transform LeIndex from Python to Rust-based Deep Code Intelligence Engine. Complete greenfield rewrite with integrated code analysis capabilities.
 
@@ -271,7 +271,7 @@ This file tracks all major tracks for the project. Each track has its own detail
 ---
 
 ## [x] Track: LeIndex Dashboard Backend 🦀 MASTER TRACK ✅ COMPLETE
-*Link: [./maestro/tracks/dashboard_backend_20260213/](./maestro/tracks/dashboard_backend_20260213/)*
+*Link: [./tracks/dashboard_backend_20260213/](./tracks/dashboard_backend_20260213/)*
 
 **Description:** Complete Rust backend implementation for LeIndex Dashboard with HTTP/WebSocket API, unique project IDs, global registry, code editing, and real-time sync. Frontend handled separately via `docs/frontend-plan.md`.
 
@@ -294,7 +294,7 @@ This file tracks all major tracks for the project. Each track has its own detail
 ---
 
 ## [~] Track: MCP Fix & LeIndex Tool Supremacy
-*Link: [./maestro/tracks/mcp_fix_tool_supremacy_20260227/](./maestro/tracks/mcp_fix_tool_supremacy_20260227/)*
+*Link: [./tracks/mcp_fix_tool_supremacy_20260227/](./tracks/mcp_fix_tool_supremacy_20260227/)*
 
 **Description:** Fix MCP stdio double-newline injection bug and placeholder hash embeddings, then expand LeIndex MCP tool surface to completely replace glob/grep/read/edit tools — making LeIndex the preferred toolset for LLM code navigation, understanding, and editing.
 
@@ -328,8 +328,8 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ---
 
-## [x] Track: LeIndex Remediation — Complete Bug Fix Suite
-*Link: [./maestro/tracks/leindex_remediation_20260414/](./maestro/tracks/leindex_remediation_20260414/)*
+## [ ] Track: LeIndex Remediation — Complete Bug Fix Suite
+*Link: [./tracks/leindex_remediation_20260414/](./tracks/leindex_remediation_20260414/)*
 
 **Description:** Complete remediation of 13 critical bugs discovered during Radis_Rust Tzar review. Fixes grep_symbols zero-result bug, broken call graph, fake complexity metrics, and phantom node pollution.
 
@@ -386,13 +386,13 @@ This file tracks all major tracks for the project. Each track has its own detail
 **Reference Documents:**
 - [Task List](../docs/TODO/LEINDEX_REMEDIATION_TASK_LIST.md)
 - [Root Cause Analysis](../docs/TODO/tzar_usage_report.md)
-- [Spec](./maestro/tracks/leindex_remediation_20260414/spec.md)
-- [Plan](./maestro/tracks/leindex_remediation_20260414/plan.md)
+- [Spec](./tracks/leindex_remediation_20260414/spec.md)
+- [Plan](./tracks/leindex_remediation_20260414/plan.md)
 
 ---
 
 ## [x] Track: Version Bump CI Workflow
-*Link: [./maestro/tracks/bump_version_ci_20260424/](./maestro/tracks/bump_version_ci_20260424/)*
+*Link: [./tracks/bump_version_ci_20260424/](./tracks/bump_version_ci_20260424/)*
 - Add `workflow_dispatch` GitHub Action to bump version across Cargo.toml, npm package.json, and PyPI pyproject.toml, committing to master to trigger existing release.yml pipeline
-- [Spec](./maestro/tracks/bump_version_ci_20260424/spec.md)
-- [Plan](./maestro/tracks/bump_version_ci_20260424/plan.md)
+- [Spec](./tracks/bump_version_ci_20260424/spec.md)
+- [Plan](./tracks/bump_version_ci_20260424/plan.md)

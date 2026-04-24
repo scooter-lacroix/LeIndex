@@ -19,6 +19,7 @@ jobs:
   bump:
     name: Bump version to ${{ github.event.inputs.version }}
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/master'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -99,6 +100,7 @@ jobs:
         env:
           NEW_VERSION: ${{ github.event.inputs.version }}
         run: |
+          # Shell installers (SCRIPT_VERSION)
           for script in install.sh install_macos.sh; do
             if [ -f "$script" ]; then
               sed -i "s/^readonly SCRIPT_VERSION=\".*\"/readonly SCRIPT_VERSION=\"${NEW_VERSION}\"/" "$script"
@@ -110,6 +112,31 @@ jobs:
               echo "$script → ${NEW_VERSION}"
             fi
           done
+          # PowerShell installer
+          if [ -f "install.ps1" ]; then
+            sed -i "s/^\$ScriptVersion = \".*\"/\$ScriptVersion = \"${NEW_VERSION}\"/" install.ps1
+            ACTUAL=$(grep 'ScriptVersion' install.ps1 | head -1 | sed 's/.*"\(.*\)".*/\1/')
+            if [ "$ACTUAL" != "$NEW_VERSION" ]; then
+              echo "::error::install.ps1 ScriptVersion mismatch: got '${ACTUAL}', expected '${NEW_VERSION}'"
+              exit 1
+            fi
+            echo "install.ps1 → ${NEW_VERSION}"
+          fi
+
+      - name: Bump version in Python __init__.py
+        env:
+          NEW_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          INIT_FILE="packages/pypi-leindex/src/leindex/__init__.py"
+          if [ -f "$INIT_FILE" ]; then
+            sed -i "s/^__version__ = \".*\"/__version__ = \"${NEW_VERSION}\"/" "$INIT_FILE"
+            ACTUAL=$(grep '^__version__' "$INIT_FILE" | sed 's/.*"\(.*\)".*/\1/')
+            if [ "$ACTUAL" != "$NEW_VERSION" ]; then
+              echo "::error::__init__.py version mismatch: got '${ACTUAL}', expected '${NEW_VERSION}'"
+              exit 1
+            fi
+            echo "__init__.py → ${NEW_VERSION}"
+          fi
 
       - name: Verify version parity
         env:
@@ -130,7 +157,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml packages/npm-leindex-mcp/package.json packages/pypi-leindex/pyproject.toml install.sh install_macos.sh
+          git add Cargo.toml packages/npm-leindex-mcp/package.json packages/pypi-leindex/pyproject.toml
+          [ -f install.sh ] && git add install.sh
+          [ -f install_macos.sh ] && git add install_macos.sh
+          [ -f install.ps1 ] && git add install.ps1
+          [ -f packages/pypi-leindex/src/leindex/__init__.py ] && git add packages/pypi-leindex/src/leindex/__init__.py
           git commit -m "chore(release): bump version to ${NEW_VERSION}"
           git push
 
@@ -147,5 +178,7 @@ jobs:
           echo "- \`packages/pypi-leindex/pyproject.toml\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- \`install.sh\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- \`install_macos.sh\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`install.ps1\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`packages/pypi-leindex/src/leindex/__init__.py\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "The \`release.yml\` workflow will now detect this version change and handle building, publishing, and GitHub release creation." >> "$GITHUB_STEP_SUMMARY"

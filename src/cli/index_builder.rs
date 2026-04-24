@@ -137,8 +137,8 @@ impl TfIdfEmbedder {
     /// # Steps
     /// 1. Tokenize every document
     /// 2. Build document-frequency table (df[token] = # docs containing token)
-    /// 3. Compute IDF = ln(N / df) per token
-    /// 4. Select top-768 tokens by IDF as vocabulary
+    /// 3. Compute IDF = ln(N / df) per token, filtering extreme frequencies
+    /// 4. Stratified vocabulary selection across the full IDF range (up to 768 tokens)
     pub(crate) fn build(documents: &[(String, String)]) -> Self {
         let tokenized: Vec<(String, Vec<String>)> = documents
             .iter()
@@ -171,8 +171,8 @@ impl TfIdfEmbedder {
 
         // Compute IDF for each token using a moderate-frequency filter.
         let n_f = n as f32;
-        let min_df: usize = (n / 1000).max(3); // at least 3 occurrences
-        let max_df: usize = (n / 4).max(min_df + 1);
+        let min_df: usize = if n < 50 { 1 } else { (n / 1000).max(3) };
+        let max_df: usize = if n < 50 { n } else { (n / 4).max(min_df + 1) };
 
         let mut idf_scores: Vec<(String, f32)> = df
             .into_iter()
@@ -397,7 +397,9 @@ pub(crate) fn collect_source_files_with_hashes(
 pub(crate) fn merge_pdgs(target: &mut ProgramDependenceGraph, source: ProgramDependenceGraph) {
     for node_idx in source.node_indices() {
         if let Some(node) = source.get_node(node_idx) {
-            target.add_node(node.clone());
+            if target.find_by_symbol(&node.id).is_none() {
+                target.add_node(node.clone());
+            }
         }
     }
 
