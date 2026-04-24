@@ -66,7 +66,9 @@ pub(crate) fn tokenize_code(text: &str) -> Vec<String> {
                 if current.len() >= 2 {
                     tokens.push(current.to_lowercase());
                 }
-                current = format!("{}{}", last_char, ch);
+                current.clear();
+                current.push(last_char);
+                current.push(ch);
             } else if ch.is_ascii_digit()
                 && !current.is_empty()
                 && current
@@ -138,6 +140,15 @@ impl TfIdfEmbedder {
     /// 3. Compute IDF = ln(N / df) per token
     /// 4. Select top-768 tokens by IDF as vocabulary
     pub(crate) fn build(documents: &[(String, String)]) -> Self {
+        let tokenized: Vec<(String, Vec<String>)> = documents
+            .iter()
+            .map(|(id, content)| (id.clone(), tokenize_code(content)))
+            .collect();
+        Self::build_from_tokens(&tokenized)
+    }
+
+    /// Build a TF-IDF embedder from pre-tokenized documents.
+    pub(crate) fn build_from_tokens(documents: &[(String, Vec<String>)]) -> Self {
         const TARGET_DIM: usize = 768;
         let n = documents.len();
 
@@ -151,9 +162,8 @@ impl TfIdfEmbedder {
 
         // Count document frequency per token
         let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        for (_, content) in documents {
-            let toks: std::collections::HashSet<String> =
-                tokenize_code(content).into_iter().collect();
+        for (_, tokens) in documents {
+            let toks: std::collections::HashSet<String> = tokens.iter().cloned().collect();
             for tok in toks {
                 *df.entry(tok).or_insert(0) += 1;
             }
@@ -237,6 +247,40 @@ impl TfIdfEmbedder {
         }
 
         // L2 normalize
+        let magnitude: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if magnitude > 1e-9 {
+            for v in &mut vec {
+                *v /= magnitude;
+            }
+        }
+
+        vec
+    }
+
+    /// Embed pre-tokenized content, skipping the tokenize_code call.
+    pub(crate) fn embed_tokens(&self, tokens: &[String]) -> Vec<f32> {
+        let mut vec = vec![0.0f32; self.dimension];
+
+        if self.vocab.is_empty() {
+            return vec;
+        }
+
+        let total = tokens.len() as f32;
+        if total == 0.0 {
+            return vec;
+        }
+
+        let mut tf_map: std::collections::HashMap<&str, f32> = std::collections::HashMap::new();
+        for tok in tokens {
+            *tf_map.entry(tok.as_str()).or_insert(0.0) += 1.0;
+        }
+
+        for (i, (word, idf_val)) in self.vocab.iter().zip(self.idf.iter()).enumerate() {
+            if let Some(&count) = tf_map.get(word.as_str()) {
+                vec[i] = (count / total) * idf_val;
+            }
+        }
+
         let magnitude: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
         if magnitude > 1e-9 {
             for v in &mut vec {
@@ -426,8 +470,8 @@ pub(crate) fn index_nodes(
         std::collections::HashMap::new();
 
     // --- Pass 1: collect all node content for TF-IDF corpus building ---
-    let mut corpus: Vec<(String, String)> = Vec::new();
-    let mut raw_nodes: Vec<(_, String)> = Vec::new();
+    let mut corpus: Vec<(String, Vec<String>)> = Vec::new();
+    let mut raw_nodes: Vec<(petgraph::graph::NodeIndex, String, Vec<String>)> = Vec::new();
 
     let connectivity_config = crate::graph::pdg::TraversalConfig {
         max_depth: Some(1),
@@ -494,20 +538,21 @@ pub(crate) fn index_nodes(
                 )
             };
 
-            corpus.push((node.id.clone(), node_content.clone()));
-            raw_nodes.push((node_idx, node_content));
+            let tokens = tokenize_code(&node_content);
+            corpus.push((node.id.clone(), tokens.clone()));
+            raw_nodes.push((node_idx, node_content, tokens));
         }
     }
 
-    // --- Build TF-IDF embedder from the full corpus ---
-    let embedder = TfIdfEmbedder::build(&corpus);
+    // --- Build TF-IDF embedder from the pre-tokenized corpus ---
+    let embedder = TfIdfEmbedder::build_from_tokens(&corpus);
 
     // --- Pass 2: build NodeInfo vec using the embedder for embeddings ---
     let mut nodes: Vec<NodeInfo> = Vec::new();
 
-    for (node_idx, node_content) in raw_nodes {
+    for (node_idx, node_content, tokens) in raw_nodes {
         if let Some(node) = pdg.get_node(node_idx) {
-            let embedding = embedder.embed(&node_content);
+            let embedding = embedder.embed_tokens(&tokens);
 
             let node_info = NodeInfo {
                 node_id: node.id.clone(),
