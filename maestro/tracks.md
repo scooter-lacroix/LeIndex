@@ -239,7 +239,7 @@ This file tracks all major tracks for the project. Each track has its own detail
 2. ✅ `legraphe_20250125` - **COMPLETE** (47 tests) - Graph Intelligence Core (PDG, gravity-based traversal, cross-project)
 3. ✅ `lerecherche_20250125` - **COMPLETE** (99 tests) - Search & Analysis Fusion (HNSW, semantic search, NL queries)
 4. ✅ `lestockage_20250125` - **COMPLETE** (59 tests) - Persistent Storage Layer (SQLite, Salsa, Turso config, cross-project)
-5. ✅ `lepasserelle_20250125` - **COMPLETE** (79 tests) - Integration & API Layer (CLI, MCP server, cache management)
+5. ⚠️ `lepasserelle_20250125` - **~90% COMPLETE** (79 tests) - Integration & API Layer (CLI, MCP server, cache management; config & docs pending)
 6. ✅ `lephase_5phase_20260205` - **COMPLETE** (58 tests) - 5-Phase Analysis System (TokenFormatter, GravityTraversal)
 
 **Performance Targets:**
@@ -393,6 +393,6 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [x] Track: Version Bump CI Workflow
 *Link: [./tracks/bump_version_ci_20260424/](./tracks/bump_version_ci_20260424/)*
-- Add `workflow_dispatch` GitHub Action to bump version across Cargo.toml, npm package.json, and PyPI pyproject.toml, committing to master to trigger existing release.yml pipeline
+- Add `workflow_dispatch` GitHub Action to bump version across Cargo.toml, npm package.json, PyPI pyproject.toml, installer scripts (install.sh, install_macos.sh, install.ps1), and Python `__init__.py`, committing to master to trigger existing release.yml pipeline
 - [Spec](./tracks/bump_version_ci_20260424/spec.md)
 - [Plan](./tracks/bump_version_ci_20260424/plan.md)

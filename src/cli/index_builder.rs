@@ -162,10 +162,13 @@ impl TfIdfEmbedder {
 
         // Count document frequency per token
         let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for (_, tokens) in documents {
-            let toks: std::collections::HashSet<&str> = tokens.iter().map(|s| s.as_str()).collect();
-            for tok in toks {
-                *df.entry(tok.to_string()).or_insert(0) += 1;
+            seen.clear();
+            for tok in tokens {
+                if seen.insert(tok.as_str()) {
+                    *df.entry(tok.to_string()).or_insert(0) += 1;
+                }
             }
         }
 
@@ -399,21 +402,21 @@ pub(crate) fn collect_source_files_with_hashes(
 /// per-file PDG into the global index). Does not deduplicate by symbol
 /// name to preserve overloaded methods that share the same qualified name.
 pub(crate) fn merge_pdgs(target: &mut ProgramDependenceGraph, source: ProgramDependenceGraph) {
+    let mut id_map: std::collections::HashMap<petgraph::graph::NodeIndex, petgraph::graph::NodeIndex> =
+        std::collections::HashMap::with_capacity(source.node_count());
+
     for node_idx in source.node_indices() {
         if let Some(node) = source.get_node(node_idx) {
-            target.add_node(node.clone());
+            let new_idx = target.add_node(node.clone());
+            id_map.insert(node_idx, new_idx);
         }
     }
 
     for edge_idx in source.edge_indices() {
         if let Some(edge) = source.get_edge(edge_idx) {
             if let Some((s, t)) = source.edge_endpoints(edge_idx) {
-                if let (Some(sn), Some(tn)) = (source.get_node(s), source.get_node(t)) {
-                    if let (Some(si), Some(ti)) =
-                        (target.find_by_symbol(&sn.id), target.find_by_symbol(&tn.id))
-                    {
-                        target.add_edge(si, ti, edge.clone());
-                    }
+                if let (Some(&si), Some(&ti)) = (id_map.get(&s), id_map.get(&t)) {
+                    target.add_edge(si, ti, edge.clone());
                 }
             }
         }

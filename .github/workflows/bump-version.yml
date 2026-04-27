@@ -79,6 +79,9 @@ jobs:
           fi
           echo "Cargo.toml → ${NEW_VERSION}"
 
+      - name: Regenerate Cargo.lock
+        run: cargo check --locked 2>/dev/null || cargo generate-lockfile
+
       - name: Bump version in npm package.json
         env:
           NEW_VERSION: ${{ github.event.inputs.version }}
@@ -170,7 +173,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml packages/npm-leindex-mcp/package.json packages/pypi-leindex/pyproject.toml
+          git add Cargo.toml Cargo.lock packages/npm-leindex-mcp/package.json packages/pypi-leindex/pyproject.toml
           [ -f install.sh ] && git add install.sh
           [ -f install_macos.sh ] && git add install_macos.sh
           [ -f install.ps1 ] && git add install.ps1
@@ -187,6 +190,7 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "**Files changed:**" >> "$GITHUB_STEP_SUMMARY"
           echo "- \`Cargo.toml\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- \`Cargo.lock\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- \`packages/npm-leindex-mcp/package.json\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- \`packages/pypi-leindex/pyproject.toml\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- \`install.sh\`" >> "$GITHUB_STEP_SUMMARY"
