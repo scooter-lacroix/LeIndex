@@ -66,66 +66,6 @@ impl PhaseAnalysisAliasHandler {
     }
 }
 
-fn phase_analysis_schema() -> Value {
-    serde_json::json!({
-        "type": "object",
-        "properties": {
-            "phase": {
-                "oneOf": [
-                    { "type": "integer", "minimum": 1, "maximum": 5 },
-                    { "type": "string", "enum": ["all", "1", "2", "3", "4", "5"] }
-                ],
-                "default": "all"
-            },
-            "project_path": {
-                "type": "string",
-                "description": "Project directory (auto-indexes on first use; omit to use current project)"
-            },
-            "mode": {
-                "type": "string",
-                "enum": ["ultra", "balanced", "verbose"],
-                "default": "balanced"
-            },
-            "path": {
-                "type": "string",
-                "description": "File or directory to analyze (defaults to project root)"
-            },
-            "max_files": {
-                "type": "integer",
-                "default": 2000
-            },
-            "max_focus_files": {
-                "type": "integer",
-                "default": 20
-            },
-            "top_n": {
-                "type": "integer",
-                "default": 10
-            },
-            "max_chars": {
-                "type": "integer",
-                "default": 12000
-            },
-            "include_docs": {
-                "type": "boolean",
-                "description": "IMPORTANT: Enable to include prose/documentation files (README, docs/, *.md) \
-    in the analysis. Without this, only source code files are analyzed. Set to true when you need \
-    architectural docs, changelogs, or project documentation. Also accepts strings: 'true'/'false'.",
-                "default": false
-            },
-            "docs_mode": {
-                "type": "string",
-                "enum": ["off", "markdown", "text", "all"],
-                "description": "Controls which documentation files to include: 'off' (default, code only), \
-    'markdown' (*.md files like README, CHANGELOG), 'text' (*.txt, *.rst), 'all' (all doc formats). \
-    Use 'markdown' or 'all' to analyze project documentation alongside code.",
-                "default": "off"
-            }
-        },
-        "required": []
-    })
-}
-
 async fn execute_phase_analysis(
     registry: &Arc<ProjectRegistry>,
     args: Value,
@@ -362,6 +302,15 @@ async fn execute_phase_analysis(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::leindex::LeIndex;
+    use crate::cli::registry::ProjectRegistry;
+    use tempfile::tempdir;
+
+    #[allow(dead_code)]
+    fn test_registry_for(path: &std::path::Path) -> Arc<ProjectRegistry> {
+        let leindex = LeIndex::new(path).expect("leindex");
+        Arc::new(ProjectRegistry::with_initial_project(5, leindex))
+    }
 
     #[test]
     fn test_phase_schema_phase_and_path_are_optional() {
@@ -453,5 +402,100 @@ mod tests {
 
         let alias = PhaseAnalysisAliasHandler;
         assert_eq!(alias.name(), "phase_analysis");
+    }
+
+    #[tokio::test]
+    async fn test_phase_analysis_defaults_to_all_when_phase_missing() {
+        let dir = tempdir().expect("tempdir");
+        let src = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(src.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&src, "pub fn ping()->bool{true}\n").expect("write source");
+
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({
+            "path": src.display().to_string(),
+            "mode": "balanced",
+            "max_files": 1
+        });
+
+        let value = execute_phase_analysis(&registry, args)
+            .await
+            .expect("phase analysis");
+        let phases = value
+            .get("executed_phases")
+            .and_then(|v| v.as_array())
+            .expect("executed phases");
+
+        let as_u8 = phases
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .map(|v| v as u8)
+            .collect::<Vec<_>>();
+        assert_eq!(as_u8, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn test_phase_analysis_accepts_string_phase_number() {
+        let dir = tempdir().expect("tempdir");
+        let src = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(src.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&src, "pub fn ping()->bool{true}\n").expect("write source");
+
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({
+            "path": src.display().to_string(),
+            "phase": "1",
+            "mode": "balanced",
+            "max_files": 1
+        });
+
+        let value = execute_phase_analysis(&registry, args)
+            .await
+            .expect("phase analysis");
+        let phases = value
+            .get("executed_phases")
+            .and_then(|v| v.as_array())
+            .expect("executed phases");
+
+        let as_u8 = phases
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .map(|v| v as u8)
+            .collect::<Vec<_>>();
+        assert_eq!(as_u8, vec![1]);
+    }
+
+    #[test]
+    fn test_phase_c_handler_schemas() {
+        // All Phase C schemas should be valid JSON objects with required fields
+        use super::super::file_summary_handler::FileSummaryHandler;
+        use super::super::project_map_handler::ProjectMapHandler;
+        use super::super::grep_symbols_handler::GrepSymbolsHandler;
+        use super::super::read_symbol_handler::ReadSymbolHandler;
+        use super::super::symbol_lookup_handler::SymbolLookupHandler;
+
+        let schemas = vec![
+            (FileSummaryHandler.argument_schema(), vec!["file_path"]),
+            // SymbolLookupHandler has no required fields (symbol or symbols accepted)
+            (SymbolLookupHandler.argument_schema(), vec![]),
+            (ProjectMapHandler.argument_schema(), vec![]),
+            (GrepSymbolsHandler.argument_schema(), vec!["pattern"]),
+            (ReadSymbolHandler.argument_schema(), vec!["symbol"]),
+        ];
+
+        for (schema, required_fields) in schemas {
+            assert!(schema.is_object(), "schema must be a JSON object");
+            for field in required_fields {
+                let required = schema
+                    .get("required")
+                    .and_then(|v| v.as_array())
+                    .expect("required array");
+                assert!(
+                    required.iter().any(|v| v.as_str() == Some(field)),
+                    "field '{}' must be in required list",
+                    field
+                );
+            }
+        }
     }
 }

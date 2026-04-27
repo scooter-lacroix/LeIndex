@@ -403,6 +403,67 @@ pub(crate) fn make_diff(original: &str, modified: &str, file_path: &str) -> Stri
     }
 }
 
+/// JSON schema for the phase analysis tool arguments.
+pub(crate) fn phase_analysis_schema() -> Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "phase": {
+                "oneOf": [
+                    { "type": "integer", "minimum": 1, "maximum": 5 },
+                    { "type": "string", "enum": ["all", "1", "2", "3", "4", "5"] }
+                ],
+                "default": "all"
+            },
+            "project_path": {
+                "type": "string",
+                "description": "Project directory (auto-indexes on first use; omit to use current project)"
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["ultra", "balanced", "verbose"],
+                "default": "balanced"
+            },
+            "path": {
+                "type": "string",
+                "description": "File or directory to analyze (defaults to project root)"
+            },
+            "max_files": {
+                "type": "integer",
+                "default": 2000
+            },
+            "max_focus_files": {
+                "type": "integer",
+                "default": 20
+            },
+            "top_n": {
+                "type": "integer",
+                "default": 10
+            },
+            "max_chars": {
+                "type": "integer",
+                "default": 12000
+            },
+            "include_docs": {
+                "type": "boolean",
+                "description": "IMPORTANT: Enable to include prose/documentation files (README, docs/, *.md) \
+    in the analysis. Without this, only source code files are analyzed. Set to true when you need \
+    architectural docs, changelogs, or project documentation. Also accepts strings: 'true'/'false'.",
+                "default": false
+            },
+            "docs_mode": {
+                "type": "string",
+                "enum": ["off", "markdown", "text", "all"],
+                "description": "Controls which documentation files to include: 'off' (default, code only), \
+    'markdown' (*.md files like README, CHANGELOG), 'text' (*.txt, *.rst), 'all' (all doc formats). \
+    Use 'markdown' or 'all' to analyze project documentation alongside code.",
+                "default": "off"
+            }
+        },
+        "required": []
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,5 +633,123 @@ mod tests {
         let modified = apply_changes_in_memory(content, &changes).unwrap();
         assert!(modified.contains("def health_status(self):"));
         assert!(modified.contains("def other():"));
+    }
+
+    #[test]
+    fn test_read_source_snippet_partial_range() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let path = file.to_str().unwrap();
+        let snippet = read_source_snippet(path, (2, 5));
+        assert_eq!(snippet.unwrap(), "234");
+    }
+
+    #[test]
+    fn test_read_source_snippet_nonexistent_file() {
+        assert!(read_source_snippet("/definitely/does/not/exist.rs", (0, 10)).is_none());
+    }
+
+    #[test]
+    fn test_parse_edit_changes_explicit_byte_offsets() {
+        // When start_byte and end_byte are provided, use them directly
+        let changes_json = serde_json::json!([{
+            "type": "replace_text",
+            "start_byte": 10,
+            "end_byte": 20,
+            "new_text": "replacement"
+        }]);
+        let changes = parse_edit_changes(&changes_json, Some("any content")).unwrap();
+        assert_eq!(changes.len(), 1);
+        if let EditChange::ReplaceText { start, end, .. } = &changes[0] {
+            assert_eq!(*start, 10);
+            assert_eq!(*end, 20);
+        } else {
+            panic!("Expected ReplaceText");
+        }
+    }
+
+    #[test]
+    fn test_parse_edit_changes_text_not_found_returns_error() {
+        let changes_json = serde_json::json!([{
+            "type": "replace_text",
+            "old_text": "nonexistent text",
+            "new_text": "replacement"
+        }]);
+        let result = parse_edit_changes(&changes_json, Some("actual file content"));
+        assert!(
+            result.is_err(),
+            "Should error when old_text not found in content"
+        );
+    }
+
+    #[test]
+    fn test_pdg_find_by_name() {
+        let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
+        let n1 = pdg.add_node(crate::graph::pdg::Node {
+            id: "file.py:MyClass.health_check".into(),
+            node_type: crate::graph::pdg::NodeType::Method,
+            name: "health_check".into(),
+            file_path: "file.py".into(),
+            byte_range: (0, 50),
+            complexity: 2,
+            language: "python".into(),
+        });
+
+        // find_by_symbol with full ID works
+        assert_eq!(pdg.find_by_symbol("file.py:MyClass.health_check"), Some(n1));
+
+        // find_by_name with short name works
+        assert_eq!(pdg.find_by_name("health_check"), Some(n1));
+
+        // find_by_symbol with short name does NOT work (that's the old bug)
+        assert_eq!(pdg.find_by_symbol("health_check"), None);
+    }
+
+    #[test]
+    fn test_pdg_find_by_name_in_file() {
+        let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
+        let n1 = pdg.add_node(crate::graph::pdg::Node {
+            id: "a.py:run".into(),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: "run".into(),
+            file_path: "a.py".into(),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "python".into(),
+        });
+        let n2 = pdg.add_node(crate::graph::pdg::Node {
+            id: "b.py:run".into(),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: "run".into(),
+            file_path: "b.py".into(),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "python".into(),
+        });
+
+        // Without file hint, returns first match
+        assert!(pdg.find_by_name("run").is_some());
+
+        // With file hint, returns correct one
+        assert_eq!(pdg.find_by_name_in_file("run", Some("a.py")), Some(n1));
+        assert_eq!(pdg.find_by_name_in_file("run", Some("b.py")), Some(n2));
+    }
+
+    #[test]
+    fn test_make_diff_generates_unified_diff() {
+        let original = "line1\nline2\nline3\n";
+        let modified = "line1\nmodified\nline3\n";
+        let diff = make_diff(original, modified, "test.rs");
+        assert!(
+            diff.contains("--- test.rs"),
+            "Should have original file header"
+        );
+        assert!(
+            diff.contains("+++ test.rs"),
+            "Should have modified file header"
+        );
+        assert!(diff.contains("-line2"), "Should show removed line");
+        assert!(diff.contains("+modified"), "Should show added line");
     }
 }

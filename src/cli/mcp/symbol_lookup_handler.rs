@@ -340,6 +340,15 @@ For the exact source implementation use leindex_read_symbol."
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::leindex::LeIndex;
+    use crate::cli::registry::ProjectRegistry;
+    use tempfile::tempdir;
+
+    #[allow(dead_code)]
+    fn test_registry_for(path: &std::path::Path) -> Arc<ProjectRegistry> {
+        let leindex = LeIndex::new(path).expect("leindex");
+        Arc::new(ProjectRegistry::with_initial_project(5, leindex))
+    }
 
     #[test]
     fn test_symbol_lookup_schema_supports_batch() {
@@ -348,5 +357,14 @@ mod tests {
         let props = schema.get("properties").unwrap();
         assert!(props.get("symbol").is_some());
         assert!(props.get("symbols").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_symbol_lookup_requires_indexed_project() {
+        let dir = tempdir().unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "symbol": "my_func" });
+        let result = SymbolLookupHandler.execute(&registry, args).await;
+        assert!(result.is_err());
     }
 }

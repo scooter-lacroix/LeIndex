@@ -210,3 +210,26 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
         }), &index))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::leindex::LeIndex;
+    use crate::cli::registry::ProjectRegistry;
+    use tempfile::tempdir;
+
+    #[allow(dead_code)]
+    fn test_registry_for(path: &std::path::Path) -> Arc<ProjectRegistry> {
+        let leindex = LeIndex::new(path).expect("leindex");
+        Arc::new(ProjectRegistry::with_initial_project(5, leindex))
+    }
+
+    #[tokio::test]
+    async fn test_read_symbol_requires_indexed_project() {
+        let dir = tempdir().unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "symbol": "my_func" });
+        let result = ReadSymbolHandler.execute(&registry, args).await;
+        assert!(result.is_err());
+    }
+}

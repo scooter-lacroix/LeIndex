@@ -18,7 +18,7 @@ impl DiagnosticsHandler {
 
     /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
-        "Get diagnostic information about the project index (staleness, file count, error count)."
+        "Get diagnostic information about the indexed project, including memory usage, index statistics, and system health."
     }
 
     /// Returns the JSON schema for the arguments of this RPC method
@@ -28,9 +28,10 @@ impl DiagnosticsHandler {
             "properties": {
                 "project_path": {
                     "type": "string",
-                    "description": "Optional path to project root."
+                    "description": "Project directory (omit to use current project)"
                 }
-            }
+            },
+            "required": []
         })
     }
 
@@ -42,14 +43,53 @@ impl DiagnosticsHandler {
     ) -> Result<Value, JsonRpcError> {
         let project_path = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
+        let mut reader = handle.lock().await;
 
-        let diagnostics = index.get_diagnostics().map_err(|e| {
+        let diagnostics = reader.get_diagnostics().map_err(|e| {
             JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e))
         })?;
 
-        serde_json::to_value(diagnostics)
-            .map(|v| wrap_with_meta(v, &index))
-            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
+        let (changed, deleted) = reader
+            .check_freshness()
+            .unwrap_or_else(|_| (vec![], vec![]));
+        let storage_path = reader.storage_path().display().to_string();
+        let db_size = std::fs::metadata(reader.storage_path().join("leindex.db"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let coverage = reader.coverage_report().ok();
+
+        let mut diag_json = serde_json::to_value(diagnostics)
+            .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?;
+
+        if let Value::Object(ref mut map) = diag_json {
+            map.insert("storage_path".to_string(), serde_json::json!(storage_path));
+            map.insert("db_size_bytes".to_string(), serde_json::json!(db_size));
+
+            let staleness = if changed.is_empty() && deleted.is_empty() {
+                serde_json::json!({
+                    "status": "fresh",
+                    "changed_files": 0,
+                    "deleted_files": 0,
+                })
+            } else {
+                serde_json::json!({
+                    "status": "stale",
+                    "changed_files": changed.len(),
+                    "deleted_files": deleted.len(),
+                    "changed_sample": changed.iter().take(10).map(|p| p.display().to_string()).collect::<Vec<_>>(),
+                    "deleted_sample": deleted.iter().take(10).cloned().collect::<Vec<_>>(),
+                    "suggestion": "Call leindex_index with force_reindex=true to refresh",
+                })
+            };
+            map.insert("freshness".to_string(), staleness);
+            if let Some(cov) = coverage {
+                map.insert(
+                    "coverage".to_string(),
+                    serde_json::to_value(cov).unwrap_or(Value::Null),
+                );
+            }
+        }
+
+        Ok(wrap_with_meta(diag_json, &reader))
     }
 }

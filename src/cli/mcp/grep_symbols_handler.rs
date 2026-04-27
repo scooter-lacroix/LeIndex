@@ -488,3 +488,47 @@ impl GrepSymbolsHandler {
         Ok(response)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::leindex::LeIndex;
+    use crate::cli::registry::ProjectRegistry;
+    use tempfile::tempdir;
+
+    #[allow(dead_code)]
+    fn test_registry_for(path: &std::path::Path) -> Arc<ProjectRegistry> {
+        let leindex = LeIndex::new(path).expect("leindex");
+        Arc::new(ProjectRegistry::with_initial_project(5, leindex))
+    }
+
+    #[tokio::test]
+    async fn test_grep_symbols_auto_indexes_returns_empty() {
+        // With auto-indexing, a project with no matching symbols returns empty results
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("lib.rs");
+        std::fs::write(&src, "pub fn greet() {}\n").unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "pattern": "nonexistent" });
+        let result = GrepSymbolsHandler.execute(&registry, args).await;
+        // Should succeed (auto-index happens) but with 0 matches
+        assert!(result.is_ok(), "auto-indexing should succeed");
+        let val = result.unwrap();
+        assert_eq!(val["total_matches"].as_u64().unwrap_or(0), 0);
+        assert_eq!(val["shown"].as_u64().unwrap_or(1), 0);
+    }
+
+    #[test]
+    fn test_grep_symbols_schema_has_pagination() {
+        let schema = GrepSymbolsHandler.argument_schema();
+        let props = schema.get("properties").unwrap();
+        assert!(
+            props.get("offset").is_some(),
+            "should have 'offset' for pagination"
+        );
+        assert!(
+            props.get("project_path").is_some(),
+            "should have 'project_path'"
+        );
+    }
+}
