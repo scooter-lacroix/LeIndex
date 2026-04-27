@@ -139,6 +139,7 @@ impl TfIdfEmbedder {
     /// 2. Build document-frequency table (df[token] = # docs containing token)
     /// 3. Compute IDF = ln(N / df) per token, filtering extreme frequencies
     /// 4. Stratified vocabulary selection across the full IDF range (up to 768 tokens)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn build(documents: &[(String, String)]) -> Self {
         let tokenized: Vec<(String, Vec<String>)> = documents
             .iter()
