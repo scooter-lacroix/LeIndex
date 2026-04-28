@@ -155,6 +155,7 @@ mod tests {
             changes: vec![],
             timestamp: chrono::Utc::now(),
             original_content: None,
+            modified_content: None,
         };
 
         history.record_command(command);
@@ -173,6 +174,7 @@ mod tests {
             changes: vec![],
             timestamp: chrono::Utc::now(),
             original_content: None,
+            modified_content: None,
         };
 
         history.record_command(command.clone());
@@ -199,6 +201,7 @@ mod tests {
             changes: vec![],
             timestamp: chrono::Utc::now(),
             original_content: None,
+            modified_content: None,
         };
 
         history.record_command(command.clone());
@@ -229,6 +232,7 @@ mod tests {
                 changes: vec![],
                 timestamp: chrono::Utc::now(),
                 original_content: None,
+                modified_content: None,
             };
             history.record_command(command);
         }
@@ -244,6 +248,7 @@ mod tests {
             changes: vec![],
             timestamp: chrono::Utc::now(),
             original_content: None,
+            modified_content: None,
         };
         history.record_command(command);
         assert_eq!(history.current_index(), 4);
@@ -273,6 +278,7 @@ mod tests {
                 changes: vec![],
                 timestamp: chrono::Utc::now(),
                 original_content: None,
+                modified_content: None,
             };
             history.record_command(command);
         }
@@ -289,6 +295,7 @@ mod tests {
             changes: vec![],
             timestamp: chrono::Utc::now(),
             original_content: None,
+            modified_content: None,
         };
         history.record_command(command);
 
@@ -482,6 +489,7 @@ mod tests {
             changes: vec![],
             timestamp: chrono::Utc::now(),
             original_content: None,
+            modified_content: None,
         };
 
         assert!(matches!(command, EditCommand::Edit { .. }));

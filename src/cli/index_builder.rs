@@ -582,10 +582,11 @@ pub(crate) fn index_nodes(
                 file_path: node.file_path.to_string(),
                 symbol_name: node.name.clone(),
                 language: node.language.clone(),
-                content: node_content,
+                content: node_content.clone(),
                 byte_range: node.byte_range,
                 embedding: Some(embedding),
                 complexity: node.complexity,
+                signature: crate::search::search::SearchEngine::extract_signature_from_content(&node_content),
             };
 
             nodes.push(node_info);

@@ -130,7 +130,8 @@ impl LeIndex {
 
         // Step 5: Update PDG
         if !unchanged_files.is_empty() && self.pdg.is_none() {
-            let _ = self.load_from_storage();
+            self.load_from_storage()
+                .context("Failed to load existing PDG for incremental reindex. Please reindex with --force if corruption persists.")?;
         }
 
         let mut pdg = self.pdg.take().unwrap_or_else(ProgramDependenceGraph::new);

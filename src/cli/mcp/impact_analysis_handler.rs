@@ -1,5 +1,5 @@
 use super::helpers::{
-    extract_string, extract_usize, get_direct_callers, wrap_with_meta, HandlerContext,
+    extract_string, extract_usize, get_direct_callers, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -65,8 +65,20 @@ to understand the blast radius of your change. No equivalent in standard tools."
             .to_owned();
         let depth = extract_usize(&args, "depth", 3)?.min(5);
 
-        let ctx = HandlerContext::new(registry, &args).await?;
-        let pdg = ctx.pdg();
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
+        let mut guard = handle.write().await;
+
+        guard.ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+
+        if guard.pdg().is_none() {
+            return Err(JsonRpcError::project_not_indexed(
+                guard.project_path().display().to_string(),
+            ));
+        }
+
+        let pdg = guard.pdg().unwrap();
 
         let node_id = if let Some(nid) = pdg.find_by_symbol(&symbol) {
             nid
@@ -154,7 +166,7 @@ to understand the blast radius of your change. No equivalent in standard tools."
                     node.name, forward.len(), affected_files.len(), risk
                 )
             }),
-            ctx.index(),
+            &*guard,
         ))
     }
 }

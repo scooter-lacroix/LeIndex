@@ -1,6 +1,6 @@
 use super::helpers::{
     extract_bool, extract_string, extract_usize, get_direct_callers, node_type_str,
-    read_source_snippet, resolve_scope, wrap_with_meta, HandlerContext,
+    read_source_snippet, resolve_scope, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -94,10 +94,12 @@ For the exact source implementation use leindex_read_symbol."
         let depth = extract_usize(&args, "depth", 2)?.min(5);
         let token_budget = extract_usize(&args, "token_budget", 1500)?;
 
-        // Resolve scope first (needs a brief lock)
+        // Resolve scope and get project handle
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
         let scope = {
-            let ctx = HandlerContext::new_optional_pdg(registry, &args).await?;
-            resolve_scope(&args, ctx.project_path())?
+            let guard = handle.read().await;
+            resolve_scope(&args, guard.project_path())?
         };
 
         // Determine symbol list: single "symbol" or batch "symbols"
@@ -115,8 +117,25 @@ For the exact source implementation use leindex_read_symbol."
             ));
         };
 
-        let ctx = HandlerContext::new(registry, &args).await?;
-        let pdg = ctx.pdg();
+        // Validate symbols is non-empty
+        if symbols.is_empty() {
+            return Err(JsonRpcError::invalid_params(
+                "'symbols' array must contain at least one valid string".to_string(),
+            ));
+        }
+
+        let mut guard = handle.write().await;
+
+        guard.ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+
+        if guard.pdg().is_none() {
+            return Err(JsonRpcError::project_not_indexed(
+                guard.project_path().display().to_string(),
+            ));
+        }
+
+        let pdg = guard.pdg().unwrap();
 
         // For batch mode, collect results for each symbol
         if symbols.len() > 1 {
@@ -149,7 +168,7 @@ For the exact source implementation use leindex_read_symbol."
                     "count": results.len(),
                     "results": results
                 }),
-                ctx.index(),
+                &*guard,
             ));
         }
 
@@ -166,7 +185,7 @@ For the exact source implementation use leindex_read_symbol."
             char_budget,
         )?;
 
-        Ok(wrap_with_meta(single, ctx.index()))
+        Ok(wrap_with_meta(single, &*guard))
     }
 
     /// Resolve and return full structural context for a single symbol.

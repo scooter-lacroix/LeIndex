@@ -1,6 +1,6 @@
 use super::helpers::{
     extract_bool, extract_string, extract_usize, glob_match, node_type_str, resolve_scope,
-    wrap_with_meta, HandlerContext,
+    wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -117,8 +117,14 @@ to understand match context. Supports regex, globs, scope, and context_lines."
             })
             .unwrap_or_default();
 
-        let ctx = HandlerContext::new_optional_pdg(registry, &args).await?;
-        let scope = resolve_scope(&args, ctx.project_path())?;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
+        let mut guard = handle.write().await;
+
+        // Best-effort PDG load
+        let _ = guard.ensure_pdg_loaded();
+
+        let scope = resolve_scope(&args, guard.project_path())?;
 
         // Build regex or literal matcher
         let regex = if is_regex {
@@ -140,10 +146,10 @@ to understand match context. Supports regex, globs, scope, and context_lines."
         };
 
         // Get PDG for enrichment (optional — works without it)
-        let pdg = ctx.maybe_pdg();
+        let pdg = guard.pdg();
 
         // Collect source files from the project
-        let project_root = ctx.project_path();
+        let project_root = guard.project_path();
         let mut results: Vec<Value> = Vec::new();
 
         // Dirs to always skip
@@ -300,7 +306,7 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                 "has_more": offset + count < total,
                 "results": paginated,
             }),
-            ctx.index(),
+            &*guard,
         ))
     }
 }

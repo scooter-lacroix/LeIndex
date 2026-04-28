@@ -149,6 +149,10 @@ pub enum EditCommand {
 
         /// Original file content before the edit (for undo).
         original_content: Option<String>,
+
+        /// Modified content after the edit (for redo).
+        /// Captured during apply_edit to ensure exact replay.
+        modified_content: Option<String>,
     },
 
     /// Multi-file rename operation with full rollback support.

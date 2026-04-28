@@ -1,6 +1,6 @@
 use super::helpers::{
     byte_range_to_line_range, extract_bool, extract_string, extract_usize, get_direct_callers,
-    node_type_str, read_source_snippet, wrap_with_meta, HandlerContext,
+    node_type_str, read_source_snippet, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -68,8 +68,20 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
         let include_dependencies = extract_bool(&args, "include_dependencies", false);
         let token_budget = extract_usize(&args, "token_budget", 8000)?;
 
-        let ctx = HandlerContext::new(registry, &args).await?;
-        let pdg = ctx.pdg();
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
+        let mut guard = handle.write().await;
+
+        guard.ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+
+        if guard.pdg().is_none() {
+            return Err(JsonRpcError::project_not_indexed(
+                guard.project_path().display().to_string(),
+            ));
+        }
+
+        let pdg = guard.pdg().unwrap();
 
         let symbol_lower = symbol.to_lowercase();
         let node_id = if let Some(ref fp_hint) = file_path_hint {
@@ -230,7 +242,7 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
                 "callees": callees,
                 "dependencies": dep_signatures
             }),
-            ctx.index(),
+            &*guard,
         ))
     }
 }

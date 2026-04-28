@@ -369,6 +369,28 @@ pub(crate) fn apply_changes_in_memory(
             let bytes = modified.as_bytes();
             let s = (*start).min(bytes.len());
             let e = (*end).min(bytes.len());
+
+            // Validate UTF-8 character boundaries
+            if !modified.is_char_boundary(s) {
+                return Err(JsonRpcError::invalid_params(format!(
+                    "start_byte {} is not on a valid UTF-8 character boundary",
+                    s
+                )));
+            }
+            if !modified.is_char_boundary(e) {
+                return Err(JsonRpcError::invalid_params(format!(
+                    "end_byte {} is not on a valid UTF-8 character boundary",
+                    e
+                )));
+            }
+            // Validate range ordering
+            if s > e {
+                return Err(JsonRpcError::invalid_params(format!(
+                    "start_byte {} must be <= end_byte {}",
+                    s, e
+                )));
+            }
+
             modified = format!("{}{}{}", &modified[..s], new_text, &modified[e..]);
         }
     }
@@ -519,173 +541,7 @@ pub(crate) fn phase_analysis_schema() -> Value {
     })
 }
 
-// ---------------------------------------------------------------------------
-// HandlerContext — eliminates preamble boilerplate from MCP handlers
-// ---------------------------------------------------------------------------
 
-/// Resolved project state for MCP handlers.
-///
-/// Owns the `Arc<Mutex<LeIndex>>` handle and the lock guard, so there are no
-/// lifetime issues.  Use the accessor methods to get at the underlying data.
-///
-/// ### Usage
-///
-/// ```ignore
-/// // BEFORE (repeated in ~12 handlers):
-/// let handle = registry.get_or_create(project_path).await?;
-/// let mut index = handle.write().await;
-/// index.ensure_pdg_loaded()
-///     .map_err(|e| JsonRpcError::indexing_failed(...))?;
-/// let pdg = index.pdg().ok_or_else(|| {
-///     JsonRpcError::project_not_indexed(...)
-/// })?;
-///
-/// // AFTER (single call):
-/// let ctx = HandlerContext::new(registry, &args).await?;
-/// let pdg = ctx.pdg();  // guaranteed non-None after new()
-/// ```
-pub(crate) struct HandlerContext {
-    /// Handle to the project (keeps the `Arc` alive).
-    #[allow(dead_code)]
-    handle: std::sync::Arc<crate::cli::registry::ProjectRwLock>,
-    /// Write guard over the `LeIndex` instance.
-    guard: crate::cli::registry::ProjectWriteGuard<'static>,
-    /// Whether the PDG was successfully loaded.
-    #[allow(dead_code)]
-    pdg_loaded: bool,
-}
-
-// SAFETY: The guard is derived from an Arc that we also store, so the
-// guard's lifetime is effectively "as long as the struct".  We use
-// a transmute to express this to the type system.  This is safe because:
-//   1. The Arc ensures the ProjectRwLock lives long enough.
-//   2. The guard is dropped before the Arc (struct field order is top-to-bottom).
-//   3. No other code can access the Arc between creation and drop.
-unsafe impl Send for HandlerContext {}
-
-impl HandlerContext {
-    /// Resolve a project, load the PDG, and return a ready-to-use context.
-    ///
-    /// The PDG is guaranteed to be loaded on success — if loading fails or the
-    /// project is not indexed, an error is returned instead.
-    pub async fn new(
-        registry: &std::sync::Arc<crate::cli::registry::ProjectRegistry>,
-        args: &Value,
-    ) -> Result<Self, JsonRpcError> {
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
-        let handle = registry.get_or_create(project_path).await?;
-        let mut guard = handle.write().await;
-
-        guard
-            .ensure_pdg_loaded()
-            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
-
-        if guard.pdg().is_none() {
-            return Err(JsonRpcError::project_not_indexed(
-                guard.project_path().display().to_string(),
-            ));
-        }
-
-        // SAFETY: We extend the guard's lifetime to 'static because the Arc
-        // that owns the ProjectRwLock is stored alongside it. The guard will be
-        // dropped when Self is dropped, and the Arc ensures the underlying data
-        // lives long enough. This is a well-established pattern for
-        // self-referential structs where the owner and borrow are co-located.
-        let guard: crate::cli::registry::ProjectWriteGuard<'static> =
-            unsafe { std::mem::transmute(guard) };
-
-        Ok(Self {
-            handle,
-            guard,
-            pdg_loaded: true,
-        })
-    }
-
-    /// Resolve a project and lock it, but do **not** require a loaded PDG.
-    ///
-    /// Use this for handlers that can operate without a PDG (e.g. search,
-    /// diagnostics, text search, git status, read_file).
-    pub async fn new_optional_pdg(
-        registry: &std::sync::Arc<crate::cli::registry::ProjectRegistry>,
-        args: &Value,
-    ) -> Result<Self, JsonRpcError> {
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
-        let handle = registry.get_or_create(project_path).await?;
-        let mut guard = handle.write().await;
-
-        // Best-effort PDG load — ignore error, just leave it unloaded.
-        let pdg_loaded = guard.ensure_pdg_loaded().is_ok();
-
-        let guard: crate::cli::registry::ProjectWriteGuard<'static> =
-            unsafe { std::mem::transmute(guard) };
-
-        Ok(Self {
-            handle,
-            guard,
-            pdg_loaded,
-        })
-    }
-
-    /// Resolve a project and lock it without any PDG loading at all.
-    ///
-    /// Use for handlers that only need the LeIndex (e.g. diagnostics, index).
-    pub async fn new_index_only(
-        registry: &std::sync::Arc<crate::cli::registry::ProjectRegistry>,
-        args: &Value,
-    ) -> Result<Self, JsonRpcError> {
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
-        let handle = registry.get_or_create(project_path).await?;
-        let guard = handle.write().await;
-
-        let guard: crate::cli::registry::ProjectWriteGuard<'static> =
-            unsafe { std::mem::transmute(guard) };
-
-        Ok(Self {
-            handle,
-            guard,
-            pdg_loaded: false,
-        })
-    }
-
-    /// Borrow the inner `LeIndex`.
-    #[inline]
-    pub fn index(&self) -> &crate::cli::leindex::LeIndex {
-        &*self.guard
-    }
-
-    /// Mutably borrow the inner `LeIndex`.
-    #[inline]
-    pub fn index_mut(&mut self) -> &mut crate::cli::leindex::LeIndex {
-        &mut *self.guard
-    }
-
-    /// Get the PDG reference. Panics if PDG was not loaded.
-    /// Always safe after `new()`. Use `maybe_pdg()` for optional access.
-    #[inline]
-    pub fn pdg(&self) -> &crate::graph::pdg::ProgramDependenceGraph {
-        self.guard.pdg().expect(
-            "HandlerContext::pdg() called but PDG not loaded — use new(), not new_optional_pdg()",
-        )
-    }
-
-    /// Get the PDG reference if loaded, `None` otherwise.
-    #[inline]
-    pub fn maybe_pdg(&self) -> Option<&crate::graph::pdg::ProgramDependenceGraph> {
-        self.guard.pdg()
-    }
-
-    /// The project root path.
-    #[inline]
-    pub fn project_path(&self) -> &std::path::Path {
-        self.guard.project_path()
-    }
-
-    /// The storage path.
-    #[inline]
-    pub fn storage_path(&self) -> &std::path::Path {
-        self.guard.storage_path()
-    }
-}
 
 /// Shared test helper: creates a `ProjectRegistry` with a single project rooted at `path`.
 #[cfg(test)]

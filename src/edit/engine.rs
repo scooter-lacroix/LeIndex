@@ -322,6 +322,9 @@ impl EditEngine {
         // Merge worktree back to main
         session.merge().await?;
 
+        // Capture modified content for redo
+        let modified_content = std::fs::read_to_string(&request.file_path).ok();
+
         // Record in history
         let mut history = self.history.lock().await;
         history.record_command(EditCommand::Edit {
@@ -330,6 +333,7 @@ impl EditEngine {
             changes: request.changes.clone(),
             timestamp: chrono::Utc::now(),
             original_content,
+            modified_content,
         });
 
         Ok(EditResult {
@@ -715,14 +719,30 @@ impl EditEngine {
     pub async fn redo(&self) -> Result<EditResult> {
         let mut history = self.history.lock().await;
         match history.redo() {
-            Some(EditCommand::Edit { file_path, .. }) => Ok(EditResult {
-                success: true,
-                changes_applied: 1,
-                files_modified: vec![file_path.clone()],
-                modified_contents: None,
-                original_contents: None,
-                error: None,
-            }),
+            Some(EditCommand::Edit {
+                file_path,
+                modified_content,
+                ..
+            }) => {
+                // Write the modified content back to the file
+                if let Some(content) = modified_content {
+                    std::fs::write(&file_path, content.as_bytes()).map_err(|e| {
+                        EditError::Generic(format!(
+                            "Failed to write '{}': {}",
+                            file_path.display(),
+                            e
+                        ))
+                    })?;
+                }
+                Ok(EditResult {
+                    success: true,
+                    changes_applied: 1,
+                    files_modified: vec![file_path.clone()],
+                    modified_contents: None,
+                    original_contents: None,
+                    error: None,
+                })
+            }
             Some(EditCommand::Rename {
                 modified_contents,
                 original_contents,
