@@ -206,13 +206,8 @@ use leindex_read_symbol."
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::leindex::LeIndex;
+    use crate::cli::mcp::helpers::test_registry_for;
     use tempfile::tempdir;
-
-    fn test_registry_for(path: &std::path::Path) -> Arc<ProjectRegistry> {
-        let leindex = LeIndex::new(path).expect("leindex");
-        Arc::new(ProjectRegistry::with_initial_project(5, leindex))
-    }
 
     #[tokio::test]
     async fn test_file_summary_requires_indexed_project() {

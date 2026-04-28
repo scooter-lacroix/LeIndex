@@ -464,19 +464,17 @@ pub(crate) fn phase_analysis_schema() -> Value {
     })
 }
 
+/// Shared test helper: creates a `ProjectRegistry` with a single project rooted at `path`.
+#[cfg(test)]
+pub(crate) fn test_registry_for(path: &std::path::Path) -> std::sync::Arc<crate::cli::registry::ProjectRegistry> {
+    let leindex = crate::cli::leindex::LeIndex::new(path).expect("leindex");
+    std::sync::Arc::new(crate::cli::registry::ProjectRegistry::with_initial_project(5, leindex))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use tempfile::tempdir;
-    use crate::cli::leindex::LeIndex;
-    use crate::cli::registry::ProjectRegistry;
-
-    #[allow(dead_code)]
-    fn test_registry_for(path: &std::path::Path) -> Arc<ProjectRegistry> {
-        let leindex = LeIndex::new(path).expect("leindex");
-        Arc::new(ProjectRegistry::with_initial_project(5, leindex))
-    }
 
     #[test]
     fn test_extract_string() {

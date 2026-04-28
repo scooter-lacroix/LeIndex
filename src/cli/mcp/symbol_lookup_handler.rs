@@ -340,15 +340,8 @@ For the exact source implementation use leindex_read_symbol."
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::leindex::LeIndex;
-    use crate::cli::registry::ProjectRegistry;
+    use crate::cli::mcp::helpers::test_registry_for;
     use tempfile::tempdir;
-
-    #[allow(dead_code)]
-    fn test_registry_for(path: &std::path::Path) -> Arc<ProjectRegistry> {
-        let leindex = LeIndex::new(path).expect("leindex");
-        Arc::new(ProjectRegistry::with_initial_project(5, leindex))
-    }
 
     #[test]
     fn test_symbol_lookup_schema_supports_batch() {
