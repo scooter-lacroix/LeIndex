@@ -1,6 +1,7 @@
 use super::helpers::*;
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
+use crate::edit::replace_whole_word;
 use serde_json::Value;
 use std::sync::Arc;
 

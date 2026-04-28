@@ -1,5 +1,5 @@
 use super::protocol::JsonRpcError;
-use crate::edit::EditChange;
+use crate::edit::{replace_whole_word, EditChange};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -322,26 +322,6 @@ pub(crate) fn apply_changes_in_memory(content: &str, changes: &[EditChange]) -> 
     }
 
     Ok(modified)
-}
-
-/// Replace `old` with `new` only at word boundaries.
-pub(crate) fn replace_whole_word(content: &str, old: &str, new: &str) -> String {
-    if old.is_empty() { return content.to_owned(); }
-    fn is_word_char(c: char) -> bool { c.is_alphanumeric() || c == '_' }
-    let mut result = String::with_capacity(content.len());
-    let mut last_match_end = 0usize;
-    for (start, matched) in content.match_indices(old) {
-        let end = start + matched.len();
-        let before_ok = start == 0 || content[..start].chars().last().map(|c| !is_word_char(c)).unwrap_or(true);
-        let after_ok = end == content.len() || content[end..].chars().next().map(|c| !is_word_char(c)).unwrap_or(true);
-        if before_ok && after_ok {
-            result.push_str(&content[last_match_end..start]);
-            result.push_str(new);
-            last_match_end = end;
-        }
-    }
-    result.push_str(&content[last_match_end..]);
-    result
 }
 
 /// Normalise whitespace in a string.
