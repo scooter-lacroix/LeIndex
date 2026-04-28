@@ -146,6 +146,21 @@ impl LeIndex {
             );
         }
 
+        // Build a lookup from file path to source bytes (avoids re-reading from disk)
+        let source_bytes_by_file: std::collections::HashMap<String, Vec<u8>> = parsing_results
+            .iter()
+            .filter_map(|r| {
+                if r.is_success() {
+                    Some((
+                        r.file_path.display().to_string(),
+                        r.source_bytes.clone().unwrap_or_default(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
         let signatures_by_file: std::collections::HashMap<String, (String, Vec<crate::parse::traits::SignatureInfo>)> =
             parsing_results
                 .iter()
@@ -163,7 +178,8 @@ impl LeIndex {
                 .collect();
 
         for (file_path, (language, signatures)) in signatures_by_file {
-            let file_pdg = crate::graph::extract_pdg_from_signatures(signatures, &[], &file_path, &language);
+            let source_bytes = source_bytes_by_file.get(&file_path).map(|s| s.as_slice()).unwrap_or(&[]);
+            let file_pdg = crate::graph::extract_pdg_from_signatures(signatures, source_bytes, &file_path, &language);
             index_builder::merge_pdgs(&mut pdg, file_pdg);
 
             if let Some((_, hash)) = source_files_with_hashes
