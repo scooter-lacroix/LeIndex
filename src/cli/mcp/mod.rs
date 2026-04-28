@@ -22,6 +22,9 @@
 // }
 // ```
 
+/// Dispatch macro for `ToolHandler` enum and match-arm generation.
+#[macro_use]
+pub mod macros;
 /// Request handlers for MCP tools.
 pub mod handlers;
 /// MCP protocol definitions and JSON-RPC types.
