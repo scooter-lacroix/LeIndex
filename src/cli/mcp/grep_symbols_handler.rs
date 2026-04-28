@@ -4,9 +4,89 @@ use super::helpers::{
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
+use crate::graph::pdg::{NodeId, ProgramDependenceGraph};
+use crate::search::ranking::Score;
 use regex::RegexBuilder;
 use serde_json::Value;
 use std::sync::Arc;
+
+/// Options for building a symbol entry in grep results.
+struct SymbolEntryOpts {
+    context_lines: usize,
+    include_source: bool,
+    score: Option<Score>,
+}
+
+/// Build a JSON symbol entry from a PDG node.
+///
+/// Extracts common logic shared by all three search modes (semantic, exact, regex)
+/// into a single helper. Produces identical output to the original inline code.
+fn build_symbol_entry(pdg: &ProgramDependenceGraph, nid: NodeId, opts: &SymbolEntryOpts) -> Value {
+    let node = match pdg.get_node(nid) {
+        Some(n) => n,
+        None => return Value::Null,
+    };
+
+    let caller_ids = get_direct_callers(pdg, nid);
+    let callers: Vec<String> = caller_ids
+        .iter()
+        .take(50)
+        .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
+        .collect();
+    let callee_ids = pdg.neighbors(nid);
+    let callees: Vec<String> = callee_ids
+        .iter()
+        .take(50)
+        .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
+        .collect();
+
+    let mut entry = serde_json::json!({
+        "name": node.name,
+        "type": node_type_str(&node.node_type),
+        "file": node.file_path,
+        "byte_range": node.byte_range,
+        "complexity": node.complexity,
+        "caller_count": caller_ids.len(),
+        "dependency_count": callees.len(),
+        "callers": callers,
+        "callees": callees,
+        "language": node.language,
+    });
+
+    if let Some(score) = opts.score {
+        entry["score"] = serde_json::json!(score);
+    }
+
+    let source = if opts.context_lines > 0 || opts.include_source {
+        read_source_snippet(&node.file_path, node.byte_range)
+    } else {
+        None
+    };
+
+    if opts.context_lines > 0 {
+        if let Some(ref src) = source {
+            let snippet: String = src
+                .lines()
+                .take(opts.context_lines)
+                .collect::<Vec<_>>()
+                .join("\n");
+            entry["context"] = Value::String(snippet);
+        }
+    }
+
+    if opts.include_source {
+        if let Some(ref src) = source {
+            let truncated: String = src.chars().take(4000).collect();
+            let was_truncated = src.char_indices().nth(4000).is_some();
+            entry["source"] = Value::String(truncated);
+            if was_truncated {
+                entry["source_truncated"] = Value::Bool(true);
+            }
+        }
+    }
+
+    entry
+}
 
 /// Handler for leindex_grep_symbols — structurally-aware symbol search.
 #[derive(Clone)]
@@ -116,14 +196,20 @@ impl GrepSymbolsHandler {
 
         const MAX_CANDIDATE_LIMIT: usize = 1000;
         let effective_fetch = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
-        let mut candidate_limit = effective_fetch.saturating_mul(5).clamp(50, MAX_CANDIDATE_LIMIT);
+        let mut candidate_limit = effective_fetch
+            .saturating_mul(5)
+            .clamp(50, MAX_CANDIDATE_LIMIT);
         let mut candidate_results = index
             .search(&pattern, candidate_limit, None)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
-        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+        index
+            .ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         if index.pdg().is_none() {
-            return Err(JsonRpcError::project_not_indexed(index.project_path().display().to_string()));
+            return Err(JsonRpcError::project_not_indexed(
+                index.project_path().display().to_string(),
+            ));
         }
 
         let pattern_lower = pattern.to_lowercase();
@@ -131,14 +217,17 @@ impl GrepSymbolsHandler {
 
         let fetch_limit = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut seen_locations: std::collections::HashSet<(String, (usize, usize))> = std::collections::HashSet::new();
+        let mut seen_locations: std::collections::HashSet<(String, (usize, usize))> =
+            std::collections::HashSet::new();
         let mut all_matches: Vec<Value> = Vec::new();
 
         let scope_prefix: Option<String> = scope.as_ref().map(|s| {
             let base = s.trim_end_matches(std::path::MAIN_SEPARATOR);
             format!("{}{}", base, std::path::MAIN_SEPARATOR)
         });
-        let scope_exact: Option<String> = scope.as_ref().map(|s| s.trim_end_matches(std::path::MAIN_SEPARATOR).to_string());
+        let scope_exact: Option<String> = scope
+            .as_ref()
+            .map(|s| s.trim_end_matches(std::path::MAIN_SEPARATOR).to_string());
 
         if mode == "semantic" {
             'semantic_retry: for _attempt in 0..2 {
@@ -146,7 +235,9 @@ impl GrepSymbolsHandler {
                 seen_ids.clear();
                 seen_locations.clear();
 
-                index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+                index.ensure_pdg_loaded().map_err(|e| {
+                    JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e))
+                })?;
 
                 for result in &candidate_results {
                     if all_matches.len() >= fetch_limit {
@@ -162,7 +253,9 @@ impl GrepSymbolsHandler {
                     };
 
                     if let Some(ref prefix) = scope_prefix {
-                        if !(node.file_path.starts_with(prefix) || node.file_path == *scope_exact.as_ref().unwrap()) {
+                        if !(node.file_path.starts_with(prefix)
+                            || node.file_path == *scope_exact.as_ref().unwrap())
+                        {
                             continue;
                         }
                     }
@@ -170,55 +263,21 @@ impl GrepSymbolsHandler {
                         continue;
                     }
 
-                    if matches!(node.node_type, crate::graph::pdg::NodeType::External) && type_filter != "external" {
+                    if matches!(node.node_type, crate::graph::pdg::NodeType::External)
+                        && type_filter != "external"
+                    {
                         continue;
                     }
 
-                    let (caller_ids, callers, callees) = if let Some(pdg) = index.pdg() {
-                        let caller_ids = get_direct_callers(pdg, nid);
-                        let callers: Vec<String> = caller_ids.iter().take(50).filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone())).collect();
-                        let callee_ids = pdg.neighbors(nid);
-                        let callees: Vec<String> = callee_ids.iter().take(50).filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone())).collect();
-                        (caller_ids, callers, callees)
-                    } else {
-                        (Vec::new(), Vec::new(), Vec::new())
-                    };
-
-                    let mut entry = serde_json::json!({
-                        "name": node.name,
-                        "type": node_type_str(&node.node_type),
-                        "file": node.file_path,
-                        "byte_range": node.byte_range,
-                        "complexity": node.complexity,
-                        "caller_count": caller_ids.len(),
-                        "dependency_count": callees.len(),
-                        "callers": callers,
-                        "callees": callees,
-                        "language": node.language,
-                        "score": result.score,
-                    });
-
-                    let source = if context_lines > 0 || include_source {
-                        read_source_snippet(&node.file_path, node.byte_range)
-                    } else {
-                        None
-                    };
-                    if context_lines > 0 {
-                        if let Some(ref src) = source {
-                            let snippet: String = src.lines().take(context_lines).collect::<Vec<_>>().join("\n");
-                            entry["context"] = Value::String(snippet);
-                        }
-                    }
-                    if include_source {
-                        if let Some(ref src) = source {
-                            let truncated: String = src.chars().take(4000).collect();
-                            let was_truncated = src.char_indices().nth(4000).is_some();
-                            entry["source"] = Value::String(truncated);
-                            if was_truncated {
-                                entry["source_truncated"] = Value::Bool(true);
-                            }
-                        }
-                    }
+                    let entry = build_symbol_entry(
+                        index.pdg().unwrap(),
+                        nid,
+                        &SymbolEntryOpts {
+                            context_lines,
+                            include_source,
+                            score: Some(result.score),
+                        },
+                    );
                     all_matches.push(entry);
                 }
 
@@ -226,9 +285,10 @@ impl GrepSymbolsHandler {
                     let expanded = (candidate_limit * 10).min(1000);
                     if expanded > candidate_limit {
                         candidate_limit = expanded;
-                        candidate_results = index
-                            .search(&pattern, candidate_limit, None)
-                            .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
+                        candidate_results =
+                            index.search(&pattern, candidate_limit, None).map_err(|e| {
+                                JsonRpcError::search_failed(format!("Search error: {}", e))
+                            })?;
                         continue 'semantic_retry;
                     }
                 }
@@ -236,7 +296,11 @@ impl GrepSymbolsHandler {
             }
 
             let total_matches = all_matches.len();
-            let paginated: Vec<Value> = all_matches.into_iter().skip(offset).take(max_results).collect();
+            let paginated: Vec<Value> = all_matches
+                .into_iter()
+                .skip(offset)
+                .take(max_results)
+                .collect();
 
             let mut truncated_results: Vec<Value> = Vec::new();
             let mut used_chars: usize = 0;
@@ -277,7 +341,9 @@ impl GrepSymbolsHandler {
                 None => continue,
             };
 
-            if matches!(node.node_type, crate::graph::pdg::NodeType::External) && type_filter != "external" {
+            if matches!(node.node_type, crate::graph::pdg::NodeType::External)
+                && type_filter != "external"
+            {
                 continue;
             }
 
@@ -299,7 +365,8 @@ impl GrepSymbolsHandler {
                 || node.id.to_lowercase().contains(&pattern_lower);
 
             let location_key = (node.file_path.clone(), node.byte_range);
-            let is_duplicate_location = node.byte_range != (0, 0) && seen_locations.contains(&location_key);
+            let is_duplicate_location =
+                node.byte_range != (0, 0) && seen_locations.contains(&location_key);
             if !matches || seen_ids.contains(&node.id) || is_duplicate_location {
                 continue;
             }
@@ -308,56 +375,15 @@ impl GrepSymbolsHandler {
                 seen_locations.insert(location_key);
             }
 
-            let caller_ids = get_direct_callers(pdg, nid);
-            let caller_count = caller_ids.len();
-            let callers: Vec<String> = caller_ids
-                .iter()
-                .take(50)
-                .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
-                .collect();
-            let callee_ids = pdg.neighbors(nid);
-            let dep_count = callee_ids.len();
-            let callees: Vec<String> = callee_ids
-                .iter()
-                .take(50)
-                .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
-                .collect();
-
-            let mut entry = serde_json::json!({
-                "name": node.name,
-                "type": node_type_str(&node.node_type),
-                "file": node.file_path,
-                "byte_range": node.byte_range,
-                "complexity": node.complexity,
-                "caller_count": caller_count,
-                "dependency_count": dep_count,
-                "callers": callers,
-                "callees": callees,
-                "language": node.language
-            });
-
-            if context_lines > 0 {
-                if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
-                    let snippet: String = src
-                        .lines()
-                        .take(context_lines)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    entry["context"] = Value::String(snippet);
-                }
-            }
-
-            if include_source {
-                if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
-                    let truncated: String = src.chars().take(4000).collect();
-                    let was_truncated = src.char_indices().nth(4000).is_some();
-                    entry["source"] = Value::String(truncated);
-                    if was_truncated {
-                        entry["source_truncated"] = Value::Bool(true);
-                    }
-                }
-            }
-
+            let entry = build_symbol_entry(
+                pdg,
+                nid,
+                &SymbolEntryOpts {
+                    context_lines,
+                    include_source,
+                    score: None,
+                },
+            );
             all_matches.push(entry);
         }
 
@@ -376,7 +402,9 @@ impl GrepSymbolsHandler {
                     continue;
                 };
 
-                if matches!(node.node_type, crate::graph::pdg::NodeType::External) && type_filter != "external" {
+                if matches!(node.node_type, crate::graph::pdg::NodeType::External)
+                    && type_filter != "external"
+                {
                     continue;
                 }
 
@@ -400,7 +428,8 @@ impl GrepSymbolsHandler {
                 };
 
                 let location_key = (node.file_path.clone(), node.byte_range);
-                let is_duplicate_location = node.byte_range != (0, 0) && seen_locations.contains(&location_key);
+                let is_duplicate_location =
+                    node.byte_range != (0, 0) && seen_locations.contains(&location_key);
                 if !matches || seen_ids.contains(&node.id) || is_duplicate_location {
                     continue;
                 }
@@ -409,62 +438,25 @@ impl GrepSymbolsHandler {
                     seen_locations.insert(location_key);
                 }
 
-                let caller_ids = get_direct_callers(pdg, nid);
-                let caller_count = caller_ids.len();
-                let callers: Vec<String> = caller_ids
-                    .iter()
-                    .take(50)
-                    .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
-                    .collect();
-                let callee_ids = pdg.neighbors(nid);
-                let dep_count = callee_ids.len();
-                let callees: Vec<String> = callee_ids
-                    .iter()
-                    .take(50)
-                    .filter_map(|id| pdg.get_node(*id).map(|n| n.name.clone()))
-                    .collect();
-
-                let mut entry = serde_json::json!({
-                    "name": node.name,
-                    "type": node_type_str(&node.node_type),
-                    "file": node.file_path,
-                    "byte_range": node.byte_range,
-                    "complexity": node.complexity,
-                    "caller_count": caller_count,
-                    "dependency_count": dep_count,
-                    "callers": callers,
-                    "callees": callees,
-                    "language": node.language
-                });
-
-                if context_lines > 0 {
-                    if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
-                        let snippet: String = src
-                            .lines()
-                            .take(context_lines)
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        entry["context"] = Value::String(snippet);
-                    }
-                }
-
-                if include_source {
-                    if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
-                        let truncated: String = src.chars().take(4000).collect();
-                        let was_truncated = src.char_indices().nth(4000).is_some();
-                        entry["source"] = Value::String(truncated);
-                        if was_truncated {
-                            entry["source_truncated"] = Value::Bool(true);
-                        }
-                    }
-                }
-
+                let entry = build_symbol_entry(
+                    pdg,
+                    nid,
+                    &SymbolEntryOpts {
+                        context_lines,
+                        include_source,
+                        score: None,
+                    },
+                );
                 all_matches.push(entry);
             }
         }
 
         let total_matches = all_matches.len();
-        let paginated: Vec<Value> = all_matches.into_iter().skip(offset).take(max_results).collect();
+        let paginated: Vec<Value> = all_matches
+            .into_iter()
+            .skip(offset)
+            .take(max_results)
+            .collect();
 
         let mut truncated_results: Vec<Value> = Vec::new();
         let mut used_chars: usize = 0;
