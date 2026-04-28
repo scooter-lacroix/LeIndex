@@ -444,26 +444,17 @@ impl SearchEngine {
         self.text_index.clear();
         self.search_cache.clear();
         self.node_id_to_idx.clear();
-
-        // Store nodes for text search
-        self.nodes = nodes.clone();
+        self.vector_index.clear();
 
         // Build node_id_to_idx for O(1) node lookups (A1 optimization)
+        // Build complexity cache and inverted index before taking ownership
         for (idx, node) in nodes.iter().enumerate() {
             self.node_id_to_idx.insert(node.node_id.clone(), idx);
-        }
-
-        // Build complexity cache for O(1) lookups
-        for node in &nodes {
             self.complexity_cache
                 .insert(node.node_id.clone(), node.complexity);
-        }
 
-        // Build inverted index for O(1) text lookups
-        // This maps each token to the set of node IDs containing it
-        for node in &nodes {
-            // Tokenize content into individual words, splitting on word boundaries
-            // This handles punctuation and special characters properly
+            // Build inverted index for O(1) text lookups
+            // This maps each token to the set of node IDs containing it
             for token in node.content.split(|c: char| !c.is_alphanumeric()) {
                 let normalized_token: String = token.to_ascii_lowercase();
                 // Skip empty tokens and very short ones (< 2 chars) to reduce noise
@@ -476,10 +467,11 @@ impl SearchEngine {
             }
         }
 
-        // Build vector index from embeddings
-        for node in nodes {
-            if let Some(embedding) = node.embedding {
-                if let Err(e) = self.vector_index.insert(node.node_id.clone(), embedding) {
+        // Build vector index from embeddings — clone only embeddings (A4 optimization)
+        // All other node content is moved via ownership, avoiding a full Vec clone
+        for node in &nodes {
+            if let Some(embedding) = &node.embedding {
+                if let Err(e) = self.vector_index.insert(node.node_id.clone(), embedding.clone()) {
                     tracing::warn!(
                         "Failed to insert embedding for node {}: {:?}",
                         node.node_id,
@@ -488,6 +480,9 @@ impl SearchEngine {
                 }
             }
         }
+
+        // Move nodes into storage — no clone needed since indexes are already built
+        self.nodes = nodes;
     }
 
     /// Get the number of indexed nodes
