@@ -565,6 +565,14 @@ impl SerializablePDG {
             pdg.embedding_store.insert(node_id, embedding.clone());
         }
 
+        // Rebuild name_file_index from nodes (not serialized separately)
+        for nid in pdg.graph.node_indices() {
+            if let Some(node) = pdg.graph.node_weight(nid) {
+                pdg.name_file_index
+                    .insert((node.name.clone(), node.file_path.clone()), nid);
+            }
+        }
+
         Ok(pdg)
     }
 }
@@ -626,6 +634,13 @@ pub struct ProgramDependenceGraph {
     /// ~300MB; this optional store is populated on demand.
     pub embedding_store: EmbeddingStore,
 
+    /// O(1) lookup by (name, file_path) pair.
+    ///
+    /// Used by `find_by_name_in_file()` when a file hint is provided,
+    /// replacing the linear scan through `name_index` candidates.
+    /// Populated during `add_node()`, cleaned up in `remove_node()`.
+    name_file_index: HashMap<(String, String), NodeId>,
+
     /// Reusable scratch buffer for BFS neighbor collection.
     ///
     /// Avoids allocating a new `Vec<NodeId>` on every BFS level iteration.
@@ -644,6 +659,7 @@ impl Clone for ProgramDependenceGraph {
             name_index: self.name_index.clone(),
             name_lower_index: self.name_lower_index.clone(),
             embedding_store: self.embedding_store.clone(),
+            name_file_index: self.name_file_index.clone(),
             bfs_scratch: Mutex::new(Vec::new()),
         }
     }
@@ -659,6 +675,7 @@ impl ProgramDependenceGraph {
             name_index: HashMap::new(),
             name_lower_index: HashMap::new(),
             embedding_store: EmbeddingStore::new(),
+            name_file_index: HashMap::new(),
             bfs_scratch: Mutex::new(Vec::new()),
         }
     }
@@ -695,6 +712,8 @@ impl ProgramDependenceGraph {
             .entry(node.name.to_lowercase())
             .or_default()
             .push(id);
+        self.name_file_index
+            .insert((node.name.clone(), node.file_path.clone()), id);
         id
     }
 
@@ -736,6 +755,8 @@ impl ProgramDependenceGraph {
             if let Some(v) = self.name_lower_index.get_mut(&node.name.to_lowercase()) {
                 v.retain(|&id| id != node_id);
             }
+            self.name_file_index
+                .remove(&(node.name.clone(), node.file_path.clone()));
             Some(node)
         } else {
             None
@@ -988,6 +1009,13 @@ impl ProgramDependenceGraph {
     /// Find by name with optional file hint.
     /// All lookups are index-backed — no O(n) scans.
     pub fn find_by_name_in_file(&self, name: &str, file_hint: Option<&str>) -> Option<NodeId> {
+        // 0. O(1) exact lookup via name_file_index when file hint is provided
+        if let Some(fp) = file_hint {
+            if let Some(&nid) = self.name_file_index.get(&(name.to_string(), fp.to_string())) {
+                return Some(nid);
+            }
+        }
+
         // 1. Exact match via name_index
         let candidates = self.name_index.get(name).cloned().unwrap_or_default();
         if !candidates.is_empty() {
@@ -1498,6 +1526,43 @@ mod tests {
         // Case-insensitive lookup should use name_lower_index, not scan
         let result = pdg.find_by_name_in_file("FUNC42", None);
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn name_file_index_provides_o1_lookup() {
+        let mut pdg = ProgramDependenceGraph::new();
+
+        // Add nodes with same name in different files
+        let a = pdg.add_node(make_node("a.rs:foo", "foo", "a.rs", NodeType::Function));
+        let b = pdg.add_node(make_node("b.rs:foo", "foo", "b.rs", NodeType::Function));
+        let c = pdg.add_node(make_node("c.rs:foo", "foo", "c.rs", NodeType::Function));
+
+        // Direct name_file_index lookup with file hint returns correct node
+        assert_eq!(pdg.find_by_name_in_file("foo", Some("a.rs")), Some(a));
+        assert_eq!(pdg.find_by_name_in_file("foo", Some("b.rs")), Some(b));
+        assert_eq!(pdg.find_by_name_in_file("foo", Some("c.rs")), Some(c));
+
+        // Non-existent file returns None for exact match but falls through
+        assert_eq!(pdg.find_by_name_in_file("foo", Some("z.rs")), Some(a));
+    }
+
+    #[test]
+    fn name_file_index_maintained_on_remove() {
+        let mut pdg = ProgramDependenceGraph::new();
+        let a = pdg.add_node(make_node("a.rs:foo", "foo", "a.rs", NodeType::Function));
+        let b = pdg.add_node(make_node("b.rs:bar", "bar", "b.rs", NodeType::Function));
+
+        // Verify lookups work before removal
+        assert_eq!(pdg.find_by_name_in_file("foo", Some("a.rs")), Some(a));
+        assert_eq!(pdg.find_by_name_in_file("bar", Some("b.rs")), Some(b));
+
+        // Remove node a
+        pdg.remove_node(a);
+
+        // name_file_index should no longer find removed node
+        assert_eq!(pdg.find_by_name_in_file("foo", Some("a.rs")), None);
+        // b should still be found
+        assert_eq!(pdg.find_by_name_in_file("bar", Some("b.rs")), Some(b));
     }
 
     #[test]
