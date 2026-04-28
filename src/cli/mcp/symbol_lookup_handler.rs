@@ -305,7 +305,7 @@ For the exact source implementation use leindex_read_symbol."
         );
         let affected_files: std::collections::HashSet<&str> = forward
             .iter()
-            .filter_map(|&nid| pdg.get_node(nid).map(|n| n.file_path.as_str()))
+            .filter_map(|&nid| pdg.get_node(nid).map(|n| n.file_path.as_ref()))
             .collect();
         let impact_radius = serde_json::json!({
             "affected_symbols": forward.len(),

@@ -99,7 +99,7 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
             .map(|s| s.chars().take(char_budget).collect::<String>());
 
         let doc_comment = (|| {
-            let file_bytes = std::fs::read(&node.file_path).ok()?;
+            let file_bytes = std::fs::read(&*node.file_path).ok()?;
             let end = node.byte_range.0.min(file_bytes.len());
             let up_to_def = String::from_utf8_lossy(&file_bytes[..end]).into_owned();
             let mut comment_lines: Vec<&str> = Vec::new();
@@ -180,7 +180,7 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
             .filter_map(|&cid| {
                 let cn = pdg.get_node(cid)?;
                 let caller_line = {
-                    let fc = std::fs::read_to_string(&cn.file_path).unwrap_or_default();
+                    let fc = std::fs::read_to_string(&*cn.file_path).unwrap_or_default();
                     byte_range_to_line_range(&fc, cn.byte_range).0
                 };
                 Some(serde_json::json!({
@@ -198,7 +198,7 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
             .filter_map(|&did| {
                 let dn = pdg.get_node(did)?;
                 let callee_line = {
-                    let fc = std::fs::read_to_string(&dn.file_path).unwrap_or_default();
+                    let fc = std::fs::read_to_string(&*dn.file_path).unwrap_or_default();
                     byte_range_to_line_range(&fc, dn.byte_range).0
                 };
                 Some(serde_json::json!({
@@ -211,7 +211,7 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
             .collect();
 
         let (line_start, line_end) = {
-            let file_content = std::fs::read_to_string(&node.file_path).unwrap_or_default();
+            let file_content = std::fs::read_to_string(&*node.file_path).unwrap_or_default();
             byte_range_to_line_range(&file_content, node.byte_range)
         };
 

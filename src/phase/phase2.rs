@@ -63,6 +63,7 @@ pub fn run(context: &PhaseExecutionContext) -> Phase2Summary {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use super::*;
     use crate::graph::pdg::{Edge, EdgeMetadata, Node};
     use crate::phase::context::PhaseExecutionContext;
@@ -81,7 +82,7 @@ mod tests {
             id: "src/main.rs:__module__".to_string(),
             node_type: NodeType::Module,
             name: "__module__".to_string(),
-            file_path: "src/main.rs".to_string(),
+            file_path: Arc::from("src/main.rs"),
             byte_range: (0, 0),
             complexity: 1,
             language: "rust".to_string(),
@@ -90,7 +91,7 @@ mod tests {
             id: "src/lib.rs:pkg::helper".to_string(),
             node_type: NodeType::Function,
             name: "helper".to_string(),
-            file_path: "src/lib.rs".to_string(),
+            file_path: Arc::from("src/lib.rs"),
             byte_range: (0, 0),
             complexity: 1,
             language: "rust".to_string(),
@@ -99,7 +100,7 @@ mod tests {
             id: "src/main.rs:__external__:third.party.lib".to_string(),
             node_type: NodeType::External,
             name: "third.party.lib".to_string(),
-            file_path: "src/main.rs".to_string(),
+            file_path: Arc::from("src/main.rs"),
             byte_range: (0, 0),
             complexity: 1,
             language: "external".to_string(),

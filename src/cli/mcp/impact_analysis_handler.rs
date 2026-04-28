@@ -107,7 +107,7 @@ to understand the blast radius of your change. No equivalent in standard tools."
             .collect();
         let affected_files: std::collections::HashSet<&str> = forward
             .iter()
-            .filter_map(|&nid| pdg.get_node(nid).map(|n| n.file_path.as_str()))
+            .filter_map(|&nid| pdg.get_node(nid).map(|n| n.file_path.as_ref()))
             .collect();
 
         let backward = pdg.backward_impact(

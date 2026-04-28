@@ -109,7 +109,7 @@ Grep + multi-file Edit with a single atomic operation."
 
             // The definition file
             if let Some(n) = pdg.get_node(node_id) {
-                ref_files.insert(n.file_path.clone());
+                ref_files.insert(n.file_path.to_string());
             }
             // Include all known incoming references, not just direct call edges.
             // This captures call, data, and transitive usage relationships.
@@ -121,14 +121,14 @@ Grep + multi-file Edit with a single atomic operation."
                 },
             ) {
                 if let Some(dn) = pdg.get_node(ref_id) {
-                    ref_files.insert(dn.file_path.clone());
+                    ref_files.insert(dn.file_path.to_string());
                 }
             }
             // Also include files where the old_name appears in other symbols' IDs
             // (e.g., imports or references that aren't captured as direct callers)
             for nid in pdg.find_all_by_name(&old_name) {
                 if let Some(n) = pdg.get_node(nid) {
-                    ref_files.insert(n.file_path.clone());
+                    ref_files.insert(n.file_path.to_string());
                 }
             }
         } else {

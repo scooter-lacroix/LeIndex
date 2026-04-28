@@ -254,7 +254,7 @@ impl GrepSymbolsHandler {
 
                     if let Some(ref prefix) = scope_prefix {
                         if !(node.file_path.starts_with(prefix)
-                            || node.file_path == *scope_exact.as_ref().unwrap())
+                            || node.file_path.as_ref() == scope_exact.as_ref().unwrap().as_str())
                         {
                             continue;
                         }
@@ -355,7 +355,7 @@ impl GrepSymbolsHandler {
 
             if let Some(ref s) = scope {
                 if !node.file_path.starts_with(s.as_str())
-                    && node.file_path != s.trim_end_matches(std::path::MAIN_SEPARATOR)
+                    && node.file_path.as_ref() != s.trim_end_matches(std::path::MAIN_SEPARATOR)
                 {
                     continue;
                 }
@@ -364,7 +364,7 @@ impl GrepSymbolsHandler {
             let matches = node.name.to_lowercase().contains(&pattern_lower)
                 || node.id.to_lowercase().contains(&pattern_lower);
 
-            let location_key = (node.file_path.clone(), node.byte_range);
+            let location_key = (node.file_path.to_string(), node.byte_range);
             let is_duplicate_location =
                 node.byte_range != (0, 0) && seen_locations.contains(&location_key);
             if !matches || seen_ids.contains(&node.id) || is_duplicate_location {
@@ -414,7 +414,7 @@ impl GrepSymbolsHandler {
 
                 if let Some(ref s) = scope {
                     if !node.file_path.starts_with(s.as_str())
-                        && node.file_path != s.trim_end_matches(std::path::MAIN_SEPARATOR)
+                        && node.file_path.as_ref() != s.trim_end_matches(std::path::MAIN_SEPARATOR)
                     {
                         continue;
                     }
@@ -427,7 +427,7 @@ impl GrepSymbolsHandler {
                         || node.id.to_lowercase().contains(&pattern_lower)
                 };
 
-                let location_key = (node.file_path.clone(), node.byte_range);
+                let location_key = (node.file_path.to_string(), node.byte_range);
                 let is_duplicate_location =
                     node.byte_range != (0, 0) && seen_locations.contains(&location_key);
                 if !matches || seen_ids.contains(&node.id) || is_duplicate_location {

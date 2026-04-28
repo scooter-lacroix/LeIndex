@@ -299,7 +299,7 @@ Works for any text file including configs and docs."
                             if dep.file_path != node.file_path {
                                 let dep_line = {
                                     let fc =
-                                        std::fs::read_to_string(&dep.file_path).unwrap_or_default();
+                                        std::fs::read_to_string(&*dep.file_path).unwrap_or_default();
                                     byte_range_to_line_range(&fc, dep.byte_range).0
                                 };
                                 imports_from.insert(format!(

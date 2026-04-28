@@ -80,6 +80,7 @@ mod tests {
     use super::*;
     use crate::graph::pdg::{Node as GraphNode, NodeType};
     use crate::search::search::EntryType;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_semantic_context_expansion() {
@@ -91,7 +92,7 @@ mod tests {
             id: "func1".to_string(),
             node_type: NodeType::Function,
             name: "func1".to_string(),
-            file_path: "test.rs".to_string(),
+            file_path: Arc::from("test.rs"),
             byte_range: (0, 50),
             complexity: 2,
             language: "rust".to_string(),
@@ -100,7 +101,7 @@ mod tests {
             id: "func2".to_string(),
             node_type: NodeType::Function,
             name: "func2".to_string(),
-            file_path: "test.rs".to_string(),
+            file_path: Arc::from("test.rs"),
             byte_range: (60, 100),
             complexity: 3,
             language: "rust".to_string(),

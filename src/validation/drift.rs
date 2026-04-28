@@ -529,7 +529,7 @@ mod tests {
             id: "my_func".to_string(),
             node_type: NodeType::Function,
             name: "my_func".to_string(),
-            file_path: "test.py".to_string(),
+            file_path: Arc::from("test.py"),
             byte_range: (0, 10),
             complexity: 1,
             language: "python".to_string(),

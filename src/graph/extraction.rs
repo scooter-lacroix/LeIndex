@@ -13,6 +13,7 @@ use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
 use crate::parse::prelude::SignatureInfo;
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Public entry point
@@ -142,7 +143,7 @@ fn infer_class_nodes_and_containment(
             id: format!("{}:{}", file_path, class_name),
             node_type: NodeType::Class,
             name: short_name,
-            file_path: file_path.to_string(),
+            file_path: Arc::from(file_path),
             byte_range: (
                 if min_start == usize::MAX {
                     0
@@ -1455,7 +1456,7 @@ fn extract_import_edges(
             id: module_sym,
             node_type: NodeType::Module,
             name: "__module__".to_string(),
-            file_path: file_path.to_string(),
+            file_path: Arc::from(file_path),
             byte_range: (0, 0),
             complexity: 1,
             language: language.to_string(),
@@ -1483,7 +1484,7 @@ fn extract_import_edges(
                     id: format!("{}:__external__:{}", file_path, path),
                     node_type: NodeType::External,
                     name: path.clone(),
-                    file_path: file_path.to_string(),
+                    file_path: Arc::from(file_path),
                     byte_range: (0, 0),
                     complexity: 1,
                     language: "external".to_string(),
@@ -1602,7 +1603,7 @@ fn signature_to_node(sig: &SignatureInfo, file_path: &str, language: &str) -> No
         id: format!("{}:{}", file_path, sig.qualified_name),
         node_type,
         name: sig.name.clone(),
-        file_path: file_path.to_string(),
+        file_path: Arc::from(file_path),
         byte_range: sig.byte_range,
         complexity,
         language: language.to_string(),

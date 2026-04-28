@@ -311,7 +311,7 @@ mod tests {
             id: name.to_string(),
             node_type: NodeType::Function,
             name: name.to_string(),
-            file_path: format!("src/{}.rs", name),
+            file_path: std::sync::Arc::from(format!("src/{}.rs", name)),
             byte_range: (0, 100),
             complexity: 5,
             language: "rust".to_string(),

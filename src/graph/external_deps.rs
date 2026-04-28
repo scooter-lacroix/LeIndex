@@ -1240,6 +1240,7 @@ pub fn discover_dependency_manifests(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use super::*;
 
     #[test]
@@ -1562,7 +1563,7 @@ PLATFORMS
             id: "serde".to_string(),
             name: "serde".to_string(),
             node_type: NodeType::External,
-            file_path: "".to_string(),
+            file_path: Arc::from(""),
             byte_range: (0, 0),
             language: "external".to_string(),
             complexity: 0,
@@ -1572,7 +1573,7 @@ PLATFORMS
             id: "my_func".to_string(),
             name: "my_func".to_string(),
             node_type: NodeType::Function,
-            file_path: "src/lib.rs".to_string(),
+            file_path: Arc::from("src/lib.rs"),
             byte_range: (0, 100),
             language: "rust".to_string(),
             complexity: 5,
@@ -1701,7 +1702,7 @@ PLATFORMS
             id: "std".to_string(),
             name: "std".to_string(),
             node_type: NodeType::External,
-            file_path: "".to_string(),
+            file_path: Arc::from(""),
             byte_range: (0, 0),
             language: "external".to_string(),
             complexity: 0,
@@ -1725,7 +1726,7 @@ PLATFORMS
             id: "src/main.rs:__external__:react".to_string(),
             name: "react".to_string(),
             node_type: NodeType::External,
-            file_path: "src/main.rs".to_string(),
+            file_path: Arc::from("src/main.rs"),
             byte_range: (0, 0),
             language: "external".to_string(),
             complexity: 0,
@@ -1734,7 +1735,7 @@ PLATFORMS
             id: "src/app.ts:__external__:react".to_string(),
             name: "react".to_string(),
             node_type: NodeType::External,
-            file_path: "src/app.ts".to_string(),
+            file_path: Arc::from("src/app.ts"),
             byte_range: (0, 0),
             language: "external".to_string(),
             complexity: 0,

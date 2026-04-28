@@ -12,7 +12,7 @@ use petgraph::stable_graph::StableGraph;
 use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// A unique identifier for a node in the Program Dependence Graph.
 ///
@@ -58,7 +58,10 @@ pub struct Node {
     pub name: String,
 
     /// Absolute path to the file containing this node.
-    pub file_path: String,
+    ///
+    /// Uses `Arc<str>` for string interning: nodes in the same file share
+    /// the same allocation, avoiding per-node path duplication.
+    pub file_path: Arc<str>,
 
     /// Byte range (start, end) within the source file where this node is defined.
     pub byte_range: (usize, usize),
@@ -570,7 +573,7 @@ impl SerializablePDG {
         for nid in pdg.graph.node_indices() {
             if let Some(node) = pdg.graph.node_weight(nid) {
                 pdg.name_file_index
-                    .insert((node.name.clone(), node.file_path.clone()), nid);
+                    .insert((node.name.clone(), node.file_path.to_string()), nid);
             }
         }
 
@@ -702,7 +705,7 @@ impl ProgramDependenceGraph {
         let id = self.graph.add_node(node.clone());
         self.symbol_index.insert(node.id.clone(), id);
         self.file_index
-            .entry(node.file_path.clone())
+            .entry(node.file_path.to_string())
             .or_default()
             .push(id);
         self.name_index
@@ -714,7 +717,7 @@ impl ProgramDependenceGraph {
             .or_default()
             .push(id);
         self.name_file_index
-            .insert((node.name.clone(), node.file_path.clone()), id);
+            .insert((node.name.clone(), node.file_path.to_string()), id);
         id
     }
 
@@ -747,7 +750,7 @@ impl ProgramDependenceGraph {
         if let Some(node) = self.graph.remove_node(node_id) {
             self.symbol_index.remove(&node.id);
             self.embedding_store.remove(&node.id);
-            if let Some(v) = self.file_index.get_mut(&node.file_path) {
+            if let Some(v) = self.file_index.get_mut(&*node.file_path) {
                 v.retain(|&id| id != node_id);
             }
             if let Some(v) = self.name_index.get_mut(&node.name) {
@@ -757,7 +760,7 @@ impl ProgramDependenceGraph {
                 v.retain(|&id| id != node_id);
             }
             self.name_file_index
-                .remove(&(node.name.clone(), node.file_path.clone()));
+                .remove(&(node.name.clone(), node.file_path.to_string()));
             Some(node)
         } else {
             None
@@ -1023,7 +1026,7 @@ impl ProgramDependenceGraph {
             if let Some(fp) = file_hint {
                 if let Some(&nid) = candidates.iter().find(|&&nid| {
                     self.get_node(nid)
-                        .map(|n| n.file_path == fp)
+                        .map(|n| n.file_path.as_ref() == fp)
                         .unwrap_or(false)
                 }) {
                     return Some(nid);
@@ -1043,7 +1046,7 @@ impl ProgramDependenceGraph {
             if let Some(fp) = file_hint {
                 if let Some(&nid) = ci_candidates.iter().find(|&&nid| {
                     self.get_node(nid)
-                        .map(|n| n.file_path == fp)
+                        .map(|n| n.file_path.as_ref() == fp)
                         .unwrap_or(false)
                 }) {
                     return Some(nid);
@@ -1458,7 +1461,7 @@ mod tests {
             id: id.to_string(),
             node_type: ntype,
             name: name.to_string(),
-            file_path: file.to_string(),
+            file_path: Arc::from(file),
             byte_range: (0, 10),
             complexity: 2,
             language: "rust".to_string(),

@@ -168,7 +168,7 @@ leindex_edit_apply to understand the blast radius of your change."
                         for dep_id in &forward {
                             if let Some(dn) = pdg.get_node(*dep_id) {
                                 affected_nodes.push(dn.name.clone());
-                                affected_files.insert(dn.file_path.clone());
+                                affected_files.insert(dn.file_path.to_string());
                             }
                         }
                         let backward = pdg.backward_impact(

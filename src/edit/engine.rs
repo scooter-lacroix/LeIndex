@@ -458,7 +458,7 @@ impl EditEngine {
                         for dep_id in forward {
                             if let Some(dep_node) = self.pdg.get_node(dep_id) {
                                 affected_nodes.push(dep_node.name.clone());
-                                affected_files.insert(PathBuf::from(&dep_node.file_path));
+                                affected_files.insert(PathBuf::from(&*dep_node.file_path));
                             }
                         }
                         // Backward impact: callers that reference this symbol (rename risk)
@@ -474,7 +474,7 @@ impl EditEngine {
                             ));
                             for bid in backward {
                                 if let Some(bn) = self.pdg.get_node(bid) {
-                                    affected_files.insert(PathBuf::from(&bn.file_path));
+                                    affected_files.insert(PathBuf::from(&*bn.file_path));
                                 }
                             }
                         }
@@ -504,7 +504,7 @@ impl EditEngine {
                         for dep_id in forward {
                             if let Some(dep_node) = self.pdg.get_node(dep_id) {
                                 affected_nodes.push(dep_node.name.clone());
-                                affected_files.insert(PathBuf::from(&dep_node.file_path));
+                                affected_files.insert(PathBuf::from(&*dep_node.file_path));
                             }
                         }
                     }

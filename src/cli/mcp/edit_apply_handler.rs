@@ -234,7 +234,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 for &nid in &nodes {
                     for &cid in &get_direct_callers(pdg, nid) {
                         if let Some(cn) = pdg.get_node(cid) {
-                            if cn.file_path != file_path {
+                            if &*cn.file_path != file_path {
                                 callers.insert(format!("{}:{}", cn.file_path, cn.name));
                             }
                         }

@@ -496,10 +496,10 @@ pub(crate) fn index_nodes(
     for node_idx in pdg.node_indices() {
         if let Some(node) = pdg.get_node(node_idx) {
             let content = file_cache
-                .entry(node.file_path.clone())
+                .entry(node.file_path.to_string())
                 .or_insert_with(|| {
                     std::sync::Arc::new(
-                        std::fs::read(&node.file_path)
+                        std::fs::read(&*node.file_path)
                             .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
                             .unwrap_or_default(),
                     )
@@ -570,7 +570,7 @@ pub(crate) fn index_nodes(
 
             let node_info = NodeInfo {
                 node_id: node.id.clone(),
-                file_path: node.file_path.clone(),
+                file_path: node.file_path.to_string(),
                 symbol_name: node.name.clone(),
                 language: node.language.clone(),
                 content: node_content,
@@ -672,10 +672,11 @@ pub(crate) fn files_importing_from_manifests(
     for nid in pdg.node_indices() {
         if let Some(node) = pdg.get_node(nid) {
             if node.node_type == NodeType::External {
-                if !affected_set.contains(&node.file_path) {
-                    if source_set.contains(&node.file_path) {
-                        affected_set.insert(node.file_path.clone());
-                        affected.push(PathBuf::from(&node.file_path));
+                let fp = node.file_path.as_ref();
+                if !affected_set.contains(fp) {
+                    if source_set.contains(fp) {
+                        affected_set.insert(node.file_path.to_string());
+                        affected.push(PathBuf::from(&*node.file_path));
                     }
                 }
             }

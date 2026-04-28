@@ -264,7 +264,7 @@ impl LeIndex {
                 if let Some(node) = pdg.get_node(nid) {
                     (
                         node.id.clone(),
-                        node.file_path.clone(),
+                        node.file_path.to_string(),
                         node.name.clone(),
                         node.language.clone(),
                         node.byte_range,
@@ -368,7 +368,7 @@ impl LeIndex {
 
                 // Retrieve actual source code if byte_range is valid
                 if node.byte_range.1 > node.byte_range.0 {
-                    if let Ok(content) = std::fs::read(&node.file_path) {
+                    if let Ok(content) = std::fs::read(&*node.file_path) {
                         let start = node.byte_range.0;
                         let end = node.byte_range.1.min(content.len());
                         if let Ok(code) = std::str::from_utf8(&content[start..end]) {

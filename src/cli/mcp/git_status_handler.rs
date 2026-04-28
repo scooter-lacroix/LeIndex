@@ -186,7 +186,7 @@ Turns a raw diff into a structural change summary with blast radius."
                         // Track affected files
                         for &fid in &forward_impact {
                             if let Some(fnode) = pdg.get_node(fid) {
-                                affected_files_set.insert(fnode.file_path.clone());
+                                affected_files_set.insert(fnode.file_path.to_string());
                             }
                         }
 

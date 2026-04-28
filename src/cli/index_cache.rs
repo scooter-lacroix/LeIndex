@@ -109,7 +109,7 @@ impl IndexCache {
                     continue;
                 }
                 let entry = cache
-                    .entry(node.file_path.clone())
+                    .entry(node.file_path.to_string())
                     .or_insert_with(|| FileStats {
                         symbol_count: 0,
                         total_complexity: 0,
@@ -134,18 +134,18 @@ impl IndexCache {
                 for dep_id in pdg.neighbors(*nid) {
                     if let Some(dep) = pdg.get_node(dep_id) {
                         if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
-                            && dep.file_path != *file_path
+                            && dep.file_path.as_ref() != file_path.as_str()
                         {
-                            outgoing_files.insert(dep.file_path.clone());
+                            outgoing_files.insert(dep.file_path.to_string());
                         }
                     }
                 }
                 for dep_id in pdg.predecessors(*nid) {
                     if let Some(dep) = pdg.get_node(dep_id) {
                         if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
-                            && dep.file_path != *file_path
+                            && dep.file_path.as_ref() != file_path.as_str()
                         {
-                            incoming_files.insert(dep.file_path.clone());
+                            incoming_files.insert(dep.file_path.to_string());
                         }
                     }
                 }

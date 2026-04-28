@@ -178,7 +178,7 @@ impl ImpactAnalyzer {
             // Collect affected files
             for node_id in &affected {
                 if let Some(node) = self.pdg.get_node(*node_id) {
-                    affected_files.insert(PathBuf::from(&node.file_path));
+                    affected_files.insert(PathBuf::from(&*node.file_path));
 
                     // Check if this is a public API
                     if matches!(
@@ -370,7 +370,7 @@ mod tests {
             id: "my_func".to_string(),
             node_type: NodeType::Function,
             name: "my_func".to_string(),
-            file_path: "test.py".to_string(),
+            file_path: Arc::from("test.py"),
             byte_range: (0, 100),
             complexity: 1,
             language: "python".to_string(),
@@ -398,7 +398,7 @@ mod tests {
             id: "func_a".to_string(),
             node_type: NodeType::Function,
             name: "func_a".to_string(),
-            file_path: "a.py".to_string(),
+            file_path: Arc::from("a.py"),
             byte_range: (0, 100),
             complexity: 1,
             language: "python".to_string(),
@@ -408,7 +408,7 @@ mod tests {
             id: "func_b".to_string(),
             node_type: NodeType::Function,
             name: "func_b".to_string(),
-            file_path: "b.py".to_string(),
+            file_path: Arc::from("b.py"),
             byte_range: (0, 100),
             complexity: 1,
             language: "python".to_string(),
@@ -418,7 +418,7 @@ mod tests {
             id: "func_c".to_string(),
             node_type: NodeType::Function,
             name: "func_c".to_string(),
-            file_path: "c.py".to_string(),
+            file_path: Arc::from("c.py"),
             byte_range: (0, 100),
             complexity: 1,
             language: "python".to_string(),
@@ -469,7 +469,7 @@ mod tests {
             id: "public_func".to_string(),
             node_type: NodeType::Function,
             name: "public_func".to_string(),
-            file_path: "src/lib.rs".to_string(),
+            file_path: Arc::from("src/lib.rs"),
             byte_range: (0, 100),
             complexity: 1,
             language: "rust".to_string(),
@@ -488,7 +488,7 @@ mod tests {
             id: "test_func".to_string(),
             node_type: NodeType::Function,
             name: "test_func".to_string(),
-            file_path: "tests/test_lib.rs".to_string(),
+            file_path: Arc::from("tests/test_lib.rs"),
             byte_range: (0, 100),
             complexity: 1,
             language: "rust".to_string(),
@@ -507,7 +507,7 @@ mod tests {
             id: "internal_func".to_string(),
             node_type: NodeType::Function,
             name: "internal_func".to_string(),
-            file_path: "src/internal/mod.rs".to_string(),
+            file_path: Arc::from("src/internal/mod.rs"),
             byte_range: (0, 100),
             complexity: 1,
             language: "rust".to_string(),

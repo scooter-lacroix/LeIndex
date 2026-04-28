@@ -163,7 +163,7 @@ impl Refactor {
         for node_id in &seed_ids {
             if let Some(node) = pdg.get_node(*node_id) {
                 if node.node_type != crate::graph::pdg::NodeType::External {
-                    files.insert(PathBuf::from(&node.file_path));
+                    files.insert(PathBuf::from(&*node.file_path));
 
                     // Add files that reference this symbol via PDG edges
                     let impacted = pdg.forward_impact(*node_id, &traversal_config);
@@ -171,11 +171,11 @@ impl Refactor {
                     for imp_id in impacted {
                         if let Some(imp_node) = pdg.get_node(imp_id) {
                             if imp_node.node_type != crate::graph::pdg::NodeType::External {
-                                files.insert(PathBuf::from(&imp_node.file_path));
+                                files.insert(PathBuf::from(&*imp_node.file_path));
                                 // Collect byte ranges from impact nodes
                                 if imp_node.byte_range != (0, 0) {
                                     impact_ranges
-                                        .entry(imp_node.file_path.clone())
+                                        .entry(imp_node.file_path.to_string())
                                         .or_default()
                                         .push(imp_node.byte_range);
                                 }
@@ -187,11 +187,11 @@ impl Refactor {
                     for back_id in backward {
                         if let Some(back_node) = pdg.get_node(back_id) {
                             if back_node.node_type != crate::graph::pdg::NodeType::External {
-                                files.insert(PathBuf::from(&back_node.file_path));
+                                files.insert(PathBuf::from(&*back_node.file_path));
                                 // Collect byte ranges from impact nodes
                                 if back_node.byte_range != (0, 0) {
                                     impact_ranges
-                                        .entry(back_node.file_path.clone())
+                                        .entry(back_node.file_path.to_string())
                                         .or_default()
                                         .push(back_node.byte_range);
                                 }
@@ -245,7 +245,7 @@ impl Refactor {
             if let Some(node) = pdg.get_node(nid) {
                 if node.byte_range != (0, 0) {
                     matches_by_file
-                        .entry(node.file_path.clone())
+                        .entry(node.file_path.to_string())
                         .or_default()
                         .push(node.byte_range);
                 }
@@ -255,7 +255,7 @@ impl Refactor {
         for node_id in &seed_ids {
             if let Some(node) = pdg.get_node(*node_id) {
                 if node.byte_range != (0, 0) {
-                    let entry = matches_by_file.entry(node.file_path.clone()).or_default();
+                    let entry = matches_by_file.entry(node.file_path.to_string()).or_default();
                     if !entry.contains(&node.byte_range) {
                         entry.push(node.byte_range);
                     }
