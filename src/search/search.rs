@@ -17,6 +17,7 @@ use crate::search::vector::VectorIndex;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::collections::hash_map::Entry;
 use std::num::NonZeroUsize;
 
 // ============================================================================
@@ -108,6 +109,18 @@ impl VectorIndexImpl {
             Self::BruteForce(idx) => idx.clear(),
             Self::HNSW(idx) => idx.clear(),
             Self::HNSWQuantized(idx) => idx.clear(),
+        }
+    }
+
+    /// Remove a vector from the index by node ID.
+    ///
+    /// Returns `true` if the node was found and removed, `false` otherwise.
+    /// For HNSW indexes, removal is lazy (marks as deleted); use `rebuild()` to reclaim memory.
+    pub fn remove(&mut self, node_id: &str) -> bool {
+        match self {
+            Self::BruteForce(idx) => idx.remove(node_id),
+            Self::HNSW(idx) => idx.remove(node_id),
+            Self::HNSWQuantized(idx) => idx.remove(node_id),
         }
     }
 
@@ -501,6 +514,149 @@ impl SearchEngine {
         for node in &mut self.nodes {
             node.content.clear();
         }
+    }
+
+    /// Apply an incremental delta update to the text index.
+    ///
+    /// This removes and adds/updates nodes without rebuilding the entire index,
+    /// making it significantly faster than `index_nodes()` for small changes.
+    ///
+    /// # Arguments
+    ///
+    /// * `delta` - The delta describing nodes to remove and add/update.
+    ///
+    /// # Performance
+    ///
+    /// - Time complexity: O(K) where K is the number of changed nodes
+    /// - Full rebuild is O(N) — incremental is faster when K << N
+    ///
+    /// # Panics
+    ///
+    /// Panics if the total node count after the update exceeds `MAX_NODES`.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let delta = TextIndexDelta {
+    ///     removed_node_ids: vec!["old_func".to_string()],
+    ///     updated_nodes: vec![new_node],
+    /// };
+    /// engine.incremental_reindex(delta);
+    /// ```
+    pub fn incremental_reindex(&mut self, delta: TextIndexDelta) {
+        // Invalidate search cache — results may change
+        self.search_cache.clear();
+
+        // Phase 1: Remove nodes
+        for node_id in &delta.removed_node_ids {
+            self.remove_node_from_index(node_id);
+        }
+
+        // Phase 2: Add/update nodes
+        for node in delta.updated_nodes {
+            self.add_node_to_index(node);
+        }
+
+        // Verify we don't exceed limits
+        if self.nodes.len() > MAX_NODES {
+            panic!(
+                "Cannot index more than {} nodes (current: {})",
+                MAX_NODES,
+                self.nodes.len()
+            );
+        }
+    }
+
+    /// Remove a single node from all index structures.
+    ///
+    /// This is O(T) where T is the number of unique tokens in the removed node.
+    fn remove_node_from_index(&mut self, node_id: &str) {
+        // Remove from node_id_to_idx
+        let Some(removed_idx) = self.node_id_to_idx.remove(node_id) else {
+            return; // Node not in index, nothing to do
+        };
+
+        // Remove from text_index: for each token the node contributed to,
+        // remove the node_id from the token's set. Clean up empty sets.
+        if let Some(tokens) = self.node_tokens.remove(node_id) {
+            for token in tokens {
+                if let Entry::Occupied(mut entry) = self.text_index.entry(token) {
+                    entry.get_mut().remove(node_id);
+                    if entry.get().is_empty() {
+                        entry.remove();
+                    }
+                }
+            }
+        }
+
+        // Remove from complexity_cache
+        self.complexity_cache.remove(node_id);
+
+        // Remove from vector_index
+        self.vector_index.remove(node_id);
+
+        // Remove from nodes Vec and fix indices
+        // Swap-remove for O(1) removal, then fix the swapped node's index
+        if removed_idx < self.nodes.len() {
+            self.nodes.swap_remove(removed_idx);
+            // If we didn't remove the last element, the swapped element needs
+            // its index updated in node_id_to_idx
+            if removed_idx < self.nodes.len() {
+                let swapped_id = self.nodes[removed_idx].node_id.clone();
+                self.node_id_to_idx.insert(swapped_id, removed_idx);
+            }
+        }
+    }
+
+    /// Add or update a single node in all index structures.
+    ///
+    /// If the node already exists (same `node_id`), it is removed first, then
+    /// re-added with the new data.
+    fn add_node_to_index(&mut self, mut node: NodeInfo) {
+        // If node already exists, remove the old version first
+        if self.node_id_to_idx.contains_key(&node.node_id) {
+            self.remove_node_from_index(&node.node_id);
+        }
+
+        let node_id = node.node_id.clone();
+        let new_idx = self.nodes.len();
+
+        // Build inverted index entries and token cache for this node
+        let mut tokens = HashSet::new();
+        for token in node.content.split(|c: char| !c.is_alphanumeric()) {
+            let normalized_token: String = token.to_ascii_lowercase();
+            if normalized_token.len() >= 2 {
+                self.text_index
+                    .entry(normalized_token.clone())
+                    .or_default()
+                    .insert(node_id.clone());
+                tokens.insert(normalized_token);
+            }
+        }
+        self.node_tokens.insert(node_id.clone(), tokens);
+
+        // Update node_id_to_idx
+        self.node_id_to_idx.insert(node_id.clone(), new_idx);
+
+        // Update complexity_cache
+        self.complexity_cache.insert(node_id.clone(), node.complexity);
+
+        // Insert embedding into vector index
+        if let Some(embedding) = &node.embedding {
+            if let Err(e) = self.vector_index.insert(node_id.clone(), embedding.clone()) {
+                tracing::warn!(
+                    "Failed to insert embedding for node {}: {:?}",
+                    node_id,
+                    e
+                );
+            }
+        }
+
+        // Clear content to save memory (same as index_nodes does)
+        node.content.clear();
+
+        // Add to nodes Vec
+        self.nodes.push(node);
     }
 
     /// Get the number of indexed nodes
@@ -1024,6 +1180,34 @@ impl SearchEngine {
     }
 }
 
+/// Delta update for the text index.
+///
+/// Describes which nodes to remove and which to add/update, enabling
+/// incremental reindexing without rebuilding the entire index from scratch.
+///
+/// # Performance
+///
+/// Incremental updates are O(K) where K is the number of changed nodes,
+/// compared to O(N) for a full `index_nodes()` rebuild.
+///
+/// # Example
+///
+/// ```ignore
+/// let delta = TextIndexDelta {
+///     removed_node_ids: vec!["old_func".to_string()],
+///     updated_nodes: vec![updated_node_info],
+/// };
+/// engine.incremental_reindex(delta);
+/// ```
+#[derive(Debug, Default)]
+pub struct TextIndexDelta {
+    /// Node IDs to remove from the index.
+    pub removed_node_ids: Vec<String>,
+    /// New or updated nodes to add to the index.
+    /// Nodes whose `node_id` already exists will be replaced in-place.
+    pub updated_nodes: Vec<NodeInfo>,
+}
+
 impl Default for SearchEngine {
     fn default() -> Self {
         Self::new()
@@ -1432,5 +1616,476 @@ mod tests {
         );
         // func1 contains both "println" and "hello", should be top result
         assert_eq!(results[0].node_id, "func1");
+    }
+
+    // ----------------------------------------------------------------
+    // T28: Incremental reindex tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_incremental_reindex_add_nodes() {
+        // T28: Adding nodes via incremental_reindex should update all indexes
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+        assert_eq!(engine.node_count(), 2);
+
+        let delta = TextIndexDelta {
+            removed_node_ids: vec![],
+            updated_nodes: vec![NodeInfo {
+                node_id: "func3".to_string(),
+                file_path: "test.rs".to_string(),
+                symbol_name: "func3".to_string(),
+                language: "rust".to_string(),
+                content: "fn func3() { db_query(); }".to_string(),
+                byte_range: (100, 130),
+                embedding: Some(vec![0.0, 0.0, 1.0]),
+                complexity: 3,
+            }],
+        };
+        engine.incremental_reindex(delta);
+
+        // Should now have 3 nodes
+        assert_eq!(engine.node_count(), 3);
+        assert_eq!(engine.node_id_to_idx.len(), 3);
+        assert_eq!(engine.node_tokens.len(), 3);
+        assert_eq!(engine.complexity_cache.len(), 3);
+
+        // Search should find the new node
+        let query = SearchQuery {
+            query: "func3".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+        let results = engine.search(query).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].node_id, "func3");
+
+        // text_index should contain "func3" token
+        assert!(engine.text_index.contains_key("func3"));
+        // "db" and "query" tokens should also be indexed
+        assert!(engine.text_index.contains_key("query"));
+    }
+
+    #[test]
+    fn test_incremental_reindex_remove_nodes() {
+        // T28: Removing nodes via incremental_reindex should clean up all indexes
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+        assert_eq!(engine.node_count(), 2);
+
+        let delta = TextIndexDelta {
+            removed_node_ids: vec!["func1".to_string()],
+            updated_nodes: vec![],
+        };
+        engine.incremental_reindex(delta);
+
+        // Should now have 1 node
+        assert_eq!(engine.node_count(), 1);
+        assert_eq!(engine.node_id_to_idx.len(), 1);
+        assert!(!engine.node_id_to_idx.contains_key("func1"));
+        assert!(engine.node_id_to_idx.contains_key("func2"));
+
+        // func1's tokens should be removed from text_index
+        // "func1" token should no longer map to func1
+        if let Some(ids) = engine.text_index.get("func1") {
+            assert!(!ids.contains("func1"), "func1 should be removed from text_index");
+        }
+
+        // node_tokens should not contain func1
+        assert!(!engine.node_tokens.contains_key("func1"));
+        assert!(engine.node_tokens.contains_key("func2"));
+
+        // Search for func1 should not find it
+        let query = SearchQuery {
+            query: "func1".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+        let results = engine.search(query).unwrap();
+        assert!(results.is_empty(), "func1 should not be found after removal");
+    }
+
+    #[test]
+    fn test_incremental_reindex_update_existing_node() {
+        // T28: Updating an existing node should replace it correctly
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+
+        // Update func1 with new content
+        let delta = TextIndexDelta {
+            removed_node_ids: vec![],
+            updated_nodes: vec![NodeInfo {
+                node_id: "func1".to_string(),
+                file_path: "updated.rs".to_string(),
+                symbol_name: "func1_renamed".to_string(),
+                language: "rust".to_string(),
+                content: "fn func1_renamed() { new_logic(); }".to_string(),
+                byte_range: (0, 35),
+                embedding: Some(vec![0.5, 0.5, 0.0]),
+                complexity: 5,
+            }],
+        };
+        engine.incremental_reindex(delta);
+
+        // Should still have 2 nodes
+        assert_eq!(engine.node_count(), 2);
+
+        // Complexity cache should reflect the update
+        assert_eq!(engine.complexity_cache.get("func1"), Some(&5));
+
+        // New tokens should be indexed
+        assert!(engine.node_tokens.get("func1").unwrap().contains("logic"));
+        assert!(engine.text_index.contains_key("logic"));
+
+        // Search for new content should work
+        let query = SearchQuery {
+            query: "new_logic".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+        let results = engine.search(query).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].node_id, "func1");
+    }
+
+    #[test]
+    fn test_incremental_reindex_combined_add_remove() {
+        // T28: Combined add and remove in one delta
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+
+        let delta = TextIndexDelta {
+            removed_node_ids: vec!["func1".to_string()],
+            updated_nodes: vec![
+                NodeInfo {
+                    node_id: "func3".to_string(),
+                    file_path: "new.rs".to_string(),
+                    symbol_name: "func3".to_string(),
+                    language: "rust".to_string(),
+                    content: "fn func3() {}".to_string(),
+                    byte_range: (0, 14),
+                    embedding: None,
+                    complexity: 1,
+                },
+                NodeInfo {
+                    node_id: "func4".to_string(),
+                    file_path: "new.rs".to_string(),
+                    symbol_name: "func4".to_string(),
+                    language: "rust".to_string(),
+                    content: "fn func4() { helper(); }".to_string(),
+                    byte_range: (15, 40),
+                    embedding: None,
+                    complexity: 2,
+                },
+            ],
+        };
+        engine.incremental_reindex(delta);
+
+        // Should have func2 (original) + func3 + func4 = 3 nodes
+        assert_eq!(engine.node_count(), 3);
+        assert_eq!(engine.node_id_to_idx.len(), 3);
+
+        // func1 should be gone
+        assert!(!engine.node_id_to_idx.contains_key("func1"));
+        // func2, func3, func4 should exist
+        assert!(engine.node_id_to_idx.contains_key("func2"));
+        assert!(engine.node_id_to_idx.contains_key("func3"));
+        assert!(engine.node_id_to_idx.contains_key("func4"));
+
+        // Search for func2 should still work
+        let query = SearchQuery {
+            query: "func2".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+        let results = engine.search(query).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].node_id, "func2");
+    }
+
+    #[test]
+    fn test_incremental_reindex_empty_delta() {
+        // T28: Empty delta should not change anything
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+
+        let delta = TextIndexDelta {
+            removed_node_ids: vec![],
+            updated_nodes: vec![],
+        };
+        engine.incremental_reindex(delta);
+
+        assert_eq!(engine.node_count(), 2);
+        assert_eq!(engine.node_id_to_idx.len(), 2);
+    }
+
+    #[test]
+    fn test_incremental_reindex_removes_empty_token_sets() {
+        // T28: When removing the last node for a token, the token entry should be removed
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(vec![
+            NodeInfo {
+                node_id: "unique1".to_string(),
+                file_path: "test.rs".to_string(),
+                symbol_name: "unique1".to_string(),
+                language: "rust".to_string(),
+                content: "fn unique1() { zebra(); }".to_string(),
+                byte_range: (0, 25),
+                embedding: None,
+                complexity: 1,
+            },
+            NodeInfo {
+                node_id: "unique2".to_string(),
+                file_path: "test.rs".to_string(),
+                symbol_name: "unique2".to_string(),
+                language: "rust".to_string(),
+                content: "fn unique2() { apple(); }".to_string(),
+                byte_range: (26, 52),
+                embedding: None,
+                complexity: 1,
+            },
+        ]);
+
+        // "zebra" token should exist and map to unique1 only
+        assert!(engine.text_index.contains_key("zebra"));
+
+        // Remove unique1 — "zebra" token set should be cleaned up entirely
+        let delta = TextIndexDelta {
+            removed_node_ids: vec!["unique1".to_string()],
+            updated_nodes: vec![],
+        };
+        engine.incremental_reindex(delta);
+
+        // "zebra" token should no longer exist in text_index (no remaining nodes have it)
+        assert!(
+            !engine.text_index.contains_key("zebra"),
+            "Token with no remaining nodes should be removed from text_index"
+        );
+
+        // "apple" should still exist
+        assert!(engine.text_index.contains_key("apple"));
+    }
+
+    #[test]
+    fn test_incremental_reindex_correctness_vs_full_rebuild() {
+        // T28: Incremental reindex should produce identical results to a full rebuild
+        let mut engine_inc = SearchEngine::new();
+        let mut engine_full = SearchEngine::new();
+
+        // Start with same initial nodes
+        let initial = create_test_nodes();
+        engine_inc.index_nodes(initial.clone());
+        engine_full.index_nodes(initial);
+
+        // Apply delta incrementally
+        let delta = TextIndexDelta {
+            removed_node_ids: vec!["func1".to_string()],
+            updated_nodes: vec![NodeInfo {
+                node_id: "func3".to_string(),
+                file_path: "new.rs".to_string(),
+                symbol_name: "func3".to_string(),
+                language: "rust".to_string(),
+                content: "fn func3() { compute(); }".to_string(),
+                byte_range: (0, 25),
+                embedding: Some(vec![1.0, 1.0, 0.0]),
+                complexity: 4,
+            }],
+        };
+        engine_inc.incremental_reindex(delta);
+
+        // Apply same changes via full rebuild
+        engine_full.index_nodes(vec![
+            NodeInfo {
+                node_id: "func2".to_string(),
+                file_path: "test.rs".to_string(),
+                symbol_name: "func2".to_string(),
+                language: "rust".to_string(),
+                content: "fn func2() { println!(\"world\"); }".to_string(),
+                byte_range: (42, 82),
+                embedding: Some(vec![0.0, 1.0, 0.0]),
+                complexity: 2,
+            },
+            NodeInfo {
+                node_id: "func3".to_string(),
+                file_path: "new.rs".to_string(),
+                symbol_name: "func3".to_string(),
+                language: "rust".to_string(),
+                content: "fn func3() { compute(); }".to_string(),
+                byte_range: (0, 25),
+                embedding: Some(vec![1.0, 1.0, 0.0]),
+                complexity: 4,
+            },
+        ]);
+
+        // Both engines should have same node count
+        assert_eq!(engine_inc.node_count(), engine_full.node_count());
+
+        // Both should have same node_ids
+        let inc_ids: std::collections::BTreeSet<_> = engine_inc.nodes.iter().map(|n| n.node_id.clone()).collect();
+        let full_ids: std::collections::BTreeSet<_> = engine_full.nodes.iter().map(|n| n.node_id.clone()).collect();
+        assert_eq!(inc_ids, full_ids);
+
+        // Search should produce same results
+        let query = SearchQuery {
+            query: "func2".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+        let inc_results = engine_inc.search(query.clone()).unwrap();
+        let full_results = engine_full.search(query).unwrap();
+        assert_eq!(inc_results.len(), full_results.len());
+        if !inc_results.is_empty() {
+            assert_eq!(inc_results[0].node_id, full_results[0].node_id);
+        }
+
+        // Semantic search should also produce same results
+        let inc_sem = engine_inc.semantic_search(&[1.0, 1.0, 0.0], 10).unwrap();
+        let full_sem = engine_full.semantic_search(&[1.0, 1.0, 0.0], 10).unwrap();
+        assert_eq!(inc_sem.len(), full_sem.len());
+        if !inc_sem.is_empty() {
+            assert_eq!(inc_sem[0].node_id, full_sem[0].node_id);
+        }
+    }
+
+    #[test]
+    fn test_incremental_reindex_semantic_search_after_update() {
+        // T28: Semantic search should work correctly after incremental update
+        let mut engine = SearchEngine::with_dimension(3);
+        engine.index_nodes(create_test_nodes());
+
+        // Add a new node with a distinct embedding
+        let delta = TextIndexDelta {
+            removed_node_ids: vec![],
+            updated_nodes: vec![NodeInfo {
+                node_id: "func3".to_string(),
+                file_path: "test.rs".to_string(),
+                symbol_name: "func3".to_string(),
+                language: "rust".to_string(),
+                content: "fn func3() {}".to_string(),
+                byte_range: (100, 115),
+                embedding: Some(vec![0.0, 0.0, 1.0]),
+                complexity: 1,
+            }],
+        };
+        engine.incremental_reindex(delta);
+
+        // Search for vec close to func3's embedding
+        let results = engine.semantic_search(&[0.1, 0.1, 0.9], 1).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].node_id, "func3");
+    }
+
+    #[test]
+    fn test_incremental_reindex_node_id_to_idx_consistency() {
+        // T28: node_id_to_idx should be consistent after multiple incremental updates
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+
+        // Add func3
+        engine.incremental_reindex(TextIndexDelta {
+            removed_node_ids: vec![],
+            updated_nodes: vec![NodeInfo {
+                node_id: "func3".to_string(),
+                file_path: "test.rs".to_string(),
+                symbol_name: "func3".to_string(),
+                language: "rust".to_string(),
+                content: "fn func3() {}".to_string(),
+                byte_range: (100, 115),
+                embedding: None,
+                complexity: 1,
+            }],
+        });
+
+        // Remove func1 (swap-remove may swap func3 into func1's slot)
+        engine.incremental_reindex(TextIndexDelta {
+            removed_node_ids: vec!["func1".to_string()],
+            updated_nodes: vec![],
+        });
+
+        // Verify all indices are consistent
+        assert_eq!(engine.node_id_to_idx.len(), engine.nodes.len());
+        for (idx, node) in engine.nodes.iter().enumerate() {
+            assert_eq!(
+                engine.node_id_to_idx.get(&node.node_id),
+                Some(&idx),
+                "node_id_to_idx mismatch for node {}",
+                node.node_id
+            );
+        }
+    }
+
+    #[test]
+    fn test_incremental_reindex_removes_nonexistent_node() {
+        // T28: Removing a node that doesn't exist should be a no-op
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+
+        let delta = TextIndexDelta {
+            removed_node_ids: vec!["nonexistent".to_string()],
+            updated_nodes: vec![],
+        };
+        engine.incremental_reindex(delta);
+
+        assert_eq!(engine.node_count(), 2);
+        assert_eq!(engine.node_id_to_idx.len(), 2);
+    }
+
+    #[test]
+    fn test_incremental_reindex_content_cleared() {
+        // T28: Content should be cleared on newly added nodes (same as index_nodes)
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+
+        engine.incremental_reindex(TextIndexDelta {
+            removed_node_ids: vec![],
+            updated_nodes: vec![NodeInfo {
+                node_id: "func3".to_string(),
+                file_path: "test.rs".to_string(),
+                symbol_name: "func3".to_string(),
+                language: "rust".to_string(),
+                content: "fn func3() { important_content(); }".to_string(),
+                byte_range: (0, 35),
+                embedding: None,
+                complexity: 2,
+            }],
+        });
+
+        // Content should be cleared for all nodes
+        for node in &engine.nodes {
+            assert!(
+                node.content.is_empty(),
+                "Node {} content should be cleared, got: {:?}",
+                node.node_id,
+                node.content
+            );
+        }
+
+        // But func3 tokens should still be searchable
+        assert!(engine.node_tokens.get("func3").unwrap().contains("important"));
     }
 }
