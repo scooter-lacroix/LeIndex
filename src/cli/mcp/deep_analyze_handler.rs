@@ -1,4 +1,4 @@
-use super::helpers::{extract_string, extract_usize, wrap_with_meta};
+use super::helpers::{extract_string, extract_usize, wrap_with_meta, HandlerContext};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
@@ -55,23 +55,22 @@ data flow, and impact radius. Use for broad codebase understanding queries."
     ) -> Result<Value, JsonRpcError> {
         let query = extract_string(&args, "query")?;
         let token_budget = extract_usize(&args, "token_budget", 2000)?;
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let handle = registry.get_or_create(project_path).await?;
-        let mut writer = handle.lock().await;
+        let mut ctx = HandlerContext::new_optional_pdg(registry, &args).await?;
 
-        if writer.search_engine().is_empty() {
+        if ctx.index().search_engine().is_empty() {
             return Err(JsonRpcError::project_not_indexed(
-                writer.project_path().display().to_string(),
+                ctx.project_path().display().to_string(),
             ));
         }
 
-        let result = writer
+        let result = ctx
+            .index_mut()
             .analyze(&query, token_budget)
             .map_err(|e| JsonRpcError::internal_error(format!("Analysis error: {}", e)))?;
 
         serde_json::to_value(result)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
-            .map(|v| wrap_with_meta(v, &writer))
+            .map(|v| wrap_with_meta(v, ctx.index()))
     }
 }

@@ -1,4 +1,6 @@
-use super::helpers::{extract_string, extract_usize, resolve_scope, wrap_with_meta};
+use super::helpers::{
+    extract_string, extract_usize, resolve_scope, wrap_with_meta, HandlerContext,
+};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
@@ -79,7 +81,6 @@ to auto-switch/auto-index projects."
             .get("search_mode")
             .and_then(|v| v.as_str())
             .unwrap_or("code");
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         // Resolve query type
         let query_type = match search_mode {
@@ -103,19 +104,19 @@ to auto-switch/auto-index projects."
             _ => Some(crate::search::ranking::QueryType::Semantic),
         };
 
-        let handle = registry.get_or_create(project_path).await?;
-        let mut index = handle.lock().await;
-        let scope = resolve_scope(&args, index.project_path())?;
+        let mut ctx = HandlerContext::new_optional_pdg(registry, &args).await?;
+        let scope = resolve_scope(&args, ctx.project_path())?;
 
-        if index.search_engine().is_empty() {
+        if ctx.index().search_engine().is_empty() {
             return Err(JsonRpcError::project_not_indexed(
-                index.project_path().display().to_string(),
+                ctx.project_path().display().to_string(),
             ));
         }
 
         const MAX_FETCH_K: usize = 1000;
         let mut fetch_k = (top_k + offset).min(MAX_FETCH_K);
-        let mut all_results = index
+        let mut all_results = ctx
+            .index_mut()
             .search(&query, fetch_k, query_type)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
@@ -141,7 +142,8 @@ to auto-switch/auto-index projects."
         if filtered.is_empty() && scope.is_some() && !all_results.is_empty() {
             fetch_k = (fetch_k * 10).min(MAX_FETCH_K * 10);
             if fetch_k > top_k + offset {
-                all_results = index
+                all_results = ctx
+                    .index_mut()
                     .search(&query, fetch_k, query_type)
                     .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
                 filtered = all_results
@@ -167,10 +169,10 @@ to auto-switch/auto-index projects."
                         "No semantic matches found for '{}'. The project contains {} indexed files. \
                         Try: rephrase query, use different keywords, or try leindex_grep_symbols for exact symbol names.",
                         query,
-                        index.source_file_paths().map(|p| p.len()).unwrap_or(0)
+                        ctx.index_mut().source_file_paths().map(|p| p.len()).unwrap_or(0)
                     )
                 }),
-                &index,
+                ctx.index(),
             ));
         }
 
@@ -182,7 +184,7 @@ to auto-switch/auto-index projects."
                 "count": total_returned,
                 "has_more": offset + total_returned < total_filtered
             }),
-            &index,
+            ctx.index(),
         ))
     }
 }
@@ -207,7 +209,10 @@ mod tests {
         let val = result.unwrap();
         assert_eq!(val["count"].as_i64().unwrap_or(0), 0);
         // Verify suggestion field is present for zero results
-        assert!(val.get("suggestion").is_some(), "zero results should include suggestion");
+        assert!(
+            val.get("suggestion").is_some(),
+            "zero results should include suggestion"
+        );
     }
 
     #[test]

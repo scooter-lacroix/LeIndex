@@ -1,6 +1,6 @@
 use super::helpers::{
     byte_range_to_line_range, extract_bool, extract_string, extract_usize, get_direct_callers,
-    node_type_str, read_source_snippet, wrap_with_meta,
+    node_type_str, read_source_snippet, wrap_with_meta, HandlerContext,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -67,14 +67,9 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
             .map(str::to_owned);
         let include_dependencies = extract_bool(&args, "include_dependencies", false);
         let token_budget = extract_usize(&args, "token_budget", 8000)?;
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let handle = registry.get_or_create(project_path).await?;
-        let mut index = handle.lock().await;
-        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
-        let pdg = index.pdg().ok_or_else(|| {
-            JsonRpcError::project_not_indexed(index.project_path().display().to_string())
-        })?;
+        let ctx = HandlerContext::new(registry, &args).await?;
+        let pdg = ctx.pdg();
 
         let symbol_lower = symbol.to_lowercase();
         let node_id = if let Some(ref fp_hint) = file_path_hint {
@@ -143,74 +138,100 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
                 break;
             }
 
-            if in_doc_block || (!saw_doc_start && comment_lines.iter().any(|l| l.trim_start().starts_with("*/"))) {
+            if in_doc_block
+                || (!saw_doc_start
+                    && comment_lines
+                        .iter()
+                        .any(|l| l.trim_start().starts_with("*/")))
+            {
                 comment_lines.clear();
             }
 
-            if comment_lines.is_empty() { None } else {
+            if comment_lines.is_empty() {
+                None
+            } else {
                 let reversed: Vec<&str> = comment_lines.into_iter().rev().collect();
                 Some(reversed.join("\n"))
             }
         })();
 
         let dep_signatures: Vec<Value> = if include_dependencies {
-            pdg.neighbors(node_id).iter().filter_map(|&did| {
+            pdg.neighbors(node_id)
+                .iter()
+                .filter_map(|&did| {
+                    let dn = pdg.get_node(did)?;
+                    let sig = read_source_snippet(&dn.file_path, dn.byte_range)
+                        .and_then(|s| s.lines().next().map(str::to_owned));
+                    Some(serde_json::json!({
+                        "name": dn.name,
+                        "type": node_type_str(&dn.node_type),
+                        "file": dn.file_path,
+                        "signature": sig
+                    }))
+                })
+                .take(20)
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let callers: Vec<Value> = get_direct_callers(pdg, node_id)
+            .iter()
+            .filter_map(|&cid| {
+                let cn = pdg.get_node(cid)?;
+                let caller_line = {
+                    let fc = std::fs::read_to_string(&cn.file_path).unwrap_or_default();
+                    byte_range_to_line_range(&fc, cn.byte_range).0
+                };
+                Some(serde_json::json!({
+                    "name": cn.name,
+                    "file": cn.file_path,
+                    "line": caller_line
+                }))
+            })
+            .take(15)
+            .collect();
+
+        let callees: Vec<Value> = pdg
+            .neighbors(node_id)
+            .iter()
+            .filter_map(|&did| {
                 let dn = pdg.get_node(did)?;
-                let sig = read_source_snippet(&dn.file_path, dn.byte_range).and_then(|s| s.lines().next().map(str::to_owned));
+                let callee_line = {
+                    let fc = std::fs::read_to_string(&dn.file_path).unwrap_or_default();
+                    byte_range_to_line_range(&fc, dn.byte_range).0
+                };
                 Some(serde_json::json!({
                     "name": dn.name,
-                    "type": node_type_str(&dn.node_type),
                     "file": dn.file_path,
-                    "signature": sig
+                    "line": callee_line
                 }))
-            }).take(20).collect()
-        } else { Vec::new() };
-
-        let callers: Vec<Value> = get_direct_callers(pdg, node_id).iter().filter_map(|&cid| {
-            let cn = pdg.get_node(cid)?;
-            let caller_line = {
-                let fc = std::fs::read_to_string(&cn.file_path).unwrap_or_default();
-                byte_range_to_line_range(&fc, cn.byte_range).0
-            };
-            Some(serde_json::json!({
-                "name": cn.name,
-                "file": cn.file_path,
-                "line": caller_line
-            }))
-        }).take(15).collect();
-
-        let callees: Vec<Value> = pdg.neighbors(node_id).iter().filter_map(|&did| {
-            let dn = pdg.get_node(did)?;
-            let callee_line = {
-                let fc = std::fs::read_to_string(&dn.file_path).unwrap_or_default();
-                byte_range_to_line_range(&fc, dn.byte_range).0
-            };
-            Some(serde_json::json!({
-                "name": dn.name,
-                "file": dn.file_path,
-                "line": callee_line
-            }))
-        }).take(15).collect();
+            })
+            .take(15)
+            .collect();
 
         let (line_start, line_end) = {
             let file_content = std::fs::read_to_string(&node.file_path).unwrap_or_default();
             byte_range_to_line_range(&file_content, node.byte_range)
         };
 
-        Ok(wrap_with_meta(serde_json::json!({
-            "symbol": node.name,
-            "type": node_type_str(&node.node_type),
-            "file": node.file_path,
-            "language": node.language,
-            "complexity": node.complexity,
-            "line_start": line_start,
-            "line_end": line_end,
-            "doc_comment": doc_comment,
-            "source": source,
-            "callers": callers,
-            "callees": callees,
-            "dependencies": dep_signatures
-        }), &index))
+        Ok(wrap_with_meta(
+            serde_json::json!({
+                "symbol": node.name,
+                "type": node_type_str(&node.node_type),
+                "file": node.file_path,
+                "language": node.language,
+                "complexity": node.complexity,
+                "line_start": line_start,
+                "line_end": line_end,
+                "doc_comment": doc_comment,
+                "source": source,
+                "callers": callers,
+                "callees": callees,
+                "dependencies": dep_signatures
+            }),
+            ctx.index(),
+        ))
     }
 }
 

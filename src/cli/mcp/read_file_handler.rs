@@ -1,6 +1,6 @@
 use super::helpers::{
     byte_range_to_line_range, extract_bool, extract_string, extract_usize, get_direct_callers,
-    node_type_str, validate_file_within_project, wrap_with_meta,
+    node_type_str, validate_file_within_project, wrap_with_meta, HandlerContext,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -74,14 +74,12 @@ Works for any text file including configs and docs."
         let start_line = extract_usize(&args, "start_line", 1)?.max(1);
         let max_lines = extract_usize(&args, "max_lines", 500)?.min(2000);
         let include_symbol_map = extract_bool(&args, "include_symbol_map", false);
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         // Try to get project handle for boundary validation and PDG, but don't require it
-        let maybe_handle = registry.get_or_create(project_path).await.ok();
-        if let Some(ref handle) = maybe_handle {
-            let index = handle.lock().await;
+        let maybe_ctx = HandlerContext::new_optional_pdg(registry, &args).await.ok();
+        if let Some(ref ctx) = maybe_ctx {
             // Validate file within project when indexed
-            let _ = validate_file_within_project(&file_path, index.project_path());
+            let _ = validate_file_within_project(&file_path, ctx.project_path());
         }
 
         // Read file content — works for any text file
@@ -118,7 +116,8 @@ Works for any text file including configs and docs."
             .extension()
             .and_then(|e| e.to_str())
             .map(|ext| ext.to_ascii_lowercase());
-        let language = ext_lower.as_deref()
+        let language = ext_lower
+            .as_deref()
             .map(|ext| match ext {
                 "rs" => "rust",
                 "py" => "python",
@@ -152,9 +151,8 @@ Works for any text file including configs and docs."
 
         // Build symbol map from PDG only when requested and available
         let symbol_map: Vec<Value> = if include_symbol_map {
-            let pdg_opt = if let Some(ref handle) = maybe_handle {
-                let index = handle.lock().await;
-                index.pdg().map(|pdg| {
+            let pdg_opt = if let Some(ref ctx) = maybe_ctx {
+                ctx.maybe_pdg().map(|pdg| {
                     let nodes = pdg.nodes_in_file(&file_path);
                     let mut symbols: Vec<Value> = Vec::new();
 
@@ -245,9 +243,8 @@ Works for any text file including configs and docs."
 
         // Build compact context block — always present when PDG available (~80-120 tokens)
         // This eliminates follow-up Grep/Read calls for imports and dependencies
-        let context = if let Some(ref handle) = maybe_handle {
-            let index = handle.lock().await;
-            index.pdg().map(|pdg| {
+        let context = if let Some(ref ctx) = maybe_ctx {
+            ctx.maybe_pdg().map(|pdg| {
                 let nodes = pdg.nodes_in_file(&file_path);
 
                 // Pre-compute line offsets
@@ -357,9 +354,8 @@ Works for any text file including configs and docs."
         }
 
         // Add staleness warning only if we have an indexed project
-        if let Some(ref handle) = maybe_handle {
-            let index = handle.lock().await;
-            result = wrap_with_meta(result, &index);
+        if let Some(ref ctx) = maybe_ctx {
+            result = wrap_with_meta(result, ctx.index());
         }
 
         Ok(result)

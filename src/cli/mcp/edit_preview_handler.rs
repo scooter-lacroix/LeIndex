@@ -1,6 +1,6 @@
 use super::helpers::{
     apply_changes_in_memory, extract_string, make_diff, parse_edit_changes,
-    validate_file_within_project, wrap_with_meta,
+    validate_file_within_project, wrap_with_meta, HandlerContext,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -86,18 +86,11 @@ leindex_edit_apply to understand the blast radius of your change."
                 _ => Value::Array(vec![]),
             }
         };
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let handle = registry.get_or_create(project_path).await?;
-        let mut index = handle.lock().await;
+        let mut ctx = HandlerContext::new(registry, &args).await?;
 
         // Enforce project boundary
-        let _ = validate_file_within_project(&file_path, index.project_path())?;
-
-        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
-        let pdg = index.pdg().ok_or_else(|| {
-            JsonRpcError::project_not_indexed(index.project_path().display().to_string())
-        })?;
+        let _ = validate_file_within_project(&file_path, ctx.project_path())?;
 
         // Read file content
         let original = std::fs::read_to_string(&file_path).map_err(|e| {
@@ -114,7 +107,7 @@ leindex_edit_apply to understand the blast radius of your change."
         let diff = make_diff(&original, &modified, &file_path);
 
         // Run validation via LogicValidator (if PDG available)
-        let validation_json = match index.create_validator() {
+        let validation_json = match ctx.index_mut().create_validator() {
             Some(validator) => {
                 // Convert parsed EditChanges to ResolvedEditChanges for validation
                 let resolved: Vec<ResolvedEditChange> = changes
@@ -154,37 +147,41 @@ leindex_edit_apply to understand the blast radius of your change."
         affected_files.insert(file_path.clone());
         let mut breaking_changes: Vec<String> = Vec::new();
 
-        for change in &changes {
-            if let crate::edit::EditChange::RenameSymbol {
-                old_name,
-                new_name: _,
-            } = change {
-                // Try name-based lookup for PDG impact analysis
-                let found_id = pdg
-                    .find_by_symbol(old_name)
-                    .or_else(|| pdg.find_by_name(old_name))
-                    .or_else(|| pdg.find_by_name_in_file(old_name, None));
-                if let Some(node_id) = found_id {
-                    let forward = pdg.forward_impact(
-                        node_id,
-                        &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
-                    );
-                    for dep_id in &forward {
-                        if let Some(dn) = pdg.get_node(*dep_id) {
-                            affected_nodes.push(dn.name.clone());
-                            affected_files.insert(dn.file_path.clone());
+        {
+            let pdg = ctx.pdg();
+            for change in &changes {
+                if let crate::edit::EditChange::RenameSymbol {
+                    old_name,
+                    new_name: _,
+                } = change
+                {
+                    // Try name-based lookup for PDG impact analysis
+                    let found_id = pdg
+                        .find_by_symbol(old_name)
+                        .or_else(|| pdg.find_by_name(old_name))
+                        .or_else(|| pdg.find_by_name_in_file(old_name, None));
+                    if let Some(node_id) = found_id {
+                        let forward = pdg.forward_impact(
+                            node_id,
+                            &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
+                        );
+                        for dep_id in &forward {
+                            if let Some(dn) = pdg.get_node(*dep_id) {
+                                affected_nodes.push(dn.name.clone());
+                                affected_files.insert(dn.file_path.clone());
+                            }
                         }
-                    }
-                    let backward = pdg.backward_impact(
-                        node_id,
-                        &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
-                    );
-                    if !backward.is_empty() {
-                        breaking_changes.push(format!(
-                            "Renaming '{}' may break {} caller(s)",
-                            old_name,
-                            backward.len()
-                        ));
+                        let backward = pdg.backward_impact(
+                            node_id,
+                            &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
+                        );
+                        if !backward.is_empty() {
+                            breaking_changes.push(format!(
+                                "Renaming '{}' may break {} caller(s)",
+                                old_name,
+                                backward.len()
+                            ));
+                        }
                     }
                 }
             }
@@ -214,6 +211,6 @@ leindex_edit_apply to understand the blast radius of your change."
             }
         }
 
-        Ok(wrap_with_meta(response, &index))
+        Ok(wrap_with_meta(response, ctx.index()))
     }
 }

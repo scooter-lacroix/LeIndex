@@ -1,6 +1,6 @@
 use super::helpers::{
     extract_bool, extract_string, extract_usize, glob_match, node_type_str, resolve_scope,
-    wrap_with_meta,
+    wrap_with_meta, HandlerContext,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -96,7 +96,6 @@ to understand match context. Supports regex, globs, scope, and context_lines."
         let max_results = extract_usize(&args, "max_results", 100)?.min(1000);
         let offset = extract_usize(&args, "offset", 0)?;
         let context_lines = extract_usize(&args, "context_lines", 2)?.min(10);
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let include_globs: Vec<String> = args
             .get("include_globs")
@@ -118,9 +117,8 @@ to understand match context. Supports regex, globs, scope, and context_lines."
             })
             .unwrap_or_default();
 
-        let handle = registry.get_or_create(project_path).await?;
-        let index = handle.lock().await;
-        let scope = resolve_scope(&args, index.project_path())?;
+        let ctx = HandlerContext::new_optional_pdg(registry, &args).await?;
+        let scope = resolve_scope(&args, ctx.project_path())?;
 
         // Build regex or literal matcher
         let regex = if is_regex {
@@ -142,10 +140,10 @@ to understand match context. Supports regex, globs, scope, and context_lines."
         };
 
         // Get PDG for enrichment (optional — works without it)
-        let pdg = index.pdg();
+        let pdg = ctx.maybe_pdg();
 
         // Collect source files from the project
-        let project_root = index.project_path();
+        let project_root = ctx.project_path();
         let mut results: Vec<Value> = Vec::new();
 
         // Dirs to always skip
@@ -302,7 +300,7 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                 "has_more": offset + count < total,
                 "results": paginated,
             }),
-            &index,
+            ctx.index(),
         ))
     }
 }

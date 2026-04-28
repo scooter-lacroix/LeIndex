@@ -1,4 +1,4 @@
-use super::helpers::wrap_with_meta;
+use super::helpers::{wrap_with_meta, HandlerContext};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
@@ -41,22 +41,21 @@ impl DiagnosticsHandler {
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
-        let handle = registry.get_or_create(project_path).await?;
-        let mut reader = handle.lock().await;
+        let mut ctx = HandlerContext::new_index_only(registry, &args).await?;
 
-        let diagnostics = reader.get_diagnostics().map_err(|e| {
+        let diagnostics = ctx.index_mut().get_diagnostics().map_err(|e| {
             JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e))
         })?;
 
-        let (changed, deleted) = reader
+        let (changed, deleted) = ctx
+            .index_mut()
             .check_freshness()
             .unwrap_or_else(|_| (vec![], vec![]));
-        let storage_path = reader.storage_path().display().to_string();
-        let db_size = std::fs::metadata(reader.storage_path().join("leindex.db"))
+        let storage_path = ctx.storage_path().display().to_string();
+        let db_size = std::fs::metadata(ctx.storage_path().join("leindex.db"))
             .map(|m| m.len())
             .unwrap_or(0);
-        let coverage = reader.coverage_report().ok();
+        let coverage = ctx.index_mut().coverage_report().ok();
 
         let mut diag_json = serde_json::to_value(diagnostics)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?;
@@ -90,6 +89,6 @@ impl DiagnosticsHandler {
             }
         }
 
-        Ok(wrap_with_meta(diag_json, &reader))
+        Ok(wrap_with_meta(diag_json, ctx.index()))
     }
 }

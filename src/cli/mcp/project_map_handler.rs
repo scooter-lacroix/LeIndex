@@ -1,4 +1,4 @@
-use super::helpers::{extract_bool, extract_usize, resolve_scope, wrap_with_meta};
+use super::helpers::{extract_bool, extract_usize, resolve_scope, wrap_with_meta, HandlerContext};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
@@ -96,12 +96,8 @@ scoping to subdirectories, sorting, and pagination."
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
         let focus = args.get("focus").and_then(|v| v.as_str()).map(String::from);
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
-
-        let handle = registry.get_or_create(project_path).await?;
-        let mut index = handle.lock().await;
-        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
-        let project_root = index.project_path().to_path_buf();
+        let mut ctx = HandlerContext::new(registry, &args).await?;
+        let project_root = ctx.project_path().to_path_buf();
 
         // Allow legacy "path" param; map it into "scope" for resolution.
         let mut args_with_scope = args.clone();
@@ -112,7 +108,7 @@ scoping to subdirectories, sorting, and pagination."
                 }
             }
         }
-        let scope = resolve_scope(&args_with_scope, index.project_path())?;
+        let scope = resolve_scope(&args_with_scope, ctx.project_path())?;
         let scope_str = scope.unwrap_or_else(|| {
             let mut s = project_root.to_string_lossy().to_string();
             if !s.ends_with(std::path::MAIN_SEPARATOR) {
@@ -127,42 +123,68 @@ scoping to subdirectories, sorting, and pagination."
 
         // Use cached file stats if available, otherwise build from PDG
         // Collect source paths first to avoid borrow conflicts with file_stats()/pdg()
-        let source_paths = index.source_file_paths().unwrap_or_default();
+        let source_paths = ctx.index_mut().source_file_paths().unwrap_or_default();
 
         // file → (symbol_count, total_complexity, symbol_names, incoming_deps, outgoing_deps)
-        let file_map: std::collections::HashMap<String, (usize, u32, Vec<String>, usize, usize)> = if let Some(cache) = index.file_stats() {
-            // Fast path: use cached statistics (includes pre-computed dep counts)
-            let mut map: std::collections::HashMap<String, (usize, u32, Vec<String>, usize, usize)> = source_paths
-                .into_iter()
-                .map(|path| (path.display().to_string(), (0, 0, Vec::new(), 0, 0)))
-                .collect();
+        let file_map: std::collections::HashMap<String, (usize, u32, Vec<String>, usize, usize)> =
+            if let Some(cache) = ctx.index().file_stats() {
+                // Fast path: use cached statistics (includes pre-computed dep counts)
+                let mut map: std::collections::HashMap<
+                    String,
+                    (usize, u32, Vec<String>, usize, usize),
+                > = source_paths
+                    .into_iter()
+                    .map(|path| (path.display().to_string(), (0, 0, Vec::new(), 0, 0)))
+                    .collect();
 
-            // Overlay cached statistics, capping symbol_names to top 5
-            for (path, stats) in cache.iter() {
-                let capped: Vec<String> = stats.symbol_names.iter().take(5).cloned().collect();
-                map.insert(path.clone(), (stats.symbol_count, stats.total_complexity, capped, stats.incoming_deps, stats.outgoing_deps));
-            }
-            map
-        } else {
-            // Fallback: build from PDG via the same method used at index time
-            index.build_file_stats_cache();
-            let mut map: std::collections::HashMap<String, (usize, u32, Vec<String>, usize, usize)> = source_paths
-                .into_iter()
-                .map(|path| (path.display().to_string(), (0, 0, Vec::new(), 0, 0)))
-                .collect();
-
-            if let Some(cache) = index.file_stats() {
+                // Overlay cached statistics, capping symbol_names to top 5
                 for (path, stats) in cache.iter() {
                     let capped: Vec<String> = stats.symbol_names.iter().take(5).cloned().collect();
-                    map.insert(path.clone(), (stats.symbol_count, stats.total_complexity, capped, stats.incoming_deps, stats.outgoing_deps));
+                    map.insert(
+                        path.clone(),
+                        (
+                            stats.symbol_count,
+                            stats.total_complexity,
+                            capped,
+                            stats.incoming_deps,
+                            stats.outgoing_deps,
+                        ),
+                    );
                 }
-            }
-            map
-        }; // file → (node_count, total_complexity, symbol_names)
+                map
+            } else {
+                // Fallback: build from PDG via the same method used at index time
+                ctx.index_mut().build_file_stats_cache();
+                let mut map: std::collections::HashMap<
+                    String,
+                    (usize, u32, Vec<String>, usize, usize),
+                > = source_paths
+                    .into_iter()
+                    .map(|path| (path.display().to_string(), (0, 0, Vec::new(), 0, 0)))
+                    .collect();
+
+                if let Some(cache) = ctx.index().file_stats() {
+                    for (path, stats) in cache.iter() {
+                        let capped: Vec<String> =
+                            stats.symbol_names.iter().take(5).cloned().collect();
+                        map.insert(
+                            path.clone(),
+                            (
+                                stats.symbol_count,
+                                stats.total_complexity,
+                                capped,
+                                stats.incoming_deps,
+                                stats.outgoing_deps,
+                            ),
+                        );
+                    }
+                }
+                map
+            }; // file → (node_count, total_complexity, symbol_names)
 
         // Get PDG for scope filtering (no degree computation needed — cached in file_map)
-        let _pdg = index
-            .pdg()
+        let _pdg = ctx
+            .maybe_pdg()
             .ok_or_else(|| JsonRpcError::project_not_indexed(project_root.display().to_string()))?;
 
         // Filter to scope path and respect depth.
@@ -234,14 +256,20 @@ scoping to subdirectories, sorting, and pagination."
         // Semantic focus ranking: when focus is provided, re-rank files by
         // cosine similarity between the focus embedding and per-file symbol embeddings.
         if let Some(ref focus_text) = focus {
-            let focus_emb = index.generate_query_embedding(focus_text);
+            let focus_emb = ctx.index().generate_query_embedding(focus_text);
             // Cache file embeddings by symbol text to avoid recomputing
             // for files with identical symbol sets.
-            let mut emb_cache: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+            let mut emb_cache: std::collections::HashMap<String, Vec<f32>> =
+                std::collections::HashMap::new();
             for entry in &mut files {
                 let syms = entry["top_symbols"].as_array();
                 let file_text = syms
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(" "))
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
                     .unwrap_or_default();
                 if file_text.is_empty() {
                     entry["relevance_score"] = serde_json::json!(0.0);
@@ -249,7 +277,7 @@ scoping to subdirectories, sorting, and pagination."
                 }
                 let file_emb = emb_cache
                     .entry(file_text.clone())
-                    .or_insert_with(|| index.generate_query_embedding(&file_text));
+                    .or_insert_with(|| ctx.index().generate_query_embedding(&file_text));
                 let score = crate::search::vector::cosine_similarity(&focus_emb, file_emb);
                 entry["relevance_score"] = serde_json::json!(score);
             }
@@ -298,7 +326,7 @@ scoping to subdirectories, sorting, and pagination."
                 "has_more": offset + truncated_files.len() < total_before_pagination,
                 "files": truncated_files
             }),
-            &index,
+            ctx.index(),
         ))
     }
 }

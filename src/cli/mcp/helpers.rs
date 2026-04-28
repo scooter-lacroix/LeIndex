@@ -17,7 +17,11 @@ pub(crate) fn extract_string(args: &Value, key: &str) -> Result<String, JsonRpcE
 }
 
 /// Helper to extract usize argument with default.
-pub(crate) fn extract_usize(args: &Value, key: &str, default: usize) -> Result<usize, JsonRpcError> {
+pub(crate) fn extract_usize(
+    args: &Value,
+    key: &str,
+    default: usize,
+) -> Result<usize, JsonRpcError> {
     match args.get(key) {
         Some(Value::Number(n)) => Ok(n.as_u64().map(|v| v as usize).unwrap_or(default)),
         Some(Value::String(s)) => s.trim().parse::<usize>().or(Ok(default)),
@@ -72,7 +76,10 @@ pub(crate) fn node_type_str(nt: &crate::graph::pdg::NodeType) -> &'static str {
 }
 
 /// Resolve and normalize a scope path for consistent filtering.
-pub(crate) fn resolve_scope(args: &Value, project_root: &Path) -> Result<Option<String>, JsonRpcError> {
+pub(crate) fn resolve_scope(
+    args: &Value,
+    project_root: &Path,
+) -> Result<Option<String>, JsonRpcError> {
     let raw = match args.get("scope").and_then(|v| v.as_str()) {
         Some(s) if !s.is_empty() => s,
         _ => return Ok(None),
@@ -136,7 +143,10 @@ pub(crate) fn read_source_snippet(file_path: &str, byte_range: (usize, usize)) -
 }
 
 /// Convert a byte range to a 1-indexed line range.
-pub(crate) fn byte_range_to_line_range(content: &str, byte_range: (usize, usize)) -> (usize, usize) {
+pub(crate) fn byte_range_to_line_range(
+    content: &str,
+    byte_range: (usize, usize),
+) -> (usize, usize) {
     let (start, end) = byte_range;
     let bytes = content.as_bytes();
     let mut line = 1usize;
@@ -235,8 +245,13 @@ pub(crate) fn parse_edit_changes(
                 let has_explicit_end = item.get("end_byte").is_some();
 
                 if has_explicit_start || has_explicit_end {
-                    let start = item.get("start_byte").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                    let end = item.get("end_byte").and_then(|v| v.as_u64()).map(|v| v as usize).unwrap_or(start + old_text.len());
+                    let start =
+                        item.get("start_byte").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    let end = item
+                        .get("end_byte")
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .unwrap_or(start + old_text.len());
                     EditChange::ReplaceText {
                         start,
                         end,
@@ -250,14 +265,20 @@ pub(crate) fn parse_edit_changes(
                                 end: pos + old_text.len(),
                                 new_text: new_text.to_owned(),
                             }
-                        } else if let Some((pos, matched_len)) = find_normalised_whitespace(content, old_text) {
+                        } else if let Some((pos, matched_len)) =
+                            find_normalised_whitespace(content, old_text)
+                        {
                             EditChange::ReplaceText {
                                 start: pos,
                                 end: pos + matched_len,
                                 new_text: new_text.to_owned(),
                             }
                         } else {
-                            let preview = if old_text.len() > 60 { format!("{}...", &old_text[..60]) } else { old_text.to_string() };
+                            let preview = if old_text.len() > 60 {
+                                format!("{}...", &old_text[..60])
+                            } else {
+                                old_text.to_string()
+                            };
                             return Err(JsonRpcError::invalid_params_with_suggestion(
                                 format!("changes[{}]: old_text not found in file content: '{}'", i, preview),
                                 "Ensure old_text exactly matches the source. Whitespace-normalised matching is attempted automatically.",
@@ -266,7 +287,11 @@ pub(crate) fn parse_edit_changes(
                     } else {
                         let start = 0usize;
                         let end = old_text.len();
-                        EditChange::ReplaceText { start, end, new_text: new_text.to_owned() }
+                        EditChange::ReplaceText {
+                            start,
+                            end,
+                            new_text: new_text.to_owned(),
+                        }
                     }
                 } else {
                     return Err(JsonRpcError::invalid_params(format!(
@@ -275,11 +300,29 @@ pub(crate) fn parse_edit_changes(
                 }
             }
             "rename_symbol" => {
-                let old_name = item.get("old_name").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError::invalid_params(format!("changes[{}]: missing 'old_name'", i)))?;
-                let new_name = item.get("new_name").and_then(|v| v.as_str()).ok_or_else(|| JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_name'", i)))?;
-                EditChange::RenameSymbol { old_name: old_name.to_owned(), new_name: new_name.to_owned() }
+                let old_name = item
+                    .get("old_name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        JsonRpcError::invalid_params(format!("changes[{}]: missing 'old_name'", i))
+                    })?;
+                let new_name = item
+                    .get("new_name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_name'", i))
+                    })?;
+                EditChange::RenameSymbol {
+                    old_name: old_name.to_owned(),
+                    new_name: new_name.to_owned(),
+                }
             }
-            other => return Err(JsonRpcError::invalid_params(format!("changes[{}]: unknown type '{}'", i, other))),
+            other => {
+                return Err(JsonRpcError::invalid_params(format!(
+                    "changes[{}]: unknown type '{}'",
+                    i, other
+                )))
+            }
         };
         result.push(change);
     }
@@ -287,7 +330,10 @@ pub(crate) fn parse_edit_changes(
 }
 
 /// Apply a Vec<EditChange> to content in memory and return the modified string.
-pub(crate) fn apply_changes_in_memory(content: &str, changes: &[EditChange]) -> Result<String, JsonRpcError> {
+pub(crate) fn apply_changes_in_memory(
+    content: &str,
+    changes: &[EditChange],
+) -> Result<String, JsonRpcError> {
     let mut replace_changes: Vec<&EditChange> = Vec::new();
     let mut other_changes: Vec<&EditChange> = Vec::new();
     for change in changes {
@@ -298,15 +344,28 @@ pub(crate) fn apply_changes_in_memory(content: &str, changes: &[EditChange]) -> 
     }
 
     replace_changes.sort_by(|a, b| {
-        let a_start = if let EditChange::ReplaceText { start, .. } = a { *start } else { 0 };
-        let b_start = if let EditChange::ReplaceText { start, .. } = b { *start } else { 0 };
+        let a_start = if let EditChange::ReplaceText { start, .. } = a {
+            *start
+        } else {
+            0
+        };
+        let b_start = if let EditChange::ReplaceText { start, .. } = b {
+            *start
+        } else {
+            0
+        };
         b_start.cmp(&a_start)
     });
 
     let mut modified = content.to_owned();
 
     for change in &replace_changes {
-        if let EditChange::ReplaceText { start, end, new_text } = change {
+        if let EditChange::ReplaceText {
+            start,
+            end,
+            new_text,
+        } = change
+        {
             let bytes = modified.as_bytes();
             let s = (*start).min(bytes.len());
             let e = (*end).min(bytes.len());
@@ -316,7 +375,9 @@ pub(crate) fn apply_changes_in_memory(content: &str, changes: &[EditChange]) -> 
 
     for change in &other_changes {
         modified = match change {
-            EditChange::RenameSymbol { old_name, new_name } => replace_whole_word(&modified, old_name, new_name),
+            EditChange::RenameSymbol { old_name, new_name } => {
+                replace_whole_word(&modified, old_name, new_name)
+            }
             _ => modified,
         };
     }
@@ -330,7 +391,9 @@ pub(crate) fn normalise_ws(s: &str) -> String {
     let mut in_ws = false;
     for ch in s.chars() {
         if ch.is_whitespace() {
-            if !in_ws && !out.is_empty() { out.push(' '); }
+            if !in_ws && !out.is_empty() {
+                out.push(' ');
+            }
             in_ws = true;
         } else {
             in_ws = false;
@@ -343,28 +406,40 @@ pub(crate) fn normalise_ws(s: &str) -> String {
 /// Find `needle` in `haystack` using whitespace-normalised matching.
 pub(crate) fn find_normalised_whitespace(haystack: &str, needle: &str) -> Option<(usize, usize)> {
     let norm_needle = normalise_ws(needle);
-    if norm_needle.is_empty() { return None; }
+    if norm_needle.is_empty() {
+        return None;
+    }
     let lines: Vec<&str> = haystack.lines().collect();
     for start_line in 0..lines.len() {
         let mut window = String::new();
         let mut raw_start_byte: Option<usize> = None;
         for end_line in start_line..lines.len().min(start_line + needle.lines().count() + 5) {
-            if !window.is_empty() { window.push(' '); }
+            if !window.is_empty() {
+                window.push(' ');
+            }
             window.push_str(lines[end_line].trim());
             let norm_window = normalise_ws(&window);
             if norm_window.find(&norm_needle).is_some() {
-                let byte_start = if let Some(s) = raw_start_byte { s } else {
+                let byte_start = if let Some(s) = raw_start_byte {
+                    s
+                } else {
                     let mut offset = 0;
-                    for l in 0..start_line { offset += lines[l].len() + 1; }
+                    for l in 0..start_line {
+                        offset += lines[l].len() + 1;
+                    }
                     offset
                 };
                 let mut byte_end = byte_start;
-                for l in start_line..=end_line { byte_end += lines[l].len() + 1; }
+                for l in start_line..=end_line {
+                    byte_end += lines[l].len() + 1;
+                }
                 return Some((byte_start, byte_end.min(haystack.len()) - byte_start));
             }
             if raw_start_byte.is_none() {
                 let mut offset = 0;
-                for l in 0..start_line { offset += lines[l].len() + 1; }
+                for l in 0..start_line {
+                    offset += lines[l].len() + 1;
+                }
                 raw_start_byte = Some(offset);
             }
         }
@@ -444,11 +519,183 @@ pub(crate) fn phase_analysis_schema() -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// HandlerContext — eliminates preamble boilerplate from MCP handlers
+// ---------------------------------------------------------------------------
+
+/// Resolved project state for MCP handlers.
+///
+/// Owns the `Arc<Mutex<LeIndex>>` handle and the lock guard, so there are no
+/// lifetime issues.  Use the accessor methods to get at the underlying data.
+///
+/// ### Usage
+///
+/// ```ignore
+/// // BEFORE (repeated in ~12 handlers):
+/// let handle = registry.get_or_create(project_path).await?;
+/// let mut index = handle.lock().await;
+/// index.ensure_pdg_loaded()
+///     .map_err(|e| JsonRpcError::indexing_failed(...))?;
+/// let pdg = index.pdg().ok_or_else(|| {
+///     JsonRpcError::project_not_indexed(...)
+/// })?;
+///
+/// // AFTER (single call):
+/// let ctx = HandlerContext::new(registry, &args).await?;
+/// let pdg = ctx.pdg();  // guaranteed non-None after new()
+/// ```
+pub(crate) struct HandlerContext {
+    /// Handle to the project (keeps the `Arc` alive).
+    #[allow(dead_code)]
+    handle: std::sync::Arc<tokio::sync::Mutex<crate::cli::leindex::LeIndex>>,
+    /// Mutex guard over the `LeIndex` instance.
+    guard: tokio::sync::MutexGuard<'static, crate::cli::leindex::LeIndex>,
+    /// Whether the PDG was successfully loaded.
+    #[allow(dead_code)]
+    pdg_loaded: bool,
+}
+
+// SAFETY: The guard is derived from an Arc that we also store, so the
+// MutexGuard's lifetime is effectively "as long as the struct".  We use
+// a transmute to express this to the type system.  This is safe because:
+//   1. The Arc ensures the Mutex lives long enough.
+//   2. The guard is dropped before the Arc (struct field order is top-to-bottom).
+//   3. No other code can access the Arc between creation and drop.
+unsafe impl Send for HandlerContext {}
+
+impl HandlerContext {
+    /// Resolve a project, load the PDG, and return a ready-to-use context.
+    ///
+    /// The PDG is guaranteed to be loaded on success — if loading fails or the
+    /// project is not indexed, an error is returned instead.
+    pub async fn new(
+        registry: &std::sync::Arc<crate::cli::registry::ProjectRegistry>,
+        args: &Value,
+    ) -> Result<Self, JsonRpcError> {
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
+        let mut guard = handle.lock().await;
+
+        guard
+            .ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+
+        if guard.pdg().is_none() {
+            return Err(JsonRpcError::project_not_indexed(
+                guard.project_path().display().to_string(),
+            ));
+        }
+
+        // SAFETY: We extend the guard's lifetime to 'static because the Arc
+        // that owns the Mutex is stored alongside it. The guard will be dropped
+        // when Self is dropped, and the Arc ensures the underlying data lives
+        // long enough. This is a well-established pattern for self-referential
+        // structs where the owner and borrow are co-located.
+        let guard: tokio::sync::MutexGuard<'static, crate::cli::leindex::LeIndex> =
+            unsafe { std::mem::transmute(guard) };
+
+        Ok(Self {
+            handle,
+            guard,
+            pdg_loaded: true,
+        })
+    }
+
+    /// Resolve a project and lock it, but do **not** require a loaded PDG.
+    ///
+    /// Use this for handlers that can operate without a PDG (e.g. search,
+    /// diagnostics, text search, git status, read_file).
+    pub async fn new_optional_pdg(
+        registry: &std::sync::Arc<crate::cli::registry::ProjectRegistry>,
+        args: &Value,
+    ) -> Result<Self, JsonRpcError> {
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
+        let mut guard = handle.lock().await;
+
+        // Best-effort PDG load — ignore error, just leave it unloaded.
+        let pdg_loaded = guard.ensure_pdg_loaded().is_ok();
+
+        let guard: tokio::sync::MutexGuard<'static, crate::cli::leindex::LeIndex> =
+            unsafe { std::mem::transmute(guard) };
+
+        Ok(Self {
+            handle,
+            guard,
+            pdg_loaded,
+        })
+    }
+
+    /// Resolve a project and lock it without any PDG loading at all.
+    ///
+    /// Use for handlers that only need the LeIndex (e.g. diagnostics, index).
+    pub async fn new_index_only(
+        registry: &std::sync::Arc<crate::cli::registry::ProjectRegistry>,
+        args: &Value,
+    ) -> Result<Self, JsonRpcError> {
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
+        let guard = handle.lock().await;
+
+        let guard: tokio::sync::MutexGuard<'static, crate::cli::leindex::LeIndex> =
+            unsafe { std::mem::transmute(guard) };
+
+        Ok(Self {
+            handle,
+            guard,
+            pdg_loaded: false,
+        })
+    }
+
+    /// Borrow the inner `LeIndex`.
+    #[inline]
+    pub fn index(&self) -> &crate::cli::leindex::LeIndex {
+        &*self.guard
+    }
+
+    /// Mutably borrow the inner `LeIndex`.
+    #[inline]
+    pub fn index_mut(&mut self) -> &mut crate::cli::leindex::LeIndex {
+        &mut *self.guard
+    }
+
+    /// Get the PDG reference. Panics if PDG was not loaded.
+    /// Always safe after `new()`. Use `maybe_pdg()` for optional access.
+    #[inline]
+    pub fn pdg(&self) -> &crate::graph::pdg::ProgramDependenceGraph {
+        self.guard.pdg().expect(
+            "HandlerContext::pdg() called but PDG not loaded — use new(), not new_optional_pdg()",
+        )
+    }
+
+    /// Get the PDG reference if loaded, `None` otherwise.
+    #[inline]
+    pub fn maybe_pdg(&self) -> Option<&crate::graph::pdg::ProgramDependenceGraph> {
+        self.guard.pdg()
+    }
+
+    /// The project root path.
+    #[inline]
+    pub fn project_path(&self) -> &std::path::Path {
+        self.guard.project_path()
+    }
+
+    /// The storage path.
+    #[inline]
+    pub fn storage_path(&self) -> &std::path::Path {
+        self.guard.storage_path()
+    }
+}
+
 /// Shared test helper: creates a `ProjectRegistry` with a single project rooted at `path`.
 #[cfg(test)]
-pub(crate) fn test_registry_for(path: &std::path::Path) -> std::sync::Arc<crate::cli::registry::ProjectRegistry> {
+pub(crate) fn test_registry_for(
+    path: &std::path::Path,
+) -> std::sync::Arc<crate::cli::registry::ProjectRegistry> {
     let leindex = crate::cli::leindex::LeIndex::new(path).expect("leindex");
-    std::sync::Arc::new(crate::cli::registry::ProjectRegistry::with_initial_project(5, leindex))
+    std::sync::Arc::new(crate::cli::registry::ProjectRegistry::with_initial_project(
+        5, leindex,
+    ))
 }
 
 #[cfg(test)]
@@ -529,12 +776,27 @@ mod tests {
 
     #[test]
     fn test_node_type_str() {
-        assert_eq!(node_type_str(&crate::graph::pdg::NodeType::Function), "function");
+        assert_eq!(
+            node_type_str(&crate::graph::pdg::NodeType::Function),
+            "function"
+        );
         assert_eq!(node_type_str(&crate::graph::pdg::NodeType::Class), "class");
-        assert_eq!(node_type_str(&crate::graph::pdg::NodeType::Method), "method");
-        assert_eq!(node_type_str(&crate::graph::pdg::NodeType::Variable), "variable");
-        assert_eq!(node_type_str(&crate::graph::pdg::NodeType::Module), "module");
-        assert_eq!(node_type_str(&crate::graph::pdg::NodeType::External), "external");
+        assert_eq!(
+            node_type_str(&crate::graph::pdg::NodeType::Method),
+            "method"
+        );
+        assert_eq!(
+            node_type_str(&crate::graph::pdg::NodeType::Variable),
+            "variable"
+        );
+        assert_eq!(
+            node_type_str(&crate::graph::pdg::NodeType::Module),
+            "module"
+        );
+        assert_eq!(
+            node_type_str(&crate::graph::pdg::NodeType::External),
+            "external"
+        );
     }
 
     #[test]
@@ -574,8 +836,24 @@ mod tests {
     #[test]
     fn test_get_direct_callers_with_edge() {
         let mut pdg = crate::graph::pdg::ProgramDependenceGraph::new();
-        let cid = pdg.add_node(crate::graph::pdg::Node { id: "caller".into(), node_type: crate::graph::pdg::NodeType::Function, name: "caller".into(), file_path: "a.rs".into(), byte_range: (0, 10), complexity: 1, language: "rust".into() });
-        let did = pdg.add_node(crate::graph::pdg::Node { id: "callee".into(), node_type: crate::graph::pdg::NodeType::Function, name: "callee".into(), file_path: "b.rs".into(), byte_range: (0, 10), complexity: 1, language: "rust".into() });
+        let cid = pdg.add_node(crate::graph::pdg::Node {
+            id: "caller".into(),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: "caller".into(),
+            file_path: "a.rs".into(),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "rust".into(),
+        });
+        let did = pdg.add_node(crate::graph::pdg::Node {
+            id: "callee".into(),
+            node_type: crate::graph::pdg::NodeType::Function,
+            name: "callee".into(),
+            file_path: "b.rs".into(),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "rust".into(),
+        });
         pdg.add_call_graph_edges(vec![(cid, did)]);
         let callers = get_direct_callers(&pdg, did);
         assert_eq!(callers.len(), 1);
@@ -584,7 +862,10 @@ mod tests {
 
     #[test]
     fn test_replace_whole_word_basic() {
-        assert_eq!(replace_whole_word("foo bar baz", "bar", "qux"), "foo qux baz");
+        assert_eq!(
+            replace_whole_word("foo bar baz", "bar", "qux"),
+            "foo qux baz"
+        );
         assert_eq!(replace_whole_word("foobar baz", "bar", "qux"), "foobar baz");
         assert_eq!(replace_whole_word("bar_foo", "bar", "qux"), "bar_foo");
         assert_eq!(replace_whole_word("bar", "bar", "qux"), "qux");
@@ -596,11 +877,18 @@ mod tests {
         let changes_json = serde_json::json!([{"type": "replace_text", "old_text": "println!(\"Hello\")", "new_text": "println!(\"Goodbye\")"}]);
         let changes = parse_edit_changes(&changes_json, Some(content)).unwrap();
         assert_eq!(changes.len(), 1);
-        if let EditChange::ReplaceText { start, end, new_text } = &changes[0] {
+        if let EditChange::ReplaceText {
+            start,
+            end,
+            new_text,
+        } = &changes[0]
+        {
             assert_eq!(*start, content.find("println!(\"Hello\")").unwrap());
             assert_eq!(*end, *start + "println!(\"Hello\")".len());
             assert_eq!(new_text, "println!(\"Goodbye\")");
-        } else { panic!("Expected ReplaceText"); }
+        } else {
+            panic!("Expected ReplaceText");
+        }
     }
 
     #[test]

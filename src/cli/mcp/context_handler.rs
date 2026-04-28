@@ -1,4 +1,4 @@
-use super::helpers::{extract_string, extract_usize, wrap_with_meta};
+use super::helpers::{extract_string, extract_usize, wrap_with_meta, HandlerContext};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
@@ -56,23 +56,22 @@ without reading the entire file. Accepts project_path to auto-switch between pro
     ) -> Result<Value, JsonRpcError> {
         let node_id = extract_string(&args, "node_id")?;
         let token_budget = extract_usize(&args, "token_budget", 2000)?;
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
 
-        let handle = registry.get_or_create(project_path).await?;
-        let reader = handle.lock().await;
+        let mut ctx = HandlerContext::new_optional_pdg(registry, &args).await?;
 
-        if !reader.is_indexed() {
+        if !ctx.index().is_indexed() {
             return Err(JsonRpcError::project_not_indexed(
-                reader.project_path().display().to_string(),
+                ctx.project_path().display().to_string(),
             ));
         }
 
-        let result = reader
+        let result = ctx
+            .index_mut()
             .expand_node_context(&node_id, token_budget)
             .map_err(|e| JsonRpcError::internal_error(format!("Context expansion error: {}", e)))?;
 
         serde_json::to_value(result)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
-            .map(|v| wrap_with_meta(v, &reader))
+            .map(|v| wrap_with_meta(v, ctx.index()))
     }
 }
