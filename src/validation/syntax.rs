@@ -1,7 +1,7 @@
 //! Syntax validation using tree-sitter
 
+use crate::edit::ResolvedEditChange;
 use crate::parse::grammar::LanguageId;
-use crate::validation::edit_change::EditChange;
 use crate::validation::ValidationError;
 use std::path::PathBuf;
 
@@ -136,7 +136,7 @@ impl SyntaxValidator {
     /// Vector of syntax errors found
     pub fn validate_syntax(
         &self,
-        changes: &[EditChange],
+        changes: &[ResolvedEditChange],
     ) -> Result<Vec<SyntaxError>, ValidationError> {
         let mut errors = Vec::new();
 
@@ -235,11 +235,11 @@ impl SyntaxValidator {
     /// Check for style issues (warnings, not errors)
     fn check_style_issues(
         &self,
-        change: &EditChange,
+        change: &ResolvedEditChange,
         _language_id: LanguageId,
     ) -> Option<SyntaxError> {
         // Check for empty edits (inserting only whitespace)
-        if change.edit_type == crate::validation::edit_change::EditType::Insert
+        if change.edit_type == crate::edit::EditType::Insert
             && change.new_content.trim().is_empty()
         {
             return Some(SyntaxError::new(
@@ -293,7 +293,7 @@ mod tests {
     #[test]
     fn test_validate_syntax_valid_python() {
         let validator = SyntaxValidator::new();
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.py"),
             String::new(),
             "def hello():\n    print('world')".to_string(),
@@ -305,7 +305,7 @@ mod tests {
     #[test]
     fn test_validate_syntax_invalid_python() {
         let validator = SyntaxValidator::new();
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.py"),
             String::new(),
             "def hello(\n    print('world')".to_string(), // Missing closing paren
@@ -318,7 +318,7 @@ mod tests {
     #[test]
     fn test_validate_syntax_valid_javascript() {
         let validator = SyntaxValidator::new();
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.js"),
             String::new(),
             "function hello() {\n  console.log('world');\n}".to_string(),
@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn test_validate_syntax_invalid_javascript() {
         let validator = SyntaxValidator::new();
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.js"),
             String::new(),
             "function hello( {\n  console.log('world');\n}".to_string(), // Syntax error
@@ -342,7 +342,7 @@ mod tests {
     #[test]
     fn test_validate_syntax_valid_rust() {
         let validator = SyntaxValidator::new();
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.rs"),
             String::new(),
             "fn hello() {\n    println!(\"world\");\n}".to_string(),
@@ -354,7 +354,7 @@ mod tests {
     #[test]
     fn test_validate_syntax_invalid_rust() {
         let validator = SyntaxValidator::new();
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.rs"),
             String::new(),
             "fn hello( {\n    println!(\"world\");\n}".to_string(), // Syntax error
@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn test_validate_syntax_unsupported_language() {
         let validator = SyntaxValidator::new();
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.xyz"),
             String::new(),
             "some content".to_string(),
@@ -402,7 +402,7 @@ mod tests {
     fn test_validate_syntax_long_line_warning() {
         let validator = SyntaxValidator::strict();
         let long_line = "x".repeat(250);
-        let change = EditChange::new(PathBuf::from("test.py"), String::new(), long_line);
+        let change = ResolvedEditChange::new(PathBuf::from("test.py"), String::new(), long_line);
         let errors = validator.validate_syntax(&[change]).unwrap();
         assert!(!errors.is_empty());
         assert_eq!(errors[0].severity, ErrorSeverity::Warning);
@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn test_validate_syntax_whitespace_only_warning() {
         let validator = SyntaxValidator::strict();
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.py"),
             String::new(),
             "   \n   \n".to_string(),
@@ -432,7 +432,7 @@ mod tests {
     #[test]
     fn test_validate_syntax_valid_go() {
         let validator = SyntaxValidator::new();
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.go"),
             String::new(),
             "package main\n\nfunc main() {\n\tprintln(\"hello\")\n}".to_string(),
@@ -444,7 +444,7 @@ mod tests {
     #[test]
     fn test_validate_syntax_valid_json() {
         let validator = SyntaxValidator::new();
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.json"),
             String::new(),
             "{\"key\": \"value\"}".to_string(),
@@ -456,7 +456,7 @@ mod tests {
     #[test]
     fn test_validate_syntax_invalid_json() {
         let validator = SyntaxValidator::new();
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.json"),
             String::new(),
             "{\"key\": }".to_string(), // Invalid JSON
@@ -468,12 +468,12 @@ mod tests {
     #[test]
     fn test_validate_syntax_multiple_changes() {
         let validator = SyntaxValidator::new();
-        let change1 = EditChange::new(
+        let change1 = ResolvedEditChange::new(
             PathBuf::from("test1.py"),
             String::new(),
             "def foo(): pass".to_string(),
         );
-        let change2 = EditChange::new(
+        let change2 = ResolvedEditChange::new(
             PathBuf::from("test2.py"),
             String::new(),
             "def bar(:\n    pass".to_string(), // Syntax error

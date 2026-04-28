@@ -19,7 +19,8 @@ pub use crate::storage::{Storage, StorageConfig, UniqueProjectId};
 
 // Public API re-exports from command module
 pub use command::{
-    EditChange, EditCommand, EditPreview, EditRequest, EditResult, ImpactAnalysis, RiskLevel,
+    EditChange, EditCommand, EditPreview, EditRequest, EditResult, EditType, ImpactAnalysis,
+    ResolvedEditChange, RiskLevel,
 };
 
 // Public API re-exports from engine module

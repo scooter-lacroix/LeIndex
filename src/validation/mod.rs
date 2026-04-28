@@ -8,13 +8,12 @@
 #![warn(unused_extern_crates)]
 
 mod drift;
-mod edit_change;
 mod impact;
 mod reference;
 mod syntax;
 
+pub use crate::edit::{EditType, ResolvedEditChange};
 pub use drift::{DriftItem, DriftReport, DriftType, SemanticDriftAnalyzer};
-pub use edit_change::EditChange;
 pub use impact::{ImpactAnalyzer, ImpactReport, Location, RiskLevel};
 pub use reference::{ReferenceChecker, ReferenceIssue, ReferenceIssueType};
 pub use syntax::{ErrorSeverity, SyntaxError, SyntaxValidator};
@@ -169,7 +168,7 @@ impl LogicValidator {
     ///
     /// # Returns
     /// Validation result with all found issues
-    pub fn validate_change(&self, change: &EditChange) -> Result<ValidationResult> {
+    pub fn validate_change(&self, change: &ResolvedEditChange) -> Result<ValidationResult> {
         self.validate_changes(&[change.clone()])
     }
 
@@ -180,7 +179,7 @@ impl LogicValidator {
     ///
     /// # Returns
     /// Validation result with all found issues
-    pub fn validate_changes(&self, changes: &[EditChange]) -> Result<ValidationResult> {
+    pub fn validate_changes(&self, changes: &[ResolvedEditChange]) -> Result<ValidationResult> {
         let mut result = ValidationResult::new();
 
         // Syntax validation

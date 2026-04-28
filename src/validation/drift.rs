@@ -1,9 +1,9 @@
 //! Semantic drift detection for signature changes and API breakage
 
+use crate::edit::ResolvedEditChange;
 use crate::graph::pdg::NodeType;
 use crate::graph::ProgramDependenceGraph;
 use crate::parse::traits::{CodeIntelligence, SignatureInfo};
-use crate::validation::edit_change::EditChange;
 use crate::validation::Location;
 use crate::validation::ValidationError;
 use std::collections::HashMap;
@@ -190,7 +190,7 @@ impl SemanticDriftAnalyzer {
     /// Vector of drift items detected
     pub fn analyze_semantic_drift(
         &self,
-        changes: &[EditChange],
+        changes: &[ResolvedEditChange],
     ) -> Result<Vec<DriftItem>, ValidationError> {
         let mut drift_items = Vec::new();
 
@@ -211,7 +211,7 @@ impl SemanticDriftAnalyzer {
     /// Extract signatures from content
     fn extract_signatures(
         &self,
-        change: &EditChange,
+        change: &ResolvedEditChange,
         content: &str,
     ) -> Result<Vec<SignatureInfo>, ValidationError> {
         if content.is_empty() {
@@ -275,7 +275,7 @@ impl SemanticDriftAnalyzer {
     /// Compare signatures to detect drift
     fn compare_signatures(
         &self,
-        change: &EditChange,
+        change: &ResolvedEditChange,
         original: &[SignatureInfo],
         new: &[SignatureInfo],
     ) -> Result<Vec<DriftItem>, ValidationError> {
@@ -322,7 +322,7 @@ impl SemanticDriftAnalyzer {
     /// Detect drift between two signatures
     fn detect_signature_drift(
         &self,
-        change: &EditChange,
+        change: &ResolvedEditChange,
         original: &SignatureInfo,
         new: &SignatureInfo,
     ) -> Result<Option<DriftItem>, ValidationError> {
@@ -364,7 +364,7 @@ impl SemanticDriftAnalyzer {
     }
 
     /// Find the location of a signature in the edit change
-    fn find_signature_location(&self, change: &EditChange, sig: &SignatureInfo) -> Location {
+    fn find_signature_location(&self, change: &ResolvedEditChange, sig: &SignatureInfo) -> Location {
         let byte_offset = sig.byte_range.0;
         let mut line = 1;
         let mut column = 1;
@@ -513,7 +513,7 @@ mod tests {
     fn test_analyze_semantic_drift_empty_changes() {
         let pdg = Arc::new(ProgramDependenceGraph::new());
         let analyzer = SemanticDriftAnalyzer::new(pdg);
-        let changes: &[EditChange] = &[];
+        let changes: &[ResolvedEditChange] = &[];
         let result = analyzer.analyze_semantic_drift(changes).unwrap();
         assert!(result.is_empty());
     }
@@ -541,7 +541,7 @@ mod tests {
         let pdg = Arc::new(ProgramDependenceGraph::new());
         let analyzer = SemanticDriftAnalyzer::new(pdg);
 
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.py"),
             String::new(),
             "def foo():\n    pass".to_string(),
