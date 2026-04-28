@@ -70,8 +70,10 @@ Grep + multi-file Edit with a single atomic operation."
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let mut index = handle.lock().await;
-        index.ensure_pdg_loaded().map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+        let mut index = handle.write().await;
+        index
+            .ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
         let pdg = index.pdg().ok_or_else(|| {
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
@@ -185,7 +187,7 @@ Grep + multi-file Edit with a single atomic operation."
         // For non-preview renames, reject if validation finds errors.
         // For preview renames, include validation results as warnings.
         let validation_json = {
-            let idx = handle.lock().await;
+            let idx = handle.read().await;
             match idx.create_validator() {
                 Some(validator) => {
                     // Build ResolvedEditChanges from the proposed file modifications
@@ -209,9 +211,18 @@ Grep + multi-file Edit with a single atomic operation."
 
                             if has_errors && !preview_only {
                                 // Build detailed error response — reject the rename
-                                let syn_errs = v_json["syntax_errors"].as_array().map(|a| a.len()).unwrap_or(0);
-                                let ref_issues = v_json["reference_issues"].as_array().map(|a| a.len()).unwrap_or(0);
-                                let drift = v_json["semantic_drift"].as_array().map(|a| a.len()).unwrap_or(0);
+                                let syn_errs = v_json["syntax_errors"]
+                                    .as_array()
+                                    .map(|a| a.len())
+                                    .unwrap_or(0);
+                                let ref_issues = v_json["reference_issues"]
+                                    .as_array()
+                                    .map(|a| a.len())
+                                    .unwrap_or(0);
+                                let drift = v_json["semantic_drift"]
+                                    .as_array()
+                                    .map(|a| a.len())
+                                    .unwrap_or(0);
                                 return Err(JsonRpcError::invalid_params(format!(
                                     "Rename rejected — validation found errors. Files unchanged.\n\
                                      Syntax errors: {}\nReference issues: {}\nSemantic drift: {}\n\
@@ -274,11 +285,8 @@ Grep + multi-file Edit with a single atomic operation."
         }
 
         // Re-acquire the lock for wrap_with_meta (released before spawn_blocking)
-        let index = handle.lock().await;
-        Ok(wrap_with_meta(
-            response_data,
-            &index,
-        ))
+        let index = handle.read().await;
+        Ok(wrap_with_meta(response_data, &index))
     }
 }
 

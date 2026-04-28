@@ -55,7 +55,7 @@ also accept project_path and auto-index, so explicit indexing is optional."
         if !force_reindex {
             // Auto-index-if-needed path: registry handles everything.
             let handle = registry.get_or_create(Some(&project_path)).await?;
-            let index = handle.lock().await;
+            let index = handle.read().await;
             if index.is_indexed() {
                 return serde_json::to_value(index.get_stats())
                     .map(|v| wrap_with_meta(v, &index))
@@ -70,7 +70,7 @@ also accept project_path and auto-index, so explicit indexing is optional."
             .await?;
 
         let index = registry.get_or_create(Some(&project_path)).await?;
-        let idx = index.lock().await;
+        let idx = index.read().await;
         serde_json::to_value(stats)
             .map(|v| wrap_with_meta(v, &idx))
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))

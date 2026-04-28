@@ -533,7 +533,7 @@ pub(crate) fn phase_analysis_schema() -> Value {
 /// ```ignore
 /// // BEFORE (repeated in ~12 handlers):
 /// let handle = registry.get_or_create(project_path).await?;
-/// let mut index = handle.lock().await;
+/// let mut index = handle.write().await;
 /// index.ensure_pdg_loaded()
 ///     .map_err(|e| JsonRpcError::indexing_failed(...))?;
 /// let pdg = index.pdg().ok_or_else(|| {
@@ -547,18 +547,18 @@ pub(crate) fn phase_analysis_schema() -> Value {
 pub(crate) struct HandlerContext {
     /// Handle to the project (keeps the `Arc` alive).
     #[allow(dead_code)]
-    handle: std::sync::Arc<tokio::sync::Mutex<crate::cli::leindex::LeIndex>>,
-    /// Mutex guard over the `LeIndex` instance.
-    guard: tokio::sync::MutexGuard<'static, crate::cli::leindex::LeIndex>,
+    handle: std::sync::Arc<crate::cli::registry::ProjectRwLock>,
+    /// Write guard over the `LeIndex` instance.
+    guard: crate::cli::registry::ProjectWriteGuard<'static>,
     /// Whether the PDG was successfully loaded.
     #[allow(dead_code)]
     pdg_loaded: bool,
 }
 
 // SAFETY: The guard is derived from an Arc that we also store, so the
-// MutexGuard's lifetime is effectively "as long as the struct".  We use
+// guard's lifetime is effectively "as long as the struct".  We use
 // a transmute to express this to the type system.  This is safe because:
-//   1. The Arc ensures the Mutex lives long enough.
+//   1. The Arc ensures the ProjectRwLock lives long enough.
 //   2. The guard is dropped before the Arc (struct field order is top-to-bottom).
 //   3. No other code can access the Arc between creation and drop.
 unsafe impl Send for HandlerContext {}
@@ -574,7 +574,7 @@ impl HandlerContext {
     ) -> Result<Self, JsonRpcError> {
         let project_path = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path).await?;
-        let mut guard = handle.lock().await;
+        let mut guard = handle.write().await;
 
         guard
             .ensure_pdg_loaded()
@@ -587,11 +587,11 @@ impl HandlerContext {
         }
 
         // SAFETY: We extend the guard's lifetime to 'static because the Arc
-        // that owns the Mutex is stored alongside it. The guard will be dropped
-        // when Self is dropped, and the Arc ensures the underlying data lives
-        // long enough. This is a well-established pattern for self-referential
-        // structs where the owner and borrow are co-located.
-        let guard: tokio::sync::MutexGuard<'static, crate::cli::leindex::LeIndex> =
+        // that owns the ProjectRwLock is stored alongside it. The guard will be
+        // dropped when Self is dropped, and the Arc ensures the underlying data
+        // lives long enough. This is a well-established pattern for
+        // self-referential structs where the owner and borrow are co-located.
+        let guard: crate::cli::registry::ProjectWriteGuard<'static> =
             unsafe { std::mem::transmute(guard) };
 
         Ok(Self {
@@ -611,12 +611,12 @@ impl HandlerContext {
     ) -> Result<Self, JsonRpcError> {
         let project_path = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path).await?;
-        let mut guard = handle.lock().await;
+        let mut guard = handle.write().await;
 
         // Best-effort PDG load — ignore error, just leave it unloaded.
         let pdg_loaded = guard.ensure_pdg_loaded().is_ok();
 
-        let guard: tokio::sync::MutexGuard<'static, crate::cli::leindex::LeIndex> =
+        let guard: crate::cli::registry::ProjectWriteGuard<'static> =
             unsafe { std::mem::transmute(guard) };
 
         Ok(Self {
@@ -635,9 +635,9 @@ impl HandlerContext {
     ) -> Result<Self, JsonRpcError> {
         let project_path = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path).await?;
-        let guard = handle.lock().await;
+        let guard = handle.write().await;
 
-        let guard: tokio::sync::MutexGuard<'static, crate::cli::leindex::LeIndex> =
+        let guard: crate::cli::registry::ProjectWriteGuard<'static> =
             unsafe { std::mem::transmute(guard) };
 
         Ok(Self {

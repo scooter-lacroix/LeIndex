@@ -191,7 +191,7 @@ impl GrepSymbolsHandler {
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let mut index = handle.lock().await;
+        let mut index = handle.write().await;
         let scope = resolve_scope(&args, index.project_path())?;
 
         const MAX_CANDIDATE_LIMIT: usize = 1000;

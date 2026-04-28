@@ -1,7 +1,7 @@
 use super::edit_preview_handler::EditPreviewHandler;
 use super::helpers::{
-    apply_changes_in_memory, extract_bool, extract_string, get_direct_callers,
-    parse_edit_changes, validate_file_within_project, wrap_with_meta,
+    apply_changes_in_memory, extract_bool, extract_string, get_direct_callers, parse_edit_changes,
+    validate_file_within_project, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -118,7 +118,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
 
         // Enforce project boundary
         {
-            let index = handle.lock().await;
+            let index = handle.read().await;
             let _ = validate_file_within_project(&file_path, index.project_path())?;
         }
 
@@ -131,7 +131,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
         let modified = apply_changes_in_memory(&original, &changes)?;
 
         if modified == original {
-            let idx = handle.lock().await;
+            let idx = handle.read().await;
             return Ok(wrap_with_meta(
                 serde_json::json!({
                     "success": true,
@@ -146,7 +146,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
         // Run validation via LogicValidator — reject edits with errors,
         // include warnings in the success response
         let validation_json = {
-            let idx = handle.lock().await;
+            let idx = handle.read().await;
             match idx.create_validator() {
                 Some(validator) => {
                     // Convert parsed EditChanges to ResolvedEditChanges for validation
@@ -170,9 +170,18 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                                     "Edit rejected — validation found errors. File unchanged.\n\
                                      Syntax errors: {}\nReference issues: {}\nSemantic drift: {}\n\
                                      Details: {}",
-                                    v_json["syntax_errors"].as_array().map(|a| a.len()).unwrap_or(0),
-                                    v_json["reference_issues"].as_array().map(|a| a.len()).unwrap_or(0),
-                                    v_json["semantic_drift"].as_array().map(|a| a.len()).unwrap_or(0),
+                                    v_json["syntax_errors"]
+                                        .as_array()
+                                        .map(|a| a.len())
+                                        .unwrap_or(0),
+                                    v_json["reference_issues"]
+                                        .as_array()
+                                        .map(|a| a.len())
+                                        .unwrap_or(0),
+                                    v_json["semantic_drift"]
+                                        .as_array()
+                                        .map(|a| a.len())
+                                        .unwrap_or(0),
                                     v_json
                                 )));
                             }
@@ -217,7 +226,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
 
         // Compact affected callers — eliminates follow-up Grep for breakage
         let affected_callers: Vec<String> = {
-            let idx = handle.lock().await;
+            let idx = handle.read().await;
             if let Some(pdg) = idx.pdg() {
                 let nodes = pdg.nodes_in_file(&file_path);
                 let mut callers: std::collections::BTreeSet<String> =
@@ -237,7 +246,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             }
         };
 
-        let idx = handle.lock().await;
+        let idx = handle.read().await;
         let mut response = serde_json::json!({
             "success": true,
             "changes_applied": changes.len(),
@@ -265,7 +274,10 @@ mod tests {
     use tokio;
 
     /// Helper: create a temp dir with a file and return (TempDir, file_path, registry)
-    async fn setup_test_file(content: &str, file_name: &str) -> (TempDir, String, Arc<ProjectRegistry>) {
+    async fn setup_test_file(
+        content: &str,
+        file_name: &str,
+    ) -> (TempDir, String, Arc<ProjectRegistry>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let file_path = dir.path().join(file_name);
         std::fs::write(&file_path, content).expect("write test file");
@@ -286,7 +298,11 @@ mod tests {
         });
 
         let result = handler.execute(&registry, args).await;
-        assert!(result.is_ok(), "Expected success, got error: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Expected success, got error: {:?}",
+            result.err()
+        );
 
         let response = result.unwrap();
         assert_eq!(response["success"], true);
@@ -333,11 +349,18 @@ mod tests {
         });
 
         let result = handler.execute(&registry, args).await;
-        assert!(result.is_ok(), "Expected success, got error: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Expected success, got error: {:?}",
+            result.err()
+        );
 
         let response = result.unwrap();
         // Preview response should have diff, not edit_region
-        assert!(response.get("diff").is_some(), "dry_run should produce diff");
+        assert!(
+            response.get("diff").is_some(),
+            "dry_run should produce diff"
+        );
 
         // File should NOT be modified
         let content = std::fs::read_to_string(&file_path).unwrap();
@@ -368,14 +391,18 @@ mod tests {
             // The error should mention validation rejection
             assert!(
                 msg.contains("Edit rejected") || msg.contains("validation"),
-                "Expected validation rejection, got: {}", msg
+                "Expected validation rejection, got: {}",
+                msg
             );
         }
         // Either validation caught it (Err) or it went through (Ok).
         // The key invariant: if rejected, file must be unchanged.
         if result.is_err() {
             let content = std::fs::read_to_string(&file_path).unwrap();
-            assert!(content.contains("world"), "File should be unchanged after rejection");
+            assert!(
+                content.contains("world"),
+                "File should be unchanged after rejection"
+            );
         }
     }
 
@@ -408,12 +435,30 @@ mod tests {
         // When validation runs (PDG available), the validation field must be present
         // and have the correct structure with all required sub-fields.
         if let Some(validation) = response.get("validation") {
-            assert!(validation.get("is_valid").is_some(), "validation.is_valid must be present");
-            assert!(validation.get("has_errors").is_some(), "validation.has_errors must be present");
-            assert!(validation.get("syntax_errors").is_some(), "validation.syntax_errors must be present");
-            assert!(validation.get("reference_issues").is_some(), "validation.reference_issues must be present");
-            assert!(validation.get("semantic_drift").is_some(), "validation.semantic_drift must be present");
-            assert!(validation.get("impact_report").is_some(), "validation.impact_report must be present");
+            assert!(
+                validation.get("is_valid").is_some(),
+                "validation.is_valid must be present"
+            );
+            assert!(
+                validation.get("has_errors").is_some(),
+                "validation.has_errors must be present"
+            );
+            assert!(
+                validation.get("syntax_errors").is_some(),
+                "validation.syntax_errors must be present"
+            );
+            assert!(
+                validation.get("reference_issues").is_some(),
+                "validation.reference_issues must be present"
+            );
+            assert!(
+                validation.get("semantic_drift").is_some(),
+                "validation.semantic_drift must be present"
+            );
+            assert!(
+                validation.get("impact_report").is_some(),
+                "validation.impact_report must be present"
+            );
 
             // For a valid edit, syntax_errors/reference_issues/semantic_drift should be arrays
             assert!(validation["syntax_errors"].is_array());

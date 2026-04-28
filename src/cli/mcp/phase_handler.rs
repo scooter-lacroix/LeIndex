@@ -123,7 +123,7 @@ async fn execute_phase_analysis(
     let include_docs = extract_bool(&args, "include_docs", false);
 
     let base_project_root = {
-        let reader = handle.lock().await;
+        let reader = handle.read().await;
         reader.project_path().to_path_buf()
     };
 
@@ -182,7 +182,7 @@ async fn execute_phase_analysis(
             };
 
             let file_path_str = file_path.to_string_lossy().to_string();
-            let reader = handle.lock().await;
+            let reader = handle.read().await;
             if let Some(pdg) = reader.pdg() {
                 let node_ids = pdg.nodes_in_file(&file_path_str);
                 let mut symbols: Vec<serde_json::Value> = node_ids
@@ -295,7 +295,7 @@ async fn execute_phase_analysis(
         );
     }
 
-    let index_for_meta = handle.lock().await;
+    let index_for_meta = handle.read().await;
     Ok(wrap_with_meta(report_value, &index_for_meta))
 }
 
@@ -319,10 +319,7 @@ mod tests {
             .get("properties")
             .and_then(|v| v.get("phase"))
             .expect("phase schema");
-        assert_eq!(
-            phase.get("default").and_then(|v| v.as_str()),
-            Some("all")
-        );
+        assert_eq!(phase.get("default").and_then(|v| v.as_str()), Some("all"));
     }
 
     #[test]
@@ -462,8 +459,8 @@ mod tests {
     fn test_phase_c_handler_schemas() {
         // All Phase C schemas should be valid JSON objects with required fields
         use super::super::file_summary_handler::FileSummaryHandler;
-        use super::super::project_map_handler::ProjectMapHandler;
         use super::super::grep_symbols_handler::GrepSymbolsHandler;
+        use super::super::project_map_handler::ProjectMapHandler;
         use super::super::read_symbol_handler::ReadSymbolHandler;
         use super::super::symbol_lookup_handler::SymbolLookupHandler;
 

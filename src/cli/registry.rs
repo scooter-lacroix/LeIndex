@@ -6,13 +6,22 @@
 //!
 //! ## Concurrency model
 //!
-//! * **Outer map** (`RwLock<HashMap<...>>`)
+//! * **Outer map** (`tokio::sync::RwLock<HashMap<...>>`)
 //!   - Read-lock for fast project lookup.
 //!   - Write-lock only for insert/remove operations.
 //!
-//! * **Per-project state** (`Arc<Mutex<LeIndex>>`)
-//!   - `LeIndex` is `Send` but not `Sync` (rusqlite internals), so per-project
-//!     access is coordinated with a mutex.
+//! * **Per-project state** (`ProjectRwLock<LeIndex>`)
+//!   - Uses `tokio::sync::Mutex` internally because `LeIndex` is `Send` but
+//!     not `Sync` (rusqlite internals use `RefCell`). `tokio::sync::Mutex<T>`
+//!     is `Sync` when `T: Send`, unlike `RwLock<T>` which requires `T: Sync`.
+//!   - Exposes `read()` and `write()` methods that both acquire the underlying
+//!     mutex. This establishes the correct read/write API contract so that
+//!     when `LeIndex` becomes `Sync` (e.g. by moving rusqlite behind a mutex),
+//!     the upgrade to a true `RwLock` is a single-line change.
+//!   - The outer `RwLock` on the project map provides concurrent access to
+//!     *different* projects. Within a single project, the `Mutex` serializes
+//!     all operations, but handlers release the lock between async steps so
+//!     concurrent requests to the same project interleave naturally.
 //!
 //! * **ASAP indexing consolidation** (`index_slots`)
 //!   - Concurrent indexing requests for the same project share a per-project
@@ -33,8 +42,128 @@ use tracing::{debug, info, warn};
 /// Default maximum number of projects kept in memory simultaneously.
 pub const DEFAULT_MAX_PROJECTS: usize = 5;
 
+// ---------------------------------------------------------------------------
+// ProjectRwLock — read/write API over a Mutex for !Sync inner types
+// ---------------------------------------------------------------------------
+
+/// A read/write lock wrapper for per-project `LeIndex` access.
+///
+/// `LeIndex` is `Send` but **not** `Sync` (rusqlite uses `RefCell` internally),
+/// which prevents using `tokio::sync::RwLock<LeIndex>` directly — `RwLock<T>`
+/// requires `T: Sync` for its own `Sync` impl, while `Mutex<T>` only requires
+/// `T: Send`.
+///
+/// `ProjectRwLock` uses a `tokio::sync::Mutex` internally but exposes `read()`
+/// and `write()` methods to establish the correct read/write API contract.
+/// Callers that only read data use `read()`, and callers that mutate use
+/// `write()`. Currently both acquire the same mutex, but the API allows a
+/// seamless upgrade to a true `RwLock` when `LeIndex` becomes `Sync`.
+///
+/// **Concurrency benefit**: The outer `RwLock` on the project map already
+/// provides concurrent access to *different* projects. Within a single project,
+/// handlers release the lock between async steps so concurrent requests
+/// interleave naturally.
+pub struct ProjectRwLock {
+    inner: Mutex<LeIndex>,
+}
+
+impl ProjectRwLock {
+    /// Create a new `ProjectRwLock` wrapping the given `LeIndex`.
+    pub fn new(leindex: LeIndex) -> Self {
+        Self {
+            inner: Mutex::new(leindex),
+        }
+    }
+
+    /// Acquire a read guard for the `LeIndex`.
+    ///
+    /// Currently acquires the underlying mutex (since `LeIndex` is `!Sync`).
+    /// When `LeIndex` becomes `Sync`, this can be upgraded to a true read lock
+    /// allowing concurrent reads.
+    pub async fn read(&self) -> ProjectReadGuard<'_> {
+        ProjectReadGuard {
+            inner: self.inner.lock().await,
+        }
+    }
+
+    /// Acquire a write guard for the `LeIndex`.
+    ///
+    /// Use for operations that mutate the `LeIndex` (e.g. PDG swap, indexing).
+    pub async fn write(&self) -> ProjectWriteGuard<'_> {
+        ProjectWriteGuard {
+            inner: self.inner.lock().await,
+        }
+    }
+
+    /// Try to acquire a write guard without blocking.
+    ///
+    /// Returns `Err` if the lock is already held. Used during eviction to
+    /// gracefully close the `LeIndex` only when it's not in use.
+    pub fn try_write(&self) -> Result<ProjectWriteGuard<'_>, ()> {
+        match self.inner.try_lock() {
+            Ok(guard) => Ok(ProjectWriteGuard { inner: guard }),
+            Err(_) => Err(()),
+        }
+    }
+
+    /// Acquire a blocking write guard (for use in `spawn_blocking` contexts).
+    ///
+    /// Blocks the current thread until the lock is available. Use only from
+    /// synchronous contexts (e.g. `spawn_blocking`).
+    pub fn blocking_write(&self) -> ProjectWriteGuard<'_> {
+        ProjectWriteGuard {
+            inner: self.inner.blocking_lock(),
+        }
+    }
+}
+
+// Both guards are `Send` because `tokio::sync::MutexGuard` is `Send`.
+// They are NOT `Sync` because the underlying `LeIndex` is `!Sync`.
+
+/// Read guard acquired from `ProjectRwLock::read()`.
+///
+/// Derefs to `LeIndex` for read-only access.
+pub struct ProjectReadGuard<'a> {
+    inner: tokio::sync::MutexGuard<'a, LeIndex>,
+}
+
+impl std::ops::Deref for ProjectReadGuard<'_> {
+    type Target = LeIndex;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// Write guard acquired from `ProjectRwLock::write()`.
+///
+/// Derefs to `LeIndex` for read access, and `DerefMut` for write access.
+pub struct ProjectWriteGuard<'a> {
+    inner: tokio::sync::MutexGuard<'a, LeIndex>,
+}
+
+impl std::ops::Deref for ProjectWriteGuard<'_> {
+    type Target = LeIndex;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for ProjectWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.inner
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ProjectHandle and ProjectRegistry
+// ---------------------------------------------------------------------------
+
 /// A handle to one project's `LeIndex`.
-pub type ProjectHandle = Arc<Mutex<LeIndex>>;
+///
+/// Uses `ProjectRwLock` which wraps a `tokio::sync::Mutex` internally (since
+/// `LeIndex` is `!Sync`) but exposes `read()` and `write()` methods to
+/// distinguish read vs write operations.
+pub type ProjectHandle = Arc<ProjectRwLock>;
 
 /// Multi-project registry.
 pub struct ProjectRegistry {
@@ -78,7 +207,7 @@ impl ProjectRegistry {
     /// Create a registry pre-loaded with one project (the initial startup project).
     pub fn with_initial_project(max_projects: usize, leindex: LeIndex) -> Self {
         let path = leindex.project_path().to_path_buf();
-        let handle: ProjectHandle = Arc::new(Mutex::new(leindex));
+        let handle: ProjectHandle = Arc::new(ProjectRwLock::new(leindex));
 
         let mut map = HashMap::new();
         map.insert(path.clone(), handle.clone());
@@ -136,12 +265,12 @@ impl ProjectRegistry {
 
         // Get canonical path for stale cache key
         let canonical = {
-            let idx = handle.lock().await;
+            let idx = handle.read().await;
             idx.project_path().to_path_buf()
         };
 
         let (needs_index, needs_refresh) = {
-            let idx = handle.lock().await;
+            let idx = handle.read().await;
             let not_indexed = !idx.is_indexed();
 
             // Check stale cache first (2-second TTL)
@@ -156,14 +285,20 @@ impl ProjectRegistry {
                         // Cache expired — compute fresh
                         drop(cache);
                         let fresh = idx.is_stale_fast();
-                        self.stale_cache.write().await.insert(canonical.clone(), (std::time::Instant::now(), fresh));
+                        self.stale_cache
+                            .write()
+                            .await
+                            .insert(canonical.clone(), (std::time::Instant::now(), fresh));
                         fresh
                     }
                 } else {
                     // No cache entry — compute and cache
                     drop(cache);
                     let fresh = idx.is_stale_fast();
-                    self.stale_cache.write().await.insert(canonical.clone(), (std::time::Instant::now(), fresh));
+                    self.stale_cache
+                        .write()
+                        .await
+                        .insert(canonical.clone(), (std::time::Instant::now(), fresh));
                     fresh
                 }
             };
@@ -210,7 +345,7 @@ impl ProjectRegistry {
         };
 
         if let Some(handle) = removed {
-            if let Ok(mut idx) = handle.try_lock() {
+            if let Ok(mut idx) = handle.try_write() {
                 let _ = idx.close();
             }
             info!("Evicted project: {}", path.display());
@@ -291,7 +426,7 @@ impl ProjectRegistry {
             leindex = fresh;
         }
 
-        let handle: ProjectHandle = Arc::new(Mutex::new(leindex));
+        let handle: ProjectHandle = Arc::new(ProjectRwLock::new(leindex));
 
         {
             let mut projects = self.projects.write().await;
@@ -334,7 +469,7 @@ impl ProjectRegistry {
         force_reindex: bool,
     ) -> Result<IndexStats, JsonRpcError> {
         let project_path = {
-            let idx = handle.lock().await;
+            let idx = handle.read().await;
             idx.project_path().to_path_buf()
         };
 
@@ -343,7 +478,7 @@ impl ProjectRegistry {
 
         if !force_reindex {
             let cached = {
-                let idx = handle.lock().await;
+                let idx = handle.read().await;
                 if idx.is_indexed() && !idx.is_stale_fast() {
                     Some(idx.get_stats().clone())
                 } else {
@@ -381,13 +516,15 @@ impl ProjectRegistry {
         })?;
 
         {
-            let mut idx = handle.lock().await;
+            let mut idx = handle.write().await;
             *idx = fresh;
         }
 
         // Invalidate stale-cache entry so get_or_create() won't reuse
         // the pre-indexing staleness result.
-        let canonical = project_path.canonicalize().unwrap_or_else(|_| project_path.clone());
+        let canonical = project_path
+            .canonicalize()
+            .unwrap_or_else(|_| project_path.clone());
         self.stale_cache.write().await.remove(&canonical);
 
         Ok(stats)
@@ -434,7 +571,7 @@ impl ProjectRegistry {
             };
 
             if let Some(handle) = removed {
-                if let Ok(mut idx) = handle.try_lock() {
+                if let Ok(mut idx) = handle.try_write() {
                     let _ = idx.close();
                 }
             }
@@ -584,14 +721,93 @@ mod tests {
         let registry = ProjectRegistry::with_initial_project(5, leindex);
 
         let h1 = registry.get_or_load(None).await.unwrap();
-        let path1 = h1.lock().await.project_path().to_path_buf();
+        let path1 = h1.read().await.project_path().to_path_buf();
         assert_eq!(path1, tmp1.path().canonicalize().unwrap());
 
         let p2 = tmp2.path().to_string_lossy().to_string();
         let _ = registry.get_or_load(Some(&p2)).await.unwrap();
 
         let h2 = registry.get_or_load(None).await.unwrap();
-        let path2 = h2.lock().await.project_path().to_path_buf();
+        let path2 = h2.read().await.project_path().to_path_buf();
         assert_eq!(path2, tmp2.path().canonicalize().unwrap());
+    }
+
+    /// Concurrency test: verify that the `ProjectRwLock` wrapper correctly
+    /// serializes access (both `read()` and `write()` acquire the underlying
+    /// mutex) and that concurrent operations from multiple tokio tasks
+    /// complete without deadlock or data corruption.
+    #[tokio::test]
+    async fn test_project_rwlock_concurrent_access_no_deadlock() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        let leindex = LeIndex::new(tmp.path()).unwrap();
+        let registry = ProjectRegistry::with_initial_project(5, leindex);
+
+        let handle = registry.get_or_load(None).await.unwrap();
+
+        // Spawn multiple concurrent tasks that acquire read guards.
+        // All should complete without deadlock (they are serialized by
+        // the underlying mutex, but the tokio runtime can interleave them).
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let h = handle.clone();
+            handles.push(tokio::spawn(async move {
+                // Alternating read and write to exercise both paths
+                if i % 2 == 0 {
+                    let guard = h.read().await;
+                    let path = guard.project_path().to_path_buf();
+                    assert!(path.exists());
+                } else {
+                    let guard = h.write().await;
+                    let path = guard.project_path().to_path_buf();
+                    assert!(path.exists());
+                }
+            }));
+        }
+
+        // All tasks must complete without deadlock
+        for h in handles {
+            h.await.unwrap();
+        }
+    }
+
+    /// Verify that `try_write()` returns Err when the lock is already held.
+    #[tokio::test]
+    async fn test_project_rwlock_try_write_returns_err_when_locked() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        let leindex = LeIndex::new(tmp.path()).unwrap();
+        let registry = ProjectRegistry::with_initial_project(5, leindex);
+
+        let handle = registry.get_or_load(None).await.unwrap();
+
+        // Acquire a read guard and hold it
+        let _guard = handle.read().await;
+
+        // try_write should fail because the lock is held
+        let result = handle.try_write();
+        assert!(result.is_err());
+    }
+
+    /// Verify that `blocking_write()` works from a spawn_blocking context.
+    #[test]
+    fn test_project_rwlock_blocking_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        let leindex = LeIndex::new(tmp.path()).unwrap();
+        let handle: ProjectHandle = Arc::new(ProjectRwLock::new(leindex));
+
+        let h = handle.clone();
+        let result = std::thread::spawn(move || {
+            let guard = h.blocking_write();
+            guard.project_path().to_path_buf()
+        })
+        .join()
+        .unwrap();
+
+        assert!(result.exists());
     }
 }
