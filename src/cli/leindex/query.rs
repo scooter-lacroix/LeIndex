@@ -160,7 +160,8 @@ impl LeIndex {
             .store_mut()
             .get_or_load(&analysis_cache_key)?
         {
-            if let Ok(mut cached) = bincode::deserialize::<super::AnalysisResult>(&serialized_data) {
+            if let Ok(mut cached) = bincode::deserialize::<super::AnalysisResult>(&serialized_data)
+            {
                 cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
                 debug!("Analysis cache hit for '{}'", query);
                 return Ok(cached);

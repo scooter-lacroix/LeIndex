@@ -949,21 +949,7 @@ data: {"type":"complete","stage":"indexing","current":0,"total":0,"message":"Don
 
 **Recommended: stdio transport** (most reliable, subprocess-based):
 
-Add to `~/.claude.json` (global, available in all projects):
-
-```json
-{
-  "mcpServers": {
-    "leindex": {
-      "command": "leindex",
-      "args": ["mcp", "--stdio"],
-      "type": "stdio"
-    }
-  }
-}
-```
-
-Or add to `.claude/settings.json` (project-local):
+Add to `~/.claude/settings.json` (global) or project-local `.claude/settings.json`:
 
 ```json
 {
@@ -1008,6 +994,16 @@ a single line of JSON (no double-newlines), which is required for the MCP protoc
   }
 }
 ```
+
+Optional LeIndex guidance pack:
+- Shared skill: `integrations/skills/leindex-toolkit/`
+- Reminder hook: `integrations/claude-code/hooks/use-leindex-instead.py`
+- Example merged settings: `integrations/claude-code/settings.example.json`
+
+Other agent guidance:
+- Codex can install the same shared skill into `~/.codex/skills/leindex-toolkit/`
+- Gemini CLI, Amp, OpenCode, Qwen, and iFlow can reuse the shared skill text as project rules
+- See [`docs/AGENT_GUIDANCE.md`](AGENT_GUIDANCE.md) for install details
 
 ### Cursor
 
@@ -1377,8 +1373,8 @@ LeIndex supports 17+ languages with full tree-sitter parsing:
 |----------|-----------|--------|
 | Rust | `.rs` | Full support |
 | Python | `.py` | Full support |
-| JavaScript | `.js`, `.jsx` | Full support |
-| TypeScript | `.ts`, `.tsx` | Full support |
+| JavaScript | `.js`, `.jsx`, `.mjs`, `.cjs` | Full support |
+| TypeScript | `.ts`, `.tsx`, `.mts`, `.cts` | Full support |
 | Go | `.go` | Full support |
 | Java | `.java` | Full support |
 | C | `.c`, `.h` | Full support |

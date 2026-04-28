@@ -478,7 +478,10 @@ impl SearchEngine {
         // All other node content is moved via ownership, avoiding a full Vec clone
         for node in &nodes {
             if let Some(embedding) = &node.embedding {
-                if let Err(e) = self.vector_index.insert(node.node_id.clone(), embedding.clone()) {
+                if let Err(e) = self
+                    .vector_index
+                    .insert(node.node_id.clone(), embedding.clone())
+                {
                     tracing::warn!(
                         "Failed to insert embedding for node {}: {:?}",
                         node.node_id,
@@ -711,7 +714,9 @@ impl SearchEngine {
                         .skip(1) // skip "// name in path" header
                         .map(|l| l.trim())
                         .find(|l| {
-                            !l.is_empty() && !l.starts_with("// [No source") && !l.starts_with("// [")
+                            !l.is_empty()
+                                && !l.starts_with("// [No source")
+                                && !l.starts_with("// [")
                         })
                         .map(|l| l.to_string())
                 };
@@ -801,10 +806,7 @@ impl SearchEngine {
             0.0
         } else if let Some(node_tokens) = self.node_tokens.get(node_id) {
             // Count overlap between query tokens and cached node tokens
-            let matching = precomputed
-                .query_tokens
-                .intersection(node_tokens)
-                .count();
+            let matching = precomputed.query_tokens.intersection(node_tokens).count();
             matching as f32 / precomputed.query_tokens.len() as f32
         } else {
             0.0
@@ -1332,7 +1334,10 @@ mod tests {
         assert_eq!(results[0].node_id, "func1");
 
         // Also verify text_index is populated
-        assert!(!engine.text_index.is_empty(), "text_index should be populated");
+        assert!(
+            !engine.text_index.is_empty(),
+            "text_index should be populated"
+        );
         assert!(
             engine.text_index.contains_key("func1"),
             "text_index should contain 'func1' token"

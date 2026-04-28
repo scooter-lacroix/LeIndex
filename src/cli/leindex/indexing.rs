@@ -101,7 +101,11 @@ impl LeIndex {
                         }
                         changed
                     }
-                    None => index_builder::detect_changed_manifests(&scan, &self.project_id, &self.cache.cache_spiller),
+                    None => index_builder::detect_changed_manifests(
+                        &scan,
+                        &self.project_id,
+                        &self.cache.cache_spiller,
+                    ),
                 };
                 if changed_manifests.is_empty() {
                     info!("No changes detected, skipping indexing");
@@ -161,25 +165,35 @@ impl LeIndex {
             })
             .collect();
 
-        let signatures_by_file: std::collections::HashMap<String, (String, Vec<crate::parse::traits::SignatureInfo>)> =
-            parsing_results
-                .iter()
-                .filter_map(|r| {
-                    if r.is_success() {
-                        let lang = r.language.clone().unwrap_or_else(|| "unknown".to_string());
-                        Some((
-                            r.file_path.display().to_string(),
-                            (lang, r.signatures.clone()),
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+        let signatures_by_file: std::collections::HashMap<
+            String,
+            (String, Vec<crate::parse::traits::SignatureInfo>),
+        > = parsing_results
+            .iter()
+            .filter_map(|r| {
+                if r.is_success() {
+                    let lang = r.language.clone().unwrap_or_else(|| "unknown".to_string());
+                    Some((
+                        r.file_path.display().to_string(),
+                        (lang, r.signatures.clone()),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         for (file_path, (language, signatures)) in signatures_by_file {
-            let source_bytes = source_bytes_by_file.get(&file_path).map(|s| s.as_slice()).unwrap_or(&[]);
-            let file_pdg = crate::graph::extract_pdg_from_signatures(signatures, source_bytes, &file_path, &language);
+            let source_bytes = source_bytes_by_file
+                .get(&file_path)
+                .map(|s| s.as_slice())
+                .unwrap_or(&[]);
+            let file_pdg = crate::graph::extract_pdg_from_signatures(
+                signatures,
+                source_bytes,
+                &file_path,
+                &language,
+            );
             index_builder::merge_pdgs(&mut pdg, file_pdg);
 
             if let Some((_, hash)) = source_files_with_hashes
@@ -237,7 +251,11 @@ impl LeIndex {
         );
 
         // Step 6: Re-index nodes for search
-        self.embedder = Some(index_builder::index_nodes(&pdg, &mut self.search_engine, &mut self.cache.file_stats_cache)?);
+        self.embedder = Some(index_builder::index_nodes(
+            &pdg,
+            &mut self.search_engine,
+            &mut self.cache.file_stats_cache,
+        )?);
         let indexed_count = self.search_engine.node_count();
 
         info!("Indexed {} nodes for search", indexed_count);
@@ -300,7 +318,11 @@ impl LeIndex {
 
         index_builder::normalize_external_nodes(&mut pdg);
 
-        self.embedder = Some(index_builder::index_nodes(&pdg, &mut self.search_engine, &mut self.cache.file_stats_cache)?);
+        self.embedder = Some(index_builder::index_nodes(
+            &pdg,
+            &mut self.search_engine,
+            &mut self.cache.file_stats_cache,
+        )?);
         let indexed_count = self.search_engine.node_count();
 
         info!("Rebuilt search index with {} nodes", indexed_count);

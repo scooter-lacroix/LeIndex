@@ -562,10 +562,7 @@ impl EditEngine {
             })?;
             if let Some(parent) = target_path.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
-                    EditError::Generic(format!(
-                        "Failed to create worktree dir {:?}: {}",
-                        parent, e
-                    ))
+                    EditError::Generic(format!("Failed to create worktree dir {:?}: {}", parent, e))
                 })?;
             }
             std::fs::write(&target_path, source.as_bytes()).map_err(|e| {
@@ -676,10 +673,7 @@ impl EditEngine {
                 for (file_path, content) in original_contents {
                     match std::fs::write(&file_path, content.as_bytes()) {
                         Ok(()) => restored.push(PathBuf::from(file_path)),
-                        Err(e) => errors.push(format!(
-                            "Failed to restore '{}': {}",
-                            file_path, e
-                        )),
+                        Err(e) => errors.push(format!("Failed to restore '{}': {}", file_path, e)),
                     }
                 }
                 if !errors.is_empty() {
@@ -916,10 +910,7 @@ impl WorktreeManager {
 
         for entry in entries {
             let entry = entry.map_err(|e| {
-                EditError::WorktreeError(format!(
-                    "Failed to read worktree directory entry: {}",
-                    e
-                ))
+                EditError::WorktreeError(format!("Failed to read worktree directory entry: {}", e))
             })?;
 
             let path = entry.path();
@@ -1107,9 +1098,7 @@ impl WorktreeSession {
                     if !file_existed {
                         let _ = std::fs::remove_file(backup_path);
                     } else if let Some(previous) = backup_content {
-                        if let Err(restore_err) =
-                            std::fs::write(backup_path, previous.as_bytes())
-                        {
+                        if let Err(restore_err) = std::fs::write(backup_path, previous.as_bytes()) {
                             tracing::error!(
                                 "CRITICAL: Failed to restore '{}' during rollback: {}",
                                 backup_path.display(),
@@ -1131,11 +1120,7 @@ impl WorktreeSession {
         if path.exists() {
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 // Post-commit cleanup failure — log but don't fail the merge
-                tracing::warn!(
-                    "Failed to clean up worktree '{}': {}",
-                    path.display(),
-                    e
-                );
+                tracing::warn!("Failed to clean up worktree '{}': {}", path.display(), e);
             }
         }
         Ok(())
@@ -1171,7 +1156,10 @@ impl Diff {
         let patch = diffy::create_patch(original, modified);
         let patch_str = patch.to_string();
         if patch_str.is_empty() {
-            Ok((format!("{} (unchanged)", file_path.display()), String::new()))
+            Ok((
+                format!("{} (unchanged)", file_path.display()),
+                String::new(),
+            ))
         } else {
             // diffy's output already contains ---/+++ headers with generic labels;
             // replace them with the actual file path
@@ -1206,7 +1194,7 @@ impl Impact {
         let config = crate::graph::pdg::TraversalConfig {
             max_depth: Some(5),
             max_nodes: Some(150),
-            allowed_edge_types: Some(vec![
+            allowed_edge_types: Some(&[
                 crate::graph::pdg::EdgeType::Call,
                 crate::graph::pdg::EdgeType::DataDependency,
                 crate::graph::pdg::EdgeType::Inheritance,
@@ -1247,7 +1235,7 @@ impl Impact {
         let config = crate::graph::pdg::TraversalConfig {
             max_depth: Some(5),
             max_nodes: Some(150),
-            allowed_edge_types: Some(vec![
+            allowed_edge_types: Some(&[
                 crate::graph::pdg::EdgeType::Call,
                 crate::graph::pdg::EdgeType::DataDependency,
                 crate::graph::pdg::EdgeType::Inheritance,

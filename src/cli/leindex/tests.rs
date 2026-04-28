@@ -26,9 +26,7 @@ fn test_project_scan_excludes_lockfiles_from_source_but_keeps_manifests() {
     assert!(scan
         .source_paths
         .iter()
-        .all(
-            |path| path.file_name().and_then(|name| name.to_str()) != Some("package-lock.json")
-        ));
+        .all(|path| path.file_name().and_then(|name| name.to_str()) != Some("package-lock.json")));
     assert!(scan
         .manifest_paths
         .iter()

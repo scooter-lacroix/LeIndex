@@ -364,7 +364,11 @@ impl SemanticDriftAnalyzer {
     }
 
     /// Find the location of a signature in the edit change
-    fn find_signature_location(&self, change: &ResolvedEditChange, sig: &SignatureInfo) -> Location {
+    fn find_signature_location(
+        &self,
+        change: &ResolvedEditChange,
+        sig: &SignatureInfo,
+    ) -> Location {
         let byte_offset = sig.byte_range.0;
         let mut line = 1;
         let mut column = 1;

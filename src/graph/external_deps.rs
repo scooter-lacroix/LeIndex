@@ -124,7 +124,8 @@ impl ExternalDependencyRegistry {
         // Group manifests by their parent directory (workspace root).
         // Within each workspace, parse with local priority ordering, then merge
         // all workspaces into a single registry.
-        let mut workspaces: std::collections::BTreeMap<PathBuf, Vec<PathBuf>> = std::collections::BTreeMap::new();
+        let mut workspaces: std::collections::BTreeMap<PathBuf, Vec<PathBuf>> =
+            std::collections::BTreeMap::new();
         for manifest_path in &sorted_paths {
             let path = if manifest_path.is_absolute() {
                 manifest_path.clone()
@@ -151,7 +152,9 @@ impl ExternalDependencyRegistry {
                 match file_name {
                     "Cargo.lock" => local.parse_cargo_lock(&content),
                     "Cargo.toml" => local.parse_cargo_toml(&content),
-                    "package-lock.json" | "npm-shrinkwrap.json" => local.parse_package_lock_json(&content),
+                    "package-lock.json" | "npm-shrinkwrap.json" => {
+                        local.parse_package_lock_json(&content)
+                    }
                     "package.json" => local.parse_package_json(&content),
                     "yarn.lock" => local.parse_yarn_lock(&content),
                     "pnpm-lock.yaml" => local.parse_pnpm_lock(&content),
@@ -1074,8 +1077,8 @@ pub fn annotate_external_nodes(
         .filter(|&idx| {
             pdg.get_node(idx)
                 .map(|n| {
-                    matches!(n.node_type, NodeType::External)
-                        || n.language == "external" // Legacy compat
+                    matches!(n.node_type, NodeType::External) || n.language == "external"
+                    // Legacy compat
                 })
                 .unwrap_or(false)
         })
@@ -1137,7 +1140,10 @@ pub struct AnnotationStats {
 /// When `exclude_dirs` is provided, those directory names are skipped in addition to
 /// the default hidden-directory heuristic. This allows callers to pass the directory
 /// patterns from `ExclusionConfig` so that user-excluded directories are respected.
-pub fn discover_dependency_manifests(root: &Path, exclude_dirs: Option<&[String]>) -> Vec<std::path::PathBuf> {
+pub fn discover_dependency_manifests(
+    root: &Path,
+    exclude_dirs: Option<&[String]>,
+) -> Vec<std::path::PathBuf> {
     const MANIFEST_NAMES: &[&str] = &[
         "Cargo.lock",
         "Cargo.toml",
@@ -1185,7 +1191,9 @@ pub fn discover_dependency_manifests(root: &Path, exclude_dirs: Option<&[String]
                     // For patterns like "target/debug", only match if the relative path
                     // from root starts with the pattern — not if any segment equals the leaf.
                     let trimmed = p.trim_matches('*').trim_matches('/');
-                    let relative = path.strip_prefix(root).ok()
+                    let relative = path
+                        .strip_prefix(root)
+                        .ok()
                         .and_then(|r| r.to_str())
                         .unwrap_or("");
                     // Check if the relative directory path matches or is a prefix
@@ -1210,7 +1218,8 @@ pub fn discover_dependency_manifests(root: &Path, exclude_dirs: Option<&[String]
             continue;
         }
 
-        if entry.file_type().is_file() && MANIFEST_NAMES.binary_search(&file_name.as_ref()).is_ok() {
+        if entry.file_type().is_file() && MANIFEST_NAMES.binary_search(&file_name.as_ref()).is_ok()
+        {
             discovered.push(path.to_path_buf());
         }
     }

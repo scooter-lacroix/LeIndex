@@ -378,7 +378,10 @@ mod tests {
         result.add_semantic_drift(DriftItem {
             symbol_name: "my_func".to_string(),
             drift_type: DriftType::SignatureChanged,
-            location: Location { line: 10, column: 1 },
+            location: Location {
+                line: 10,
+                column: 1,
+            },
             impact_description: "Parameter count changed".to_string(),
         });
         let json = validation_to_json(&result);

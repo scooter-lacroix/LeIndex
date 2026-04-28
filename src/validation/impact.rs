@@ -137,7 +137,10 @@ impl ImpactAnalyzer {
     ///
     /// # Returns
     /// Impact report with analysis results
-    pub fn analyze_impact(&self, changes: &[ResolvedEditChange]) -> Result<ImpactReport, ValidationError> {
+    pub fn analyze_impact(
+        &self,
+        changes: &[ResolvedEditChange],
+    ) -> Result<ImpactReport, ValidationError> {
         if changes.is_empty() {
             return Ok(ImpactReport::minimal());
         }
@@ -450,7 +453,8 @@ mod tests {
         let analyzer = ImpactAnalyzer::new(Arc::new(pdg));
 
         // Change to func_c should show impact
-        let change = ResolvedEditChange::new(PathBuf::from("c.py"), "old".to_string(), "new".to_string());
+        let change =
+            ResolvedEditChange::new(PathBuf::from("c.py"), "old".to_string(), "new".to_string());
 
         let report = analyzer.analyze_impact(&[change]).unwrap();
         // func_c is in c.py, and func_b and func_a depend on it

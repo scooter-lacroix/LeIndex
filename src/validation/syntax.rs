@@ -239,8 +239,7 @@ impl SyntaxValidator {
         _language_id: LanguageId,
     ) -> Option<SyntaxError> {
         // Check for empty edits (inserting only whitespace)
-        if change.edit_type == crate::edit::EditType::Insert
-            && change.new_content.trim().is_empty()
+        if change.edit_type == crate::edit::EditType::Insert && change.new_content.trim().is_empty()
         {
             return Some(SyntaxError::new(
                 change.file_path.clone(),

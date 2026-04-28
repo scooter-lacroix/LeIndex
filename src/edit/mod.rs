@@ -25,8 +25,8 @@ pub use command::{
 
 // Public API re-exports from engine module
 pub use engine::{
-    Diff, EditEngine, EditError, Impact, WorktreeManager, WorktreeSession, replace_near_definitions,
-    replace_whole_word, Result,
+    replace_near_definitions, replace_whole_word, Diff, EditEngine, EditError, Impact, Result,
+    WorktreeManager, WorktreeSession,
 };
 
 // Public API re-exports from history module
@@ -299,7 +299,10 @@ mod tests {
     #[test]
     fn test_worktree_manager_new() {
         let manager = WorktreeManager::new();
-        assert_eq!(manager.base_path, std::path::PathBuf::from("/tmp/leedit-worktrees"));
+        assert_eq!(
+            manager.base_path,
+            std::path::PathBuf::from("/tmp/leedit-worktrees")
+        );
     }
 
     #[test]

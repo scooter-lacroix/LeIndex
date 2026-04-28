@@ -8,9 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::command::{EditCommand, EditResult};
-use super::engine::{
-    replace_near_definitions, EditEngine, EditError, Result,
-};
+use super::engine::{replace_near_definitions, EditEngine, EditError, Result};
 use crate::graph::pdg::ProgramDependenceGraph as PDG;
 use crate::storage::UniqueProjectId;
 
@@ -138,7 +136,7 @@ impl Refactor {
         let traversal_config = crate::graph::pdg::TraversalConfig {
             max_depth: Some(1000),
             max_nodes: Some(max_nodes_limit),
-            allowed_edge_types: Some(vec![
+            allowed_edge_types: Some(&[
                 crate::graph::pdg::EdgeType::Call,
                 crate::graph::pdg::EdgeType::DataDependency,
                 crate::graph::pdg::EdgeType::Inheritance,
@@ -238,10 +236,9 @@ impl Refactor {
         let mut errors = Vec::new();
 
         // Phase 1: collect all modifications (no writes yet)
-        let mut pending_writes: Vec<(PathBuf, String, String)> =
-            Vec::new(); // (path, original, modified)
-        // Cache all PDG nodes matching old_name once — avoids redundant lookups per file.
-        // Pre-group by file path for O(Files + Matches) instead of O(Files * Matches).
+        let mut pending_writes: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, modified)
+                                                                             // Cache all PDG nodes matching old_name once — avoids redundant lookups per file.
+                                                                             // Pre-group by file path for O(Files + Matches) instead of O(Files * Matches).
         let mut matches_by_file: std::collections::HashMap<String, Vec<(usize, usize)>> =
             std::collections::HashMap::new();
         for nid in pdg.find_all_by_name(old_name) {
@@ -328,8 +325,7 @@ impl Refactor {
                 Err(e) => {
                     errors.push(format!("Failed to write '{}': {}", file_path.display(), e));
                     // Restore the failed file first — write() may have truncated it
-                    if let Err(restore_err) =
-                        std::fs::write(file_path, original_content.as_bytes())
+                    if let Err(restore_err) = std::fs::write(file_path, original_content.as_bytes())
                     {
                         tracing::error!(
                             "CRITICAL: Failed to restore failed file '{}' during rollback: {}",

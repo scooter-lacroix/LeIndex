@@ -10,8 +10,7 @@ pub(crate) const SOURCE_FILE_EXTENSIONS: &[&str] = &[
     // Main languages
     "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts",
     // Systems languages
-    "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp",
-    // Scripting & other
+    "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Scripting & other
     "cs", "rb", "php", "lua", "scala", "sc", "sh", "bash", "json",
 ];
 

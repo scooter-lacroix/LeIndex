@@ -173,7 +173,8 @@ impl LanguageConfig {
         // Must stay in sync with crate::parse::grammar::LanguageId::from_extension
         // and crate::cli::leindex::collect_source_files_with_hashes.
         let all_extensions = [
-            "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", // Main languages
+            "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts",
+            "cts", // Main languages
             "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Systems languages
             "cs",  // C#
             "rb", "php", "lua", "scala", "sc", // Scripting languages
@@ -605,8 +606,9 @@ mod tests {
         let exts = config.enabled_extensions();
         // All extensions supported by leparse
         for ext in &[
-            "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "go", "java", "cpp", "cc", "cxx", "c", "h",
-            "hpp", "cs", "rb", "php", "lua", "scala", "sc", "sh", "bash", "json",
+            "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "go", "java", "cpp",
+            "cc", "cxx", "c", "h", "hpp", "cs", "rb", "php", "lua", "scala", "sc", "sh", "bash",
+            "json",
         ] {
             assert!(exts.contains(*ext), "Extension '{}' should be enabled", ext);
         }

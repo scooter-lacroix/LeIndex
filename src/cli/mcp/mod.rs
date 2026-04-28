@@ -27,10 +27,10 @@
 pub mod macros;
 /// Request handlers for MCP tools.
 pub mod handlers;
-/// MCP protocol definitions and JSON-RPC types.
-pub mod protocol;
 /// Shared helpers for MCP request processing.
 pub mod helpers;
+/// MCP protocol definitions and JSON-RPC types.
+pub mod protocol;
 
 /// Handler for leindex_context — PDG-based context expansion.
 pub mod context_handler;

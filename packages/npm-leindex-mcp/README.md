@@ -70,18 +70,23 @@ Add to Cursor settings (`~/.cursor/mcp.json` or Settings → MCP):
 
 ### Claude Code
 
-Add to `~/.config/claude-code/mcp_servers.json`:
+Add to `~/.claude/settings.json` or project-local `.claude/settings.json`:
 
 ```json
 {
   "mcpServers": {
     "leindex": {
       "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
+      "args": ["-y", "@leindex/mcp"],
+      "type": "stdio"
     }
   }
 }
 ```
+
+Optional guidance pack:
+- Install `integrations/skills/leindex-toolkit/` as a Claude Code skill
+- Merge `integrations/claude-code/settings.example.json` to add the LeIndex reminder hook
 
 ### Zed IDE
 
@@ -114,6 +119,13 @@ Add to `.vscode/settings.json`:
   }
 }
 ```
+
+### Agent Guidance Packs
+
+- Claude Code: shared skill plus reminder hook
+- Codex: install `integrations/skills/leindex-toolkit/` into `~/.codex/skills/leindex-toolkit/`
+- Gemini CLI, Amp, OpenCode, Qwen, and iFlow: reuse the shared skill text as project instructions or agent rules
+- Full instructions: `docs/AGENT_GUIDANCE.md`
 
 ### Claude Desktop
 

@@ -27,7 +27,6 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-
 /// LeIndex - Main orchestration struct for the entire LeIndex system.
 ///
 /// ```ignore
@@ -266,7 +265,10 @@ impl LeIndex {
         }
         let project_id = self.project_id.clone();
         if !refresh {
-            if let result @ Ok(_) = self.cache.get_project_scan(&project_id, false, || Err(anyhow::anyhow!("cache miss"))) {
+            if let result @ Ok(_) = self
+                .cache
+                .get_project_scan(&project_id, false, || Err(anyhow::anyhow!("cache miss")))
+            {
                 return result;
             }
         }
@@ -299,13 +301,22 @@ impl LeIndex {
         query_type: Option<&crate::search::ranking::QueryType>,
     ) -> String {
         index_builder::search_cache_key_for(
-            &self.project_id, &self.project_path, &self.stats, query, top_k, query_type,
+            &self.project_id,
+            &self.project_path,
+            &self.stats,
+            query,
+            top_k,
+            query_type,
         )
     }
 
     fn analysis_cache_key_for(&self, query: &str, token_budget: usize) -> String {
         index_builder::analysis_cache_key_for(
-            &self.project_id, &self.project_path, &self.stats, query, token_budget,
+            &self.project_id,
+            &self.project_path,
+            &self.stats,
+            query,
+            token_budget,
         )
     }
 
@@ -350,31 +361,45 @@ impl LeIndex {
 
     /// Get the project path.
     #[inline]
-    pub fn project_path(&self) -> &Path { &self.project_path }
+    pub fn project_path(&self) -> &Path {
+        &self.project_path
+    }
 
     /// Get the storage path used for index artifacts.
     #[inline]
-    pub fn storage_path(&self) -> &Path { &self.storage_path }
+    pub fn storage_path(&self) -> &Path {
+        &self.storage_path
+    }
 
     /// Get the project ID (legacy, for backward compatibility).
     #[inline]
-    pub fn project_id(&self) -> &str { &self.project_id }
+    pub fn project_id(&self) -> &str {
+        &self.project_id
+    }
 
     /// Get the unique project identifier (BLAKE3-based, conflict-free).
     #[inline]
-    pub fn unique_id(&self) -> &UniqueProjectId { &self.unique_id }
+    pub fn unique_id(&self) -> &UniqueProjectId {
+        &self.unique_id
+    }
 
     /// Get the display name for the project.
     #[inline]
-    pub fn display_name(&self) -> String { self.unique_id.display() }
+    pub fn display_name(&self) -> String {
+        self.unique_id.display()
+    }
 
     /// Get a reference to the search engine.
     #[inline]
-    pub fn search_engine(&self) -> &SearchEngine { &self.search_engine }
+    pub fn search_engine(&self) -> &SearchEngine {
+        &self.search_engine
+    }
 
     /// Get the PDG, if the project has been indexed.
     #[inline]
-    pub fn pdg(&self) -> Option<&ProgramDependenceGraph> { self.pdg.as_ref() }
+    pub fn pdg(&self) -> Option<&ProgramDependenceGraph> {
+        self.pdg.as_ref()
+    }
 
     /// Create a LogicValidator for this project's PDG and storage.
     ///
@@ -402,9 +427,8 @@ impl LeIndex {
     /// Ensure the PDG is loaded from storage (deferred load on first use).
     pub fn ensure_pdg_loaded(&mut self) -> Result<()> {
         if self.pdg.is_none() {
-            let has_content = crate::storage::pdg_store::has_indexed_files(
-                &self.storage, &self.project_id,
-            );
+            let has_content =
+                crate::storage::pdg_store::has_indexed_files(&self.storage, &self.project_id);
             if has_content {
                 self.load_from_storage()?;
             }
@@ -414,7 +438,9 @@ impl LeIndex {
 
     /// Get the current indexing statistics.
     #[inline]
-    pub fn get_stats(&self) -> &IndexStats { &self.stats }
+    pub fn get_stats(&self) -> &IndexStats {
+        &self.stats
+    }
 
     /// Build file statistics cache from PDG
     pub(crate) fn build_file_stats_cache(&mut self) {
@@ -425,7 +451,9 @@ impl LeIndex {
 
     /// Get file statistics cache.
     #[inline]
-    pub fn file_stats(&self) -> Option<&HashMap<String, FileStats>> { self.cache.file_stats() }
+    pub fn file_stats(&self) -> Option<&HashMap<String, FileStats>> {
+        self.cache.file_stats()
+    }
 
     /// Get source file paths for the project (uses cached scan).
     pub fn source_file_paths(&mut self) -> Result<Vec<PathBuf>> {
@@ -434,7 +462,9 @@ impl LeIndex {
 
     /// Check if the project has been indexed.
     #[inline]
-    pub fn is_indexed(&self) -> bool { self.search_engine.node_count() > 0 }
+    pub fn is_indexed(&self) -> bool {
+        self.search_engine.node_count() > 0
+    }
 
     /// Close the LeIndex and ensure WAL is checkpointed.
     pub fn close(&mut self) -> Result<()> {
@@ -447,24 +477,32 @@ impl LeIndex {
 
     /// Check memory and spill cache if threshold exceeded.
     #[inline]
-    pub fn check_memory_and_spill(&mut self) -> Result<bool> { self.cache.check_memory_and_spill() }
+    pub fn check_memory_and_spill(&mut self) -> Result<bool> {
+        self.cache.check_memory_and_spill()
+    }
 
     /// Spill PDG cache to disk.
     #[inline]
-    pub fn spill_pdg_cache(&mut self) -> Result<()> { self.cache.spill_pdg_cache(&self.project_id, &mut self.pdg) }
+    pub fn spill_pdg_cache(&mut self) -> Result<()> {
+        self.cache.spill_pdg_cache(&self.project_id, &mut self.pdg)
+    }
 
     /// Spill vector search cache to disk.
     #[inline]
     pub fn spill_vector_cache(&mut self) -> Result<()> {
-        self.cache.spill_vector_cache(&self.project_id, self.search_engine.node_count())
+        self.cache
+            .spill_vector_cache(&self.project_id, self.search_engine.node_count())
     }
 
     /// Spill all caches (PDG and vector) to disk.
     #[inline]
     pub fn spill_all_caches(&mut self) -> Result<(usize, usize)> {
-        self.cache.spill_all_caches(&self.project_id, &mut self.pdg, self.search_engine.node_count())
+        self.cache.spill_all_caches(
+            &self.project_id,
+            &mut self.pdg,
+            self.search_engine.node_count(),
+        )
     }
-
 
     /// Reload PDG from cache (load from storage if not in memory).
     pub fn reload_pdg_from_cache(&mut self) -> Result<()> {
@@ -483,7 +521,11 @@ impl LeIndex {
             .take()
             .ok_or_else(|| anyhow::anyhow!("No PDG available for vector rebuild"))?;
 
-        self.embedder = Some(index_builder::index_nodes(&pdg, &mut self.search_engine, &mut self.cache.file_stats_cache)?);
+        self.embedder = Some(index_builder::index_nodes(
+            &pdg,
+            &mut self.search_engine,
+            &mut self.cache.file_stats_cache,
+        )?);
         let indexed_count = self.search_engine.node_count();
 
         self.pdg = Some(pdg);
@@ -514,5 +556,7 @@ impl LeIndex {
 
     /// Get cache statistics.
     #[inline]
-    pub fn get_cache_stats(&self) -> Result<crate::cli::memory::MemoryStats> { self.cache.get_cache_stats() }
+    pub fn get_cache_stats(&self) -> Result<crate::cli::memory::MemoryStats> {
+        self.cache.get_cache_stats()
+    }
 }

@@ -239,7 +239,8 @@ pub struct TraversalConfig {
     /// Strongly recommended: always set this. `None` = unlimited.
     pub max_nodes: Option<usize>,
     /// Only traverse edges of these types. `None` = all edge types.
-    pub allowed_edge_types: Option<Vec<EdgeType>>,
+    /// Uses a static slice to eliminate heap allocation during traversal.
+    pub allowed_edge_types: Option<&'static [EdgeType]>,
     /// Do not collect nodes of these types (but still traverse through them).
     pub excluded_node_types: Option<Vec<NodeType>>,
     /// Skip collecting nodes with complexity below this threshold.
@@ -255,7 +256,7 @@ impl TraversalConfig {
         Self {
             max_depth: Some(3),
             max_nodes: Some(50),
-            allowed_edge_types: Some(vec![EdgeType::Call, EdgeType::DataDependency]),
+            allowed_edge_types: Some(&[EdgeType::Call, EdgeType::DataDependency]),
             excluded_node_types: Some(vec![NodeType::Module]),
             min_complexity: None,
             min_edge_confidence: 0.5,
@@ -267,7 +268,7 @@ impl TraversalConfig {
         Self {
             max_depth: Some(5),
             max_nodes: Some(150),
-            allowed_edge_types: Some(vec![
+            allowed_edge_types: Some(&[
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
@@ -283,7 +284,7 @@ impl TraversalConfig {
         Self {
             max_depth: None,
             max_nodes: Some(500),
-            allowed_edge_types: Some(vec![
+            allowed_edge_types: Some(&[
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
@@ -299,7 +300,7 @@ impl TraversalConfig {
         Self {
             max_depth: Some(10),
             max_nodes: Some(1000),
-            allowed_edge_types: Some(vec![EdgeType::Import]),
+            allowed_edge_types: Some(&[EdgeType::Import]),
             excluded_node_types: None,
             min_complexity: None,
             min_edge_confidence: 0.0,
@@ -1378,7 +1379,7 @@ impl ProgramDependenceGraph {
         let config = TraversalConfig {
             max_depth: Some(max_depth),
             max_nodes: Some(500),
-            allowed_edge_types: Some(vec![
+            allowed_edge_types: Some(&[
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
@@ -1405,7 +1406,7 @@ impl ProgramDependenceGraph {
         let config = TraversalConfig {
             max_depth: Some(max_depth),
             max_nodes: Some(500),
-            allowed_edge_types: Some(vec![
+            allowed_edge_types: Some(&[
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
@@ -1598,7 +1599,7 @@ mod tests {
         let config = TraversalConfig {
             max_depth: Some(5),
             max_nodes: Some(100),
-            allowed_edge_types: Some(vec![EdgeType::DataDependency]),
+            allowed_edge_types: Some(&[EdgeType::DataDependency]),
             excluded_node_types: None,
             min_complexity: None,
             min_edge_confidence: 0.5,

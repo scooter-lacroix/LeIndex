@@ -25,7 +25,11 @@ impl LeIndex {
             .context("Failed to get memory stats")?;
         let memory_percent = memory_stats.memory_percent();
         let threshold_exceeded = self.cache.cache_spiller.store().total_bytes() > 0
-            && self.cache.cache_spiller.is_threshold_exceeded().unwrap_or(false);
+            && self
+                .cache
+                .cache_spiller
+                .is_threshold_exceeded()
+                .unwrap_or(false);
 
         let pdg_loaded = self.pdg.is_some();
         let (pdg_nodes, pdg_edges) = self

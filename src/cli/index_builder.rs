@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 use super::leindex::{
-    IndexStats, ProjectFileScan, FileStats,
-    SOURCE_FILE_EXTENSIONS, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS,
+    FileStats, IndexStats, ProjectFileScan, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS,
+    SOURCE_FILE_EXTENSIONS,
 };
 
 // ============================================================================
@@ -314,8 +314,7 @@ pub(crate) fn is_dependency_manifest_name(name: &str) -> bool {
 
 /// Scan the project directory for source and manifest files.
 pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan> {
-    let project_config =
-        crate::cli::config::ProjectConfig::load(project_path).unwrap_or_default();
+    let project_config = crate::cli::config::ProjectConfig::load(project_path).unwrap_or_default();
     let mut source_paths = Vec::new();
     let mut manifest_paths = Vec::new();
     let mut walker = walkdir::WalkDir::new(project_path).into_iter();
@@ -349,7 +348,8 @@ pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan>
 
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             if is_dependency_manifest_name(name) {
-                let is_lockfile = name.contains("lock") || name.contains(".sum") || name == "npm-shrinkwrap.json";
+                let is_lockfile =
+                    name.contains("lock") || name.contains(".sum") || name == "npm-shrinkwrap.json";
                 if is_lockfile || !project_config.should_exclude(path) {
                     manifest_paths.push(path.to_path_buf());
                 }
@@ -403,8 +403,10 @@ pub(crate) fn collect_source_files_with_hashes(
 /// per-file PDG into the global index). Does not deduplicate by symbol
 /// name to preserve overloaded methods that share the same qualified name.
 pub(crate) fn merge_pdgs(target: &mut ProgramDependenceGraph, source: ProgramDependenceGraph) {
-    let mut id_map: std::collections::HashMap<petgraph::graph::NodeIndex, petgraph::graph::NodeIndex> =
-        std::collections::HashMap::with_capacity(source.node_count());
+    let mut id_map: std::collections::HashMap<
+        petgraph::graph::NodeIndex,
+        petgraph::graph::NodeIndex,
+    > = std::collections::HashMap::with_capacity(source.node_count());
 
     for node_idx in source.node_indices() {
         if let Some(node) = source.get_node(node_idx) {
@@ -438,15 +440,17 @@ pub(crate) fn remove_file_from_pdg(
 pub(crate) fn normalize_external_nodes(pdg: &mut ProgramDependenceGraph) {
     let mut migrated = 0usize;
     for node in pdg.node_weights_mut() {
-        let is_external = node.language == "external"
-            || node.language.starts_with("external:");
+        let is_external = node.language == "external" || node.language.starts_with("external:");
         if is_external && node.node_type != NodeType::External {
             node.node_type = NodeType::External;
             migrated += 1;
         }
     }
     if migrated > 0 {
-        info!("Normalized {} external nodes to NodeType::External", migrated);
+        info!(
+            "Normalized {} external nodes to NodeType::External",
+            migrated
+        );
     }
 }
 
@@ -456,8 +460,7 @@ pub(crate) fn save_to_storage(
     project_id: &str,
     pdg: &ProgramDependenceGraph,
 ) -> Result<()> {
-    pdg_store::save_pdg(storage, project_id, pdg)
-        .context("Failed to save PDG to storage")?;
+    pdg_store::save_pdg(storage, project_id, pdg).context("Failed to save PDG to storage")?;
     info!("Saved PDG to storage for project: {}", project_id);
     Ok(())
 }
@@ -484,7 +487,7 @@ pub(crate) fn index_nodes(
     let connectivity_config = crate::graph::pdg::TraversalConfig {
         max_depth: Some(1),
         max_nodes: Some(1000),
-        allowed_edge_types: Some(vec![EdgeType::Call, EdgeType::DataDependency]),
+        allowed_edge_types: Some(&[EdgeType::Call, EdgeType::DataDependency]),
         excluded_node_types: Some(vec![NodeType::External]),
         min_complexity: None,
         min_edge_confidence: 0.0,
@@ -532,7 +535,10 @@ pub(crate) fn index_nodes(
 
                 if start < end {
                     let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
-                    format!("{}\n// {} in {}\n{}", enrichment, node.name, node.file_path, snippet)
+                    format!(
+                        "{}\n// {} in {}\n{}",
+                        enrichment, node.name, node.file_path, snippet
+                    )
                 } else {
                     format!(
                         "{}\n// {} in {}\n{}",
@@ -595,9 +601,9 @@ pub(crate) fn detect_changed_manifests(
         .store()
         .peek(&cache_key)
         .and_then(|entry| match entry {
-            crate::cli::memory::CacheEntry::Binary { serialized_data, .. } => {
-                bincode::deserialize::<ProjectFileScan>(serialized_data).ok()
-            }
+            crate::cli::memory::CacheEntry::Binary {
+                serialized_data, ..
+            } => bincode::deserialize::<ProjectFileScan>(serialized_data).ok(),
             _ => None,
         })
         .map(|scan| scan.manifest_hashes)
@@ -655,11 +661,12 @@ pub(crate) fn files_importing_from_manifests(
         }
     }
 
-    let affected_set: HashSet<String> =
-        affected.iter().map(|p| p.display().to_string()).collect();
+    let affected_set: HashSet<String> = affected.iter().map(|p| p.display().to_string()).collect();
 
-    let source_set: HashSet<String> =
-        all_source_paths.iter().map(|p| p.display().to_string()).collect();
+    let source_set: HashSet<String> = all_source_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
 
     let mut affected_set = affected_set;
     for nid in pdg.node_indices() {

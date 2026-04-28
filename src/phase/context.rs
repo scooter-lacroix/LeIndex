@@ -244,10 +244,7 @@ fn signatures_from_results(
 
 /// Build a map from file path → source bytes from ParsingResults.
 /// Returns an empty Vec for results without source_bytes.
-fn source_bytes_from_results(
-    root: &Path,
-    results: &[ParsingResult],
-) -> HashMap<String, Vec<u8>> {
+fn source_bytes_from_results(root: &Path, results: &[ParsingResult]) -> HashMap<String, Vec<u8>> {
     results
         .iter()
         .filter_map(|result| {

@@ -151,7 +151,11 @@ fn infer_class_nodes_and_containment(
                 },
                 max_end,
             ),
-            complexity: if class_complexity > 0 { class_complexity } else { method_nids.len() as u32 },
+            complexity: if class_complexity > 0 {
+                class_complexity
+            } else {
+                method_nids.len() as u32
+            },
             language: language.to_string(),
         };
         let class_nid = pdg.add_node(class_node);
@@ -1824,8 +1828,16 @@ mod tests {
             name: "with_params".to_string(),
             qualified_name: "with_params".to_string(),
             parameters: vec![
-                Parameter { name: "a".into(), type_annotation: None, default_value: None },
-                Parameter { name: "b".into(), type_annotation: None, default_value: None },
+                Parameter {
+                    name: "a".into(),
+                    type_annotation: None,
+                    default_value: None,
+                },
+                Parameter {
+                    name: "b".into(),
+                    type_annotation: None,
+                    default_value: None,
+                },
             ],
             cyclomatic_complexity: 0,
             ..sig_simple
@@ -1841,6 +1853,9 @@ mod tests {
         };
 
         let node = signature_to_node(&sig_both, "test.rs", "rust");
-        assert_eq!(node.complexity, 10, "Both: cyclomatic=10 overrides param count");
+        assert_eq!(
+            node.complexity, 10,
+            "Both: cyclomatic=10 overrides param count"
+        );
     }
 }

@@ -419,7 +419,8 @@ CREATE TABLE IF NOT EXISTS project_metadata (
         if current > Self::SCHEMA_VERSION {
             return Err(rusqlite::Error::InvalidParameterName(format!(
                 "Database schema v{} is newer than this version (v{}). Please upgrade LeIndex.",
-                current, Self::SCHEMA_VERSION
+                current,
+                Self::SCHEMA_VERSION
             )));
         }
 
