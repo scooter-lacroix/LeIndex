@@ -376,6 +376,29 @@ impl LeIndex {
     #[inline]
     pub fn pdg(&self) -> Option<&ProgramDependenceGraph> { self.pdg.as_ref() }
 
+    /// Create a LogicValidator for this project's PDG and storage.
+    ///
+    /// Returns `None` if no PDG is available (project not yet indexed).
+    /// The validator can be used to check edit changes for syntax errors,
+    /// reference issues, semantic drift, and impact before applying.
+    ///
+    /// Opens a new Storage connection for the validator to avoid cloning
+    /// the main connection (rusqlite::Connection is not Clone).
+    pub fn create_validator(&self) -> Option<crate::validation::LogicValidator> {
+        let pdg = self.pdg.as_ref()?;
+
+        // Open a separate Storage connection for the validator.
+        // Storage wraps rusqlite::Connection which is not Clone, so we
+        // create a new read-only handle to the same database.
+        let db_path = self.storage_path.join("leindex.db");
+        let storage = crate::storage::schema::Storage::open(&db_path).ok()?;
+
+        Some(crate::validation::LogicValidator::new(
+            std::sync::Arc::new(pdg.clone()),
+            std::sync::Arc::new(storage),
+        ))
+    }
+
     /// Ensure the PDG is loaded from storage (deferred load on first use).
     pub fn ensure_pdg_loaded(&mut self) -> Result<()> {
         if self.pdg.is_none() {

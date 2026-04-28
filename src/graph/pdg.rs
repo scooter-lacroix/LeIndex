@@ -345,7 +345,7 @@ impl TraversalConfig {
 ///
 /// Rationale: At 50k nodes with 1536-dim embeddings, inline storage adds ~300MB
 /// to the graph struct. This store is optional — the graph operates fully without it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct EmbeddingStore {
     pub(crate) embeddings: HashMap<String, Vec<f32>>, // keyed by node.id (stable across serialization)
 }
@@ -592,6 +592,7 @@ impl SerializablePDG {
 /// - `file_index`: Maps file paths to all nodes in that file
 /// - `name_index`: Maps symbol names to nodes (exact match)
 /// - `name_lower_index`: Maps lowercase names for case-insensitive search
+#[derive(Clone)]
 pub struct ProgramDependenceGraph {
     /// The underlying stable graph storing nodes and edges.
     pub(crate) graph: StableGraph<Node, Edge>,

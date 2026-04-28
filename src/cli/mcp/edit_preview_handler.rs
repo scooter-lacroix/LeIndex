@@ -4,7 +4,9 @@ use super::helpers::{
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
+use crate::edit::ResolvedEditChange;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Handler for leindex_edit_preview — dry-run for code changes.
@@ -110,6 +112,93 @@ leindex_edit_apply to understand the blast radius of your change."
         // Generate diff
         let diff = make_diff(&original, &modified, &file_path);
 
+        // Run validation via LogicValidator (if PDG available)
+        let validation_json = match index.create_validator() {
+            Some(validator) => {
+                // Convert parsed EditChanges to ResolvedEditChanges for validation
+                let resolved: Vec<ResolvedEditChange> = changes
+                    .iter()
+                    .map(|_c| {
+                        ResolvedEditChange::new(
+                            PathBuf::from(&file_path),
+                            original.clone(),
+                            modified.clone(),
+                        )
+                    })
+                    .collect();
+
+                match validator.validate_changes(&resolved) {
+                    Ok(result) => {
+                        let syntax_errors: Vec<Value> = result
+                            .syntax_errors
+                            .iter()
+                            .map(|e| {
+                                serde_json::json!({
+                                    "file": e.file_path.display().to_string(),
+                                    "line": e.line,
+                                    "column": e.column,
+                                    "message": e.message,
+                                    "severity": format!("{:?}", e.severity),
+                                })
+                            })
+                            .collect();
+                        let reference_issues: Vec<Value> = result
+                            .reference_issues
+                            .iter()
+                            .map(|i| {
+                                serde_json::json!({
+                                    "type": format!("{:?}", i.issue_type),
+                                    "file": i.file_path.display().to_string(),
+                                    "location": format!("{}:{}", i.location.line, i.location.column),
+                                    "description": i.description,
+                                })
+                            })
+                            .collect();
+                        let semantic_drift: Vec<Value> = result
+                            .semantic_drift
+                            .iter()
+                            .map(|d| {
+                                serde_json::json!({
+                                    "symbol": d.symbol_name,
+                                    "drift_type": format!("{:?}", d.drift_type),
+                                    "location": format!("{}:{}", d.location.line, d.location.column),
+                                    "impact": d.impact_description,
+                                })
+                            })
+                            .collect();
+                        let impact = result.impact_report.as_ref().map(|r| {
+                            serde_json::json!({
+                                "risk_level": format!("{:?}", r.risk_level),
+                                "affected_symbols": r.affected_nodes,
+                                "affected_files": r.affected_files.len(),
+                            })
+                        });
+                        Some(serde_json::json!({
+                            "is_valid": result.is_valid,
+                            "has_errors": result.has_errors(),
+                            "syntax_errors": syntax_errors,
+                            "reference_issues": reference_issues,
+                            "semantic_drift": semantic_drift,
+                            "impact_report": impact,
+                        }))
+                    }
+                    Err(e) => {
+                        // Validation itself failed — include as a warning, don't block preview
+                        Some(serde_json::json!({
+                            "is_valid": true,
+                            "has_errors": false,
+                            "syntax_errors": [],
+                            "reference_issues": [],
+                            "semantic_drift": [],
+                            "impact_report": null,
+                            "validation_warning": format!("Validation check failed: {}", e),
+                        }))
+                    }
+                }
+            }
+            None => None,
+        };
+
         // Compute impact from PDG
         let mut affected_nodes: Vec<String> = Vec::new();
         let mut affected_files: std::collections::HashSet<String> =
@@ -161,16 +250,22 @@ leindex_edit_apply to understand the blast radius of your change."
             "low"
         };
 
-        Ok(wrap_with_meta(
-            serde_json::json!({
-                "diff": diff,
-                "affected_symbols": affected_nodes,
-                "affected_files": affected_files.into_iter().collect::<Vec<_>>(),
-                "breaking_changes": breaking_changes,
-                "risk_level": risk,
-                "change_count": changes.len()
-            }),
-            &index,
-        ))
+        let mut response = serde_json::json!({
+            "diff": diff,
+            "affected_symbols": affected_nodes,
+            "affected_files": affected_files.into_iter().collect::<Vec<_>>(),
+            "breaking_changes": breaking_changes,
+            "risk_level": risk,
+            "change_count": changes.len()
+        });
+
+        // Include validation results (warnings only — preview is never blocked)
+        if let Some(validation) = validation_json {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("validation".to_string(), validation);
+            }
+        }
+
+        Ok(wrap_with_meta(response, &index))
     }
 }
