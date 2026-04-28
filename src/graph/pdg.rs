@@ -12,6 +12,7 @@ use petgraph::stable_graph::StableGraph;
 use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Mutex;
 
 /// A unique identifier for a node in the Program Dependence Graph.
 ///
@@ -592,7 +593,6 @@ impl SerializablePDG {
 /// - `file_index`: Maps file paths to all nodes in that file
 /// - `name_index`: Maps symbol names to nodes (exact match)
 /// - `name_lower_index`: Maps lowercase names for case-insensitive search
-#[derive(Clone)]
 pub struct ProgramDependenceGraph {
     /// The underlying stable graph storing nodes and edges.
     pub(crate) graph: StableGraph<Node, Edge>,
@@ -625,6 +625,28 @@ pub struct ProgramDependenceGraph {
     /// usage. At 50k nodes with 1536-dim embeddings, inline storage would add
     /// ~300MB; this optional store is populated on demand.
     pub embedding_store: EmbeddingStore,
+
+    /// Reusable scratch buffer for BFS neighbor collection.
+    ///
+    /// Avoids allocating a new `Vec<NodeId>` on every BFS level iteration.
+    /// Cleared at the start of each level, reused across traversals.
+    /// Wrapped in `Mutex` because the PDG is shared across threads
+    /// (e.g., via `Arc<ProgramDependenceGraph>` in validation handlers).
+    bfs_scratch: Mutex<Vec<NodeId>>,
+}
+
+impl Clone for ProgramDependenceGraph {
+    fn clone(&self) -> Self {
+        Self {
+            graph: self.graph.clone(),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: self.name_lower_index.clone(),
+            embedding_store: self.embedding_store.clone(),
+            bfs_scratch: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl ProgramDependenceGraph {
@@ -637,6 +659,7 @@ impl ProgramDependenceGraph {
             name_index: HashMap::new(),
             name_lower_index: HashMap::new(),
             embedding_store: EmbeddingStore::new(),
+            bfs_scratch: Mutex::new(Vec::new()),
         }
     }
 
@@ -1211,30 +1234,36 @@ impl ProgramDependenceGraph {
                 }
             }
 
-            let neighbors: Vec<NodeId> = match dir {
+            // Reuse the scratch buffer instead of allocating a new Vec per level.
+            let mut scratch = self.bfs_scratch.lock().unwrap();
+            scratch.clear();
+            match dir {
                 Direction::Forward => {
                     // Outgoing edges — filter by edge type
-                    self.graph
-                        .edges(current)
-                        .filter(|e| config.edge_allowed(e.weight()))
-                        .map(|e| e.target())
-                        .collect()
+                    scratch.extend(
+                        self.graph
+                            .edges(current)
+                            .filter(|e| config.edge_allowed(e.weight()))
+                            .map(|e| e.target()),
+                    );
                 }
                 Direction::Backward => {
                     use petgraph::Direction as PD;
-                    self.graph
-                        .edges_directed(current, PD::Incoming)
-                        .filter(|e| config.edge_allowed(e.weight()))
-                        .map(|e| e.source())
-                        .collect()
+                    scratch.extend(
+                        self.graph
+                            .edges_directed(current, PD::Incoming)
+                            .filter(|e| config.edge_allowed(e.weight()))
+                            .map(|e| e.source()),
+                    );
                 }
-            };
+            }
 
-            for neighbor in neighbors {
+            for &neighbor in scratch.iter() {
                 if visited.insert(neighbor) {
                     queue.push_back((neighbor, depth + 1));
                 }
             }
+            // scratch (MutexGuard) dropped here → lock released
         }
 
         result
@@ -1620,9 +1649,19 @@ mod tests {
         // Remove file src/lib.rs — should clean up a and b embeddings
         pdg.remove_file("src/lib.rs");
 
-        assert!(pdg.get_embedding("f:a").is_none(), "a's embedding should be removed");
-        assert!(pdg.get_embedding("f:b").is_none(), "b's embedding should be removed");
-        assert_eq!(pdg.get_embedding("f:c"), Some(&vec![3.0]), "c's embedding should remain");
+        assert!(
+            pdg.get_embedding("f:a").is_none(),
+            "a's embedding should be removed"
+        );
+        assert!(
+            pdg.get_embedding("f:b").is_none(),
+            "b's embedding should be removed"
+        );
+        assert_eq!(
+            pdg.get_embedding("f:c"),
+            Some(&vec![3.0]),
+            "c's embedding should remain"
+        );
         assert_eq!(pdg.embedding_count(), 1);
 
         // n1 and n2 should be gone, n3 should remain
@@ -1642,7 +1681,11 @@ mod tests {
         // Overwrite
         pdg.set_embedding("f:foo", vec![3.0, 4.0]);
         assert_eq!(pdg.get_embedding("f:foo"), Some(&vec![3.0, 4.0]));
-        assert_eq!(pdg.embedding_count(), 1, "Should still have 1 embedding after overwrite");
+        assert_eq!(
+            pdg.embedding_count(),
+            1,
+            "Should still have 1 embedding after overwrite"
+        );
     }
 
     #[test]
@@ -1658,8 +1701,8 @@ mod tests {
         let bytes = pdg.serialize().expect("Serialization should succeed");
 
         // Deserialize
-        let restored = ProgramDependenceGraph::deserialize(&bytes)
-            .expect("Deserialization should succeed");
+        let restored =
+            ProgramDependenceGraph::deserialize(&bytes).expect("Deserialization should succeed");
 
         // Verify embeddings survived the round-trip
         assert_eq!(restored.get_embedding("f:foo"), Some(&vec![0.1, 0.2, 0.3]));
@@ -1675,13 +1718,17 @@ mod tests {
 
         // Manually serialize without embeddings (simulate old format)
         let old_format = SerializablePDG {
-            nodes: pdg.graph.node_indices()
+            nodes: pdg
+                .graph
+                .node_indices()
                 .map(|idx| SerializableNode {
                     index: idx.index() as u32,
                     node: pdg.graph[idx].clone(),
                 })
                 .collect(),
-            edges: pdg.graph.edge_indices()
+            edges: pdg
+                .graph
+                .edge_indices()
                 .map(|eidx| {
                     let (source, target) = pdg.graph.edge_endpoints(eidx).unwrap();
                     SerializableEdge {
@@ -1691,16 +1738,24 @@ mod tests {
                     }
                 })
                 .collect(),
-            symbol_index: pdg.symbol_index.iter()
+            symbol_index: pdg
+                .symbol_index
+                .iter()
                 .map(|(k, v)| (k.clone(), v.index() as u32))
                 .collect(),
-            file_index: pdg.file_index.iter()
+            file_index: pdg
+                .file_index
+                .iter()
                 .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
                 .collect(),
-            name_index: pdg.name_index.iter()
+            name_index: pdg
+                .name_index
+                .iter()
                 .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
                 .collect(),
-            name_lower_index: pdg.name_lower_index.iter()
+            name_lower_index: pdg
+                .name_lower_index
+                .iter()
                 .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
                 .collect(),
             embeddings: HashMap::new(), // No embeddings — simulates old format
@@ -1723,7 +1778,8 @@ mod tests {
 
         pdg.add_import_edges(vec![(a, b), (a, c)]);
 
-        let import_count = pdg.edge_indices()
+        let import_count = pdg
+            .edge_indices()
             .filter_map(|e| pdg.get_edge(e))
             .filter(|e| e.edge_type == EdgeType::Import)
             .count();
@@ -1739,7 +1795,8 @@ mod tests {
         pdg.add_inheritance_edges(vec![(child, parent, 0.85)]);
 
         // Verify edge was created with correct type and confidence
-        let edges: Vec<_> = pdg.edge_indices()
+        let edges: Vec<_> = pdg
+            .edge_indices()
             .filter_map(|e| {
                 let edge = pdg.get_edge(e)?;
                 if edge.edge_type == EdgeType::Inheritance {
