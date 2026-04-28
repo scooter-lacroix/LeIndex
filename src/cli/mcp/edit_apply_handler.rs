@@ -6,6 +6,7 @@ use super::helpers::{
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use crate::edit::ResolvedEditChange;
+use crate::validation::validation_to_json;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -164,121 +165,20 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                         Ok(result) => {
                             if result.has_errors() {
                                 // Build detailed error response with validation details
-                                let syntax_errors: Vec<Value> = result
-                                    .syntax_errors
-                                    .iter()
-                                    .map(|e| {
-                                        serde_json::json!({
-                                            "file": e.file_path.display().to_string(),
-                                            "line": e.line,
-                                            "column": e.column,
-                                            "message": e.message,
-                                            "severity": format!("{:?}", e.severity),
-                                        })
-                                    })
-                                    .collect();
-                                let reference_issues: Vec<Value> = result
-                                    .reference_issues
-                                    .iter()
-                                    .map(|i| {
-                                        serde_json::json!({
-                                            "type": format!("{:?}", i.issue_type),
-                                            "file": i.file_path.display().to_string(),
-                                            "location": format!("{}:{}", i.location.line, i.location.column),
-                                            "description": i.description,
-                                        })
-                                    })
-                                    .collect();
-                                let semantic_drift: Vec<Value> = result
-                                    .semantic_drift
-                                    .iter()
-                                    .map(|d| {
-                                        serde_json::json!({
-                                            "symbol": d.symbol_name,
-                                            "drift_type": format!("{:?}", d.drift_type),
-                                            "location": format!("{}:{}", d.location.line, d.location.column),
-                                            "impact": d.impact_description,
-                                        })
-                                    })
-                                    .collect();
-
+                                let v_json = validation_to_json(&result);
                                 return Err(JsonRpcError::invalid_params(format!(
                                     "Edit rejected — validation found errors. File unchanged.\n\
                                      Syntax errors: {}\nReference issues: {}\nSemantic drift: {}\n\
                                      Details: {}",
-                                    syntax_errors.len(),
-                                    reference_issues.len(),
-                                    semantic_drift.len(),
-                                    serde_json::json!({
-                                        "syntax_errors": syntax_errors,
-                                        "reference_issues": reference_issues,
-                                        "semantic_drift": semantic_drift,
-                                    })
+                                    v_json["syntax_errors"].as_array().map(|a| a.len()).unwrap_or(0),
+                                    v_json["reference_issues"].as_array().map(|a| a.len()).unwrap_or(0),
+                                    v_json["semantic_drift"].as_array().map(|a| a.len()).unwrap_or(0),
+                                    v_json
                                 )));
                             }
 
-                            // No blocking errors — serialize warnings for inclusion in response
-                            let syntax_warnings: Vec<Value> = result
-                                .syntax_errors
-                                .iter()
-                                .map(|e| {
-                                    serde_json::json!({
-                                        "file": e.file_path.display().to_string(),
-                                        "line": e.line,
-                                        "column": e.column,
-                                        "message": e.message,
-                                        "severity": format!("{:?}", e.severity),
-                                    })
-                                })
-                                .collect();
-                            let reference_warnings: Vec<Value> = result
-                                .reference_issues
-                                .iter()
-                                .map(|i| {
-                                    serde_json::json!({
-                                        "type": format!("{:?}", i.issue_type),
-                                        "file": i.file_path.display().to_string(),
-                                        "location": format!("{}:{}", i.location.line, i.location.column),
-                                        "description": i.description,
-                                    })
-                                })
-                                .collect();
-                            let drift_warnings: Vec<Value> = result
-                                .semantic_drift
-                                .iter()
-                                .map(|d| {
-                                    serde_json::json!({
-                                        "symbol": d.symbol_name,
-                                        "drift_type": format!("{:?}", d.drift_type),
-                                        "location": format!("{}:{}", d.location.line, d.location.column),
-                                        "impact": d.impact_description,
-                                    })
-                                })
-                                .collect();
-                            let impact = result.impact_report.as_ref().map(|r| {
-                                serde_json::json!({
-                                    "risk_level": format!("{:?}", r.risk_level),
-                                    "affected_symbols": r.affected_nodes,
-                                    "affected_files": r.affected_files.len(),
-                                })
-                            });
-
-                            let has_warnings = !syntax_warnings.is_empty()
-                                || !reference_warnings.is_empty()
-                                || !drift_warnings.is_empty();
-
-                            if has_warnings || impact.is_some() {
-                                Some(serde_json::json!({
-                                    "is_valid": result.is_valid,
-                                    "has_errors": false,
-                                    "syntax_errors": syntax_warnings,
-                                    "reference_issues": reference_warnings,
-                                    "semantic_drift": drift_warnings,
-                                    "impact_report": impact,
-                                }))
-                            } else {
-                                None
-                            }
+                            // No blocking errors — include validation in response
+                            Some(validation_to_json(&result))
                         }
                         Err(e) => {
                             // Validation itself failed — log warning but don't block the edit
@@ -482,7 +382,8 @@ mod tests {
     #[tokio::test]
     async fn test_edit_apply_includes_validation_field_in_response() {
         // When the project has a PDG (auto-indexed), validation runs.
-        // For a valid edit, the response may include a validation field if there are warnings.
+        // For a valid edit, the response should include a validation field
+        // with the complete structured result.
         let (_dir, file_path, registry) =
             setup_test_file("fn hello() { println!(\"world\"); }\n", "test.rs").await;
 
@@ -499,9 +400,26 @@ mod tests {
         let response = result.unwrap();
         assert_eq!(response["success"], true);
         assert_eq!(response["changes_applied"], 1);
-        // Validation field may or may not be present depending on whether
-        // the project has a PDG and whether there are warnings.
-        // The key check is that the edit succeeded.
+
+        // Verify the file was actually modified
+        let content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(content.contains("universe"));
+
+        // When validation runs (PDG available), the validation field must be present
+        // and have the correct structure with all required sub-fields.
+        if let Some(validation) = response.get("validation") {
+            assert!(validation.get("is_valid").is_some(), "validation.is_valid must be present");
+            assert!(validation.get("has_errors").is_some(), "validation.has_errors must be present");
+            assert!(validation.get("syntax_errors").is_some(), "validation.syntax_errors must be present");
+            assert!(validation.get("reference_issues").is_some(), "validation.reference_issues must be present");
+            assert!(validation.get("semantic_drift").is_some(), "validation.semantic_drift must be present");
+            assert!(validation.get("impact_report").is_some(), "validation.impact_report must be present");
+
+            // For a valid edit, syntax_errors/reference_issues/semantic_drift should be arrays
+            assert!(validation["syntax_errors"].is_array());
+            assert!(validation["reference_issues"].is_array());
+            assert!(validation["semantic_drift"].is_array());
+        }
     }
 
     #[tokio::test]

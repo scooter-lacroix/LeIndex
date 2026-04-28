@@ -3,6 +3,7 @@ use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use crate::edit::replace_whole_word;
 use crate::edit::ResolvedEditChange;
+use crate::validation::validation_to_json;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -203,60 +204,8 @@ Grep + multi-file Edit with a single atomic operation."
 
                     match validator.validate_changes(&resolved) {
                         Ok(result) => {
-                            let syntax_errors: Vec<Value> = result
-                                .syntax_errors
-                                .iter()
-                                .map(|e| {
-                                    serde_json::json!({
-                                        "file": e.file_path.display().to_string(),
-                                        "line": e.line,
-                                        "column": e.column,
-                                        "message": e.message,
-                                        "severity": format!("{:?}", e.severity),
-                                    })
-                                })
-                                .collect();
-                            let reference_issues: Vec<Value> = result
-                                .reference_issues
-                                .iter()
-                                .map(|i| {
-                                    serde_json::json!({
-                                        "type": format!("{:?}", i.issue_type),
-                                        "file": i.file_path.display().to_string(),
-                                        "location": format!("{}:{}", i.location.line, i.location.column),
-                                        "description": i.description,
-                                    })
-                                })
-                                .collect();
-                            let semantic_drift: Vec<Value> = result
-                                .semantic_drift
-                                .iter()
-                                .map(|d| {
-                                    serde_json::json!({
-                                        "symbol": d.symbol_name,
-                                        "drift_type": format!("{:?}", d.drift_type),
-                                        "location": format!("{}:{}", d.location.line, d.location.column),
-                                        "impact": d.impact_description,
-                                    })
-                                })
-                                .collect();
-                            let impact = result.impact_report.as_ref().map(|r| {
-                                serde_json::json!({
-                                    "risk_level": format!("{:?}", r.risk_level),
-                                    "affected_symbols": r.affected_nodes,
-                                    "affected_files": r.affected_files.len(),
-                                })
-                            });
-
                             let has_errors = result.has_errors();
-                            let v_json = serde_json::json!({
-                                "is_valid": result.is_valid,
-                                "has_errors": has_errors,
-                                "syntax_errors": syntax_errors,
-                                "reference_issues": reference_issues,
-                                "semantic_drift": semantic_drift,
-                                "impact_report": impact,
-                            });
+                            let v_json = validation_to_json(&result);
 
                             if has_errors && !preview_only {
                                 // Build detailed error response — reject the rename
