@@ -2,7 +2,9 @@ use super::helpers::{extract_bool, extract_string, make_diff, wrap_with_meta};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use crate::edit::replace_whole_word;
+use crate::edit::ResolvedEditChange;
 use serde_json::Value;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Handler for leindex_rename_symbol — rename a symbol across all files.
@@ -86,6 +88,22 @@ Grep + multi-file Edit with a single atomic operation."
             .or_else(|| pdg.find_by_name_in_file(&old_name, None));
 
         if let Some(node_id) = node_id {
+            // --- Name conflict check ---
+            // Reject rename if new_name already exists as a symbol in the PDG,
+            // which would create an ambiguous binding or break references.
+            let name_conflict = pdg
+                .find_by_symbol(&new_name)
+                .or_else(|| pdg.find_by_name(&new_name))
+                .or_else(|| pdg.find_by_name_in_file(&new_name, None));
+            if name_conflict.is_some() {
+                return Err(JsonRpcError::invalid_params(format!(
+                    "Rename conflict: symbol '{}' already exists in the project index. \
+                    Renaming '{}' to '{}' would create a duplicate. \
+                    Use leindex_grep_symbols to inspect '{}'.",
+                    new_name, old_name, new_name, new_name
+                )));
+            }
+
             // The definition file
             if let Some(n) = pdg.get_node(node_id) {
                 ref_files.insert(n.file_path.clone());
@@ -135,13 +153,14 @@ Grep + multi-file Edit with a single atomic operation."
         drop(index);
 
         // Generate per-file diffs (file I/O — offload to blocking thread)
-        let (diffs, files_to_modify) = tokio::task::spawn_blocking({
+        let (diffs, files_to_modify, file_contents) = tokio::task::spawn_blocking({
             let filtered_files = filtered_files;
             let old_name = old_name.clone();
             let new_name = new_name.clone();
-            move || -> Result<(Vec<Value>, Vec<String>), String> {
+            move || -> Result<(Vec<Value>, Vec<String>, Vec<(String, String, String)>), String> {
                 let mut diffs: Vec<Value> = Vec::new();
                 let mut files_to_modify: Vec<String> = Vec::new();
+                let mut file_contents: Vec<(String, String, String)> = Vec::new(); // (path, original, modified)
                 for file_path in &filtered_files {
                     let original = std::fs::read_to_string(file_path)
                         .map_err(|e| format!("Failed reading '{}': {}", file_path, e))?;
@@ -150,14 +169,121 @@ Grep + multi-file Edit with a single atomic operation."
                         let diff = make_diff(&original, &modified, file_path);
                         diffs.push(serde_json::json!({ "file": file_path, "diff": diff }));
                         files_to_modify.push(file_path.clone());
+                        file_contents.push((file_path.clone(), original, modified));
                     }
                 }
-                Ok((diffs, files_to_modify))
+                Ok((diffs, files_to_modify, file_contents))
             }
         })
         .await
         .map_err(|e| JsonRpcError::internal_error(format!("Rename task failed: {}", e)))?
         .map_err(JsonRpcError::internal_error)?;
+
+        // --- Syntax validation via LogicValidator ---
+        // Validate the proposed file contents for syntax correctness.
+        // For non-preview renames, reject if validation finds errors.
+        // For preview renames, include validation results as warnings.
+        let validation_json = {
+            let idx = handle.lock().await;
+            match idx.create_validator() {
+                Some(validator) => {
+                    // Build ResolvedEditChanges from the proposed file modifications
+                    let resolved: Vec<ResolvedEditChange> = file_contents
+                        .iter()
+                        .map(|(path, original, modified)| {
+                            let mut change = ResolvedEditChange::new(
+                                PathBuf::from(path),
+                                original.clone(),
+                                modified.clone(),
+                            );
+                            change = change.with_edit_type(crate::edit::EditType::Rename);
+                            change
+                        })
+                        .collect();
+
+                    match validator.validate_changes(&resolved) {
+                        Ok(result) => {
+                            let syntax_errors: Vec<Value> = result
+                                .syntax_errors
+                                .iter()
+                                .map(|e| {
+                                    serde_json::json!({
+                                        "file": e.file_path.display().to_string(),
+                                        "line": e.line,
+                                        "column": e.column,
+                                        "message": e.message,
+                                        "severity": format!("{:?}", e.severity),
+                                    })
+                                })
+                                .collect();
+                            let reference_issues: Vec<Value> = result
+                                .reference_issues
+                                .iter()
+                                .map(|i| {
+                                    serde_json::json!({
+                                        "type": format!("{:?}", i.issue_type),
+                                        "file": i.file_path.display().to_string(),
+                                        "location": format!("{}:{}", i.location.line, i.location.column),
+                                        "description": i.description,
+                                    })
+                                })
+                                .collect();
+                            let semantic_drift: Vec<Value> = result
+                                .semantic_drift
+                                .iter()
+                                .map(|d| {
+                                    serde_json::json!({
+                                        "symbol": d.symbol_name,
+                                        "drift_type": format!("{:?}", d.drift_type),
+                                        "location": format!("{}:{}", d.location.line, d.location.column),
+                                        "impact": d.impact_description,
+                                    })
+                                })
+                                .collect();
+                            let impact = result.impact_report.as_ref().map(|r| {
+                                serde_json::json!({
+                                    "risk_level": format!("{:?}", r.risk_level),
+                                    "affected_symbols": r.affected_nodes,
+                                    "affected_files": r.affected_files.len(),
+                                })
+                            });
+
+                            let has_errors = result.has_errors();
+                            let v_json = serde_json::json!({
+                                "is_valid": result.is_valid,
+                                "has_errors": has_errors,
+                                "syntax_errors": syntax_errors,
+                                "reference_issues": reference_issues,
+                                "semantic_drift": semantic_drift,
+                                "impact_report": impact,
+                            });
+
+                            if has_errors && !preview_only {
+                                // Build detailed error response — reject the rename
+                                let syn_errs = v_json["syntax_errors"].as_array().map(|a| a.len()).unwrap_or(0);
+                                let ref_issues = v_json["reference_issues"].as_array().map(|a| a.len()).unwrap_or(0);
+                                let drift = v_json["semantic_drift"].as_array().map(|a| a.len()).unwrap_or(0);
+                                return Err(JsonRpcError::invalid_params(format!(
+                                    "Rename rejected — validation found errors. Files unchanged.\n\
+                                     Syntax errors: {}\nReference issues: {}\nSemantic drift: {}\n\
+                                     Details: {}",
+                                    syn_errs, ref_issues, drift, v_json
+                                )));
+                            }
+
+                            // Include validation in response (warnings or preview mode)
+                            Some(v_json)
+                        }
+                        Err(e) => {
+                            // Validation itself failed — log warning but don't block
+                            tracing::warn!("Rename validation check failed: {}", e);
+                            None
+                        }
+                    }
+                }
+                None => None,
+            }
+        };
 
         if !preview_only {
             // Apply changes to all files (file I/O — offload to blocking thread)
@@ -182,7 +308,7 @@ Grep + multi-file Edit with a single atomic operation."
             .map_err(JsonRpcError::internal_error)?;
         }
 
-        let response_data = serde_json::json!({
+        let mut response_data = serde_json::json!({
             "old_name": old_name,
             "new_name": new_name,
             "files_affected": files_to_modify.len(),
@@ -191,11 +317,200 @@ Grep + multi-file Edit with a single atomic operation."
             "applied": !preview_only
         });
 
+        // Include validation results in response
+        if let Some(validation) = validation_json {
+            if let Some(obj) = response_data.as_object_mut() {
+                obj.insert("validation".to_string(), validation);
+            }
+        }
+
         // Re-acquire the lock for wrap_with_meta (released before spawn_blocking)
         let index = handle.lock().await;
         Ok(wrap_with_meta(
             response_data,
             &index,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::mcp::helpers::test_registry_for;
+    use tempfile::TempDir;
+    use tokio;
+
+    /// Helper: create a temp dir with a file and return (TempDir, file_path, registry)
+    async fn setup_test_file(
+        content: &str,
+        file_name: &str,
+    ) -> (TempDir, String, Arc<ProjectRegistry>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join(file_name);
+        std::fs::write(&file_path, content).expect("write test file");
+        let registry = test_registry_for(dir.path());
+        (dir, file_path.to_string_lossy().to_string(), registry)
+    }
+
+    #[tokio::test]
+    async fn test_rename_missing_old_name_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = test_registry_for(dir.path());
+
+        let handler = RenameSymbolHandler;
+        let args = serde_json::json!({
+            "new_name": "bar",
+        });
+
+        let result = handler.execute(&registry, args).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("old_name"),
+            "Expected missing old_name error, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_missing_new_name_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = test_registry_for(dir.path());
+
+        let handler = RenameSymbolHandler;
+        let args = serde_json::json!({
+            "old_name": "foo",
+        });
+
+        let result = handler.execute(&registry, args).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("new_name"),
+            "Expected missing new_name error, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_symbol_not_found_returns_error() {
+        // Without a PDG (empty project), the symbol lookup fails
+        let (_dir, _file_path, registry) =
+            setup_test_file("fn hello() { println!(\"world\"); }\n", "test.rs").await;
+
+        let handler = RenameSymbolHandler;
+        let args = serde_json::json!({
+            "old_name": "nonexistent_symbol",
+            "new_name": "new_name",
+            "preview_only": true,
+        });
+
+        let result = handler.execute(&registry, args).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("not found"),
+            "Expected 'not found' error, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_returns_project_not_indexed_for_empty_project() {
+        // Empty project with no indexed files — PDG is None, so pdg() returns error
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = test_registry_for(dir.path());
+
+        let handler = RenameSymbolHandler;
+        let args = serde_json::json!({
+            "old_name": "foo",
+            "new_name": "bar",
+            "preview_only": true,
+        });
+
+        let result = handler.execute(&registry, args).await;
+        assert!(result.is_err());
+        // With no PDG loaded and no indexed files, handler returns project not indexed
+        // or symbol not found depending on ensure_pdg_loaded behavior
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("not indexed")
+                || err.message.contains("not found")
+                || err.message.contains("Failed to load PDG"),
+            "Expected project not indexed or symbol not found error, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_preview_only_does_not_modify_file() {
+        // Even if the project auto-indexes, the rename in preview_only mode
+        // should NOT modify files. Since the symbol won't be in the PDG for a
+        // simple test file, this will return "not found" — but the key invariant
+        // is that files are never modified.
+        let (_dir, file_path, registry) =
+            setup_test_file("fn hello() { println!(\"world\"); }\n", "test.rs").await;
+
+        let original_content = std::fs::read_to_string(&file_path).unwrap();
+
+        let handler = RenameSymbolHandler;
+        let args = serde_json::json!({
+            "old_name": "hello",
+            "new_name": "greet",
+            "preview_only": true,
+        });
+
+        let _ = handler.execute(&registry, args).await;
+
+        // File must be unchanged regardless of outcome
+        let content_after = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            content_after, original_content,
+            "File must not be modified in preview_only mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_apply_does_not_modify_on_symbol_not_found() {
+        // When the symbol is not found, the file should remain unchanged
+        let (_dir, file_path, registry) =
+            setup_test_file("fn hello() { println!(\"world\"); }\n", "test.rs").await;
+
+        let original_content = std::fs::read_to_string(&file_path).unwrap();
+
+        let handler = RenameSymbolHandler;
+        let args = serde_json::json!({
+            "old_name": "nonexistent",
+            "new_name": "something",
+            "preview_only": false,
+        });
+
+        let _ = handler.execute(&registry, args).await;
+
+        // File must be unchanged since symbol was not found
+        let content_after = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(
+            content_after, original_content,
+            "File must not be modified when symbol not found"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_schema_has_required_fields() {
+        let handler = RenameSymbolHandler;
+        let schema = handler.argument_schema();
+
+        // Verify required fields
+        let required = schema.get("required").unwrap().as_array().unwrap();
+        assert!(required.contains(&serde_json::Value::String("old_name".to_string())));
+        assert!(required.contains(&serde_json::Value::String("new_name".to_string())));
+
+        // Verify properties exist
+        let props = schema.get("properties").unwrap();
+        assert!(props.get("old_name").is_some());
+        assert!(props.get("new_name").is_some());
+        assert!(props.get("preview_only").is_some());
+        assert!(props.get("scope").is_some());
+        assert!(props.get("project_path").is_some());
     }
 }
