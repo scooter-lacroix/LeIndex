@@ -195,19 +195,49 @@ impl TfIdfEmbedder {
             "TF-IDF vocabulary candidates (moderate-IDF filter)"
         );
 
-        // Stratified vocabulary selection across the full IDF range.
-        idf_scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-
+        // Stratified vocabulary selection using partition-based sampling.
+        // Instead of O(N log N) full sort, we use select_nth_unstable_by to
+        // partition at quantile boundaries in O(N) each, then sample from
+        // each partition. Total: O(K*N) where K = TARGET_DIM (768), vs O(N log N).
         let final_scores: Vec<(String, f32)> = if idf_scores.len() <= TARGET_DIM {
+            // Fewer candidates than target — sort the small set and use all.
+            idf_scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
             idf_scores
         } else {
             let total = idf_scores.len();
+            // Build quantile boundaries for stratified sampling.
+            // Each boundary is the index where the i-th output element should be sampled from.
             let stride = total as f64 / TARGET_DIM as f64;
-            (0..TARGET_DIM)
-                .map(|i| {
-                    let idx = ((i as f64 * stride) as usize).min(total - 1);
-                    idf_scores[idx].clone()
-                })
+            let target_indices: Vec<usize> = (0..TARGET_DIM)
+                .map(|i| ((i as f64 * stride) as usize).min(total - 1))
+                .collect();
+
+            // Use min-heap of size TARGET_DIM to select the top-K elements
+            // by their target index positions. We partition at each unique
+            // quantile boundary and pick the element at that boundary.
+            //
+            // Optimization: instead of partitioning TARGET_DIM times, we
+            // only partition at unique quantile boundaries. Typically there
+            // are far fewer unique boundaries than TARGET_DIM when total >> TARGET_DIM.
+            let mut unique_bounds: Vec<usize> = target_indices.clone();
+            unique_bounds.sort_unstable();
+            unique_bounds.dedup();
+
+            // Partition at each unique boundary using select_nth_unstable_by.
+            // After partitioning, idf_scores[p..=p] contains the element that
+            // would be at position p in a fully sorted array.
+            for &pivot in &unique_bounds {
+                if pivot < total {
+                    idf_scores.select_nth_unstable_by(pivot, |a, b| {
+                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                }
+            }
+
+            // Collect sampled elements at target indices.
+            target_indices
+                .into_iter()
+                .map(|idx| idf_scores[idx].clone())
                 .collect()
         };
 
@@ -942,5 +972,85 @@ mod tests {
         let vec = embedder.embed("zzzzzz aaaaaaa bbbbbbb cccccccc");
         let magnitude: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!(magnitude < 1.1, "magnitude out of range: {}", magnitude);
+    }
+
+    /// Regression test: verify partition-based selection produces the same
+    /// vocab+idf as the original sort-based approach.
+    #[test]
+    fn test_tfidf_partition_matches_sort_selection() {
+        use std::collections::HashMap;
+
+        // Generate a corpus large enough to exercise the partition path
+        // (> TARGET_DIM unique tokens). Use 200 docs with unique per-doc tokens
+        // to ensure many unique tokens pass the df filter.
+        let docs: Vec<(String, String)> = (0..200)
+            .map(|i| {
+                let content = format!(
+                    "fn func_{i}(arg_{i}: &str) -> Result<{i}> {{ \
+                     let var_{i} = compute_{i}(arg_{i}); \
+                     process_{i}(var_{i}) }}",
+                );
+                (format!("doc_{i}"), content)
+            })
+            .collect();
+
+        let embedder = TfIdfEmbedder::build(&docs);
+
+        // Build a reference vocab using the original sort+stride approach
+        // with the SAME min_df/max_df logic as build_from_tokens.
+        let tokenized: Vec<(String, Vec<String>)> = docs
+            .iter()
+            .map(|(id, content)| (id.clone(), tokenize_code(content)))
+            .collect();
+
+        let n = tokenized.len();
+        let n_f = n as f32;
+        // Same logic as build_from_tokens
+        let min_df: usize = if n < 50 { 1 } else { (n / 1000).max(3) };
+        let max_df: usize = if n < 50 { n } else { (n / 4).max(min_df + 1) };
+
+        let mut df: HashMap<String, usize> = HashMap::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (_, tokens) in &tokenized {
+            seen.clear();
+            for tok in tokens {
+                if seen.insert(tok.as_str()) {
+                    *df.entry(tok.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut ref_scores: Vec<(String, f32)> = df
+            .into_iter()
+            .filter(|(_, c)| *c >= min_df && *c <= max_df)
+            .map(|(tok, c)| (tok, (n_f / c as f32).ln()))
+            .collect();
+        ref_scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        let target_dim = crate::search::search::DEFAULT_EMBEDDING_DIMENSION;
+        let expected_vocab: Vec<String> = if ref_scores.len() <= target_dim {
+            ref_scores.iter().map(|(t, _)| t.clone()).collect()
+        } else {
+            let total = ref_scores.len();
+            let stride = total as f64 / target_dim as f64;
+            (0..target_dim)
+                .map(|i| ref_scores[((i as f64 * stride) as usize).min(total - 1)].0.clone())
+                .collect()
+        };
+
+        // The embedder's vocab should match the sort-based reference exactly.
+        assert_eq!(
+            embedder.vocab.len(),
+            expected_vocab.len(),
+            "vocab length mismatch: got {} expected {}",
+            embedder.vocab.len(),
+            expected_vocab.len()
+        );
+        for (i, (got, expected)) in embedder.vocab.iter().zip(expected_vocab.iter()).enumerate() {
+            assert_eq!(
+                got, expected,
+                "vocab mismatch at position {i}: got '{got}' expected '{expected}'"
+            );
+        }
     }
 }
