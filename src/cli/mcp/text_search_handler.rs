@@ -1,4 +1,7 @@
-use super::helpers::*;
+use super::helpers::{
+    extract_bool, extract_string, extract_usize, glob_match, node_type_str, resolve_scope,
+    wrap_with_meta,
+};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use regex::RegexBuilder;

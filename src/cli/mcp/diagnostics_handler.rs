@@ -1,4 +1,4 @@
-use super::helpers::*;
+use super::helpers::wrap_with_meta;
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
