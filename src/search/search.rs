@@ -343,6 +343,9 @@ pub struct SearchEngine {
     /// Inverted index for O(1) text lookups: token -> set of node IDs
     /// This allows sub-linear text search instead of O(N) scan
     text_index: HashMap<String, HashSet<String>>,
+    /// Node ID to index mapping for O(1) node lookups (fixes A1)
+    /// Populated during index_nodes() and maintained on updates
+    node_id_to_idx: HashMap<String, usize>,
     /// Result cache for repeated queries
     search_cache: LruCache<String, Vec<SearchResult>>,
 }
@@ -365,6 +368,7 @@ impl SearchEngine {
             )),
             complexity_cache: HashMap::new(),
             text_index: HashMap::new(),
+            node_id_to_idx: HashMap::new(),
             search_cache: LruCache::new(NonZeroUsize::new(1000).unwrap()),
         }
     }
@@ -402,6 +406,7 @@ impl SearchEngine {
             vector_index: VectorIndexImpl::BruteForce(VectorIndex::new(dimension)),
             complexity_cache: HashMap::new(),
             text_index: HashMap::new(),
+            node_id_to_idx: HashMap::new(),
             search_cache: LruCache::new(NonZeroUsize::new(1000).unwrap()),
         }
     }
@@ -438,9 +443,15 @@ impl SearchEngine {
         self.complexity_cache.clear();
         self.text_index.clear();
         self.search_cache.clear();
+        self.node_id_to_idx.clear();
 
         // Store nodes for text search
         self.nodes = nodes.clone();
+
+        // Build node_id_to_idx for O(1) node lookups (A1 optimization)
+        for (idx, node) in nodes.iter().enumerate() {
+            self.node_id_to_idx.insert(node.node_id.clone(), idx);
+        }
 
         // Build complexity cache for O(1) lookups
         for node in &nodes {
@@ -843,15 +854,15 @@ impl SearchEngine {
         // Perform vector similarity search
         let results = self.vector_index.search(query_embedding, top_k);
 
-        // Convert to SemanticEntry format
+        // Convert to SemanticEntry format using O(1) HashMap lookup
         let entries = results
             .into_iter()
             .map(|(node_id, score)| {
-                // Determine entry type based on node info
+                // O(1) lookup via node_id_to_idx instead of O(N) linear scan
                 let entry_type = self
-                    .nodes
-                    .iter()
-                    .find(|n| n.node_id == node_id)
+                    .node_id_to_idx
+                    .get(&node_id)
+                    .and_then(|&idx| self.nodes.get(idx))
                     .map(|_| EntryType::Function)
                     .unwrap_or(EntryType::Function);
 
@@ -1220,5 +1231,60 @@ mod tests {
         };
         let results = engine.search(query).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_node_id_to_idx_populated() {
+        let mut engine = SearchEngine::new();
+        let nodes = create_test_nodes();
+        engine.index_nodes(nodes);
+
+        // Verify node_id_to_idx is populated with correct indices
+        assert_eq!(engine.node_id_to_idx.len(), 2);
+        assert_eq!(engine.node_id_to_idx.get("func1"), Some(&0));
+        assert_eq!(engine.node_id_to_idx.get("func2"), Some(&1));
+    }
+
+    #[test]
+    fn test_node_id_to_idx_o1_lookup_in_semantic_search() {
+        let mut engine = SearchEngine::with_dimension(3);
+        let nodes = create_test_nodes();
+        engine.index_nodes(nodes);
+
+        // Verify semantic_search uses node_id_to_idx for O(1) lookup
+        // by checking that results are still correct after optimization
+        let results = engine.semantic_search(&[1.0, 0.0, 0.0], 10).unwrap();
+        assert!(!results.is_empty());
+
+        // The top result should be func1 (closest to query vector)
+        assert_eq!(results[0].node_id, "func1");
+        assert_eq!(results[0].entry_type, EntryType::Function);
+
+        // Verify all results have correct entry type
+        for entry in &results {
+            assert_eq!(entry.entry_type, EntryType::Function);
+        }
+    }
+
+    #[test]
+    fn test_node_id_to_idx_cleared_on_reindex() {
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+        assert_eq!(engine.node_id_to_idx.len(), 2);
+
+        // Re-index with different nodes - should clear and repopulate
+        engine.index_nodes(vec![NodeInfo {
+            node_id: "new_func".to_string(),
+            file_path: "new.rs".to_string(),
+            symbol_name: "new_func".to_string(),
+            language: "rust".to_string(),
+            content: "fn new_func() {}".to_string(),
+            byte_range: (0, 18),
+            embedding: None,
+            complexity: 1,
+        }]);
+        assert_eq!(engine.node_id_to_idx.len(), 1);
+        assert_eq!(engine.node_id_to_idx.get("new_func"), Some(&0));
+        assert_eq!(engine.node_id_to_idx.get("func1"), None);
     }
 }
