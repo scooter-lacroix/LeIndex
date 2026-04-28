@@ -5,10 +5,11 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use thiserror::Error;
+// Submodules
+mod command;
+mod engine;
+mod history;
+mod refactor;
 
 // Re-exports from legraphe
 pub use crate::graph::pdg::{Edge, EdgeType, Node, NodeType, ProgramDependenceGraph as PDG};
@@ -16,1882 +17,22 @@ pub use crate::graph::pdg::{Edge, EdgeType, Node, NodeType, ProgramDependenceGra
 // Re-exports from lestockage
 pub use crate::storage::{Storage, StorageConfig, UniqueProjectId};
 
-/// Error types for the edit engine.
-#[derive(Error, Debug)]
-pub enum EditError {
-    /// Generic edit error
-    #[error("Edit error: {0}")]
-    Generic(String),
-
-    /// File not found
-    #[error("File not found: {0}")]
-    FileNotFound(PathBuf),
-
-    /// Git operation failed
-    #[error("Git operation failed: {0}")]
-    GitError(String),
-
-    /// Parse error
-    #[error("Parse error: {0}")]
-    ParseError(String),
-
-    /// Invalid edit range
-    #[error("Invalid edit range: {start}-{end} in file {file}")]
-    InvalidRange {
-        /// Start of range
-        start: usize,
-        /// End of range
-        end: usize,
-        /// File path
-        file: PathBuf,
-    },
-
-    /// Worktree error
-    #[error("Worktree error: {0}")]
-    WorktreeError(String),
-
-    /// History error
-    #[error("History error: {0}")]
-    HistoryError(String),
-
-    /// Symbol not found
-    #[error("Symbol not found: {0}")]
-    SymbolNotFound(String),
-
-    /// Storage error
-    #[error("Storage error: {0}")]
-    StorageError(String),
-}
-
-/// Result type for edit operations
-pub type Result<T> = std::result::Result<T, EditError>;
-
-/// Edit change operations
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub enum EditChange {
-    /// Replace text at a specific byte range
-    ReplaceText {
-        /// Start byte offset
-        start: usize,
-        /// End byte offset
-        end: usize,
-        /// New text to insert
-        new_text: String,
-    },
-
-    /// Rename a symbol across all references
-    RenameSymbol {
-        /// Old symbol name
-        old_name: String,
-        /// New symbol name
-        new_name: String,
-    },
-
-    /// Extract selected code into a new function
-    ExtractFunction {
-        /// Start of selection
-        start: usize,
-        /// End of selection
-        end: usize,
-        /// Name for the new function
-        function_name: String,
-    },
-
-    /// Inline a variable at its usage sites
-    InlineVariable {
-        /// Variable name to inline
-        variable_name: String,
-    },
-}
-
-/// Edit request
-#[derive(Debug, Clone)]
-pub struct EditRequest {
-    /// Project identifier
-    pub project_id: UniqueProjectId,
-
-    /// File path to edit
-    pub file_path: PathBuf,
-
-    /// Changes to apply
-    pub changes: Vec<EditChange>,
-
-    /// Preview only (don't apply changes)
-    pub preview_only: bool,
-}
-
-/// Preview of an edit operation
-#[derive(Debug, Clone)]
-pub struct EditPreview {
-    /// Unified diff
-    pub diff: String,
-
-    /// Impact analysis
-    pub impact: ImpactAnalysis,
-
-    /// Files affected by this edit
-    pub files_affected: Vec<PathBuf>,
-}
-
-/// Result of an edit operation
-#[derive(Debug, Clone)]
-pub struct EditResult {
-    /// Success status
-    pub success: bool,
-
-    /// Number of changes applied
-    pub changes_applied: usize,
-
-    /// Files modified
-    pub files_modified: Vec<PathBuf>,
-
-    /// Error message if failed
-    pub error: Option<String>,
-
-    /// Map of file_path → original content before the operation.
-    /// Used internally to record undo history. `None` for single-file edits
-    /// (which capture original_content in EditCommand::Edit directly).
-    pub original_contents: Option<HashMap<String, String>>,
-
-    /// Map of file_path → content after the operation.
-    /// Used internally to record redo history. `None` for single-file edits.
-    /// Stores the exact post-rename content (result of `replace_near_definitions`)
-    /// so redo can restore the precise state without re-running replacement.
-    pub modified_contents: Option<HashMap<String, String>>,
-}
-
-/// Impact analysis for an edit
-#[derive(Debug, Clone)]
-pub struct ImpactAnalysis {
-    /// Nodes directly affected
-    pub affected_nodes: Vec<String>,
-
-    /// Files that will be modified
-    pub affected_files: Vec<PathBuf>,
-
-    /// Potential breaking changes
-    pub breaking_changes: Vec<String>,
-
-    /// Estimated risk level
-    pub risk_level: RiskLevel,
-}
-
-/// Risk level for an edit
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RiskLevel {
-    /// Low risk - localized change
-    Low,
-    /// Medium risk - affects multiple files
-    Medium,
-    /// High risk - affects critical components
-    High,
-}
-
-/// Edit engine
-pub struct EditEngine {
-    /// Program Dependence Graph for impact analysis
-    pub pdg: Arc<PDG>,
-
-    /// Worktree manager for isolated edits
-    pub worktree_manager: Arc<WorktreeManager>,
-
-    /// Edit history
-    pub history: Arc<tokio::sync::Mutex<EditHistory>>,
-}
-
-fn clamp_to_char_boundary(content: &str, idx: usize) -> usize {
-    let mut i = idx.min(content.len());
-    while i > 0 && !content.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-
-fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
-}
-
-/// Replace `old` with `new` only within windows around known definition byte ranges.
-/// Each window extends from the definition start minus a context buffer to the end
-/// plus a buffer, covering nearby references that the PDG traversal identified.
-/// Falls back gracefully for files without usable byte ranges.
-fn replace_near_definitions(
-    content: &str,
-    old: &str,
-    new: &str,
-    def_ranges: &[(usize, usize)],
-) -> String {
-    if old.is_empty() || def_ranges.is_empty() {
-        return content.to_owned();
-    }
-
-    // Context buffer (bytes) around each definition for targeted replacement.
-    // Covers typical function bodies plus surrounding references.
-    const REPLACE_CONTEXT_BYTES: usize = 2048;
-
-    // Build sorted, non-overlapping windows around each definition
-    let ctx = REPLACE_CONTEXT_BYTES;
-    let mut windows: Vec<(usize, usize)> = def_ranges
-        .iter()
-        .map(|&(s, e)| {
-            let start = clamp_to_char_boundary(content, s.saturating_sub(ctx));
-            let end = clamp_to_char_boundary(content, (e + ctx).min(content.len()));
-            (start, end)
-        })
-        .collect();
-    windows.sort_by_key(|w| w.0);
-
-    // Merge overlapping windows
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for w in windows {
-        if let Some(last) = merged.last_mut() {
-            if w.0 <= last.1 {
-                last.1 = last.1.max(w.1);
-                continue;
-            }
-        }
-        merged.push(w);
-    }
-
-    // Find all whole-word match positions on the FULL content first,
-    // then filter to matches within the merged windows.
-    // This avoids false word boundaries at slice edges.
-    let mut matches_in_windows: Vec<(usize, usize)> = Vec::new(); // (start, end)
-    for (start, matched) in content.match_indices(old) {
-        let end = start + matched.len();
-        let before_ok = start == 0
-            || content[..start]
-                .chars()
-                .last()
-                .map(|c| !is_word_char(c))
-                .unwrap_or(true);
-        let after_ok = end == content.len()
-            || content[end..]
-                .chars()
-                .next()
-                .map(|c| !is_word_char(c))
-                .unwrap_or(true);
-        if before_ok && after_ok {
-            // Check if this match falls within any merged window
-            for &(win_start, win_end) in &merged {
-                if start >= win_start && end <= win_end {
-                    matches_in_windows.push((start, end));
-                    break;
-                }
-            }
-        }
-    }
-
-    // Build result: replace matched positions, copy everything else verbatim
-    let mut result = String::with_capacity(content.len());
-    let mut pos = 0usize;
-    for (start, end) in &matches_in_windows {
-        if *start > pos {
-            result.push_str(&content[pos..*start]);
-        }
-        result.push_str(new);
-        pos = *end;
-    }
-    if pos < content.len() {
-        result.push_str(&content[pos..]);
-    }
-    result
-}
-
-fn replace_whole_word(content: &str, old: &str, new: &str) -> String {
-    if old.is_empty() {
-        return content.to_owned();
-    }
-
-    let mut result = String::with_capacity(content.len());
-    let mut last_match_end = 0usize;
-
-    for (start, matched) in content.match_indices(old) {
-        let end = start + matched.len();
-        let before_ok = start == 0
-            || content[..start]
-                .chars()
-                .last()
-                .map(|c| !is_word_char(c))
-                .unwrap_or(true);
-        let after_ok = end == content.len()
-            || content[end..]
-                .chars()
-                .next()
-                .map(|c| !is_word_char(c))
-                .unwrap_or(true);
-
-        if before_ok && after_ok {
-            result.push_str(&content[last_match_end..start]);
-            result.push_str(new);
-            last_match_end = end;
-        }
-    }
-
-    result.push_str(&content[last_match_end..]);
-    result
-}
-
-fn sanitize_session_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
-            out.push(ch);
-        } else {
-            out.push('_');
-        }
-    }
-    if out.is_empty() {
-        "session".to_string()
-    } else {
-        out
-    }
-}
-
-impl EditEngine {
-    /// Create a new edit engine
-    pub fn new(pdg: Arc<PDG>, _storage: Arc<Storage>) -> Result<Self> {
-        let worktree_manager = Arc::new(WorktreeManager::new());
-        let history = Arc::new(tokio::sync::Mutex::new(EditHistory::new()));
-
-        Ok(Self {
-            pdg,
-            worktree_manager,
-            history,
-        })
-    }
-
-    /// Preview an edit without applying it
-    pub async fn preview_edit(&self, request: &EditRequest) -> Result<EditPreview> {
-        // Read the original content
-        let original = self.read_file_content(&request.file_path).await?;
-
-        // Apply each change to produce modified content, then generate diff
-        let mut modified = original.clone();
-        for change in &request.changes {
-            modified = self.apply_change_to_string(&modified, change)?;
-        }
-
-        let diff = self.generate_diff(&original, &modified, &request.file_path)?;
-
-        // Analyze impact using PDG
-        let impact = self.analyze_impact(request).await?;
-        let all_files = impact.affected_files.clone();
-
-        Ok(EditPreview {
-            diff,
-            impact,
-            files_affected: all_files,
-        })
-    }
-
-    /// Apply an edit
-    pub async fn apply_edit(&self, request: &EditRequest) -> Result<EditResult> {
-        // Create worktree session
-        let mut session = self
-            .worktree_manager
-            .create_session(
-                &request.project_id,
-                &format!("edit-{}", chrono::Utc::now().timestamp()),
-            )
-            .await?;
-
-        // Capture original content for undo — fail fast if pre-image unreadable
-        let original_content = Some(std::fs::read_to_string(&request.file_path).map_err(|e| {
-            EditError::Generic(format!(
-                "Failed to capture original content for '{}': {}",
-                request.file_path.display(),
-                e
-            ))
-        })?);
-
-        // Apply changes in worktree
-        let mut changes_applied = 0;
-        let mut files_modified = Vec::new();
-
-        for change in &request.changes {
-            match self
-                .apply_change(&mut session, &request.file_path, change)
-                .await
-            {
-                Ok(modified) => {
-                    if modified {
-                        changes_applied += 1;
-                        if !files_modified.contains(&request.file_path) {
-                            files_modified.push(request.file_path.clone());
-                        }
-                    }
-                }
-                Err(e) => {
-                    // Discard worktree on error
-                    let _ = session.discard().await;
-                    return Ok(EditResult {
-                        success: false,
-                        changes_applied: 0,
-                        files_modified: vec![],
-                        modified_contents: None,
-                        original_contents: None,
-                        error: Some(e.to_string()),
-                    });
-                }
-            }
-        }
-
-        // Merge worktree back to main
-        session.merge().await?;
-
-        // Record in history
-        let mut history = self.history.lock().await;
-        history.record_command(EditCommand::Edit {
-            project_id: request.project_id.clone(),
-            file_path: request.file_path.clone(),
-            changes: request.changes.clone(),
-            timestamp: chrono::Utc::now(),
-            original_content,
-        });
-
-        Ok(EditResult {
-            success: true,
-            changes_applied,
-            files_modified,
-            modified_contents: None,
-            original_contents: None,
-            error: None,
-        })
-    }
-
-    /// Generate a unified diff between original and modified content.
-    pub fn generate_diff(
-        &self,
-        original: &str,
-        modified: &str,
-        file_path: &Path,
-    ) -> Result<String> {
-        Self::format_unified_diff(original, modified, file_path)
-    }
-
-    /// Generate a unified diff (public alias used by other call sites).
-    pub fn generate_unified_diff(
-        &self,
-        original: &str,
-        modified: &str,
-        file_path: &Path,
-    ) -> Result<String> {
-        Self::format_unified_diff(original, modified, file_path)
-    }
-
-    /// Shared implementation: create a diffy patch and replace its default
-    /// "--- original" / "+++ modified" headers with the actual file path.
-    fn format_unified_diff(original: &str, modified: &str, file_path: &Path) -> Result<String> {
-        let patch = diffy::create_patch(original, modified);
-        let patch_str = patch.to_string();
-        if patch_str.is_empty() {
-            Ok(format!(
-                "--- {}\n+++ {}\n(no changes)\n",
-                file_path.display(),
-                file_path.display()
-            ))
-        } else {
-            // Replace diffy's default headers with file-path labels
-            let lines: Vec<&str> = patch_str.lines().collect();
-            let mut result = format!("--- {}\n+++ {}", file_path.display(), file_path.display());
-            for line in lines.iter().skip(2) {
-                result.push('\n');
-                result.push_str(line);
-            }
-            result.push('\n');
-            Ok(result)
-        }
-    }
-
-    /// Apply a single EditChange to a string in memory, returning the modified string.
-    ///
-    /// Used by `preview_edit` to compute the diff without touching the filesystem.
-    fn apply_change_to_string(&self, content: &str, change: &EditChange) -> Result<String> {
-        match change {
-            EditChange::ReplaceText {
-                start,
-                end,
-                new_text,
-            } => {
-                let start_idx = clamp_to_char_boundary(content, *start);
-                let end_idx = clamp_to_char_boundary(content, *end);
-                if start_idx > end_idx {
-                    return Err(EditError::InvalidRange {
-                        start: *start,
-                        end: *end,
-                        file: PathBuf::from("(in-memory)"),
-                    });
-                }
-                let result = format!(
-                    "{}{}{}",
-                    &content[..start_idx],
-                    new_text,
-                    &content[end_idx..]
-                );
-                Ok(result)
-            }
-            EditChange::RenameSymbol { old_name, new_name } => Ok(replace_whole_word(
-                content,
-                old_name.as_str(),
-                new_name.as_str(),
-            )),
-            EditChange::ExtractFunction { .. } | EditChange::InlineVariable { .. } => {
-                // AST-level changes are complex; return content unchanged for preview
-                Ok(content.to_owned())
-            }
-        }
-    }
-
-    /// Analyze impact of an edit using forward PDG traversal.
-    async fn analyze_impact(&self, request: &EditRequest) -> Result<ImpactAnalysis> {
-        let mut affected_nodes: Vec<String> = Vec::new();
-        let mut affected_files: std::collections::HashSet<PathBuf> =
-            std::collections::HashSet::new();
-        affected_files.insert(request.file_path.clone());
-        let mut breaking_changes = Vec::new();
-
-        // Check each change for impact
-        for change in &request.changes {
-            match change {
-                EditChange::RenameSymbol {
-                    old_name,
-                    new_name: _,
-                } => {
-                    if let Some(node_id) = self.pdg.find_by_symbol(old_name) {
-                        affected_nodes.push(old_name.clone());
-                        // Forward impact: all nodes reachable from this one
-                        let forward = self.pdg.forward_impact(
-                            node_id,
-                            &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
-                        );
-                        for dep_id in forward {
-                            if let Some(dep_node) = self.pdg.get_node(dep_id) {
-                                affected_nodes.push(dep_node.name.clone());
-                                affected_files.insert(PathBuf::from(&dep_node.file_path));
-                            }
-                        }
-                        // Backward impact: callers that reference this symbol (rename risk)
-                        let backward = self.pdg.backward_impact(
-                            node_id,
-                            &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
-                        );
-                        if !backward.is_empty() {
-                            breaking_changes.push(format!(
-                                "Renaming '{}' may break {} caller(s)",
-                                old_name,
-                                backward.len()
-                            ));
-                            for bid in backward {
-                                if let Some(bn) = self.pdg.get_node(bid) {
-                                    affected_files.insert(PathBuf::from(&bn.file_path));
-                                }
-                            }
-                        }
-                    } else {
-                        breaking_changes.push(format!(
-                            "Symbol '{}' not found in PDG — rename may miss references",
-                            old_name
-                        ));
-                    }
-                }
-                EditChange::ReplaceText { .. } => {
-                    // Text replacement is low impact unless it touches a symbol boundary
-                }
-                EditChange::ExtractFunction { function_name, .. } => {
-                    breaking_changes.push(format!(
-                        "Extracting function '{}' — verify no name collision",
-                        function_name
-                    ));
-                }
-                EditChange::InlineVariable { variable_name } => {
-                    if let Some(node_id) = self.pdg.find_by_symbol(variable_name) {
-                        affected_nodes.push(variable_name.clone());
-                        let forward = self.pdg.forward_impact(
-                            node_id,
-                            &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
-                        );
-                        for dep_id in forward {
-                            if let Some(dep_node) = self.pdg.get_node(dep_id) {
-                                affected_nodes.push(dep_node.name.clone());
-                                affected_files.insert(PathBuf::from(&dep_node.file_path));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let affected_files_vec: Vec<PathBuf> = affected_files.into_iter().collect();
-
-        // Calculate risk level based on blast radius
-        let risk_level = if affected_nodes.len() > 5 || affected_files_vec.len() > 3 {
-            RiskLevel::High
-        } else if affected_nodes.len() > 1 || affected_files_vec.len() > 1 {
-            RiskLevel::Medium
-        } else {
-            RiskLevel::Low
-        };
-
-        Ok(ImpactAnalysis {
-            affected_nodes,
-            affected_files: affected_files_vec,
-            breaking_changes,
-            risk_level,
-        })
-    }
-
-    /// Apply a single change to a file in the worktree session's path.
-    async fn apply_change(
-        &self,
-        session: &mut WorktreeSession,
-        file_path: &Path,
-        change: &EditChange,
-    ) -> Result<bool> {
-        // Resolve the file path within the worktree
-        let target_path = if file_path.is_absolute() {
-            // Map absolute path into worktree, preserving directory structure.
-            // Try stripping common prefixes; fall back to the full relative path.
-            let rel = file_path
-                .strip_prefix(session.path())
-                .or_else(|_| file_path.strip_prefix("/"))
-                .unwrap_or(file_path);
-            session.path().join(rel)
-        } else {
-            session.path().join(file_path)
-        };
-
-        // Always materialize/read the target in the worktree to keep edits isolated.
-        let content = if target_path.exists() {
-            std::fs::read_to_string(&target_path).map_err(|e| {
-                EditError::Generic(format!("Failed to read {:?}: {}", target_path, e))
-            })?
-        } else if file_path.exists() {
-            let source = std::fs::read_to_string(file_path).map_err(|e| {
-                EditError::Generic(format!("Failed to read {:?}: {}", file_path, e))
-            })?;
-            if let Some(parent) = target_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    EditError::Generic(format!("Failed to create worktree dir {:?}: {}", parent, e))
-                })?;
-            }
-            std::fs::write(&target_path, source.as_bytes()).map_err(|e| {
-                EditError::Generic(format!(
-                    "Failed to materialize worktree file {:?}: {}",
-                    target_path, e
-                ))
-            })?;
-            source
-        } else {
-            return Err(EditError::FileNotFound(file_path.to_path_buf()));
-        };
-
-        let modified = self.apply_change_to_string(&content, change)?;
-
-        if modified == content {
-            return Ok(false); // No change
-        }
-
-        // Write modified content back into worktree only.
-        if let Some(parent) = target_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                EditError::Generic(format!("Failed to create worktree dir {:?}: {}", parent, e))
-            })?;
-        }
-        std::fs::write(&target_path, modified.as_bytes())
-            .map_err(|e| EditError::Generic(format!("Failed to write {:?}: {}", target_path, e)))?;
-
-        session.track_file(file_path.to_path_buf(), target_path);
-
-        Ok(true)
-    }
-
-    /// Read file content from disk.
-    pub async fn read_file_content(&self, file_path: &Path) -> Result<String> {
-        std::fs::read_to_string(file_path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                EditError::FileNotFound(file_path.to_path_buf())
-            } else {
-                EditError::Generic(format!("Failed to read {:?}: {}", file_path, e))
-            }
-        })
-    }
-
-    /// Undo last edit
-    pub async fn undo(&self) -> Result<EditResult> {
-        // Note: single sync fs::write — acceptable overhead for a single file restore.
-        // If this evolves to multi-file undo, wrap in spawn_blocking.
-        let mut history = self.history.lock().await;
-        // Extract the command data before potentially modifying history again
-        let cmd = history.undo().cloned();
-        match cmd {
-            Some(EditCommand::Edit { file_path, original_content, .. }) => {
-                // Restore original content if available
-                if let Some(content) = original_content {
-                    if let Err(e) = std::fs::write(&file_path, content.as_bytes()) {
-                        // Restore failed — revert the history cursor so undo/redo stay consistent
-                        history.redo();
-                        return Ok(EditResult {
-                            success: false,
-                            changes_applied: 0,
-                            files_modified: vec![],
-                            modified_contents: None,
-                            original_contents: None,
-                            error: Some(format!("Failed to restore '{}': {}", file_path.display(), e)),
-                        });
-                    }
-                } else {
-                    // No pre-image was captured — revert cursor, cannot reliably undo
-                    history.redo();
-                    return Ok(EditResult {
-                        success: false,
-                        changes_applied: 0,
-                        files_modified: vec![],
-                        modified_contents: None,
-                        original_contents: None,
-                        error: Some(format!("Cannot undo '{}': original content was not captured", file_path.display())),
-                    });
-                }
-                Ok(EditResult {
-                    success: true,
-                    changes_applied: 1,
-                    files_modified: vec![file_path.clone()],
-                    modified_contents: None,
-                    original_contents: None,
-                    error: None,
-                })
-            }
-            Some(EditCommand::Rename { original_contents, .. }) => {
-                // Restore all files to their pre-rename state (all-or-nothing).
-                // On partial failure, leave cursor in the undone state (don't revert
-                // to "renamed") so the user can retry or manually fix.
-                let mut restored = Vec::new();
-                let mut errors = Vec::new();
-                for (file_path, content) in original_contents {
-                    match std::fs::write(&file_path, content.as_bytes()) {
-                        Ok(()) => restored.push(PathBuf::from(file_path)),
-                        Err(e) => errors.push(format!("Failed to restore '{}': {}", file_path, e)),
-                    }
-                }
-                if !errors.is_empty() {
-                    // Leave cursor in undone state — don't call history.redo().
-                    // The files are partially restored; the user needs to resolve manually.
-                    return Ok(EditResult {
-                        success: false,
-                        changes_applied: restored.len(),
-                        files_modified: restored,
-                        modified_contents: None,
-                        original_contents: None,
-                        error: Some(format!("Partial undo (cursor left in undone state): {}", errors.join("; "))),
-                    });
-                }
-                Ok(EditResult {
-                    success: true,
-                    changes_applied: restored.len(),
-                    files_modified: restored,
-                    modified_contents: None,
-                    original_contents: None,
-                    error: None,
-                })
-            }
-            Some(EditCommand::RollbackPoint { .. }) | None => Ok(EditResult {
-                success: false,
-                changes_applied: 0,
-                files_modified: vec![],
-                modified_contents: None,
-                original_contents: None,
-                error: Some("No edit to undo".to_string()),
-            }),
-        }
-    }
-
-    /// Redo last undone edit
-    pub async fn redo(&self) -> Result<EditResult> {
-        let mut history = self.history.lock().await;
-        match history.redo() {
-            Some(EditCommand::Edit { file_path, .. }) => Ok(EditResult {
-                success: true,
-                changes_applied: 1,
-                files_modified: vec![file_path.clone()],
-                modified_contents: None,
-                original_contents: None,
-                error: None,
-            }),
-            Some(EditCommand::Rename { modified_contents, original_contents, .. }) => {
-                // Re-apply the exact post-rename content for each file.
-                // Uses modified_contents (the precise result of replace_near_definitions)
-                // rather than re-running replace_whole_word which could corrupt
-                // comments, strings, or unrelated same-name tokens.
-                // All-or-nothing semantics: on any I/O failure, rollback to originals.
-                let mut re_applied = Vec::new();
-                let mut failed = None;
-                for (file_path, post_rename_content) in modified_contents {
-                    match std::fs::write(&file_path, post_rename_content.as_bytes()) {
-                        Ok(()) => re_applied.push(PathBuf::from(file_path)),
-                        Err(e) => { failed = Some(e); break; }
-                    }
-                }
-
-                if let Some(_) = failed {
-                    // Rollback: restore all successfully written files to their pre-redo state
-                    // (original_contents holds the pre-rename content, which is the undone state)
-                    for (fp, content) in original_contents {
-                        let _ = std::fs::write(&fp, content.as_bytes());
-                    }
-                    return Ok(EditResult {
-                        success: false,
-                        changes_applied: 0,
-                        files_modified: vec![],
-                        modified_contents: None,
-                        original_contents: None,
-                        error: Some("Redo failed: I/O error during rename re-application, rolled back".to_string()),
-                    });
-                }
-
-                Ok(EditResult {
-                    success: true,
-                    changes_applied: re_applied.len(),
-                    files_modified: re_applied,
-                    modified_contents: None,
-                    original_contents: None,
-                    error: None,
-                })
-            }
-            Some(_) | None => Ok(EditResult {
-                success: false,
-                changes_applied: 0,
-                files_modified: vec![],
-                modified_contents: None,
-                original_contents: None,
-                error: Some("No edit to redo".to_string()),
-            }),
-        }
-    }
-
-    /// Create a rollback point
-    pub async fn create_rollback_point(&self, name: String) -> Result<()> {
-        let mut history = self.history.lock().await;
-        history.create_rollback_point(name);
-        Ok(())
-    }
-
-    /// Rollback to a named point
-    pub async fn rollback(&self, name: &str) -> Result<EditResult> {
-        let mut history = self.history.lock().await;
-        match history.rollback(name) {
-            Some(_) => Ok(EditResult {
-                success: true,
-                changes_applied: 1,
-                files_modified: vec![],
-                modified_contents: None,
-                original_contents: None,
-                error: None,
-            }),
-            None => Ok(EditResult {
-                success: false,
-                changes_applied: 0,
-                files_modified: vec![],
-                modified_contents: None,
-                original_contents: None,
-                error: Some(format!("Rollback point '{}' not found", name)),
-            }),
-        }
-    }
-
-    /// Get current history state
-    pub async fn history_state(&self) -> (usize, usize) {
-        let history = self.history.lock().await;
-        (history.current_index(), history.len())
-    }
-}
-
-/// Worktree manager for isolated edit sessions
-pub struct WorktreeManager {
-    /// Base path for worktree directories
-    pub base_path: PathBuf,
-}
-
-impl WorktreeManager {
-    /// Create a new worktree manager
-    pub fn new() -> Self {
-        Self {
-            base_path: PathBuf::from("/tmp/leedit-worktrees"),
-        }
-    }
-
-    /// Create a new worktree session
-    pub async fn create_session(
-        &self,
-        _project_id: &UniqueProjectId,
-        session_name: &str,
-    ) -> Result<WorktreeSession> {
-        std::fs::create_dir_all(&self.base_path)
-            .map_err(|e| EditError::WorktreeError(format!(
-                "Failed to create worktree base '{}': {}",
-                self.base_path.display(),
-                e
-            )))?;
-
-        let mut session_dir = None;
-        for attempt in 0..16 {
-            let candidate = self.base_path.join(format!(
-                "{}-{}-{}-{}",
-                sanitize_session_component(session_name),
-                chrono::Utc::now().timestamp_millis(),
-                std::process::id(),
-                attempt
-            ));
-            match std::fs::create_dir(&candidate) {
-                Ok(()) => {
-                    session_dir = Some(candidate);
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => {
-                    return Err(EditError::WorktreeError(format!(
-                        "Failed to create session worktree '{}': {}",
-                        candidate.display(),
-                        e
-                    )));
-                }
-            }
-        }
-        let session_dir = session_dir.ok_or_else(|| {
-            EditError::WorktreeError("Failed to allocate unique session worktree".to_string())
-        })?;
-
-        Ok(WorktreeSession {
-            path: session_dir,
-            tracked_files: HashMap::new(),
-        })
-    }
-
-    /// Clean up old worktrees older than the specified duration.
-    ///
-    /// Scans the base worktree directory for session directories that were
-    /// created more than `older_than` ago and removes them. Each session
-    /// directory name includes a timestamp suffix for this purpose.
-    ///
-    /// Returns the number of worktree directories removed.
-    pub async fn cleanup_old(&self, older_than: chrono::Duration) -> Result<usize> {
-        if !self.base_path.exists() {
-            return Ok(0);
-        }
-
-        let cutoff_time = chrono::Utc::now() - older_than;
-        let mut removed_count = 0;
-
-        let entries = std::fs::read_dir(&self.base_path).map_err(|e| {
-            EditError::WorktreeError(format!(
-                "Failed to read worktree base directory '{}': {}",
-                self.base_path.display(),
-                e
-            ))
-        })?;
-
-        for entry in entries {
-            let entry = entry.map_err(|e| {
-                EditError::WorktreeError(format!(
-                    "Failed to read worktree directory entry: {}",
-                    e
-                ))
-            })?;
-
-            let path = entry.path();
-
-            // Only process directories that look like session directories
-            // (they contain timestamp suffixes)
-            if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    // Session names end with timestamp-pid: prefix-1234567890123-1234
-                    // Validate all three parts before treating as a session directory
-                    // Session names: {prefix}-{timestamp_millis}-{pid}-{attempt}
-                    // Use rsplitn to extract the numeric segments from the right
-                    let mut parts = name.rsplitn(4, '-');
-                    let attempt_part = parts.next();
-                    let pid_part = parts.next();
-                    let ts_part = parts.next();
-                    let prefix_part = parts.next();
-                    if let (Some(_attempt_str), Some(pid_str), Some(timestamp_str), Some(_prefix)) =
-                        (attempt_part, pid_part, ts_part, prefix_part)
-                    {
-                        if _attempt_str.parse::<u32>().is_ok()
-                            && pid_str.parse::<u32>().is_ok()
-                            && timestamp_str.parse::<i64>().is_ok()
-                        {
-                            let timestamp_millis = timestamp_str.parse::<i64>().unwrap();
-                            let session_time = chrono::DateTime::<chrono::Utc>::from_timestamp(
-                                timestamp_millis / 1000,
-                                ((timestamp_millis % 1000) * 1_000_000) as u32,
-                            );
-
-                            if let Some(session_time) = session_time {
-                                if session_time < cutoff_time {
-                                    // Remove the old worktree directory
-                                    match std::fs::remove_dir_all(&path) {
-                                        Ok(_) => removed_count += 1,
-                                        Err(e) => {
-                                            // Log but don't fail - continue cleaning up others
-                                            tracing::warn!(
-                                                "Failed to remove old worktree '{}': {}",
-                                                path.display(),
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(removed_count)
-    }
-}
-
-/// Active worktree session
-pub struct WorktreeSession {
-    /// Path to the worktree directory
-    pub path: PathBuf,
-
-    /// Mapping from original file path to staged worktree path.
-    tracked_files: HashMap<PathBuf, PathBuf>,
-}
-
-impl WorktreeSession {
-    /// Get the worktree path
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Track a file that was materialized in the worktree.
-    fn track_file(&mut self, original: PathBuf, staged: PathBuf) {
-        self.tracked_files.insert(original, staged);
-    }
-
-    /// Discard the worktree without merging
-    pub async fn discard(self) -> Result<()> {
-        if self.path.exists() {
-            std::fs::remove_dir_all(&self.path).map_err(|e| {
-                EditError::WorktreeError(format!(
-                    "Failed to discard worktree '{}': {}",
-                    self.path.display(),
-                    e
-                ))
-            })?;
-        }
-        Ok(())
-    }
-
-    /// Merge worktree changes back to original files and cleanup the worktree.
-    ///
-    /// # Semantics
-    ///
-    /// This uses **best-effort compensating rollback** on failure, not true
-    /// transactional atomicity. Specifically:
-    ///
-    /// 1. Original files are backed up in memory before any writes
-    /// 2. Staged files are merged in sorted order
-    /// 3. On write failure, previous backups are restored to their original state
-    /// 4. The worktree is cleaned up on success
-    ///
-    /// # Limitations
-    ///
-    /// - Backups are in-memory only (lost if process crashes mid-merge)
-    /// - No file-level locking (concurrent writes can cause conflicts)
-    /// - Rollback is best-effort (individual restoration failures are ignored)
-    /// - Not atomic across all files (files are written one at a time)
-    ///
-    /// For true transactional semantics, use git worktrees or a proper transaction
-    /// coordinator. This implementation provides reasonable isolation for editing
-    /// sessions but cannot guarantee full atomicity.
-    pub async fn merge(self) -> Result<()> {
-        // Spawn blocking since merge performs synchronous file I/O
-        tokio::task::spawn_blocking(move || Self::merge_blocking(self))
-            .await
-            .map_err(|e| EditError::WorktreeError(format!("Merge task panicked: {}", e)))?
-    }
-
-    /// Synchronous merge implementation — performs file I/O.
-    /// Separated from the async wrapper to avoid blocking the executor.
-    fn merge_blocking(
-        session: WorktreeSession,
-    ) -> Result<()> {
-        let WorktreeSession {
-            path,
-            tracked_files,
-        } = session;
-
-        let mut staged_entries: Vec<(PathBuf, PathBuf)> = tracked_files.into_iter().collect();
-        staged_entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-        // Phase 1 (prepare): read all staged files, back up originals, create dirs.
-        // If any prepare step fails, nothing has been written yet — just return the error.
-        let mut backups: Vec<(PathBuf, bool, Option<String>)> = Vec::new();
-        // TODO: The two-phase approach reads all staged content into memory for
-        // rollback safety. For projects with very large files, consider a streaming
-        // approach with temp-file renames for atomicity without full buffering.
-        let mut prepared: Vec<(PathBuf, String)> = Vec::new(); // (original, staged_content)
-
-        for (original, staged) in &staged_entries {
-            let file_existed = original.exists();
-            let backup = if file_existed {
-                Some(std::fs::read_to_string(original).map_err(|e| {
-                    EditError::WorktreeError(format!(
-                        "Failed to back up original file '{}': {}",
-                        original.display(),
-                        e
-                    ))
-                })?)
-            } else {
-                None
-            };
-            backups.push((original.clone(), file_existed, backup));
-
-            let content = std::fs::read_to_string(staged).map_err(|e| {
-                EditError::WorktreeError(format!(
-                    "Failed to read staged file '{}': {}",
-                    staged.display(),
-                    e
-                ))
-            })?;
-
-            if let Some(parent) = original.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    EditError::WorktreeError(format!(
-                        "Failed to create destination directory '{}': {}",
-                        parent.display(),
-                        e
-                    ))
-                })?;
-            }
-
-            prepared.push((original.clone(), content));
-        }
-
-        // Phase 2 (write): apply all prepared writes. On failure, roll back everything.
-        let mut written: usize = 0;
-        for (original, content) in &prepared {
-            if let Err(e) = std::fs::write(original, content.as_bytes()) {
-                // Roll back all previously written files AND the failed file
-                for (backup_path, file_existed, backup_content) in backups.iter().take(written + 1).rev() {
-                    if !file_existed {
-                        let _ = std::fs::remove_file(backup_path);
-                    } else if let Some(previous) = backup_content {
-                        if let Err(restore_err) = std::fs::write(backup_path, previous.as_bytes()) {
-                            tracing::error!(
-                                "CRITICAL: Failed to restore '{}' during rollback: {}",
-                                backup_path.display(),
-                                restore_err
-                            );
-                        }
-                    }
-                }
-                return Err(EditError::WorktreeError(format!(
-                    "Failed to merge staged file into '{}': {}",
-                    original.display(),
-                    e
-                )));
-            }
-            written += 1;
-        }
-
-        if path.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&path) {
-                // Post-commit cleanup failure — log but don't fail the merge
-                tracing::warn!(
-                    "Failed to clean up worktree '{}': {}",
-                    path.display(),
-                    e
-                );
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Edit history with command pattern
-#[derive(Debug)]
-pub struct EditHistory {
-    /// List of recorded edit commands
-    pub commands: Vec<EditCommand>,
-
-    /// Current position in the command history
-    pub current_index: usize,
-
-    /// Named rollback points mapping to command indices
-    pub rollback_points: HashMap<String, usize>,
-}
-
-impl EditHistory {
-    /// Create a new empty history
-    pub fn new() -> Self {
-        Self {
-            commands: Vec::new(),
-            current_index: 0,
-            rollback_points: HashMap::new(),
-        }
-    }
-
-    /// Record a command
-    pub fn record_command(&mut self, command: EditCommand) {
-        // Remove any commands after current index (redo stack)
-        self.commands.truncate(self.current_index);
-        self.commands.push(command);
-        self.current_index += 1;
-    }
-
-    /// Undo last command
-    pub fn undo(&mut self) -> Option<&EditCommand> {
-        if self.current_index == 0 {
-            return None;
-        }
-        self.current_index -= 1;
-        self.commands.get(self.current_index)
-    }
-
-    /// Redo last undone command
-    pub fn redo(&mut self) -> Option<&EditCommand> {
-        if self.current_index >= self.commands.len() {
-            return None;
-        }
-        let command = self.commands.get(self.current_index)?;
-        self.current_index += 1;
-        Some(command)
-    }
-
-    /// Create a rollback point
-    pub fn create_rollback_point(&mut self, name: String) {
-        self.rollback_points.insert(name, self.current_index);
-    }
-
-    /// Rollback to a named point
-    pub fn rollback(&mut self, name: &str) -> Option<&EditCommand> {
-        let index = self.rollback_points.get(name)?;
-        self.current_index = *index;
-        self.commands.get(self.current_index)
-    }
-
-    /// Get current index
-    pub fn current_index(&self) -> usize {
-        self.current_index
-    }
-
-    /// Get history length
-    pub fn len(&self) -> usize {
-        self.commands.len()
-    }
-
-    /// Check if history is empty
-    pub fn is_empty(&self) -> bool {
-        self.commands.is_empty()
-    }
-
-    /// Get all commands
-    pub fn commands(&self) -> &[EditCommand] {
-        &self.commands
-    }
-}
-
-impl Default for EditHistory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Edit command for history
-#[derive(Debug, Clone)]
-pub enum EditCommand {
-    /// Standard edit operation
-    Edit {
-        /// Project identifier
-        project_id: UniqueProjectId,
-
-        /// File path to edit
-        file_path: PathBuf,
-
-        /// Changes to apply
-        changes: Vec<EditChange>,
-
-        /// Timestamp of the edit operation
-        timestamp: chrono::DateTime<chrono::Utc>,
-
-        /// Original file content before the edit (for undo).
-            original_content: Option<String>,
-    },
-
-    /// Multi-file rename operation with full rollback support.
-    /// Original and modified contents of all files are captured for precise
-    /// undo (restore originals) and redo (restore modifieds).
-    Rename {
-        /// Project identifier
-        project_id: UniqueProjectId,
-
-        /// Old symbol name
-        old_name: String,
-
-        /// New symbol name
-        new_name: String,
-
-        /// Timestamp of the rename operation
-        timestamp: chrono::DateTime<chrono::Utc>,
-
-        /// Map of file path → original content before rename (for undo)
-        original_contents: HashMap<String, String>,
-
-        /// Map of file path → content after rename (for redo).
-        /// Stored as the exact post-rename content so redo restores the precise
-        /// result of `replace_near_definitions` rather than re-running
-        /// `replace_whole_word` which could corrupt comments/strings.
-        modified_contents: HashMap<String, String>,
-    },
-
-    /// Rollback point
-    RollbackPoint {
-        /// Name of the rollback point
-        name: String,
-
-        /// Timestamp of the rollback operation
-        timestamp: chrono::DateTime<chrono::Utc>,
-    },
-}
-
-/// AST refactoring operations
-pub struct Refactor;
-
-impl Refactor {
-    /// Rename a symbol across all files using PDG-guided file discovery and whole-word replacement.
-    ///
-    /// This operates directly on project source files (not through WorktreeManager)
-    /// because renames are PDG-scoped global operations that must touch all impacted
-    /// files atomically. WorktreeManager is designed for single-file edit sessions
-    /// with review/discard workflow. A future enhancement could add a staging mode
-    /// where rename results are written to a worktree for review before merging.
-    ///
-    /// Note: This function performs synchronous file I/O. It uses
-    /// `tokio::task::block_in_place` to avoid blocking the executor in
-    /// multi-threaded contexts.
-    ///
-    /// # Implementation Details
-    ///
-    /// This is **NOT** a full AST/reference-aware rename. It uses a hybrid approach:
-    ///
-    /// 1. **File discovery via PDG**: Uses `pdg.find_by_symbol()` and `pdg.find_all_by_name()`
-    ///    to discover which files contain nodes matching `old_name`
-    ///
-    /// 2. **Whole-word replacement**: Within each discovered file, applies `replace_whole_word()`
-    ///    which replaces occurrences bounded by word boundaries (alphanumeric or underscore)
-    ///
-    /// # Limitations
-    ///
-    /// - Does NOT parse AST or resolve semantic references
-    /// - Does NOT distinguish between type names, variable names, or string literals
-    /// - May rename occurrences in comments, strings, or documentation
-    /// - Does NOT handle language-specific scoping or namespacing
-    /// - Relies on PDG symbol names which may not capture all references
-    ///
-    /// # Future Work
-    ///
-    /// For true AST/reference-aware rename, this should be replaced with:
-    /// - Language-specific tree-sitter queries for semantic rename
-    /// - Or LSP-based rename operations (if language server is available)
-    /// - The upstream-first policy requires implementing this in LeIndex first
-    ///
-    /// # Returns
-    ///
-    /// Count of files modified and list of modified file paths.
-    pub async fn rename_symbol(
-        engine: &EditEngine,
-        old_name: &str,
-        new_name: &str,
-    ) -> Result<EditResult> {
-        if old_name.is_empty() || new_name.is_empty() {
-            return Ok(EditResult {
-                success: false,
-                changes_applied: 0,
-                files_modified: vec![],
-                modified_contents: None,
-                original_contents: None,
-                error: Some("old_name and new_name must be non-empty".to_string()),
-            });
-        }
-        if old_name == new_name {
-            return Ok(EditResult {
-                success: true,
-                changes_applied: 0,
-                files_modified: vec![],
-                modified_contents: None,
-                original_contents: None,
-                error: None,
-            });
-        }
-
-        // Clone Arc and strings for the blocking closure
-        let pdg = Arc::clone(&engine.pdg);
-        let old_name_c = old_name.to_owned();
-        let new_name_c = new_name.to_owned();
-
-        let result = tokio::task::spawn_blocking(move || {
-            Self::rename_symbol_blocking(&pdg, &old_name_c, &new_name_c)
-        })
-        .await
-        .map_err(|e| EditError::WorktreeError(format!("Rename task panicked: {}", e)))??;
-
-        // Record in edit history for undo support.
-        if result.success {
-            if let (Some(ref originals), Some(ref modifieds)) = (&result.original_contents, &result.modified_contents) {
-                let mut history = engine.history.lock().await;
-                history.record_command(EditCommand::Rename {
-                    project_id: UniqueProjectId::new("_rename".to_string(), "".to_string(), 0),
-                    old_name: old_name.to_owned(),
-                    new_name: new_name.to_owned(),
-                    timestamp: chrono::Utc::now(),
-                    original_contents: originals.clone(),
-                    modified_contents: modifieds.clone(),
-                });
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// Synchronous rename implementation — runs on blocking thread pool.
-    fn rename_symbol_blocking(
-        pdg: &PDG,
-        old_name: &str,
-        new_name: &str,
-    ) -> Result<EditResult> {
-
-        // 1. Resolve the PDG symbol candidates and prefer exact symbol hits.
-        let node_ids = pdg.find_all_by_name(old_name);
-        let exact_node = pdg.find_by_symbol(old_name);
-
-        // Collect files containing the symbol definition AND all files that
-        // reference it (call sites, type usages) via PDG forward/backward edges.
-        let mut files: HashSet<PathBuf> = HashSet::new();
-
-        // Use exhaustive traversal for rename — missing any reference would break the build.
-        // High limits ensure completeness for real projects; a post-traversal check warns
-        // if the limit was hit.
-        //
-        // Both forward and backward traversals use the same config:
-        // - Forward: things the symbol depends on (callees, used types) — may contain
-        //   same-name references in those files
-        // - Backward: callers and dependents of the symbol — the primary rename targets
-        // Call edges are caller→callee, so backward_impact reaches callers.
-        let max_nodes_limit = 1_000_000;
-        let traversal_config = crate::graph::pdg::TraversalConfig {
-            max_depth: Some(1000),
-            max_nodes: Some(max_nodes_limit),
-            allowed_edge_types: Some(vec![
-                crate::graph::pdg::EdgeType::Call,
-                crate::graph::pdg::EdgeType::DataDependency,
-                crate::graph::pdg::EdgeType::Inheritance,
-            ]),
-            excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
-            min_complexity: None,
-            min_edge_confidence: 0.0,
-        };
-
-        // Collect all matching seed node IDs
-        let mut seed_ids: Vec<_> = node_ids;
-        if let Some(exact) = exact_node {
-            if !seed_ids.contains(&exact) {
-                seed_ids.push(exact);
-            }
-        }
-
-        let mut hit_node_limit = false;
-        // Collect byte ranges from impact traversal for targeted replacements
-        let mut impact_ranges: std::collections::HashMap<String, Vec<(usize, usize)>> = std::collections::HashMap::new();
-
-        // For each seed, collect definition file + forward/backward impact files
-        for node_id in &seed_ids {
-            if let Some(node) = pdg.get_node(*node_id) {
-                if node.node_type != crate::graph::pdg::NodeType::External
-                {
-                    files.insert(PathBuf::from(&node.file_path));
-
-                    // Add files that reference this symbol via PDG edges
-                    let impacted = pdg.forward_impact(*node_id, &traversal_config);
-                    hit_node_limit |= impacted.len() >= max_nodes_limit;
-                    for imp_id in impacted {
-                        if let Some(imp_node) = pdg.get_node(imp_id) {
-                            if imp_node.node_type != crate::graph::pdg::NodeType::External
-                            {
-                                files.insert(PathBuf::from(&imp_node.file_path));
-                                // Collect byte ranges from impact nodes
-                                if imp_node.byte_range != (0, 0) {
-                                    impact_ranges.entry(imp_node.file_path.clone()).or_default().push(imp_node.byte_range);
-                                }
-                            }
-                        }
-                    }
-                    let backward = pdg.backward_impact(*node_id, &traversal_config);
-                    hit_node_limit |= backward.len() >= max_nodes_limit;
-                    for back_id in backward {
-                        if let Some(back_node) = pdg.get_node(back_id) {
-                            if back_node.node_type != crate::graph::pdg::NodeType::External
-                            {
-                                files.insert(PathBuf::from(&back_node.file_path));
-                                // Collect byte ranges from impact nodes
-                                if back_node.byte_range != (0, 0) {
-                                    impact_ranges.entry(back_node.file_path.clone()).or_default().push(back_node.byte_range);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if files.is_empty() {
-            return Ok(EditResult {
-                success: false,
-                changes_applied: 0,
-                files_modified: vec![],
-                modified_contents: None,
-                original_contents: None,
-                error: Some(format!(
-                    "Symbol '{}' was not found in project sources",
-                    old_name
-                )),
-            });
-        }
-
-        // Warn if the traversal hit the node limit — some references may have been missed
-        let mut truncation_warning = None;
-        if hit_node_limit {
-            truncation_warning = Some(format!(
-                "Warning: rename traversal hit the node limit ({}). Some references may be missing — verify manually.",
-                max_nodes_limit
-            ));
-            tracing::warn!("{}", truncation_warning.as_ref().unwrap());
-        }
-
-        // 4. Apply replace_whole_word to each file (two-phase: collect then write)
-        // Sort files for deterministic processing order
-        let mut sorted_files: Vec<_> = files.into_iter().collect();
-        sorted_files.sort();
-
-        let mut total_changes = 0usize;
-        let mut modified_files: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, modified)
-        let mut errors = Vec::new();
-
-        // Phase 1: collect all modifications (no writes yet)
-        let mut pending_writes: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, modified)
-        // Cache all PDG nodes matching old_name once — avoids redundant lookups per file.
-        // Pre-group by file path for O(Files + Matches) instead of O(Files * Matches).
-        let mut matches_by_file: std::collections::HashMap<String, Vec<(usize, usize)>> = std::collections::HashMap::new();
-        for nid in pdg.find_all_by_name(old_name) {
-            if let Some(node) = pdg.get_node(nid) {
-                if node.byte_range != (0, 0) {
-                    matches_by_file
-                        .entry(node.file_path.clone())
-                        .or_default()
-                        .push(node.byte_range);
-                }
-            }
-        }
-        // Also add seed_ids ranges to the per-file map
-        for node_id in &seed_ids {
-            if let Some(node) = pdg.get_node(*node_id) {
-                if node.byte_range != (0, 0) {
-                    let entry = matches_by_file.entry(node.file_path.clone()).or_default();
-                    if !entry.contains(&node.byte_range) {
-                        entry.push(node.byte_range);
-                    }
-                }
-            }
-        }
-        for file_path in &sorted_files {
-            let original = match std::fs::read_to_string(file_path) {
-                Ok(content) => content,
-                Err(e) => {
-                    errors.push(format!("Failed to read '{}': {}", file_path.display(), e));
-                    continue;
-                }
-            };
-
-            // Look up pre-grouped ranges for this file (includes PDG name matches + traversal impacts)
-            let mut def_ranges: Vec<(usize, usize)> = matches_by_file
-                .get(file_path.to_str().unwrap_or(""))
-                .cloned()
-                .unwrap_or_default();
-            // Also include ranges from traversal impact nodes in this file
-            if let Some(imp_ranges) = impact_ranges.get(file_path.to_str().unwrap_or("")) {
-                for r in imp_ranges {
-                    if !def_ranges.contains(r) {
-                        def_ranges.push(*r);
-                    }
-                }
-            }
-
-            if def_ranges.is_empty() {
-                // No local definition or reference ranges for this file — skip it.
-                // The file was reached via PDG traversal but may not contain the symbol.
-                // Whole-file replacement would risk corrupting unrelated same-name tokens.
-                continue;
-            }
-
-            // Targeted replacement: only replace within expanded windows around definitions
-            let modified = replace_near_definitions(&original, old_name, new_name, &def_ranges);
-            if modified != original {
-                pending_writes.push((file_path.clone(), original, modified));
-            }
-        }
-
-        // If discovery/read failed for any candidate, do not write anything (all-or-nothing).
-        if !errors.is_empty() {
-            return Ok(EditResult {
-                success: false,
-                changes_applied: 0,
-                files_modified: vec![],
-                modified_contents: None,
-                original_contents: None,
-                error: Some(errors.join("; ")),
-            });
-        }
-
-        // Phase 2: write all files, rollback on failure
-        for (file_path, original_content, modified) in &pending_writes {
-            match std::fs::write(file_path, modified.as_bytes()) {
-                Ok(()) => {
-                    total_changes += 1;
-                    modified_files.push((file_path.clone(), original_content.clone(), modified.clone()));
-                }
-                Err(e) => {
-                    errors.push(format!("Failed to write '{}': {}", file_path.display(), e));
-                    // Restore the failed file first — write() may have truncated it
-                    if let Err(restore_err) = std::fs::write(file_path, original_content.as_bytes()) {
-                        tracing::error!(
-                            "CRITICAL: Failed to restore failed file '{}' during rollback: {}",
-                            file_path.display(),
-                            restore_err
-                        );
-                    }
-                    // Rollback all previously written files
-                    for (prev_path, prev_original, _prev_modified) in &modified_files {
-                        if let Err(restore_err) = std::fs::write(prev_path, prev_original.as_bytes()) {
-                            tracing::error!(
-                                "CRITICAL: Failed to restore '{}' during rollback: {}",
-                                prev_path.display(),
-                                restore_err
-                            );
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
-        if !errors.is_empty() {
-            // Rollback was already performed in the loop — return clean zero metrics
-            return Ok(EditResult {
-                success: false,
-                changes_applied: 0,
-                files_modified: vec![],
-                modified_contents: None,
-                original_contents: None,
-                error: Some(errors.join("; ")),
-            });
-        }
-
-        Ok(EditResult {
-            success: errors.is_empty(),
-            changes_applied: total_changes,
-            files_modified: modified_files.iter().map(|(p, _, _)| p.clone()).collect(),
-            modified_contents: Some(
-                modified_files.iter().map(|(p, _, modified)| (p.display().to_string(), modified.clone())).collect()
-            ),
-            original_contents: Some(
-                modified_files.into_iter().map(|(p, orig, _)| (p.display().to_string(), orig)).collect()
-            ),
-            error: match (errors.is_empty(), &truncation_warning) {
-                (true, None) => None,
-                (true, Some(w)) => Some(w.clone()),
-                (false, _) => Some(errors.join("; ")),
-            },
-        })
-    }
-
-    /// Extract a function from selected code
-    pub async fn extract_function(
-        _engine: &EditEngine,
-        _file_path: &Path,
-        _selection: (usize, usize),
-        _function_name: &str,
-    ) -> Result<EditResult> {
-        // In full implementation:
-        // 1. Parse file with tree-sitter
-        // 2. Extract selected nodes
-        // 3. Create function definition
-        // 4. Replace selection with call
-        // 5. Update PDG
-
-        Ok(EditResult {
-            success: true,
-            changes_applied: 1,
-            files_modified: vec![],
-            modified_contents: None,
-            original_contents: None,
-            error: None,
-        })
-    }
-
-    /// Inline a variable
-    pub async fn inline_variable(
-        _engine: &EditEngine,
-        _file_path: &Path,
-        _variable_name: &str,
-    ) -> Result<EditResult> {
-        // In full implementation:
-        // 1. Find variable definition
-        // 2. Find all usages
-        // 3. Replace usages with value
-        // 4. Remove definition
-        // 5. Update PDG
-
-        Ok(EditResult {
-            success: true,
-            changes_applied: 1,
-            files_modified: vec![],
-            modified_contents: None,
-            original_contents: None,
-            error: None,
-        })
-    }
-}
-
-/// Diff generation utilities
-pub struct Diff;
-
-impl Diff {
-    /// Generate a unified diff
-    pub fn generate_unified_diff(
-        original: &str,
-        modified: &str,
-        file_path: &Path,
-    ) -> Result<String> {
-        EditEngine::format_unified_diff(original, modified, file_path)
-    }
-
-    /// Generate a split unified diff tuple (left header, right header + body).
-    ///
-    /// Despite the name, this returns a pair of strings representing the `---` and
-    /// `+++` sides of a unified diff (not a true side-by-side layout). The first
-    /// element is the `--- {file_path}` header; the second is `+++ {file_path}`
-    /// followed by the diff body lines.
-    pub fn generate_side_by_side_diff(
-        original: &str,
-        modified: &str,
-        file_path: &Path,
-    ) -> Result<(String, String)> {
-        let patch = diffy::create_patch(original, modified);
-        let patch_str = patch.to_string();
-        if patch_str.is_empty() {
-            Ok((format!("{} (unchanged)", file_path.display()), String::new()))
-        } else {
-            // diffy's output already contains ---/+++ headers with generic labels;
-            // replace them with the actual file path
-            let lines: Vec<&str> = patch_str.lines().collect();
-            let body = lines.iter().skip(2).cloned().collect::<Vec<_>>().join("\n");
-            Ok((
-                format!("--- {}", file_path.display()),
-                format!("+++ {}\n{}", file_path.display(), body),
-            ))
-        }
-    }
-}
-
-/// Impact analysis utilities
-pub struct Impact;
-
-impl Impact {
-    /// Analyze forward impact (what depends on this change)
-    ///
-    /// Uses PDG forward traversal from all nodes matching `symbol` to find
-    /// downstream dependents. Returns `file:symbol` strings for each impacted node.
-    /// Excludes external nodes from traversal.
-    pub fn analyze_forward_impact(pdg: &PDG, symbol: &str) -> Result<Vec<String>> {
-        let node_ids = pdg.find_all_by_name(symbol);
-        if node_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let config = crate::graph::pdg::TraversalConfig {
-            max_depth: Some(5),
-            max_nodes: Some(150),
-            allowed_edge_types: Some(vec![
-                crate::graph::pdg::EdgeType::Call,
-                crate::graph::pdg::EdgeType::DataDependency,
-                crate::graph::pdg::EdgeType::Inheritance,
-            ]),
-            excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
-            min_complexity: None,
-            min_edge_confidence: 0.0,
-        };
-
-        let mut impacted: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        for &start_id in &node_ids {
-            let forward = pdg.forward_impact(start_id, &config);
-            for nid in forward {
-                if seen.insert(nid) {
-                    if let Some(node) = pdg.get_node(nid) {
-                        impacted.push(format!("{}:{}", node.file_path, node.name));
-                    }
-                }
-            }
-        }
-
-        Ok(impacted)
-    }
-
-    /// Analyze backward impact (what this change depends on)
-    ///
-    /// Uses PDG backward traversal from all nodes matching `symbol` to find
-    /// upstream dependencies. Returns `file:symbol` strings for each dependency.
-    /// Excludes external nodes from traversal.
-    pub fn analyze_backward_impact(pdg: &PDG, symbol: &str) -> Result<Vec<String>> {
-        let node_ids = pdg.find_all_by_name(symbol);
-        if node_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let config = crate::graph::pdg::TraversalConfig {
-            max_depth: Some(5),
-            max_nodes: Some(150),
-            allowed_edge_types: Some(vec![
-                crate::graph::pdg::EdgeType::Call,
-                crate::graph::pdg::EdgeType::DataDependency,
-                crate::graph::pdg::EdgeType::Inheritance,
-            ]),
-            excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
-            min_complexity: None,
-            min_edge_confidence: 0.0,
-        };
-
-        let mut impacted: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-
-        for &start_id in &node_ids {
-            let backward = pdg.backward_impact(start_id, &config);
-            for nid in backward {
-                if seen.insert(nid) {
-                    if let Some(node) = pdg.get_node(nid) {
-                        impacted.push(format!("{}:{}", node.file_path, node.name));
-                    }
-                }
-            }
-        }
-
-        Ok(impacted)
-    }
-}
+// Public API re-exports from command module
+pub use command::{
+    EditChange, EditCommand, EditPreview, EditRequest, EditResult, ImpactAnalysis, RiskLevel,
+};
+
+// Public API re-exports from engine module
+pub use engine::{
+    Diff, EditEngine, EditError, Impact, WorktreeManager, WorktreeSession, replace_near_definitions,
+    replace_whole_word, Result,
+};
+
+// Public API re-exports from history module
+pub use history::EditHistory;
+
+// Public API re-exports from refactor module
+pub use refactor::Refactor;
 
 // =========================================================================
 // Tests
@@ -1926,7 +67,7 @@ mod tests {
     #[test]
     fn test_edit_request_creation() {
         let project_id = make_test_id();
-        let file_path = PathBuf::from("test.py");
+        let file_path = std::path::PathBuf::from("test.py");
         let changes = vec![EditChange::ReplaceText {
             start: 0,
             end: 10,
@@ -2009,7 +150,7 @@ mod tests {
         let project_id = make_test_id();
         let command = EditCommand::Edit {
             project_id,
-            file_path: PathBuf::from("test.py"),
+            file_path: std::path::PathBuf::from("test.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
             original_content: None,
@@ -2027,7 +168,7 @@ mod tests {
         let project_id = make_test_id();
         let command = EditCommand::Edit {
             project_id,
-            file_path: PathBuf::from("test.py"),
+            file_path: std::path::PathBuf::from("test.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
             original_content: None,
@@ -2053,7 +194,7 @@ mod tests {
         let project_id = make_test_id();
         let command = EditCommand::Edit {
             project_id,
-            file_path: PathBuf::from("test.py"),
+            file_path: std::path::PathBuf::from("test.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
             original_content: None,
@@ -2083,7 +224,7 @@ mod tests {
         for i in 0..3 {
             let command = EditCommand::Edit {
                 project_id: project_id.clone(),
-                file_path: PathBuf::from(format!("test{}.py", i)),
+                file_path: std::path::PathBuf::from(format!("test{}.py", i)),
                 changes: vec![],
                 timestamp: chrono::Utc::now(),
                 original_content: None,
@@ -2098,7 +239,7 @@ mod tests {
         // Add more commands
         let command = EditCommand::Edit {
             project_id: project_id.clone(),
-            file_path: PathBuf::from("test3.py"),
+            file_path: std::path::PathBuf::from("test3.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
             original_content: None,
@@ -2127,7 +268,7 @@ mod tests {
         for i in 0..3 {
             let command = EditCommand::Edit {
                 project_id: project_id.clone(),
-                file_path: PathBuf::from(format!("test{}.py", i)),
+                file_path: std::path::PathBuf::from(format!("test{}.py", i)),
                 changes: vec![],
                 timestamp: chrono::Utc::now(),
                 original_content: None,
@@ -2143,7 +284,7 @@ mod tests {
         // Add a new command - should clear redo stack
         let command = EditCommand::Edit {
             project_id: project_id.clone(),
-            file_path: PathBuf::from("new.py"),
+            file_path: std::path::PathBuf::from("new.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
             original_content: None,
@@ -2157,7 +298,7 @@ mod tests {
     #[test]
     fn test_worktree_manager_new() {
         let manager = WorktreeManager::new();
-        assert_eq!(manager.base_path, PathBuf::from("/tmp/leedit-worktrees"));
+        assert_eq!(manager.base_path, std::path::PathBuf::from("/tmp/leedit-worktrees"));
     }
 
     #[test]
@@ -2212,7 +353,7 @@ mod tests {
         let result = EditResult {
             success: true,
             changes_applied: 5,
-            files_modified: vec![PathBuf::from("test.py")],
+            files_modified: vec![std::path::PathBuf::from("test.py")],
             modified_contents: None,
             original_contents: None,
             error: None,
@@ -2225,8 +366,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_engine_creation() {
-        let pdg = Arc::new(create_test_pdg());
-        let storage = Arc::new(make_test_storage());
+        let pdg = std::sync::Arc::new(create_test_pdg());
+        let storage = std::sync::Arc::new(make_test_storage());
 
         let engine = EditEngine::new(pdg, storage);
         assert!(engine.is_ok());
@@ -2238,8 +379,8 @@ mod tests {
         let file_path = dir.path().join("test.py");
         std::fs::write(&file_path, b"hello world").expect("write test file");
 
-        let pdg = Arc::new(create_test_pdg());
-        let storage = Arc::new(make_test_storage());
+        let pdg = std::sync::Arc::new(create_test_pdg());
+        let storage = std::sync::Arc::new(make_test_storage());
         let engine = EditEngine::new(pdg, storage).unwrap();
 
         let project_id = make_test_id();
@@ -2270,8 +411,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_engine_history_state() {
-        let pdg = Arc::new(create_test_pdg());
-        let storage = Arc::new(make_test_storage());
+        let pdg = std::sync::Arc::new(create_test_pdg());
+        let storage = std::sync::Arc::new(make_test_storage());
         let engine = EditEngine::new(pdg, storage).unwrap();
 
         let (index, len) = engine.history_state().await;
@@ -2281,8 +422,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_engine_rollback_point() {
-        let pdg = Arc::new(create_test_pdg());
-        let storage = Arc::new(make_test_storage());
+        let pdg = std::sync::Arc::new(create_test_pdg());
+        let storage = std::sync::Arc::new(make_test_storage());
         let engine = EditEngine::new(pdg, storage).unwrap();
 
         let result = engine.create_rollback_point("test_point".to_string()).await;
@@ -2291,8 +432,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_engine_undo_no_history() {
-        let pdg = Arc::new(create_test_pdg());
-        let storage = Arc::new(make_test_storage());
+        let pdg = std::sync::Arc::new(create_test_pdg());
+        let storage = std::sync::Arc::new(make_test_storage());
         let engine = EditEngine::new(pdg, storage).unwrap();
 
         let result = engine.undo().await;
@@ -2304,8 +445,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_engine_redo_no_history() {
-        let pdg = Arc::new(create_test_pdg());
-        let storage = Arc::new(make_test_storage());
+        let pdg = std::sync::Arc::new(create_test_pdg());
+        let storage = std::sync::Arc::new(make_test_storage());
         let engine = EditEngine::new(pdg, storage).unwrap();
 
         let result = engine.redo().await;
@@ -2317,8 +458,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_edit_engine_rollback_nonexistent() {
-        let pdg = Arc::new(create_test_pdg());
-        let storage = Arc::new(make_test_storage());
+        let pdg = std::sync::Arc::new(create_test_pdg());
+        let storage = std::sync::Arc::new(make_test_storage());
         let engine = EditEngine::new(pdg, storage).unwrap();
 
         let result = engine.rollback("nonexistent").await;
@@ -2333,7 +474,7 @@ mod tests {
         let project_id = make_test_id();
         let command = EditCommand::Edit {
             project_id,
-            file_path: PathBuf::from("test.py"),
+            file_path: std::path::PathBuf::from("test.py"),
             changes: vec![],
             timestamp: chrono::Utc::now(),
             original_content: None,
@@ -2354,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_edit_error_display() {
-        let error = EditError::FileNotFound(PathBuf::from("missing.py"));
+        let error = EditError::FileNotFound(std::path::PathBuf::from("missing.py"));
         let msg = format!("{}", error);
         assert!(msg.contains("missing.py"));
     }
@@ -2364,7 +505,7 @@ mod tests {
         let error = EditError::InvalidRange {
             start: 10,
             end: 5,
-            file: PathBuf::from("test.py"),
+            file: std::path::PathBuf::from("test.py"),
         };
         let msg = format!("{}", error);
         assert!(msg.contains("10-5"));
@@ -2415,7 +556,7 @@ mod tests {
         let result = EditResult {
             success: true,
             changes_applied: 1,
-            files_modified: vec![PathBuf::from("test.py")],
+            files_modified: vec![std::path::PathBuf::from("test.py")],
             modified_contents: None,
             original_contents: None,
             error: None,
@@ -2427,8 +568,8 @@ mod tests {
 
     #[test]
     fn test_refactor_rename_symbol() {
-        let pdg = Arc::new(create_test_pdg());
-        let storage = Arc::new(make_test_storage());
+        let pdg = std::sync::Arc::new(create_test_pdg());
+        let storage = std::sync::Arc::new(make_test_storage());
         let engine = EditEngine::new(pdg, storage).unwrap();
 
         // Test that rename compiles
@@ -2444,8 +585,8 @@ mod tests {
 
     #[test]
     fn test_refactor_extract_function() {
-        let pdg = Arc::new(create_test_pdg());
-        let storage = Arc::new(make_test_storage());
+        let pdg = std::sync::Arc::new(create_test_pdg());
+        let storage = std::sync::Arc::new(make_test_storage());
         let engine = EditEngine::new(pdg, storage).unwrap();
 
         // Test that extract compiles
@@ -2453,7 +594,7 @@ mod tests {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(Refactor::extract_function(
                 &engine,
-                Path::new("test.py"),
+                std::path::Path::new("test.py"),
                 (0, 10),
                 "newFunc",
             ))
@@ -2466,8 +607,8 @@ mod tests {
 
     #[test]
     fn test_refactor_inline_variable() {
-        let pdg = Arc::new(create_test_pdg());
-        let storage = Arc::new(make_test_storage());
+        let pdg = std::sync::Arc::new(create_test_pdg());
+        let storage = std::sync::Arc::new(make_test_storage());
         let engine = EditEngine::new(pdg, storage).unwrap();
 
         // Test that inline compiles
@@ -2475,7 +616,7 @@ mod tests {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(Refactor::inline_variable(
                 &engine,
-                Path::new("test.py"),
+                std::path::Path::new("test.py"),
                 "myVar",
             ))
         })
