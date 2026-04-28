@@ -343,6 +343,9 @@ pub struct SearchEngine {
     /// Node ID to index mapping for O(1) node lookups (fixes A1)
     /// Populated during index_nodes() and maintained on updates
     node_id_to_idx: HashMap<String, usize>,
+    /// Per-node token cache: node_id -> set of normalized tokens
+    /// Populated during index_nodes() to avoid re-tokenization in scoring
+    node_tokens: HashMap<String, HashSet<String>>,
     /// Result cache for repeated queries
     search_cache: LruCache<String, Vec<SearchResult>>,
 }
@@ -366,6 +369,7 @@ impl SearchEngine {
             complexity_cache: HashMap::new(),
             text_index: HashMap::new(),
             node_id_to_idx: HashMap::new(),
+            node_tokens: HashMap::new(),
             search_cache: LruCache::new(NonZeroUsize::new(1000).unwrap()),
         }
     }
@@ -404,6 +408,7 @@ impl SearchEngine {
             complexity_cache: HashMap::new(),
             text_index: HashMap::new(),
             node_id_to_idx: HashMap::new(),
+            node_tokens: HashMap::new(),
             search_cache: LruCache::new(NonZeroUsize::new(1000).unwrap()),
         }
     }
@@ -441,10 +446,11 @@ impl SearchEngine {
         self.text_index.clear();
         self.search_cache.clear();
         self.node_id_to_idx.clear();
+        self.node_tokens.clear();
         self.vector_index.clear();
 
         // Build node_id_to_idx for O(1) node lookups (A1 optimization)
-        // Build complexity cache and inverted index before taking ownership
+        // Build complexity cache, inverted index, and token cache before taking ownership
         for (idx, node) in nodes.iter().enumerate() {
             self.node_id_to_idx.insert(node.node_id.clone(), idx);
             self.complexity_cache
@@ -452,16 +458,20 @@ impl SearchEngine {
 
             // Build inverted index for O(1) text lookups
             // This maps each token to the set of node IDs containing it
+            // Also build per-node token cache for scoring (T14 optimization)
+            let mut tokens = HashSet::new();
             for token in node.content.split(|c: char| !c.is_alphanumeric()) {
                 let normalized_token: String = token.to_ascii_lowercase();
                 // Skip empty tokens and very short ones (< 2 chars) to reduce noise
                 if normalized_token.len() >= 2 {
                     self.text_index
-                        .entry(normalized_token)
+                        .entry(normalized_token.clone())
                         .or_default()
                         .insert(node.node_id.clone());
+                    tokens.insert(normalized_token);
                 }
             }
+            self.node_tokens.insert(node.node_id.clone(), tokens);
         }
 
         // Build vector index from embeddings — clone only embeddings (A4 optimization)
@@ -746,14 +756,15 @@ impl SearchEngine {
         Ok(final_results)
     }
 
-    /// Optimized text score calculation using inverted index and pre-computed query data
+    /// Optimized text score calculation using cached node tokens and pre-computed query data
     ///
-    /// Uses the text_index HashMap for O(1) token matching instead of re-tokenizing
-    /// content. Content is cleared after indexing (T13) to save memory.
+    /// Uses the node_tokens HashMap for O(1) token overlap calculation instead of
+    /// iterating over the inverted index per query token. Tokens are cached during
+    /// index_nodes() — no re-tokenization in the scoring hot path.
     ///
     /// # Performance
     ///
-    /// - Time complexity: O(q) where q is number of query tokens (each looked up in O(1) HashMap)
+    /// - Time complexity: O(min(q, t)) where q = query tokens, t = node tokens (set intersection)
     /// - Space complexity: O(1) — no allocations per call
     fn calculate_text_score_optimized(
         &self,
@@ -781,22 +792,22 @@ impl SearchEngine {
             0.0
         };
 
-        // Use inverted index for token matching (content is cleared after indexing — T13)
-        // Count how many query tokens this node contains via the text_index
+        // Use cached node tokens for overlap calculation (T14 optimization)
+        // Tokens were cached during index_nodes() — no re-tokenization needed.
+        // This avoids iterating over each query token and checking the inverted index,
+        // replacing it with a single set intersection on pre-cached per-node tokens.
         let base_score = if precomputed.query_tokens.is_empty() {
             // No meaningful tokens in query
             0.0
-        } else {
-            let mut matching = 0;
-            for token in &precomputed.query_tokens {
-                if let Some(node_ids) = self.text_index.get(token) {
-                    if node_ids.contains(node_id) {
-                        matching += 1;
-                    }
-                }
-            }
-
+        } else if let Some(node_tokens) = self.node_tokens.get(node_id) {
+            // Count overlap between query tokens and cached node tokens
+            let matching = precomputed
+                .query_tokens
+                .intersection(node_tokens)
+                .count();
             matching as f32 / precomputed.query_tokens.len() as f32
+        } else {
+            0.0
         };
 
         ((base_score + symbol_boost) - test_penalty).clamp(0.0, 1.0)
@@ -1330,5 +1341,91 @@ mod tests {
             engine.text_index.contains_key("func2"),
             "text_index should contain 'func2' token"
         );
+    }
+
+    #[test]
+    fn test_node_tokens_populated() {
+        // T14: Verify that node_tokens cache is populated during index_nodes()
+        let mut engine = SearchEngine::new();
+        let nodes = create_test_nodes();
+        engine.index_nodes(nodes);
+
+        // node_tokens should have an entry for each node
+        assert_eq!(engine.node_tokens.len(), 2);
+        assert!(engine.node_tokens.contains_key("func1"));
+        assert!(engine.node_tokens.contains_key("func2"));
+
+        // Verify tokens contain expected normalized content
+        let func1_tokens = engine.node_tokens.get("func1").unwrap();
+        assert!(
+            func1_tokens.contains("func1"),
+            "func1 tokens should contain 'func1', got: {:?}",
+            func1_tokens
+        );
+
+        let func2_tokens = engine.node_tokens.get("func2").unwrap();
+        assert!(
+            func2_tokens.contains("func2"),
+            "func2 tokens should contain 'func2', got: {:?}",
+            func2_tokens
+        );
+    }
+
+    #[test]
+    fn test_node_tokens_cleared_on_reindex() {
+        // T14: Verify node_tokens is cleared when re-indexing
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+        assert_eq!(engine.node_tokens.len(), 2);
+
+        // Re-index with different nodes
+        engine.index_nodes(vec![NodeInfo {
+            node_id: "new_func".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "new_func".to_string(),
+            language: "rust".to_string(),
+            content: "fn new_func() {}".to_string(),
+            byte_range: (0, 18),
+            embedding: None,
+            complexity: 1,
+        }]);
+        assert_eq!(engine.node_tokens.len(), 1);
+        assert!(engine.node_tokens.contains_key("new_func"));
+        assert!(!engine.node_tokens.contains_key("func1"));
+    }
+
+    #[test]
+    fn test_node_tokens_used_in_scoring() {
+        // T14: Verify that scoring uses cached tokens (no re-tokenization)
+        // by checking that search results are correct after content is cleared.
+        // This implicitly tests that calculate_text_score_optimized uses node_tokens.
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+
+        // Content is cleared (T13), but tokens are cached (T14)
+        for node in &engine.nodes {
+            assert!(node.content.is_empty());
+        }
+
+        // Search for a term that appears in content — should still find it via cached tokens
+        let query = SearchQuery {
+            query: "println hello".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+        let results = engine.search(query).unwrap();
+
+        // Should find results since "println" and "hello" appear in node content and tokens are cached
+        assert!(
+            !results.is_empty(),
+            "Search should find results using cached node_tokens even after content is cleared"
+        );
+        // func1 contains both "println" and "hello", should be top result
+        assert_eq!(results[0].node_id, "func1");
     }
 }
