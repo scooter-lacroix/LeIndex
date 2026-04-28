@@ -680,53 +680,64 @@ fn find_node_by_id<'a>(
     None
 }
 
-/// Calculate complexity metrics
+/// Calculate complexity metrics (iterative to avoid stack overflow on deeply nested code)
 fn calculate_complexity(
     node: &tree_sitter::Node<'_>,
     metrics: &mut ComplexityMetrics,
     depth: usize,
 ) {
-    metrics.nesting_depth = metrics.nesting_depth.max(depth);
-    metrics.line_count = std::cmp::max(metrics.line_count, 1);
+    // Use a stack-based approach with explicit traversal to avoid recursion
+    // Stack holds (node, depth) pairs
+    let mut stack: Vec<(tree_sitter::Node<'_>, usize)> = Vec::new();
+    stack.push((*node, depth));
 
-    match node.kind() {
-        "if_expression"
-        | "if_let_expression"
-        | "while_expression"
-        | "while_let_expression"
-        | "for_expression"
-        | "loop_expression"
-        | "match_expression"
-        | "match_arm"
-        | "if_expression_else" => {
-            metrics.cyclomatic += 1;
-        }
-        "binary_expression" => {
-            if let Some(op) = node.child_by_field_name("operator") {
-                match op.kind() {
-                    "&&" | "||" => {
-                        metrics.cyclomatic += 1;
+    while let Some((current_node, current_depth)) = stack.pop() {
+        metrics.nesting_depth = metrics.nesting_depth.max(current_depth);
+        metrics.line_count = std::cmp::max(metrics.line_count, 1);
+
+        match current_node.kind() {
+            "if_expression"
+            | "if_let_expression"
+            | "while_expression"
+            | "while_let_expression"
+            | "for_expression"
+            | "loop_expression"
+            | "match_expression"
+            | "match_arm"
+            | "if_expression_else" => {
+                metrics.cyclomatic += 1;
+            }
+            "binary_expression" => {
+                if let Some(op) = current_node.child_by_field_name("operator") {
+                    match op.kind() {
+                        "&&" | "||" => {
+                            metrics.cyclomatic += 1;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
+            "try_expression" => {
+                metrics.cyclomatic += 1;
+            }
+            _ => {}
         }
-        "try_expression" => {
-            metrics.cyclomatic += 1;
-        }
-        _ => {}
-    }
 
-    metrics.token_count += node.child_count();
+        metrics.token_count += current_node.child_count();
 
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        // Skip nested function_item nodes that appear inside a block (function body).
-        // Top-level function_items (children of source_file) are always traversed.
-        if child.kind() == "function_item" && node.kind() == "block" {
-            continue;
+        // Push children onto stack in reverse order to process them left-to-right
+        let mut cursor = current_node.walk();
+        let mut children: Vec<tree_sitter::Node<'_>> = current_node.children(&mut cursor).collect();
+        children.reverse(); // Reverse to maintain left-to-right processing order
+
+        for child in children {
+            // Skip nested function_item nodes that appear inside a block (function body).
+            // Top-level function_items (children of source_file) are always traversed.
+            if child.kind() == "function_item" && current_node.kind() == "block" {
+                continue;
+            }
+            stack.push((child, current_depth + 1));
         }
-        calculate_complexity(&child, metrics, depth + 1);
     }
 }
 
@@ -750,33 +761,42 @@ impl<'a> CfgBuilder<'a> {
 
     fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {
         let entry_id = self.create_block();
-        self.build_cfg_recursive(node, entry_id)?;
+        self.build_cfg_iterative(node, entry_id)?;
         Ok(())
     }
 
-    fn build_cfg_recursive(
+    fn build_cfg_iterative(
         &mut self,
-        node: &tree_sitter::Node<'_>,
-        current_block: usize,
+        root_node: &tree_sitter::Node<'_>,
+        entry_block: usize,
     ) -> Result<()> {
-        match node.kind() {
-            "if_expression" | "if_let_expression" => {
-                self.handle_if_statement(node, current_block)?;
-            }
-            "while_expression" | "while_let_expression" | "for_expression" | "loop_expression" => {
-                self.handle_loop_statement(node, current_block)?;
-            }
-            "match_expression" => {
-                self.handle_match_statement(node, current_block)?;
-            }
-            _ => {
-                if let Ok(text) = node.utf8_text(self.source) {
-                    self.add_statement_to_block(current_block, text.to_string());
-                }
+        use std::collections::VecDeque;
 
-                let mut cursor = node.walk();
-                for child in node.children(&mut cursor) {
-                    self.build_cfg_recursive(&child, current_block)?;
+        // Work queue: (node, current_block_id)
+        let mut work_queue: VecDeque<(tree_sitter::Node<'_>, usize)> = VecDeque::new();
+        work_queue.push_back((*root_node, entry_block));
+
+        while let Some((node, current_block)) = work_queue.pop_front() {
+            match node.kind() {
+                "if_expression" | "if_let_expression" => {
+                    self.handle_if_statement(&node, current_block)?;
+                }
+                "while_expression" | "while_let_expression" | "for_expression" | "loop_expression" => {
+                    self.handle_loop_statement(&node, current_block)?;
+                }
+                "match_expression" => {
+                    self.handle_match_statement(&node, current_block)?;
+                }
+                _ => {
+                    if let Ok(text) = node.utf8_text(self.source) {
+                        self.add_statement_to_block(current_block, text.to_string());
+                    }
+
+                    // Add children to the work queue
+                    let mut cursor = node.walk();
+                    for child in node.children(&mut cursor) {
+                        work_queue.push_back((child, current_block));
+                    }
                 }
             }
         }

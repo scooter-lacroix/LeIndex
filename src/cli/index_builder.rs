@@ -195,49 +195,28 @@ impl TfIdfEmbedder {
             "TF-IDF vocabulary candidates (moderate-IDF filter)"
         );
 
-        // Stratified vocabulary selection using partition-based sampling.
-        // Instead of O(N log N) full sort, we use select_nth_unstable_by to
-        // partition at quantile boundaries in O(N) each, then sample from
-        // each partition. Total: O(K*N) where K = TARGET_DIM (768), vs O(N log N).
+        // Stratified vocabulary selection using sort-based sampling.
+        // Sort by IDF score, then sample at quantile boundaries to get
+        // diverse coverage across the full IDF range.
+        idf_scores.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
         let final_scores: Vec<(String, f32)> = if idf_scores.len() <= TARGET_DIM {
-            // Fewer candidates than target — sort the small set and use all.
-            idf_scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            // Fewer candidates than target — use all.
             idf_scores
         } else {
+            // Sample at stratified quantile boundaries to get TARGET_DIM elements
+            // covering the full IDF range.
             let total = idf_scores.len();
-            // Build quantile boundaries for stratified sampling.
-            // Each boundary is the index where the i-th output element should be sampled from.
             let stride = total as f64 / TARGET_DIM as f64;
-            let target_indices: Vec<usize> = (0..TARGET_DIM)
-                .map(|i| ((i as f64 * stride) as usize).min(total - 1))
-                .collect();
-
-            // Use min-heap of size TARGET_DIM to select the top-K elements
-            // by their target index positions. We partition at each unique
-            // quantile boundary and pick the element at that boundary.
-            //
-            // Optimization: instead of partitioning TARGET_DIM times, we
-            // only partition at unique quantile boundaries. Typically there
-            // are far fewer unique boundaries than TARGET_DIM when total >> TARGET_DIM.
-            let mut unique_bounds: Vec<usize> = target_indices.clone();
-            unique_bounds.sort_unstable();
-            unique_bounds.dedup();
-
-            // Partition at each unique boundary using select_nth_unstable_by.
-            // After partitioning, idf_scores[p..=p] contains the element that
-            // would be at position p in a fully sorted array.
-            for &pivot in &unique_bounds {
-                if pivot < total {
-                    idf_scores.select_nth_unstable_by(pivot, |a, b| {
-                        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-                    });
-                }
-            }
-
-            // Collect sampled elements at target indices.
-            target_indices
-                .into_iter()
-                .map(|idx| idf_scores[idx].clone())
+            (0..TARGET_DIM)
+                .map(|i| {
+                    let idx = ((i as f64 * stride) as usize).min(total - 1);
+                    idf_scores[idx].clone()
+                })
                 .collect()
         };
 
@@ -980,19 +959,58 @@ mod tests {
     fn test_tfidf_partition_matches_sort_selection() {
         use std::collections::HashMap;
 
-        // Generate a corpus large enough to exercise the partition path
-        // (> TARGET_DIM unique tokens). Use 200 docs with unique per-doc tokens
-        // to ensure many unique tokens pass the df filter.
-        let docs: Vec<(String, String)> = (0..200)
+        // Generate a corpus that produces >768 candidates after df filtering.
+        //
+        // Strategy: Create ~1200 tokens, each appearing in 3-8 documents.
+        // With 200 docs, min_df=3 and max_df=50, this produces ~1200 candidates,
+        // which exercises the sort+stride sampling branch (for >768 candidates).
+        //
+        // Token distribution:
+        // - 1200 unique tokens total (3-letter lowercase tokens like "aaa", "aab", ...)
+        // - Each token appears in 3-8 documents (df in range [3, 8])
+        // - Documents are 200, each containing ~180 tokens
+        // - All tokens are space-separated to avoid introducing extra code keywords
+        //
+        let mut docs: Vec<(String, String)> = Vec::with_capacity(200);
+
+        // First, create 1200 tokens with their assigned document ranges
+        // Use lowercase letter-based tokens to avoid camelCase splitting
+        let token_names: Vec<String> = (0usize..1200)
             .map(|i| {
-                let content = format!(
-                    "fn func_{i}(arg_{i}: &str) -> Result<{i}> {{ \
-                     let var_{i} = compute_{i}(arg_{i}); \
-                     process_{i}(var_{i}) }}",
-                );
-                (format!("doc_{i}"), content)
+                // Create tokens like "aaa", "aab", etc. - won't be split by tokenizer
+                let first = (b'a' + (i % 26) as u8) as char;
+                let second = (b'a' + ((i / 26) % 26) as u8) as char;
+                let third = (b'a' + ((i / 676) % 26) as u8) as char;
+                format!("{}{}{}", first, second, third)
             })
             .collect();
+        
+        let mut token_doc_assignments: Vec<(String, Vec<usize>)> = Vec::new();
+        for (token_id, token) in token_names.iter().enumerate() {
+            // Each token appears in 3-8 documents
+            let df = 3 + (token_id % 6); // df in range [3, 8]
+            
+            // Use modulo to distribute tokens across documents deterministically
+            let docs_with_token: Vec<usize> = (0..df)
+                .map(|j| (token_id * 7 + j * 13) % 200) // Spread across docs
+                .collect();
+            
+            token_doc_assignments.push((token.clone(), docs_with_token));
+        }
+
+        // Build documents by collecting their assigned tokens
+        for doc_id in 0..200 {
+            let mut tokens = Vec::new();
+            for (token, doc_ids) in &token_doc_assignments {
+                if doc_ids.contains(&doc_id) {
+                    tokens.push(token.clone());
+                }
+            }
+            
+            // Format as space-separated tokens (no code keywords to avoid extra tokens)
+            let content = tokens.join(" ");
+            docs.push((format!("doc_{}", doc_id), content));
+        }
 
         let embedder = TfIdfEmbedder::build(&docs);
 
@@ -1025,7 +1043,12 @@ mod tests {
             .filter(|(_, c)| *c >= min_df && *c <= max_df)
             .map(|(tok, c)| (tok, (n_f / c as f32).ln()))
             .collect();
-        ref_scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Sort by IDF score, then by token name for deterministic tie-breaking
+        ref_scores.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         let target_dim = crate::search::search::DEFAULT_EMBEDDING_DIMENSION;
         let expected_vocab: Vec<String> = if ref_scores.len() <= target_dim {
