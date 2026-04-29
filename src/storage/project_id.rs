@@ -258,6 +258,57 @@ impl UniqueProjectId {
         })
     }
 
+    /// Parse a unique project ID from its string representation (compatibility alias)
+    ///
+    /// This method is a compatibility shim for the 1.x API. It delegates to `parse_id`.
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - String in format `<base_name>_<path_hash>_<instance>`
+    ///
+    /// # Returns
+    ///
+    /// `Option<UniqueProjectId>` - None if format is invalid
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use leindex::storage::UniqueProjectId;
+    ///
+    /// let id = UniqueProjectId::from_str_compat("leindex_a3f7d9e2_0");
+    /// assert!(id.is_some());
+    /// assert_eq!(id.unwrap().base_name, "leindex");
+    /// ```
+    #[must_use]
+    #[inline(always)]
+    pub fn from_str_compat(s: &str) -> Option<Self> {
+        Self::parse_id(s)
+    }
+
+    /// Parse a unique project ID from its string representation (backward compatibility)
+    ///
+    /// This is an alias for `from_str_compat` to preserve the 1.x API surface.
+    /// Downstream crates using `UniqueProjectId::from_str()` will continue to work.
+    ///
+    /// # Deprecated
+    ///
+    /// This method is deprecated in favor of `parse_id`. Use `parse_id` for new code.
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - String in format `<base_name>_<path_hash>_<instance>`
+    ///
+    /// # Returns
+    ///
+    /// `Option<UniqueProjectId>` - None if format is invalid
+    #[deprecated(since = "1.6.0", note = "Use `parse_id` instead")]
+    #[must_use]
+    #[inline(always)]
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        Self::parse_id(s)
+    }
+
     /// Check if this ID represents a clone (instance > 0)
     ///
     /// # Returns
