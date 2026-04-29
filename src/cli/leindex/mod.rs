@@ -194,7 +194,9 @@ impl LeIndex {
 
         // Generate unique project ID with conflict resolution
         // Load existing projects with same base name
-        let existing_ids = storage.load_existing_ids(&project_id).unwrap_or_default();
+        let existing_ids = storage
+            .load_existing_ids(&project_id)
+            .context("Failed to load existing project IDs from storage")?;
         let unique_id = UniqueProjectId::generate(&project_path, &existing_ids);
 
         // Store the project metadata

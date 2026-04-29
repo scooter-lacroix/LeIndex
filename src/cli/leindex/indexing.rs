@@ -30,9 +30,8 @@ impl LeIndex {
         );
 
         // Step 1: Get currently indexed files from storage
-        let indexed_files =
-            crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
-                .unwrap_or_default();
+        let indexed_files = crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
+            .context("Failed to load indexed files from storage")?;
 
         // Step 2: Collect all source files and compute hashes.
         let old_scan = self.get_project_scan(false).ok();

@@ -91,9 +91,8 @@ impl LeIndex {
 
     /// Report which files are indexed and which are not.
     pub fn coverage_report(&mut self) -> Result<super::CoverageReport> {
-        let indexed_files =
-            crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
-                .unwrap_or_default();
+        let indexed_files = crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
+            .context("Failed to load indexed files from storage")?;
         let source_files = self.collect_source_file_paths(true)?;
 
         let indexed_set: HashSet<String> = indexed_files.keys().cloned().collect();
