@@ -678,6 +678,9 @@ impl SearchEngine {
             }
         }
 
+        // Extract signature before clearing content (same as index_nodes does)
+        node.signature = Self::extract_signature_from_content(&node.content);
+
         // Clear content to save memory (same as index_nodes does)
         node.content.clear();
 
