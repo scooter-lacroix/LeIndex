@@ -150,49 +150,29 @@ impl LeIndex {
             );
         }
 
-        // Build a lookup from file path to source bytes (avoids re-reading from disk)
-        let source_bytes_by_file: std::collections::HashMap<String, Vec<u8>> = parsing_results
-            .iter()
-            .filter_map(|r| {
-                if r.is_success() {
-                    Some((
-                        r.file_path.display().to_string(),
-                        r.source_bytes.clone().unwrap_or_default(),
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Iterate over parsing_results directly, avoiding intermediate HashMap construction
+        // and the associated cloning of source_bytes, language, and signatures.
+        for result in &parsing_results {
+            if !result.is_success() {
+                continue;
+            }
 
-        let signatures_by_file: std::collections::HashMap<
-            String,
-            (String, Vec<crate::parse::traits::SignatureInfo>),
-        > = parsing_results
-            .iter()
-            .filter_map(|r| {
-                if r.is_success() {
-                    let lang = r.language.clone().unwrap_or_else(|| "unknown".to_string());
-                    Some((
-                        r.file_path.display().to_string(),
-                        (lang, r.signatures.clone()),
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        for (file_path, (language, signatures)) in signatures_by_file {
-            let source_bytes = source_bytes_by_file
-                .get(&file_path)
-                .map(|s| s.as_slice())
+            let file_path = result.file_path.display().to_string();
+            let language = result
+                .language
+                .as_deref()
+                .unwrap_or("unknown");
+            let source_bytes = result
+                .source_bytes
+                .as_deref()
                 .unwrap_or(&[]);
+            let signatures = &result.signatures;
+
             let file_pdg = crate::graph::extract_pdg_from_signatures(
-                signatures,
+                signatures.clone(),
                 source_bytes,
                 &file_path,
-                &language,
+                language,
             );
             index_builder::merge_pdgs(&mut pdg, file_pdg);
 
