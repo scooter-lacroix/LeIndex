@@ -312,6 +312,12 @@ path = "benches/phase_bench.rs"
 harness = false
 required-features = ["phase"]
 
+[[bench]]
+name = "edit_preview_bench"
+path = "benches/edit_preview_bench.rs"
+harness = false
+required-features = ["edit"]
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

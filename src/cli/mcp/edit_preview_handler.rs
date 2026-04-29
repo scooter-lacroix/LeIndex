@@ -120,19 +120,17 @@ leindex_edit_apply to understand the blast radius of your change."
         // Run validation via LogicValidator (if PDG available)
         let validation_json = match guard.create_validator() {
             Some(validator) => {
-                // Convert parsed EditChanges to ResolvedEditChanges for validation
-                let resolved: Vec<ResolvedEditChange> = changes
-                    .iter()
-                    .map(|_c| {
-                        ResolvedEditChange::new(
-                            PathBuf::from(&file_path),
-                            original.clone(),
-                            modified.clone(),
-                        )
-                    })
-                    .collect();
+                // Create a single ResolvedEditChange representing the final file state.
+                // All edit changes apply to the same file and produce the same
+                // (original → modified) pair, so N identical validation objects would
+                // be redundant — one is sufficient for syntax/reference/drift checks.
+                let resolved = ResolvedEditChange::new(
+                    PathBuf::from(&file_path),
+                    original.clone(),
+                    modified.clone(),
+                );
 
-                match validator.validate_changes(&resolved) {
+                match validator.validate_changes(&[resolved]) {
                     Ok(result) => Some(validation_to_json(&result)),
                     Err(e) => {
                         // Validation itself failed — include as a warning, don't block preview
