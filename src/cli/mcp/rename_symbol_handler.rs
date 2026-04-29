@@ -247,17 +247,12 @@ Grep + multi-file Edit with a single atomic operation."
 
         if !preview_only {
             // Apply changes to all files (file I/O — offload to blocking thread)
-            let old_name_c = old_name.clone();
-            let new_name_c = new_name.clone();
-            let apply_files = files_to_modify.clone();
+            // IMPORTANT: Write the validated buffers from file_contents instead of recomputing.
+            // If files change between validation and write, recomputing would corrupt data.
+            let validated_contents = file_contents;
             tokio::task::spawn_blocking(move || {
-                for file_path in &apply_files {
-                    let original = match std::fs::read_to_string(file_path) {
-                        Ok(o) => o,
-                        Err(e) => return Err(format!("Failed reading '{}': {}", file_path, e)),
-                    };
-                    let modified = replace_whole_word(&original, &old_name_c, &new_name_c);
-                    if let Err(e) = std::fs::write(file_path, modified.as_bytes()) {
+                for (file_path, _original, modified) in validated_contents {
+                    if let Err(e) = std::fs::write(&file_path, modified.as_bytes()) {
                         return Err(format!("Failed writing '{}': {}", file_path, e));
                     }
                 }
