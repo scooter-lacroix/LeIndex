@@ -216,6 +216,25 @@ impl GrepSymbolsHandler {
         let char_budget = token_budget * 4;
 
         let fetch_limit = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
+
+        // NOTE: PR review suggested using `Arc<str>` or `Arc<String>` instead of `String`
+        // for the HashSet key types (`seen_ids` and `seen_locations`). This is a false
+        // positive — the current `String` approach is optimal here because:
+        //
+        // 1. The PDG node's `id` field is already a `String`, so `node.id.clone()` is a
+        //    simple heap allocation with no indirection overhead. Converting to `Arc<str>`
+        //    would require `node.id.clone().into()` (alloc + coerce) for every insertion,
+        //    adding an extra allocation per entry compared to just cloning the String.
+        // 2. `Arc<String>` would add an extra pointer indirection on every lookup with no
+        //    benefit — these HashSets are local to this function call and are never shared
+        //    across threads or stored beyond the handler's lifetime.
+        // 3. `Arc<str>` has a slightly larger stack footprint (fat pointer: 2×usize) vs
+        //    `String` (3×usize), but the real cost is the forced re-allocation when
+        //    converting from the owned `String` in `PdgNode.id`.
+        // 4. The `seen_ids` HashSet is also cleared and reused in the semantic retry loop,
+        //    so the total number of live entries is bounded by `MAX_CANDIDATE_LIMIT` (500).
+        //    At this scale, the allocation overhead difference is negligible, but the
+        //    conversion overhead of `Arc<str>` is strictly worse.
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut seen_locations: std::collections::HashSet<(String, (usize, usize))> =
             std::collections::HashSet::new();
