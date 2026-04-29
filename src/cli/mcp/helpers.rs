@@ -426,43 +426,41 @@ pub(crate) fn normalise_ws(s: &str) -> String {
 }
 
 /// Find `needle` in `haystack` using whitespace-normalised matching.
+///
+/// Uses pre-computed cumulative byte offsets to achieve O(N) complexity instead
+/// of the previous O(N²) approach that recalculated byte offsets in nested loops.
 pub(crate) fn find_normalised_whitespace(haystack: &str, needle: &str) -> Option<(usize, usize)> {
     let norm_needle = normalise_ws(needle);
     if norm_needle.is_empty() {
         return None;
     }
     let lines: Vec<&str> = haystack.lines().collect();
+
+    // Pre-compute cumulative byte offsets for O(1) line-to-byte lookup.
+    // line_offsets[i] = byte offset of the start of line i.
+    // +1 accounts for the newline character between lines.
+    let mut line_offsets: Vec<usize> = Vec::with_capacity(lines.len());
+    let mut cumulative: usize = 0;
+    for line in &lines {
+        line_offsets.push(cumulative);
+        cumulative += line.len() + 1; // +1 for '\n'
+    }
+
+    let max_window = needle.lines().count() + 5;
     for start_line in 0..lines.len() {
         let mut window = String::new();
-        let mut raw_start_byte: Option<usize> = None;
-        for end_line in start_line..lines.len().min(start_line + needle.lines().count() + 5) {
+        let window_end = lines.len().min(start_line + max_window);
+        for end_line in start_line..window_end {
             if !window.is_empty() {
                 window.push(' ');
             }
             window.push_str(lines[end_line].trim());
             let norm_window = normalise_ws(&window);
             if norm_window.find(&norm_needle).is_some() {
-                let byte_start = if let Some(s) = raw_start_byte {
-                    s
-                } else {
-                    let mut offset = 0;
-                    for l in 0..start_line {
-                        offset += lines[l].len() + 1;
-                    }
-                    offset
-                };
-                let mut byte_end = byte_start;
-                for l in start_line..=end_line {
-                    byte_end += lines[l].len() + 1;
-                }
+                // O(1) byte offset lookups using pre-computed offsets
+                let byte_start = line_offsets[start_line];
+                let byte_end = line_offsets[end_line] + lines[end_line].len() + 1;
                 return Some((byte_start, byte_end.min(haystack.len()) - byte_start));
-            }
-            if raw_start_byte.is_none() {
-                let mut offset = 0;
-                for l in 0..start_line {
-                    offset += lines[l].len() + 1;
-                }
-                raw_start_byte = Some(offset);
             }
         }
     }

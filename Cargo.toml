@@ -318,6 +318,11 @@ path = "benches/edit_preview_bench.rs"
 harness = false
 required-features = ["edit"]
 
+[[bench]]
+name = "text_search_bench"
+path = "benches/text_search_bench.rs"
+harness = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
