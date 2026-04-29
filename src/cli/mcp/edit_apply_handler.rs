@@ -149,19 +149,17 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             let idx = handle.read().await;
             match idx.create_validator() {
                 Some(validator) => {
-                    // Convert parsed EditChanges to ResolvedEditChanges for validation
-                    let resolved: Vec<ResolvedEditChange> = changes
-                        .iter()
-                        .map(|_c| {
-                            ResolvedEditChange::new(
-                                PathBuf::from(&file_path),
-                                original.clone(),
-                                modified.clone(),
-                            )
-                        })
-                        .collect();
+                    // Create a single ResolvedEditChange representing the final file state.
+                    // All edit changes apply to the same file and produce the same
+                    // (original → modified) pair, so N identical validation objects would
+                    // be redundant — one is sufficient for syntax/reference/drift checks.
+                    let resolved = ResolvedEditChange::new(
+                        PathBuf::from(&file_path),
+                        original.clone(),
+                        modified.clone(),
+                    );
 
-                    match validator.validate_changes(&resolved) {
+                    match validator.validate_changes(&[resolved]) {
                         Ok(result) => {
                             if result.has_errors() {
                                 // Build detailed error response with validation details
