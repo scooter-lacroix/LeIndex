@@ -200,6 +200,33 @@ pub fn replace_whole_word(content: &str, old: &str, new: &str) -> String {
     result
 }
 
+/// Write `data` to `target` atomically using a temp file + rename.
+///
+/// 1. Write to a temp file (`.leindex-tmp-{nanos}`) in the same directory.
+/// 2. Try `rename` (atomic on POSIX when source and dest are on the same filesystem).
+/// 3. On Windows (where rename fails if dest exists), fall back to copy + remove.
+/// 4. Clean up the temp file on any error.
+fn atomic_write(target: &Path, data: &[u8]) -> std::io::Result<()> {
+    let dir = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp_name = format!(
+        ".leindex-tmp-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let tmp_path = dir.join(&tmp_name);
+    std::fs::write(&tmp_path, data)?;
+    if std::fs::rename(&tmp_path, target).is_err() {
+        std::fs::copy(&tmp_path, target).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            e
+        })?;
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    Ok(())
+}
+
 fn sanitize_session_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -626,7 +653,7 @@ impl EditEngine {
             }) => {
                 // Restore original content if available
                 if let Some(content) = original_content {
-                    if let Err(e) = std::fs::write(&file_path, content.as_bytes()) {
+                    if let Err(e) = atomic_write(&file_path, content.as_bytes()) {
                         // Restore failed — revert the history cursor so undo/redo stay consistent
                         history.redo();
                         return Ok(EditResult {
@@ -675,7 +702,7 @@ impl EditEngine {
                 let mut restored = Vec::new();
                 let mut errors = Vec::new();
                 for (file_path, content) in original_contents {
-                    match std::fs::write(&file_path, content.as_bytes()) {
+                    match atomic_write(std::path::Path::new(&file_path), content.as_bytes()) {
                         Ok(()) => restored.push(PathBuf::from(file_path)),
                         Err(e) => errors.push(format!("Failed to restore '{}': {}", file_path, e)),
                     }
@@ -726,7 +753,7 @@ impl EditEngine {
             }) => {
                 // Write the modified content back to the file
                 if let Some(content) = modified_content {
-                    std::fs::write(file_path, content.as_bytes()).map_err(|e| {
+                    atomic_write(file_path, content.as_bytes()).map_err(|e| {
                         EditError::Generic(format!(
                             "Failed to write '{}': {}",
                             file_path.display(),
@@ -756,7 +783,7 @@ impl EditEngine {
                 let mut re_applied = Vec::new();
                 let mut failed = None;
                 for (file_path, post_rename_content) in modified_contents {
-                    match std::fs::write(file_path, post_rename_content.as_bytes()) {
+                    match atomic_write(std::path::Path::new(file_path), post_rename_content.as_bytes()) {
                         Ok(()) => re_applied.push(PathBuf::from(file_path)),
                         Err(e) => {
                             failed = Some(e);
@@ -769,7 +796,7 @@ impl EditEngine {
                     // Rollback: restore all successfully written files to their pre-redo state
                     // (original_contents holds the pre-rename content, which is the undone state)
                     for (fp, content) in original_contents {
-                        let _ = std::fs::write(fp, content.as_bytes());
+                        let _ = atomic_write(std::path::Path::new(fp), content.as_bytes());
                     }
                     return Ok(EditResult {
                         success: false,
