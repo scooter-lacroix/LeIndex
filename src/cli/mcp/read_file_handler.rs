@@ -156,9 +156,10 @@ Works for any text file including configs and docs."
         let symbol_map: Vec<Value> = if include_symbol_map {
             let pdg_opt = if let Some(ref handle) = maybe_handle {
                 let mut guard = handle.write().await;
-                guard.ensure_pdg_loaded().map_err(|e| {
-                    JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e))
-                })?;
+                if let Err(e) = guard.ensure_pdg_loaded() {
+                    tracing::warn!("PDG load failed for symbol_map enrichment, degrading gracefully: {}", e);
+                    None
+                } else {
                 guard.pdg().map(|pdg| {
                 let nodes = pdg.nodes_in_file(&file_path);
                 let mut symbols: Vec<Value> = Vec::new();
@@ -240,6 +241,7 @@ Works for any text file including configs and docs."
                     .sort_by_key(|s| s.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0));
                 symbols
                 })
+                }
             } else {
                 None
             };
@@ -252,9 +254,10 @@ Works for any text file including configs and docs."
         // This eliminates follow-up Grep/Read calls for imports and dependencies
         let context = if let Some(ref handle) = maybe_handle {
             let mut guard = handle.write().await;
-            guard.ensure_pdg_loaded().map_err(|e| {
-                JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e))
-            })?;
+            if let Err(e) = guard.ensure_pdg_loaded() {
+                tracing::warn!("PDG load failed for context enrichment, degrading gracefully: {}", e);
+                None
+            } else {
             guard.pdg().map(|pdg| {
             let nodes = pdg.nodes_in_file(&file_path);
 
@@ -341,6 +344,7 @@ Works for any text file including configs and docs."
                 "used_by": used_by_vec
             })
             })
+            }
         } else {
             None
         };
