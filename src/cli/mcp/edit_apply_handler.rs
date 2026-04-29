@@ -198,9 +198,35 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             }
         };
 
-        std::fs::write(&file_path, modified.as_bytes()).map_err(|e| {
-            JsonRpcError::internal_error(format!("Failed to write '{}': {}", file_path, e))
-        })?;
+        // Atomic write: write to a temp file in the same directory, then rename.
+        // This prevents data corruption if the process dies mid-write — rename is
+        // atomic on POSIX when source and dest are on the same filesystem.
+        {
+            let target = PathBuf::from(&file_path);
+            let dir = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let tmp_name = format!(
+                ".leindex-tmp-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            let tmp_path = dir.join(&tmp_name);
+            std::fs::write(&tmp_path, modified.as_bytes()).map_err(|e| {
+                JsonRpcError::internal_error(format!(
+                    "Failed to write temp file for '{}': {}",
+                    file_path, e
+                ))
+            })?;
+            std::fs::rename(&tmp_path, &target).map_err(|e| {
+                // Clean up temp file on rename failure
+                let _ = std::fs::remove_file(&tmp_path);
+                JsonRpcError::internal_error(format!(
+                    "Failed to rename temp file to '{}': {}",
+                    file_path, e
+                ))
+            })?;
+        }
 
         // Build verification context: show the edited region so LLM doesn't need to Read
         let modified_lines: Vec<&str> = modified.lines().collect();
