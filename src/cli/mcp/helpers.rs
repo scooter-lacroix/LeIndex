@@ -274,8 +274,16 @@ pub(crate) fn parse_edit_changes(
                                 new_text: new_text.to_owned(),
                             }
                         } else {
+                            // Safe UTF-8 truncation at character boundaries
                             let preview = if old_text.len() > 60 {
-                                format!("{}...", &old_text[..60])
+                                // Find the last safe character boundary at or before byte 60
+                                let safe_end = old_text
+                                    .char_indices()
+                                    .map(|(idx, _)| idx)
+                                    .take_while(|&idx| idx <= 60)
+                                    .last()
+                                    .unwrap_or(0);
+                                format!("{}...", &old_text[..safe_end])
                             } else {
                                 old_text.to_string()
                             };
