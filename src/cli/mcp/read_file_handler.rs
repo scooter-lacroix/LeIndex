@@ -155,7 +155,8 @@ Works for any text file including configs and docs."
         // Build symbol map from PDG only when requested and available
         let symbol_map: Vec<Value> = if include_symbol_map {
             let pdg_opt = if let Some(ref handle) = maybe_handle {
-                let guard = handle.read().await;
+                let mut guard = handle.write().await;
+                let _ = guard.ensure_pdg_loaded();
                 guard.pdg().map(|pdg| {
                 let nodes = pdg.nodes_in_file(&file_path);
                 let mut symbols: Vec<Value> = Vec::new();
@@ -248,7 +249,8 @@ Works for any text file including configs and docs."
         // Build compact context block — always present when PDG available (~80-120 tokens)
         // This eliminates follow-up Grep/Read calls for imports and dependencies
         let context = if let Some(ref handle) = maybe_handle {
-            let guard = handle.read().await;
+            let mut guard = handle.write().await;
+            let _ = guard.ensure_pdg_loaded();
             guard.pdg().map(|pdg| {
             let nodes = pdg.nodes_in_file(&file_path);
 
