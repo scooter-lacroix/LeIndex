@@ -205,19 +205,24 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                 Err(_) => continue, // Skip binary or unreadable files
             };
 
-            let lines: Vec<&str> = content.lines().collect();
+            // Use split_inclusive to preserve line endings for accurate byte offset calculation
+            // This handles both Unix (\n) and Windows (\r\n) line endings correctly
+            let lines: Vec<&str> = content.split_inclusive('\n').collect();
 
             for (line_idx, line) in lines.iter().enumerate() {
                 if results.len() >= max_results {
                     break;
                 }
 
+                // Strip line ending for matching (handles both \n and \r\n)
+                let line_without_ending = line.trim_end();
+
                 let matched = if let Some(ref re) = regex {
-                    re.is_match(line)
+                    re.is_match(line_without_ending)
                 } else if case_sensitive {
-                    line.contains(&search_query)
+                    line_without_ending.contains(&search_query)
                 } else {
-                    line.to_lowercase().contains(&search_query)
+                    line_without_ending.to_lowercase().contains(&search_query)
                 };
 
                 if !matched {
@@ -226,21 +231,23 @@ to understand match context. Supports regex, globs, scope, and context_lines."
 
                 let line_number = line_idx + 1; // 1-indexed
 
-                // Collect context lines
+                // Collect context lines - strip line endings for display
                 let ctx_before: Vec<String> = (line_idx.saturating_sub(context_lines)..line_idx)
-                    .map(|i| format!("{}: {}", i + 1, lines[i]))
+                    .map(|i| format!("{}: {}", i + 1, lines[i].trim_end()))
                     .collect();
                 let ctx_after: Vec<String> = ((line_idx + 1)
                     ..((line_idx + 1 + context_lines).min(lines.len())))
-                    .map(|i| format!("{}: {}", i + 1, lines[i]))
+                    .map(|i| format!("{}: {}", i + 1, lines[i].trim_end()))
                     .collect();
 
                 // Compact PDG enrichment: just symbol name + type (~4 tokens)
                 // Eliminates follow-up Read to understand what code this match is in
                 let (in_symbol, symbol_type) = pdg
                     .and_then(|pdg| {
+                        // Calculate byte offset correctly for both Unix (\n) and Windows (\r\n)
+                        // Since we used split_inclusive('\n'), lines include their line endings
                         let byte_offset: usize =
-                            lines[..line_idx].iter().map(|l| l.len() + 1).sum();
+                            lines[..line_idx].iter().map(|l| l.len()).sum();
 
                         let nodes = pdg.nodes_in_file(&file_path_str);
                         let mut best: Option<(crate::graph::pdg::NodeId, usize)> = None;
@@ -269,7 +276,7 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                 let mut entry = serde_json::json!({
                     "file": file_path_str,
                     "line": line_number,
-                    "content": *line,
+                    "content": line_without_ending,
                 });
 
                 // Only include context lines when requested (context_lines > 0)
