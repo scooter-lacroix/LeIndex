@@ -210,6 +210,18 @@ to understand match context. Supports regex, globs, scope, and context_lines."
             // This handles both Unix (\n) and Windows (\r\n) line endings correctly
             let lines: Vec<&str> = content.split_inclusive('\n').collect();
 
+            // Precompute cumulative byte offsets (prefix sums) for O(1) lookup per match.
+            // Without this, the per-match sum `lines[..line_idx].iter().map(|l| l.len()).sum()`
+            // would be O(N²) in total across all matches.
+            let line_byte_offsets: Vec<usize> = lines
+                .iter()
+                .scan(0usize, |acc, l| {
+                    let offset = *acc;
+                    *acc += l.len();
+                    Some(offset)
+                })
+                .collect();
+
             for (line_idx, line) in lines.iter().enumerate() {
                 if results.len() >= max_results {
                     break;
@@ -245,10 +257,8 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                 // Eliminates follow-up Read to understand what code this match is in
                 let (in_symbol, symbol_type) = pdg
                     .and_then(|pdg| {
-                        // Calculate byte offset correctly for both Unix (\n) and Windows (\r\n)
-                        // Since we used split_inclusive('\n'), lines include their line endings
-                        let byte_offset: usize =
-                            lines[..line_idx].iter().map(|l| l.len()).sum();
+                        // O(1) lookup from precomputed prefix sums — avoids O(N²) recomputation
+                        let byte_offset: usize = line_byte_offsets[line_idx];
 
                         let nodes = pdg.nodes_in_file(&file_path_str);
                         let mut best: Option<(crate::graph::pdg::NodeId, usize)> = None;
