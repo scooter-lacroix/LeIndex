@@ -108,8 +108,9 @@ to auto-switch/auto-index projects."
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
-        // Best-effort PDG load
-        let _ = guard.ensure_pdg_loaded();
+        guard
+            .ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
 
         let scope = resolve_scope(&args, guard.project_path())?;
 

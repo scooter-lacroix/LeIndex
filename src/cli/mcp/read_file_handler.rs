@@ -156,7 +156,9 @@ Works for any text file including configs and docs."
         let symbol_map: Vec<Value> = if include_symbol_map {
             let pdg_opt = if let Some(ref handle) = maybe_handle {
                 let mut guard = handle.write().await;
-                let _ = guard.ensure_pdg_loaded();
+                guard.ensure_pdg_loaded().map_err(|e| {
+                    JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e))
+                })?;
                 guard.pdg().map(|pdg| {
                 let nodes = pdg.nodes_in_file(&file_path);
                 let mut symbols: Vec<Value> = Vec::new();
@@ -250,7 +252,9 @@ Works for any text file including configs and docs."
         // This eliminates follow-up Grep/Read calls for imports and dependencies
         let context = if let Some(ref handle) = maybe_handle {
             let mut guard = handle.write().await;
-            let _ = guard.ensure_pdg_loaded();
+            guard.ensure_pdg_loaded().map_err(|e| {
+                JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e))
+            })?;
             guard.pdg().map(|pdg| {
             let nodes = pdg.nodes_in_file(&file_path);
 

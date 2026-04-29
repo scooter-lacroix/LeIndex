@@ -60,8 +60,9 @@ data flow, and impact radius. Use for broad codebase understanding queries."
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
-        // Best-effort PDG load
-        let _ = guard.ensure_pdg_loaded();
+        guard
+            .ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
 
         if guard.search_engine().is_empty() {
             return Err(JsonRpcError::project_not_indexed(

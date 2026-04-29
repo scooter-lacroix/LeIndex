@@ -61,8 +61,9 @@ without reading the entire file. Accepts project_path to auto-switch between pro
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
-        // Best-effort PDG load
-        let _ = guard.ensure_pdg_loaded();
+        guard
+            .ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
 
         if !guard.is_indexed() {
             return Err(JsonRpcError::project_not_indexed(

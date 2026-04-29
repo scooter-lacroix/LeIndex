@@ -63,8 +63,9 @@ Turns a raw diff into a structural change summary with blast radius."
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
-        // Best-effort PDG load
-        let _ = guard.ensure_pdg_loaded();
+        guard
+            .ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
 
         let project_root = guard.project_path().to_path_buf();
 
