@@ -350,7 +350,13 @@ impl EditEngine {
         session.merge().await?;
 
         // Capture modified content for redo
-        let modified_content = std::fs::read_to_string(&request.file_path).ok();
+        let modified_content = std::fs::read_to_string(&request.file_path).map_err(|e| {
+            EditError::Generic(format!(
+                "Failed to read '{}' for redo capture: {}",
+                request.file_path.display(),
+                e
+            ))
+        })?;
 
         // Record in history
         let mut history = self.history.lock().await;
@@ -360,7 +366,7 @@ impl EditEngine {
             changes: request.changes.clone(),
             timestamp: chrono::Utc::now(),
             original_content,
-            modified_content,
+            modified_content: Some(modified_content),
         });
 
         Ok(EditResult {
@@ -752,15 +758,19 @@ impl EditEngine {
                 ..
             }) => {
                 // Write the modified content back to the file
-                if let Some(content) = modified_content {
-                    atomic_write(file_path, content.as_bytes()).map_err(|e| {
-                        EditError::Generic(format!(
-                            "Failed to write '{}': {}",
-                            file_path.display(),
-                            e
-                        ))
-                    })?;
-                }
+                let content = modified_content.clone().ok_or_else(|| {
+                    EditError::Generic(format!(
+                        "Cannot redo: no modified content captured for '{}'",
+                        file_path.display()
+                    ))
+                })?;
+                atomic_write(file_path, content.as_bytes()).map_err(|e| {
+                    EditError::Generic(format!(
+                        "Failed to write '{}': {}",
+                        file_path.display(),
+                        e
+                    ))
+                })?;
                 Ok(EditResult {
                     success: true,
                     changes_applied: 1,
