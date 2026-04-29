@@ -442,16 +442,20 @@ pub(crate) fn find_normalised_whitespace(haystack: &str, needle: &str) -> Option
     if norm_needle.is_empty() {
         return None;
     }
-    let lines: Vec<&str> = haystack.lines().collect();
+    // Use split_inclusive('\n') so line strings retain their terminators.
+    // This handles both \n (Unix) and \r\n (Windows) correctly because the
+    // terminator bytes are included in the string, and cumulative offsets
+    // are derived from actual string lengths rather than a fixed +1 guess.
+    let lines: Vec<&str> = haystack.split_inclusive('\n').collect();
 
     // Pre-compute cumulative byte offsets for O(1) line-to-byte lookup.
     // line_offsets[i] = byte offset of the start of line i.
-    // +1 accounts for the newline character between lines.
+    // Line length already includes the terminator (\n or \r\n).
     let mut line_offsets: Vec<usize> = Vec::with_capacity(lines.len());
     let mut cumulative: usize = 0;
     for line in &lines {
         line_offsets.push(cumulative);
-        cumulative += line.len() + 1; // +1 for '\n'
+        cumulative += line.len();
     }
 
     let max_window = needle.lines().count() + 5;
@@ -467,7 +471,7 @@ pub(crate) fn find_normalised_whitespace(haystack: &str, needle: &str) -> Option
             if norm_window.contains(&norm_needle) {
                 // O(1) byte offset lookups using pre-computed offsets
                 let byte_start = line_offsets[start_line];
-                let byte_end = line_offsets[end_line] + lines[end_line].len() + 1;
+                let byte_end = line_offsets[end_line] + lines[end_line].len();
                 return Some((byte_start, byte_end.min(haystack.len()) - byte_start));
             }
         }
