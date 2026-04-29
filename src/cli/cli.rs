@@ -347,8 +347,8 @@ fn complete_post_install_actions(
     command: &Commands,
     leindex_home: &std::path::Path,
 ) -> AnyhowResult<()> {
-    fs::create_dir_all(&leindex_home).context("failed to create LEINDEX_HOME")?;
-    cleanup_legacy_user_installations(&leindex_home);
+    fs::create_dir_all(leindex_home).context("failed to create LEINDEX_HOME")?;
+    cleanup_legacy_user_installations(leindex_home);
 
     let marker_path = leindex_home.join(POST_INSTALL_STAR_MARKER);
     if !marker_path.exists() {
@@ -864,7 +864,7 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
 async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
     // Check for environment variable override (for customization via LEINDEX_PORT)
     let port = if let Ok(env_port) = std::env::var("LEINDEX_PORT") {
-        env_port.parse::<u16>().unwrap_or(port).min(65535)
+        env_port.parse::<u16>().unwrap_or(port)
     } else {
         port
     };

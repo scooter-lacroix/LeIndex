@@ -207,7 +207,7 @@ use leindex_read_symbol."
                 "symbols": symbols,
                 "module_role": module_role
             }),
-            &*guard,
+            &guard,
         ))
     }
 }

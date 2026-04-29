@@ -90,6 +90,6 @@ impl DiagnosticsHandler {
             }
         }
 
-        Ok(wrap_with_meta(diag_json, &*guard))
+        Ok(wrap_with_meta(diag_json, &guard))
     }
 }

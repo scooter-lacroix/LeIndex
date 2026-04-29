@@ -42,12 +42,10 @@ pub struct SearchQuery {
 /// State shared across all handlers
 ///
 /// Uses `Arc<Mutex<Storage>>` because `rusqlite::Connection` is not `Send + Sync`.
-
 /// Note: AppState fields are documented for their purposes:
-/// - `storage`: Arc<Mutex<Storage>> provides thread-safe storage access requiring mutex lock
-/// - `config`: Arc<ServerConfig> provides immutable server configuration
-
-/// Handlers must lock the mutex before accessing storage.
+///   - `storage`: Arc<Mutex<Storage>> provides thread-safe storage access requiring mutex lock
+///   - `config`: Arc<ServerConfig> provides immutable server configuration
+///     Handlers must lock the mutex before accessing storage.
 #[derive(Clone)]
 pub struct AppState {
     /// Thread-safe storage access requiring mutex lock
@@ -834,7 +832,7 @@ pub async fn websocket_handler(
                         Ok(event) => {
                             let json = event.to_json();
                             use axum::extract::ws::Message;
-                            if socket.send(Message::Text(json.into())).await.is_err() {
+                            if socket.send(Message::Text(json)).await.is_err() {
                                 break;
                             }
                         }

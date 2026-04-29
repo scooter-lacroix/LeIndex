@@ -242,7 +242,7 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
                 "callees": callees,
                 "dependencies": dep_signatures
             }),
-            &*guard,
+            &guard,
         ))
     }
 }

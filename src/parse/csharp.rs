@@ -254,7 +254,7 @@ fn extract_csharp_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Imp
                 if let Some((alias, path)) = text.split_once('=') {
                     add_import(imports, path.trim(), Some(alias.trim().to_string()));
                 } else {
-                    let alias = text.split('.').last().map(|s| s.to_string());
+                    let alias = text.split('.').next_back().map(|s| s.to_string());
                     add_import(imports, text, alias);
                 }
             }
@@ -403,12 +403,8 @@ fn extract_csharp_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec
     // Try "parameters" field first, then look for parameter_list child
     let params_node = node.child_by_field_name("parameters").or_else(|| {
         let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "parameter_list" {
-                return Some(child);
-            }
-        }
-        None
+        let result = node.children(&mut cursor).find(|child| child.kind() == "parameter_list");
+        result
     });
 
     if let Some(params) = params_node {

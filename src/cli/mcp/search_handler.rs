@@ -176,7 +176,7 @@ to auto-switch/auto-index projects."
                         guard.source_file_paths().map(|p| p.len()).unwrap_or(0)
                     )
                 }),
-                &*guard,
+                &guard,
             ));
         }
 
@@ -188,7 +188,7 @@ to auto-switch/auto-index projects."
                 "count": total_returned,
                 "has_more": offset + total_returned < total_filtered
             }),
-            &*guard,
+            &guard,
         ))
     }
 }

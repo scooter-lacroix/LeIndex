@@ -361,7 +361,7 @@ Works for any text file including configs and docs."
         // Add staleness warning only if we have an indexed project
         if let Some(ref handle) = maybe_handle {
             let guard = handle.read().await;
-            result = wrap_with_meta(result, &*guard);
+            result = wrap_with_meta(result, &guard);
         }
 
         Ok(result)

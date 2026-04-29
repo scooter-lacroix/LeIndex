@@ -1,20 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 /// Output formatting mode for phase reports.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum FormatMode {
     /// Shortest output for tight token budgets.
     Ultra,
     /// Balanced detail and compactness.
+    #[default]
     Balanced,
     /// Most detailed output.
     Verbose,
-}
-
-impl Default for FormatMode {
-    fn default() -> Self {
-        Self::Balanced
-    }
 }
 
 impl FormatMode {

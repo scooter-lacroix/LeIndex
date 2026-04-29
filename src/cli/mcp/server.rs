@@ -258,7 +258,7 @@ pub async fn index_stream_handler(
     let stream = ReceiverStream::new(rx).map(|event| -> Result<Event, Infallible> {
         let event_data = Event::default()
             .json_data(event)
-            .unwrap_or_else(|_| Event::default().data("error".to_string()));
+            .unwrap_or_else(|_| Event::default().data("error"));
         Ok(event_data)
     });
 

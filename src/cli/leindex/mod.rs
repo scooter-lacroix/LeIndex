@@ -329,7 +329,7 @@ impl LeIndex {
         crate::cli::index_freshness::check_freshness(
             &ctx,
             || self.scan_project_files(),
-            |p| index_builder::hash_file(p),
+            index_builder::hash_file,
         )
     }
 
@@ -420,6 +420,9 @@ impl LeIndex {
 
         Some(crate::validation::LogicValidator::new(
             std::sync::Arc::new(pdg.clone()),
+            // Storage wraps rusqlite::Connection which is not Sync;
+            // Arc is required by the LogicValidator interface for shared ownership.
+            #[allow(clippy::arc_with_non_send_sync)]
             std::sync::Arc::new(storage),
         ))
     }

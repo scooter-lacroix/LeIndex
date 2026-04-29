@@ -337,10 +337,7 @@ impl BackgroundSync {
     pub fn spawn(self) -> std::thread::JoinHandle<Vec<SyncReport>> {
         std::thread::spawn(move || {
             let mut bg_sync = self;
-            match bg_sync.run() {
-                Ok(reports) => reports,
-                Err(_) => Vec::new(),
-            }
+            bg_sync.run().unwrap_or_default()
         })
     }
 

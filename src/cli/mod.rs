@@ -76,6 +76,7 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
+#[allow(clippy::module_inception)]
 /// Command-line interface definitions and handling.
 pub mod cli;
 /// Configuration for projects, languages, and storage.

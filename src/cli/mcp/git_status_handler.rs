@@ -76,7 +76,7 @@ Turns a raw diff into a structural change summary with blast radius."
                     "is_git_repo": false,
                     "message": "Not a git repository"
                 }),
-                &*guard,
+                &guard,
             ));
         }
 
@@ -265,7 +265,7 @@ Turns a raw diff into a structural change summary with blast radius."
                 },
                 "diff": diff_content,
             }),
-            &*guard,
+            &guard,
         ))
     }
 }

@@ -354,10 +354,8 @@ impl GrepSymbolsHandler {
                 continue;
             }
 
-            if type_filter != "all" {
-                if node_type_str(&node.node_type) != type_filter.as_str() {
-                    continue;
-                }
+            if type_filter != "all" && node_type_str(&node.node_type) != type_filter.as_str() {
+                continue;
             }
 
             if let Some(ref s) = scope {

@@ -281,7 +281,7 @@ fn extract_cpp_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Import
         if path.is_empty() {
             return;
         }
-        let alias = alias.or_else(|| path.split('/').last().map(|s| s.to_string()));
+        let alias = alias.or_else(|| path.split('/').next_back().map(|s| s.to_string()));
         imports.push(ImportInfo {
             path: path.to_string(),
             alias,

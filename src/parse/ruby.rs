@@ -256,12 +256,12 @@ fn extract_ruby_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                 let receiver = node
                     .child_by_field_name("receiver")
                     .and_then(|n| n.utf8_text(source).ok())
-                    .map(|s| clean_call_text(s));
+                    .map(clean_call_text);
                 let method = node
                     .child_by_field_name("method")
                     .or_else(|| node.child_by_field_name("name"))
                     .and_then(|n| n.utf8_text(source).ok())
-                    .map(|s| clean_call_text(s));
+                    .map(clean_call_text);
 
                 let call_name = match (receiver, method) {
                     (Some(r), Some(m)) => format!("{}.{}", r, m),
@@ -269,7 +269,7 @@ fn extract_ruby_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                     _ => node
                         .utf8_text(source)
                         .ok()
-                        .map(|s| clean_call_text(s))
+                        .map(clean_call_text)
                         .unwrap_or_default(),
                 };
 

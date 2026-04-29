@@ -157,9 +157,9 @@ Grep + multi-file Edit with a single atomic operation."
 
         // Generate per-file diffs (file I/O — offload to blocking thread)
         let (diffs, files_to_modify, file_contents) = tokio::task::spawn_blocking({
-            let filtered_files = filtered_files;
             let old_name = old_name.clone();
             let new_name = new_name.clone();
+            #[allow(clippy::type_complexity)]
             move || -> Result<(Vec<Value>, Vec<String>, Vec<(String, String, String)>), String> {
                 let mut diffs: Vec<Value> = Vec::new();
                 let mut files_to_modify: Vec<String> = Vec::new();

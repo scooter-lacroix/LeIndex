@@ -456,7 +456,7 @@ pub(crate) fn find_normalised_whitespace(haystack: &str, needle: &str) -> Option
             }
             window.push_str(lines[end_line].trim());
             let norm_window = normalise_ws(&window);
-            if norm_window.find(&norm_needle).is_some() {
+            if norm_window.contains(&norm_needle) {
                 // O(1) byte offset lookups using pre-computed offsets
                 let byte_start = line_offsets[start_line];
                 let byte_end = line_offsets[end_line] + lines[end_line].len() + 1;

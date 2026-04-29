@@ -87,7 +87,7 @@ For the exact source implementation use leindex_read_symbol."
         let is_batch = args
             .get("symbols")
             .and_then(|v| v.as_array())
-            .map_or(false, |a| a.len() > 1);
+            .is_some_and(|a| a.len() > 1);
         let include_source = extract_bool(&args, "include_source", !is_batch);
         let include_callers = extract_bool(&args, "include_callers", true);
         let include_callees = extract_bool(&args, "include_callees", true);
@@ -168,7 +168,7 @@ For the exact source implementation use leindex_read_symbol."
                     "count": results.len(),
                     "results": results
                 }),
-                &*guard,
+                &guard,
             ));
         }
 
@@ -185,10 +185,11 @@ For the exact source implementation use leindex_read_symbol."
             char_budget,
         )?;
 
-        Ok(wrap_with_meta(single, &*guard))
+        Ok(wrap_with_meta(single, &guard))
     }
 
     /// Resolve and return full structural context for a single symbol.
+    #[allow(clippy::too_many_arguments)]
     fn lookup_single_symbol(
         &self,
         pdg: &crate::graph::pdg::ProgramDependenceGraph,
@@ -207,7 +208,7 @@ For the exact source implementation use leindex_read_symbol."
 
         // 1. Exact symbol lookup (by node.id in symbol_index)
         let node_id = if let Some(nid) = pdg.find_by_symbol(symbol) {
-            pdg.get_node(nid).filter(|n| in_scope(*n)).map(|_| nid)
+            pdg.get_node(nid).filter(|n| in_scope(n)).map(|_| nid)
         } else {
             None
         }
@@ -227,7 +228,7 @@ For the exact source implementation use leindex_read_symbol."
                     candidates
                         .iter()
                         .copied()
-                        .find(|&nid| pdg.get_node(nid).map(|n| in_scope(n)).unwrap_or(false))
+                        .find(|&nid| pdg.get_node(nid).is_some_and(&in_scope))
                 })
         })
         .or_else(|| {

@@ -198,7 +198,7 @@ fn extract_scala_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Impo
                 if part.is_empty() {
                     continue;
                 }
-                let alias = part.split('.').last().map(|s| s.to_string());
+                let alias = part.split('.').next_back().map(|s| s.to_string());
                 add_import(imports, part, alias);
             }
         }

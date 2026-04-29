@@ -220,6 +220,6 @@ leindex_edit_apply to understand the blast radius of your change."
             }
         }
 
-        Ok(wrap_with_meta(response, &*guard))
+        Ok(wrap_with_meta(response, &guard))
     }
 }

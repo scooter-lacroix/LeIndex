@@ -213,7 +213,7 @@ fn extract_python_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Imp
                 if let Some((path, alias)) = part.split_once(" as ") {
                     add_import(imports, path.trim(), Some(alias.trim().to_string()));
                 } else {
-                    add_import(imports, part, part.split('.').last().map(|s| s.to_string()));
+                    add_import(imports, part, part.split('.').next_back().map(|s| s.to_string()));
                 }
             }
         } else if text.starts_with("from ") {
@@ -233,7 +233,7 @@ fn extract_python_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Imp
                         add_import(
                             imports,
                             &path,
-                            item.split('.').last().map(|s| s.to_string()),
+                            item.split('.').next_back().map(|s| s.to_string()),
                         );
                     }
                 }

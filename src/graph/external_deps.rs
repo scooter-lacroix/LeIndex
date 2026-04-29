@@ -452,9 +452,9 @@ impl ExternalDependencyRegistry {
                 // Handle quoted entries like `"@babel/core@^7.0.0":`
                 let spec = spec.trim_matches('"');
                 // Extract package name (everything before the last @version)
-                let name = if spec.starts_with('@') {
+                let name = if let Some(stripped) = spec.strip_prefix('@') {
                     // Scoped package: @scope/name@version
-                    if let Some(at_pos) = spec[1..].rfind('@') {
+                    if let Some(at_pos) = stripped.rfind('@') {
                         spec[..at_pos + 1].to_string()
                     } else {
                         spec.to_string()
@@ -496,8 +496,8 @@ impl ExternalDependencyRegistry {
                 continue;
             }
 
-            let (name, mut version) = if spec.starts_with('@') {
-                if let Some(pos) = spec[1..].rfind('@').map(|p| p + 1) {
+            let (name, mut version) = if let Some(stripped) = spec.strip_prefix('@') {
+                if let Some(pos) = stripped.rfind('@').map(|p| p + 1) {
                     (spec[..pos].to_string(), spec[pos + 1..].to_string())
                 } else {
                     (spec.to_string(), "*".to_string())
@@ -841,9 +841,7 @@ impl ExternalDependencyRegistry {
 /// Converts path separators, strips common prefixes, and lowercases.
 fn normalise_import(raw: &str) -> String {
     raw.replace("::", ".")
-        .replace('/', ".")
-        .replace('\\', ".")
-        .replace(':', ".")
+        .replace(['/', '\\', ':'], ".")
         .replace("..", ".")
         .trim_matches('.')
         .to_lowercase()

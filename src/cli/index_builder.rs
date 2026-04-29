@@ -107,9 +107,7 @@ pub(crate) fn tokenize_code(text: &str) -> Vec<String> {
             current.push(ch);
         }
     }
-    if current.len() >= 2 {
-        tokens.push(current.to_lowercase());
-    } else if !current.is_empty() && current.chars().all(|c| c.is_ascii_digit()) {
+    if current.len() >= 2 || !current.is_empty() && current.chars().all(|c| c.is_ascii_digit()) {
         tokens.push(current.to_lowercase());
     }
     tokens
@@ -683,11 +681,9 @@ pub(crate) fn files_importing_from_manifests(
         if let Some(node) = pdg.get_node(nid) {
             if node.node_type == NodeType::External {
                 let fp = node.file_path.as_ref();
-                if !affected_set.contains(fp) {
-                    if source_set.contains(fp) {
-                        affected_set.insert(node.file_path.to_string());
-                        affected.push(PathBuf::from(&*node.file_path));
-                    }
+                if !affected_set.contains(fp) && source_set.contains(fp) {
+                    affected_set.insert(node.file_path.to_string());
+                    affected.push(PathBuf::from(&*node.file_path));
                 }
             }
         }

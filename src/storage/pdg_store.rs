@@ -186,7 +186,7 @@ pub fn save_pdg(
             qualified_name: pdg_node
                 .id
                 .split(':')
-                .last()
+                .next_back()
                 .unwrap_or(&pdg_node.id)
                 .to_string(),
             language: pdg_node.language.clone(),

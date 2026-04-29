@@ -354,7 +354,7 @@ fn resolve_import_candidates_ranked(
     }
 
     // Last segment
-    if let Some(last) = normalized.split('.').last() {
+    if let Some(last) = normalized.split('.').next_back() {
         if let Some(values) = symbol_map.get(last) {
             for id in values {
                 *scored.entry(*id).or_insert(0) += config.last_seg_score;
@@ -473,7 +473,7 @@ fn candidate_keys_for_node(node: &crate::graph::pdg::Node) -> Vec<String> {
             let start = parts.len() - len;
             keys.insert(parts[start..].join("."));
         }
-        if let Some(last) = norm_id.split('.').last() {
+        if let Some(last) = norm_id.split('.').next_back() {
             keys.insert(last.to_string());
         }
     }

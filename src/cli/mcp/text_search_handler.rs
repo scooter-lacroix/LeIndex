@@ -306,7 +306,7 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                 "has_more": offset + count < total,
                 "results": paginated,
             }),
-            &*guard,
+            &guard,
         ))
     }
 }

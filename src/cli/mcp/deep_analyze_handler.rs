@@ -75,6 +75,6 @@ data flow, and impact radius. Use for broad codebase understanding queries."
 
         serde_json::to_value(result)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
-            .map(|v| wrap_with_meta(v, &*guard))
+            .map(|v| wrap_with_meta(v, &guard))
     }
 }

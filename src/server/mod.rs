@@ -20,6 +20,7 @@ pub mod websocket;
 /// API response types matching frontend contract
 pub mod responses;
 
+#[allow(clippy::module_inception)]
 /// Server instance management
 pub mod server;
 

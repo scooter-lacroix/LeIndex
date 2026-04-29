@@ -443,11 +443,11 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                 let receiver = current
                     .child_by_field_name("receiver")
                     .and_then(|r| r.utf8_text(source).ok())
-                    .map(|s| clean_call_text(s));
+                    .map(clean_call_text);
                 let method = current
                     .child_by_field_name("method")
                     .and_then(|m| m.utf8_text(source).ok())
-                    .map(|s| clean_call_text(s));
+                    .map(clean_call_text);
 
                 let name = match (receiver, method) {
                     (Some(r), Some(m)) => format!("{}.{}", r, m),

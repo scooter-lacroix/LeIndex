@@ -166,7 +166,7 @@ to understand the blast radius of your change. No equivalent in standard tools."
                     node.name, forward.len(), affected_files.len(), risk
                 )
             }),
-            &*guard,
+            &guard,
         ))
     }
 }

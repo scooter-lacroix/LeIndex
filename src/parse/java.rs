@@ -273,7 +273,7 @@ fn extract_java_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Impor
                 let text = text
                     .trim_start_matches("import ")
                     .trim_start_matches("static ");
-                let alias = text.split('.').last().map(|s| s.to_string());
+                let alias = text.split('.').next_back().map(|s| s.to_string());
                 add_import(imports, text, alias);
             }
         }
@@ -386,11 +386,11 @@ fn extract_java_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                     .child_by_field_name("object")
                     .or_else(|| node.child_by_field_name("scope"))
                     .and_then(|n| n.utf8_text(source).ok())
-                    .map(|s| clean_call_text(s));
+                    .map(clean_call_text);
                 let name = node
                     .child_by_field_name("name")
                     .and_then(|n| n.utf8_text(source).ok())
-                    .map(|s| clean_call_text(s));
+                    .map(clean_call_text);
 
                 let call_name = match (object, name) {
                     (Some(obj), Some(method)) => format!("{}.{}", obj, method),
@@ -398,7 +398,7 @@ fn extract_java_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
                     _ => node
                         .utf8_text(source)
                         .ok()
-                        .map(|s| clean_call_text(s))
+                        .map(clean_call_text)
                         .unwrap_or_default(),
                 };
 

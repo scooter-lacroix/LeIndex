@@ -258,7 +258,7 @@ impl GlobalRegistry {
         let projects = stmt
             .query_map([], |row| {
                 let id_str: String = row.get(0)?;
-                let unique_id = UniqueProjectId::from_str(&id_str)
+                let unique_id = UniqueProjectId::parse_id(&id_str)
                     .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
 
                 Ok(ProjectInfo {
@@ -302,7 +302,7 @@ impl GlobalRegistry {
         let result = stmt.query_row(params![id], |row| {
             let id_str: String = row.get(0)?;
             let unique_id =
-                UniqueProjectId::from_str(&id_str).ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+                UniqueProjectId::parse_id(&id_str).ok_or_else(|| rusqlite::Error::InvalidQuery)?;
 
             Ok(ProjectInfo {
                 unique_id,
@@ -366,7 +366,7 @@ impl GlobalRegistry {
         let result = stmt.query_row(params![fingerprint], |row| {
             let id_str: String = row.get(0)?;
             let unique_id =
-                UniqueProjectId::from_str(&id_str).ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+                UniqueProjectId::parse_id(&id_str).ok_or_else(|| rusqlite::Error::InvalidQuery)?;
 
             Ok(ProjectInfo {
                 unique_id,
@@ -398,8 +398,8 @@ impl GlobalRegistry {
         let ids: Vec<UniqueProjectId> = stmt
             .query_map(params![base_name], |row| {
                 let id_str: String = row.get(0)?;
-                Ok(UniqueProjectId::from_str(&id_str)
-                    .ok_or_else(|| rusqlite::Error::InvalidQuery)?)
+                UniqueProjectId::parse_id(&id_str)
+                    .ok_or_else(|| rusqlite::Error::InvalidQuery)
             })?
             .filter_map(|r| r.ok())
             .collect();

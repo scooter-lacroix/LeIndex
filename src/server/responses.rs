@@ -118,7 +118,7 @@ pub struct CodebaseDetailResponse {
 }
 
 /// Sync report matching frontend SyncReport interface
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SyncReportResponse {
     /// Newly discovered files
     pub newly_discovered: usize,
@@ -137,19 +137,6 @@ pub struct SyncReportResponse {
 
     /// Errors encountered
     pub errors: usize,
-}
-
-impl Default for SyncReportResponse {
-    fn default() -> Self {
-        Self {
-            newly_discovered: 0,
-            updated: 0,
-            invalidated: 0,
-            missing: 0,
-            unchanged: 0,
-            errors: 0,
-        }
-    }
 }
 
 /// File tree node for file listing
@@ -471,14 +458,8 @@ pub struct GraphNodeDetailResponse {
 }
 
 /// Phantom data marker for empty responses
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PhantomData {}
-
-impl Default for PhantomData {
-    fn default() -> Self {
-        Self {}
-    }
-}
 
 #[cfg(test)]
 mod tests {

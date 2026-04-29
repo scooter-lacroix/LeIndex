@@ -7,8 +7,6 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Unique project identifier with conflict resolution via instance counter
-
-/// Unique project identifier with conflict resolution via instance counter
 ///
 /// Each project gets a deterministic ID based on:
 /// - `base_name`: The directory name of the project
@@ -233,12 +231,12 @@ impl UniqueProjectId {
     /// ```
     /// use leindex::storage::UniqueProjectId;
     ///
-    /// let id = UniqueProjectId::from_str("leindex_a3f7d9e2_0");
+    /// let id = UniqueProjectId::parse_id("leindex_a3f7d9e2_0");
     /// assert!(id.is_some());
     /// assert_eq!(id.unwrap().base_name, "leindex");
     /// ```
     #[must_use]
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_id(s: &str) -> Option<Self> {
         let parts: Vec<&str> = s.rsplitn(3, '_').collect();
         if parts.len() != 3 {
             return None;
@@ -390,8 +388,8 @@ mod tests {
     }
 
     #[test]
-    fn test_from_str_valid() {
-        let id = UniqueProjectId::from_str("leindex_a3f7d9e2_0");
+    fn test_parse_id_valid() {
+        let id = UniqueProjectId::parse_id("leindex_a3f7d9e2_0");
         assert!(id.is_some());
         let id = id.unwrap();
         assert_eq!(id.base_name, "leindex");
@@ -400,24 +398,24 @@ mod tests {
     }
 
     #[test]
-    fn test_from_str_invalid_format() {
-        assert!(UniqueProjectId::from_str("invalid").is_none());
-        assert!(UniqueProjectId::from_str("only_two_parts").is_none());
+    fn test_parse_id_invalid_format() {
+        assert!(UniqueProjectId::parse_id("invalid").is_none());
+        assert!(UniqueProjectId::parse_id("only_two_parts").is_none());
     }
 
     #[test]
-    fn test_from_str_invalid_hash() {
+    fn test_parse_id_invalid_hash() {
         // Wrong hash length
-        assert!(UniqueProjectId::from_str("leindex_a3f7_0").is_none());
+        assert!(UniqueProjectId::parse_id("leindex_a3f7_0").is_none());
         // Non-hex characters
-        assert!(UniqueProjectId::from_str("leindex_xyzxyz9_0").is_none());
+        assert!(UniqueProjectId::parse_id("leindex_xyzxyz9_0").is_none());
     }
 
     #[test]
-    fn test_from_str_roundtrip() {
+    fn test_parse_id_roundtrip() {
         let original = UniqueProjectId::new("myproject".to_string(), "b4e8f1a3".to_string(), 3);
         let s = original.as_unique_string();
-        let parsed = UniqueProjectId::from_str(&s).unwrap();
+        let parsed = UniqueProjectId::parse_id(&s).unwrap();
         assert_eq!(parsed, original);
     }
 

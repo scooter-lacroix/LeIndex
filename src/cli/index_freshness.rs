@@ -156,16 +156,14 @@ pub(crate) fn is_stale_fast(
                         source_count = Some(scan.source_paths.len());
                     }
                 }
-            } else if let Ok(entry) = ctx.cache_spiller.store().load_from_disk(&cache_key) {
-                if let CacheEntry::Binary {
-                    serialized_data, ..
-                } = entry
-                {
-                    if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
-                        cached_manifest_paths = Some(scan.manifest_paths.clone());
-                        cached_scan = Some(scan.clone());
-                        source_count = Some(scan.source_paths.len());
-                    }
+            } else if let Ok(CacheEntry::Binary {
+                serialized_data, ..
+            }) = ctx.cache_spiller.store().load_from_disk(&cache_key)
+            {
+                if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
+                    cached_manifest_paths = Some(scan.manifest_paths.clone());
+                    cached_scan = Some(scan.clone());
+                    source_count = Some(scan.source_paths.len());
                 }
             }
             if source_count.is_none() {
@@ -220,9 +218,8 @@ pub(crate) fn is_stale_fast(
     }
 
     // Quick spot-check: sample indexed files for deletion or modification
-    let sample_size = (indexed_files.len() / 20).max(50).min(500);
-    let mut checked = 0;
-    for indexed_path in indexed_files.keys() {
+    let sample_size = (indexed_files.len() / 20).clamp(50, 500);
+    for (checked, indexed_path) in indexed_files.keys().enumerate() {
         if checked >= sample_size {
             break;
         }
@@ -237,7 +234,6 @@ pub(crate) fn is_stale_fast(
                 }
             }
         }
-        checked += 1;
     }
 
     // Check manifest file mtimes

@@ -131,7 +131,7 @@ scoping to subdirectories, sorting, and pagination."
         });
         let scope_path = PathBuf::from(&scope_str);
         let scope_base = PathBuf::from(
-            scope_str.trim_end_matches(|c| c == '/' || c == std::path::MAIN_SEPARATOR),
+            scope_str.trim_end_matches(['/', std::path::MAIN_SEPARATOR]),
         );
 
         // Use cached file stats if available, otherwise build from PDG
@@ -339,7 +339,7 @@ scoping to subdirectories, sorting, and pagination."
                 "has_more": offset + truncated_files.len() < total_before_pagination,
                 "files": truncated_files
             }),
-            &*guard,
+            &guard,
         ))
     }
 }

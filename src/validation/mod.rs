@@ -169,7 +169,7 @@ impl LogicValidator {
     /// # Returns
     /// Validation result with all found issues
     pub fn validate_change(&self, change: &ResolvedEditChange) -> Result<ValidationResult> {
-        self.validate_changes(&[change.clone()])
+        self.validate_changes(std::slice::from_ref(change))
     }
 
     /// Validate multiple edit changes

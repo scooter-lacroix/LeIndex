@@ -2,7 +2,6 @@
 
 use super::LeIndex;
 use crate::cli::index_builder;
-use crate::graph::pdg::ProgramDependenceGraph;
 use anyhow::{Context, Result};
 use tracing::info;
 
@@ -134,7 +133,7 @@ impl LeIndex {
                 .context("Failed to load existing PDG for incremental reindex. Please reindex with --force if corruption persists.")?;
         }
 
-        let mut pdg = self.pdg.take().unwrap_or_else(ProgramDependenceGraph::new);
+        let mut pdg = self.pdg.take().unwrap_or_default();
 
         for (path, _) in &source_files_with_hashes {
             let path_str = path.display().to_string();

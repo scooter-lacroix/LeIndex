@@ -726,7 +726,7 @@ impl EditEngine {
             }) => {
                 // Write the modified content back to the file
                 if let Some(content) = modified_content {
-                    std::fs::write(&file_path, content.as_bytes()).map_err(|e| {
+                    std::fs::write(file_path, content.as_bytes()).map_err(|e| {
                         EditError::Generic(format!(
                             "Failed to write '{}': {}",
                             file_path.display(),
@@ -756,7 +756,7 @@ impl EditEngine {
                 let mut re_applied = Vec::new();
                 let mut failed = None;
                 for (file_path, post_rename_content) in modified_contents {
-                    match std::fs::write(&file_path, post_rename_content.as_bytes()) {
+                    match std::fs::write(file_path, post_rename_content.as_bytes()) {
                         Ok(()) => re_applied.push(PathBuf::from(file_path)),
                         Err(e) => {
                             failed = Some(e);
@@ -765,11 +765,11 @@ impl EditEngine {
                     }
                 }
 
-                if let Some(_) = failed {
+                if failed.is_some() {
                     // Rollback: restore all successfully written files to their pre-redo state
                     // (original_contents holds the pre-rename content, which is the undone state)
                     for (fp, content) in original_contents {
-                        let _ = std::fs::write(&fp, content.as_bytes());
+                        let _ = std::fs::write(fp, content.as_bytes());
                     }
                     return Ok(EditResult {
                         success: false,
@@ -847,6 +847,12 @@ impl EditEngine {
 pub struct WorktreeManager {
     /// Base path for worktree directories
     pub base_path: PathBuf,
+}
+
+impl Default for WorktreeManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WorktreeManager {
@@ -1108,8 +1114,7 @@ impl WorktreeSession {
         }
 
         // Phase 2 (write): apply all prepared writes. On failure, roll back everything.
-        let mut written: usize = 0;
-        for (original, content) in &prepared {
+        for (written, (original, content)) in prepared.iter().enumerate() {
             if let Err(e) = std::fs::write(original, content.as_bytes()) {
                 // Roll back all previously written files AND the failed file
                 for (backup_path, file_existed, backup_content) in
@@ -1133,7 +1138,6 @@ impl WorktreeSession {
                     e
                 )));
             }
-            written += 1;
         }
 
         // Cleanup: remove the worktree directory

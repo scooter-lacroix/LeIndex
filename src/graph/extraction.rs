@@ -911,8 +911,8 @@ pub fn extract_call_edges(
             let alias = import.alias.clone().or_else(|| {
                 import
                     .path
-                    .split(|c| c == '.' || c == ':' || c == '/' || c == '\\')
-                    .last()
+                    .split(['.', ':', '/', '\\'])
+                    .next_back()
                     .map(|s| s.to_string())
             });
             if let Some(alias) = alias {
@@ -1007,7 +1007,7 @@ pub fn extract_call_edges(
             if let Some((scoped_prefix, _member)) = callee_name.rsplit_once('.') {
                 let bare_type = scoped_prefix.rsplit('.').next().unwrap_or(scoped_prefix);
                 // Only look up if bare_type looks like a type name (starts uppercase)
-                let looks_like_type = bare_type.chars().next().map_or(false, |c| c.is_uppercase());
+                let looks_like_type = bare_type.chars().next().is_some_and(|c| c.is_uppercase());
                 if looks_like_type {
                     // Try exact scoped match first, then last-segment match
                     let struct_nid = node_ids
@@ -1468,7 +1468,7 @@ fn extract_import_edges(
         if let Some(&nid) = node_ids.get(&sig.qualified_name) {
             let norm = normalize_symbol(&sig.qualified_name);
             symbol_map.entry(norm.clone()).or_default().push(nid);
-            if let Some(last) = norm.split('.').last() {
+            if let Some(last) = norm.split('.').next_back() {
                 symbol_map.entry(last.to_string()).or_default().push(nid);
             }
         }
@@ -1529,7 +1529,7 @@ fn resolve_import_targets(
     }
 
     if targets.is_empty() {
-        if let Some(last) = normalized.split('.').last() {
+        if let Some(last) = normalized.split('.').next_back() {
             if let Some(ids) = symbol_map.get(last) {
                 targets.extend(ids);
             }
@@ -1576,9 +1576,7 @@ pub fn normalize_symbol(raw: &str) -> String {
         .replace("?.", ".")
         .replace("::", ".")
         .replace("->", ".")
-        .replace('\\', ".")
-        .replace('/', ".")
-        .replace(':', ".")
+        .replace(['\\', '/', ':'], ".")
         .replace("..", ".")
         .trim_matches('.')
         .to_string()
