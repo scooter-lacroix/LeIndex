@@ -41,7 +41,7 @@ impl LeIndex {
 
         // Step 3: Identify changed/new/deleted files
         let mut files_to_parse = Vec::new();
-        let mut unchanged_files = Vec::new();
+        let mut unchanged_files = std::collections::HashSet::new();
 
         let current_file_paths: std::collections::HashSet<String> = source_files_with_hashes
             .iter()
@@ -56,7 +56,7 @@ impl LeIndex {
             {
                 files_to_parse.push(path.clone());
             } else {
-                unchanged_files.push(path_str);
+                unchanged_files.insert(path_str);
             }
         }
 
