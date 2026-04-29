@@ -390,6 +390,7 @@ pub enum MergeError {
 mod tests {
     use super::*;
     use crate::storage::pdg_store::save_pdg;
+    use std::sync::Arc;
     use tempfile::NamedTempFile;
 
     fn create_test_resolver() -> CrossProjectResolver {
@@ -407,7 +408,7 @@ mod tests {
             id: node_id_str,
             node_type: crate::graph::pdg::NodeType::Function,
             name: "test_func".to_string(),
-            file_path: "src/test.rs".to_string(),
+            file_path: Arc::from("src/test.rs"),
             byte_range: (0, 100),
             complexity: 5,
             language: "rust".to_string(),
@@ -714,7 +715,7 @@ mod tests {
             id: "root_func".to_string(),
             node_type: crate::graph::pdg::NodeType::Function,
             name: "root_func".to_string(),
-            file_path: "src/root.rs".to_string(),
+            file_path: Arc::from("src/root.rs"),
             byte_range: (0, 100),
             complexity: 5,
             language: "rust".to_string(),
@@ -727,7 +728,7 @@ mod tests {
             id: "ext_func".to_string(),
             node_type: crate::graph::pdg::NodeType::Function,
             name: "ext_func".to_string(),
-            file_path: "src/ext.rs".to_string(),
+            file_path: Arc::from("src/ext.rs"),
             byte_range: (0, 100),
             complexity: 3,
             language: "rust".to_string(),

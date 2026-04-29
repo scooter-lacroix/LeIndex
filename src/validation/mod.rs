@@ -8,13 +8,12 @@
 #![warn(unused_extern_crates)]
 
 mod drift;
-mod edit_change;
 mod impact;
 mod reference;
 mod syntax;
 
+pub use crate::edit::{EditType, ResolvedEditChange};
 pub use drift::{DriftItem, DriftReport, DriftType, SemanticDriftAnalyzer};
-pub use edit_change::EditChange;
 pub use impact::{ImpactAnalyzer, ImpactReport, Location, RiskLevel};
 pub use reference::{ReferenceChecker, ReferenceIssue, ReferenceIssueType};
 pub use syntax::{ErrorSeverity, SyntaxError, SyntaxValidator};
@@ -169,7 +168,7 @@ impl LogicValidator {
     ///
     /// # Returns
     /// Validation result with all found issues
-    pub fn validate_change(&self, change: &EditChange) -> Result<ValidationResult> {
+    pub fn validate_change(&self, change: &ResolvedEditChange) -> Result<ValidationResult> {
         self.validate_changes(&[change.clone()])
     }
 
@@ -180,7 +179,7 @@ impl LogicValidator {
     ///
     /// # Returns
     /// Validation result with all found issues
-    pub fn validate_changes(&self, changes: &[EditChange]) -> Result<ValidationResult> {
+    pub fn validate_changes(&self, changes: &[ResolvedEditChange]) -> Result<ValidationResult> {
         let mut result = ValidationResult::new();
 
         // Syntax validation
@@ -308,6 +307,186 @@ mod tests {
         };
         assert_eq!(loc.to_string(), "10:5");
     }
+
+    #[test]
+    fn test_validation_to_json_empty_result() {
+        let result = ValidationResult::new();
+        let json = validation_to_json(&result);
+
+        // Verify all required fields present
+        assert_eq!(json["is_valid"], true);
+        assert_eq!(json["has_errors"], false);
+        assert!(json["syntax_errors"].is_array());
+        assert!(json["syntax_errors"].as_array().unwrap().is_empty());
+        assert!(json["reference_issues"].is_array());
+        assert!(json["reference_issues"].as_array().unwrap().is_empty());
+        assert!(json["semantic_drift"].is_array());
+        assert!(json["semantic_drift"].as_array().unwrap().is_empty());
+        assert!(json["impact_report"].is_null());
+    }
+
+    #[test]
+    fn test_validation_to_json_with_syntax_error() {
+        let mut result = ValidationResult::new();
+        result.add_syntax_error(SyntaxError {
+            file_path: PathBuf::from("src/main.rs"),
+            line: 42,
+            column: 10,
+            message: "expected `;`".to_string(),
+            severity: ErrorSeverity::Error,
+        });
+        let json = validation_to_json(&result);
+
+        assert_eq!(json["is_valid"], false);
+        assert_eq!(json["has_errors"], true);
+
+        let errors = json["syntax_errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["file"], "src/main.rs");
+        assert_eq!(errors[0]["line"], 42);
+        assert_eq!(errors[0]["column"], 10);
+        assert_eq!(errors[0]["message"], "expected `;`");
+        assert_eq!(errors[0]["severity"], "Error");
+    }
+
+    #[test]
+    fn test_validation_to_json_with_reference_issue() {
+        let mut result = ValidationResult::new();
+        result.add_reference_issue(ReferenceIssue {
+            issue_type: ReferenceIssueType::BrokenImport {
+                symbol: "missing_mod".to_string(),
+            },
+            file_path: PathBuf::from("src/lib.rs"),
+            location: Location { line: 5, column: 1 },
+            description: "Import not found".to_string(),
+        });
+        let json = validation_to_json(&result);
+
+        assert_eq!(json["is_valid"], false);
+        assert_eq!(json["has_errors"], true);
+
+        let issues = json["reference_issues"].as_array().unwrap();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0]["file"], "src/lib.rs");
+        assert_eq!(issues[0]["location"], "5:1");
+        assert_eq!(issues[0]["description"], "Import not found");
+    }
+
+    #[test]
+    fn test_validation_to_json_with_semantic_drift() {
+        let mut result = ValidationResult::new();
+        result.add_semantic_drift(DriftItem {
+            symbol_name: "my_func".to_string(),
+            drift_type: DriftType::SignatureChanged,
+            location: Location {
+                line: 10,
+                column: 1,
+            },
+            impact_description: "Parameter count changed".to_string(),
+        });
+        let json = validation_to_json(&result);
+
+        assert_eq!(json["is_valid"], false);
+        assert_eq!(json["has_errors"], true);
+
+        let drift = json["semantic_drift"].as_array().unwrap();
+        assert_eq!(drift.len(), 1);
+        assert_eq!(drift[0]["symbol"], "my_func");
+        assert_eq!(drift[0]["drift_type"], "SignatureChanged");
+        assert_eq!(drift[0]["location"], "10:1");
+        assert_eq!(drift[0]["impact"], "Parameter count changed");
+    }
+
+    #[test]
+    fn test_validation_to_json_with_warning_only() {
+        let mut result = ValidationResult::new();
+        result.add_syntax_error(SyntaxError {
+            file_path: PathBuf::from("test.rs"),
+            line: 1,
+            column: 1,
+            message: "Unused variable".to_string(),
+            severity: ErrorSeverity::Warning,
+        });
+        let json = validation_to_json(&result);
+
+        assert_eq!(json["is_valid"], false);
+        assert_eq!(json["has_errors"], false); // warnings only, no errors
+        let errors = json["syntax_errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["severity"], "Warning");
+    }
+}
+
+/// Convert a [`ValidationResult`] into a structured JSON value suitable for
+/// inclusion in MCP edit responses.
+///
+/// The returned object always contains the following fields:
+/// - `is_valid: bool`
+/// - `has_errors: bool`
+/// - `syntax_errors: []`
+/// - `reference_issues: []`
+/// - `semantic_drift: []`
+/// - `impact_report: null | { risk_level, affected_symbols, affected_files }`
+///
+/// Empty arrays are produced for clean validations, ensuring a consistent
+/// response shape that MCP consumers can rely on.
+pub fn validation_to_json(result: &ValidationResult) -> serde_json::Value {
+    let syntax_errors: Vec<serde_json::Value> = result
+        .syntax_errors
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "file": e.file_path.display().to_string(),
+                "line": e.line,
+                "column": e.column,
+                "message": e.message,
+                "severity": format!("{:?}", e.severity),
+            })
+        })
+        .collect();
+
+    let reference_issues: Vec<serde_json::Value> = result
+        .reference_issues
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "type": format!("{:?}", i.issue_type),
+                "file": i.file_path.display().to_string(),
+                "location": format!("{}:{}", i.location.line, i.location.column),
+                "description": i.description,
+            })
+        })
+        .collect();
+
+    let semantic_drift: Vec<serde_json::Value> = result
+        .semantic_drift
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "symbol": d.symbol_name,
+                "drift_type": format!("{:?}", d.drift_type),
+                "location": format!("{}:{}", d.location.line, d.location.column),
+                "impact": d.impact_description,
+            })
+        })
+        .collect();
+
+    let impact_report = result.impact_report.as_ref().map(|r| {
+        serde_json::json!({
+            "risk_level": format!("{:?}", r.risk_level),
+            "affected_symbols": r.affected_nodes,
+            "affected_files": r.affected_files.len(),
+        })
+    });
+
+    serde_json::json!({
+        "is_valid": result.is_valid,
+        "has_errors": result.has_errors(),
+        "syntax_errors": syntax_errors,
+        "reference_issues": reference_issues,
+        "semantic_drift": semantic_drift,
+        "impact_report": impact_report,
+    })
 }
 
 /// Library initialization

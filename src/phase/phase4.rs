@@ -93,6 +93,7 @@ pub fn run(context: &PhaseExecutionContext, options: &PhaseOptions) -> Phase4Sum
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use super::*;
     use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
     use std::collections::HashMap;
@@ -116,7 +117,7 @@ mod tests {
             id: format!("src/lib.rs:{name}"),
             node_type: NodeType::Function,
             name: name.to_string(),
-            file_path: "src/lib.rs".to_string(),
+            file_path: Arc::from("src/lib.rs"),
             byte_range: (0, 1),
             complexity,
             language: "rust".to_string(),

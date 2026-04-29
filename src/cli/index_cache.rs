@@ -1,8 +1,8 @@
 // Index Cache — cache subsystem extracted from LeIndex
 
 use crate::cli::memory::{
-    pdg_cache_key, project_scan_cache_key, search_cache_key, CacheEntry,
-    CacheSpiller, MemoryConfig, WarmStrategy,
+    pdg_cache_key, project_scan_cache_key, search_cache_key, CacheEntry, CacheSpiller,
+    MemoryConfig, WarmStrategy,
 };
 use crate::graph::pdg::ProgramDependenceGraph;
 use anyhow::{Context, Result};
@@ -108,13 +108,15 @@ impl IndexCache {
                 if matches!(node.node_type, crate::graph::pdg::NodeType::External) {
                     continue;
                 }
-                let entry = cache.entry(node.file_path.clone()).or_insert_with(|| FileStats {
-                    symbol_count: 0,
-                    total_complexity: 0,
-                    symbol_names: Vec::new(),
-                    outgoing_deps: 0,
-                    incoming_deps: 0,
-                });
+                let entry = cache
+                    .entry(node.file_path.to_string())
+                    .or_insert_with(|| FileStats {
+                        symbol_count: 0,
+                        total_complexity: 0,
+                        symbol_names: Vec::new(),
+                        outgoing_deps: 0,
+                        incoming_deps: 0,
+                    });
                 entry.symbol_count += 1;
                 entry.total_complexity += node.complexity;
                 if entry.symbol_names.len() < 5 {
@@ -132,18 +134,18 @@ impl IndexCache {
                 for dep_id in pdg.neighbors(*nid) {
                     if let Some(dep) = pdg.get_node(dep_id) {
                         if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
-                            && dep.file_path != *file_path
+                            && dep.file_path.as_ref() != file_path.as_str()
                         {
-                            outgoing_files.insert(dep.file_path.clone());
+                            outgoing_files.insert(dep.file_path.to_string());
                         }
                     }
                 }
                 for dep_id in pdg.predecessors(*nid) {
                     if let Some(dep) = pdg.get_node(dep_id) {
                         if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
-                            && dep.file_path != *file_path
+                            && dep.file_path.as_ref() != file_path.as_str()
                         {
-                            incoming_files.insert(dep.file_path.clone());
+                            incoming_files.insert(dep.file_path.to_string());
                         }
                     }
                 }
@@ -219,11 +221,7 @@ impl IndexCache {
     }
 
     /// Spill vector search cache to disk.
-    pub fn spill_vector_cache(
-        &mut self,
-        project_id: &str,
-        search_node_count: usize,
-    ) -> Result<()> {
+    pub fn spill_vector_cache(&mut self, project_id: &str, search_node_count: usize) -> Result<()> {
         let cache_key = search_cache_key(project_id);
         let entry = CacheEntry::SearchIndex {
             project_id: project_id.to_string(),
@@ -275,10 +273,7 @@ impl IndexCache {
     }
 
     /// Warm caches with frequently accessed data.
-    pub fn warm_cache(
-        &mut self,
-        strategy: WarmStrategy,
-    ) -> Result<crate::cli::memory::WarmResult> {
+    pub fn warm_cache(&mut self, strategy: WarmStrategy) -> Result<crate::cli::memory::WarmResult> {
         info!("Warming caches with strategy: {:?}", strategy);
         Ok(self.cache_spiller.warm_cache(strategy)?)
     }

@@ -341,7 +341,7 @@ Configure in `settings.json`:
 <details>
 <summary><b>Claude Code</b></summary>
 
-Add to `~/.config/claude-code/mcp_servers.json`:
+Add to `~/.claude/settings.json` or project-local `.claude/settings.json`:
 
 ```json
 {
@@ -349,11 +349,15 @@ Add to `~/.config/claude-code/mcp_servers.json`:
     "leindex": {
       "command": "npx",
       "args": ["-y", "@leindex/mcp"],
-      "env": {}
+      "type": "stdio"
     }
   }
 }
 ```
+
+Optional guidance pack:
+- Install the shared skill from `integrations/skills/leindex-toolkit/` into `~/.claude/skills/leindex-toolkit/`
+- Merge `integrations/claude-code/settings.example.json` to add the LeIndex reminder hook
 </details>
 
 <details>
@@ -458,6 +462,12 @@ Add to `~/.gemini/settings.json`:
 }
 ```
 </details>
+
+Agent guidance packs:
+- Claude Code: shared skill plus reminder hook
+- Codex: install `integrations/skills/leindex-toolkit/` into `~/.codex/skills/leindex-toolkit/`
+- Gemini CLI, Amp, OpenCode, Qwen, and iFlow: reuse the shared skill text as project instructions or agent rules
+- Full instructions: `docs/AGENT_GUIDANCE.md`
 
 <details>
 <summary><b>Claude Desktop</b></summary>

@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "leindex": {
+      "command": "npx",
+      "args": ["-y", "@leindex/mcp"],
+      "type": "stdio"
+    }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Grep|Glob|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/integrations/claude-code/hooks/use-leindex-instead.py"
+          }
+        ]
+      }
+    ]
+  }
+}

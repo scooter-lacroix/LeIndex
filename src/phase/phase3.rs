@@ -42,7 +42,7 @@ pub fn run(context: &PhaseExecutionContext, options: &PhaseOptions) -> Phase3Sum
         {
             impacted.insert(impacted_node);
             if let Some(node) = context.pdg.get_node(impacted_node) {
-                *file_impact.entry(node.file_path.clone()).or_insert(0) += 1;
+                *file_impact.entry(node.file_path.to_string()).or_insert(0) += 1;
             }
         }
     }
@@ -63,6 +63,7 @@ pub fn run(context: &PhaseExecutionContext, options: &PhaseOptions) -> Phase3Sum
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use super::*;
     use crate::graph::pdg::{Edge, EdgeMetadata, EdgeType, Node, NodeType, ProgramDependenceGraph};
     use std::collections::HashMap;
@@ -85,7 +86,7 @@ mod tests {
             id: "src/a.rs:a".to_string(),
             node_type: NodeType::Function,
             name: "a".to_string(),
-            file_path: "src/a.rs".to_string(),
+            file_path: Arc::from("src/a.rs"),
             byte_range: (0, 1),
             complexity: 9,
             language: "rust".to_string(),
@@ -94,7 +95,7 @@ mod tests {
             id: "src/b.rs:b".to_string(),
             node_type: NodeType::Function,
             name: "b".to_string(),
-            file_path: "src/b.rs".to_string(),
+            file_path: Arc::from("src/b.rs"),
             byte_range: (0, 1),
             complexity: 2,
             language: "rust".to_string(),

@@ -544,18 +544,23 @@ leindex -v mcp
 
 #### Claude Code Integration
 
-Add to `~/.claude/claude_desktop_config.json`:
+Add to `~/.claude/settings.json` or project-local `.claude/settings.json`:
 
 ```json
 {
   "mcpServers": {
     "leindex": {
       "command": "npx",
-      "args": ["-y", "@leindex/mcp"]
+      "args": ["-y", "@leindex/mcp"],
+      "type": "stdio"
     }
   }
 }
 ```
+
+Optional guidance pack:
+- Shared skill: `integrations/skills/leindex-toolkit/`
+- Reminder hook example: `integrations/claude-code/settings.example.json`
 
 #### Cursor Integration
 

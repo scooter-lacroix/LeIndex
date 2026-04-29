@@ -11,6 +11,7 @@ use crate::storage::nodes::{NodeRecord, NodeType as StorageNodeType};
 use crate::storage::schema::Storage;
 use rusqlite::{params, Result as SqliteResult};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Type alias for node database rows to reduce type complexity
 type NodeDbRow = (
@@ -179,7 +180,7 @@ pub fn save_pdg(
         let record = NodeRecord {
             id: None,
             project_id: project_id.to_string(),
-            file_path: pdg_node.file_path.clone(),
+            file_path: pdg_node.file_path.to_string(),
             node_id: pdg_node.id.clone(),
             symbol_name: pdg_node.name.clone(),
             qualified_name: pdg_node
@@ -349,7 +350,7 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
             id: node_id_str,
             node_type: convert_storage_node_type(&node_type),
             name: symbol_name,
-            file_path,
+            file_path: Arc::from(file_path),
             byte_range: (start.unwrap_or(0) as usize, end.unwrap_or(0) as usize),
             complexity: complexity.unwrap_or(0) as u32,
             language,
@@ -549,7 +550,7 @@ mod tests {
             id: "func1".to_string(),
             node_type: PDGNodeType::Function,
             name: "func1".to_string(),
-            file_path: "test.rs".to_string(),
+            file_path: Arc::from("test.rs"),
             byte_range: (0, 100),
             complexity: 5,
             language: "rust".to_string(),
@@ -559,7 +560,7 @@ mod tests {
             id: "func2".to_string(),
             node_type: PDGNodeType::Function,
             name: "func2".to_string(),
-            file_path: "test.rs".to_string(),
+            file_path: Arc::from("test.rs"),
             byte_range: (100, 200),
             complexity: 3,
             language: "rust".to_string(),
@@ -614,7 +615,7 @@ mod tests {
             id: "new_func".to_string(),
             node_type: PDGNodeType::Function,
             name: "new_func".to_string(),
-            file_path: "new.rs".to_string(),
+            file_path: Arc::from("new.rs"),
             byte_range: (0, 50),
             complexity: 1,
             language: "rust".to_string(),
@@ -764,7 +765,7 @@ mod tests {
             id: "child".to_string(),
             node_type: PDGNodeType::Class,
             name: "Child".to_string(),
-            file_path: "test.rs".to_string(),
+            file_path: Arc::from("test.rs"),
             byte_range: (0, 50),
             complexity: 1,
             language: "rust".to_string(),
@@ -774,7 +775,7 @@ mod tests {
             id: "parent".to_string(),
             node_type: PDGNodeType::Class,
             name: "Parent".to_string(),
-            file_path: "test.rs".to_string(),
+            file_path: Arc::from("test.rs"),
             byte_range: (50, 100),
             complexity: 1,
             language: "rust".to_string(),
@@ -784,7 +785,7 @@ mod tests {
             id: "data_user".to_string(),
             node_type: PDGNodeType::Function,
             name: "data_user".to_string(),
-            file_path: "test.rs".to_string(),
+            file_path: Arc::from("test.rs"),
             byte_range: (100, 150),
             complexity: 1,
             language: "rust".to_string(),

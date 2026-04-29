@@ -25,8 +25,8 @@ If you installed the full Rust binary and want to run it directly, `leindex mcp`
 
 Add to your Claude Code MCP configuration:
 
-**macOS/Linux:** `~/.config/claude-code/mcp_servers.json`
-**Windows:** `%APPDATA%\claude-code\mcp_servers.json`
+**Global:** `~/.claude/settings.json`
+**Project-local:** `.claude/settings.json`
 
 ```json
 {
@@ -34,11 +34,15 @@ Add to your Claude Code MCP configuration:
     "leindex": {
       "command": "npx",
       "args": ["-y", "@leindex/mcp"],
-      "env": {}
+      "type": "stdio"
     }
   }
 }
 ```
+
+Optional guidance pack:
+- Shared skill: `integrations/skills/leindex-toolkit/`
+- Reminder hook example: `integrations/claude-code/settings.example.json`
 
 ### Cursor
 

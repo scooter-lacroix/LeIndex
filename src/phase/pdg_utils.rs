@@ -219,8 +219,7 @@ pub fn relink_external_import_edges(pdg: &mut ProgramDependenceGraph, config: &R
         let Some(node) = pdg.get_node(node_idx) else {
             continue;
         };
-        if matches!(node.node_type, NodeType::External)
-        {
+        if matches!(node.node_type, NodeType::External) {
             continue;
         }
         for key in candidate_keys_for_node(node) {
@@ -247,8 +246,7 @@ pub fn relink_external_import_edges(pdg: &mut ProgramDependenceGraph, config: &R
         let Some(target) = pdg.get_node(to) else {
             continue;
         };
-        if !matches!(target.node_type, NodeType::External)
-        {
+        if !matches!(target.node_type, NodeType::External) {
             continue;
         }
 
@@ -562,8 +560,7 @@ mod tests {
                 }
                 let (_, to) = pdg.edge_endpoints(idx)?;
                 let target = pdg.get_node(to)?;
-                matches!(target.node_type, NodeType::External)
-                    .then_some(())
+                matches!(target.node_type, NodeType::External).then_some(())
             })
             .count();
 

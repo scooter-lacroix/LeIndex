@@ -285,7 +285,7 @@ pub async fn index_with_progress(
     // Quick cached check first so we can emit a skip event immediately.
     let handle = registry.get_or_load(Some(project_path)).await?;
     let cached_stats = {
-        let idx = handle.lock().await;
+        let idx = handle.read().await;
         if idx.is_indexed() && !force_reindex {
             Some(idx.get_stats().clone())
         } else {

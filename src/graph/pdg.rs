@@ -12,6 +12,7 @@ use petgraph::stable_graph::StableGraph;
 use petgraph::visit::EdgeRef;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex};
 
 /// A unique identifier for a node in the Program Dependence Graph.
 ///
@@ -57,7 +58,10 @@ pub struct Node {
     pub name: String,
 
     /// Absolute path to the file containing this node.
-    pub file_path: String,
+    ///
+    /// Uses `Arc<str>` for string interning: nodes in the same file share
+    /// the same allocation, avoiding per-node path duplication.
+    pub file_path: Arc<str>,
 
     /// Byte range (start, end) within the source file where this node is defined.
     pub byte_range: (usize, usize),
@@ -238,7 +242,8 @@ pub struct TraversalConfig {
     /// Strongly recommended: always set this. `None` = unlimited.
     pub max_nodes: Option<usize>,
     /// Only traverse edges of these types. `None` = all edge types.
-    pub allowed_edge_types: Option<Vec<EdgeType>>,
+    /// Uses a static slice to eliminate heap allocation during traversal.
+    pub allowed_edge_types: Option<&'static [EdgeType]>,
     /// Do not collect nodes of these types (but still traverse through them).
     pub excluded_node_types: Option<Vec<NodeType>>,
     /// Skip collecting nodes with complexity below this threshold.
@@ -254,7 +259,7 @@ impl TraversalConfig {
         Self {
             max_depth: Some(3),
             max_nodes: Some(50),
-            allowed_edge_types: Some(vec![EdgeType::Call, EdgeType::DataDependency]),
+            allowed_edge_types: Some(&[EdgeType::Call, EdgeType::DataDependency]),
             excluded_node_types: Some(vec![NodeType::Module]),
             min_complexity: None,
             min_edge_confidence: 0.5,
@@ -266,7 +271,7 @@ impl TraversalConfig {
         Self {
             max_depth: Some(5),
             max_nodes: Some(150),
-            allowed_edge_types: Some(vec![
+            allowed_edge_types: Some(&[
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
@@ -282,7 +287,7 @@ impl TraversalConfig {
         Self {
             max_depth: None,
             max_nodes: Some(500),
-            allowed_edge_types: Some(vec![
+            allowed_edge_types: Some(&[
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
@@ -298,7 +303,7 @@ impl TraversalConfig {
         Self {
             max_depth: Some(10),
             max_nodes: Some(1000),
-            allowed_edge_types: Some(vec![EdgeType::Import]),
+            allowed_edge_types: Some(&[EdgeType::Import]),
             excluded_node_types: None,
             min_complexity: None,
             min_edge_confidence: 0.0,
@@ -345,9 +350,9 @@ impl TraversalConfig {
 ///
 /// Rationale: At 50k nodes with 1536-dim embeddings, inline storage adds ~300MB
 /// to the graph struct. This store is optional — the graph operates fully without it.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct EmbeddingStore {
-    embeddings: HashMap<String, Vec<f32>>, // keyed by node.id (stable across serialization)
+    pub(crate) embeddings: HashMap<String, Vec<f32>>, // keyed by node.id (stable across serialization)
 }
 
 impl EmbeddingStore {
@@ -426,6 +431,10 @@ struct SerializablePDG {
     name_index: HashMap<String, Vec<u32>>,
     #[serde(default)]
     name_lower_index: HashMap<String, Vec<u32>>,
+    /// Embeddings stored separately from nodes for memory efficiency.
+    /// Keyed by node.id string, value is the embedding vector.
+    #[serde(default)]
+    embeddings: HashMap<String, Vec<f32>>,
 }
 
 impl SerializablePDG {
@@ -483,6 +492,7 @@ impl SerializablePDG {
             file_index,
             name_index,
             name_lower_index,
+            embeddings: pdg.embedding_store.embeddings.clone(),
         }
     }
 
@@ -554,6 +564,19 @@ impl SerializablePDG {
             pdg.graph.add_edge(*src, *tgt, se.edge.clone());
         }
 
+        // Restore embeddings from serialized data
+        for (node_id, embedding) in &self.embeddings {
+            pdg.embedding_store.insert(node_id, embedding.clone());
+        }
+
+        // Rebuild name_file_index from nodes (not serialized separately)
+        for nid in pdg.graph.node_indices() {
+            if let Some(node) = pdg.graph.node_weight(nid) {
+                pdg.name_file_index
+                    .insert((node.name.clone(), node.file_path.to_string()), nid);
+            }
+        }
+
         Ok(pdg)
     }
 }
@@ -607,6 +630,43 @@ pub struct ProgramDependenceGraph {
     /// This eliminates the O(n) scan that would otherwise be needed for
     /// case-insensitive searches like `find_by_name_in_file`.
     pub(crate) name_lower_index: HashMap<String, Vec<NodeId>>,
+
+    /// Externalized embedding storage.
+    ///
+    /// Embeddings are stored here rather than inline in `Node` to reduce memory
+    /// usage. At 50k nodes with 1536-dim embeddings, inline storage would add
+    /// ~300MB; this optional store is populated on demand.
+    pub embedding_store: EmbeddingStore,
+
+    /// O(1) lookup by (name, file_path) pair.
+    ///
+    /// Used by `find_by_name_in_file()` when a file hint is provided,
+    /// replacing the linear scan through `name_index` candidates.
+    /// Populated during `add_node()`, cleaned up in `remove_node()`.
+    name_file_index: HashMap<(String, String), NodeId>,
+
+    /// Reusable scratch buffer for BFS neighbor collection.
+    ///
+    /// Avoids allocating a new `Vec<NodeId>` on every BFS level iteration.
+    /// Cleared at the start of each level, reused across traversals.
+    /// Wrapped in `Mutex` because the PDG is shared across threads
+    /// (e.g., via `Arc<ProgramDependenceGraph>` in validation handlers).
+    bfs_scratch: Mutex<Vec<NodeId>>,
+}
+
+impl Clone for ProgramDependenceGraph {
+    fn clone(&self) -> Self {
+        Self {
+            graph: self.graph.clone(),
+            symbol_index: self.symbol_index.clone(),
+            file_index: self.file_index.clone(),
+            name_index: self.name_index.clone(),
+            name_lower_index: self.name_lower_index.clone(),
+            embedding_store: self.embedding_store.clone(),
+            name_file_index: self.name_file_index.clone(),
+            bfs_scratch: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl ProgramDependenceGraph {
@@ -618,6 +678,9 @@ impl ProgramDependenceGraph {
             file_index: HashMap::new(),
             name_index: HashMap::new(),
             name_lower_index: HashMap::new(),
+            embedding_store: EmbeddingStore::new(),
+            name_file_index: HashMap::new(),
+            bfs_scratch: Mutex::new(Vec::new()),
         }
     }
 
@@ -642,7 +705,7 @@ impl ProgramDependenceGraph {
         let id = self.graph.add_node(node.clone());
         self.symbol_index.insert(node.id.clone(), id);
         self.file_index
-            .entry(node.file_path.clone())
+            .entry(node.file_path.to_string())
             .or_default()
             .push(id);
         self.name_index
@@ -653,6 +716,8 @@ impl ProgramDependenceGraph {
             .entry(node.name.to_lowercase())
             .or_default()
             .push(id);
+        self.name_file_index
+            .insert((node.name.clone(), node.file_path.to_string()), id);
         id
     }
 
@@ -684,7 +749,8 @@ impl ProgramDependenceGraph {
     pub fn remove_node(&mut self, node_id: NodeId) -> Option<Node> {
         if let Some(node) = self.graph.remove_node(node_id) {
             self.symbol_index.remove(&node.id);
-            if let Some(v) = self.file_index.get_mut(&node.file_path) {
+            self.embedding_store.remove(&node.id);
+            if let Some(v) = self.file_index.get_mut(&*node.file_path) {
                 v.retain(|&id| id != node_id);
             }
             if let Some(v) = self.name_index.get_mut(&node.name) {
@@ -693,6 +759,8 @@ impl ProgramDependenceGraph {
             if let Some(v) = self.name_lower_index.get_mut(&node.name.to_lowercase()) {
                 v.retain(|&id| id != node_id);
             }
+            self.name_file_index
+                .remove(&(node.name.clone(), node.file_path.to_string()));
             Some(node)
         } else {
             None
@@ -945,13 +1013,20 @@ impl ProgramDependenceGraph {
     /// Find by name with optional file hint.
     /// All lookups are index-backed — no O(n) scans.
     pub fn find_by_name_in_file(&self, name: &str, file_hint: Option<&str>) -> Option<NodeId> {
+        // 0. O(1) exact lookup via name_file_index when file hint is provided
+        if let Some(fp) = file_hint {
+            if let Some(&nid) = self.name_file_index.get(&(name.to_string(), fp.to_string())) {
+                return Some(nid);
+            }
+        }
+
         // 1. Exact match via name_index
         let candidates = self.name_index.get(name).cloned().unwrap_or_default();
         if !candidates.is_empty() {
             if let Some(fp) = file_hint {
                 if let Some(&nid) = candidates.iter().find(|&&nid| {
                     self.get_node(nid)
-                        .map(|n| n.file_path == fp)
+                        .map(|n| n.file_path.as_ref() == fp)
                         .unwrap_or(false)
                 }) {
                     return Some(nid);
@@ -971,7 +1046,7 @@ impl ProgramDependenceGraph {
             if let Some(fp) = file_hint {
                 if let Some(&nid) = ci_candidates.iter().find(|&&nid| {
                     self.get_node(nid)
-                        .map(|n| n.file_path == fp)
+                        .map(|n| n.file_path.as_ref() == fp)
                         .unwrap_or(false)
                 }) {
                     return Some(nid);
@@ -1103,6 +1178,41 @@ impl ProgramDependenceGraph {
     }
 
     // -----------------------------------------------------------------------
+    // Embedding accessors
+    // -----------------------------------------------------------------------
+
+    /// Stores an embedding for a specific node.
+    ///
+    /// The embedding is stored in the external `EmbeddingStore`, keeping it
+    /// separate from the graph structure to reduce memory usage.
+    ///
+    /// # Arguments
+    ///
+    /// * `node_id` - The string identifier of the node (matches `Node.id`)
+    /// * `embedding` - The vector embedding (typically 1536 dimensions)
+    pub fn set_embedding(&mut self, node_id: &str, embedding: Vec<f32>) {
+        self.embedding_store.insert(node_id, embedding);
+    }
+
+    /// Retrieves the embedding for a node.
+    ///
+    /// # Arguments
+    ///
+    /// * `node_id` - The string identifier of the node
+    ///
+    /// # Returns
+    ///
+    /// An optional reference to the embedding vector if it exists.
+    pub fn get_embedding(&self, node_id: &str) -> Option<&Vec<f32>> {
+        self.embedding_store.get(node_id)
+    }
+
+    /// Returns the number of embeddings stored in the embedding store.
+    pub fn embedding_count(&self) -> usize {
+        self.embedding_store.len()
+    }
+
+    // -----------------------------------------------------------------------
     // Traversal — all methods require explicit TraversalConfig
     // -----------------------------------------------------------------------
 
@@ -1156,30 +1266,36 @@ impl ProgramDependenceGraph {
                 }
             }
 
-            let neighbors: Vec<NodeId> = match dir {
+            // Reuse the scratch buffer instead of allocating a new Vec per level.
+            let mut scratch = self.bfs_scratch.lock().unwrap();
+            scratch.clear();
+            match dir {
                 Direction::Forward => {
                     // Outgoing edges — filter by edge type
-                    self.graph
-                        .edges(current)
-                        .filter(|e| config.edge_allowed(e.weight()))
-                        .map(|e| e.target())
-                        .collect()
+                    scratch.extend(
+                        self.graph
+                            .edges(current)
+                            .filter(|e| config.edge_allowed(e.weight()))
+                            .map(|e| e.target()),
+                    );
                 }
                 Direction::Backward => {
                     use petgraph::Direction as PD;
-                    self.graph
-                        .edges_directed(current, PD::Incoming)
-                        .filter(|e| config.edge_allowed(e.weight()))
-                        .map(|e| e.source())
-                        .collect()
+                    scratch.extend(
+                        self.graph
+                            .edges_directed(current, PD::Incoming)
+                            .filter(|e| config.edge_allowed(e.weight()))
+                            .map(|e| e.source()),
+                    );
                 }
-            };
+            }
 
-            for neighbor in neighbors {
+            for &neighbor in scratch.iter() {
                 if visited.insert(neighbor) {
                     queue.push_back((neighbor, depth + 1));
                 }
             }
+            // scratch (MutexGuard) dropped here → lock released
         }
 
         result
@@ -1266,7 +1382,7 @@ impl ProgramDependenceGraph {
         let config = TraversalConfig {
             max_depth: Some(max_depth),
             max_nodes: Some(500),
-            allowed_edge_types: Some(vec![
+            allowed_edge_types: Some(&[
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
@@ -1293,7 +1409,7 @@ impl ProgramDependenceGraph {
         let config = TraversalConfig {
             max_depth: Some(max_depth),
             max_nodes: Some(500),
-            allowed_edge_types: Some(vec![
+            allowed_edge_types: Some(&[
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
@@ -1345,7 +1461,7 @@ mod tests {
             id: id.to_string(),
             node_type: ntype,
             name: name.to_string(),
-            file_path: file.to_string(),
+            file_path: Arc::from(file),
             byte_range: (0, 10),
             complexity: 2,
             language: "rust".to_string(),
@@ -1417,6 +1533,43 @@ mod tests {
     }
 
     #[test]
+    fn name_file_index_provides_o1_lookup() {
+        let mut pdg = ProgramDependenceGraph::new();
+
+        // Add nodes with same name in different files
+        let a = pdg.add_node(make_node("a.rs:foo", "foo", "a.rs", NodeType::Function));
+        let b = pdg.add_node(make_node("b.rs:foo", "foo", "b.rs", NodeType::Function));
+        let c = pdg.add_node(make_node("c.rs:foo", "foo", "c.rs", NodeType::Function));
+
+        // Direct name_file_index lookup with file hint returns correct node
+        assert_eq!(pdg.find_by_name_in_file("foo", Some("a.rs")), Some(a));
+        assert_eq!(pdg.find_by_name_in_file("foo", Some("b.rs")), Some(b));
+        assert_eq!(pdg.find_by_name_in_file("foo", Some("c.rs")), Some(c));
+
+        // Non-existent file returns None for exact match but falls through
+        assert_eq!(pdg.find_by_name_in_file("foo", Some("z.rs")), Some(a));
+    }
+
+    #[test]
+    fn name_file_index_maintained_on_remove() {
+        let mut pdg = ProgramDependenceGraph::new();
+        let a = pdg.add_node(make_node("a.rs:foo", "foo", "a.rs", NodeType::Function));
+        let b = pdg.add_node(make_node("b.rs:bar", "bar", "b.rs", NodeType::Function));
+
+        // Verify lookups work before removal
+        assert_eq!(pdg.find_by_name_in_file("foo", Some("a.rs")), Some(a));
+        assert_eq!(pdg.find_by_name_in_file("bar", Some("b.rs")), Some(b));
+
+        // Remove node a
+        pdg.remove_node(a);
+
+        // name_file_index should no longer find removed node
+        assert_eq!(pdg.find_by_name_in_file("foo", Some("a.rs")), None);
+        // b should still be found
+        assert_eq!(pdg.find_by_name_in_file("bar", Some("b.rs")), Some(b));
+    }
+
+    #[test]
     fn containment_edge_type_is_separate_from_call() {
         let mut pdg = ProgramDependenceGraph::new();
         let cls = pdg.add_node(make_node("f:C", "C", "f.rs", NodeType::Class));
@@ -1449,7 +1602,7 @@ mod tests {
         let config = TraversalConfig {
             max_depth: Some(5),
             max_nodes: Some(100),
-            allowed_edge_types: Some(vec![EdgeType::DataDependency]),
+            allowed_edge_types: Some(&[EdgeType::DataDependency]),
             excluded_node_types: None,
             min_complexity: None,
             min_edge_confidence: 0.5,
@@ -1504,5 +1657,229 @@ mod tests {
             !bidirectional.contains(&n2),
             "Should not include start node"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // EmbeddingStore integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn embedding_store_field_initialized_on_new_pdg() {
+        let pdg = ProgramDependenceGraph::new();
+        assert!(pdg.embedding_store.is_empty());
+        assert_eq!(pdg.embedding_count(), 0);
+    }
+
+    #[test]
+    fn set_and_get_embedding_roundtrip() {
+        let mut pdg = ProgramDependenceGraph::new();
+        let n1 = pdg.add_node(make_node("f:foo", "foo", "f.rs", NodeType::Function));
+
+        // Store embedding via PDG accessor
+        let emb = vec![0.1, 0.2, 0.3, 0.4];
+        pdg.set_embedding("f:foo", emb.clone());
+
+        // Retrieve via PDG accessor
+        assert_eq!(pdg.get_embedding("f:foo"), Some(&emb));
+        assert_eq!(pdg.embedding_count(), 1);
+
+        // Node should still exist
+        assert!(pdg.get_node(n1).is_some());
+    }
+
+    #[test]
+    fn remove_node_cleans_up_embedding() {
+        let mut pdg = ProgramDependenceGraph::new();
+        let n1 = pdg.add_node(make_node("f:foo", "foo", "f.rs", NodeType::Function));
+        pdg.set_embedding("f:foo", vec![0.5, 0.6]);
+
+        assert_eq!(pdg.embedding_count(), 1);
+
+        // Remove node should also remove embedding
+        let removed = pdg.remove_node(n1);
+        assert!(removed.is_some());
+        assert_eq!(pdg.embedding_count(), 0);
+        assert!(pdg.get_embedding("f:foo").is_none());
+    }
+
+    #[test]
+    fn remove_file_cleans_up_all_embeddings() {
+        let mut pdg = ProgramDependenceGraph::new();
+        let n1 = pdg.add_node(make_node("f:a", "a", "src/lib.rs", NodeType::Function));
+        let n2 = pdg.add_node(make_node("f:b", "b", "src/lib.rs", NodeType::Function));
+        let n3 = pdg.add_node(make_node("f:c", "c", "src/other.rs", NodeType::Function));
+
+        pdg.set_embedding("f:a", vec![1.0]);
+        pdg.set_embedding("f:b", vec![2.0]);
+        pdg.set_embedding("f:c", vec![3.0]);
+
+        assert_eq!(pdg.embedding_count(), 3);
+
+        // Remove file src/lib.rs — should clean up a and b embeddings
+        pdg.remove_file("src/lib.rs");
+
+        assert!(
+            pdg.get_embedding("f:a").is_none(),
+            "a's embedding should be removed"
+        );
+        assert!(
+            pdg.get_embedding("f:b").is_none(),
+            "b's embedding should be removed"
+        );
+        assert_eq!(
+            pdg.get_embedding("f:c"),
+            Some(&vec![3.0]),
+            "c's embedding should remain"
+        );
+        assert_eq!(pdg.embedding_count(), 1);
+
+        // n1 and n2 should be gone, n3 should remain
+        assert!(pdg.get_node(n1).is_none());
+        assert!(pdg.get_node(n2).is_none());
+        assert!(pdg.get_node(n3).is_some());
+    }
+
+    #[test]
+    fn embedding_store_overwrite() {
+        let mut pdg = ProgramDependenceGraph::new();
+        pdg.add_node(make_node("f:foo", "foo", "f.rs", NodeType::Function));
+
+        pdg.set_embedding("f:foo", vec![1.0, 2.0]);
+        assert_eq!(pdg.get_embedding("f:foo"), Some(&vec![1.0, 2.0]));
+
+        // Overwrite
+        pdg.set_embedding("f:foo", vec![3.0, 4.0]);
+        assert_eq!(pdg.get_embedding("f:foo"), Some(&vec![3.0, 4.0]));
+        assert_eq!(
+            pdg.embedding_count(),
+            1,
+            "Should still have 1 embedding after overwrite"
+        );
+    }
+
+    #[test]
+    fn serialization_preserves_embeddings() {
+        let mut pdg = ProgramDependenceGraph::new();
+        let n1 = pdg.add_node(make_node("f:foo", "foo", "f.rs", NodeType::Function));
+        let n2 = pdg.add_node(make_node("f:bar", "bar", "f.rs", NodeType::Function));
+        pdg.add_call_edges(vec![(n1, n2)]);
+        pdg.set_embedding("f:foo", vec![0.1, 0.2, 0.3]);
+        pdg.set_embedding("f:bar", vec![0.4, 0.5, 0.6]);
+
+        // Serialize
+        let bytes = pdg.serialize().expect("Serialization should succeed");
+
+        // Deserialize
+        let restored =
+            ProgramDependenceGraph::deserialize(&bytes).expect("Deserialization should succeed");
+
+        // Verify embeddings survived the round-trip
+        assert_eq!(restored.get_embedding("f:foo"), Some(&vec![0.1, 0.2, 0.3]));
+        assert_eq!(restored.get_embedding("f:bar"), Some(&vec![0.4, 0.5, 0.6]));
+        assert_eq!(restored.embedding_count(), 2);
+    }
+
+    #[test]
+    fn deserialization_backward_compat_no_embeddings() {
+        let mut pdg = ProgramDependenceGraph::new();
+        let n1 = pdg.add_node(make_node("f:foo", "foo", "f.rs", NodeType::Function));
+        pdg.add_call_edges(vec![(n1, n1)]);
+
+        // Manually serialize without embeddings (simulate old format)
+        let old_format = SerializablePDG {
+            nodes: pdg
+                .graph
+                .node_indices()
+                .map(|idx| SerializableNode {
+                    index: idx.index() as u32,
+                    node: pdg.graph[idx].clone(),
+                })
+                .collect(),
+            edges: pdg
+                .graph
+                .edge_indices()
+                .map(|eidx| {
+                    let (source, target) = pdg.graph.edge_endpoints(eidx).unwrap();
+                    SerializableEdge {
+                        source: source.index() as u32,
+                        target: target.index() as u32,
+                        edge: pdg.graph[eidx].clone(),
+                    }
+                })
+                .collect(),
+            symbol_index: pdg
+                .symbol_index
+                .iter()
+                .map(|(k, v)| (k.clone(), v.index() as u32))
+                .collect(),
+            file_index: pdg
+                .file_index
+                .iter()
+                .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
+                .collect(),
+            name_index: pdg
+                .name_index
+                .iter()
+                .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
+                .collect(),
+            name_lower_index: pdg
+                .name_lower_index
+                .iter()
+                .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
+                .collect(),
+            embeddings: HashMap::new(), // No embeddings — simulates old format
+        };
+
+        let bytes = bincode::serialize(&old_format).expect("Serialize old format");
+        let restored = ProgramDependenceGraph::deserialize(&bytes)
+            .expect("Should deserialize old format without error");
+
+        assert_eq!(restored.embedding_count(), 0);
+        assert_eq!(restored.node_count(), 1);
+    }
+
+    #[test]
+    fn bulk_import_edges_helper() {
+        let mut pdg = ProgramDependenceGraph::new();
+        let a = pdg.add_node(make_node("mod:a", "a", "a.rs", NodeType::Module));
+        let b = pdg.add_node(make_node("mod:b", "b", "b.rs", NodeType::Module));
+        let c = pdg.add_node(make_node("mod:c", "c", "c.rs", NodeType::Module));
+
+        pdg.add_import_edges(vec![(a, b), (a, c)]);
+
+        let import_count = pdg
+            .edge_indices()
+            .filter_map(|e| pdg.get_edge(e))
+            .filter(|e| e.edge_type == EdgeType::Import)
+            .count();
+        assert_eq!(import_count, 2, "Should have 2 import edges");
+    }
+
+    #[test]
+    fn bulk_inheritance_edges_with_confidence() {
+        let mut pdg = ProgramDependenceGraph::new();
+        let child = pdg.add_node(make_node("f:Child", "Child", "f.rs", NodeType::Class));
+        let parent = pdg.add_node(make_node("f:Parent", "Parent", "f.rs", NodeType::Class));
+
+        pdg.add_inheritance_edges(vec![(child, parent, 0.85)]);
+
+        // Verify edge was created with correct type and confidence
+        let edges: Vec<_> = pdg
+            .edge_indices()
+            .filter_map(|e| {
+                let edge = pdg.get_edge(e)?;
+                if edge.edge_type == EdgeType::Inheritance {
+                    Some((pdg.edge_endpoints(e).unwrap(), edge.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        assert_eq!(edges.len(), 1);
+        let ((src, tgt), edge) = &edges[0];
+        assert_eq!(*src, child);
+        assert_eq!(*tgt, parent);
+        assert_eq!(edge.metadata.confidence, Some(0.85));
     }
 }

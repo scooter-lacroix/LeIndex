@@ -80,7 +80,7 @@ fn benchmark_dot_product(c: &mut Criterion) {
         #[cfg(target_arch = "x86_64")]
         {
             if is_x86_feature_detected!("avx2") {
-                use lerecherche::quantization::simd::x86_avx2;
+                use leindex::search::quantization::simd::x86_avx2;
 
                 group.bench_with_input(BenchmarkId::new("avx2", dim), dim, |b, _| {
                     b.iter(|| unsafe {
@@ -143,7 +143,7 @@ fn benchmark_throughput(c: &mut Criterion) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            use lerecherche::quantization::simd::x86_avx2;
+            use leindex::search::quantization::simd::x86_avx2;
 
             group.bench_function("avx2_batch_1000", |b| {
                 b.iter(|| {
@@ -203,7 +203,7 @@ fn benchmark_comparison(c: &mut Criterion) {
     #[cfg(target_arch = "x86_64")]
     {
         if is_x86_feature_detected!("avx2") {
-            use lerecherche::quantization::simd::x86_avx2;
+            use leindex::search::quantization::simd::x86_avx2;
 
             group.bench_function("avx2_768d", |b| {
                 b.iter(|| unsafe {

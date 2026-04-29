@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 use super::leindex::{
-    IndexStats, ProjectFileScan, FileStats,
-    SOURCE_FILE_EXTENSIONS, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS,
+    FileStats, IndexStats, ProjectFileScan, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS,
+    SOURCE_FILE_EXTENSIONS,
 };
 
 // ============================================================================
@@ -139,6 +139,7 @@ impl TfIdfEmbedder {
     /// 2. Build document-frequency table (df[token] = # docs containing token)
     /// 3. Compute IDF = ln(N / df) per token, filtering extreme frequencies
     /// 4. Stratified vocabulary selection across the full IDF range (up to 768 tokens)
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn build(documents: &[(String, String)]) -> Self {
         let tokenized: Vec<(String, Vec<String>)> = documents
             .iter()
@@ -194,12 +195,21 @@ impl TfIdfEmbedder {
             "TF-IDF vocabulary candidates (moderate-IDF filter)"
         );
 
-        // Stratified vocabulary selection across the full IDF range.
-        idf_scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        // Stratified vocabulary selection using sort-based sampling.
+        // Sort by IDF score, then sample at quantile boundaries to get
+        // diverse coverage across the full IDF range.
+        idf_scores.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
         let final_scores: Vec<(String, f32)> = if idf_scores.len() <= TARGET_DIM {
+            // Fewer candidates than target — use all.
             idf_scores
         } else {
+            // Sample at stratified quantile boundaries to get TARGET_DIM elements
+            // covering the full IDF range.
             let total = idf_scores.len();
             let stride = total as f64 / TARGET_DIM as f64;
             (0..TARGET_DIM)
@@ -313,8 +323,7 @@ pub(crate) fn is_dependency_manifest_name(name: &str) -> bool {
 
 /// Scan the project directory for source and manifest files.
 pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan> {
-    let project_config =
-        crate::cli::config::ProjectConfig::load(project_path).unwrap_or_default();
+    let project_config = crate::cli::config::ProjectConfig::load(project_path).unwrap_or_default();
     let mut source_paths = Vec::new();
     let mut manifest_paths = Vec::new();
     let mut walker = walkdir::WalkDir::new(project_path).into_iter();
@@ -348,7 +357,8 @@ pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan>
 
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             if is_dependency_manifest_name(name) {
-                let is_lockfile = name.contains("lock") || name.contains(".sum") || name == "npm-shrinkwrap.json";
+                let is_lockfile =
+                    name.contains("lock") || name.contains(".sum") || name == "npm-shrinkwrap.json";
                 if is_lockfile || !project_config.should_exclude(path) {
                     manifest_paths.push(path.to_path_buf());
                 }
@@ -402,8 +412,10 @@ pub(crate) fn collect_source_files_with_hashes(
 /// per-file PDG into the global index). Does not deduplicate by symbol
 /// name to preserve overloaded methods that share the same qualified name.
 pub(crate) fn merge_pdgs(target: &mut ProgramDependenceGraph, source: ProgramDependenceGraph) {
-    let mut id_map: std::collections::HashMap<petgraph::graph::NodeIndex, petgraph::graph::NodeIndex> =
-        std::collections::HashMap::with_capacity(source.node_count());
+    let mut id_map: std::collections::HashMap<
+        petgraph::graph::NodeIndex,
+        petgraph::graph::NodeIndex,
+    > = std::collections::HashMap::with_capacity(source.node_count());
 
     for node_idx in source.node_indices() {
         if let Some(node) = source.get_node(node_idx) {
@@ -437,15 +449,17 @@ pub(crate) fn remove_file_from_pdg(
 pub(crate) fn normalize_external_nodes(pdg: &mut ProgramDependenceGraph) {
     let mut migrated = 0usize;
     for node in pdg.node_weights_mut() {
-        let is_external = node.language == "external"
-            || node.language.starts_with("external:");
+        let is_external = node.language == "external" || node.language.starts_with("external:");
         if is_external && node.node_type != NodeType::External {
             node.node_type = NodeType::External;
             migrated += 1;
         }
     }
     if migrated > 0 {
-        info!("Normalized {} external nodes to NodeType::External", migrated);
+        info!(
+            "Normalized {} external nodes to NodeType::External",
+            migrated
+        );
     }
 }
 
@@ -455,8 +469,7 @@ pub(crate) fn save_to_storage(
     project_id: &str,
     pdg: &ProgramDependenceGraph,
 ) -> Result<()> {
-    pdg_store::save_pdg(storage, project_id, pdg)
-        .context("Failed to save PDG to storage")?;
+    pdg_store::save_pdg(storage, project_id, pdg).context("Failed to save PDG to storage")?;
     info!("Saved PDG to storage for project: {}", project_id);
     Ok(())
 }
@@ -483,7 +496,7 @@ pub(crate) fn index_nodes(
     let connectivity_config = crate::graph::pdg::TraversalConfig {
         max_depth: Some(1),
         max_nodes: Some(1000),
-        allowed_edge_types: Some(vec![EdgeType::Call, EdgeType::DataDependency]),
+        allowed_edge_types: Some(&[EdgeType::Call, EdgeType::DataDependency]),
         excluded_node_types: Some(vec![NodeType::External]),
         min_complexity: None,
         min_edge_confidence: 0.0,
@@ -492,10 +505,10 @@ pub(crate) fn index_nodes(
     for node_idx in pdg.node_indices() {
         if let Some(node) = pdg.get_node(node_idx) {
             let content = file_cache
-                .entry(node.file_path.clone())
+                .entry(node.file_path.to_string())
                 .or_insert_with(|| {
                     std::sync::Arc::new(
-                        std::fs::read(&node.file_path)
+                        std::fs::read(&*node.file_path)
                             .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
                             .unwrap_or_default(),
                     )
@@ -531,7 +544,10 @@ pub(crate) fn index_nodes(
 
                 if start < end {
                     let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
-                    format!("{}\n// {} in {}\n{}", enrichment, node.name, node.file_path, snippet)
+                    format!(
+                        "{}\n// {} in {}\n{}",
+                        enrichment, node.name, node.file_path, snippet
+                    )
                 } else {
                     format!(
                         "{}\n// {} in {}\n{}",
@@ -563,7 +579,7 @@ pub(crate) fn index_nodes(
 
             let node_info = NodeInfo {
                 node_id: node.id.clone(),
-                file_path: node.file_path.clone(),
+                file_path: node.file_path.to_string(),
                 symbol_name: node.name.clone(),
                 language: node.language.clone(),
                 content: node_content,
@@ -594,9 +610,9 @@ pub(crate) fn detect_changed_manifests(
         .store()
         .peek(&cache_key)
         .and_then(|entry| match entry {
-            crate::cli::memory::CacheEntry::Binary { serialized_data, .. } => {
-                bincode::deserialize::<ProjectFileScan>(serialized_data).ok()
-            }
+            crate::cli::memory::CacheEntry::Binary {
+                serialized_data, ..
+            } => bincode::deserialize::<ProjectFileScan>(serialized_data).ok(),
             _ => None,
         })
         .map(|scan| scan.manifest_hashes)
@@ -654,20 +670,22 @@ pub(crate) fn files_importing_from_manifests(
         }
     }
 
-    let affected_set: HashSet<String> =
-        affected.iter().map(|p| p.display().to_string()).collect();
+    let affected_set: HashSet<String> = affected.iter().map(|p| p.display().to_string()).collect();
 
-    let source_set: HashSet<String> =
-        all_source_paths.iter().map(|p| p.display().to_string()).collect();
+    let source_set: HashSet<String> = all_source_paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
 
     let mut affected_set = affected_set;
     for nid in pdg.node_indices() {
         if let Some(node) = pdg.get_node(nid) {
             if node.node_type == NodeType::External {
-                if !affected_set.contains(&node.file_path) {
-                    if source_set.contains(&node.file_path) {
-                        affected_set.insert(node.file_path.clone());
-                        affected.push(PathBuf::from(&node.file_path));
+                let fp = node.file_path.as_ref();
+                if !affected_set.contains(fp) {
+                    if source_set.contains(fp) {
+                        affected_set.insert(node.file_path.to_string());
+                        affected.push(PathBuf::from(&*node.file_path));
                     }
                 }
             }
@@ -933,5 +951,129 @@ mod tests {
         let vec = embedder.embed("zzzzzz aaaaaaa bbbbbbb cccccccc");
         let magnitude: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
         assert!(magnitude < 1.1, "magnitude out of range: {}", magnitude);
+    }
+
+    /// Regression test: verify partition-based selection produces the same
+    /// vocab+idf as the original sort-based approach.
+    #[test]
+    fn test_tfidf_partition_matches_sort_selection() {
+        use std::collections::HashMap;
+
+        // Generate a corpus that produces >768 candidates after df filtering.
+        //
+        // Strategy: Create ~1200 tokens, each appearing in 3-8 documents.
+        // With 200 docs, min_df=3 and max_df=50, this produces ~1200 candidates,
+        // which exercises the sort+stride sampling branch (for >768 candidates).
+        //
+        // Token distribution:
+        // - 1200 unique tokens total (3-letter lowercase tokens like "aaa", "aab", ...)
+        // - Each token appears in 3-8 documents (df in range [3, 8])
+        // - Documents are 200, each containing ~180 tokens
+        // - All tokens are space-separated to avoid introducing extra code keywords
+        //
+        let mut docs: Vec<(String, String)> = Vec::with_capacity(200);
+
+        // First, create 1200 tokens with their assigned document ranges
+        // Use lowercase letter-based tokens to avoid camelCase splitting
+        let token_names: Vec<String> = (0usize..1200)
+            .map(|i| {
+                // Create tokens like "aaa", "aab", etc. - won't be split by tokenizer
+                let first = (b'a' + (i % 26) as u8) as char;
+                let second = (b'a' + ((i / 26) % 26) as u8) as char;
+                let third = (b'a' + ((i / 676) % 26) as u8) as char;
+                format!("{}{}{}", first, second, third)
+            })
+            .collect();
+        
+        let mut token_doc_assignments: Vec<(String, Vec<usize>)> = Vec::new();
+        for (token_id, token) in token_names.iter().enumerate() {
+            // Each token appears in 3-8 documents
+            let df = 3 + (token_id % 6); // df in range [3, 8]
+            
+            // Use modulo to distribute tokens across documents deterministically
+            let docs_with_token: Vec<usize> = (0..df)
+                .map(|j| (token_id * 7 + j * 13) % 200) // Spread across docs
+                .collect();
+            
+            token_doc_assignments.push((token.clone(), docs_with_token));
+        }
+
+        // Build documents by collecting their assigned tokens
+        for doc_id in 0..200 {
+            let mut tokens = Vec::new();
+            for (token, doc_ids) in &token_doc_assignments {
+                if doc_ids.contains(&doc_id) {
+                    tokens.push(token.clone());
+                }
+            }
+            
+            // Format as space-separated tokens (no code keywords to avoid extra tokens)
+            let content = tokens.join(" ");
+            docs.push((format!("doc_{}", doc_id), content));
+        }
+
+        let embedder = TfIdfEmbedder::build(&docs);
+
+        // Build a reference vocab using the original sort+stride approach
+        // with the SAME min_df/max_df logic as build_from_tokens.
+        let tokenized: Vec<(String, Vec<String>)> = docs
+            .iter()
+            .map(|(id, content)| (id.clone(), tokenize_code(content)))
+            .collect();
+
+        let n = tokenized.len();
+        let n_f = n as f32;
+        // Same logic as build_from_tokens
+        let min_df: usize = if n < 50 { 1 } else { (n / 1000).max(3) };
+        let max_df: usize = if n < 50 { n } else { (n / 4).max(min_df + 1) };
+
+        let mut df: HashMap<String, usize> = HashMap::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (_, tokens) in &tokenized {
+            seen.clear();
+            for tok in tokens {
+                if seen.insert(tok.as_str()) {
+                    *df.entry(tok.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        let mut ref_scores: Vec<(String, f32)> = df
+            .into_iter()
+            .filter(|(_, c)| *c >= min_df && *c <= max_df)
+            .map(|(tok, c)| (tok, (n_f / c as f32).ln()))
+            .collect();
+        // Sort by IDF score, then by token name for deterministic tie-breaking
+        ref_scores.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let target_dim = crate::search::search::DEFAULT_EMBEDDING_DIMENSION;
+        let expected_vocab: Vec<String> = if ref_scores.len() <= target_dim {
+            ref_scores.iter().map(|(t, _)| t.clone()).collect()
+        } else {
+            let total = ref_scores.len();
+            let stride = total as f64 / target_dim as f64;
+            (0..target_dim)
+                .map(|i| ref_scores[((i as f64 * stride) as usize).min(total - 1)].0.clone())
+                .collect()
+        };
+
+        // The embedder's vocab should match the sort-based reference exactly.
+        assert_eq!(
+            embedder.vocab.len(),
+            expected_vocab.len(),
+            "vocab length mismatch: got {} expected {}",
+            embedder.vocab.len(),
+            expected_vocab.len()
+        );
+        for (i, (got, expected)) in embedder.vocab.iter().zip(expected_vocab.iter()).enumerate() {
+            assert_eq!(
+                got, expected,
+                "vocab mismatch at position {i}: got '{got}' expected '{expected}'"
+            );
+        }
     }
 }

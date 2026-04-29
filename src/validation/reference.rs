@@ -1,7 +1,7 @@
 //! Reference integrity checking via legraphe
 
+use crate::edit::ResolvedEditChange;
 use crate::graph::ProgramDependenceGraph;
-use crate::validation::edit_change::EditChange;
 use crate::validation::Location;
 use crate::validation::ValidationError;
 use std::collections::{HashMap, HashSet};
@@ -114,7 +114,7 @@ impl ReferenceChecker {
     /// Vector of reference issues found
     pub fn check_references(
         &self,
-        changes: &[EditChange],
+        changes: &[ResolvedEditChange],
     ) -> Result<Vec<ReferenceIssue>, ValidationError> {
         let mut issues = Vec::new();
 
@@ -145,7 +145,7 @@ impl ReferenceChecker {
     }
 
     /// Extract imports from edit change content
-    fn extract_imports(&self, change: &EditChange) -> Vec<String> {
+    fn extract_imports(&self, change: &ResolvedEditChange) -> Vec<String> {
         let mut imports = Vec::new();
         let lang = change.infer_language();
 
@@ -263,7 +263,7 @@ impl ReferenceChecker {
     }
 
     /// Find undefined references in the edit change
-    fn find_undefined_references(&self, change: &EditChange) -> Vec<ReferenceIssue> {
+    fn find_undefined_references(&self, change: &ResolvedEditChange) -> Vec<ReferenceIssue> {
         let mut issues = Vec::new();
         let lang = change.infer_language();
 
@@ -412,7 +412,7 @@ impl ReferenceChecker {
     /// Check for cycles introduced by the changes
     fn check_for_cycles(
         &self,
-        changes: &[EditChange],
+        changes: &[ResolvedEditChange],
     ) -> Result<Vec<ReferenceIssue>, ValidationError> {
         let mut issues = Vec::new();
 
@@ -533,7 +533,7 @@ mod tests {
         let pdg = Arc::new(ProgramDependenceGraph::new());
         let checker = ReferenceChecker::new(pdg);
 
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.py"),
             String::new(),
             "import os\nimport sys\nfrom collections import defaultdict\n".to_string(),
@@ -548,7 +548,7 @@ mod tests {
         let pdg = Arc::new(ProgramDependenceGraph::new());
         let checker = ReferenceChecker::new(pdg);
 
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.js"),
             String::new(),
             "import { foo } from 'bar';\nconst baz = require('qux');\n".to_string(),
@@ -563,7 +563,7 @@ mod tests {
         let pdg = Arc::new(ProgramDependenceGraph::new());
         let checker = ReferenceChecker::new(pdg);
 
-        let change = EditChange::new(
+        let change = ResolvedEditChange::new(
             PathBuf::from("test.rs"),
             String::new(),
             "use std::collections::HashMap;\nmod my_module;\n".to_string(),

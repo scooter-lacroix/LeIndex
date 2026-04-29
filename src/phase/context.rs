@@ -109,6 +109,7 @@ impl PhaseExecutionContext {
             if !parse_paths.is_empty() {
                 self.parse_results = ParallelParser::new().parse_files(parse_paths);
                 self.signatures_by_file = signatures_from_results(&self.root, &self.parse_results);
+                let source_bytes_map = source_bytes_from_results(&self.root, &self.parse_results);
 
                 let inventory_hashes = freshness
                     .file_inventory
@@ -128,10 +129,15 @@ impl PhaseExecutionContext {
                         let _ = delete_file_data(&mut self.storage, &self.project_id, &key);
                     }
 
-                    let source_bytes = source_bytes_for_file(&self.root, file_path);
+                    // Use source_bytes from ParsingResult when available, fall back to disk read
+                    let source_bytes_fallback = source_bytes_for_file(&self.root, file_path);
+                    let source_bytes = source_bytes_map
+                        .get(file_path)
+                        .map(|s| s.as_slice())
+                        .unwrap_or_else(|| source_bytes_fallback.as_slice());
                     let file_pdg = extract_pdg_from_signatures(
                         signatures.clone(),
-                        &source_bytes,
+                        source_bytes,
                         file_path,
                         language,
                     );
@@ -170,12 +176,18 @@ impl PhaseExecutionContext {
             .collect::<Vec<_>>();
         self.parse_results = ParallelParser::new().parse_files(parse_targets);
         self.signatures_by_file = signatures_from_results(&self.root, &self.parse_results);
+        let source_bytes_map = source_bytes_from_results(&self.root, &self.parse_results);
 
         let mut pdg = ProgramDependenceGraph::new();
         for (file_path, (language, signatures)) in &self.signatures_by_file {
-            let source_bytes = source_bytes_for_file(&self.root, file_path);
+            // Use source_bytes from ParsingResult when available, fall back to disk read
+            let source_bytes_fallback = source_bytes_for_file(&self.root, file_path);
+            let source_bytes = source_bytes_map
+                .get(file_path)
+                .map(|s| s.as_slice())
+                .unwrap_or_else(|| source_bytes_fallback.as_slice());
             let file_pdg =
-                extract_pdg_from_signatures(signatures.clone(), &source_bytes, file_path, language);
+                extract_pdg_from_signatures(signatures.clone(), source_bytes, file_path, language);
             merge_pdgs(&mut pdg, &file_pdg);
         }
         crate::phase::pdg_utils::relink_external_import_edges(
@@ -226,6 +238,21 @@ fn signatures_from_results(
                 .unwrap_or_else(|| "unknown".to_string());
             let file = normalize_file_key(root, &result.file_path.display().to_string());
             Some((file, (language, result.signatures.clone())))
+        })
+        .collect()
+}
+
+/// Build a map from file path → source bytes from ParsingResults.
+/// Returns an empty Vec for results without source_bytes.
+fn source_bytes_from_results(root: &Path, results: &[ParsingResult]) -> HashMap<String, Vec<u8>> {
+    results
+        .iter()
+        .filter_map(|result| {
+            if !result.is_success() {
+                return None;
+            }
+            let file = normalize_file_key(root, &result.file_path.display().to_string());
+            Some((file, result.source_bytes.clone().unwrap_or_default()))
         })
         .collect()
 }

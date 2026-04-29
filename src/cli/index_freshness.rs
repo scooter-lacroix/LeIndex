@@ -1,12 +1,12 @@
 // Index Freshness — staleness detection logic extracted from LeIndex
 
+use super::leindex::{ProjectFileScan, DEPENDENCY_MANIFEST_NAMES};
 use crate::cli::memory::CacheEntry;
+use crate::cli::skip_dirs::SKIP_DIRS;
 use crate::storage::schema::Storage;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use super::leindex::{ProjectFileScan, DEPENDENCY_MANIFEST_NAMES};
-use crate::cli::skip_dirs::SKIP_DIRS;
 
 /// Read-only context passed to freshness functions to avoid borrow conflicts.
 pub(crate) struct FreshnessContext<'a> {
@@ -25,9 +25,8 @@ pub(crate) fn check_freshness(
     scan_fn: impl Fn() -> Result<ProjectFileScan>,
     hash_fn: impl Fn(&Path) -> Result<String>,
 ) -> Result<(Vec<PathBuf>, Vec<String>)> {
-    let indexed_files =
-        crate::storage::pdg_store::get_indexed_files(ctx.storage, ctx.project_id)
-            .unwrap_or_default();
+    let indexed_files = crate::storage::pdg_store::get_indexed_files(ctx.storage, ctx.project_id)
+        .unwrap_or_default();
 
     let scan = scan_fn()?;
     let current: Vec<(PathBuf, String)> = scan
@@ -56,7 +55,10 @@ pub(crate) fn check_freshness(
 }
 
 /// Check if any dependency manifest/lockfile has changed since last index.
-pub(crate) fn check_manifest_stale(ctx: &FreshnessContext<'_>, scan_fn: impl Fn() -> Result<ProjectFileScan>) -> bool {
+pub(crate) fn check_manifest_stale(
+    ctx: &FreshnessContext<'_>,
+    scan_fn: impl Fn() -> Result<ProjectFileScan>,
+) -> bool {
     let db_time = match ctx
         .storage_path
         .join("leindex.db")
@@ -112,10 +114,12 @@ pub(crate) fn check_manifest_stale(ctx: &FreshnessContext<'_>, scan_fn: impl Fn(
 /// 2. Directory mtime sentinel — detects new file additions in <1ms
 /// 3. Mtime sampling of 50-500 indexed files
 /// 4. Manifest walkdir (depth-limited) for dependency changes
-pub(crate) fn is_stale_fast(ctx: &FreshnessContext<'_>, scan_fn: impl Fn() -> Result<ProjectFileScan>) -> bool {
-    let indexed_files =
-        crate::storage::pdg_store::get_indexed_files(ctx.storage, ctx.project_id)
-            .unwrap_or_default();
+pub(crate) fn is_stale_fast(
+    ctx: &FreshnessContext<'_>,
+    scan_fn: impl Fn() -> Result<ProjectFileScan>,
+) -> bool {
+    let indexed_files = crate::storage::pdg_store::get_indexed_files(ctx.storage, ctx.project_id)
+        .unwrap_or_default();
 
     if indexed_files.is_empty() {
         return true;
@@ -258,7 +262,10 @@ pub(crate) fn is_stale_fast(ctx: &FreshnessContext<'_>, scan_fn: impl Fn() -> Re
                         return false;
                     }
                     // Skip non-root hidden directories (mirrors external_deps.rs)
-                    if e.path() != ctx.project_path && name.starts_with('.') && e.file_type().is_dir() {
+                    if e.path() != ctx.project_path
+                        && name.starts_with('.')
+                        && e.file_type().is_dir()
+                    {
                         return false;
                     }
                 }
