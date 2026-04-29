@@ -107,9 +107,15 @@ For the exact source implementation use leindex_read_symbol."
         {
             arr.iter()
                 .filter_map(|v| v.as_str().map(str::to_owned))
+                .filter(|s| !s.trim().is_empty())
                 .take(20)
                 .collect()
         } else if let Ok(sym) = extract_string(&args, "symbol") {
+            if sym.trim().is_empty() {
+                return Err(JsonRpcError::invalid_params(
+                    "'symbol' must be a non-empty string".to_string(),
+                ));
+            }
             vec![sym]
         } else {
             return Err(JsonRpcError::invalid_params(
@@ -117,10 +123,10 @@ For the exact source implementation use leindex_read_symbol."
             ));
         };
 
-        // Validate symbols is non-empty
+        // Validate symbols is non-empty (after filtering blanks)
         if symbols.is_empty() {
             return Err(JsonRpcError::invalid_params(
-                "'symbols' array must contain at least one valid string".to_string(),
+                "'symbols' array must contain at least one non-blank string".to_string(),
             ));
         }
 
@@ -377,5 +383,69 @@ mod tests {
         let args = serde_json::json!({ "symbol": "my_func" });
         let result = SymbolLookupHandler.execute(&registry, args).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_blank_single_symbol_rejected() {
+        let dir = tempdir().unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "symbol": "" });
+        let result = SymbolLookupHandler.execute(&registry, args).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("non-empty"),
+            "Expected 'non-empty' in error message, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_whitespace_only_single_symbol_rejected() {
+        let dir = tempdir().unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "symbol": "   " });
+        let result = SymbolLookupHandler.execute(&registry, args).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("non-empty"),
+            "Expected 'non-empty' in error message, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_blank_batch_symbols_rejected() {
+        let dir = tempdir().unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "symbols": ["", ""] });
+        let result = SymbolLookupHandler.execute(&registry, args).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("non-blank"),
+            "Expected 'non-blank' in error message, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_with_mixed_blank_and_valid_symbols() {
+        // Blank strings should be filtered out; valid symbols should proceed
+        let dir = tempdir().unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "symbols": ["", "my_func", "  "] });
+        let result = SymbolLookupHandler.execute(&registry, args).await;
+        // Should not return invalid_params — the blank strings are filtered out,
+        // leaving ["my_func"] which is a valid single-symbol lookup (just not indexed)
+        assert!(result.is_err());
+        // The error should NOT be about blank symbols — it should be about indexing
+        let err = result.unwrap_err();
+        assert!(
+            !err.message.contains("non-blank"),
+            "Should not reject for blank symbols when valid ones exist, got: {}",
+            err.message
+        );
     }
 }
