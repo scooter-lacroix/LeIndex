@@ -218,14 +218,19 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                     file_path, e
                 ))
             })?;
-            std::fs::rename(&tmp_path, &target).map_err(|e| {
-                // Clean up temp file on rename failure
+            // On Unix, rename is atomic and replaces the destination.
+            // On Windows, rename fails if the destination already exists,
+            // so fall back to copy + remove.
+            if std::fs::rename(&tmp_path, &target).is_err() {
+                std::fs::copy(&tmp_path, &target).map_err(|e| {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    JsonRpcError::internal_error(format!(
+                        "Failed to write to '{}': {}",
+                        file_path, e
+                    ))
+                })?;
                 let _ = std::fs::remove_file(&tmp_path);
-                JsonRpcError::internal_error(format!(
-                    "Failed to rename temp file to '{}': {}",
-                    file_path, e
-                ))
-            })?;
+            }
         }
 
         // Build verification context: show the edited region so LLM doesn't need to Read
