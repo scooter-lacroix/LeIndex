@@ -1650,7 +1650,7 @@ process (already partially implemented via rayon) rather than cross-machine dist
 
 - **Code churn** requires `git log` analysis (commit frequency per file, author
   activity, change rate). This is orthogonal to tree-sitter parsing and would require
-  a new data source (git2 integration already exists for other purposes)
+  a dedicated repository history data source
 - **Tech debt** quantification is inherently subjective and varies by team convention.
   Automated metrics (cyclomatic complexity, dependency depth, test coverage) are
   already partially covered by the existing `complexity` scores and hotspot detection
@@ -1661,7 +1661,7 @@ process (already partially implemented via rayon) rather than cross-machine dist
 **Recommendation:** The existing complexity scoring and hotspot detection in
 `leindex_phase_analysis` effectively address the need for tech debt awareness.
 Code churn tracking could be added as a future `leindex_git_insights` tool using
-the existing git2 dependency, but is not a priority for the MCP server.
+repository history data, but is not a priority for the MCP server.
 
 ### Cache Architecture — PDG Direct Storage
 

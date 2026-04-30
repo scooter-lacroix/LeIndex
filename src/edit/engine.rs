@@ -26,10 +26,6 @@ pub enum EditError {
     #[error("File not found: {0}")]
     FileNotFound(PathBuf),
 
-    /// Git operation failed
-    #[error("Git operation failed: {0}")]
-    GitError(String),
-
     /// Parse error
     #[error("Parse error: {0}")]
     ParseError(String),

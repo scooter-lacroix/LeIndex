@@ -945,7 +945,7 @@ impl MemoryManager {
     /// Create a new memory manager
     pub fn new(config: MemoryConfig) -> Result<Self, Error> {
         let current_pid = get_current_pid().map_err(|e| Error::ProcessAccess(e.to_string()))?;
-        let system = System::new_all();
+        let system = System::new();
 
         Ok(Self {
             config,
