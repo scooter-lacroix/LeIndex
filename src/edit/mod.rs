@@ -24,6 +24,7 @@ pub use command::{
 };
 
 // Public API re-exports from engine module
+pub(crate) use engine::{atomic_write, atomic_write_async};
 pub use engine::{
     replace_near_definitions, replace_whole_word, Diff, EditEngine, EditError, Impact, Result,
     WorktreeManager, WorktreeSession,

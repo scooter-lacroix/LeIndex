@@ -134,8 +134,11 @@ pub(crate) fn read_source_snippet(file_path: &str, byte_range: (usize, usize)) -
         return None;
     }
     let bytes = std::fs::read(file_path).ok()?;
-    let start = byte_range.0.min(bytes.len());
-    let end = byte_range.1.min(bytes.len());
+    if byte_range.0 > bytes.len() || byte_range.1 > bytes.len() {
+        return None;
+    }
+    let start = byte_range.0;
+    let end = byte_range.1;
     if start >= end {
         return None;
     }
@@ -149,6 +152,9 @@ pub(crate) fn byte_range_to_line_range(
 ) -> (usize, usize) {
     let (start, end) = byte_range;
     let bytes = content.as_bytes();
+    if start > bytes.len() || end > bytes.len() || end < start {
+        return (0, 0);
+    }
     let mut line = 1usize;
     let mut start_line = 1usize;
     let mut end_line = 1usize;
@@ -433,6 +439,40 @@ pub(crate) fn normalise_ws(s: &str) -> String {
     out.trim_end().to_string()
 }
 
+fn normalise_ws_with_spans(s: &str) -> (String, Vec<(usize, usize)>) {
+    let mut chars: Vec<char> = Vec::with_capacity(s.len());
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(s.len());
+    let mut seen_non_ws = false;
+    let mut in_ws = false;
+
+    for (idx, ch) in s.char_indices() {
+        if ch.is_whitespace() {
+            if !seen_non_ws {
+                continue;
+            }
+            if !in_ws {
+                chars.push(' ');
+                spans.push((idx, idx + ch.len_utf8()));
+                in_ws = true;
+            } else if let Some(last) = spans.last_mut() {
+                last.1 = idx + ch.len_utf8();
+            }
+        } else {
+            seen_non_ws = true;
+            in_ws = false;
+            chars.push(ch);
+            spans.push((idx, idx + ch.len_utf8()));
+        }
+    }
+
+    while matches!(chars.last(), Some(' ')) {
+        chars.pop();
+        spans.pop();
+    }
+
+    (chars.into_iter().collect(), spans)
+}
+
 /// Find `needle` in `haystack` using whitespace-normalised matching.
 ///
 /// Uses pre-computed cumulative byte offsets to achieve O(N) complexity instead
@@ -460,19 +500,20 @@ pub(crate) fn find_normalised_whitespace(haystack: &str, needle: &str) -> Option
 
     let max_window = needle.lines().count() + 5;
     for start_line in 0..lines.len() {
-        let mut window = String::new();
         let window_end = lines.len().min(start_line + max_window);
+        let byte_start = line_offsets[start_line];
+        let mut byte_end = byte_start;
         for end_line in start_line..window_end {
-            if !window.is_empty() {
-                window.push(' ');
-            }
-            window.push_str(lines[end_line].trim());
-            let norm_window = normalise_ws(&window);
+            byte_end = line_offsets[end_line] + lines[end_line].len();
+            let window = &haystack[byte_start..byte_end];
+            let (norm_window, spans) = normalise_ws_with_spans(window);
             if norm_window.contains(&norm_needle) {
-                // O(1) byte offset lookups using pre-computed offsets
-                let byte_start = line_offsets[start_line];
-                let byte_end = line_offsets[end_line] + lines[end_line].len();
-                return Some((byte_start, byte_end.min(haystack.len()) - byte_start));
+                let match_byte_start = norm_window.find(&norm_needle)?;
+                let match_char_start = norm_window[..match_byte_start].chars().count();
+                let match_char_end = match_char_start + norm_needle.chars().count();
+                let &(span_start, _) = spans.get(match_char_start)?;
+                let &(_, span_end) = spans.get(match_char_end.saturating_sub(1))?;
+                return Some((byte_start + span_start, span_end - span_start));
             }
         }
     }
@@ -550,8 +591,6 @@ pub(crate) fn phase_analysis_schema() -> Value {
         "required": []
     })
 }
-
-
 
 /// Shared test helper: creates a `ProjectRegistry` with a single project rooted at `path`.
 #[cfg(test)]
@@ -682,6 +721,16 @@ mod tests {
     }
 
     #[test]
+    fn test_read_source_snippet_rejects_out_of_bounds_range() {
+        let dir = tempdir().unwrap();
+        let file = dir.path().join("test.rs");
+        std::fs::write(&file, b"0123456789").unwrap();
+        let path = file.to_str().unwrap();
+        assert!(read_source_snippet(path, (0, 11)).is_none());
+        assert!(read_source_snippet(path, (11, 12)).is_none());
+    }
+
+    #[test]
     fn test_get_direct_callers_empty_pdg() {
         let pdg = crate::graph::pdg::ProgramDependenceGraph::new();
         let node = crate::graph::pdg::Node {
@@ -778,8 +827,23 @@ mod tests {
     }
 
     #[test]
+    fn test_byte_range_to_line_range_rejects_out_of_bounds() {
+        let content = "first line\nsecond line\n";
+        assert_eq!(byte_range_to_line_range(content, (0, 32)), (0, 0));
+        assert_eq!(byte_range_to_line_range(content, (32, 33)), (0, 0));
+    }
+
+    #[test]
     fn test_read_source_snippet_nonexistent_file() {
         assert!(read_source_snippet("/definitely/does/not/exist.rs", (0, 10)).is_none());
+    }
+
+    #[test]
+    fn test_find_normalised_whitespace_returns_tight_span() {
+        let content = "before\nfoo\t  bar\nafter";
+        let (start, len) = find_normalised_whitespace(content, "foo bar").unwrap();
+        assert_eq!(&content[start..start + len], "foo\t  bar");
+        assert_ne!(&content[start..start + len], content);
     }
 
     #[test]

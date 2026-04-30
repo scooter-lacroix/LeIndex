@@ -1,8 +1,7 @@
 use super::helpers::{extract_bool, extract_string, make_diff, wrap_with_meta};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
-use crate::edit::replace_whole_word;
-use crate::edit::ResolvedEditChange;
+use crate::edit::{atomic_write, replace_whole_word, ResolvedEditChange};
 use crate::validation::validation_to_json;
 use serde_json::Value;
 use std::path::PathBuf;
@@ -251,10 +250,18 @@ Grep + multi-file Edit with a single atomic operation."
             // If files change between validation and write, recomputing would corrupt data.
             let validated_contents = file_contents;
             tokio::task::spawn_blocking(move || {
-                for (file_path, _original, modified) in validated_contents {
-                    if let Err(e) = std::fs::write(&file_path, modified.as_bytes()) {
+                let mut written: Vec<(String, String)> = Vec::new();
+                for (file_path, original, modified) in validated_contents {
+                    if let Err(e) = atomic_write(std::path::Path::new(&file_path), modified.as_bytes()) {
+                        for (written_path, original_content) in written.into_iter().rev() {
+                            let _ = atomic_write(
+                                std::path::Path::new(&written_path),
+                                original_content.as_bytes(),
+                            );
+                        }
                         return Err(format!("Failed writing '{}': {}", file_path, e));
                     }
+                    written.push((file_path, original));
                 }
                 Ok(())
             })

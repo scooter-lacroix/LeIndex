@@ -574,17 +574,19 @@ pub(crate) fn index_nodes(
     for (node_idx, node_content, tokens) in raw_nodes {
         if let Some(node) = pdg.get_node(node_idx) {
             let embedding = embedder.embed_tokens(&tokens);
+            let signature =
+                crate::search::search::SearchEngine::extract_signature_from_content(&node_content);
 
             let node_info = NodeInfo {
                 node_id: node.id.clone(),
                 file_path: node.file_path.to_string(),
                 symbol_name: node.name.clone(),
                 language: node.language.clone(),
-                content: node_content.clone(),
+                content: node_content,
                 byte_range: node.byte_range,
                 embedding: Some(embedding),
                 complexity: node.complexity,
-                signature: crate::search::search::SearchEngine::extract_signature_from_content(&node_content),
+                signature,
             };
 
             nodes.push(node_info);
@@ -997,17 +999,17 @@ mod tests {
                 format!("{}{}{}", first, second, third)
             })
             .collect();
-        
+
         let mut token_doc_assignments: Vec<(String, Vec<usize>)> = Vec::new();
         for (token_id, token) in token_names.iter().enumerate() {
             // Each token appears in 3-8 documents
             let df = 3 + (token_id % 6); // df in range [3, 8]
-            
+
             // Use modulo to distribute tokens across documents deterministically
             let docs_with_token: Vec<usize> = (0..df)
                 .map(|j| (token_id * 7 + j * 13) % 200) // Spread across docs
                 .collect();
-            
+
             token_doc_assignments.push((token.clone(), docs_with_token));
         }
 
@@ -1019,7 +1021,7 @@ mod tests {
                     tokens.push(token.clone());
                 }
             }
-            
+
             // Format as space-separated tokens (no code keywords to avoid extra tokens)
             let content = tokens.join(" ");
             docs.push((format!("doc_{}", doc_id), content));
@@ -1070,7 +1072,11 @@ mod tests {
             let total = ref_scores.len();
             let stride = total as f64 / target_dim as f64;
             (0..target_dim)
-                .map(|i| ref_scores[((i as f64 * stride) as usize).min(total - 1)].0.clone())
+                .map(|i| {
+                    ref_scores[((i as f64 * stride) as usize).min(total - 1)]
+                        .0
+                        .clone()
+                })
                 .collect()
         };
 
@@ -1126,7 +1132,10 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             serialized_data: serialized,
         };
-        spiller.store_mut().insert(cache_key.clone(), entry).unwrap();
+        spiller
+            .store_mut()
+            .insert(cache_key.clone(), entry)
+            .unwrap();
 
         // Persist to disk, then remove from in-memory cache (simulating cold start)
         spiller.store_mut().persist_key(&cache_key).unwrap();
@@ -1151,8 +1160,7 @@ mod tests {
 
         // Without the fix, this would return the manifest as changed (false positive)
         // because old_hashes would be empty (peek returns None).
-        let changed =
-            detect_changed_manifests(&current_scan, "test_project", &spiller);
+        let changed = detect_changed_manifests(&current_scan, "test_project", &spiller);
 
         assert!(
             changed.is_empty(),
@@ -1193,7 +1201,10 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             serialized_data: serialized,
         };
-        spiller.store_mut().insert(cache_key.clone(), entry).unwrap();
+        spiller
+            .store_mut()
+            .insert(cache_key.clone(), entry)
+            .unwrap();
         spiller.store_mut().persist_key(&cache_key).unwrap();
         let _ = spiller.store_mut().remove(&cache_key);
 
@@ -1208,8 +1219,7 @@ mod tests {
             manifest_hashes: current_hashes,
         };
 
-        let changed =
-            detect_changed_manifests(&current_scan, "test_project2", &spiller);
+        let changed = detect_changed_manifests(&current_scan, "test_project2", &spiller);
 
         assert_eq!(
             changed.len(),
@@ -1241,7 +1251,10 @@ mod tests {
 
         // Create a stale disk cache with old hash
         let mut disk_hashes = std::collections::HashMap::new();
-        disk_hashes.insert(manifest_path.display().to_string(), "stale_hash".to_string());
+        disk_hashes.insert(
+            manifest_path.display().to_string(),
+            "stale_hash".to_string(),
+        );
         let disk_scan = ProjectFileScan {
             source_paths: vec![],
             manifest_paths: vec![manifest_path.clone()],
@@ -1254,12 +1267,18 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             serialized_data: serialized,
         };
-        spiller.store_mut().insert(cache_key.clone(), disk_entry).unwrap();
+        spiller
+            .store_mut()
+            .insert(cache_key.clone(), disk_entry)
+            .unwrap();
         spiller.store_mut().persist_key(&cache_key).unwrap();
 
         // Create a fresh in-memory cache with current hash
         let mut mem_hashes = std::collections::HashMap::new();
-        mem_hashes.insert(manifest_path.display().to_string(), "current_hash".to_string());
+        mem_hashes.insert(
+            manifest_path.display().to_string(),
+            "current_hash".to_string(),
+        );
         let mem_scan = ProjectFileScan {
             source_paths: vec![],
             manifest_paths: vec![manifest_path.clone()],
@@ -1271,11 +1290,17 @@ mod tests {
             metadata: std::collections::HashMap::new(),
             serialized_data: mem_serialized,
         };
-        spiller.store_mut().insert(cache_key.clone(), mem_entry).unwrap();
+        spiller
+            .store_mut()
+            .insert(cache_key.clone(), mem_entry)
+            .unwrap();
 
         // Current scan matches the in-memory hash, not the disk hash
         let mut current_hashes = std::collections::HashMap::new();
-        current_hashes.insert(manifest_path.display().to_string(), "current_hash".to_string());
+        current_hashes.insert(
+            manifest_path.display().to_string(),
+            "current_hash".to_string(),
+        );
         let current_scan = ProjectFileScan {
             source_paths: vec![],
             manifest_paths: vec![manifest_path.clone()],
@@ -1283,8 +1308,7 @@ mod tests {
             manifest_hashes: current_hashes,
         };
 
-        let changed =
-            detect_changed_manifests(&current_scan, "test_project3", &spiller);
+        let changed = detect_changed_manifests(&current_scan, "test_project3", &spiller);
 
         assert!(
             changed.is_empty(),

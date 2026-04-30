@@ -274,8 +274,7 @@ impl GlobalRegistry {
                     last_modified: row.get::<_, Option<i64>>(9)?,
                 })
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(projects)
     }
@@ -398,11 +397,9 @@ impl GlobalRegistry {
         let ids: Vec<UniqueProjectId> = stmt
             .query_map(params![base_name], |row| {
                 let id_str: String = row.get(0)?;
-                UniqueProjectId::parse_id(&id_str)
-                    .ok_or_else(|| rusqlite::Error::InvalidQuery)
+                UniqueProjectId::parse_id(&id_str).ok_or_else(|| rusqlite::Error::InvalidQuery)
             })?
-            .filter_map(|r| r.ok())
-            .collect();
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(ids)
     }
@@ -523,6 +520,80 @@ mod tests {
         assert!(projects
             .iter()
             .all(|p| p.language == Some("rust".to_string())));
+    }
+
+    #[test]
+    fn test_list_projects_propagates_invalid_row() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let mut registry = GlobalRegistry::init(&db_path).unwrap();
+
+        registry
+            .conn
+            .execute(
+                r#"
+                INSERT INTO global_projects (
+                    unique_project_id, base_name, canonical_path, language, file_count,
+                    content_fingerprint, is_clone, cloned_from, registered_at, last_modified,
+                    path_hash, instance
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                "#,
+                params![
+                    "invalid-id",
+                    "broken",
+                    "/tmp/broken",
+                    Option::<String>::None,
+                    0i64,
+                    "fp",
+                    false,
+                    Option::<String>::None,
+                    0i64,
+                    Option::<i64>::None,
+                    "deadbeef",
+                    0i64,
+                ],
+            )
+            .unwrap();
+
+        let err = registry.list_projects().unwrap_err();
+        assert!(matches!(err, GlobalRegistryError::Database(_)));
+    }
+
+    #[test]
+    fn test_load_existing_ids_propagates_invalid_row() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let mut registry = GlobalRegistry::init(&db_path).unwrap();
+
+        registry
+            .conn
+            .execute(
+                r#"
+                INSERT INTO global_projects (
+                    unique_project_id, base_name, canonical_path, language, file_count,
+                    content_fingerprint, is_clone, cloned_from, registered_at, last_modified,
+                    path_hash, instance
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                "#,
+                params![
+                    "invalid-id",
+                    "broken",
+                    "/tmp/broken",
+                    Option::<String>::None,
+                    0i64,
+                    "fp",
+                    false,
+                    Option::<String>::None,
+                    0i64,
+                    Option::<i64>::None,
+                    "deadbeef",
+                    0i64,
+                ],
+            )
+            .unwrap();
+
+        let err = registry.load_existing_ids("broken").unwrap_err();
+        assert!(matches!(err, GlobalRegistryError::Database(_)));
     }
 
     #[test]

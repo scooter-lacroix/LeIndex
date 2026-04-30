@@ -63,10 +63,6 @@ Turns a raw diff into a structural change summary with blast radius."
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
-        guard
-            .ensure_pdg_loaded()
-            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
-
         let project_root = guard.project_path().to_path_buf();
 
         // Check if it's a git repo
@@ -98,6 +94,14 @@ Turns a raw diff into a structural change summary with blast radius."
         }
 
         let status_text = String::from_utf8_lossy(&status_output.stdout);
+
+        let pdg = match guard.ensure_pdg_loaded() {
+            Ok(()) => guard.pdg(),
+            Err(e) => {
+                tracing::warn!("PDG load failed for git status enrichment: {}", e);
+                None
+            }
+        };
 
         // Parse git status output
         let mut modified_files: Vec<String> = Vec::new();
@@ -138,7 +142,6 @@ Turns a raw diff into a structural change summary with blast radius."
             .unwrap_or_else(|| "unknown".to_string());
 
         // PDG enrichment: map changed files to symbols
-        let pdg = guard.pdg();
         let mut changed_symbols: Vec<Value> = Vec::new();
         let mut total_affected_symbols = 0usize;
         let mut affected_files_set: std::collections::HashSet<String> =

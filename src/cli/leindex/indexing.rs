@@ -30,8 +30,9 @@ impl LeIndex {
         );
 
         // Step 1: Get currently indexed files from storage
-        let indexed_files = crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
-            .context("Failed to load indexed files from storage")?;
+        let indexed_files =
+            crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
+                .context("Failed to load indexed files from storage")?;
 
         // Step 2: Collect all source files and compute hashes.
         let old_scan = self.get_project_scan(false).ok();
@@ -41,6 +42,11 @@ impl LeIndex {
         // Step 3: Identify changed/new/deleted files
         let mut files_to_parse = Vec::new();
         let mut unchanged_files = std::collections::HashSet::new();
+        let source_file_hashes: std::collections::HashMap<String, String> =
+            source_files_with_hashes
+                .iter()
+                .map(|(path, hash)| (path.display().to_string(), hash.clone()))
+                .collect();
 
         let current_file_paths: std::collections::HashSet<String> = source_files_with_hashes
             .iter()
@@ -133,6 +139,11 @@ impl LeIndex {
         }
 
         let mut pdg = self.pdg.take().unwrap_or_default();
+        let files_parsed = parsing_results.len();
+
+        let successful = parsing_results.iter().filter(|r| r.is_success()).count();
+        let failed = parsing_results.iter().filter(|r| r.is_failure()).count();
+        let total_sigs: usize = parsing_results.iter().map(|r| r.signatures.len()).sum();
 
         for (path, _) in &source_files_with_hashes {
             let path_str = path.display().to_string();
@@ -151,34 +162,24 @@ impl LeIndex {
 
         // Iterate over parsing_results directly, avoiding intermediate HashMap construction
         // and the associated cloning of source_bytes, language, and signatures.
-        for result in &parsing_results {
+        for result in parsing_results.into_iter() {
             if !result.is_success() {
                 continue;
             }
 
             let file_path = result.file_path.display().to_string();
-            let language = result
-                .language
-                .as_deref()
-                .unwrap_or("unknown");
-            let source_bytes = result
-                .source_bytes
-                .as_deref()
-                .unwrap_or(&[]);
-            let signatures = &result.signatures;
+            let language = result.language.as_deref().unwrap_or("unknown");
+            let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
 
             let file_pdg = crate::graph::extract_pdg_from_signatures(
-                signatures.clone(),
+                result.signatures,
                 source_bytes,
                 &file_path,
                 language,
             );
             index_builder::merge_pdgs(&mut pdg, file_pdg);
 
-            if let Some((_, hash)) = source_files_with_hashes
-                .iter()
-                .find(|(p, _)| p.display().to_string() == file_path)
-            {
+            if let Some(hash) = source_file_hashes.get(&file_path) {
                 let _ = crate::storage::pdg_store::update_indexed_file(
                     &mut self.storage,
                     &self.project_id,
@@ -243,13 +244,9 @@ impl LeIndex {
         index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
 
         // Update statistics
-        let successful = parsing_results.iter().filter(|r| r.is_success()).count();
-        let failed = parsing_results.iter().filter(|r| r.is_failure()).count();
-        let total_sigs: usize = parsing_results.iter().map(|r| r.signatures.len()).sum();
-
         self.stats = super::IndexStats {
             total_files: source_files_with_hashes.len(),
-            files_parsed: parsing_results.len(),
+            files_parsed,
             successful_parses: successful,
             failed_parses: failed,
             total_signatures: total_sigs,

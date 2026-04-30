@@ -12,6 +12,10 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct TextSearchHandler;
 
+fn strip_line_ending(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
+}
+
 #[allow(missing_docs)]
 impl TextSearchHandler {
     pub fn name(&self) -> &str {
@@ -177,8 +181,8 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                 continue;
             }
 
-            let file_path = entry.path();
-            let file_path_str = file_path.to_string_lossy();
+        let file_path = entry.path();
+        let file_path_str = file_path.to_string_lossy();
 
             // Apply scope filter
             if let Some(ref s) = scope {
@@ -228,7 +232,7 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                 }
 
                 // Strip line ending for matching (handles both \n and \r\n)
-                let line_without_ending = line.trim_end();
+                let line_without_ending = strip_line_ending(line);
 
                 let matched = if let Some(ref re) = regex {
                     re.is_match(line_without_ending)
@@ -246,11 +250,11 @@ to understand match context. Supports regex, globs, scope, and context_lines."
 
                 // Collect context lines - strip line endings for display
                 let ctx_before: Vec<String> = (line_idx.saturating_sub(context_lines)..line_idx)
-                    .map(|i| format!("{}: {}", i + 1, lines[i].trim_end()))
+                    .map(|i| format!("{}: {}", i + 1, strip_line_ending(lines[i])))
                     .collect();
                 let ctx_after: Vec<String> = ((line_idx + 1)
                     ..((line_idx + 1 + context_lines).min(lines.len())))
-                    .map(|i| format!("{}: {}", i + 1, lines[i].trim_end()))
+                    .map(|i| format!("{}: {}", i + 1, strip_line_ending(lines[i])))
                     .collect();
 
                 // Compact PDG enrichment: just symbol name + type (~4 tokens)
