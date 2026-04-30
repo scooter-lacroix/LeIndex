@@ -1000,7 +1000,11 @@ impl MemoryManager {
 
 impl Default for MemoryManager {
     fn default() -> Self {
-        Self::new(MemoryConfig::default()).unwrap()
+        Self::new(MemoryConfig::default()).expect(
+            "failed to create MemoryManager via MemoryManager::default() -> \
+MemoryManager::new(MemoryConfig::default()); get_current_pid() can fail when the \
+current process PID cannot be resolved",
+        )
     }
 }
 
