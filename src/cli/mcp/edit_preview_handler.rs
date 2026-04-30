@@ -91,7 +91,8 @@ leindex_edit_apply to understand the blast radius of your change."
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
-        guard.ensure_pdg_loaded()
+        guard
+            .ensure_pdg_loaded()
             .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
 
         if guard.pdg().is_none() {
@@ -104,7 +105,7 @@ leindex_edit_apply to understand the blast radius of your change."
         let _ = validate_file_within_project(&file_path, guard.project_path())?;
 
         // Read file content
-        let original = std::fs::read_to_string(&file_path).map_err(|e| {
+        let original = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
             JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
         })?;
 

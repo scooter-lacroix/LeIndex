@@ -1,6 +1,4 @@
-use super::helpers::{
-    extract_string, extract_usize, resolve_scope, wrap_with_meta,
-};
+use super::helpers::{extract_string, extract_usize, resolve_scope, wrap_with_meta};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
@@ -108,9 +106,12 @@ to auto-switch/auto-index projects."
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
-        guard
-            .ensure_pdg_loaded()
-            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+        if let Err(e) = guard.ensure_pdg_loaded() {
+            tracing::warn!(
+                "Failed to load PDG for semantic search; continuing without enrichment: {}",
+                e
+            );
+        }
 
         let scope = resolve_scope(&args, guard.project_path())?;
 

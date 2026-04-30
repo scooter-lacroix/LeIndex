@@ -211,6 +211,9 @@ static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn atomic_write(target: &Path, data: &[u8]) -> std::io::Result<()> {
     let dir = target.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let target_permissions = std::fs::metadata(target)
+        .ok()
+        .map(|meta| meta.permissions());
     let tmp_name = format!(
         ".leindex-tmp-{}-{}-{}",
         std::process::id(),
@@ -222,11 +225,23 @@ pub(crate) fn atomic_write(target: &Path, data: &[u8]) -> std::io::Result<()> {
     );
     let tmp_path = dir.join(&tmp_name);
     std::fs::write(&tmp_path, data)?;
+    if let Some(perms) = target_permissions.as_ref() {
+        std::fs::set_permissions(&tmp_path, perms.clone()).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            e
+        })?;
+    }
     if std::fs::rename(&tmp_path, target).is_err() {
         std::fs::copy(&tmp_path, target).map_err(|e| {
             let _ = std::fs::remove_file(&tmp_path);
             e
         })?;
+        if let Some(perms) = target_permissions {
+            if let Err(e) = std::fs::set_permissions(target, perms) {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+        }
         let _ = std::fs::remove_file(&tmp_path);
     }
     Ok(())

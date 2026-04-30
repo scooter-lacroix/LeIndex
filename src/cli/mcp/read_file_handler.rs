@@ -6,7 +6,7 @@ use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use crate::graph::pdg::ProgramDependenceGraph;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Handler for leindex_read_file — PDG-annotated file read.
@@ -231,16 +231,23 @@ Works for any text file including configs and docs."
             registry.get_or_create(project_path).await.ok()
         };
 
-        // Validate file within project when indexed
-        if let Some(ref handle) = maybe_handle {
+        let resolved_file_path = if let Some(ref handle) = maybe_handle {
             let guard = handle.read().await;
-            validate_file_within_project(&file_path, guard.project_path())?;
-        }
+            validate_file_within_project(&file_path, guard.project_path())?
+        } else {
+            PathBuf::from(&file_path)
+        };
 
         // Read file content — works for any text file
-        let content = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
-            JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
-        })?;
+        let content = tokio::fs::read_to_string(&resolved_file_path)
+            .await
+            .map_err(|e| {
+                JsonRpcError::invalid_params(format!(
+                    "Cannot read file '{}': {}",
+                    resolved_file_path.display(),
+                    e
+                ))
+            })?;
 
         let total_lines = content.lines().count();
 
@@ -250,14 +257,14 @@ Works for any text file including configs and docs."
             .min(total_lines)
             .min(start_line + max_lines - 1);
 
-        if start_line > total_lines {
+        if total_lines > 0 && start_line > total_lines {
             return Err(JsonRpcError::invalid_params(format!(
                 "start_line {} exceeds total lines {}",
                 start_line, total_lines
             )));
         }
 
-        if end_line < start_line {
+        if total_lines > 0 && end_line < start_line {
             return Err(JsonRpcError::invalid_params(format!(
                 "end_line {} precedes start_line {}",
                 end_line_raw, start_line
@@ -265,13 +272,17 @@ Works for any text file including configs and docs."
         }
 
         // Build numbered content (1-indexed)
-        let visible_lines: Vec<String> = content
-            .lines()
-            .skip(start_line - 1)
-            .take(end_line.min(total_lines) - (start_line - 1))
-            .enumerate()
-            .map(|(i, line)| format!("{}: {}", start_line + i, line))
-            .collect();
+        let visible_lines: Vec<String> = if total_lines == 0 {
+            Vec::new()
+        } else {
+            content
+                .lines()
+                .skip(start_line - 1)
+                .take(end_line.min(total_lines) - (start_line - 1))
+                .enumerate()
+                .map(|(i, line)| format!("{}: {}", start_line + i, line))
+                .collect()
+        };
         let content_str = visible_lines.join("\n");
 
         // Detect language from extension (case-insensitive)
@@ -327,7 +338,7 @@ Works for any text file including configs and docs."
             None
         };
 
-        let enrichment_file_path = file_path.clone();
+        let enrichment_file_path = resolved_file_path.to_string_lossy().to_string();
         let (symbol_map, context) = if let Some(pdg) = pdg_snapshot {
             tokio::task::spawn_blocking(move || {
                 build_pdg_enrichment(

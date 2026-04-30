@@ -145,12 +145,6 @@ impl LeIndex {
         let failed = parsing_results.iter().filter(|r| r.is_failure()).count();
         let total_sigs: usize = parsing_results.iter().map(|r| r.signatures.len()).sum();
 
-        for (path, _) in &source_files_with_hashes {
-            let path_str = path.display().to_string();
-            if !unchanged_files.contains(&path_str) {
-                index_builder::remove_file_from_pdg(&mut pdg, &path_str)?;
-            }
-        }
         for path in &deleted_files {
             index_builder::remove_file_from_pdg(&mut pdg, path)?;
             let _ = crate::storage::pdg_store::delete_file_data(
@@ -170,6 +164,10 @@ impl LeIndex {
             let file_path = result.file_path.display().to_string();
             let language = result.language.as_deref().unwrap_or("unknown");
             let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
+
+            // Only replace the old subgraph once parsing succeeds. If parsing fails,
+            // keep the previous graph intact so the saved PDG remains usable.
+            index_builder::remove_file_from_pdg(&mut pdg, &file_path)?;
 
             let file_pdg = crate::graph::extract_pdg_from_signatures(
                 result.signatures,

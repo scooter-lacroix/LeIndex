@@ -221,11 +221,10 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
 
             // Find the first differing line to show relevant context
             let original_lines: Vec<&str> = original.lines().collect();
-            let first_diff_line = original_lines
-                .iter()
-                .zip(modified_lines.iter())
-                .position(|(a, b)| a != b)
-                .unwrap_or(0);
+            let shared_len = original_lines.len().min(modified_lines.len());
+            let first_diff_line = (0..shared_len)
+                .position(|i| original_lines[i] != modified_lines[i])
+                .unwrap_or(shared_len);
 
             // Show ±5 lines around the edit point
             let ctx_start = first_diff_line.saturating_sub(5);

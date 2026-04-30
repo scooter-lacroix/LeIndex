@@ -125,9 +125,12 @@ to understand match context. Supports regex, globs, scope, and context_lines."
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
-        guard
-            .ensure_pdg_loaded()
-            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+        if let Err(e) = guard.ensure_pdg_loaded() {
+            tracing::warn!(
+                "Failed to load PDG for text search; continuing without enrichment: {}",
+                e
+            );
+        }
 
         let scope = resolve_scope(&args, guard.project_path())?;
 
@@ -181,8 +184,8 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                 continue;
             }
 
-        let file_path = entry.path();
-        let file_path_str = file_path.to_string_lossy();
+            let file_path = entry.path();
+            let file_path_str = file_path.to_string_lossy();
 
             // Apply scope filter
             if let Some(ref s) = scope {
