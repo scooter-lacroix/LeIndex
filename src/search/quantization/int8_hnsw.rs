@@ -160,7 +160,7 @@ impl Int8HnswParams {
 /// reduction compared to f32 storage while maintaining search accuracy.
 pub struct Int8HnswIndex {
     /// HNSW structure storing Int8QuantizedVector
-    hnsw: Hnsw<Int8QuantizedVector, Int8AdcDistance>,
+    hnsw: Hnsw<'static, Int8QuantizedVector, Int8AdcDistance>,
 
     /// Mapping from HNSW internal IDs to node IDs
     id_map: HashMap<usize, String>,
