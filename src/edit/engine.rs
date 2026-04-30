@@ -4,8 +4,8 @@
 //! [`WorktreeSession`], [`Diff`], and [`Impact`] utilities.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::command::{
@@ -201,49 +201,31 @@ pub fn replace_whole_word(content: &str, old: &str, new: &str) -> String {
     result
 }
 
-/// Write `data` to `target` atomically using a temp file + rename.
-///
-/// 1. Write to a temp file (`.leindex-tmp-{nanos}`) in the same directory.
-/// 2. Try `rename` (atomic on POSIX when source and dest are on the same filesystem).
-/// 3. On Windows (where rename fails if dest exists), fall back to copy + remove.
-/// 4. Clean up the temp file on any error.
-static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
 pub(crate) fn atomic_write(target: &Path, data: &[u8]) -> std::io::Result<()> {
-    let dir = target.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let target_permissions = std::fs::metadata(target)
+    let resolved_target = if target.exists() {
+        std::fs::canonicalize(target)?
+    } else {
+        target.to_path_buf()
+    };
+    let dir = resolved_target
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let target_permissions = std::fs::metadata(&resolved_target)
         .ok()
         .map(|meta| meta.permissions());
-    let tmp_name = format!(
-        ".leindex-tmp-{}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-        ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed)
-    );
-    let tmp_path = dir.join(&tmp_name);
-    std::fs::write(&tmp_path, data)?;
+
+    let mut tmp_file = tempfile::NamedTempFile::new_in(dir)?;
+    tmp_file.write_all(data)?;
+    tmp_file.flush()?;
+
     if let Some(perms) = target_permissions.as_ref() {
-        std::fs::set_permissions(&tmp_path, perms.clone()).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            e
-        })?;
+        std::fs::set_permissions(tmp_file.path(), perms.clone())?;
     }
-    if std::fs::rename(&tmp_path, target).is_err() {
-        std::fs::copy(&tmp_path, target).map_err(|e| {
-            let _ = std::fs::remove_file(&tmp_path);
-            e
-        })?;
-        if let Some(perms) = target_permissions {
-            if let Err(e) = std::fs::set_permissions(target, perms) {
-                let _ = std::fs::remove_file(&tmp_path);
-                return Err(e);
-            }
-        }
-        let _ = std::fs::remove_file(&tmp_path);
-    }
+
+    tmp_file
+        .persist(&resolved_target)
+        .map_err(|e| std::io::Error::new(e.error.kind(), e.error.to_string()))?;
+
     Ok(())
 }
 
@@ -347,8 +329,32 @@ impl EditEngine {
         // Apply changes in worktree
         let mut changes_applied = 0;
         let mut files_modified = Vec::new();
+        let mut modified_content_for_history = original_content
+            .as_deref()
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                EditError::Generic(format!(
+                    "Missing original content for '{}'",
+                    request.file_path.display()
+                ))
+            })?;
 
         for change in &request.changes {
+            let next_modified_content =
+                match self.apply_change_to_string(&modified_content_for_history, change) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        let _ = session.discard().await;
+                        return Ok(EditResult {
+                            success: false,
+                            changes_applied: 0,
+                            files_modified: vec![],
+                            modified_contents: None,
+                            original_contents: None,
+                            error: Some(e.to_string()),
+                        });
+                    }
+                };
             match self
                 .apply_change(&mut session, &request.file_path, change)
                 .await
@@ -360,6 +366,7 @@ impl EditEngine {
                             files_modified.push(request.file_path.clone());
                         }
                     }
+                    modified_content_for_history = next_modified_content;
                 }
                 Err(e) => {
                     // Discard worktree on error
@@ -380,15 +387,17 @@ impl EditEngine {
         session.merge().await?;
 
         // Capture modified content for redo
-        let modified_content = tokio::fs::read_to_string(&request.file_path)
-            .await
-            .map_err(|e| {
-                EditError::Generic(format!(
-                    "Failed to read '{}' for redo capture: {}",
+        let modified_content = match tokio::fs::read_to_string(&request.file_path).await {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read '{}' for redo capture; using in-memory modified content: {}",
                     request.file_path.display(),
                     e
-                ))
-            })?;
+                );
+                modified_content_for_history
+            }
+        };
 
         // Record in history
         let mut history = self.history.lock().await;

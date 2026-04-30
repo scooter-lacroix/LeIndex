@@ -405,7 +405,7 @@ pub(crate) fn apply_changes_in_memory(
                 )));
             }
 
-            modified = format!("{}{}{}", &modified[..s], new_text, &modified[e..]);
+            modified.replace_range(s..e, new_text);
         }
     }
 
@@ -482,6 +482,7 @@ pub(crate) fn find_normalised_whitespace(haystack: &str, needle: &str) -> Option
     if norm_needle.is_empty() {
         return None;
     }
+    let needle_char_count = norm_needle.chars().count();
     // Use split_inclusive('\n') so line strings retain their terminators.
     // This handles both \n (Unix) and \r\n (Windows) correctly because the
     // terminator bytes are included in the string, and cumulative offsets
@@ -502,15 +503,13 @@ pub(crate) fn find_normalised_whitespace(haystack: &str, needle: &str) -> Option
     for start_line in 0..lines.len() {
         let window_end = lines.len().min(start_line + max_window);
         let byte_start = line_offsets[start_line];
-        let mut byte_end = byte_start;
         for end_line in start_line..window_end {
-            byte_end = line_offsets[end_line] + lines[end_line].len();
+            let byte_end = line_offsets[end_line] + lines[end_line].len();
             let window = &haystack[byte_start..byte_end];
             let (norm_window, spans) = normalise_ws_with_spans(window);
-            if norm_window.contains(&norm_needle) {
-                let match_byte_start = norm_window.find(&norm_needle)?;
+            if let Some(match_byte_start) = norm_window.find(&norm_needle) {
                 let match_char_start = norm_window[..match_byte_start].chars().count();
-                let match_char_end = match_char_start + norm_needle.chars().count();
+                let match_char_end = match_char_start + needle_char_count;
                 let &(span_start, _) = spans.get(match_char_start)?;
                 let &(_, span_end) = spans.get(match_char_end.saturating_sub(1))?;
                 return Some((byte_start + span_start, span_end - span_start));

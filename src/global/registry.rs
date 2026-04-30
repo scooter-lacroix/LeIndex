@@ -526,7 +526,7 @@ mod tests {
     fn test_list_projects_propagates_invalid_row() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let mut registry = GlobalRegistry::init(&db_path).unwrap();
+        let registry = GlobalRegistry::init(&db_path).unwrap();
 
         registry
             .conn
@@ -563,7 +563,7 @@ mod tests {
     fn test_load_existing_ids_propagates_invalid_row() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let mut registry = GlobalRegistry::init(&db_path).unwrap();
+        let registry = GlobalRegistry::init(&db_path).unwrap();
 
         registry
             .conn

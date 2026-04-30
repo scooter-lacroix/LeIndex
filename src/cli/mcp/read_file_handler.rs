@@ -1,11 +1,12 @@
 use super::helpers::{
-    byte_range_to_line_range, extract_bool, extract_string, extract_usize, get_direct_callers,
-    node_type_str, validate_file_within_project, wrap_with_meta,
+    extract_bool, extract_string, extract_usize, get_direct_callers, node_type_str,
+    validate_file_within_project, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use crate::graph::pdg::ProgramDependenceGraph;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -24,6 +25,16 @@ fn line_byte_offsets(content: &str) -> Vec<usize> {
     offsets
 }
 
+fn byte_to_line_start(offsets: &[usize], byte_pos: usize, total_lines: usize) -> usize {
+    offsets
+        .partition_point(|&off| off <= byte_pos)
+        .min(total_lines.max(1))
+}
+
+fn byte_to_line_end(offsets: &[usize], byte_pos: usize, total_lines: usize) -> usize {
+    offsets.partition_point(|&off| off < byte_pos).min(total_lines.max(1))
+}
+
 fn build_pdg_enrichment(
     pdg: &ProgramDependenceGraph,
     file_path: &str,
@@ -33,12 +44,13 @@ fn build_pdg_enrichment(
     total_lines: usize,
     include_symbol_map: bool,
 ) -> (Vec<Value>, Option<Value>) {
-    let line_byte_offsets = line_byte_offsets(content);
+    let file_line_offsets = line_byte_offsets(content);
     let nodes = pdg.nodes_in_file(file_path);
+    let mut dep_line_offsets_cache: HashMap<Arc<str>, Vec<usize>> = HashMap::new();
 
     let symbol_map = if include_symbol_map {
-        let visible_start_byte = line_byte_offsets.get(start_line - 1).copied().unwrap_or(0);
-        let visible_end_byte = line_byte_offsets
+        let visible_start_byte = file_line_offsets.get(start_line - 1).copied().unwrap_or(0);
+        let visible_end_byte = file_line_offsets
             .get(end_line.min(total_lines))
             .copied()
             .unwrap_or(content.len());
@@ -54,14 +66,8 @@ fn build_pdg_enrichment(
                 continue;
             }
 
-            let line_start = line_byte_offsets
-                .iter()
-                .position(|&off| off > sym_start)
-                .unwrap_or(1);
-            let line_end = line_byte_offsets
-                .iter()
-                .position(|&off| off >= sym_end)
-                .unwrap_or(total_lines);
+            let line_start = byte_to_line_start(&file_line_offsets, sym_start, total_lines);
+            let line_end = byte_to_line_end(&file_line_offsets, sym_end, total_lines);
 
             let caller_count = get_direct_callers(pdg, nid).len();
             let dep_count = pdg.neighbors(nid).len();
@@ -97,8 +103,8 @@ fn build_pdg_enrichment(
     };
 
     let context = {
-        let visible_start_byte = line_byte_offsets.get(start_line - 1).copied().unwrap_or(0);
-        let visible_end_byte = line_byte_offsets
+        let visible_start_byte = file_line_offsets.get(start_line - 1).copied().unwrap_or(0);
+        let visible_end_byte = file_line_offsets
             .get(end_line.min(total_lines))
             .copied()
             .unwrap_or(content.len());
@@ -115,23 +121,27 @@ fn build_pdg_enrichment(
             let (sym_start, sym_end) = node.byte_range;
 
             if sym_end > visible_start_byte && sym_start < visible_end_byte {
-                let ls = line_byte_offsets
-                    .iter()
-                    .position(|&off| off > sym_start)
-                    .unwrap_or(1);
-                let le = line_byte_offsets
-                    .iter()
-                    .position(|&off| off >= sym_end)
-                    .unwrap_or(total_lines);
+                let ls = byte_to_line_start(&file_line_offsets, sym_start, total_lines);
+                let le = byte_to_line_end(&file_line_offsets, sym_end, total_lines);
                 symbols_here.push(format!("{}(L{}-L{})", node.name, ls, le));
             }
 
             for &did in &pdg.neighbors(nid) {
                 if let Some(dep) = pdg.get_node(did) {
                     if dep.file_path != node.file_path {
-                        let dep_content =
-                            std::fs::read_to_string(&*dep.file_path).unwrap_or_default();
-                        let dep_line = byte_range_to_line_range(&dep_content, dep.byte_range).0;
+                        let dep_offsets = dep_line_offsets_cache
+                            .entry(dep.file_path.clone())
+                            .or_insert_with(|| {
+                                std::fs::read_to_string(&*dep.file_path)
+                                    .map(|c| line_byte_offsets(&c))
+                                    .unwrap_or_default()
+                            });
+                        if dep_offsets.is_empty() {
+                            continue;
+                        }
+                        let dep_total_lines = dep_offsets.len().saturating_sub(1);
+                        let dep_line =
+                            byte_to_line_start(dep_offsets, dep.byte_range.0, dep_total_lines);
                         imports_from
                             .insert(format!("{}:{} (L{})", dep.file_path, dep.name, dep_line));
                     }
