@@ -5,12 +5,13 @@
 
 use bincode::{deserialize, serialize};
 use lru::LruCache;
-use psutil::process::Process;
+use sysinfo::{get_current_pid, ProcessesToUpdate, System};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
+use std::sync::Mutex;
 use tracing::{debug, info, warn};
 
 // ============================================================================
@@ -936,34 +937,50 @@ impl CacheSpiller {
 /// Memory manager for resource-aware operations
 pub struct MemoryManager {
     config: MemoryConfig,
-    current_process: Process,
+    system: Mutex<System>,
+    current_pid: sysinfo::Pid,
 }
 
 impl MemoryManager {
     /// Create a new memory manager
     pub fn new(config: MemoryConfig) -> Result<Self, Error> {
-        let current_process =
-            Process::current().map_err(|e| Error::ProcessAccess(e.to_string()))?;
+        let current_pid = get_current_pid().map_err(|e| Error::ProcessAccess(e.to_string()))?;
+        let system = System::new_all();
 
         Ok(Self {
             config,
-            current_process,
+            system: Mutex::new(system),
+            current_pid,
         })
     }
 
     /// Get current RSS memory in bytes
     pub fn get_rss_bytes(&self) -> Result<usize, Error> {
-        self.current_process
-            .memory_info()
-            .map(|info| info.rss() as usize)
-            .map_err(|e| Error::MemoryInfo(e.to_string()))
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|e| Error::MemoryInfo(format!("System lock poisoned: {}", e)))?;
+        let pid_list = [self.current_pid];
+        system.refresh_processes(ProcessesToUpdate::Some(&pid_list), true);
+        system
+            .process(self.current_pid)
+            .map(|process| process.memory() as usize)
+            .ok_or_else(|| {
+                Error::ProcessAccess(format!(
+                    "Current process {} is not available",
+                    self.current_pid
+                ))
+            })
     }
 
     /// Get total system memory in bytes
     pub fn get_total_memory(&self) -> Result<usize, Error> {
-        psutil::memory::virtual_memory()
-            .map(|mem| mem.total() as usize)
-            .map_err(|e| Error::MemoryInfo(e.to_string()))
+        let mut system = self
+            .system
+            .lock()
+            .map_err(|e| Error::MemoryInfo(format!("System lock poisoned: {}", e)))?;
+        system.refresh_memory();
+        Ok(system.total_memory() as usize)
     }
 
     /// Check if RSS threshold is exceeded
