@@ -384,8 +384,6 @@ This file tracks all major tracks for the project. Each track has its own detail
 - C.2 depends on A.1
 
 **Reference Documents:**
-- [Task List](../docs/TODO/LEINDEX_REMEDIATION_TASK_LIST.md)
-- [Root Cause Analysis](../docs/TODO/tzar_usage_report.md)
 - [Spec](./tracks/leindex_remediation_20260414/spec.md)
 - [Plan](./tracks/leindex_remediation_20260414/plan.md)
 
