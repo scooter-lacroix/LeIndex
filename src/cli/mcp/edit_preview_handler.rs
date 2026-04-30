@@ -1,6 +1,6 @@
 use super::helpers::{
     apply_changes_in_memory, extract_string, make_diff, parse_edit_changes,
-    validate_file_within_project, wrap_with_meta, HandlerContext,
+    validate_file_within_project, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -87,13 +87,25 @@ leindex_edit_apply to understand the blast radius of your change."
             }
         };
 
-        let mut ctx = HandlerContext::new(registry, &args).await?;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
+        let mut guard = handle.write().await;
+
+        guard
+            .ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+
+        if guard.pdg().is_none() {
+            return Err(JsonRpcError::project_not_indexed(
+                guard.project_path().display().to_string(),
+            ));
+        }
 
         // Enforce project boundary
-        let _ = validate_file_within_project(&file_path, ctx.project_path())?;
+        let _ = validate_file_within_project(&file_path, guard.project_path())?;
 
         // Read file content
-        let original = std::fs::read_to_string(&file_path).map_err(|e| {
+        let original = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
             JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
         })?;
 
@@ -107,21 +119,19 @@ leindex_edit_apply to understand the blast radius of your change."
         let diff = make_diff(&original, &modified, &file_path);
 
         // Run validation via LogicValidator (if PDG available)
-        let validation_json = match ctx.index_mut().create_validator() {
+        let validation_json = match guard.create_validator() {
             Some(validator) => {
-                // Convert parsed EditChanges to ResolvedEditChanges for validation
-                let resolved: Vec<ResolvedEditChange> = changes
-                    .iter()
-                    .map(|_c| {
-                        ResolvedEditChange::new(
-                            PathBuf::from(&file_path),
-                            original.clone(),
-                            modified.clone(),
-                        )
-                    })
-                    .collect();
+                // Create a single ResolvedEditChange representing the final file state.
+                // All edit changes apply to the same file and produce the same
+                // (original → modified) pair, so N identical validation objects would
+                // be redundant — one is sufficient for syntax/reference/drift checks.
+                let resolved = ResolvedEditChange::new(
+                    PathBuf::from(&file_path),
+                    original.clone(),
+                    modified.clone(),
+                );
 
-                match validator.validate_changes(&resolved) {
+                match validator.validate_changes(&[resolved]) {
                     Ok(result) => Some(validation_to_json(&result)),
                     Err(e) => {
                         // Validation itself failed — include as a warning, don't block preview
@@ -148,7 +158,7 @@ leindex_edit_apply to understand the blast radius of your change."
         let mut breaking_changes: Vec<String> = Vec::new();
 
         {
-            let pdg = ctx.pdg();
+            let pdg = guard.pdg().unwrap();
             for change in &changes {
                 if let crate::edit::EditChange::RenameSymbol {
                     old_name,
@@ -211,6 +221,6 @@ leindex_edit_apply to understand the blast radius of your change."
             }
         }
 
-        Ok(wrap_with_meta(response, ctx.index()))
+        Ok(wrap_with_meta(response, &guard))
     }
 }

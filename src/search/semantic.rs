@@ -119,6 +119,7 @@ mod tests {
                 byte_range: (0, 50),
                 complexity: 2,
                 embedding: None,
+                signature: None,
             },
             NodeInfo {
                 node_id: "func2".to_string(),
@@ -129,6 +130,7 @@ mod tests {
                 byte_range: (60, 100),
                 complexity: 3,
                 embedding: None,
+                signature: None,
             },
         ];
 

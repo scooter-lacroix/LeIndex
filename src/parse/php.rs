@@ -213,7 +213,7 @@ fn extract_php_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Import
                 add_import(
                     imports,
                     part,
-                    part.split('\\').last().map(|s| s.to_string()),
+                    part.split('\\').next_back().map(|s| s.to_string()),
                 );
             }
         }

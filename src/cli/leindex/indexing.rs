@@ -2,7 +2,6 @@
 
 use super::LeIndex;
 use crate::cli::index_builder;
-use crate::graph::pdg::ProgramDependenceGraph;
 use anyhow::{Context, Result};
 use tracing::info;
 
@@ -33,7 +32,7 @@ impl LeIndex {
         // Step 1: Get currently indexed files from storage
         let indexed_files =
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
-                .unwrap_or_default();
+                .context("Failed to load indexed files from storage")?;
 
         // Step 2: Collect all source files and compute hashes.
         let old_scan = self.get_project_scan(false).ok();
@@ -42,7 +41,12 @@ impl LeIndex {
 
         // Step 3: Identify changed/new/deleted files
         let mut files_to_parse = Vec::new();
-        let mut unchanged_files = Vec::new();
+        let mut unchanged_files = std::collections::HashSet::new();
+        let source_file_hashes: std::collections::HashMap<String, String> =
+            source_files_with_hashes
+                .iter()
+                .map(|(path, hash)| (path.display().to_string(), hash.clone()))
+                .collect();
 
         let current_file_paths: std::collections::HashSet<String> = source_files_with_hashes
             .iter()
@@ -57,7 +61,7 @@ impl LeIndex {
             {
                 files_to_parse.push(path.clone());
             } else {
-                unchanged_files.push(path_str);
+                unchanged_files.insert(path_str);
             }
         }
 
@@ -130,17 +134,17 @@ impl LeIndex {
 
         // Step 5: Update PDG
         if !unchanged_files.is_empty() && self.pdg.is_none() {
-            let _ = self.load_from_storage();
+            self.load_from_storage()
+                .context("Failed to load existing PDG for incremental reindex. Please reindex with --force if corruption persists.")?;
         }
 
-        let mut pdg = self.pdg.take().unwrap_or_else(ProgramDependenceGraph::new);
+        let mut pdg = self.pdg.take().unwrap_or_default();
+        let files_parsed = parsing_results.len();
 
-        for (path, _) in &source_files_with_hashes {
-            let path_str = path.display().to_string();
-            if !unchanged_files.contains(&path_str) {
-                index_builder::remove_file_from_pdg(&mut pdg, &path_str)?;
-            }
-        }
+        let successful = parsing_results.iter().filter(|r| r.is_success()).count();
+        let failed = parsing_results.iter().filter(|r| r.is_failure()).count();
+        let total_sigs: usize = parsing_results.iter().map(|r| r.signatures.len()).sum();
+
         for path in &deleted_files {
             index_builder::remove_file_from_pdg(&mut pdg, path)?;
             let _ = crate::storage::pdg_store::delete_file_data(
@@ -150,56 +154,30 @@ impl LeIndex {
             );
         }
 
-        // Build a lookup from file path to source bytes (avoids re-reading from disk)
-        let source_bytes_by_file: std::collections::HashMap<String, Vec<u8>> = parsing_results
-            .iter()
-            .filter_map(|r| {
-                if r.is_success() {
-                    Some((
-                        r.file_path.display().to_string(),
-                        r.source_bytes.clone().unwrap_or_default(),
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Iterate over parsing_results directly, avoiding intermediate HashMap construction
+        // and the associated cloning of source_bytes, language, and signatures.
+        for result in parsing_results.into_iter() {
+            if !result.is_success() {
+                continue;
+            }
 
-        let signatures_by_file: std::collections::HashMap<
-            String,
-            (String, Vec<crate::parse::traits::SignatureInfo>),
-        > = parsing_results
-            .iter()
-            .filter_map(|r| {
-                if r.is_success() {
-                    let lang = r.language.clone().unwrap_or_else(|| "unknown".to_string());
-                    Some((
-                        r.file_path.display().to_string(),
-                        (lang, r.signatures.clone()),
-                    ))
-                } else {
-                    None
-                }
-            })
-            .collect();
+            let file_path = result.file_path.display().to_string();
+            let language = result.language.as_deref().unwrap_or("unknown");
+            let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
 
-        for (file_path, (language, signatures)) in signatures_by_file {
-            let source_bytes = source_bytes_by_file
-                .get(&file_path)
-                .map(|s| s.as_slice())
-                .unwrap_or(&[]);
+            // Only replace the old subgraph once parsing succeeds. If parsing fails,
+            // keep the previous graph intact so the saved PDG remains usable.
+            index_builder::remove_file_from_pdg(&mut pdg, &file_path)?;
+
             let file_pdg = crate::graph::extract_pdg_from_signatures(
-                signatures,
+                result.signatures,
                 source_bytes,
                 &file_path,
-                &language,
+                language,
             );
             index_builder::merge_pdgs(&mut pdg, file_pdg);
 
-            if let Some((_, hash)) = source_files_with_hashes
-                .iter()
-                .find(|(p, _)| p.display().to_string() == file_path)
-            {
+            if let Some(hash) = source_file_hashes.get(&file_path) {
                 let _ = crate::storage::pdg_store::update_indexed_file(
                     &mut self.storage,
                     &self.project_id,
@@ -264,13 +242,9 @@ impl LeIndex {
         index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
 
         // Update statistics
-        let successful = parsing_results.iter().filter(|r| r.is_success()).count();
-        let failed = parsing_results.iter().filter(|r| r.is_failure()).count();
-        let total_sigs: usize = parsing_results.iter().map(|r| r.signatures.len()).sum();
-
         self.stats = super::IndexStats {
             total_files: source_files_with_hashes.len(),
-            files_parsed: parsing_results.len(),
+            files_parsed,
             successful_parses: successful,
             failed_parses: failed,
             total_signatures: total_sigs,

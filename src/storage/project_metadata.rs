@@ -97,7 +97,7 @@ impl ProjectMetadata {
         let ids: Vec<UniqueProjectId> = stmt
             .query_map(params![base_name], |row| {
                 let id_str: String = row.get(0)?;
-                Ok(UniqueProjectId::from_str(&id_str))
+                Ok(UniqueProjectId::parse_id(&id_str))
             })?
             .filter_map(|r| r.ok().flatten())
             .collect();
@@ -134,7 +134,7 @@ impl ProjectMetadata {
         let result = stmt
             .query_row(params![id.to_string()], |row| {
                 let id_str: String = row.get(0)?;
-                let unique_project_id = UniqueProjectId::from_str(&id_str)
+                let unique_project_id = UniqueProjectId::parse_id(&id_str)
                     .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
                 Ok(Self {
                     unique_project_id,

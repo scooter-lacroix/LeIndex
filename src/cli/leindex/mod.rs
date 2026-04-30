@@ -194,7 +194,9 @@ impl LeIndex {
 
         // Generate unique project ID with conflict resolution
         // Load existing projects with same base name
-        let existing_ids = storage.load_existing_ids(&project_id).unwrap_or_default();
+        let existing_ids = storage
+            .load_existing_ids(&project_id)
+            .context("Failed to load existing project IDs from storage")?;
         let unique_id = UniqueProjectId::generate(&project_path, &existing_ids);
 
         // Store the project metadata
@@ -329,7 +331,7 @@ impl LeIndex {
         crate::cli::index_freshness::check_freshness(
             &ctx,
             || self.scan_project_files(),
-            |p| index_builder::hash_file(p),
+            index_builder::hash_file,
         )
     }
 
@@ -420,6 +422,9 @@ impl LeIndex {
 
         Some(crate::validation::LogicValidator::new(
             std::sync::Arc::new(pdg.clone()),
+            // Storage wraps rusqlite::Connection which is not Sync;
+            // Arc is required by the LogicValidator interface for shared ownership.
+            #[allow(clippy::arc_with_non_send_sync)]
             std::sync::Arc::new(storage),
         ))
     }

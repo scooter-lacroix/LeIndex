@@ -27,7 +27,7 @@ pub use hnsw_rs::prelude::{DistCosine, Hnsw, Neighbour};
 /// Use `rebuild()` to permanently remove deleted nodes and reclaim capacity.
 pub struct HNSWIndex {
     /// HNSW structure
-    hnsw: Hnsw<f32, DistCosine>,
+    hnsw: Hnsw<'static, f32, DistCosine>,
 
     /// Mapping from HNSW internal IDs to node IDs
     id_map: HashMap<usize, String>,

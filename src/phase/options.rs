@@ -3,9 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Controls optional markdown/text analysis.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub enum DocsMode {
     /// Disable docs processing.
+    #[default]
     Off,
     /// Analyze markdown files only.
     Markdown,
@@ -13,12 +14,6 @@ pub enum DocsMode {
     Text,
     /// Analyze markdown and plain-text files.
     All,
-}
-
-impl Default for DocsMode {
-    fn default() -> Self {
-        Self::Off
-    }
 }
 
 impl DocsMode {

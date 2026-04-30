@@ -216,8 +216,15 @@ impl GrepSymbolsHandler {
         let char_budget = token_budget * 4;
 
         let fetch_limit = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
+
+        // `seen_ids` uses `String` keys because `PdgNode.id` is a `String`, so
+        // `node.id.clone()` is already optimal (single heap allocation, no indirection).
+        //
+        // `seen_locations` uses `Arc<str>` keys because `PdgNode.file_path` is `Arc<str>`,
+        // so `node.file_path.clone()` is a cheap atomic refcount increment — avoiding the
+        // heap allocation that `to_string()` would incur for every node visited.
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut seen_locations: std::collections::HashSet<(String, (usize, usize))> =
+        let mut seen_locations: std::collections::HashSet<(Arc<str>, (usize, usize))> =
             std::collections::HashSet::new();
         let mut all_matches: Vec<Value> = Vec::new();
 
@@ -347,10 +354,8 @@ impl GrepSymbolsHandler {
                 continue;
             }
 
-            if type_filter != "all" {
-                if node_type_str(&node.node_type) != type_filter.as_str() {
-                    continue;
-                }
+            if type_filter != "all" && node_type_str(&node.node_type) != type_filter.as_str() {
+                continue;
             }
 
             if let Some(ref s) = scope {
@@ -364,7 +369,7 @@ impl GrepSymbolsHandler {
             let matches = node.name.to_lowercase().contains(&pattern_lower)
                 || node.id.to_lowercase().contains(&pattern_lower);
 
-            let location_key = (node.file_path.to_string(), node.byte_range);
+            let location_key = (node.file_path.clone(), node.byte_range);
             let is_duplicate_location =
                 node.byte_range != (0, 0) && seen_locations.contains(&location_key);
             if !matches || seen_ids.contains(&node.id) || is_duplicate_location {
@@ -427,7 +432,7 @@ impl GrepSymbolsHandler {
                         || node.id.to_lowercase().contains(&pattern_lower)
                 };
 
-                let location_key = (node.file_path.to_string(), node.byte_range);
+                let location_key = (node.file_path.clone(), node.byte_range);
                 let is_duplicate_location =
                     node.byte_range != (0, 0) && seen_locations.contains(&location_key);
                 if !matches || seen_ids.contains(&node.id) || is_duplicate_location {

@@ -1,5 +1,5 @@
 use super::helpers::{
-    extract_bool, extract_usize, get_direct_callers, node_type_str, wrap_with_meta, HandlerContext,
+    extract_bool, extract_usize, get_direct_callers, node_type_str, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -59,8 +59,11 @@ Turns a raw diff into a structural change summary with blast radius."
         let include_diff = extract_bool(&args, "include_diff", false);
         let diff_context_lines = extract_usize(&args, "diff_context_lines", 3)?;
 
-        let ctx = HandlerContext::new_optional_pdg(registry, &args).await?;
-        let project_root = ctx.project_path().to_path_buf();
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
+        let mut guard = handle.write().await;
+
+        let project_root = guard.project_path().to_path_buf();
 
         // Check if it's a git repo
         let git_dir = project_root.join(".git");
@@ -70,7 +73,7 @@ Turns a raw diff into a structural change summary with blast radius."
                     "is_git_repo": false,
                     "message": "Not a git repository"
                 }),
-                ctx.index(),
+                &guard,
             ));
         }
 
@@ -91,6 +94,14 @@ Turns a raw diff into a structural change summary with blast radius."
         }
 
         let status_text = String::from_utf8_lossy(&status_output.stdout);
+
+        let pdg = match guard.ensure_pdg_loaded() {
+            Ok(()) => guard.pdg(),
+            Err(e) => {
+                tracing::warn!("PDG load failed for git status enrichment: {}", e);
+                None
+            }
+        };
 
         // Parse git status output
         let mut modified_files: Vec<String> = Vec::new();
@@ -131,7 +142,6 @@ Turns a raw diff into a structural change summary with blast radius."
             .unwrap_or_else(|| "unknown".to_string());
 
         // PDG enrichment: map changed files to symbols
-        let pdg = ctx.maybe_pdg();
         let mut changed_symbols: Vec<Value> = Vec::new();
         let mut total_affected_symbols = 0usize;
         let mut affected_files_set: std::collections::HashSet<String> =
@@ -259,7 +269,7 @@ Turns a raw diff into a structural change summary with blast radius."
                 },
                 "diff": diff_content,
             }),
-            ctx.index(),
+            &guard,
         ))
     }
 }

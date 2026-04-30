@@ -446,7 +446,7 @@ fn extract_js_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportI
                         add_import(
                             imports,
                             &path,
-                            part.split('.').last().map(|s| s.to_string()),
+                            part.split('.').next_back().map(|s| s.to_string()),
                         );
                     }
                 }
@@ -479,7 +479,7 @@ fn extract_js_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportI
                             add_import(
                                 imports,
                                 &path,
-                                part.split('.').last().map(|s| s.to_string()),
+                                part.split('.').next_back().map(|s| s.to_string()),
                             );
                         }
                     }
@@ -618,22 +618,22 @@ fn extract_js_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> 
                 let object = node
                     .child_by_field_name("object")
                     .and_then(|n| n.utf8_text(source).ok())
-                    .map(|s| clean_call_text(s));
+                    .map(clean_call_text);
                 let property = node
                     .child_by_field_name("property")
                     .or_else(|| node.child_by_field_name("name"))
                     .and_then(|n| n.utf8_text(source).ok())
-                    .map(|s| clean_call_text(s));
+                    .map(clean_call_text);
 
                 match (object, property) {
                     (Some(obj), Some(prop)) => Some(format!("{}.{}", obj, prop)),
-                    _ => node.utf8_text(source).ok().map(|s| clean_call_text(s)),
+                    _ => node.utf8_text(source).ok().map(clean_call_text),
                 }
             }
             "call_expression" | "optional_call_expression" => node
                 .child_by_field_name("function")
                 .and_then(|n| extract_callee(&n, source)),
-            _ => node.utf8_text(source).ok().map(|s| clean_call_text(s)),
+            _ => node.utf8_text(source).ok().map(clean_call_text),
         }
     }
 

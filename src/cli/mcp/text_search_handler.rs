@@ -1,6 +1,6 @@
 use super::helpers::{
     extract_bool, extract_string, extract_usize, glob_match, node_type_str, resolve_scope,
-    wrap_with_meta, HandlerContext,
+    wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -11,6 +11,10 @@ use std::sync::Arc;
 /// Handler for leindex_text_search — raw text/regex search across files.
 #[derive(Clone)]
 pub struct TextSearchHandler;
+
+fn strip_line_ending(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
+}
 
 #[allow(missing_docs)]
 impl TextSearchHandler {
@@ -117,8 +121,18 @@ to understand match context. Supports regex, globs, scope, and context_lines."
             })
             .unwrap_or_default();
 
-        let ctx = HandlerContext::new_optional_pdg(registry, &args).await?;
-        let scope = resolve_scope(&args, ctx.project_path())?;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
+        let mut guard = handle.write().await;
+
+        if let Err(e) = guard.ensure_pdg_loaded() {
+            tracing::warn!(
+                "Failed to load PDG for text search; continuing without enrichment: {}",
+                e
+            );
+        }
+
+        let scope = resolve_scope(&args, guard.project_path())?;
 
         // Build regex or literal matcher
         let regex = if is_regex {
@@ -140,10 +154,10 @@ to understand match context. Supports regex, globs, scope, and context_lines."
         };
 
         // Get PDG for enrichment (optional — works without it)
-        let pdg = ctx.maybe_pdg();
+        let pdg = guard.pdg();
 
         // Collect source files from the project
-        let project_root = ctx.project_path();
+        let project_root = guard.project_path();
         let mut results: Vec<Value> = Vec::new();
 
         // Dirs to always skip
@@ -199,19 +213,36 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                 Err(_) => continue, // Skip binary or unreadable files
             };
 
-            let lines: Vec<&str> = content.lines().collect();
+            // Use split_inclusive to preserve line endings for accurate byte offset calculation
+            // This handles both Unix (\n) and Windows (\r\n) line endings correctly
+            let lines: Vec<&str> = content.split_inclusive('\n').collect();
+
+            // Precompute cumulative byte offsets (prefix sums) for O(1) lookup per match.
+            // Without this, the per-match sum `lines[..line_idx].iter().map(|l| l.len()).sum()`
+            // would be O(N²) in total across all matches.
+            let line_byte_offsets: Vec<usize> = lines
+                .iter()
+                .scan(0usize, |acc, l| {
+                    let offset = *acc;
+                    *acc += l.len();
+                    Some(offset)
+                })
+                .collect();
 
             for (line_idx, line) in lines.iter().enumerate() {
                 if results.len() >= max_results {
                     break;
                 }
 
+                // Strip line ending for matching (handles both \n and \r\n)
+                let line_without_ending = strip_line_ending(line);
+
                 let matched = if let Some(ref re) = regex {
-                    re.is_match(line)
+                    re.is_match(line_without_ending)
                 } else if case_sensitive {
-                    line.contains(&search_query)
+                    line_without_ending.contains(&search_query)
                 } else {
-                    line.to_lowercase().contains(&search_query)
+                    line_without_ending.to_lowercase().contains(&search_query)
                 };
 
                 if !matched {
@@ -220,21 +251,21 @@ to understand match context. Supports regex, globs, scope, and context_lines."
 
                 let line_number = line_idx + 1; // 1-indexed
 
-                // Collect context lines
+                // Collect context lines - strip line endings for display
                 let ctx_before: Vec<String> = (line_idx.saturating_sub(context_lines)..line_idx)
-                    .map(|i| format!("{}: {}", i + 1, lines[i]))
+                    .map(|i| format!("{}: {}", i + 1, strip_line_ending(lines[i])))
                     .collect();
                 let ctx_after: Vec<String> = ((line_idx + 1)
                     ..((line_idx + 1 + context_lines).min(lines.len())))
-                    .map(|i| format!("{}: {}", i + 1, lines[i]))
+                    .map(|i| format!("{}: {}", i + 1, strip_line_ending(lines[i])))
                     .collect();
 
                 // Compact PDG enrichment: just symbol name + type (~4 tokens)
                 // Eliminates follow-up Read to understand what code this match is in
                 let (in_symbol, symbol_type) = pdg
                     .and_then(|pdg| {
-                        let byte_offset: usize =
-                            lines[..line_idx].iter().map(|l| l.len() + 1).sum();
+                        // O(1) lookup from precomputed prefix sums — avoids O(N²) recomputation
+                        let byte_offset: usize = line_byte_offsets[line_idx];
 
                         let nodes = pdg.nodes_in_file(&file_path_str);
                         let mut best: Option<(crate::graph::pdg::NodeId, usize)> = None;
@@ -263,7 +294,7 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                 let mut entry = serde_json::json!({
                     "file": file_path_str,
                     "line": line_number,
-                    "content": *line,
+                    "content": line_without_ending,
                 });
 
                 // Only include context lines when requested (context_lines > 0)
@@ -300,7 +331,7 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                 "has_more": offset + count < total,
                 "results": paginated,
             }),
-            ctx.index(),
+            &guard,
         ))
     }
 }

@@ -186,6 +186,10 @@ pub struct NodeInfo {
 
     /// Complexity score (0-100+, higher = more complex)
     pub complexity: u32,
+
+    /// Cached signature extracted from content (for search results)
+    /// This is extracted before content is cleared during T13 optimization
+    pub signature: Option<String>,
 }
 
 /// Pre-computed query data for optimized text scoring
@@ -507,6 +511,12 @@ impl SearchEngine {
         // Move nodes into storage — no clone needed since indexes are already built
         self.nodes = nodes;
 
+        // Extract signatures before clearing content (for search results)
+        // This must happen before T13 optimization clears the content
+        for node in &mut self.nodes {
+            node.signature = Self::extract_signature_from_content(&node.content);
+        }
+
         // Free content memory after all indexes are built (T13 optimization)
         // The inverted index (text_index) already captures all tokens,
         // and the Storage layer retains original source files on disk.
@@ -514,6 +524,22 @@ impl SearchEngine {
         for node in &mut self.nodes {
             node.content.clear();
         }
+    }
+
+    /// Extract signature from node content.
+    ///
+    /// Returns the first non-empty, non-comment line after the header.
+    pub fn extract_signature_from_content(content: &str) -> Option<String> {
+        content
+            .lines()
+            .skip(1) // skip "// name in path" header
+            .map(|l| l.trim())
+            .find(|l| {
+                !l.is_empty()
+                    && !l.starts_with("// [No source")
+                    && !l.starts_with("// [")
+            })
+            .map(|l| l.to_string())
     }
 
     /// Apply an incremental delta update to the text index.
@@ -651,6 +677,9 @@ impl SearchEngine {
                 );
             }
         }
+
+        // Extract signature before clearing content (same as index_nodes does)
+        node.signature = Self::extract_signature_from_content(&node.content);
 
         // Clear content to save memory (same as index_nodes does)
         node.content.clear();
@@ -859,23 +888,8 @@ impl SearchEngine {
                     }
                 }
 
-                // Extract signature from content if available.
-                // After T13 content is cleared post-indexing, so signature
-                // falls back to None — it can be enriched later from Storage.
-                let signature = if node.content.is_empty() {
-                    None
-                } else {
-                    node.content
-                        .lines()
-                        .skip(1) // skip "// name in path" header
-                        .map(|l| l.trim())
-                        .find(|l| {
-                            !l.is_empty()
-                                && !l.starts_with("// [No source")
-                                && !l.starts_with("// [")
-                        })
-                        .map(|l| l.to_string())
-                };
+                // Use cached signature (extracted before content was cleared)
+                let signature = node.signature.clone();
 
                 results.push(SearchResult {
                     rank: 0, // Will be set after sorting
@@ -1274,6 +1288,7 @@ mod tests {
                 byte_range: (0, 40),
                 embedding: Some(vec![1.0, 0.0, 0.0]),
                 complexity: 2,
+                signature: None,
             },
             NodeInfo {
                 node_id: "func2".to_string(),
@@ -1284,6 +1299,7 @@ mod tests {
                 byte_range: (42, 82),
                 embedding: Some(vec![0.0, 1.0, 0.0]),
                 complexity: 2,
+                signature: None,
             },
         ]
     }
@@ -1474,6 +1490,7 @@ mod tests {
             byte_range: (0, 18),
             embedding: None,
             complexity: 1,
+            signature: None,
         }]);
         assert_eq!(engine.node_id_to_idx.len(), 1);
         assert_eq!(engine.node_id_to_idx.get("new_func"), Some(&0));
@@ -1577,6 +1594,7 @@ mod tests {
             byte_range: (0, 18),
             embedding: None,
             complexity: 1,
+            signature: None,
         }]);
         assert_eq!(engine.node_tokens.len(), 1);
         assert!(engine.node_tokens.contains_key("new_func"));
@@ -1640,6 +1658,7 @@ mod tests {
                 byte_range: (100, 130),
                 embedding: Some(vec![0.0, 0.0, 1.0]),
                 complexity: 3,
+                signature: None,
             }],
         };
         engine.incremental_reindex(delta);
@@ -1733,6 +1752,7 @@ mod tests {
                 byte_range: (0, 35),
                 embedding: Some(vec![0.5, 0.5, 0.0]),
                 complexity: 5,
+                signature: None,
             }],
         };
         engine.incremental_reindex(delta);
@@ -1781,6 +1801,7 @@ mod tests {
                     byte_range: (0, 14),
                     embedding: None,
                     complexity: 1,
+                    signature: None,
                 },
                 NodeInfo {
                     node_id: "func4".to_string(),
@@ -1791,6 +1812,7 @@ mod tests {
                     byte_range: (15, 40),
                     embedding: None,
                     complexity: 2,
+                    signature: None,
                 },
             ],
         };
@@ -1853,6 +1875,7 @@ mod tests {
                 byte_range: (0, 25),
                 embedding: None,
                 complexity: 1,
+                signature: None,
             },
             NodeInfo {
                 node_id: "unique2".to_string(),
@@ -1863,6 +1886,7 @@ mod tests {
                 byte_range: (26, 52),
                 embedding: None,
                 complexity: 1,
+                signature: None,
             },
         ]);
 
@@ -1909,6 +1933,7 @@ mod tests {
                 byte_range: (0, 25),
                 embedding: Some(vec![1.0, 1.0, 0.0]),
                 complexity: 4,
+                signature: None,
             }],
         };
         engine_inc.incremental_reindex(delta);
@@ -1924,6 +1949,7 @@ mod tests {
                 byte_range: (42, 82),
                 embedding: Some(vec![0.0, 1.0, 0.0]),
                 complexity: 2,
+                signature: None,
             },
             NodeInfo {
                 node_id: "func3".to_string(),
@@ -1934,6 +1960,7 @@ mod tests {
                 byte_range: (0, 25),
                 embedding: Some(vec![1.0, 1.0, 0.0]),
                 complexity: 4,
+                signature: None,
             },
         ]);
 
@@ -1987,9 +2014,10 @@ mod tests {
                 symbol_name: "func3".to_string(),
                 language: "rust".to_string(),
                 content: "fn func3() {}".to_string(),
-                byte_range: (100, 115),
-                embedding: Some(vec![0.0, 0.0, 1.0]),
+                byte_range: (0, 14),
+                embedding: Some(vec![0.1, 0.1, 0.9]),
                 complexity: 1,
+                signature: None,
             }],
         };
         engine.incremental_reindex(delta);
@@ -2015,9 +2043,10 @@ mod tests {
                 symbol_name: "func3".to_string(),
                 language: "rust".to_string(),
                 content: "fn func3() {}".to_string(),
-                byte_range: (100, 115),
+                byte_range: (0, 14),
                 embedding: None,
                 complexity: 1,
+                signature: None,
             }],
         });
 
@@ -2069,9 +2098,10 @@ mod tests {
                 symbol_name: "func3".to_string(),
                 language: "rust".to_string(),
                 content: "fn func3() { important_content(); }".to_string(),
-                byte_range: (0, 35),
+                byte_range: (0, 40),
                 embedding: None,
-                complexity: 2,
+                complexity: 3,
+                signature: None,
             }],
         });
 

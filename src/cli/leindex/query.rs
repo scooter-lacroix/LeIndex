@@ -373,7 +373,7 @@ impl LeIndex {
                         let end = node.byte_range.1.min(content.len());
                         if let Ok(code) = std::str::from_utf8(&content[start..end]) {
                             context.push_str(code);
-                            context.push_str("\n");
+                            context.push('\n');
                         } else {
                             context.push_str("// [Error: Source code is not valid UTF-8]\n");
                         }

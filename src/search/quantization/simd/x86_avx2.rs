@@ -46,8 +46,8 @@ pub unsafe fn dot_product_adc(query: &[f32], qvec: &Int8QuantizedVector, query_s
         // Software prefetching for large dimensions (>1536)
         // Prefetch data 4 iterations ahead to hide memory latency
         if dimension > 1536 && i + 4 < n_chunks {
-            let prefetch_ptr = q_slice.as_ptr().add((i + 4) * 16) as *const i8;
-            _mm_prefetch(prefetch_ptr as *const i8, _MM_HINT_T0);
+            let prefetch_ptr = q_slice.as_ptr().add((i + 4) * 16);
+            _mm_prefetch(prefetch_ptr, _MM_HINT_T0);
         }
 
         // Load 16 i8 values (128-bit)

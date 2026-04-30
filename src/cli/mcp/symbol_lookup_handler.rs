@@ -1,6 +1,6 @@
 use super::helpers::{
     extract_bool, extract_string, extract_usize, get_direct_callers, node_type_str,
-    read_source_snippet, resolve_scope, wrap_with_meta, HandlerContext,
+    read_source_snippet, resolve_scope, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -87,17 +87,19 @@ For the exact source implementation use leindex_read_symbol."
         let is_batch = args
             .get("symbols")
             .and_then(|v| v.as_array())
-            .map_or(false, |a| a.len() > 1);
+            .is_some_and(|a| a.len() > 1);
         let include_source = extract_bool(&args, "include_source", !is_batch);
         let include_callers = extract_bool(&args, "include_callers", true);
         let include_callees = extract_bool(&args, "include_callees", true);
         let depth = extract_usize(&args, "depth", 2)?.min(5);
         let token_budget = extract_usize(&args, "token_budget", 1500)?;
 
-        // Resolve scope first (needs a brief lock)
+        // Resolve scope and get project handle
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
         let scope = {
-            let ctx = HandlerContext::new_optional_pdg(registry, &args).await?;
-            resolve_scope(&args, ctx.project_path())?
+            let guard = handle.read().await;
+            resolve_scope(&args, guard.project_path())?
         };
 
         // Determine symbol list: single "symbol" or batch "symbols"
@@ -105,9 +107,15 @@ For the exact source implementation use leindex_read_symbol."
         {
             arr.iter()
                 .filter_map(|v| v.as_str().map(str::to_owned))
+                .filter(|s| !s.trim().is_empty())
                 .take(20)
                 .collect()
         } else if let Ok(sym) = extract_string(&args, "symbol") {
+            if sym.trim().is_empty() {
+                return Err(JsonRpcError::invalid_params(
+                    "'symbol' must be a non-empty string".to_string(),
+                ));
+            }
             vec![sym]
         } else {
             return Err(JsonRpcError::invalid_params(
@@ -115,8 +123,25 @@ For the exact source implementation use leindex_read_symbol."
             ));
         };
 
-        let ctx = HandlerContext::new(registry, &args).await?;
-        let pdg = ctx.pdg();
+        // Validate symbols is non-empty (after filtering blanks)
+        if symbols.is_empty() {
+            return Err(JsonRpcError::invalid_params(
+                "'symbols' array must contain at least one non-blank string".to_string(),
+            ));
+        }
+
+        let mut guard = handle.write().await;
+
+        guard.ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+
+        if guard.pdg().is_none() {
+            return Err(JsonRpcError::project_not_indexed(
+                guard.project_path().display().to_string(),
+            ));
+        }
+
+        let pdg = guard.pdg().unwrap();
 
         // For batch mode, collect results for each symbol
         if symbols.len() > 1 {
@@ -149,7 +174,7 @@ For the exact source implementation use leindex_read_symbol."
                     "count": results.len(),
                     "results": results
                 }),
-                ctx.index(),
+                &guard,
             ));
         }
 
@@ -166,10 +191,11 @@ For the exact source implementation use leindex_read_symbol."
             char_budget,
         )?;
 
-        Ok(wrap_with_meta(single, ctx.index()))
+        Ok(wrap_with_meta(single, &guard))
     }
 
     /// Resolve and return full structural context for a single symbol.
+    #[allow(clippy::too_many_arguments)]
     fn lookup_single_symbol(
         &self,
         pdg: &crate::graph::pdg::ProgramDependenceGraph,
@@ -188,7 +214,7 @@ For the exact source implementation use leindex_read_symbol."
 
         // 1. Exact symbol lookup (by node.id in symbol_index)
         let node_id = if let Some(nid) = pdg.find_by_symbol(symbol) {
-            pdg.get_node(nid).filter(|n| in_scope(*n)).map(|_| nid)
+            pdg.get_node(nid).filter(|n| in_scope(n)).map(|_| nid)
         } else {
             None
         }
@@ -208,7 +234,7 @@ For the exact source implementation use leindex_read_symbol."
                     candidates
                         .iter()
                         .copied()
-                        .find(|&nid| pdg.get_node(nid).map(|n| in_scope(n)).unwrap_or(false))
+                        .find(|&nid| pdg.get_node(nid).is_some_and(&in_scope))
                 })
         })
         .or_else(|| {
@@ -357,5 +383,69 @@ mod tests {
         let args = serde_json::json!({ "symbol": "my_func" });
         let result = SymbolLookupHandler.execute(&registry, args).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_blank_single_symbol_rejected() {
+        let dir = tempdir().unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "symbol": "" });
+        let result = SymbolLookupHandler.execute(&registry, args).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("non-empty"),
+            "Expected 'non-empty' in error message, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_whitespace_only_single_symbol_rejected() {
+        let dir = tempdir().unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "symbol": "   " });
+        let result = SymbolLookupHandler.execute(&registry, args).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("non-empty"),
+            "Expected 'non-empty' in error message, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_all_blank_batch_symbols_rejected() {
+        let dir = tempdir().unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "symbols": ["", ""] });
+        let result = SymbolLookupHandler.execute(&registry, args).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.message.contains("non-blank"),
+            "Expected 'non-blank' in error message, got: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_with_mixed_blank_and_valid_symbols() {
+        // Blank strings should be filtered out; valid symbols should proceed
+        let dir = tempdir().unwrap();
+        let registry = test_registry_for(dir.path());
+        let args = serde_json::json!({ "symbols": ["", "my_func", "  "] });
+        let result = SymbolLookupHandler.execute(&registry, args).await;
+        // Should not return invalid_params — the blank strings are filtered out,
+        // leaving ["my_func"] which is a valid single-symbol lookup (just not indexed)
+        assert!(result.is_err());
+        // The error should NOT be about blank symbols — it should be about indexing
+        let err = result.unwrap_err();
+        assert!(
+            !err.message.contains("non-blank"),
+            "Should not reject for blank symbols when valid ones exist, got: {}",
+            err.message
+        );
     }
 }

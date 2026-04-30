@@ -107,9 +107,7 @@ pub(crate) fn tokenize_code(text: &str) -> Vec<String> {
             current.push(ch);
         }
     }
-    if current.len() >= 2 {
-        tokens.push(current.to_lowercase());
-    } else if !current.is_empty() && current.chars().all(|c| c.is_ascii_digit()) {
+    if current.len() >= 2 || !current.is_empty() && current.chars().all(|c| c.is_ascii_digit()) {
         tokens.push(current.to_lowercase());
     }
     tokens
@@ -576,6 +574,8 @@ pub(crate) fn index_nodes(
     for (node_idx, node_content, tokens) in raw_nodes {
         if let Some(node) = pdg.get_node(node_idx) {
             let embedding = embedder.embed_tokens(&tokens);
+            let signature =
+                crate::search::search::SearchEngine::extract_signature_from_content(&node_content);
 
             let node_info = NodeInfo {
                 node_id: node.id.clone(),
@@ -586,6 +586,7 @@ pub(crate) fn index_nodes(
                 byte_range: node.byte_range,
                 embedding: Some(embedding),
                 complexity: node.complexity,
+                signature,
             };
 
             nodes.push(node_info);
@@ -606,6 +607,10 @@ pub(crate) fn detect_changed_manifests(
     cache_spiller: &crate::cli::memory::CacheSpiller,
 ) -> Vec<PathBuf> {
     let cache_key = crate::cli::memory::project_scan_cache_key(project_id);
+
+    // Try in-memory cache first; fall back to loading persisted scan from disk
+    // to avoid false-positive manifest changes on cold start (when the in-memory
+    // cache is empty but a previous scan was spilled/persisted).
     let old_hashes: std::collections::HashMap<String, String> = cache_spiller
         .store()
         .peek(&cache_key)
@@ -614,6 +619,18 @@ pub(crate) fn detect_changed_manifests(
                 serialized_data, ..
             } => bincode::deserialize::<ProjectFileScan>(serialized_data).ok(),
             _ => None,
+        })
+        .or_else(|| {
+            cache_spiller
+                .store()
+                .load_from_disk(&cache_key)
+                .ok()
+                .and_then(|entry| match entry {
+                    crate::cli::memory::CacheEntry::Binary {
+                        serialized_data, ..
+                    } => bincode::deserialize::<ProjectFileScan>(&serialized_data).ok(),
+                    _ => None,
+                })
         })
         .map(|scan| scan.manifest_hashes)
         .unwrap_or_default();
@@ -682,11 +699,9 @@ pub(crate) fn files_importing_from_manifests(
         if let Some(node) = pdg.get_node(nid) {
             if node.node_type == NodeType::External {
                 let fp = node.file_path.as_ref();
-                if !affected_set.contains(fp) {
-                    if source_set.contains(fp) {
-                        affected_set.insert(node.file_path.to_string());
-                        affected.push(PathBuf::from(&*node.file_path));
-                    }
+                if !affected_set.contains(fp) && source_set.contains(fp) {
+                    affected_set.insert(node.file_path.to_string());
+                    affected.push(PathBuf::from(&*node.file_path));
                 }
             }
         }
@@ -984,17 +999,17 @@ mod tests {
                 format!("{}{}{}", first, second, third)
             })
             .collect();
-        
+
         let mut token_doc_assignments: Vec<(String, Vec<usize>)> = Vec::new();
         for (token_id, token) in token_names.iter().enumerate() {
             // Each token appears in 3-8 documents
             let df = 3 + (token_id % 6); // df in range [3, 8]
-            
+
             // Use modulo to distribute tokens across documents deterministically
             let docs_with_token: Vec<usize> = (0..df)
                 .map(|j| (token_id * 7 + j * 13) % 200) // Spread across docs
                 .collect();
-            
+
             token_doc_assignments.push((token.clone(), docs_with_token));
         }
 
@@ -1006,7 +1021,7 @@ mod tests {
                     tokens.push(token.clone());
                 }
             }
-            
+
             // Format as space-separated tokens (no code keywords to avoid extra tokens)
             let content = tokens.join(" ");
             docs.push((format!("doc_{}", doc_id), content));
@@ -1057,7 +1072,11 @@ mod tests {
             let total = ref_scores.len();
             let stride = total as f64 / target_dim as f64;
             (0..target_dim)
-                .map(|i| ref_scores[((i as f64 * stride) as usize).min(total - 1)].0.clone())
+                .map(|i| {
+                    ref_scores[((i as f64 * stride) as usize).min(total - 1)]
+                        .0
+                        .clone()
+                })
                 .collect()
         };
 
@@ -1075,5 +1094,225 @@ mod tests {
                 "vocab mismatch at position {i}: got '{got}' expected '{expected}'"
             );
         }
+    }
+
+    #[test]
+    fn test_detect_changed_manifests_cold_start_no_false_positive() {
+        // Simulates a cold-start scenario: a persisted scan exists on disk but
+        // the in-memory cache is empty. Without the load_from_disk fallback,
+        // old_hashes would be empty and every manifest would be flagged as changed.
+        use crate::cli::memory::{CacheSpiller, MemoryConfig};
+        use std::path::PathBuf;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = MemoryConfig {
+            cache_dir: temp_dir.path().join("cache"),
+            max_cache_bytes: 10_000_000,
+            ..Default::default()
+        };
+
+        let mut spiller = CacheSpiller::new(config).unwrap();
+
+        // Create an old scan with a manifest hash
+        let manifest_path = PathBuf::from("/project/Cargo.toml");
+        let mut old_hashes = std::collections::HashMap::new();
+        old_hashes.insert(manifest_path.display().to_string(), "abc123".to_string());
+
+        let old_scan = ProjectFileScan {
+            source_paths: vec![PathBuf::from("/project/src/main.rs")],
+            manifest_paths: vec![manifest_path.clone()],
+            source_directories: vec![PathBuf::from("/project/src")],
+            manifest_hashes: old_hashes,
+        };
+
+        // Serialize and store in cache
+        let cache_key = crate::cli::memory::project_scan_cache_key("test_project");
+        let serialized = bincode::serialize(&old_scan).unwrap();
+        let entry = crate::cli::memory::CacheEntry::Binary {
+            metadata: std::collections::HashMap::new(),
+            serialized_data: serialized,
+        };
+        spiller
+            .store_mut()
+            .insert(cache_key.clone(), entry)
+            .unwrap();
+
+        // Persist to disk, then remove from in-memory cache (simulating cold start)
+        spiller.store_mut().persist_key(&cache_key).unwrap();
+        let _ = spiller.store_mut().remove(&cache_key);
+
+        // Verify in-memory cache is empty (peek returns None)
+        assert!(
+            spiller.store().peek(&cache_key).is_none(),
+            "peek should return None after removal"
+        );
+
+        // Create a current scan with the SAME manifest hashes
+        let mut current_hashes = std::collections::HashMap::new();
+        current_hashes.insert(manifest_path.display().to_string(), "abc123".to_string());
+
+        let current_scan = ProjectFileScan {
+            source_paths: vec![PathBuf::from("/project/src/main.rs")],
+            manifest_paths: vec![manifest_path.clone()],
+            source_directories: vec![PathBuf::from("/project/src")],
+            manifest_hashes: current_hashes,
+        };
+
+        // Without the fix, this would return the manifest as changed (false positive)
+        // because old_hashes would be empty (peek returns None).
+        let changed = detect_changed_manifests(&current_scan, "test_project", &spiller);
+
+        assert!(
+            changed.is_empty(),
+            "cold start should NOT produce false-positive manifest changes, got: {:?}",
+            changed
+        );
+    }
+
+    #[test]
+    fn test_detect_changed_manifests_detects_real_change() {
+        // Verifies that a real manifest change is still detected even on cold start.
+        use crate::cli::memory::{CacheSpiller, MemoryConfig};
+        use std::path::PathBuf;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = MemoryConfig {
+            cache_dir: temp_dir.path().join("cache"),
+            max_cache_bytes: 10_000_000,
+            ..Default::default()
+        };
+
+        let mut spiller = CacheSpiller::new(config).unwrap();
+
+        let manifest_path = PathBuf::from("/project/Cargo.toml");
+        let mut old_hashes = std::collections::HashMap::new();
+        old_hashes.insert(manifest_path.display().to_string(), "old_hash".to_string());
+
+        let old_scan = ProjectFileScan {
+            source_paths: vec![PathBuf::from("/project/src/main.rs")],
+            manifest_paths: vec![manifest_path.clone()],
+            source_directories: vec![PathBuf::from("/project/src")],
+            manifest_hashes: old_hashes,
+        };
+
+        let cache_key = crate::cli::memory::project_scan_cache_key("test_project2");
+        let serialized = bincode::serialize(&old_scan).unwrap();
+        let entry = crate::cli::memory::CacheEntry::Binary {
+            metadata: std::collections::HashMap::new(),
+            serialized_data: serialized,
+        };
+        spiller
+            .store_mut()
+            .insert(cache_key.clone(), entry)
+            .unwrap();
+        spiller.store_mut().persist_key(&cache_key).unwrap();
+        let _ = spiller.store_mut().remove(&cache_key);
+
+        // Current scan with DIFFERENT manifest hash
+        let mut current_hashes = std::collections::HashMap::new();
+        current_hashes.insert(manifest_path.display().to_string(), "new_hash".to_string());
+
+        let current_scan = ProjectFileScan {
+            source_paths: vec![PathBuf::from("/project/src/main.rs")],
+            manifest_paths: vec![manifest_path.clone()],
+            source_directories: vec![PathBuf::from("/project/src")],
+            manifest_hashes: current_hashes,
+        };
+
+        let changed = detect_changed_manifests(&current_scan, "test_project2", &spiller);
+
+        assert_eq!(
+            changed.len(),
+            1,
+            "should detect exactly one changed manifest"
+        );
+        assert_eq!(
+            changed[0], manifest_path,
+            "should detect the correct manifest as changed"
+        );
+    }
+
+    #[test]
+    fn test_detect_changed_manifests_uses_in_memory_cache_first() {
+        // When both in-memory and disk caches exist, in-memory takes priority.
+        use crate::cli::memory::{CacheSpiller, MemoryConfig};
+        use std::path::PathBuf;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = MemoryConfig {
+            cache_dir: temp_dir.path().join("cache"),
+            max_cache_bytes: 10_000_000,
+            ..Default::default()
+        };
+
+        let mut spiller = CacheSpiller::new(config).unwrap();
+
+        let manifest_path = PathBuf::from("/project/Cargo.toml");
+
+        // Create a stale disk cache with old hash
+        let mut disk_hashes = std::collections::HashMap::new();
+        disk_hashes.insert(
+            manifest_path.display().to_string(),
+            "stale_hash".to_string(),
+        );
+        let disk_scan = ProjectFileScan {
+            source_paths: vec![],
+            manifest_paths: vec![manifest_path.clone()],
+            source_directories: vec![],
+            manifest_hashes: disk_hashes,
+        };
+        let cache_key = crate::cli::memory::project_scan_cache_key("test_project3");
+        let serialized = bincode::serialize(&disk_scan).unwrap();
+        let disk_entry = crate::cli::memory::CacheEntry::Binary {
+            metadata: std::collections::HashMap::new(),
+            serialized_data: serialized,
+        };
+        spiller
+            .store_mut()
+            .insert(cache_key.clone(), disk_entry)
+            .unwrap();
+        spiller.store_mut().persist_key(&cache_key).unwrap();
+
+        // Create a fresh in-memory cache with current hash
+        let mut mem_hashes = std::collections::HashMap::new();
+        mem_hashes.insert(
+            manifest_path.display().to_string(),
+            "current_hash".to_string(),
+        );
+        let mem_scan = ProjectFileScan {
+            source_paths: vec![],
+            manifest_paths: vec![manifest_path.clone()],
+            source_directories: vec![],
+            manifest_hashes: mem_hashes,
+        };
+        let mem_serialized = bincode::serialize(&mem_scan).unwrap();
+        let mem_entry = crate::cli::memory::CacheEntry::Binary {
+            metadata: std::collections::HashMap::new(),
+            serialized_data: mem_serialized,
+        };
+        spiller
+            .store_mut()
+            .insert(cache_key.clone(), mem_entry)
+            .unwrap();
+
+        // Current scan matches the in-memory hash, not the disk hash
+        let mut current_hashes = std::collections::HashMap::new();
+        current_hashes.insert(
+            manifest_path.display().to_string(),
+            "current_hash".to_string(),
+        );
+        let current_scan = ProjectFileScan {
+            source_paths: vec![],
+            manifest_paths: vec![manifest_path.clone()],
+            source_directories: vec![],
+            manifest_hashes: current_hashes,
+        };
+
+        let changed = detect_changed_manifests(&current_scan, "test_project3", &spiller);
+
+        assert!(
+            changed.is_empty(),
+            "in-memory cache should be preferred over disk; should see no changes"
+        );
     }
 }

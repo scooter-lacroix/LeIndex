@@ -4,6 +4,7 @@
 //! [`WorktreeSession`], [`Diff`], and [`Impact`] utilities.
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -200,6 +201,40 @@ pub fn replace_whole_word(content: &str, old: &str, new: &str) -> String {
     result
 }
 
+pub(crate) fn atomic_write(target: &Path, data: &[u8]) -> std::io::Result<()> {
+    let resolved_target = if target.exists() {
+        std::fs::canonicalize(target)?
+    } else {
+        target.to_path_buf()
+    };
+    let dir = resolved_target
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let target_permissions = std::fs::metadata(&resolved_target)
+        .ok()
+        .map(|meta| meta.permissions());
+
+    let mut tmp_file = tempfile::NamedTempFile::new_in(dir)?;
+    tmp_file.write_all(data)?;
+    tmp_file.flush()?;
+
+    if let Some(perms) = target_permissions.as_ref() {
+        std::fs::set_permissions(tmp_file.path(), perms.clone())?;
+    }
+
+    tmp_file
+        .persist(&resolved_target)
+        .map_err(|e| std::io::Error::new(e.error.kind(), e.error.to_string()))?;
+
+    Ok(())
+}
+
+pub(crate) async fn atomic_write_async(target: PathBuf, data: Vec<u8>) -> std::io::Result<()> {
+    tokio::task::spawn_blocking(move || atomic_write(&target, &data))
+        .await
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?
+}
+
 fn sanitize_session_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {
@@ -279,19 +314,47 @@ impl EditEngine {
             .await?;
 
         // Capture original content for undo — fail fast if pre-image unreadable
-        let original_content = Some(std::fs::read_to_string(&request.file_path).map_err(|e| {
-            EditError::Generic(format!(
-                "Failed to capture original content for '{}': {}",
-                request.file_path.display(),
-                e
-            ))
-        })?);
+        let original_content = Some(
+            tokio::fs::read_to_string(&request.file_path)
+                .await
+                .map_err(|e| {
+                    EditError::Generic(format!(
+                        "Failed to capture original content for '{}': {}",
+                        request.file_path.display(),
+                        e
+                    ))
+                })?,
+        );
 
         // Apply changes in worktree
         let mut changes_applied = 0;
         let mut files_modified = Vec::new();
+        let mut modified_content_for_history = original_content
+            .as_deref()
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                EditError::Generic(format!(
+                    "Missing original content for '{}'",
+                    request.file_path.display()
+                ))
+            })?;
 
         for change in &request.changes {
+            let next_modified_content =
+                match self.apply_change_to_string(&modified_content_for_history, change) {
+                    Ok(content) => content,
+                    Err(e) => {
+                        let _ = session.discard().await;
+                        return Ok(EditResult {
+                            success: false,
+                            changes_applied: 0,
+                            files_modified: vec![],
+                            modified_contents: None,
+                            original_contents: None,
+                            error: Some(e.to_string()),
+                        });
+                    }
+                };
             match self
                 .apply_change(&mut session, &request.file_path, change)
                 .await
@@ -303,6 +366,7 @@ impl EditEngine {
                             files_modified.push(request.file_path.clone());
                         }
                     }
+                    modified_content_for_history = next_modified_content;
                 }
                 Err(e) => {
                     // Discard worktree on error
@@ -322,6 +386,19 @@ impl EditEngine {
         // Merge worktree back to main
         session.merge().await?;
 
+        // Capture modified content for redo
+        let modified_content = match tokio::fs::read_to_string(&request.file_path).await {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read '{}' for redo capture; using in-memory modified content: {}",
+                    request.file_path.display(),
+                    e
+                );
+                modified_content_for_history
+            }
+        };
+
         // Record in history
         let mut history = self.history.lock().await;
         history.record_command(EditCommand::Edit {
@@ -330,6 +407,7 @@ impl EditEngine {
             changes: request.changes.clone(),
             timestamp: chrono::Utc::now(),
             original_content,
+            modified_content: Some(modified_content),
         });
 
         Ok(EditResult {
@@ -552,25 +630,33 @@ impl EditEngine {
         };
 
         // Always materialize/read the target in the worktree to keep edits isolated.
-        let content = if target_path.exists() {
-            std::fs::read_to_string(&target_path).map_err(|e| {
+        let content = if tokio::fs::try_exists(&target_path)
+            .await
+            .map_err(|e| EditError::Generic(format!("Failed to check {:?}: {}", target_path, e)))?
+        {
+            tokio::fs::read_to_string(&target_path).await.map_err(|e| {
                 EditError::Generic(format!("Failed to read {:?}: {}", target_path, e))
             })?
-        } else if file_path.exists() {
-            let source = std::fs::read_to_string(file_path).map_err(|e| {
+        } else if tokio::fs::try_exists(file_path)
+            .await
+            .map_err(|e| EditError::Generic(format!("Failed to check {:?}: {}", file_path, e)))?
+        {
+            let source = tokio::fs::read_to_string(file_path).await.map_err(|e| {
                 EditError::Generic(format!("Failed to read {:?}: {}", file_path, e))
             })?;
             if let Some(parent) = target_path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
                     EditError::Generic(format!("Failed to create worktree dir {:?}: {}", parent, e))
                 })?;
             }
-            std::fs::write(&target_path, source.as_bytes()).map_err(|e| {
-                EditError::Generic(format!(
-                    "Failed to materialize worktree file {:?}: {}",
-                    target_path, e
-                ))
-            })?;
+            tokio::fs::write(&target_path, source.as_bytes())
+                .await
+                .map_err(|e| {
+                    EditError::Generic(format!(
+                        "Failed to materialize worktree file {:?}: {}",
+                        target_path, e
+                    ))
+                })?;
             source
         } else {
             return Err(EditError::FileNotFound(file_path.to_path_buf()));
@@ -584,11 +670,12 @@ impl EditEngine {
 
         // Write modified content back into worktree only.
         if let Some(parent) = target_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
                 EditError::Generic(format!("Failed to create worktree dir {:?}: {}", parent, e))
             })?;
         }
-        std::fs::write(&target_path, modified.as_bytes())
+        tokio::fs::write(&target_path, modified.as_bytes())
+            .await
             .map_err(|e| EditError::Generic(format!("Failed to write {:?}: {}", target_path, e)))?;
 
         session.track_file(file_path.to_path_buf(), target_path);
@@ -598,7 +685,7 @@ impl EditEngine {
 
     /// Read file content from disk.
     pub async fn read_file_content(&self, file_path: &Path) -> Result<String> {
-        std::fs::read_to_string(file_path).map_err(|e| {
+        tokio::fs::read_to_string(file_path).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 EditError::FileNotFound(file_path.to_path_buf())
             } else {
@@ -622,7 +709,9 @@ impl EditEngine {
             }) => {
                 // Restore original content if available
                 if let Some(content) = original_content {
-                    if let Err(e) = std::fs::write(&file_path, content.as_bytes()) {
+                    if let Err(e) =
+                        atomic_write_async(file_path.clone(), content.into_bytes()).await
+                    {
                         // Restore failed — revert the history cursor so undo/redo stay consistent
                         history.redo();
                         return Ok(EditResult {
@@ -671,7 +760,8 @@ impl EditEngine {
                 let mut restored = Vec::new();
                 let mut errors = Vec::new();
                 for (file_path, content) in original_contents {
-                    match std::fs::write(&file_path, content.as_bytes()) {
+                    match atomic_write_async(PathBuf::from(&file_path), content.into_bytes()).await
+                    {
                         Ok(()) => restored.push(PathBuf::from(file_path)),
                         Err(e) => errors.push(format!("Failed to restore '{}': {}", file_path, e)),
                     }
@@ -714,15 +804,40 @@ impl EditEngine {
     /// Redo last undone edit
     pub async fn redo(&self) -> Result<EditResult> {
         let mut history = self.history.lock().await;
-        match history.redo() {
-            Some(EditCommand::Edit { file_path, .. }) => Ok(EditResult {
-                success: true,
-                changes_applied: 1,
-                files_modified: vec![file_path.clone()],
-                modified_contents: None,
-                original_contents: None,
-                error: None,
-            }),
+        match history.redo().cloned() {
+            Some(EditCommand::Edit {
+                file_path,
+                modified_content,
+                ..
+            }) => {
+                // Write the modified content back to the file.
+                let content = match modified_content {
+                    Some(content) => content,
+                    None => {
+                        history.undo();
+                        return Err(EditError::Generic(format!(
+                            "Cannot redo: no modified content captured for '{}'",
+                            file_path.display()
+                        )));
+                    }
+                };
+                if let Err(e) = atomic_write_async(file_path.clone(), content.into_bytes()).await {
+                    history.undo();
+                    return Err(EditError::Generic(format!(
+                        "Failed to write '{}': {}",
+                        file_path.display(),
+                        e
+                    )));
+                }
+                Ok(EditResult {
+                    success: true,
+                    changes_applied: 1,
+                    files_modified: vec![file_path.clone()],
+                    modified_contents: None,
+                    original_contents: None,
+                    error: None,
+                })
+            }
             Some(EditCommand::Rename {
                 modified_contents,
                 original_contents,
@@ -736,7 +851,12 @@ impl EditEngine {
                 let mut re_applied = Vec::new();
                 let mut failed = None;
                 for (file_path, post_rename_content) in modified_contents {
-                    match std::fs::write(&file_path, post_rename_content.as_bytes()) {
+                    match atomic_write_async(
+                        PathBuf::from(&file_path),
+                        post_rename_content.into_bytes(),
+                    )
+                    .await
+                    {
                         Ok(()) => re_applied.push(PathBuf::from(file_path)),
                         Err(e) => {
                             failed = Some(e);
@@ -745,12 +865,13 @@ impl EditEngine {
                     }
                 }
 
-                if let Some(_) = failed {
+                if failed.is_some() {
                     // Rollback: restore all successfully written files to their pre-redo state
                     // (original_contents holds the pre-rename content, which is the undone state)
                     for (fp, content) in original_contents {
-                        let _ = std::fs::write(&fp, content.as_bytes());
+                        let _ = atomic_write_async(PathBuf::from(fp), content.into_bytes()).await;
                     }
+                    history.undo();
                     return Ok(EditResult {
                         success: false,
                         changes_applied: 0,
@@ -829,6 +950,12 @@ pub struct WorktreeManager {
     pub base_path: PathBuf,
 }
 
+impl Default for WorktreeManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WorktreeManager {
     /// Create a new worktree manager
     pub fn new() -> Self {
@@ -843,13 +970,15 @@ impl WorktreeManager {
         _project_id: &UniqueProjectId,
         session_name: &str,
     ) -> Result<WorktreeSession> {
-        std::fs::create_dir_all(&self.base_path).map_err(|e| {
-            EditError::WorktreeError(format!(
-                "Failed to create worktree base '{}': {}",
-                self.base_path.display(),
-                e
-            ))
-        })?;
+        tokio::fs::create_dir_all(&self.base_path)
+            .await
+            .map_err(|e| {
+                EditError::WorktreeError(format!(
+                    "Failed to create worktree base '{}': {}",
+                    self.base_path.display(),
+                    e
+                ))
+            })?;
 
         let mut session_dir = None;
         for attempt in 0..16 {
@@ -860,7 +989,7 @@ impl WorktreeManager {
                 std::process::id(),
                 attempt
             ));
-            match std::fs::create_dir(&candidate) {
+            match tokio::fs::create_dir(&candidate).await {
                 Ok(()) => {
                     session_dir = Some(candidate);
                     break;
@@ -893,14 +1022,20 @@ impl WorktreeManager {
     ///
     /// Returns the number of worktree directories removed.
     pub async fn cleanup_old(&self, older_than: chrono::Duration) -> Result<usize> {
-        if !self.base_path.exists() {
+        if !tokio::fs::try_exists(&self.base_path).await.map_err(|e| {
+            EditError::WorktreeError(format!(
+                "Failed to check worktree base directory '{}': {}",
+                self.base_path.display(),
+                e
+            ))
+        })? {
             return Ok(0);
         }
 
         let cutoff_time = chrono::Utc::now() - older_than;
         let mut removed_count = 0;
 
-        let entries = std::fs::read_dir(&self.base_path).map_err(|e| {
+        let mut entries = tokio::fs::read_dir(&self.base_path).await.map_err(|e| {
             EditError::WorktreeError(format!(
                 "Failed to read worktree base directory '{}': {}",
                 self.base_path.display(),
@@ -908,16 +1043,14 @@ impl WorktreeManager {
             ))
         })?;
 
-        for entry in entries {
-            let entry = entry.map_err(|e| {
+        while let Some(entry) = entries.next_entry().await.map_err(|e| {
+            EditError::WorktreeError(format!("Failed to read worktree directory entry: {}", e))
+        })? {
+            let path = entry.path();
+            let file_type = entry.file_type().await.map_err(|e| {
                 EditError::WorktreeError(format!("Failed to read worktree directory entry: {}", e))
             })?;
-
-            let path = entry.path();
-
-            // Only process directories that look like session directories
-            // (they contain timestamp suffixes)
-            if path.is_dir() {
+            if file_type.is_dir() {
                 if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                     // Session names end with timestamp-pid: prefix-1234567890123-1234
                     // Validate all three parts before treating as a session directory
@@ -944,7 +1077,7 @@ impl WorktreeManager {
                             if let Some(session_time) = session_time {
                                 if session_time < cutoff_time {
                                     // Remove the old worktree directory
-                                    match std::fs::remove_dir_all(&path) {
+                                    match tokio::fs::remove_dir_all(&path).await {
                                         Ok(_) => removed_count += 1,
                                         Err(e) => {
                                             // Log but don't fail - continue cleaning up others
@@ -991,8 +1124,14 @@ impl WorktreeSession {
 
     /// Discard the worktree without merging
     pub async fn discard(self) -> Result<()> {
-        if self.path.exists() {
-            std::fs::remove_dir_all(&self.path).map_err(|e| {
+        if tokio::fs::try_exists(&self.path).await.map_err(|e| {
+            EditError::WorktreeError(format!(
+                "Failed to check worktree '{}': {}",
+                self.path.display(),
+                e
+            ))
+        })? {
+            tokio::fs::remove_dir_all(&self.path).await.map_err(|e| {
                 EditError::WorktreeError(format!(
                     "Failed to discard worktree '{}': {}",
                     self.path.display(),
@@ -1088,8 +1227,7 @@ impl WorktreeSession {
         }
 
         // Phase 2 (write): apply all prepared writes. On failure, roll back everything.
-        let mut written: usize = 0;
-        for (original, content) in &prepared {
+        for (written, (original, content)) in prepared.iter().enumerate() {
             if let Err(e) = std::fs::write(original, content.as_bytes()) {
                 // Roll back all previously written files AND the failed file
                 for (backup_path, file_existed, backup_content) in
@@ -1113,7 +1251,6 @@ impl WorktreeSession {
                     e
                 )));
             }
-            written += 1;
         }
 
         // Cleanup: remove the worktree directory

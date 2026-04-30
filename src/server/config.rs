@@ -148,7 +148,7 @@ impl ServerConfig {
     /// # Returns
     ///
     /// `Result<SocketAddr, String>` - Parsed address or error message
-    #[must_use]
+    #[must_use = "returns the parsed socket address which may indicate a configuration error if unused"]
     pub fn socket_addr(&self) -> Result<SocketAddr, String> {
         format!("{}:{}", self.host, self.port)
             .parse()
@@ -180,7 +180,7 @@ impl ServerConfig {
     /// # Returns
     ///
     /// `Result<(), String>` - Ok if valid, error otherwise
-    #[must_use]
+    #[must_use = "returns validation result which should be checked before starting the server"]
     pub fn validate(&self) -> Result<(), String> {
         // Validate port range
         if self.port == 0 {

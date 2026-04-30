@@ -5,10 +5,9 @@ use super::helpers::{
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
-use crate::edit::ResolvedEditChange;
+use crate::edit::{atomic_write_async, ResolvedEditChange};
 use crate::validation::validation_to_json;
 use serde_json::Value;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Handler for leindex_edit_apply — atomic code modifications.
@@ -119,150 +118,165 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
         // Enforce project boundary
         {
             let index = handle.read().await;
-            let _ = validate_file_within_project(&file_path, index.project_path())?;
-        }
+            let canonical_path = validate_file_within_project(&file_path, index.project_path())?;
+            drop(index);
 
-        // Read → parse (with content for text-search) → apply → write
-        let original = std::fs::read_to_string(&file_path).map_err(|e| {
-            JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
-        })?;
+            // Read → parse (with content for text-search) → apply → write
+            let original = tokio::fs::read_to_string(&canonical_path)
+                .await
+                .map_err(|e| {
+                    JsonRpcError::invalid_params(format!(
+                        "Cannot read file '{}': {}",
+                        canonical_path.display(),
+                        e
+                    ))
+                })?;
 
-        let changes = parse_edit_changes(&changes_val, Some(&original))?;
-        let modified = apply_changes_in_memory(&original, &changes)?;
+            let changes = parse_edit_changes(&changes_val, Some(&original))?;
+            let modified = apply_changes_in_memory(&original, &changes)?;
 
-        if modified == original {
-            let idx = handle.read().await;
-            return Ok(wrap_with_meta(
-                serde_json::json!({
-                    "success": true,
-                    "changes_applied": 0,
-                    "files_modified": [],
-                    "message": "No changes needed — content already matches"
-                }),
-                &idx,
-            ));
-        }
-
-        // Run validation via LogicValidator — reject edits with errors,
-        // include warnings in the success response
-        let validation_json = {
-            let idx = handle.read().await;
-            match idx.create_validator() {
-                Some(validator) => {
-                    // Convert parsed EditChanges to ResolvedEditChanges for validation
-                    let resolved: Vec<ResolvedEditChange> = changes
-                        .iter()
-                        .map(|_c| {
-                            ResolvedEditChange::new(
-                                PathBuf::from(&file_path),
-                                original.clone(),
-                                modified.clone(),
-                            )
-                        })
-                        .collect();
-
-                    match validator.validate_changes(&resolved) {
-                        Ok(result) => {
-                            if result.has_errors() {
-                                // Build detailed error response with validation details
-                                let v_json = validation_to_json(&result);
-                                return Err(JsonRpcError::invalid_params(format!(
-                                    "Edit rejected — validation found errors. File unchanged.\n\
-                                     Syntax errors: {}\nReference issues: {}\nSemantic drift: {}\n\
-                                     Details: {}",
-                                    v_json["syntax_errors"]
-                                        .as_array()
-                                        .map(|a| a.len())
-                                        .unwrap_or(0),
-                                    v_json["reference_issues"]
-                                        .as_array()
-                                        .map(|a| a.len())
-                                        .unwrap_or(0),
-                                    v_json["semantic_drift"]
-                                        .as_array()
-                                        .map(|a| a.len())
-                                        .unwrap_or(0),
-                                    v_json
-                                )));
-                            }
-
-                            // No blocking errors — include validation in response
-                            Some(validation_to_json(&result))
-                        }
-                        Err(e) => {
-                            // Validation itself failed — log warning but don't block the edit
-                            tracing::warn!("Validation check failed: {}", e);
-                            None
-                        }
-                    }
-                }
-                None => None,
+            if modified == original {
+                let idx = handle.read().await;
+                return Ok(wrap_with_meta(
+                    serde_json::json!({
+                        "success": true,
+                        "changes_applied": 0,
+                        "files_modified": [],
+                        "message": "No changes needed — content already matches"
+                    }),
+                    &idx,
+                ));
             }
-        };
 
-        std::fs::write(&file_path, modified.as_bytes()).map_err(|e| {
-            JsonRpcError::internal_error(format!("Failed to write '{}': {}", file_path, e))
-        })?;
+            // Run validation via LogicValidator — reject edits with errors,
+            // include warnings in the success response
+            let validation_json = {
+                let idx = handle.read().await;
+                match idx.create_validator() {
+                    Some(validator) => {
+                        // Create a single ResolvedEditChange representing the final file state.
+                        // All edit changes apply to the same file and produce the same
+                        // (original → modified) pair, so N identical validation objects would
+                        // be redundant — one is sufficient for syntax/reference/drift checks.
+                        let resolved = ResolvedEditChange::new(
+                            canonical_path.clone(),
+                            original.clone(),
+                            modified.clone(),
+                        );
 
-        // Build verification context: show the edited region so LLM doesn't need to Read
-        let modified_lines: Vec<&str> = modified.lines().collect();
+                        match validator.validate_changes(&[resolved]) {
+                            Ok(result) => {
+                                if result.has_errors() {
+                                    // Build detailed error response with validation details
+                                    let v_json = validation_to_json(&result);
+                                    return Err(JsonRpcError::invalid_params(format!(
+                                        "Edit rejected — validation found errors. File unchanged.\n\
+                                         Syntax errors: {}\nReference issues: {}\nSemantic drift: {}\n\
+                                         Details: {}",
+                                        v_json["syntax_errors"]
+                                            .as_array()
+                                            .map(|a| a.len())
+                                            .unwrap_or(0),
+                                        v_json["reference_issues"]
+                                            .as_array()
+                                            .map(|a| a.len())
+                                            .unwrap_or(0),
+                                        v_json["semantic_drift"]
+                                            .as_array()
+                                            .map(|a| a.len())
+                                            .unwrap_or(0),
+                                        v_json
+                                    )));
+                                }
 
-        // Find the first differing line to show relevant context
-        let original_lines: Vec<&str> = original.lines().collect();
-        let first_diff_line = original_lines
-            .iter()
-            .zip(modified_lines.iter())
-            .position(|(a, b)| a != b)
-            .unwrap_or(0);
-
-        // Show ±5 lines around the edit point
-        let ctx_start = first_diff_line.saturating_sub(5);
-        let ctx_end = (first_diff_line + 10).min(modified_lines.len());
-        let edit_region: Vec<String> = modified_lines[ctx_start..ctx_end]
-            .iter()
-            .enumerate()
-            .map(|(i, line)| format!("{}: {}", ctx_start + i + 1, line))
-            .collect();
-
-        // Compact affected callers — eliminates follow-up Grep for breakage
-        let affected_callers: Vec<String> = {
-            let idx = handle.read().await;
-            if let Some(pdg) = idx.pdg() {
-                let nodes = pdg.nodes_in_file(&file_path);
-                let mut callers: std::collections::BTreeSet<String> =
-                    std::collections::BTreeSet::new();
-                for &nid in &nodes {
-                    for &cid in &get_direct_callers(pdg, nid) {
-                        if let Some(cn) = pdg.get_node(cid) {
-                            if &*cn.file_path != file_path {
-                                callers.insert(format!("{}:{}", cn.file_path, cn.name));
+                                // No blocking errors — include validation in response
+                                Some(validation_to_json(&result))
+                            }
+                            Err(e) => {
+                                // Validation itself failed — log warning but don't block the edit
+                                tracing::warn!("Validation check failed: {}", e);
+                                None
                             }
                         }
                     }
+                    None => None,
                 }
-                callers.into_iter().take(15).collect()
-            } else {
-                Vec::new()
-            }
-        };
+            };
 
-        let idx = handle.read().await;
-        let mut response = serde_json::json!({
-            "success": true,
-            "changes_applied": changes.len(),
-            "files_modified": [&file_path],
-            "edit_region": edit_region.join("\n"),
-            "external_callers": affected_callers
-        });
+            // Atomic write: write to a temp file in the same directory, then rename.
+            // This prevents data corruption if the process dies mid-write — rename is
+            // atomic on POSIX when source and dest are on the same filesystem.
+            atomic_write_async(canonical_path.clone(), modified.as_bytes().to_vec())
+                .await
+                .map_err(|e| {
+                    JsonRpcError::internal_error(format!(
+                        "Failed to write '{}': {}",
+                        canonical_path.display(),
+                        e
+                    ))
+                })?;
 
-        // Include validation warnings in success response
-        if let Some(validation) = validation_json {
-            if let Some(obj) = response.as_object_mut() {
-                obj.insert("validation".to_string(), validation);
+            // Build verification context: show the edited region so LLM doesn't need to Read
+            let modified_lines: Vec<&str> = modified.lines().collect();
+
+            // Find the first differing line to show relevant context
+            let original_lines: Vec<&str> = original.lines().collect();
+            let shared_len = original_lines.len().min(modified_lines.len());
+            let first_diff_line = (0..shared_len)
+                .position(|i| original_lines[i] != modified_lines[i])
+                .unwrap_or(shared_len);
+
+            // Show ±5 lines around the edit point
+            let ctx_start = first_diff_line.saturating_sub(5);
+            let ctx_end = (first_diff_line + 10).min(modified_lines.len());
+            let edit_region: Vec<String> = modified_lines[ctx_start..ctx_end]
+                .iter()
+                .enumerate()
+                .map(|(i, line)| format!("{}: {}", ctx_start + i + 1, line))
+                .collect();
+
+            let canonical_path_str = canonical_path.to_string_lossy().to_string();
+
+            // Compact affected callers — eliminates follow-up Grep for breakage
+            let affected_callers: Vec<String> = {
+                let idx = handle.read().await;
+                if let Some(pdg) = idx.pdg() {
+                    let nodes = pdg.nodes_in_file(&canonical_path_str);
+                    let mut callers: std::collections::BTreeSet<String> =
+                        std::collections::BTreeSet::new();
+                    for &nid in &nodes {
+                        for &cid in &get_direct_callers(pdg, nid) {
+                            if let Some(cn) = pdg.get_node(cid) {
+                                if cn.file_path.as_ref() != canonical_path_str.as_str() {
+                                    callers.insert(format!("{}:{}", cn.file_path, cn.name));
+                                }
+                            }
+                        }
+                    }
+                    callers.into_iter().take(15).collect()
+                } else {
+                    Vec::new()
+                }
+            };
+
+            let idx = handle.read().await;
+            let mut response = serde_json::json!({
+                "success": true,
+                "changes_applied": changes.len(),
+                "files_modified": [&file_path],
+                "edit_region": edit_region.join("\n"),
+                "external_callers": affected_callers
+            });
+
+            // Include validation warnings in success response
+            if let Some(validation) = validation_json {
+                if let Some(obj) = response.as_object_mut() {
+                    obj.insert("validation".to_string(), validation);
+                }
             }
+
+            return Ok(wrap_with_meta(response, &idx));
         }
-
-        Ok(wrap_with_meta(response, &idx))
     }
 }
 

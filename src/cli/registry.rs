@@ -99,6 +99,7 @@ impl ProjectRwLock {
     ///
     /// Returns `Err` if the lock is already held. Used during eviction to
     /// gracefully close the `LeIndex` only when it's not in use.
+    #[allow(clippy::result_unit_err)]
     pub fn try_write(&self) -> Result<ProjectWriteGuard<'_>, ()> {
         match self.inner.try_lock() {
             Ok(guard) => Ok(ProjectWriteGuard { inner: guard }),
@@ -150,7 +151,7 @@ impl std::ops::Deref for ProjectWriteGuard<'_> {
 
 impl std::ops::DerefMut for ProjectWriteGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.inner
+        &mut self.inner
     }
 }
 
@@ -330,6 +331,11 @@ impl ProjectRegistry {
     /// Number of projects currently in memory.
     pub async fn len(&self) -> usize {
         self.projects.read().await.len()
+    }
+
+    /// Returns `true` if no projects are currently loaded.
+    pub async fn is_empty(&self) -> bool {
+        self.projects.read().await.is_empty()
     }
 
     /// List all loaded project paths (for diagnostics).

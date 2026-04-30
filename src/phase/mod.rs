@@ -280,6 +280,7 @@ fn options_hash_for_phase(phase: u8, options: &PhaseOptions) -> Option<String> {
     Some(blake3::hash(key.as_bytes()).to_hex().to_string()[..8].to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn format_report(
     context: &PhaseExecutionContext,
     executed_phases: &[u8],

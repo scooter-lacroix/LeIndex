@@ -255,7 +255,9 @@ impl Refactor {
         for node_id in &seed_ids {
             if let Some(node) = pdg.get_node(*node_id) {
                 if node.byte_range != (0, 0) {
-                    let entry = matches_by_file.entry(node.file_path.to_string()).or_default();
+                    let entry = matches_by_file
+                        .entry(node.file_path.to_string())
+                        .or_default();
                     if !entry.contains(&node.byte_range) {
                         entry.push(node.byte_range);
                     }

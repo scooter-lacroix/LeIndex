@@ -321,7 +321,7 @@ impl HybridStorage {
         let storage = self
             .local
             .as_ref()
-            .ok_or_else(|| StorageError::VectorExtensionNotAvailable)?;
+            .ok_or(StorageError::VectorExtensionNotAvailable)?;
 
         self.store_local_embedding(
             storage,
@@ -403,7 +403,7 @@ impl HybridStorage {
         let storage = self
             .local
             .as_ref()
-            .ok_or_else(|| StorageError::VectorExtensionNotAvailable)?;
+            .ok_or(StorageError::VectorExtensionNotAvailable)?;
 
         self.search_local_similar(storage, query_embedding, k)
     }
@@ -493,7 +493,7 @@ impl HybridStorage {
         let storage = self
             .local
             .as_ref()
-            .ok_or_else(|| StorageError::VectorExtensionNotAvailable)?;
+            .ok_or(StorageError::VectorExtensionNotAvailable)?;
 
         let mut stored = 0;
         for (node_id, symbol_name, file_path, node_type, embedding) in embeddings {

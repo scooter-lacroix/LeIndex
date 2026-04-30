@@ -14,6 +14,7 @@ pub mod query;
 /// Hybrid ranking and scoring algorithms.
 pub mod ranking;
 /// Unified search engine combining keyword and semantic search.
+#[allow(clippy::module_inception)]
 pub mod search;
 /// Semantic analysis and embedding generation.
 pub mod semantic;

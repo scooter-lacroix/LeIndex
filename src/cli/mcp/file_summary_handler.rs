@@ -1,6 +1,6 @@
 use super::helpers::{
     extract_bool, extract_string, extract_usize, get_direct_callers, node_type_str,
-    read_source_snippet, validate_file_within_project, wrap_with_meta, HandlerContext,
+    read_source_snippet, validate_file_within_project, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -69,12 +69,23 @@ use leindex_read_symbol."
             .map(str::to_owned);
         let token_budget = extract_usize(&args, "token_budget", 1000)?;
 
-        let ctx = HandlerContext::new(registry, &args).await?;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
+        let mut guard = handle.write().await;
+
+        guard.ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+
+        if guard.pdg().is_none() {
+            return Err(JsonRpcError::project_not_indexed(
+                guard.project_path().display().to_string(),
+            ));
+        }
 
         // Enforce project boundary
-        let _ = validate_file_within_project(&file_path, ctx.project_path())?;
+        let _ = validate_file_within_project(&file_path, guard.project_path())?;
 
-        let pdg = ctx.pdg();
+        let pdg = guard.pdg().unwrap();
 
         // Collect all nodes in this file
         let node_ids = pdg.nodes_in_file(&file_path);
@@ -196,7 +207,7 @@ use leindex_read_symbol."
                 "symbols": symbols,
                 "module_role": module_role
             }),
-            ctx.index(),
+            &guard,
         ))
     }
 }

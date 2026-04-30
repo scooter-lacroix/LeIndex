@@ -1,6 +1,4 @@
-use super::helpers::{
-    extract_string, extract_usize, resolve_scope, wrap_with_meta, HandlerContext,
-};
+use super::helpers::{extract_string, extract_usize, resolve_scope, wrap_with_meta};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
@@ -104,19 +102,28 @@ to auto-switch/auto-index projects."
             _ => Some(crate::search::ranking::QueryType::Semantic),
         };
 
-        let mut ctx = HandlerContext::new_optional_pdg(registry, &args).await?;
-        let scope = resolve_scope(&args, ctx.project_path())?;
+        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let handle = registry.get_or_create(project_path).await?;
+        let mut guard = handle.write().await;
 
-        if ctx.index().search_engine().is_empty() {
+        if let Err(e) = guard.ensure_pdg_loaded() {
+            tracing::warn!(
+                "Failed to load PDG for semantic search; continuing without enrichment: {}",
+                e
+            );
+        }
+
+        let scope = resolve_scope(&args, guard.project_path())?;
+
+        if guard.search_engine().is_empty() {
             return Err(JsonRpcError::project_not_indexed(
-                ctx.project_path().display().to_string(),
+                guard.project_path().display().to_string(),
             ));
         }
 
         const MAX_FETCH_K: usize = 1000;
         let mut fetch_k = (top_k + offset).min(MAX_FETCH_K);
-        let mut all_results = ctx
-            .index_mut()
+        let mut all_results = guard
             .search(&query, fetch_k, query_type)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
@@ -142,8 +149,7 @@ to auto-switch/auto-index projects."
         if filtered.is_empty() && scope.is_some() && !all_results.is_empty() {
             fetch_k = (fetch_k * 10).min(MAX_FETCH_K * 10);
             if fetch_k > top_k + offset {
-                all_results = ctx
-                    .index_mut()
+                all_results = guard
                     .search(&query, fetch_k, query_type)
                     .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
                 filtered = all_results
@@ -169,10 +175,10 @@ to auto-switch/auto-index projects."
                         "No semantic matches found for '{}'. The project contains {} indexed files. \
                         Try: rephrase query, use different keywords, or try leindex_grep_symbols for exact symbol names.",
                         query,
-                        ctx.index_mut().source_file_paths().map(|p| p.len()).unwrap_or(0)
+                        guard.source_file_paths().map(|p| p.len()).unwrap_or(0)
                     )
                 }),
-                ctx.index(),
+                &guard,
             ));
         }
 
@@ -184,7 +190,7 @@ to auto-switch/auto-index projects."
                 "count": total_returned,
                 "has_more": offset + total_returned < total_filtered
             }),
-            ctx.index(),
+            &guard,
         ))
     }
 }
