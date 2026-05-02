@@ -252,7 +252,9 @@ Grep + multi-file Edit with a single atomic operation."
             tokio::task::spawn_blocking(move || {
                 let mut written: Vec<(String, String)> = Vec::new();
                 for (file_path, original, modified) in validated_contents {
-                    if let Err(e) = atomic_write(std::path::Path::new(&file_path), modified.as_bytes()) {
+                    if let Err(e) =
+                        atomic_write(std::path::Path::new(&file_path), modified.as_bytes())
+                    {
                         for (written_path, original_content) in written.into_iter().rev() {
                             let _ = atomic_write(
                                 std::path::Path::new(&written_path),

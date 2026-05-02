@@ -93,10 +93,10 @@ pub fn run(context: &PhaseExecutionContext, options: &PhaseOptions) -> Phase4Sum
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::*;
     use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     fn context_with_node(name: &str, complexity: u32) -> PhaseExecutionContext {
         let unique = format!(

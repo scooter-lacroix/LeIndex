@@ -403,7 +403,9 @@ fn extract_csharp_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec
     // Try "parameters" field first, then look for parameter_list child
     let params_node = node.child_by_field_name("parameters").or_else(|| {
         let mut cursor = node.walk();
-        let result = node.children(&mut cursor).find(|child| child.kind() == "parameter_list");
+        let result = node
+            .children(&mut cursor)
+            .find(|child| child.kind() == "parameter_list");
         result
     });
 

@@ -1238,8 +1238,8 @@ pub fn discover_dependency_manifests(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn parse_cargo_lock() {

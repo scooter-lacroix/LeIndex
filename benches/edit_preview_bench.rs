@@ -15,7 +15,12 @@ use leindex::edit::ResolvedEditChange;
 use std::path::PathBuf;
 
 /// Simulate the OLD (redundant) approach: create N identical ResolvedEditChange objects.
-fn create_redundant_changes_old(n: usize, file_path: &PathBuf, original: &str, modified: &str) -> Vec<ResolvedEditChange> {
+fn create_redundant_changes_old(
+    n: usize,
+    file_path: &PathBuf,
+    original: &str,
+    modified: &str,
+) -> Vec<ResolvedEditChange> {
     (0..n)
         .map(|_| {
             ResolvedEditChange::new(
@@ -28,7 +33,11 @@ fn create_redundant_changes_old(n: usize, file_path: &PathBuf, original: &str, m
 }
 
 /// Simulate the NEW (optimized) approach: create a single ResolvedEditChange.
-fn create_single_change_optimized(file_path: &PathBuf, original: &str, modified: &str) -> ResolvedEditChange {
+fn create_single_change_optimized(
+    file_path: &PathBuf,
+    original: &str,
+    modified: &str,
+) -> ResolvedEditChange {
     ResolvedEditChange::new(
         file_path.clone(),
         original.to_string(),
@@ -50,37 +59,29 @@ fn bench_redundant_creation(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
 
         // Old approach: N objects
-        group.bench_with_input(
-            BenchmarkId::new("redundant_O(N)", n),
-            &n,
-            |b, &n| {
-                b.iter(|| {
-                    let changes = create_redundant_changes_old(
-                        black_box(n),
-                        black_box(&file_path),
-                        black_box(&original),
-                        black_box(&modified),
-                    );
-                    black_box(changes);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("redundant_O(N)", n), &n, |b, &n| {
+            b.iter(|| {
+                let changes = create_redundant_changes_old(
+                    black_box(n),
+                    black_box(&file_path),
+                    black_box(&original),
+                    black_box(&modified),
+                );
+                black_box(changes);
+            });
+        });
 
         // New approach: 1 object
-        group.bench_with_input(
-            BenchmarkId::new("optimized_O(1)", n),
-            &n,
-            |b, &_n| {
-                b.iter(|| {
-                    let change = create_single_change_optimized(
-                        black_box(&file_path),
-                        black_box(&original),
-                        black_box(&modified),
-                    );
-                    black_box(change);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("optimized_O(1)", n), &n, |b, &_n| {
+            b.iter(|| {
+                let change = create_single_change_optimized(
+                    black_box(&file_path),
+                    black_box(&original),
+                    black_box(&modified),
+                );
+                black_box(change);
+            });
+        });
     }
 
     group.finish();
@@ -100,40 +101,29 @@ fn bench_allocation_by_content_size(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
 
         // Old: 10 identical objects
-        group.bench_with_input(
-            BenchmarkId::new("redundant_10x", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    let changes: Vec<ResolvedEditChange> = (0..10)
-                        .map(|_| {
-                            ResolvedEditChange::new(
-                                file_path.clone(),
-                                original.clone(),
-                                modified.clone(),
-                            )
-                        })
-                        .collect();
-                    black_box(changes);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("redundant_10x", size), &size, |b, _| {
+            b.iter(|| {
+                let changes: Vec<ResolvedEditChange> = (0..10)
+                    .map(|_| {
+                        ResolvedEditChange::new(
+                            file_path.clone(),
+                            original.clone(),
+                            modified.clone(),
+                        )
+                    })
+                    .collect();
+                black_box(changes);
+            });
+        });
 
         // New: 1 object
-        group.bench_with_input(
-            BenchmarkId::new("optimized_1x", size),
-            &size,
-            |b, _| {
-                b.iter(|| {
-                    let change = ResolvedEditChange::new(
-                        file_path.clone(),
-                        original.clone(),
-                        modified.clone(),
-                    );
-                    black_box(change);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("optimized_1x", size), &size, |b, _| {
+            b.iter(|| {
+                let change =
+                    ResolvedEditChange::new(file_path.clone(), original.clone(), modified.clone());
+                black_box(change);
+            });
+        });
     }
 
     group.finish();

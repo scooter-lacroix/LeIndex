@@ -101,7 +101,8 @@ scoping to subdirectories, sorting, and pagination."
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
-        guard.ensure_pdg_loaded()
+        guard
+            .ensure_pdg_loaded()
             .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
 
         if guard.pdg().is_none() {
@@ -130,9 +131,8 @@ scoping to subdirectories, sorting, and pagination."
             s
         });
         let scope_path = PathBuf::from(&scope_str);
-        let scope_base = PathBuf::from(
-            scope_str.trim_end_matches(['/', std::path::MAIN_SEPARATOR]),
-        );
+        let scope_base =
+            PathBuf::from(scope_str.trim_end_matches(['/', std::path::MAIN_SEPARATOR]));
 
         // Use cached file stats if available, otherwise build from PDG
         // Collect source paths first to avoid borrow conflicts with file_stats()/pdg()

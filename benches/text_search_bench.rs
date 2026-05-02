@@ -23,7 +23,12 @@ use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criteri
 /// Each line is ~50 chars of code-like text.
 fn generate_haystack(num_lines: usize) -> String {
     (0..num_lines)
-        .map(|i| format!("    let value_{} = some_function(arg1, arg2) + other_call();", i))
+        .map(|i| {
+            format!(
+                "    let value_{} = some_function(arg1, arg2) + other_call();",
+                i
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -35,7 +40,10 @@ fn generate_needle_for_position(haystack: &str, target_line: usize) -> String {
     let line = lines[line_idx];
     if let Some(idx) = line.find("some_function") {
         let portion = &line[idx..line.len().min(idx + 30)];
-        portion.replace("(", " ( ").replace(",", " , ").replace(")", " ) ")
+        portion
+            .replace("(", " ( ")
+            .replace(",", " , ")
+            .replace(")", " ) ")
     } else {
         line.to_string()
     }
@@ -164,7 +172,10 @@ fn bench_optimized(c: &mut Criterion) {
             &(&haystack, &needle),
             |b, &(haystack, needle)| {
                 b.iter(|| {
-                    black_box(find_normalised_whitespace_new(black_box(haystack), black_box(needle)));
+                    black_box(find_normalised_whitespace_new(
+                        black_box(haystack),
+                        black_box(needle),
+                    ));
                 });
             },
         );
@@ -189,7 +200,10 @@ fn bench_old(c: &mut Criterion) {
             &(&haystack, &needle),
             |b, &(haystack, needle)| {
                 b.iter(|| {
-                    black_box(find_normalised_whitespace_old(black_box(haystack), black_box(needle)));
+                    black_box(find_normalised_whitespace_old(
+                        black_box(haystack),
+                        black_box(needle),
+                    ));
                 });
             },
         );
@@ -215,7 +229,10 @@ fn bench_small_file_performance(c: &mut Criterion) {
             &(&haystack, &needle),
             |b, &(haystack, needle)| {
                 b.iter(|| {
-                    black_box(find_normalised_whitespace_new(black_box(haystack), black_box(needle)));
+                    black_box(find_normalised_whitespace_new(
+                        black_box(haystack),
+                        black_box(needle),
+                    ));
                 });
             },
         );

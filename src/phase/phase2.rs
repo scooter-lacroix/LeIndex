@@ -63,11 +63,11 @@ pub fn run(context: &PhaseExecutionContext) -> Phase2Summary {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use super::*;
     use crate::graph::pdg::{Edge, EdgeMetadata, Node};
     use crate::phase::context::PhaseExecutionContext;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use tempfile::tempdir;
 
     #[test]

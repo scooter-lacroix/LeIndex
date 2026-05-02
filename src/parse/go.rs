@@ -201,7 +201,8 @@ fn extract_go_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportI
                 .and_then(|n| n.utf8_text(source).ok())
                 .unwrap_or_default();
             let cleaned_path = path.trim_matches('"').trim_matches('`');
-            let alias = alias.or_else(|| cleaned_path.split('/').next_back().map(|s| s.to_string()));
+            let alias =
+                alias.or_else(|| cleaned_path.split('/').next_back().map(|s| s.to_string()));
             add_import(imports, cleaned_path, alias);
         }
 
