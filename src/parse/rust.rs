@@ -1412,4 +1412,49 @@ fn test_function() {
             fn_sig.calls
         );
     }
+
+    #[test]
+    fn test_rust_mod_item_extraction() {
+        let source = b"
+pub mod outer {
+    mod inner {
+        fn baz() {}
+    }
+}
+mod external;
+";
+
+        let parser = RustParser::new();
+        let signatures = parser.get_signatures(source).unwrap();
+
+        // Module signatures should be present
+        let outer = signatures.iter().find(|s| s.name == "outer");
+        assert!(outer.is_some(), "should emit SignatureInfo for `outer`");
+        assert_eq!(outer.unwrap().return_type.as_deref(), Some("module"));
+        assert_eq!(outer.unwrap().visibility, Visibility::Public);
+
+        let inner = signatures.iter().find(|s| s.name == "inner");
+        assert!(
+            inner.is_some(),
+            "should emit SignatureInfo for nested `inner`"
+        );
+        assert_eq!(inner.unwrap().return_type.as_deref(), Some("module"));
+
+        // `mod external;` should also produce a module signature
+        let ext = signatures.iter().find(|s| s.name == "external");
+        assert!(
+            ext.is_some(),
+            "should emit SignatureInfo for external `mod external;`"
+        );
+
+        // Function inside nested module should be indexed
+        let baz = signatures.iter().find(|s| s.name == "baz");
+        assert!(baz.is_some(), "nested fn baz should be indexed");
+        // qualified_name should reflect the module path
+        assert!(
+            baz.unwrap().qualified_name.contains("inner"),
+            "baz qualified_name should include `inner`, got: {}",
+            baz.unwrap().qualified_name
+        );
+    }
 }

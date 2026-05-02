@@ -25,6 +25,7 @@
 /// - `impl ToolHandler { pub fn description(&self) -> &str { … } }`
 /// - `impl ToolHandler { pub fn argument_schema(&self) -> Value { … } }`
 /// - `impl ToolHandler { pub async fn execute(…) -> Result<Value, JsonRpcError> { … } }`
+#[macro_export]
 macro_rules! dispatch_handler {
     (
         $(

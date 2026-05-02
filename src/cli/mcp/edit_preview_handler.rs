@@ -116,14 +116,25 @@ leindex_edit_apply to understand the blast radius of your change."
         // Apply changes in memory
         let modified = apply_changes_in_memory(&original, &changes)?;
 
+        let preview_token = blake3::hash(
+            format!("{}{}", abs_file_path.display(), chrono::Utc::now().to_rfc3339()).as_bytes(),
+        )
+        .to_hex()
+        .to_string();
+
         // Store in cache for leindex_edit_apply
-        GLOBAL_EDIT_CACHE.set(guard.storage_path(), EditCacheEntry {
+        let cache_entry = EditCacheEntry {
             file_path: abs_file_path.clone(),
+            preview_token: preview_token.clone(),
             original_text: original.clone(),
             modified_text: modified.clone(),
             changes: changes.clone(),
             timestamp: chrono::Utc::now(),
-        }).await?;
+        };
+
+        if let Err(e) = GLOBAL_EDIT_CACHE.set(guard.storage_path(), cache_entry).await {
+            tracing::warn!("Failed to store edit in cache: {}", e);
+        }
 
         // Generate diff
         let diff = make_diff(&original, &modified, &file_path);
@@ -216,6 +227,7 @@ leindex_edit_apply to understand the blast radius of your change."
         };
 
         let mut response = serde_json::json!({
+            "preview_token": preview_token,
             "diff": diff,
             "affected_symbols": affected_nodes,
             "affected_files": affected_files.into_iter().collect::<Vec<_>>(),

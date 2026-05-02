@@ -201,7 +201,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1.40", features = ["full"] }
 blake3 = "1.5"
-chrono = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
 
 # Serialization
 bincode = "1.3"

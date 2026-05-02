@@ -56,9 +56,8 @@ fn bench_redundant_creation(c: &mut Criterion) {
     let change_counts = [1, 5, 10, 50, 100, 500];
 
     for &n in &change_counts {
-        group.throughput(Throughput::Elements(n as u64));
-
         // Old approach: N objects
+        group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::new("redundant_O(N)", n), &n, |b, &n| {
             b.iter(|| {
                 let changes = create_redundant_changes_old(
@@ -72,6 +71,7 @@ fn bench_redundant_creation(c: &mut Criterion) {
         });
 
         // New approach: 1 object
+        group.throughput(Throughput::Elements(1));
         group.bench_with_input(BenchmarkId::new("optimized_O(1)", n), &n, |b, &_n| {
             b.iter(|| {
                 let change = create_single_change_optimized(
@@ -98,9 +98,8 @@ fn bench_allocation_by_content_size(c: &mut Criterion) {
         let original = "x".repeat(size);
         let modified = "y".repeat(size);
 
-        group.throughput(Throughput::Bytes(size as u64));
-
         // Old: 10 identical objects
+        group.throughput(Throughput::Bytes(size as u64 * 10));
         group.bench_with_input(BenchmarkId::new("redundant_10x", size), &size, |b, _| {
             b.iter(|| {
                 let changes: Vec<ResolvedEditChange> = (0..10)
@@ -117,6 +116,7 @@ fn bench_allocation_by_content_size(c: &mut Criterion) {
         });
 
         // New: 1 object
+        group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::new("optimized_1x", size), &size, |b, _| {
             b.iter(|| {
                 let change =

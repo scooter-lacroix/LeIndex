@@ -2,11 +2,9 @@
 //
 // This module implements the handlers for each MCP tool that the server exposes.
 // Individual handler implementations live in their own `*_handler.rs` files.
-// The `dispatch_handler!` macro generates the `ToolHandler` enum and all
-// dispatch methods from a single compact table — adding a new tool is just
-// one extra line.
+// The `dispatch_handler!` macro generates the tool dispatch table.
 
-// Import and re-export handler structs from submodules
+// Import all handler implementations
 pub use super::context_handler::ContextHandler;
 pub use super::deep_analyze_handler::DeepAnalyzeHandler;
 pub use super::diagnostics_handler::DiagnosticsHandler;
@@ -31,30 +29,29 @@ pub use super::write_handler::WriteHandler;
 //
 // One line per tool.  The macro expands to:
 //   • `enum ToolHandler { … }`          (with #[derive(Clone)])
-//   • `fn all_tool_handlers() -> Vec`   (construction list)
-//   • `impl ToolHandler { name, description, argument_schema, execute }`
+//   • `pub fn all_tool_handlers() -> Vec<ToolHandler> { … }`
+//   • Standard method delegations: `name()`, `description()`, `argument_schema()`, `execute()`
 //
-// To add a new tool: import the handler struct above, then add one line here.
 dispatch_handler! {
-    /// Handler for project indexing
+    /// Handler for indexing a project
     Index               => IndexHandler,
-    /// Handler for semantic search
+    /// Handler for semantic code search
     Search              => SearchHandler,
-    /// Handler for deep code analysis
+    /// Handler for deep PDG analysis
     DeepAnalyze         => DeepAnalyzeHandler,
-    /// Handler for code context expansion
+    /// Handler for expanding PDG context
     Context             => ContextHandler,
-    /// Handler for system diagnostics
+    /// Handler for project diagnostics
     Diagnostics         => DiagnosticsHandler,
     /// Handler for multi-phase analysis
     PhaseAnalysis       => PhaseAnalysisHandler,
-    /// Handler for multi-phase analysis (alias)
+    /// Alias for phase analysis (compatibility)
     PhaseAnalysisAlias  => PhaseAnalysisAliasHandler,
-    /// Handler for file summary
+    /// Handler for structured file overview
     FileSummary         => FileSummaryHandler,
-    /// Handler for symbol relationship lookup
+    /// Handler for call-graph lookups
     SymbolLookup        => SymbolLookupHandler,
-    /// Handler for project map
+    /// Handler for project structure mapping
     ProjectMap          => ProjectMapHandler,
     /// Handler for symbol grep
     GrepSymbols         => GrepSymbolsHandler,
@@ -70,7 +67,7 @@ dispatch_handler! {
     RenameSymbol        => RenameSymbolHandler,
     /// Handler for impact analysis
     ImpactAnalysis      => ImpactAnalysisHandler,
-    /// Handler for text search
+    /// Handler for PDG-aware text search
     TextSearch           => TextSearchHandler,
     /// Handler for file reading
     ReadFile            => ReadFileHandler,
@@ -97,6 +94,7 @@ mod tests {
         assert_eq!(ProjectMapHandler.name(), "leindex_project_map");
         assert_eq!(GrepSymbolsHandler.name(), "leindex_grep_symbols");
         assert_eq!(ReadSymbolHandler.name(), "leindex_read_symbol");
+        assert_eq!(WriteHandler.name(), "leindex_write");
         // Phase D handlers
         assert_eq!(EditPreviewHandler.name(), "leindex_edit_preview");
         assert_eq!(EditApplyHandler.name(), "leindex_edit_apply");
@@ -110,6 +108,7 @@ mod tests {
             IndexHandler.argument_schema(),
             SearchHandler.argument_schema(),
             DeepAnalyzeHandler.argument_schema(),
+            WriteHandler.argument_schema(),
         ];
 
         for schema in schemas {
@@ -130,6 +129,7 @@ mod tests {
             ProjectMapHandler.argument_schema(),
             GrepSymbolsHandler.argument_schema(),
             ReadSymbolHandler.argument_schema(),
+            WriteHandler.argument_schema(),
             EditPreviewHandler.argument_schema(),
             EditApplyHandler.argument_schema(),
             RenameSymbolHandler.argument_schema(),

@@ -270,8 +270,10 @@ jobs:
 
       - name: Check NPM_TOKEN availability
         id: check_token
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          if [ -z "${{ secrets.NPM_TOKEN }}" ]; then
+          if [ -z "$NPM_TOKEN" ]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "⚠️ NPM_TOKEN not set — skipping npm publish"
           else
@@ -323,8 +325,10 @@ jobs:
 
       - name: Check PYPI_TOKEN availability
         id: check_token
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
         run: |
-          if [ -z "${{ secrets.PYPI_TOKEN }}" ]; then
+          if [ -z "$PYPI_TOKEN" ]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "⚠️ PYPI_TOKEN not set — skipping PyPI publish"
           else

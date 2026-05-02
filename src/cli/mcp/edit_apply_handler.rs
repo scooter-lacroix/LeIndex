@@ -65,6 +65,10 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                     "description": "If true, return preview without modifying files (default: false). \
         Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
                     "default": false
+                },
+                "preview_token": {
+                    "type": "string",
+                    "description": "The token returned by a previous leindex_edit_preview call. Required if using cached preview."
                 }
             },
             "required": ["file_path"]
@@ -85,9 +89,15 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
 
         let file_path = extract_string(&args, "file_path")?;
         let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let provided_token = args.get("preview_token").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
+
+        // Ensure PDG is loaded
+        guard
+            .ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
 
         // Enforce project boundary
         let canonical_path = validate_file_within_project(&file_path, guard.project_path())?;
@@ -96,41 +106,32 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
         let cached_entry = GLOBAL_EDIT_CACHE.get(guard.storage_path(), &canonical_path).await;
         
         let (original, modified, changes) = if let Some(cache) = cached_entry {
-            // If cache exists, we use it.
-            (cache.original_text, cache.modified_text, cache.changes)
+            // If cache exists, verify it matches the current request
+            let token_matches = provided_token.map(|t| t == cache.preview_token).unwrap_or(false);
+            
+            // Freshness check: read the file from disk and compare it to cache.original_text
+            let disk_content = tokio::fs::read_to_string(&canonical_path).await.map_err(|e| {
+                JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
+            })?;
+
+            if token_matches && disk_content == cache.original_text {
+                (cache.original_text, cache.modified_text, cache.changes)
+            } else {
+                // Cache stale or token mismatch - discard cache and proceed with provided args
+                GLOBAL_EDIT_CACHE.clear(guard.storage_path(), &canonical_path).await;
+                
+                let changes_val = self.get_changes_from_args(&args)?;
+                let changes = parse_edit_changes(&changes_val, Some(&disk_content))?;
+                let modified = apply_changes_in_memory(&disk_content, &changes)?;
+                (disk_content, modified, changes)
+            }
         } else {
             // No cache - proceed with provided arguments
-            let changes_val = if let Some(changes) = args.get("changes").cloned() {
-                changes
-            } else {
-                let old_text = args
-                    .get("old_text")
-                    .or_else(|| args.get("old_str"))
-                    .and_then(|v| v.as_str());
-                let new_text = args
-                    .get("new_text")
-                    .or_else(|| args.get("new_str"))
-                    .and_then(|v| v.as_str());
-                match (old_text, new_text) {
-                    (Some(old), Some(new)) => {
-                        serde_json::json!([{
-                            "type": "replace_text",
-                            "old_text": old,
-                            "new_text": new
-                        }])
-                    }
-                    _ => {
-                        return Err(JsonRpcError::invalid_params(
-                            "Provide either 'changes' array or 'old_text'+'new_text' for simple replacement"
-                        ));
-                    }
-                }
-            };
-
             let original = tokio::fs::read_to_string(&canonical_path).await.map_err(|e| {
                 JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
             })?;
 
+            let changes_val = self.get_changes_from_args(&args)?;
             let changes = parse_edit_changes(&changes_val, Some(&original))?;
             let modified = apply_changes_in_memory(&original, &changes)?;
             (original, modified, changes)
@@ -207,5 +208,34 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
         });
 
         Ok(wrap_with_meta(response, &guard))
+    }
+
+    fn get_changes_from_args(&self, args: &Value) -> Result<Value, JsonRpcError> {
+        if let Some(changes) = args.get("changes").cloned() {
+            Ok(changes)
+        } else {
+            let old_text = args
+                .get("old_text")
+                .or_else(|| args.get("old_str"))
+                .and_then(|v| v.as_str());
+            let new_text = args
+                .get("new_text")
+                .or_else(|| args.get("new_str"))
+                .and_then(|v| v.as_str());
+            match (old_text, new_text) {
+                (Some(old), Some(new)) => {
+                    Ok(serde_json::json!([{
+                        "type": "replace_text",
+                        "old_text": old,
+                        "new_text": new
+                    }]))
+                }
+                _ => {
+                    Err(JsonRpcError::invalid_params(
+                        "Provide either 'changes' array or 'old_text'+'new_text' for simple replacement"
+                    ))
+                }
+            }
+        }
     }
 }

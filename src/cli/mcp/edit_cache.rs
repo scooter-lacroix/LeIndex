@@ -11,6 +11,8 @@ use once_cell::sync::Lazy;
 pub struct EditCacheEntry {
     /// Path to the file being edited.
     pub file_path: PathBuf,
+    /// A unique token for this preview request to prevent race conditions or cross-client application.
+    pub preview_token: String,
     /// Original file content before any changes.
     pub original_text: String,
     /// Modified file content after applying changes in memory.
@@ -45,30 +47,31 @@ impl EditCache {
         } else {
             file_path.canonicalize().unwrap_or(file_path.clone())
         };
-
-        {
-            let mut entries = self.entries.lock().await;
-            entries.insert(abs_path.clone(), entry.clone());
-        }
         
         // Cold storage: persist to project storage directory
         let cache_dir = project_storage.join("edit_cache");
         if !cache_dir.exists() {
-            std::fs::create_dir_all(&cache_dir).map_err(|e| {
-                JsonRpcError::internal_error(format!(\"Failed to create edit cache directory: {}\", e))
-            })?;
+            tokio::fs::create_dir_all(&cache_dir).await.map_err(|e| {
+                JsonRpcError::internal_error(format!("Failed to create edit cache directory: {}", e))
+            })?
         }
         
         let hash = blake3::hash(abs_path.to_string_lossy().as_bytes()).to_hex();
-        let cache_file = cache_dir.join(format!(\"{}.json\", hash));
+        let cache_file = cache_dir.join(format!("{}.json", hash));
         
         let json = serde_json::to_string_pretty(&entry).map_err(|e| {
-            JsonRpcError::internal_error(format!(\"Failed to serialize edit cache: {}\", e))
+            JsonRpcError::internal_error(format!("Failed to serialize edit cache: {}", e))
         })?;
         
-        std::fs::write(cache_file, json).map_err(|e| {
-            JsonRpcError::internal_error(format!(\"Failed to write edit cache to disk: {}\", e))
+        tokio::fs::write(&cache_file, json).await.map_err(|e| {
+            JsonRpcError::internal_error(format!("Failed to write edit cache to disk: {}", e))
         })?;
+
+        // Update hot cache only AFTER successful disk persistence
+        {
+            let mut entries = self.entries.lock().await;
+            entries.insert(abs_path, entry);
+        }
         
         Ok(())
     }
@@ -91,7 +94,7 @@ impl EditCache {
         
         // Try cold storage fallback
         let hash = blake3::hash(abs_path.to_string_lossy().as_bytes()).to_hex();
-        let cache_file = project_storage.join(\"edit_cache\").join(format!(\"{}.json\", hash));
+        let cache_file = project_storage.join("edit_cache").join(format!("{}.json", hash));
         
         if cache_file.exists() {
             if let Ok(json) = std::fs::read_to_string(&cache_file) {
@@ -121,7 +124,7 @@ impl EditCache {
         }
         
         let hash = blake3::hash(abs_path.to_string_lossy().as_bytes()).to_hex();
-        let cache_file = project_storage.join(\"edit_cache\").join(format!(\"{}.json\", hash));
+        let cache_file = project_storage.join("edit_cache").join(format!("{}.json", hash));
         if cache_file.exists() {
             let _ = std::fs::remove_file(cache_file);
         }

@@ -58,13 +58,26 @@ context (symbols, types) immediately so the model knows how the new file fits in
 
         // Enforce project boundary
         let project_root = guard.project_path().to_path_buf();
-        let abs_path = if PathBuf::from(&file_path).is_absolute() {
+        let requested_path = if PathBuf::from(&file_path).is_absolute() {
             PathBuf::from(&file_path)
         } else {
             project_root.join(&file_path)
         };
 
-        // Simplified validation since the file might not exist yet (canonicalize fails)
+        // Normalize path to resolve .. and . components without requiring filesystem access
+        let mut abs_path = PathBuf::new();
+        for component in requested_path.components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    abs_path.pop();
+                }
+                std::path::Component::CurDir => {}
+                _ => {
+                    abs_path.push(component);
+                }
+            }
+        }
+
         if !abs_path.starts_with(&project_root) {
              return Err(JsonRpcError::invalid_params(format!(
                 "File '{}' is outside the project boundary '{}'",

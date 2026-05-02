@@ -105,29 +105,39 @@ fn find_normalised_whitespace_new(haystack: &str, needle: &str) -> Option<(usize
     if norm_needle.is_empty() {
         return None;
     }
-    let lines: Vec<&str> = haystack.lines().collect();
-
+    
     // Pre-compute cumulative byte offsets for O(1) line-to-byte lookup.
-    let mut line_offsets: Vec<usize> = Vec::with_capacity(lines.len());
+    // Use split_inclusive to correctly handle CRLF and varied line endings.
+    let mut line_offsets: Vec<usize> = Vec::new();
+    let mut line_lengths: Vec<usize> = Vec::new();
     let mut cumulative: usize = 0;
-    for line in &lines {
+    
+    for chunk in haystack.split_inclusive('\n') {
         line_offsets.push(cumulative);
-        cumulative += line.len() + 1;
+        line_lengths.push(chunk.len());
+        cumulative += chunk.len();
     }
 
     let max_window = needle.lines().count() + 5;
-    for start_line in 0..lines.len() {
+    let line_count = line_offsets.len();
+    
+    for start_line in 0..line_count {
         let mut window = String::new();
-        let window_end = lines.len().min(start_line + max_window);
+        let window_end = line_count.min(start_line + max_window);
         for end_line in start_line..window_end {
             if !window.is_empty() {
                 window.push(' ');
             }
-            window.push_str(lines[end_line].trim());
+            
+            // Reconstruct window content (trimming as before)
+            let start = line_offsets[end_line];
+            let end = start + line_lengths[end_line];
+            window.push_str(haystack[start..end].trim());
+            
             let norm_window = normalise_ws(&window);
             if norm_window.find(&norm_needle).is_some() {
                 let byte_start = line_offsets[start_line];
-                let byte_end = line_offsets[end_line] + lines[end_line].len() + 1;
+                let byte_end = line_offsets[end_line] + line_lengths[end_line];
                 return Some((byte_start, byte_end.min(haystack.len()) - byte_start));
             }
         }
