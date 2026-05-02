@@ -1,3 +1,4 @@
+use super::edit_cache::{EditCacheEntry, GLOBAL_EDIT_CACHE};
 use super::helpers::{
     apply_changes_in_memory, extract_string, make_diff, parse_edit_changes,
     validate_file_within_project, wrap_with_meta,
@@ -102,10 +103,10 @@ leindex_edit_apply to understand the blast radius of your change."
         }
 
         // Enforce project boundary
-        let _ = validate_file_within_project(&file_path, guard.project_path())?;
+        let abs_file_path = validate_file_within_project(&file_path, guard.project_path())?;
 
         // Read file content
-        let original = tokio::fs::read_to_string(&file_path).await.map_err(|e| {
+        let original = tokio::fs::read_to_string(&abs_file_path).await.map_err(|e| {
             JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
         })?;
 
@@ -114,6 +115,15 @@ leindex_edit_apply to understand the blast radius of your change."
 
         // Apply changes in memory
         let modified = apply_changes_in_memory(&original, &changes)?;
+
+        // Store in cache for leindex_edit_apply
+        GLOBAL_EDIT_CACHE.set(guard.storage_path(), EditCacheEntry {
+            file_path: abs_file_path.clone(),
+            original_text: original.clone(),
+            modified_text: modified.clone(),
+            changes: changes.clone(),
+            timestamp: chrono::Utc::now(),
+        }).await?;
 
         // Generate diff
         let diff = make_diff(&original, &modified, &file_path);

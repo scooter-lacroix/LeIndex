@@ -25,6 +25,7 @@ pub use super::rename_symbol_handler::RenameSymbolHandler;
 pub use super::search_handler::SearchHandler;
 pub use super::symbol_lookup_handler::SymbolLookupHandler;
 pub use super::text_search_handler::TextSearchHandler;
+pub use super::write_handler::WriteHandler;
 
 // ── Tool surface definition ──────────────────────────────────────────────
 //
@@ -59,6 +60,8 @@ dispatch_handler! {
     GrepSymbols         => GrepSymbolsHandler,
     /// Handler for reading symbol source
     ReadSymbol          => ReadSymbolHandler,
+    /// Handler for atomic file write
+    Write               => WriteHandler,
     /// Handler for edit preview
     EditPreview         => EditPreviewHandler,
     /// Handler for edit apply

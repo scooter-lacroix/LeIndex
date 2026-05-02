@@ -40,6 +40,8 @@ pub mod deep_analyze_handler;
 pub mod diagnostics_handler;
 /// Handler for leindex_edit_apply — atomic code modifications.
 pub mod edit_apply_handler;
+/// Disk-persistent cache for edit previews.
+pub mod edit_cache;
 /// Handler for leindex_edit_preview — dry-run code changes.
 pub mod edit_preview_handler;
 /// Handler for leindex_file_summary — structured file analysis.
@@ -68,6 +70,8 @@ pub mod search_handler;
 pub mod symbol_lookup_handler;
 /// Handler for leindex_text_search — raw text/regex search.
 pub mod text_search_handler;
+/// Handler for leindex_write — atomic file creation with PDG surfacing.
+pub mod write_handler;
 
 /// MCP server implementation.
 pub mod server;

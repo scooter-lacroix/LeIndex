@@ -47,6 +47,27 @@ impl RustParser {
                         .child_by_field_name("name")
                         .and_then(|n| n.utf8_text(source).ok())
                     {
+                        let qualified_name = if parent_path.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{}.{}", parent_path.join("::"), name)
+                        };
+
+                        signatures.push(SignatureInfo {
+                            name: name.to_string(),
+                            qualified_name,
+                            parameters: vec![],
+                            return_type: Some("module".to_string()),
+                            visibility: extract_visibility(&node, source),
+                            is_async: false,
+                            is_method: false,
+                            docstring: extract_docstring(&node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                            cyclomatic_complexity: 0,
+                        });
+
                         let mut new_path = parent_path.clone();
                         new_path.push(name.to_string());
                         push_children_with_path(&mut stack, node, &new_path);
@@ -781,7 +802,10 @@ impl<'a> CfgBuilder<'a> {
                 "if_expression" | "if_let_expression" => {
                     self.handle_if_statement(&node, current_block)?;
                 }
-                "while_expression" | "while_let_expression" | "for_expression" | "loop_expression" => {
+                "while_expression"
+                | "while_let_expression"
+                | "for_expression"
+                | "loop_expression" => {
                     self.handle_loop_statement(&node, current_block)?;
                 }
                 "match_expression" => {
