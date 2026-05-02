@@ -31,6 +31,7 @@ fn generate_vectors(count: usize, dim: usize) -> Vec<(String, Vec<f32>)> {
 
 /// Benchmark search latency with various index sizes
 fn benchmark_search_latency(c: &mut Criterion) {
+    print_search_summary();
     let mut group = c.benchmark_group("search_latency");
 
     // Different index sizes to test scalability

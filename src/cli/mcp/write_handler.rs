@@ -1,5 +1,5 @@
 use super::helpers::{
-    extract_string, validate_file_within_project, wrap_with_meta,
+    extract_string, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -54,7 +54,7 @@ context (symbols, types) immediately so the model knows how the new file fits in
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path).await?;
-        let mut guard = handle.write().await;
+        let guard = handle.write().await;
 
         // Enforce project boundary
         let project_root = guard.project_path().to_path_buf();
