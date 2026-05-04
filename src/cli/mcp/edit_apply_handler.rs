@@ -93,7 +93,15 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
 
         let handle = registry.get_or_create(project_path_arg).await?;
 
-        // 1. Resolve path and check cache with READ lock first
+        // 0. Ensure PDG is loaded for BOTH branches (parsing and impact analysis)
+        {
+            let mut guard = handle.write().await;
+            guard
+                .ensure_pdg_loaded()
+                .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+        }
+
+        // 1. Resolve path and check cache with READ lock
         let (canonical_path, storage_path, cached_entry) = {
             let guard = handle.read().await;
             let canonical = validate_file_within_project(&file_path, guard.project_path())?;
@@ -123,14 +131,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
 
             (cache.original_text, cache.modified_text, cache.changes)
         } else {
-            // No token provided - we need to parse changes (which might need PDG/Write lock)
-            let mut guard = handle.write().await;
-            
-            // Ensure PDG is loaded for change parsing/resolution
-            guard
-                .ensure_pdg_loaded()
-                .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
-
+            // No token provided - we need to parse changes (PDG already loaded above)
             let original = tokio::fs::read_to_string(&canonical_path).await.map_err(|e| {
                 JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
             })?;
@@ -152,7 +153,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
         }
 
         // 2. Validation (if validator available)
-        let _validation_json = {
+        let validation_json = {
             let guard = handle.read().await;
             match guard.create_validator() {
                 Some(validator) => {
@@ -191,18 +192,36 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
         // 5. PDG Context Enrichment
         let mut affected_nodes: Vec<String> = Vec::new();
         let mut affected_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+        affected_files.insert(canonical_path.to_string_lossy().to_string());
+        let mut breaking_changes: Vec<String> = Vec::new();
         
         {
             let guard = handle.read().await;
             if let Some(pdg) = guard.pdg() {
                 for change in &changes {
                     if let crate::edit::EditChange::RenameSymbol { old_name, .. } = change {
-                        if let Some(node_id) = pdg.find_by_symbol(old_name).or_else(|| pdg.find_by_name(old_name)) {
+                        let found_id = pdg
+                            .find_by_symbol(old_name)
+                            .or_else(|| pdg.find_by_name(old_name))
+                            .or_else(|| pdg.find_by_name_in_file(old_name, Some(&canonical_path.to_string_lossy())));
+                        
+                        if let Some(node_id) = found_id {
                             for dep_id in pdg.forward_impact(node_id, &crate::graph::pdg::TraversalConfig::for_impact_analysis()) {
                                 if let Some(dn) = pdg.get_node(dep_id) {
                                     affected_nodes.push(dn.name.clone());
                                     affected_files.insert(dn.file_path.to_string());
                                 }
+                            }
+                            let backward = pdg.backward_impact(
+                                node_id,
+                                &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
+                            );
+                            if !backward.is_empty() {
+                                breaking_changes.push(format!(
+                                    "Renaming '{}' may break {} caller(s)",
+                                    old_name,
+                                    backward.len()
+                                ));
                             }
                         }
                     }
@@ -229,14 +248,21 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             .collect::<Vec<_>>()
             .join("\n");
 
-        let response = serde_json::json!({
+        let mut response = serde_json::json!({
             "success": true,
             "changes_applied": changes.len(),
             "file_path": canonical_path.to_string_lossy(),
             "edit_region": edit_region,
             "affected_symbols": affected_nodes,
             "affected_files": affected_files.into_iter().collect::<Vec<_>>(),
+            "breaking_changes": breaking_changes,
         });
+
+        if let Some(val) = validation_json {
+            if let Some(obj) = response.as_object_mut() {
+                obj.insert("validation".to_string(), val);
+            }
+        }
 
         let guard = handle.read().await;
         Ok(wrap_with_meta(response, &guard))

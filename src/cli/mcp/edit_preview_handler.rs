@@ -156,7 +156,7 @@ leindex_edit_apply to understand the blast radius of your change."
                         Ok(result) => Some(validation_to_json(&result)),
                         Err(e) => {
                             Some(serde_json::json!({
-                                "is_valid": true,
+                                "is_valid": Value::Null,
                                 "has_errors": false,
                                 "syntax_errors": [],
                                 "reference_issues": [],
@@ -173,7 +173,7 @@ leindex_edit_apply to understand the blast radius of your change."
             // Compute impact from PDG
             let mut nodes: Vec<String> = Vec::new();
             let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
-            files.insert(file_path.clone());
+            files.insert(abs_file_path.to_string_lossy().to_string());
             let mut breaks: Vec<String> = Vec::new();
 
             if let Some(pdg) = guard.pdg() {
@@ -187,7 +187,7 @@ leindex_edit_apply to understand the blast radius of your change."
                         let found_id = pdg
                             .find_by_symbol(old_name)
                             .or_else(|| pdg.find_by_name(old_name))
-                            .or_else(|| pdg.find_by_name_in_file(old_name, None));
+                            .or_else(|| pdg.find_by_name_in_file(old_name, Some(&abs_file_path.to_string_lossy())));
                         if let Some(node_id) = found_id {
                             let forward = pdg.forward_impact(
                                 node_id,

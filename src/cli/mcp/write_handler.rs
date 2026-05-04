@@ -1,5 +1,5 @@
 use super::helpers::{
-    extract_string, validate_file_within_project, wrap_with_meta,
+    extract_string, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
@@ -55,11 +55,42 @@ context (symbols, types) immediately so the model knows how the new file fits in
         let handle = registry.get_or_create(project_path_arg).await?;
         
         let abs_path = {
-            let guard = handle.write().await;
-            // Enforce project boundary and resolve path
-            validate_file_within_project(&file_path, guard.project_path())?
+            let guard = handle.read().await;
+            let project_root = guard.project_path();
+            
+            let path = std::path::Path::new(&file_path);
+            let resolved = if path.is_relative() {
+                project_root.join(path)
+            } else {
+                path.to_path_buf()
+            };
+
+            let canonical = if resolved.exists() {
+                resolved.canonicalize().map_err(|e| {
+                    JsonRpcError::invalid_params(format!("Cannot resolve file path '{}': {}", file_path, e))
+                })?
+            } else {
+                let parent = resolved.parent().ok_or_else(|| {
+                    JsonRpcError::invalid_params(format!("Invalid file path '{}': no parent directory", file_path))
+                })?;
+                let canonical_parent = parent.canonicalize().map_err(|e| {
+                    JsonRpcError::invalid_params(format!("Cannot resolve parent directory of '{}': {}", file_path, e))
+                })?;
+                canonical_parent.join(resolved.file_name().ok_or_else(|| {
+                    JsonRpcError::invalid_params(format!("Invalid file path '{}': no file name", file_path))
+                })?)
+            };
+
+            if !canonical.starts_with(project_root) {
+                return Err(JsonRpcError::invalid_params(format!(
+                    "File '{}' is outside the project boundary '{}'",
+                    file_path,
+                    project_root.display()
+                )));
+            }
+            canonical
         };
-        // Write lock dropped here
+        // Registry lock dropped here
 
         // Atomic write (perform IO without holding registry lock)
         atomic_write_async(abs_path.clone(), content.as_bytes().to_vec())
@@ -79,8 +110,13 @@ context (symbols, types) immediately so the model knows how the new file fits in
 
         let signatures = if language != "unknown" {
             let parser = crate::parse::parallel::ParallelParser::new();
-            // We just parse this one file for immediate surfacing
-            let results = parser.parse_files(vec![abs_path.clone()]);
+            let abs_path_for_spawn = abs_path.clone();
+            // We just parse this one file for immediate surfacing.
+            // Wrap in spawn_blocking to avoid blocking the async executor.
+            let results = tokio::task::spawn_blocking(move || {
+                parser.parse_files(vec![abs_path_for_spawn])
+            }).await.map_err(|e| JsonRpcError::internal_error(format!("Parser task panicked: {}", e)))?;
+
             if let Some(res) = results.first() {
                 res.signatures.clone()
             } else {
