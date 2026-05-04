@@ -47,6 +47,27 @@ impl RustParser {
                         .child_by_field_name("name")
                         .and_then(|n| n.utf8_text(source).ok())
                     {
+                        let qualified_name = if parent_path.is_empty() {
+                            name.to_string()
+                        } else {
+                            format!("{}::{}", parent_path.join("::"), name)
+                        };
+
+                        signatures.push(SignatureInfo {
+                            name: name.to_string(),
+                            qualified_name,
+                            parameters: vec![],
+                            return_type: Some("module".to_string()),
+                            visibility: extract_visibility(&node, source),
+                            is_async: false,
+                            is_method: false,
+                            docstring: extract_docstring(&node, source),
+                            calls: vec![],
+                            imports: vec![],
+                            byte_range: (node.start_byte(), node.end_byte()),
+                            cyclomatic_complexity: 0,
+                        });
+
                         let mut new_path = parent_path.clone();
                         new_path.push(name.to_string());
                         push_children_with_path(&mut stack, node, &new_path);
@@ -97,7 +118,7 @@ impl RustParser {
                         let qualified_name = if parent_path.is_empty() {
                             name.to_string()
                         } else {
-                            format!("{}.{}", parent_path.join("::"), name)
+                            format!("{}::{}", parent_path.join("::"), name)
                         };
 
                         signatures.push(SignatureInfo {
@@ -126,7 +147,7 @@ impl RustParser {
                         let qualified_name = if parent_path.is_empty() {
                             name.to_string()
                         } else {
-                            format!("{}.{}", parent_path.join("::"), name)
+                            format!("{}::{}", parent_path.join("::"), name)
                         };
 
                         let type_params = node
@@ -164,7 +185,7 @@ impl RustParser {
                         let qualified_name = if parent_path.is_empty() {
                             name.to_string()
                         } else {
-                            format!("{}.{}", parent_path.join("::"), name)
+                            format!("{}::{}", parent_path.join("::"), name)
                         };
 
                         signatures.push(SignatureInfo {
@@ -360,7 +381,7 @@ fn extract_function_signature(
     let qualified_name = if parent_path.is_empty() {
         name.clone()
     } else {
-        format!("{}.{}", parent_path.join("::"), name)
+        format!("{}::{}", parent_path.join("::"), name)
     };
 
     let parameters = extract_rust_parameters(node, source);
@@ -781,7 +802,10 @@ impl<'a> CfgBuilder<'a> {
                 "if_expression" | "if_let_expression" => {
                     self.handle_if_statement(&node, current_block)?;
                 }
-                "while_expression" | "while_let_expression" | "for_expression" | "loop_expression" => {
+                "while_expression"
+                | "while_let_expression"
+                | "for_expression"
+                | "loop_expression" => {
                     self.handle_loop_statement(&node, current_block)?;
                 }
                 "match_expression" => {
@@ -1386,6 +1410,51 @@ fn test_function() {
             fn_sig.calls.iter().any(|c| c == "DeepThoughtManager"),
             "Should detect DeepThoughtManager type prefix, got calls: {:?}",
             fn_sig.calls
+        );
+    }
+
+    #[test]
+    fn test_rust_mod_item_extraction() {
+        let source = b"
+pub mod outer {
+    mod inner {
+        fn baz() {}
+    }
+}
+mod external;
+";
+
+        let parser = RustParser::new();
+        let signatures = parser.get_signatures(source).unwrap();
+
+        // Module signatures should be present
+        let outer = signatures.iter().find(|s| s.name == "outer");
+        assert!(outer.is_some(), "should emit SignatureInfo for `outer`");
+        assert_eq!(outer.unwrap().return_type.as_deref(), Some("module"));
+        assert_eq!(outer.unwrap().visibility, Visibility::Public);
+
+        let inner = signatures.iter().find(|s| s.name == "inner");
+        assert!(
+            inner.is_some(),
+            "should emit SignatureInfo for nested `inner`"
+        );
+        assert_eq!(inner.unwrap().return_type.as_deref(), Some("module"));
+
+        // `mod external;` should also produce a module signature
+        let ext = signatures.iter().find(|s| s.name == "external");
+        assert!(
+            ext.is_some(),
+            "should emit SignatureInfo for external `mod external;`"
+        );
+
+        // Function inside nested module should be indexed
+        let baz = signatures.iter().find(|s| s.name == "baz");
+        assert!(baz.is_some(), "nested fn baz should be indexed");
+        // qualified_name should reflect the module path exactly
+        assert_eq!(
+            baz.unwrap().qualified_name,
+            "outer::inner::baz",
+            "baz qualified_name should match the module path exactly"
         );
     }
 }

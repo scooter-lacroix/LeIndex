@@ -49,9 +49,7 @@ impl DiagnosticsHandler {
             JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e))
         })?;
 
-        let (changed, deleted) = guard
-            .check_freshness()
-            .unwrap_or_else(|_| (vec![], vec![]));
+        let (changed, deleted) = guard.check_freshness().unwrap_or_else(|_| (vec![], vec![]));
         let storage_path = guard.storage_path().display().to_string();
         let db_size = std::fs::metadata(guard.storage_path().join("leindex.db"))
             .map(|m| m.len())

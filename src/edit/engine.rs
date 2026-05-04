@@ -231,6 +231,31 @@ pub(crate) async fn atomic_write_async(target: PathBuf, data: Vec<u8>) -> std::i
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?
 }
 
+/// Perform an atomic write only if the target file's current content matches `expected`.
+/// Returns `Ok(true)` on success, `Ok(false)` if content mismatched, and `Err` on I/O failure.
+pub(crate) async fn atomic_write_with_expected_async(
+    target: PathBuf,
+    data: Vec<u8>,
+    expected: Vec<u8>,
+) -> std::io::Result<bool> {
+    tokio::task::spawn_blocking(move || {
+        if target.exists() {
+            let current = std::fs::read(&target)?;
+            if current != expected {
+                return Ok(false);
+            }
+        } else if !expected.is_empty() {
+            // Target doesn't exist but we expected content
+            return Ok(false);
+        }
+
+        atomic_write(&target, &data)?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?
+}
+
 fn sanitize_session_component(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for ch in value.chars() {

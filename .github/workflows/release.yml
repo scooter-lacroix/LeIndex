@@ -270,8 +270,10 @@ jobs:
 
       - name: Check NPM_TOKEN availability
         id: check_token
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          if [ -z "${{ secrets.NPM_TOKEN }}" ]; then
+          if [ -z "$NPM_TOKEN" ]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "⚠️ NPM_TOKEN not set — skipping npm publish"
           else
@@ -321,12 +323,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check PYPI_TOKEN availability
+        id: check_token
+        env:
+          PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          if [ -z "$PYPI_TOKEN" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "⚠️ PYPI_TOKEN not set — skipping PyPI publish"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup Python
+        if: steps.check_token.outputs.available == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Verify version parity
+        if: steps.check_token.outputs.available == 'true'
         run: |
           CARGO_VERSION=$(grep '^version =' ../../Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           PYPI_VERSION=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
@@ -337,12 +353,15 @@ jobs:
           echo "Versions match: v${CARGO_VERSION}"
 
       - name: Install build tools
+        if: steps.check_token.outputs.available == 'true'
         run: pip install build twine
 
       - name: Build package
+        if: steps.check_token.outputs.available == 'true'
         run: python -m build
 
       - name: Publish to PyPI
+        if: steps.check_token.outputs.available == 'true'
         run: |
           PYPI_VER=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           PKG_NAME=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['name'])")
@@ -409,5 +428,5 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "### Registry notes" >> "$GITHUB_STEP_SUMMARY"
           echo "- **crates.io**: Publishes the Rust crate (required)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **PyPI**: Thin Python wrapper that bootstraps cargo install (required)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **PyPI**: Thin Python wrapper that bootstraps cargo install (optional — needs PYPI_TOKEN)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **npm**: Binary wrapper with GH Release download (optional — needs NPM_TOKEN)" >> "$GITHUB_STEP_SUMMARY"

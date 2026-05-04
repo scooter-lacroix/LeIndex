@@ -1,6 +1,4 @@
-use super::helpers::{
-    extract_string, extract_usize, get_direct_callers, wrap_with_meta,
-};
+use super::helpers::{extract_string, extract_usize, get_direct_callers, wrap_with_meta};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
@@ -69,7 +67,8 @@ to understand the blast radius of your change. No equivalent in standard tools."
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
-        guard.ensure_pdg_loaded()
+        guard
+            .ensure_pdg_loaded()
             .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
 
         if guard.pdg().is_none() {

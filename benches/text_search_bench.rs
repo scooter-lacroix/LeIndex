@@ -19,11 +19,68 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 
+// Mock dependencies from helpers.rs to keep benchmark self-contained while mirroring production
+fn normalise_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_ws = false;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            if !in_ws && !out.is_empty() {
+                out.push(' ');
+            }
+            in_ws = true;
+        } else {
+            in_ws = false;
+            out.push(ch);
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn normalise_ws_with_spans(s: &str) -> (String, Vec<(usize, usize)>) {
+    let mut chars: Vec<char> = Vec::with_capacity(s.len());
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(s.len());
+    let mut seen_non_ws = false;
+    let mut in_ws = false;
+
+    for (idx, ch) in s.char_indices() {
+        if ch.is_whitespace() {
+            if !seen_non_ws {
+                continue;
+            }
+            if !in_ws {
+                chars.push(' ');
+                spans.push((idx, idx + ch.len_utf8()));
+                in_ws = true;
+            } else if let Some(last) = spans.last_mut() {
+                last.1 = idx + ch.len_utf8();
+            }
+        } else {
+            seen_non_ws = true;
+            in_ws = false;
+            chars.push(ch);
+            spans.push((idx, idx + ch.len_utf8()));
+        }
+    }
+
+    let mut result = chars.into_iter().collect::<String>();
+    while result.ends_with(' ') {
+        result.pop();
+        spans.pop();
+    }
+    (result, spans)
+}
+
 /// Generate a haystack with the specified number of lines.
 /// Each line is ~50 chars of code-like text.
 fn generate_haystack(num_lines: usize) -> String {
     (0..num_lines)
-        .map(|i| format!("    let value_{} = some_function(arg1, arg2) + other_call();", i))
+        .map(|i| {
+            format!(
+                "    let value_{} = some_function(arg1, arg2) + other_call();",
+                i
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -35,7 +92,10 @@ fn generate_needle_for_position(haystack: &str, target_line: usize) -> String {
     let line = lines[line_idx];
     if let Some(idx) = line.find("some_function") {
         let portion = &line[idx..line.len().min(idx + 30)];
-        portion.replace("(", " ( ").replace(",", " , ").replace(")", " ) ")
+        portion
+            .replace("(", " ( ")
+            .replace(",", " , ")
+            .replace(")", " ) ")
     } else {
         line.to_string()
     }
@@ -97,51 +157,44 @@ fn find_normalised_whitespace_new(haystack: &str, needle: &str) -> Option<(usize
     if norm_needle.is_empty() {
         return None;
     }
-    let lines: Vec<&str> = haystack.lines().collect();
+    let needle_char_count = norm_needle.chars().count();
 
     // Pre-compute cumulative byte offsets for O(1) line-to-byte lookup.
-    let mut line_offsets: Vec<usize> = Vec::with_capacity(lines.len());
+    // Use split_inclusive to correctly handle CRLF and varied line endings.
+    let mut line_offsets: Vec<usize> = Vec::new();
+    let mut line_lengths: Vec<usize> = Vec::new();
     let mut cumulative: usize = 0;
-    for line in &lines {
+
+    for chunk in haystack.split_inclusive('\n') {
         line_offsets.push(cumulative);
-        cumulative += line.len() + 1;
+        line_lengths.push(chunk.len());
+        cumulative += chunk.len();
     }
 
     let max_window = needle.lines().count() + 5;
-    for start_line in 0..lines.len() {
-        let mut window = String::new();
-        let window_end = lines.len().min(start_line + max_window);
+    let line_count = line_offsets.len();
+
+    for start_line in 0..line_count {
+        let byte_start = line_offsets[start_line];
+        let window_end = line_count.min(start_line + max_window);
         for end_line in start_line..window_end {
-            if !window.is_empty() {
-                window.push(' ');
-            }
-            window.push_str(lines[end_line].trim());
-            let norm_window = normalise_ws(&window);
-            if norm_window.find(&norm_needle).is_some() {
-                let byte_start = line_offsets[start_line];
-                let byte_end = line_offsets[end_line] + lines[end_line].len() + 1;
-                return Some((byte_start, byte_end.min(haystack.len()) - byte_start));
+            let byte_end = line_offsets[end_line] + line_lengths[end_line];
+            let window = &haystack[byte_start..byte_end];
+            
+            // Align with production span tracking
+            let (norm_window, spans) = normalise_ws_with_spans(window);
+            if let Some(match_byte_start) = norm_window.find(&norm_needle) {
+                let match_char_start = norm_window[..match_byte_start].chars().count();
+                let match_char_end = match_char_start + needle_char_count;
+                
+                let (span_start, _) = spans.get(match_char_start)?;
+                let (_, span_end) = spans.get(match_char_end.saturating_sub(1))?;
+                
+                return Some((byte_start + span_start, span_end - span_start));
             }
         }
     }
     None
-}
-
-fn normalise_ws(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut in_ws = false;
-    for ch in s.chars() {
-        if ch.is_whitespace() {
-            if !in_ws && !out.is_empty() {
-                out.push(' ');
-            }
-            in_ws = true;
-        } else {
-            in_ws = false;
-            out.push(ch);
-        }
-    }
-    out.trim_end().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -164,7 +217,10 @@ fn bench_optimized(c: &mut Criterion) {
             &(&haystack, &needle),
             |b, &(haystack, needle)| {
                 b.iter(|| {
-                    black_box(find_normalised_whitespace_new(black_box(haystack), black_box(needle)));
+                    black_box(find_normalised_whitespace_new(
+                        black_box(haystack),
+                        black_box(needle),
+                    ));
                 });
             },
         );
@@ -189,7 +245,10 @@ fn bench_old(c: &mut Criterion) {
             &(&haystack, &needle),
             |b, &(haystack, needle)| {
                 b.iter(|| {
-                    black_box(find_normalised_whitespace_old(black_box(haystack), black_box(needle)));
+                    black_box(find_normalised_whitespace_old(
+                        black_box(haystack),
+                        black_box(needle),
+                    ));
                 });
             },
         );
@@ -215,7 +274,10 @@ fn bench_small_file_performance(c: &mut Criterion) {
             &(&haystack, &needle),
             |b, &(haystack, needle)| {
                 b.iter(|| {
-                    black_box(find_normalised_whitespace_new(black_box(haystack), black_box(needle)));
+                    black_box(find_normalised_whitespace_new(
+                        black_box(haystack),
+                        black_box(needle),
+                    ));
                 });
             },
         );

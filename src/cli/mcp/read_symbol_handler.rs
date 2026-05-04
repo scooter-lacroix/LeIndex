@@ -72,7 +72,8 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
-        guard.ensure_pdg_loaded()
+        guard
+            .ensure_pdg_loaded()
             .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
 
         if guard.pdg().is_none() {

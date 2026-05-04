@@ -1015,7 +1015,10 @@ impl ProgramDependenceGraph {
     pub fn find_by_name_in_file(&self, name: &str, file_hint: Option<&str>) -> Option<NodeId> {
         // 0. O(1) exact lookup via name_file_index when file hint is provided
         if let Some(fp) = file_hint {
-            if let Some(&nid) = self.name_file_index.get(&(name.to_string(), fp.to_string())) {
+            if let Some(&nid) = self
+                .name_file_index
+                .get(&(name.to_string(), fp.to_string()))
+            {
                 return Some(nid);
             }
         }

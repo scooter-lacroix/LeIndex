@@ -16,8 +16,8 @@ use crate::search::ranking::{HybridScorer, Score};
 use crate::search::vector::VectorIndex;
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 // ============================================================================
@@ -534,11 +534,7 @@ impl SearchEngine {
             .lines()
             .skip(1) // skip "// name in path" header
             .map(|l| l.trim())
-            .find(|l| {
-                !l.is_empty()
-                    && !l.starts_with("// [No source")
-                    && !l.starts_with("// [")
-            })
+            .find(|l| !l.is_empty() && !l.starts_with("// [No source") && !l.starts_with("// ["))
             .map(|l| l.to_string())
     }
 
@@ -665,16 +661,13 @@ impl SearchEngine {
         self.node_id_to_idx.insert(node_id.clone(), new_idx);
 
         // Update complexity_cache
-        self.complexity_cache.insert(node_id.clone(), node.complexity);
+        self.complexity_cache
+            .insert(node_id.clone(), node.complexity);
 
         // Insert embedding into vector index
         if let Some(embedding) = &node.embedding {
             if let Err(e) = self.vector_index.insert(node_id.clone(), embedding.clone()) {
-                tracing::warn!(
-                    "Failed to insert embedding for node {}: {:?}",
-                    node_id,
-                    e
-                );
+                tracing::warn!("Failed to insert embedding for node {}: {:?}", node_id, e);
             }
         }
 
@@ -1712,7 +1705,10 @@ mod tests {
         // func1's tokens should be removed from text_index
         // "func1" token should no longer map to func1
         if let Some(ids) = engine.text_index.get("func1") {
-            assert!(!ids.contains("func1"), "func1 should be removed from text_index");
+            assert!(
+                !ids.contains("func1"),
+                "func1 should be removed from text_index"
+            );
         }
 
         // node_tokens should not contain func1
@@ -1731,7 +1727,10 @@ mod tests {
             query_type: None,
         };
         let results = engine.search(query).unwrap();
-        assert!(results.is_empty(), "func1 should not be found after removal");
+        assert!(
+            results.is_empty(),
+            "func1 should not be found after removal"
+        );
     }
 
     #[test]
@@ -1968,8 +1967,13 @@ mod tests {
         assert_eq!(engine_inc.node_count(), engine_full.node_count());
 
         // Both should have same node_ids
-        let inc_ids: std::collections::BTreeSet<_> = engine_inc.nodes.iter().map(|n| n.node_id.clone()).collect();
-        let full_ids: std::collections::BTreeSet<_> = engine_full.nodes.iter().map(|n| n.node_id.clone()).collect();
+        let inc_ids: std::collections::BTreeSet<_> =
+            engine_inc.nodes.iter().map(|n| n.node_id.clone()).collect();
+        let full_ids: std::collections::BTreeSet<_> = engine_full
+            .nodes
+            .iter()
+            .map(|n| n.node_id.clone())
+            .collect();
         assert_eq!(inc_ids, full_ids);
 
         // Search should produce same results
@@ -2116,6 +2120,10 @@ mod tests {
         }
 
         // But func3 tokens should still be searchable
-        assert!(engine.node_tokens.get("func3").unwrap().contains("important"));
+        assert!(engine
+            .node_tokens
+            .get("func3")
+            .unwrap()
+            .contains("important"));
     }
 }

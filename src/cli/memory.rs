@@ -5,13 +5,13 @@
 
 use bincode::{deserialize, serialize};
 use lru::LruCache;
-use sysinfo::{get_current_pid, ProcessesToUpdate, System};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use sysinfo::{get_current_pid, ProcessesToUpdate, System};
 use tracing::{debug, info, warn};
 
 // ============================================================================

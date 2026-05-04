@@ -32,7 +32,9 @@ fn byte_to_line_start(offsets: &[usize], byte_pos: usize, total_lines: usize) ->
 }
 
 fn byte_to_line_end(offsets: &[usize], byte_pos: usize, total_lines: usize) -> usize {
-    offsets.partition_point(|&off| off < byte_pos).min(total_lines.max(1))
+    offsets
+        .partition_point(|&off| off < byte_pos)
+        .min(total_lines.max(1))
 }
 
 fn build_pdg_enrichment(
