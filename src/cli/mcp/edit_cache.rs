@@ -41,16 +41,16 @@ impl EditCache {
     pub async fn set(&self, project_storage: &Path, entry: EditCacheEntry) -> Result<(), JsonRpcError> {
         let file_path = entry.file_path.clone();
         
-        // Canonicalize file path for consistent keys
+        // Use tokio::fs for async path operations
         let abs_path = if file_path.is_absolute() {
             file_path.clone()
         } else {
-            file_path.canonicalize().unwrap_or(file_path.clone())
+            tokio::fs::canonicalize(&file_path).await.unwrap_or(file_path.clone())
         };
         
         // Cold storage: persist to project storage directory
         let cache_dir = project_storage.join("edit_cache");
-        if !cache_dir.exists() {
+        if tokio::fs::metadata(&cache_dir).await.is_err() {
             tokio::fs::create_dir_all(&cache_dir).await.map_err(|e| {
                 JsonRpcError::internal_error(format!("Failed to create edit cache directory: {}", e))
             })?
@@ -81,7 +81,7 @@ impl EditCache {
         let abs_path = if file_path.is_absolute() {
             file_path.to_path_buf()
         } else {
-            file_path.canonicalize().unwrap_or(file_path.to_path_buf())
+            tokio::fs::canonicalize(file_path).await.unwrap_or(file_path.to_path_buf())
         };
 
         // Try hot cache first
@@ -96,8 +96,8 @@ impl EditCache {
         let hash = blake3::hash(abs_path.to_string_lossy().as_bytes()).to_hex();
         let cache_file = project_storage.join("edit_cache").join(format!("{}.json", hash));
         
-        if cache_file.exists() {
-            if let Ok(json) = std::fs::read_to_string(&cache_file) {
+        if tokio::fs::metadata(&cache_file).await.is_ok() {
+            if let Ok(json) = tokio::fs::read_to_string(&cache_file).await {
                 if let Ok(entry) = serde_json::from_str::<EditCacheEntry>(&json) {
                     // Backfill hot cache
                     let mut entries = self.entries.lock().await;
@@ -115,7 +115,7 @@ impl EditCache {
         let abs_path = if file_path.is_absolute() {
             file_path.to_path_buf()
         } else {
-            file_path.canonicalize().unwrap_or(file_path.to_path_buf())
+            tokio::fs::canonicalize(file_path).await.unwrap_or(file_path.to_path_buf())
         };
 
         {
@@ -125,8 +125,8 @@ impl EditCache {
         
         let hash = blake3::hash(abs_path.to_string_lossy().as_bytes()).to_hex();
         let cache_file = project_storage.join("edit_cache").join(format!("{}.json", hash));
-        if cache_file.exists() {
-            let _ = std::fs::remove_file(cache_file);
+        if tokio::fs::metadata(&cache_file).await.is_ok() {
+            let _ = tokio::fs::remove_file(cache_file).await;
         }
     }
 }

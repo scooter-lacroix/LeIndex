@@ -50,7 +50,7 @@ impl RustParser {
                         let qualified_name = if parent_path.is_empty() {
                             name.to_string()
                         } else {
-                            format!("{}.{}", parent_path.join("::"), name)
+                            format!("{}::{}", parent_path.join("::"), name)
                         };
 
                         signatures.push(SignatureInfo {
@@ -118,7 +118,7 @@ impl RustParser {
                         let qualified_name = if parent_path.is_empty() {
                             name.to_string()
                         } else {
-                            format!("{}.{}", parent_path.join("::"), name)
+                            format!("{}::{}", parent_path.join("::"), name)
                         };
 
                         signatures.push(SignatureInfo {
@@ -147,7 +147,7 @@ impl RustParser {
                         let qualified_name = if parent_path.is_empty() {
                             name.to_string()
                         } else {
-                            format!("{}.{}", parent_path.join("::"), name)
+                            format!("{}::{}", parent_path.join("::"), name)
                         };
 
                         let type_params = node
@@ -185,7 +185,7 @@ impl RustParser {
                         let qualified_name = if parent_path.is_empty() {
                             name.to_string()
                         } else {
-                            format!("{}.{}", parent_path.join("::"), name)
+                            format!("{}::{}", parent_path.join("::"), name)
                         };
 
                         signatures.push(SignatureInfo {
@@ -381,7 +381,7 @@ fn extract_function_signature(
     let qualified_name = if parent_path.is_empty() {
         name.clone()
     } else {
-        format!("{}.{}", parent_path.join("::"), name)
+        format!("{}::{}", parent_path.join("::"), name)
     };
 
     let parameters = extract_rust_parameters(node, source);
@@ -1450,11 +1450,11 @@ mod external;
         // Function inside nested module should be indexed
         let baz = signatures.iter().find(|s| s.name == "baz");
         assert!(baz.is_some(), "nested fn baz should be indexed");
-        // qualified_name should reflect the module path
-        assert!(
-            baz.unwrap().qualified_name.contains("inner"),
-            "baz qualified_name should include `inner`, got: {}",
-            baz.unwrap().qualified_name
+        // qualified_name should reflect the module path exactly
+        assert_eq!(
+            baz.unwrap().qualified_name,
+            "outer::inner::baz",
+            "baz qualified_name should match the module path exactly"
         );
     }
 }

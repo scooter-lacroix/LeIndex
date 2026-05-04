@@ -1,11 +1,10 @@
 use super::helpers::{
-    extract_string, wrap_with_meta,
+    extract_string, validate_file_within_project, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use crate::edit::atomic_write_async;
 use serde_json::Value;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Handler for leindex_write — atomic file creation/overwrite with immediate PDG surfacing.
@@ -29,7 +28,7 @@ context (symbols, types) immediately so the model knows how the new file fits in
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute path to the file to write"
+                    "description": "Absolute or project-relative path. Relative paths resolve against the project root."
                 },
                 "content": {
                     "type": "string",
@@ -51,42 +50,18 @@ context (symbols, types) immediately so the model knows how the new file fits in
     ) -> Result<Value, JsonRpcError> {
         let file_path = extract_string(&args, "file_path")?;
         let content = extract_string(&args, "content")?;
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let project_path_arg = args.get("project_path").and_then(|v| v.as_str());
 
-        let handle = registry.get_or_create(project_path).await?;
-        let guard = handle.write().await;
-
-        // Enforce project boundary
-        let project_root = guard.project_path().to_path_buf();
-        let requested_path = if PathBuf::from(&file_path).is_absolute() {
-            PathBuf::from(&file_path)
-        } else {
-            project_root.join(&file_path)
+        let handle = registry.get_or_create(project_path_arg).await?;
+        
+        let abs_path = {
+            let guard = handle.write().await;
+            // Enforce project boundary and resolve path
+            validate_file_within_project(&file_path, guard.project_path())?
         };
+        // Write lock dropped here
 
-        // Normalize path to resolve .. and . components without requiring filesystem access
-        let mut abs_path = PathBuf::new();
-        for component in requested_path.components() {
-            match component {
-                std::path::Component::ParentDir => {
-                    abs_path.pop();
-                }
-                std::path::Component::CurDir => {}
-                _ => {
-                    abs_path.push(component);
-                }
-            }
-        }
-
-        if !abs_path.starts_with(&project_root) {
-             return Err(JsonRpcError::invalid_params(format!(
-                "File '{}' is outside the project boundary '{}'",
-                file_path,
-                project_root.display()
-            )));
-        }
-
-        // Atomic write
+        // Atomic write (perform IO without holding registry lock)
         atomic_write_async(abs_path.clone(), content.as_bytes().to_vec())
             .await
             .map_err(|e| {
@@ -128,6 +103,8 @@ context (symbols, types) immediately so the model knows how the new file fits in
             }).collect::<Vec<_>>()
         });
 
-        Ok(wrap_with_meta(response, &guard))
+        // Re-acquire READ lock for response wrapping
+        let read_guard = handle.read().await;
+        Ok(wrap_with_meta(response, &read_guard))
     }
 }

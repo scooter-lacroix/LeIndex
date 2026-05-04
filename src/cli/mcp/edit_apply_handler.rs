@@ -33,7 +33,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute path to the file to edit"
+                    "description": "Absolute or project-relative path. Relative paths resolve against the project root."
                 },
                 "old_text": {
                     "type": "string",
@@ -88,45 +88,49 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
         }
 
         let file_path = extract_string(&args, "file_path")?;
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let project_path_arg = args.get("project_path").and_then(|v| v.as_str());
         let provided_token = args.get("preview_token").and_then(|v| v.as_str());
 
-        let handle = registry.get_or_create(project_path).await?;
-        let mut guard = handle.write().await;
+        let handle = registry.get_or_create(project_path_arg).await?;
 
-        // Ensure PDG is loaded
-        guard
-            .ensure_pdg_loaded()
-            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
-
-        // Enforce project boundary
-        let canonical_path = validate_file_within_project(&file_path, guard.project_path())?;
-
-        // 1. Check Edit Cache for a match
-        let cached_entry = GLOBAL_EDIT_CACHE.get(guard.storage_path(), &canonical_path).await;
+        // 1. Resolve path and check cache with READ lock first
+        let (canonical_path, storage_path, cached_entry) = {
+            let guard = handle.read().await;
+            let canonical = validate_file_within_project(&file_path, guard.project_path())?;
+            let entry = GLOBAL_EDIT_CACHE.get(guard.storage_path(), &canonical).await;
+            (canonical, guard.storage_path().to_path_buf(), entry)
+        };
         
-        let (original, modified, changes) = if let Some(cache) = cached_entry {
-            // If cache exists, verify it matches the current request
-            let token_matches = provided_token.map(|t| t == cache.preview_token).unwrap_or(false);
-            
+        let (original, modified, changes) = if let Some(provided_token) = provided_token {
+            // Strict token enforcement: if token is provided, it MUST be valid and fresh
+            let cache = cached_entry.ok_or_else(|| {
+                JsonRpcError::invalid_params("No cached preview found for this file — request a new preview")
+            })?;
+
+            if cache.preview_token != provided_token {
+                return Err(JsonRpcError::invalid_params("preview token mismatch — request a new preview"));
+            }
+
             // Freshness check: read the file from disk and compare it to cache.original_text
             let disk_content = tokio::fs::read_to_string(&canonical_path).await.map_err(|e| {
                 JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
             })?;
 
-            if token_matches && disk_content == cache.original_text {
-                (cache.original_text, cache.modified_text, cache.changes)
-            } else {
-                // Cache stale or token mismatch - discard cache and proceed with provided args
-                GLOBAL_EDIT_CACHE.clear(guard.storage_path(), &canonical_path).await;
-                
-                let changes_val = self.get_changes_from_args(&args)?;
-                let changes = parse_edit_changes(&changes_val, Some(&disk_content))?;
-                let modified = apply_changes_in_memory(&disk_content, &changes)?;
-                (disk_content, modified, changes)
+            if disk_content != cache.original_text {
+                GLOBAL_EDIT_CACHE.clear(&storage_path, &canonical_path).await;
+                return Err(JsonRpcError::invalid_params("cache stale (disk content changed) — request a new preview"));
             }
+
+            (cache.original_text, cache.modified_text, cache.changes)
         } else {
-            // No cache - proceed with provided arguments
+            // No token provided - we need to parse changes (which might need PDG/Write lock)
+            let mut guard = handle.write().await;
+            
+            // Ensure PDG is loaded for change parsing/resolution
+            guard
+                .ensure_pdg_loaded()
+                .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+
             let original = tokio::fs::read_to_string(&canonical_path).await.map_err(|e| {
                 JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
             })?;
@@ -139,6 +143,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
 
         // If no changes, nothing to do
         if modified == original {
+            let guard = handle.read().await;
             return Ok(wrap_with_meta(serde_json::json!({
                 "success": true,
                 "changes_applied": 0,
@@ -146,27 +151,30 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             }), &guard));
         }
 
-        // Run validation
-        let _validation_json = match guard.create_validator() {
-            Some(validator) => {
-                let resolved = ResolvedEditChange::new(
-                    canonical_path.clone(),
-                    original.clone(),
-                    modified.clone(),
-                );
+        // 2. Validation (if validator available)
+        let _validation_json = {
+            let guard = handle.read().await;
+            match guard.create_validator() {
+                Some(validator) => {
+                    let resolved = ResolvedEditChange::new(
+                        canonical_path.clone(),
+                        original.clone(),
+                        modified.clone(),
+                    );
 
-                match validator.validate_changes(&[resolved]) {
-                    Ok(result) => Some(validation_to_json(&result)),
-                    Err(e) => {
-                        tracing::warn!("Validation check failed: {}", e);
-                        None
+                    match validator.validate_changes(&[resolved]) {
+                        Ok(result) => Some(validation_to_json(&result)),
+                        Err(e) => {
+                            tracing::warn!("Validation check failed: {}", e);
+                            None
+                        }
                     }
                 }
+                None => None,
             }
-            None => None,
         };
 
-        // Atomic write
+        // 3. Atomic write (Drop all locks for IO)
         atomic_write_async(canonical_path.clone(), modified.as_bytes().to_vec())
             .await
             .map_err(|e| {
@@ -177,21 +185,24 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 ))
             })?;
 
-        // Clear cache after successful apply
-        GLOBAL_EDIT_CACHE.clear(guard.storage_path(), &canonical_path).await;
+        // 4. Clear cache after successful apply
+        GLOBAL_EDIT_CACHE.clear(&storage_path, &canonical_path).await;
 
-        // PDG Context Enrichment
+        // 5. PDG Context Enrichment
         let mut affected_nodes: Vec<String> = Vec::new();
         let mut affected_files: std::collections::HashSet<String> = std::collections::HashSet::new();
         
-        if let Some(pdg) = guard.pdg() {
-            for change in &changes {
-                if let crate::edit::EditChange::RenameSymbol { old_name, .. } = change {
-                    if let Some(node_id) = pdg.find_by_symbol(old_name).or_else(|| pdg.find_by_name(old_name)) {
-                        for dep_id in pdg.forward_impact(node_id, &crate::graph::pdg::TraversalConfig::for_impact_analysis()) {
-                            if let Some(dn) = pdg.get_node(dep_id) {
-                                affected_nodes.push(dn.name.clone());
-                                affected_files.insert(dn.file_path.to_string());
+        {
+            let guard = handle.read().await;
+            if let Some(pdg) = guard.pdg() {
+                for change in &changes {
+                    if let crate::edit::EditChange::RenameSymbol { old_name, .. } = change {
+                        if let Some(node_id) = pdg.find_by_symbol(old_name).or_else(|| pdg.find_by_name(old_name)) {
+                            for dep_id in pdg.forward_impact(node_id, &crate::graph::pdg::TraversalConfig::for_impact_analysis()) {
+                                if let Some(dn) = pdg.get_node(dep_id) {
+                                    affected_nodes.push(dn.name.clone());
+                                    affected_files.insert(dn.file_path.to_string());
+                                }
                             }
                         }
                     }
@@ -199,14 +210,35 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             }
         }
 
+        // 6. Generate edit_region for LLM verification
+        let modified_lines: Vec<&str> = modified.lines().collect();
+        let original_lines: Vec<&str> = original.lines().collect();
+        let shared_len = original_lines.len().min(modified_lines.len());
+        let first_diff_line = original_lines
+            .iter()
+            .zip(modified_lines.iter())
+            .position(|(old, new)| old != new)
+            .unwrap_or(shared_len);
+
+        let ctx_start = first_diff_line.saturating_sub(5);
+        let ctx_end = (first_diff_line + 10).min(modified_lines.len());
+        let edit_region: String = modified_lines[ctx_start..ctx_end]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{}: {}", ctx_start + i + 1, line))
+            .collect::<Vec<_>>()
+            .join("\n");
+
         let response = serde_json::json!({
             "success": true,
             "changes_applied": changes.len(),
             "file_path": canonical_path.to_string_lossy(),
+            "edit_region": edit_region,
             "affected_symbols": affected_nodes,
             "affected_files": affected_files.into_iter().collect::<Vec<_>>(),
         });
 
+        let guard = handle.read().await;
         Ok(wrap_with_meta(response, &guard))
     }
 
