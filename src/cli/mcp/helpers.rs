@@ -439,7 +439,7 @@ pub(crate) fn normalise_ws(s: &str) -> String {
     out.trim_end().to_string()
 }
 
-fn normalise_ws_with_spans(s: &str) -> (String, Vec<(usize, usize)>) {
+pub(crate) fn normalise_ws_with_spans(s: &str) -> (String, Vec<(usize, usize)>) {
     let mut chars: Vec<char> = Vec::with_capacity(s.len());
     let mut spans: Vec<(usize, usize)> = Vec::with_capacity(s.len());
     let mut seen_non_ws = false;

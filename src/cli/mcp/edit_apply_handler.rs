@@ -6,7 +6,7 @@ use super::helpers::{
 };
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
-use crate::edit::{atomic_write_async, ResolvedEditChange};
+use crate::edit::{atomic_write_with_expected_async, ResolvedEditChange};
 use crate::validation::validation_to_json;
 use serde_json::Value;
 use std::sync::Arc;
@@ -124,22 +124,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 ));
             }
 
-            // Freshness check: read the file from disk and compare it to cache.original_text
-            let disk_content = tokio::fs::read_to_string(&canonical_path)
-                .await
-                .map_err(|e| {
-                    JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
-                })?;
-
-            if disk_content != cache.original_text {
-                GLOBAL_EDIT_CACHE
-                    .clear(&storage_path, &canonical_path)
-                    .await;
-                return Err(JsonRpcError::invalid_params(
-                    "cache stale (disk content changed) — request a new preview",
-                ));
-            }
-
+            // Freshness check: compare expected to disk content handled by atomic_write_with_expected_async
             (cache.original_text, cache.modified_text, cache.changes)
         } else {
             // No token provided - we need to parse changes (PDG already loaded above)
@@ -194,16 +179,30 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             }
         };
 
-        // 3. Atomic write (Drop all locks for IO)
-        atomic_write_async(canonical_path.clone(), modified.as_bytes().to_vec())
-            .await
-            .map_err(|e| {
-                JsonRpcError::internal_error(format!(
-                    "Failed to write '{}': {}",
-                    canonical_path.display(),
-                    e
-                ))
-            })?;
+        // 3. Atomic write with compare-and-swap semantics (Drop all locks for IO)
+        let success: bool = atomic_write_with_expected_async(
+            canonical_path.clone(),
+            modified.as_bytes().to_vec(),
+            original.as_bytes().to_vec(),
+        )
+        .await
+        .map_err(|e| {
+            JsonRpcError::internal_error(format!(
+                "Failed to write '{}': {}",
+                canonical_path.display(),
+                e
+            ))
+        })?;
+
+        if !success {
+            GLOBAL_EDIT_CACHE
+                .clear(&storage_path, &canonical_path)
+                .await;
+            return Err(JsonRpcError::invalid_params(
+                "Edit rejected: file content changed on disk since preview was generated. \
+                Please call leindex_edit_preview again."
+            ));
+        }
 
         // 4. Clear cache after successful apply
         GLOBAL_EDIT_CACHE
