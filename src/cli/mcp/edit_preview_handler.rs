@@ -109,16 +109,23 @@ leindex_edit_apply to understand the blast radius of your change."
         // Write lock dropped
 
         // 2. Read file content (IO without lock)
-        let original = tokio::fs::read_to_string(&abs_file_path).await.map_err(|e| {
-            JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
-        })?;
+        let original = tokio::fs::read_to_string(&abs_file_path)
+            .await
+            .map_err(|e| {
+                JsonRpcError::invalid_params(format!("Cannot read file '{}': {}", file_path, e))
+            })?;
 
         // 3. Parse changes and apply in memory (CPU without lock)
         let changes = parse_edit_changes(&changes_val, Some(&original))?;
         let modified = apply_changes_in_memory(&original, &changes)?;
 
         let preview_token = blake3::hash(
-            format!("{}{}", abs_file_path.display(), chrono::Utc::now().to_rfc3339()).as_bytes(),
+            format!(
+                "{}{}",
+                abs_file_path.display(),
+                chrono::Utc::now().to_rfc3339()
+            )
+            .as_bytes(),
         )
         .to_hex()
         .to_string();
@@ -142,7 +149,7 @@ leindex_edit_apply to understand the blast radius of your change."
 
         let (validation_json, affected_nodes, affected_files, breaking_changes) = {
             let guard = handle.read().await;
-            
+
             // Run validation
             let validation = match guard.create_validator() {
                 Some(validator) => {
@@ -154,17 +161,15 @@ leindex_edit_apply to understand the blast radius of your change."
 
                     match validator.validate_changes(&[resolved]) {
                         Ok(result) => Some(validation_to_json(&result)),
-                        Err(e) => {
-                            Some(serde_json::json!({
-                                "is_valid": Value::Null,
-                                "has_errors": false,
-                                "syntax_errors": [],
-                                "reference_issues": [],
-                                "semantic_drift": [],
-                                "impact_report": null,
-                                "validation_warning": format!("Validation check failed: {}", e),
-                            }))
-                        }
+                        Err(e) => Some(serde_json::json!({
+                            "is_valid": Value::Null,
+                            "has_errors": false,
+                            "syntax_errors": [],
+                            "reference_issues": [],
+                            "semantic_drift": [],
+                            "impact_report": null,
+                            "validation_warning": format!("Validation check failed: {}", e),
+                        })),
                     }
                 }
                 None => None,
@@ -187,7 +192,12 @@ leindex_edit_apply to understand the blast radius of your change."
                         let found_id = pdg
                             .find_by_symbol(old_name)
                             .or_else(|| pdg.find_by_name(old_name))
-                            .or_else(|| pdg.find_by_name_in_file(old_name, Some(&abs_file_path.to_string_lossy())));
+                            .or_else(|| {
+                                pdg.find_by_name_in_file(
+                                    old_name,
+                                    Some(&abs_file_path.to_string_lossy()),
+                                )
+                            });
                         if let Some(node_id) = found_id {
                             let forward = pdg.forward_impact(
                                 node_id,

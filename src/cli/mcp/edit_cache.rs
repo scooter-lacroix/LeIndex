@@ -1,10 +1,10 @@
+use crate::cli::mcp::protocol::JsonRpcError;
+use crate::edit::EditChange;
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
-use crate::edit::EditChange;
-use serde::{Deserialize, Serialize};
-use crate::cli::mcp::protocol::JsonRpcError;
-use once_cell::sync::Lazy;
 
 /// Entry in the edit cache, representing a previewed but not yet applied edit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,32 +37,53 @@ impl EditCache {
         }
     }
 
-    /// Store an edit preview in the cache.
-    pub async fn set(&self, project_storage: &Path, entry: EditCacheEntry) -> Result<(), JsonRpcError> {
-        let file_path = entry.file_path.clone();
-        
-        // Use tokio::fs for async path operations
+    /// Internal helper to resolve absolute path and cache file location.
+    async fn get_abs_path_and_cache_file(
+        &self,
+        project_storage: &Path,
+        file_path: &Path,
+    ) -> (PathBuf, PathBuf) {
         let abs_path = if file_path.is_absolute() {
-            file_path.clone()
+            file_path.to_path_buf()
         } else {
-            tokio::fs::canonicalize(&file_path).await.unwrap_or(file_path.clone())
+            tokio::fs::canonicalize(file_path)
+                .await
+                .unwrap_or_else(|_| file_path.to_path_buf())
         };
-        
+
+        let hash = blake3::hash(abs_path.to_string_lossy().as_bytes()).to_hex();
+        let cache_file = project_storage
+            .join("edit_cache")
+            .join(format!("{}.json", hash));
+
+        (abs_path, cache_file)
+    }
+
+    /// Store an edit preview in the cache.
+    pub async fn set(
+        &self,
+        project_storage: &Path,
+        entry: EditCacheEntry,
+    ) -> Result<(), JsonRpcError> {
+        let (abs_path, cache_file) = self
+            .get_abs_path_and_cache_file(project_storage, &entry.file_path)
+            .await;
+
         // Cold storage: persist to project storage directory
-        let cache_dir = project_storage.join("edit_cache");
-        if tokio::fs::metadata(&cache_dir).await.is_err() {
-            tokio::fs::create_dir_all(&cache_dir).await.map_err(|e| {
-                JsonRpcError::internal_error(format!("Failed to create edit cache directory: {}", e))
+        let cache_dir = cache_file.parent().unwrap();
+        if tokio::fs::metadata(cache_dir).await.is_err() {
+            tokio::fs::create_dir_all(cache_dir).await.map_err(|e| {
+                JsonRpcError::internal_error(format!(
+                    "Failed to create edit cache directory: {}",
+                    e
+                ))
             })?
         }
-        
-        let hash = blake3::hash(abs_path.to_string_lossy().as_bytes()).to_hex();
-        let cache_file = cache_dir.join(format!("{}.json", hash));
-        
+
         let json = serde_json::to_string_pretty(&entry).map_err(|e| {
             JsonRpcError::internal_error(format!("Failed to serialize edit cache: {}", e))
         })?;
-        
+
         tokio::fs::write(&cache_file, json).await.map_err(|e| {
             JsonRpcError::internal_error(format!("Failed to write edit cache to disk: {}", e))
         })?;
@@ -72,17 +93,15 @@ impl EditCache {
             let mut entries = self.entries.lock().await;
             entries.insert(abs_path, entry);
         }
-        
+
         Ok(())
     }
 
     /// Retrieve an edit preview from the cache.
     pub async fn get(&self, project_storage: &Path, file_path: &Path) -> Option<EditCacheEntry> {
-        let abs_path = if file_path.is_absolute() {
-            file_path.to_path_buf()
-        } else {
-            tokio::fs::canonicalize(file_path).await.unwrap_or(file_path.to_path_buf())
-        };
+        let (abs_path, cache_file) = self
+            .get_abs_path_and_cache_file(project_storage, file_path)
+            .await;
 
         // Try hot cache first
         {
@@ -91,43 +110,32 @@ impl EditCache {
                 return Some(entry.clone());
             }
         }
-        
+
         // Try cold storage fallback
-        let hash = blake3::hash(abs_path.to_string_lossy().as_bytes()).to_hex();
-        let cache_file = project_storage.join("edit_cache").join(format!("{}.json", hash));
-        
-        if tokio::fs::metadata(&cache_file).await.is_ok() {
-            if let Ok(json) = tokio::fs::read_to_string(&cache_file).await {
-                if let Ok(entry) = serde_json::from_str::<EditCacheEntry>(&json) {
-                    // Backfill hot cache
-                    let mut entries = self.entries.lock().await;
-                    entries.insert(abs_path, entry.clone());
-                    return Some(entry);
-                }
+        if let Ok(json) = tokio::fs::read_to_string(&cache_file).await {
+            if let Ok(entry) = serde_json::from_str::<EditCacheEntry>(&json) {
+                // Backfill hot cache
+                let mut entries = self.entries.lock().await;
+                entries.insert(abs_path, entry.clone());
+                return Some(entry);
             }
         }
-        
+
         None
     }
 
     /// Clear an edit preview from the cache (called after successful apply).
     pub async fn clear(&self, project_storage: &Path, file_path: &Path) {
-        let abs_path = if file_path.is_absolute() {
-            file_path.to_path_buf()
-        } else {
-            tokio::fs::canonicalize(file_path).await.unwrap_or(file_path.to_path_buf())
-        };
+        let (abs_path, cache_file) = self
+            .get_abs_path_and_cache_file(project_storage, file_path)
+            .await;
 
         {
             let mut entries = self.entries.lock().await;
             entries.remove(&abs_path);
         }
-        
-        let hash = blake3::hash(abs_path.to_string_lossy().as_bytes()).to_hex();
-        let cache_file = project_storage.join("edit_cache").join(format!("{}.json", hash));
-        if tokio::fs::metadata(&cache_file).await.is_ok() {
-            let _ = tokio::fs::remove_file(cache_file).await;
-        }
+
+        let _ = tokio::fs::remove_file(cache_file).await;
     }
 }
 

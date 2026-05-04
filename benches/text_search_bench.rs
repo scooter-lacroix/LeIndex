@@ -105,13 +105,13 @@ fn find_normalised_whitespace_new(haystack: &str, needle: &str) -> Option<(usize
     if norm_needle.is_empty() {
         return None;
     }
-    
+
     // Pre-compute cumulative byte offsets for O(1) line-to-byte lookup.
     // Use split_inclusive to correctly handle CRLF and varied line endings.
     let mut line_offsets: Vec<usize> = Vec::new();
     let mut line_lengths: Vec<usize> = Vec::new();
     let mut cumulative: usize = 0;
-    
+
     for chunk in haystack.split_inclusive('\n') {
         line_offsets.push(cumulative);
         line_lengths.push(chunk.len());
@@ -120,7 +120,7 @@ fn find_normalised_whitespace_new(haystack: &str, needle: &str) -> Option<(usize
 
     let max_window = needle.lines().count() + 5;
     let line_count = line_offsets.len();
-    
+
     for start_line in 0..line_count {
         let mut window = String::new();
         let window_end = line_count.min(start_line + max_window);
@@ -128,12 +128,12 @@ fn find_normalised_whitespace_new(haystack: &str, needle: &str) -> Option<(usize
             if !window.is_empty() {
                 window.push(' ');
             }
-            
+
             // Reconstruct window content (trimming as before)
             let start = line_offsets[end_line];
             let end = start + line_lengths[end_line];
             window.push_str(haystack[start..end].trim());
-            
+
             let norm_window = normalise_ws(&window);
             if norm_window.find(&norm_needle).is_some() {
                 let byte_start = line_offsets[start_line];

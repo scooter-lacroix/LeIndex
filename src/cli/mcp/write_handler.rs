@@ -1,11 +1,13 @@
-use super::helpers::{
-    extract_string, wrap_with_meta,
-};
+use super::helpers::{extract_string, wrap_with_meta};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use crate::edit::atomic_write_async;
+use crate::parse::parallel::ParallelParser;
+use once_cell::sync::Lazy;
 use serde_json::Value;
 use std::sync::Arc;
+
+static GLOBAL_PARSER: Lazy<ParallelParser> = Lazy::new(|| ParallelParser::new().without_stats());
 
 /// Handler for leindex_write — atomic file creation/overwrite with immediate PDG surfacing.
 #[derive(Clone)]
@@ -53,11 +55,11 @@ context (symbols, types) immediately so the model knows how the new file fits in
         let project_path_arg = args.get("project_path").and_then(|v| v.as_str());
 
         let handle = registry.get_or_create(project_path_arg).await?;
-        
+
         let abs_path = {
             let guard = handle.read().await;
             let project_root = guard.project_path();
-            
+
             let path = std::path::Path::new(&file_path);
             let resolved = if path.is_relative() {
                 project_root.join(path)
@@ -67,17 +69,29 @@ context (symbols, types) immediately so the model knows how the new file fits in
 
             let canonical = if resolved.exists() {
                 resolved.canonicalize().map_err(|e| {
-                    JsonRpcError::invalid_params(format!("Cannot resolve file path '{}': {}", file_path, e))
+                    JsonRpcError::invalid_params(format!(
+                        "Cannot resolve file path '{}': {}",
+                        file_path, e
+                    ))
                 })?
             } else {
                 let parent = resolved.parent().ok_or_else(|| {
-                    JsonRpcError::invalid_params(format!("Invalid file path '{}': no parent directory", file_path))
+                    JsonRpcError::invalid_params(format!(
+                        "Invalid file path '{}': no parent directory",
+                        file_path
+                    ))
                 })?;
                 let canonical_parent = parent.canonicalize().map_err(|e| {
-                    JsonRpcError::invalid_params(format!("Cannot resolve parent directory of '{}': {}", file_path, e))
+                    JsonRpcError::invalid_params(format!(
+                        "Cannot resolve parent directory of '{}': {}",
+                        file_path, e
+                    ))
                 })?;
                 canonical_parent.join(resolved.file_name().ok_or_else(|| {
-                    JsonRpcError::invalid_params(format!("Invalid file path '{}': no file name", file_path))
+                    JsonRpcError::invalid_params(format!(
+                        "Invalid file path '{}': no file name",
+                        file_path
+                    ))
                 })?)
             };
 
@@ -105,17 +119,22 @@ context (symbols, types) immediately so the model knows how the new file fits in
 
         // Surface PDG context for the new file
         let language = crate::parse::grammar::LanguageId::from_extension(
-            abs_path.extension().and_then(|e| e.to_str()).unwrap_or("")
-        ).map(|id| id.config().name.clone()).unwrap_or_else(|| "unknown".to_string());
+            abs_path.extension().and_then(|e| e.to_str()).unwrap_or(""),
+        )
+        .map(|id| id.config().name.clone())
+        .unwrap_or_else(|| "unknown".to_string());
 
         let signatures = if language != "unknown" {
-            let parser = crate::parse::parallel::ParallelParser::new();
             let abs_path_for_spawn = abs_path.clone();
             // We just parse this one file for immediate surfacing.
             // Wrap in spawn_blocking to avoid blocking the async executor.
             let results = tokio::task::spawn_blocking(move || {
-                parser.parse_files(vec![abs_path_for_spawn])
-            }).await.map_err(|e| JsonRpcError::internal_error(format!("Parser task panicked: {}", e)))?;
+                GLOBAL_PARSER.parse_files(vec![abs_path_for_spawn])
+            })
+            .await
+            .map_err(|e| {
+                JsonRpcError::internal_error(format!("Parser task panicked: {}", e))
+            })?;
 
             if let Some(res) = results.first() {
                 res.signatures.clone()
