@@ -2,6 +2,67 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [1.6.1] - 2026-05-04
+
+### ✨ New Features
+- **leindex_write Tool**: New atomic file creation tool with immediate PDG surfacing, path validation, and project boundary checks
+- **EditCache System**: Disk-persistent edit cache for preview/apply workflow with tokio::fs async IO
+- **PDG Impact Analysis**: Edit apply responses now include comprehensive PDG impact analysis with backward callers visibility
+- **Atomic Write APIs**: New Compare-And-Swap (CAS) pattern via `atomic_write_with_expected_async` for safe file operations
+
+### 🚀 Performance Optimizations
+- **GLOBAL_PARSER Reuse**: Write handler now reuses global parser instance to reduce allocation overhead
+- **Lock Duration Minimization**: Reduced lock holding time in edit_apply_handler, write_handler, and edit_preview
+- **Async Parsing**: Offloaded synchronous parsing in write_handler to spawn_blocking for better concurrency
+- **Shared Read Locks**: Path resolution in write_handler now uses shared read locks instead of exclusive locks
+- **Benchmark Alignment**: Text search benchmarks aligned with production match-span semantics and span tracking
+- **Throughput Fix**: Corrected misreported throughput metrics in edit preview benchmarks
+
+### 🔧 Code Quality & Refactoring
+- **Unified Crate Structure**: Consolidated crate logic into main package with improved module organization
+- **Rust Parser Enhancement**: Fixed indexing gap for lib.rs by including mod_item extraction in Rust parser
+- **PDG Improvements**: Refined PDG graph extraction, traversal, and external dependency handling
+- **MCP Handler Refactoring**: Significantly refactored edit_apply_handler (588 lines changed) for clarity and safety
+- **Deduplication**: Edit cache now uses shared path/hash resolution logic to reduce code duplication
+- **Zero-Warning Build**: Removed unused imports, unnecessary mutability, and dead code across all targets
+- **Normalize API**: Exposed `normalise_ws_with_spans` for performance testing
+
+### 🔒 Security & Safety
+- **Path Traversal Protection**: Enhanced write_handler and edit_apply with strict path normalization and boundary checks
+- **Project Boundary Enforcement**: Standardized project boundary validation in write_handler for new and existing files
+- **Token Enforcement**: Implemented strict token enforcement and file freshness checks in edit_apply
+- **Edit Freshness Validation**: Preview token validation and freshness checks prevent stale edit applications
+- **CAS Pattern**: Compare-And-Swap atomic writes prevent race conditions in concurrent edit scenarios
+- **Cache No-Op Handling**: Edit cache cleared on no-op applies to prevent stale state
+
+### 🐛 Bug Fixes
+- **PDG Loading**: Ensured PDG is loaded in edit_apply fast-path for accurate impact analysis
+- **Validation UX**: Fixed misleading validation status in edit_preview error cases
+- **Edit Region**: Restored 'edit_region' in edit_apply response for LLM verification
+- **Cache Writes**: Implemented best-effort cache writes in preview handler for resilience
+- **IO Transition**: Completed transition to fully async IO in EditCache using tokio::fs
+- **Python/C# Parsing**: Improved parsing accuracy for Python and C# source files
+- **Search Semantics**: Fixed match-span semantics alignment in search benchmarks
+
+### 📊 Testing
+- **Unit Tests**: Added tests for Rust mod_item extraction and Write tool registration
+- **Exact Assertions**: Updated Rust tests with exact qualified_name assertions using '::' separator
+- **Benchmark Suite**: Enhanced edit_preview_bench.rs and text_search_bench.rs with improved metrics
+- **CodeRabbit Analysis**: Integrated review feedback from PR #10 and PR #11 (926 lines of analysis docs)
+
+### 🏗️ Infrastructure
+- **Release Workflow**: PyPI/NPM tokens now passed via env vars; PyPI publish skips gracefully when token unavailable
+- **Diagnostics**: Updated diagnostic handlers across MCP tools with improved error context
+- **Review Process**: Added PR10_CODERABBIT_ANALYSIS.md, PR10_ISSUES_SUMMARY.md, PR11_REVIEW_ANALYSIS.md
+
+### Migration Notes
+No breaking changes. All changes are internal improvements, new features, and safety enhancements. Users can upgrade seamlessly.
+
+### Contributors
+- factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
+
+---
+
 ## [1.6.0] - 2026-04-28
 
 ### 🚀 Performance Optimization
