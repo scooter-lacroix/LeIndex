@@ -91,9 +91,6 @@ No breaking changes. All changes are internal improvements, new features, and sa
 ### Migration Notes
 No breaking changes. All changes are internal optimizations and improvements. Users can upgrade seamlessly without any configuration changes or data migration.
 
-### Contributors
-- factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
-
 ---
 
 ## [1.5.2] - 2026-03-11 - Unified Crate Release Hardening
