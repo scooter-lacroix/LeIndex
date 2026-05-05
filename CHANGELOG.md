@@ -53,9 +53,6 @@ All notable changes to the LeIndex project are documented in this file.
 ### Migration Notes
 No breaking changes. All changes are internal improvements, new features, and safety enhancements. Users can upgrade seamlessly.
 
-### Contributors
-- factory-droid[bot] <138933559+factory-droid[bot]@users.noreply.github.com>
-
 ---
 
 ## [1.6.0] - 2026-04-28
