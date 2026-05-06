@@ -11,14 +11,14 @@ use crate::validation::validation_to_json;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_edit_apply — atomic code modifications.
+/// Handler for LeIndex [edit_apply — atomic code modifications.
 #[derive(Clone)]
 pub struct EditApplyHandler;
 
 #[allow(missing_docs)]
 impl EditApplyHandler {
     pub fn name(&self) -> &str {
-        "leindex_edit_apply"
+        "LeIndex [Edit Apply]"
     }
 
     pub fn description(&self) -> &str {
@@ -68,7 +68,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 },
                 "preview_token": {
                     "type": "string",
-                    "description": "The token returned by a previous leindex_edit_preview call. Required if using cached preview."
+                    "description":                     "The token returned by a previous LeIndex [Edit Preview] call. Required if using cached preview."
                 }
             },
             "required": ["file_path"]
@@ -200,7 +200,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 .await;
             return Err(JsonRpcError::invalid_params(
                 "Edit rejected: file content changed on disk since preview was generated. \
-                Please call leindex_edit_preview again.",
+                Please call LeIndex [Edit Preview] again.",
             ));
         }
 

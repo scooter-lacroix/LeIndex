@@ -10,20 +10,20 @@ use crate::validation::validation_to_json;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_edit_preview — dry-run for code changes.
+/// Handler for LeIndex [edit_preview — dry-run for code changes.
 #[derive(Clone)]
 pub struct EditPreviewHandler;
 
 #[allow(missing_docs)]
 impl EditPreviewHandler {
     pub fn name(&self) -> &str {
-        "leindex_edit_preview"
+        "LeIndex [Edit Preview]"
     }
 
     pub fn description(&self) -> &str {
         "Preview a code edit: unified diff, affected symbols/files, breaking changes, and risk \
 level — all before touching the filesystem. No equivalent in standard tools. Run before \
-leindex_edit_apply to understand the blast radius of your change."
+LeIndex [Edit Apply] to understand the blast radius of your change."
     }
 
     pub fn argument_schema(&self) -> Value {

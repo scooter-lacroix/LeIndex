@@ -4,7 +4,7 @@ use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_context
+/// Handler for LeIndex [context
 ///
 /// Expands context around a specific node using PDG traversal.
 #[derive(Clone)]
@@ -13,7 +13,7 @@ pub struct ContextHandler;
 impl ContextHandler {
     /// Returns the name of this RPC method
     pub fn name(&self) -> &str {
-        "leindex_context"
+        "LeIndex [Context]"
     }
 
     /// Returns the description of this RPC method

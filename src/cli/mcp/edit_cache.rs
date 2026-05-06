@@ -29,12 +29,18 @@ pub struct EditCache {
     entries: Mutex<HashMap<PathBuf, EditCacheEntry>>,
 }
 
-impl EditCache {
-    /// Create a new empty edit cache.
-    pub fn new() -> Self {
+impl Default for EditCache {
+    fn default() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
         }
+    }
+}
+
+impl EditCache {
+    /// Create a new empty edit cache.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Internal helper to resolve absolute path and cache file location.

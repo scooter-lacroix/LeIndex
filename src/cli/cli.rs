@@ -876,12 +876,6 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
 
     info!("Starting MCP server on {}", addr);
 
-    // Create a default LeIndex instance for the server
-    // The server will use the current directory as the project path
-    let current_dir = std::env::current_dir().context("Failed to get current directory")?;
-
-    let _leindex = LeIndex::new(&current_dir).context("Failed to create LeIndex instance")?;
-
     // Create and run the MCP server
     let server = McpServer::with_address(addr).context("Failed to create MCP server")?;
 
@@ -1221,11 +1215,24 @@ fn find_tool_handler(name: &str) -> Option<ToolHandler> {
     all_tool_handlers().into_iter().find(|handler| {
         let handler_name = normalize_tool_name(handler.name());
         handler_name == normalized
-            || handler_name
-                .strip_prefix("leindex_")
-                .map(|short| short == normalized)
-                .unwrap_or(false)
+            || extract_short_name(&handler_name) == normalized
     })
+}
+
+/// Extract short name from a tool name.
+/// For "leindex_foo" returns "foo", for "leindex [foo bar]" returns "foo_bar".
+fn extract_short_name(name: &str) -> String {
+    // Handle "leindex [foo bar]" format (normalized to "leindex [foo bar]")
+    if let Some(inside) = name.strip_prefix("leindex [") {
+        if let Some(inside) = inside.strip_suffix(']') {
+            let with_underscores = inside.replace(' ', "_");
+            return normalize_tool_name(&with_underscores);
+        }
+    }
+    // Handle old "leindex_foo" format
+    name.strip_prefix("leindex_")
+        .map(normalize_tool_name)
+        .unwrap_or_else(|| normalize_tool_name(name))
 }
 
 async fn execute_tool_handler(
@@ -1371,10 +1378,31 @@ async fn handle_mcp_request(
     request: JsonRpcRequest,
     _project_path: PathBuf,
 ) -> anyhow::Result<JsonRpcResponse> {
-    use crate::cli::mcp::server::{handle_tool_call, list_tools_json, HANDLERS, SERVER_STATE};
+    use crate::cli::mcp::server::{handle_tool_call, list_tools_json, HANDLERS, SERVER_INSTANCE, SERVER_STATE};
 
     let method_name = request.method.clone();
     let id = request.id.clone().unwrap_or(serde_json::Value::Null);
+
+    // Get server instance to check handshake status
+    let server_instance = match SERVER_INSTANCE.get() {
+        Some(s) => s,
+        None => {
+            return Ok(JsonRpcResponse::error(
+                id,
+                crate::cli::mcp::protocol::JsonRpcError::new(-32603, "Server instance not initialized"),
+            ));
+        }
+    };
+
+    // Check handshake completion for non-initialize requests
+    if !server_instance.handshake_complete.load(std::sync::atomic::Ordering::SeqCst)
+        && method_name != "initialize"
+    {
+        return Ok(JsonRpcResponse::error(
+            id,
+            crate::cli::mcp::protocol::JsonRpcError::new(-32000, "Server not initialized. Call 'initialize' first."),
+        ));
+    }
 
     // Get the global state and handlers
     let state = SERVER_STATE
@@ -1588,7 +1616,7 @@ mod tests {
 
     #[test]
     fn test_find_tool_handler_accepts_short_and_full_names() {
-        assert!(find_tool_handler("leindex_project_map").is_some());
+        assert!(find_tool_handler("LeIndex [Project Map]").is_some());
         assert!(find_tool_handler("project_map").is_some());
         assert!(find_tool_handler("project-map").is_some());
     }

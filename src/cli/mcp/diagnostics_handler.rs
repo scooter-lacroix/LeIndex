@@ -4,7 +4,7 @@ use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_diagnostics
+/// Handler for LeIndex [diagnostics
 ///
 /// Returns diagnostic information about the indexed project.
 #[derive(Clone)]
@@ -13,7 +13,7 @@ pub struct DiagnosticsHandler;
 impl DiagnosticsHandler {
     /// Returns the name of this RPC method
     pub fn name(&self) -> &str {
-        "leindex_diagnostics"
+        "LeIndex [Diagnostics]"
     }
 
     /// Returns the description of this RPC method
@@ -76,7 +76,7 @@ impl DiagnosticsHandler {
                     "deleted_files": deleted.len(),
                     "changed_sample": changed.iter().take(10).map(|p| p.display().to_string()).collect::<Vec<_>>(),
                     "deleted_sample": deleted.iter().take(10).cloned().collect::<Vec<_>>(),
-                    "suggestion": "Call leindex_index with force_reindex=true to refresh",
+                    "suggestion": "Call LeIndex [Index] with force_reindex=true to refresh",
                 })
             };
             map.insert("freshness".to_string(), staleness);

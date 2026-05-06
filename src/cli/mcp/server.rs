@@ -20,7 +20,10 @@ use serde::Serialize;
 use serde_json::Value;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
@@ -72,7 +75,7 @@ pub struct McpServer {
     /// Multi-project registry (kept alive for the server's lifetime).
     pub _registry: Arc<ProjectRegistry>,
     /// Flag to track MCP handshake completion
-    handshake_complete: Arc<AtomicBool>,
+    pub(crate) handshake_complete: Arc<AtomicBool>,
 }
 
 impl McpServer {
@@ -89,9 +92,7 @@ impl McpServer {
     /// let server = McpServer::new(config)?;
     /// server.run().await?;
     /// ```
-    pub fn new(
-        config: McpServerConfig,
-    ) -> anyhow::Result<Self> {
+    pub fn new(config: McpServerConfig) -> anyhow::Result<Self> {
         let registry = Arc::new(ProjectRegistry::new(
             crate::cli::registry::DEFAULT_MAX_PROJECTS,
         ));
@@ -116,7 +117,9 @@ impl McpServer {
             handshake_complete: Arc::new(AtomicBool::new(false)),
         };
 
-        SERVER_INSTANCE.set(Arc::new(server.clone())).map_err(|_| anyhow::anyhow!("Server instance already initialized"))?;
+        SERVER_INSTANCE
+            .set(Arc::new(server.clone()))
+            .map_err(|_| anyhow::anyhow!("Server instance already initialized"))?;
 
         Ok(server)
     }
@@ -130,9 +133,7 @@ impl McpServer {
     /// # Returns
     ///
     /// `Result<McpServer>` - New server instance or error
-    pub fn with_address(
-        bind_address: SocketAddr,
-    ) -> anyhow::Result<Self> {
+    pub fn with_address(bind_address: SocketAddr) -> anyhow::Result<Self> {
         let config = McpServerConfig {
             bind_address,
             ..Default::default()
@@ -343,7 +344,7 @@ pub async fn index_with_progress(
 ///
 /// Returns server capabilities and information as per MCP protocol.
 /// This is the first request sent by MCP clients to negotiate capabilities.
-fn handle_initialize(server: &Arc<McpServer>) -> Value {
+fn handle_initialize(server: &McpServer) -> Value {
     // Mark handshake as complete
     server.handshake_complete.store(true, Ordering::SeqCst);
 
@@ -415,20 +416,7 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
         }
     };
 
-    let state = match SERVER_STATE.get() {
-        Some(s) => s,
-        None => {
-            warn!("Server state not initialized");
-            return Json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "id": json_req.id,
-                "error": {
-                    "code": -32603,
-                    "message": "Server state not initialized"
-                }
-            }));
-        }
-    };
+    let state = server_instance._registry.clone();
 
     let handlers = match HANDLERS.get() {
         Some(h) => h,
@@ -455,7 +443,8 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
     }
 
     // Check handshake completion for non-initialize requests
-    if !server_instance.handshake_complete.load(Ordering::SeqCst) && json_req.method != "initialize" {
+    if !server_instance.handshake_complete.load(Ordering::SeqCst) && json_req.method != "initialize"
+    {
         return Json(serde_json::json!({
             "jsonrpc": "2.0",
             "id": json_req.id,
@@ -467,9 +456,10 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
     }
 
     let response = match json_req.method.as_str() {
-        "initialize" => Ok(handle_initialize(&server_instance)),
+        "initialize" => Ok(handle_initialize(server_instance)),
+        "notifications/initialized" => Ok(serde_json::json!({})),
         "ping" => Ok(handle_ping()),
-        "tools/call" => handle_tool_call(state, handlers, &json_req).await,
+        "tools/call" => handle_tool_call(&state, handlers, &json_req).await,
         "tools/list" => Ok(list_tools_json(handlers)),
         "prompts/list" => Ok(list_prompts_json()),
         "prompts/get" => handle_prompt_get(&json_req),
@@ -734,7 +724,7 @@ pub fn get_prompt(
             PromptMessage {
                 role: "user".to_string(),
                 content: PromptContent::Text {
-                    text: "Welcome to LeIndex! Here's how to get started:\n\n1. **Indexing**: First, index your project with `leindex_index`\n2. **Searching**: Use `leindex_search` for semantic code search\n3. **Analysis**: Use `leindex_deep_analyze` for comprehensive code analysis\n4. **Context**: Use `leindex_context` to expand around specific symbols\n\nPro tip: LeIndex auto-indexes on first use, so you can start searching immediately!".to_string(),
+                    text: "Welcome to LeIndex! Here's how to get started:\n\n1. **Indexing**: First, index your project with `LeIndex [Index]`\n2. **Searching**: Use `LeIndex [Search]` for semantic code search\n3. **Analysis**: Use `LeIndex [Deep Analyze]` for comprehensive code analysis\n4. **Context**: Use `LeIndex [Context]` to expand around specific symbols\n\nPro tip: LeIndex auto-indexes on first use, so you can start searching immediately!".to_string(),
                 },
             },
         ]),
@@ -750,7 +740,7 @@ pub fn get_prompt(
                     role: "user".to_string(),
                     content: PromptContent::Text {
                         text: format!(
-                            "Let me help you investigate: {}\n\nHere's the recommended workflow:\n\n1. **Start broad**: Use `leindex_search` with a natural language query like '{}'\n2. **Find entry points**: Look for the most relevant symbols in the results\n3. **Deep dive**: Use `leindex_deep_analyze` on the most relevant symbol\n4. **Expand context**: Use `leindex_context` to see how the symbol is used\n5. **Navigate**: Follow symbol references with `leindex_read_symbol`\n\nWould you like me to help you with any specific step?",
+                            "Let me help you investigate: {}\n\nHere's the recommended workflow:\n\n1. **Start broad**: Use `LeIndex [Search]` with a natural language query like '{}'\n2. **Find entry points**: Look for the most relevant symbols in the results\n3. **Deep dive**: Use `LeIndex [Deep Analyze]` on the most relevant symbol\n4. **Expand context**: Use `LeIndex [Context]` to see how the symbol is used\n5. **Navigate**: Follow symbol references with `LeIndex [Read Symbol]`\n\nWould you like me to help you with any specific step?",
                             query, query
                         ),
                     },
@@ -856,7 +846,7 @@ leindex index /path/to/project
 Or use the MCP tool:
 ```json
 {
-  "name": "leindex_index",
+  "name": "LeIndex [Index]",
   "arguments": {
     "project_path": "/path/to/project"
   }
@@ -872,7 +862,7 @@ leindex search "how is authentication handled"
 Or use the MCP tool:
 ```json
 {
-  "name": "leindex_search",
+  "name": "LeIndex [Search]",
   "arguments": {
     "query": "how is authentication handled",
     "limit": 10
@@ -889,7 +879,7 @@ leindex analyze --symbol "User::authenticate"
 Or use the MCP tool:
 ```json
 {
-  "name": "leindex_deep_analyze",
+  "name": "LeIndex [Deep Analyze]",
   "arguments": {
     "query": "User::authenticate"
   }
@@ -898,12 +888,12 @@ Or use the MCP tool:
 
 ## Available Tools
 
-- `leindex_search` - Semantic code search
-- `leindex_deep_analyze` - Comprehensive code analysis
-- `leindex_context` - Expand symbol context
-- `leindex_grep_symbols` - Search symbols by name
-- `leindex_read_file` - Read file with PDG annotations
-- `leindex_file_summary` - Get file structural summary
+- `LeIndex [Search]` - Semantic code search
+- `LeIndex [Deep Analyze]` - Comprehensive code analysis
+- `LeIndex [Context]` - Expand symbol context
+- `LeIndex [Grep Symbols]` - Search symbols by name
+- `LeIndex [Read File]` - Read file with PDG annotations
+- `LeIndex [File Summary]` - Get file structural summary
 
 ## Environment Variables
 

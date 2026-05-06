@@ -9,14 +9,14 @@ use std::sync::Arc;
 
 static GLOBAL_PARSER: Lazy<ParallelParser> = Lazy::new(|| ParallelParser::new().without_stats());
 
-/// Handler for leindex_write — atomic file creation/overwrite with immediate PDG surfacing.
+/// Handler for LeIndex [write — atomic file creation/overwrite with immediate PDG surfacing.
 #[derive(Clone)]
 pub struct WriteHandler;
 
 #[allow(missing_docs)]
 impl WriteHandler {
     pub fn name(&self) -> &str {
-        "leindex_write"
+        "LeIndex [Write]"
     }
 
     pub fn description(&self) -> &str {

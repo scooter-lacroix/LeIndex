@@ -228,7 +228,7 @@ pub(crate) fn atomic_write(target: &Path, data: &[u8]) -> std::io::Result<()> {
 pub(crate) async fn atomic_write_async(target: PathBuf, data: Vec<u8>) -> std::io::Result<()> {
     tokio::task::spawn_blocking(move || atomic_write(&target, &data))
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?
+        .map_err(|e| std::io::Error::other(format!("{}", e)))?
 }
 
 /// Perform an atomic write only if the target file's current content matches `expected`.
@@ -253,7 +253,7 @@ pub(crate) async fn atomic_write_with_expected_async(
         Ok(true)
     })
     .await
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{}", e)))?
+    .map_err(|e| std::io::Error::other(format!("{}", e)))?
 }
 
 fn sanitize_session_component(value: &str) -> String {

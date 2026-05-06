@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Handler for leindex_read_file — PDG-annotated file read.
+/// Handler for LeIndex [read_file — PDG-annotated file read.
 #[derive(Clone)]
 pub struct ReadFileHandler;
 
@@ -175,7 +175,7 @@ fn build_pdg_enrichment(
 #[allow(missing_docs)]
 impl ReadFileHandler {
     pub fn name(&self) -> &str {
-        "leindex_read_file"
+        "LeIndex [Read File]"
     }
 
     pub fn description(&self) -> &str {

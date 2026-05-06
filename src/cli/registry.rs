@@ -38,6 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
+use dirs;
 
 /// Default maximum number of projects kept in memory simultaneously.
 pub const DEFAULT_MAX_PROJECTS: usize = 5;
@@ -236,8 +237,6 @@ impl ProjectRegistry {
         }
     }
 
-
-
     /// Get an existing project, or create + load from storage (no auto-index).
     ///
     /// If `project_path` is `None`, returns the current default project.
@@ -383,20 +382,33 @@ impl ProjectRegistry {
             })?
         };
 
-        // Validate path safety: reject home directory and system paths
-        if path.starts_with("/home") && path.components().count() < 3 {
+        // Canonicalize first to resolve symlinks and relative paths
+        let canonical = path.canonicalize().map_err(|e| {
+            JsonRpcError::invalid_params(format!(
+                "Cannot resolve project_path '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        // Reject root directory
+        if canonical.as_path() == "/" {
             return Err(JsonRpcError::invalid_params(
-                "Refusing to index home directory. Specify a project subdirectory.".to_string(),
+                "Refusing to index root directory. Specify a project subdirectory.".to_string(),
             ));
         }
 
-        // Canonicalize after validation
-        path.canonicalize().map_err(|e| {
-            JsonRpcError::invalid_params(format!(
-                "Cannot resolve project_path '{}': {}",
-                path.display(), e
-            ))
-        })
+        // Reject home directory (cross-platform)
+        if let Some(home_dir) = dirs::home_dir() {
+            let home_canonical = home_dir.canonicalize().unwrap_or(home_dir);
+            if canonical == home_canonical {
+                return Err(JsonRpcError::invalid_params(
+                    "Refusing to index home directory. Specify a project subdirectory.".to_string(),
+                ));
+            }
+        }
+
+        Ok(canonical)
     }
 
     /// Create a new `LeIndex`, attempt to load from storage, and insert into

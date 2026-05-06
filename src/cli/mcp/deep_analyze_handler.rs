@@ -4,7 +4,7 @@ use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_deep_analyze
+/// Handler for LeIndex [deep_analyze
 ///
 /// Performs deep analysis with PDG-based context expansion.
 #[derive(Clone)]
@@ -13,7 +13,7 @@ pub struct DeepAnalyzeHandler;
 impl DeepAnalyzeHandler {
     /// Returns the name of this RPC method
     pub fn name(&self) -> &str {
-        "leindex_deep_analyze"
+        "LeIndex [Deep Analyze]"
     }
 
     /// Returns the description of this RPC method

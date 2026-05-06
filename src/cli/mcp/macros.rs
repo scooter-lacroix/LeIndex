@@ -86,7 +86,7 @@ macro_rules! dispatch_handler {
             /// Execute the tool
             pub async fn execute(
                 &self,
-                registry: &std::sync::Arc<crate::cli::registry::ProjectRegistry>,
+                registry: &std::sync::Arc<$crate::cli::registry::ProjectRegistry>,
                 args: serde_json::Value,
             ) -> Result<serde_json::Value, $crate::cli::mcp::protocol::JsonRpcError> {
                 match self {

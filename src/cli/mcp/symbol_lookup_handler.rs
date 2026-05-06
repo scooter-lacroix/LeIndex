@@ -7,20 +7,20 @@ use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_symbol_lookup — full call graph for any symbol.
+/// Handler for LeIndex [symbol_lookup — full call graph for any symbol.
 #[derive(Clone)]
 pub struct SymbolLookupHandler;
 
 #[allow(missing_docs)]
 impl SymbolLookupHandler {
     pub fn name(&self) -> &str {
-        "leindex_symbol_lookup"
+        "LeIndex [Symbol Lookup]"
     }
 
     pub fn description(&self) -> &str {
         "Symbol relationship lookup: callers, callees, data dependencies, and impact radius. \
 Use for understanding how a symbol connects to the rest of the codebase. \
-For the exact source implementation use leindex_read_symbol."
+For the exact source implementation use LeIndex [Read Symbol]."
     }
 
     pub fn argument_schema(&self) -> Value {
@@ -270,8 +270,8 @@ For the exact source implementation use leindex_read_symbol."
             let total_files = pdg.file_count();
             let suggestion = format!(
                 "Symbol '{}' not found among {} indexed symbols across {} files. Try: \
-                check spelling, use leindex_grep_symbols for partial matches, \
-                or leindex_text_search for raw content search.",
+                check spelling, use LeIndex [Grep Symbols] for partial matches, \
+                or LeIndex [Text Search] for raw content search.",
                 symbol, total_symbols, total_files
             );
             JsonRpcError::invalid_params_with_suggestion(

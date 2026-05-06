@@ -81,25 +81,25 @@ mod tests {
 
     #[test]
     fn test_handler_names() {
-        assert_eq!(IndexHandler.name(), "leindex_index");
-        assert_eq!(SearchHandler.name(), "leindex_search");
-        assert_eq!(DeepAnalyzeHandler.name(), "leindex_deep_analyze");
-        assert_eq!(ContextHandler.name(), "leindex_context");
-        assert_eq!(DiagnosticsHandler.name(), "leindex_diagnostics");
-        assert_eq!(PhaseAnalysisHandler.name(), "leindex_phase_analysis");
+        assert_eq!(IndexHandler.name(), "LeIndex [Index]");
+        assert_eq!(SearchHandler.name(), "LeIndex [Search]");
+        assert_eq!(DeepAnalyzeHandler.name(), "LeIndex [Deep Analyze]");
+        assert_eq!(ContextHandler.name(), "LeIndex [Context]");
+        assert_eq!(DiagnosticsHandler.name(), "LeIndex [Diagnostics]");
+        assert_eq!(PhaseAnalysisHandler.name(), "LeIndex [Phase Analysis]");
         assert_eq!(PhaseAnalysisAliasHandler.name(), "phase_analysis");
         // Phase C handlers
-        assert_eq!(FileSummaryHandler.name(), "leindex_file_summary");
-        assert_eq!(SymbolLookupHandler.name(), "leindex_symbol_lookup");
-        assert_eq!(ProjectMapHandler.name(), "leindex_project_map");
-        assert_eq!(GrepSymbolsHandler.name(), "leindex_grep_symbols");
-        assert_eq!(ReadSymbolHandler.name(), "leindex_read_symbol");
-        assert_eq!(WriteHandler.name(), "leindex_write");
+        assert_eq!(FileSummaryHandler.name(), "LeIndex [File Summary]");
+        assert_eq!(SymbolLookupHandler.name(), "LeIndex [Symbol Lookup]");
+        assert_eq!(ProjectMapHandler.name(), "LeIndex [Project Map]");
+        assert_eq!(GrepSymbolsHandler.name(), "LeIndex [Grep Symbols]");
+        assert_eq!(ReadSymbolHandler.name(), "LeIndex [Read Symbol]");
+        assert_eq!(WriteHandler.name(), "LeIndex [Write]");
         // Phase D handlers
-        assert_eq!(EditPreviewHandler.name(), "leindex_edit_preview");
-        assert_eq!(EditApplyHandler.name(), "leindex_edit_apply");
-        assert_eq!(RenameSymbolHandler.name(), "leindex_rename_symbol");
-        assert_eq!(ImpactAnalysisHandler.name(), "leindex_impact_analysis");
+        assert_eq!(EditPreviewHandler.name(), "LeIndex [Edit Preview]");
+        assert_eq!(EditApplyHandler.name(), "LeIndex [Edit Apply]");
+        assert_eq!(RenameSymbolHandler.name(), "LeIndex [Rename Symbol]");
+        assert_eq!(ImpactAnalysisHandler.name(), "LeIndex [Impact Analysis]");
     }
 
     #[test]

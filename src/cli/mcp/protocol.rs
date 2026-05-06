@@ -394,10 +394,10 @@ impl JsonRpcError {
     pub fn project_not_indexed(project: String) -> Self {
         Self::with_data(
             error_codes::PROJECT_NOT_INDEXED,
-            "Project not indexed — call leindex_index or pass project_path to auto-index",
+            "Project not indexed — call LeIndex [Index] or pass project_path to auto-index",
             serde_json::json!({
                 "project": project,
-                "suggestion": "Pass project_path to any tool to auto-index on first use, or call leindex_index explicitly.",
+                "suggestion": "Pass project_path to any tool to auto-index on first use, or call LeIndex [Index] explicitly.",
                 "error_type": "project_not_indexed"
             }),
         )
@@ -452,9 +452,9 @@ impl JsonRpcError {
             format!(
                 "{}\n\n\
                  Remediation:\n\
-                 1. Ensure the project is indexed (call leindex_index)\n\
+                 1. Ensure the project is indexed (call LeIndex [Index])\n\
                  2. Try a simpler query (single term instead of complex pattern)\n\
-                 3. Use leindex_grep_symbols for exact/regex pattern matching\n\
+                 3. Use LeIndex [Grep Symbols] for exact/regex pattern matching\n\
                  4. Try force_reindex=true if the index may be stale",
                 m
             ),
@@ -473,7 +473,7 @@ impl JsonRpcError {
                 "{}\n\n\
                  Remediation:\n\
                  1. Check that the node_id exists in the indexed project\n\
-                 2. Use leindex_grep_symbols to find valid symbol names\n\
+                 2. Use LeIndex [Grep Symbols] to find valid symbol names\n\
                  3. Try force_reindex=true if the index may be stale",
                 m
             ),
@@ -797,7 +797,7 @@ mod tests {
             "id": 1,
             "method": "tools/call",
             "params": {
-                "name": "leindex_search",
+                "name": "LeIndex [Search]",
                 "arguments": {"query": "test"}
             }
         }"#;
@@ -805,7 +805,7 @@ mod tests {
         let req: JsonRpcRequest = serde_json::from_str(json).unwrap();
         let tool_call = req.extract_tool_call().unwrap();
 
-        assert_eq!(tool_call.name, "leindex_search");
+        assert_eq!(tool_call.name, "LeIndex [Search]");
         assert_eq!(tool_call.arguments["query"], "test");
     }
 

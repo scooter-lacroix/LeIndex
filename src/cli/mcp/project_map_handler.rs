@@ -5,14 +5,14 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Handler for leindex_project_map — annotated project tree replacing Glob/ls.
+/// Handler for LeIndex [project_map — annotated project tree replacing Glob/ls.
 #[derive(Clone)]
 pub struct ProjectMapHandler;
 
 #[allow(missing_docs)]
 impl ProjectMapHandler {
     pub fn name(&self) -> &str {
-        "leindex_project_map"
+        "LeIndex [Project Map]"
     }
 
     pub fn description(&self) -> &str {

@@ -8,7 +8,7 @@ use regex::RegexBuilder;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_text_search — raw text/regex search across files.
+/// Handler for LeIndex [text_search — raw text/regex search across files.
 #[derive(Clone)]
 pub struct TextSearchHandler;
 
@@ -19,7 +19,7 @@ fn strip_line_ending(line: &str) -> &str {
 #[allow(missing_docs)]
 impl TextSearchHandler {
     pub fn name(&self) -> &str {
-        "leindex_text_search"
+        "LeIndex [Text Search]"
     }
 
     pub fn description(&self) -> &str {

@@ -6,14 +6,14 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Handler for leindex_phase_analysis.
+/// Handler for LeIndex [phase_analysis.
 #[derive(Clone)]
 pub struct PhaseAnalysisHandler;
 
 impl PhaseAnalysisHandler {
     /// Returns the name of this RPC method.
     pub fn name(&self) -> &str {
-        "leindex_phase_analysis"
+        "LeIndex [Phase Analysis]"
     }
 
     /// Returns the description of this RPC method.
@@ -48,7 +48,7 @@ impl PhaseAnalysisAliasHandler {
 
     /// Returns description.
     pub fn description(&self) -> &str {
-        "Alias for leindex_phase_analysis"
+        "Alias for LeIndex [Phase Analysis]"
     }
 
     /// Returns argument schema.
@@ -388,7 +388,7 @@ mod tests {
     #[test]
     fn test_handler_names() {
         let primary = PhaseAnalysisHandler;
-        assert_eq!(primary.name(), "leindex_phase_analysis");
+        assert_eq!(primary.name(), "LeIndex [Phase Analysis]");
 
         let alias = PhaseAnalysisAliasHandler;
         assert_eq!(alias.name(), "phase_analysis");
