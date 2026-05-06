@@ -132,9 +132,7 @@ context (symbols, types) immediately so the model knows how the new file fits in
                 GLOBAL_PARSER.parse_files(vec![abs_path_for_spawn])
             })
             .await
-            .map_err(|e| {
-                JsonRpcError::internal_error(format!("Parser task panicked: {}", e))
-            })?;
+            .map_err(|e| JsonRpcError::internal_error(format!("Parser task panicked: {}", e)))?;
 
             if let Some(res) = results.first() {
                 res.signatures.clone()

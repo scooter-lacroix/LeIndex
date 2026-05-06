@@ -20,7 +20,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
@@ -30,6 +30,9 @@ use tracing::{debug, info, warn};
 /// Replaces the old `Arc<Mutex<LeIndex>>` singleton. Multiple projects can
 /// be loaded in one process, with per-project coordination in `ProjectRegistry`.
 pub static SERVER_STATE: std::sync::OnceLock<Arc<ProjectRegistry>> = std::sync::OnceLock::new();
+
+/// Global server instance — for handshake and state management.
+pub static SERVER_INSTANCE: std::sync::OnceLock<Arc<McpServer>> = std::sync::OnceLock::new();
 
 /// Global tool handlers list
 pub static HANDLERS: std::sync::OnceLock<Vec<ToolHandler>> = std::sync::OnceLock::new();
@@ -62,11 +65,14 @@ impl Default for McpServerConfig {
 }
 
 /// MCP Server
+#[derive(Clone)]
 pub struct McpServer {
     /// Configuration for the server
     pub config: McpServerConfig,
     /// Multi-project registry (kept alive for the server's lifetime).
     pub _registry: Arc<ProjectRegistry>,
+    /// Flag to track MCP handshake completion
+    handshake_complete: Arc<AtomicBool>,
 }
 
 impl McpServer {
@@ -75,23 +81,19 @@ impl McpServer {
     /// # Arguments
     ///
     /// * `config` - Server configuration
-    /// * `leindex` - Initial LeIndex instance (the startup project)
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let leindex = LeIndex::new("/path/to/project")?;
     /// let config = McpServerConfig::default();
-    /// let server = McpServer::new(config, leindex)?;
+    /// let server = McpServer::new(config)?;
     /// server.run().await?;
     /// ```
     pub fn new(
         config: McpServerConfig,
-        leindex: crate::cli::leindex::LeIndex,
     ) -> anyhow::Result<Self> {
-        let registry = Arc::new(ProjectRegistry::with_initial_project(
+        let registry = Arc::new(ProjectRegistry::new(
             crate::cli::registry::DEFAULT_MAX_PROJECTS,
-            leindex,
         ));
         SERVER_STATE
             .set(registry.clone())
@@ -108,10 +110,15 @@ impl McpServer {
             crate::cli::registry::DEFAULT_MAX_PROJECTS
         );
 
-        Ok(Self {
+        let server = Self {
             config,
             _registry: registry,
-        })
+            handshake_complete: Arc::new(AtomicBool::new(false)),
+        };
+
+        SERVER_INSTANCE.set(Arc::new(server.clone())).map_err(|_| anyhow::anyhow!("Server instance already initialized"))?;
+
+        Ok(server)
     }
 
     /// Create MCP server with custom configuration
@@ -119,20 +126,18 @@ impl McpServer {
     /// # Arguments
     ///
     /// * `bind_address` - Address to bind the server to
-    /// * `leindex` - LeIndex instance to use for operations
     ///
     /// # Returns
     ///
     /// `Result<McpServer>` - New server instance or error
     pub fn with_address(
         bind_address: SocketAddr,
-        leindex: crate::cli::leindex::LeIndex,
     ) -> anyhow::Result<Self> {
         let config = McpServerConfig {
             bind_address,
             ..Default::default()
         };
-        Self::new(config, leindex)
+        Self::new(config)
     }
 
     /// Run the MCP server
@@ -338,7 +343,10 @@ pub async fn index_with_progress(
 ///
 /// Returns server capabilities and information as per MCP protocol.
 /// This is the first request sent by MCP clients to negotiate capabilities.
-fn handle_initialize() -> Value {
+fn handle_initialize(server: &Arc<McpServer>) -> Value {
+    // Mark handshake as complete
+    server.handshake_complete.store(true, Ordering::SeqCst);
+
     serde_json::json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {
@@ -359,7 +367,11 @@ fn handle_initialize() -> Value {
             "name": "leindex",
             "version": env!("CARGO_PKG_VERSION"),
             "description": "LeIndex MCP Server - Semantic code indexing and analysis with PDG-based tools for superior code comprehension"
-        }
+        },
+        "notes": [
+            "Projects are no longer auto-indexed on startup. Use explicit tool calls to index projects.",
+            "The server must receive an 'initialize' call before processing other requests."
+        ]
     })
 }
 
@@ -388,6 +400,21 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
         }
     };
 
+    let server_instance = match SERVER_INSTANCE.get() {
+        Some(s) => s,
+        None => {
+            warn!("Server instance not initialized");
+            return Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": json_req.id,
+                "error": {
+                    "code": -32603,
+                    "message": "Server instance not initialized"
+                }
+            }));
+        }
+    };
+
     let state = match SERVER_STATE.get() {
         Some(s) => s,
         None => {
@@ -397,7 +424,7 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
                 "id": json_req.id,
                 "error": {
                     "code": -32603,
-                    "message": "Server not initialized"
+                    "message": "Server state not initialized"
                 }
             }));
         }
@@ -427,8 +454,20 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
         return Json(serde_json::to_value(&resp).unwrap());
     }
 
+    // Check handshake completion for non-initialize requests
+    if !server_instance.handshake_complete.load(Ordering::SeqCst) && json_req.method != "initialize" {
+        return Json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": json_req.id,
+            "error": {
+                "code": -32000,
+                "message": "Server not initialized. Call 'initialize' first."
+            }
+        }));
+    }
+
     let response = match json_req.method.as_str() {
-        "initialize" => Ok(handle_initialize()),
+        "initialize" => Ok(handle_initialize(&server_instance)),
         "ping" => Ok(handle_ping()),
         "tools/call" => handle_tool_call(state, handlers, &json_req).await,
         "tools/list" => Ok(list_tools_json(handlers)),
@@ -566,6 +605,22 @@ pub fn handle_resource_read(req: &JsonRpcRequest) -> Result<Value, JsonRpcError>
 
 /// List tools handler
 async fn list_tools_handler() -> Json<Value> {
+    let server_instance = match SERVER_INSTANCE.get() {
+        Some(s) => s,
+        None => {
+            return Json(serde_json::json!({
+                "error": "Server instance not initialized"
+            }));
+        }
+    };
+
+    // Check handshake completion
+    if !server_instance.handshake_complete.load(Ordering::SeqCst) {
+        return Json(serde_json::json!({
+            "error": "Server not initialized. Call 'initialize' first."
+        }));
+    }
+
     let handlers = match HANDLERS.get() {
         Some(h) => h,
         None => {

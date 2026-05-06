@@ -236,6 +236,8 @@ impl ProjectRegistry {
         }
     }
 
+
+
     /// Get an existing project, or create + load from storage (no auto-index).
     ///
     /// If `project_path` is `None`, returns the current default project.
@@ -369,13 +371,8 @@ impl ProjectRegistry {
 
     /// Resolve an optional `project_path` string to a canonical `PathBuf`.
     async fn resolve_path(&self, project_path: Option<&str>) -> Result<PathBuf, JsonRpcError> {
-        if let Some(raw) = project_path {
-            Path::new(raw).canonicalize().map_err(|e| {
-                JsonRpcError::invalid_params(format!(
-                    "Cannot resolve project_path '{}': {}",
-                    raw, e
-                ))
-            })
+        let path = if let Some(raw) = project_path {
+            Path::new(raw).to_path_buf()
         } else {
             let default = self.default_project.read().await;
             default.clone().ok_or_else(|| {
@@ -383,8 +380,23 @@ impl ProjectRegistry {
                     "No project_path provided and no project has been loaded yet. \
                      Pass project_path on the first call.",
                 )
-            })
+            })?
+        };
+
+        // Validate path safety: reject home directory and system paths
+        if path.starts_with("/home") && path.components().count() < 3 {
+            return Err(JsonRpcError::invalid_params(
+                "Refusing to index home directory. Specify a project subdirectory.".to_string(),
+            ));
         }
+
+        // Canonicalize after validation
+        path.canonicalize().map_err(|e| {
+            JsonRpcError::invalid_params(format!(
+                "Cannot resolve project_path '{}': {}",
+                path.display(), e
+            ))
+        })
     }
 
     /// Create a new `LeIndex`, attempt to load from storage, and insert into

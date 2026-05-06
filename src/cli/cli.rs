@@ -880,10 +880,10 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
     // The server will use the current directory as the project path
     let current_dir = std::env::current_dir().context("Failed to get current directory")?;
 
-    let leindex = LeIndex::new(&current_dir).context("Failed to create LeIndex instance")?;
+    let _leindex = LeIndex::new(&current_dir).context("Failed to create LeIndex instance")?;
 
     // Create and run the MCP server
-    let server = McpServer::with_address(addr, leindex).context("Failed to create MCP server")?;
+    let server = McpServer::with_address(addr).context("Failed to create MCP server")?;
 
     println!("\nLeIndex MCP Server\n");
     println!("Server starting on http://{}\n", addr);

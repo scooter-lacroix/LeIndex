@@ -200,7 +200,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 .await;
             return Err(JsonRpcError::invalid_params(
                 "Edit rejected: file content changed on disk since preview was generated. \
-                Please call leindex_edit_preview again."
+                Please call leindex_edit_preview again.",
             ));
         }
 

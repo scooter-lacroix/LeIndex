@@ -180,16 +180,16 @@ fn find_normalised_whitespace_new(haystack: &str, needle: &str) -> Option<(usize
         for end_line in start_line..window_end {
             let byte_end = line_offsets[end_line] + line_lengths[end_line];
             let window = &haystack[byte_start..byte_end];
-            
+
             // Align with production span tracking
             let (norm_window, spans) = normalise_ws_with_spans(window);
             if let Some(match_byte_start) = norm_window.find(&norm_needle) {
                 let match_char_start = norm_window[..match_byte_start].chars().count();
                 let match_char_end = match_char_start + needle_char_count;
-                
+
                 let (span_start, _) = spans.get(match_char_start)?;
                 let (_, span_end) = spans.get(match_char_end.saturating_sub(1))?;
-                
+
                 return Some((byte_start + span_start, span_end - span_start));
             }
         }
