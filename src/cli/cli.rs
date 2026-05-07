@@ -926,6 +926,16 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     // Initialize handlers
     let _ = crate::cli::mcp::server::HANDLERS.set(all_tool_handlers());
 
+    // Initialize SERVER_INSTANCE for stdio mode
+    let server = crate::cli::mcp::server::McpServer {
+        config: crate::cli::mcp::server::McpServerConfig::default(),
+        _registry: registry.clone(),
+        handshake_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    crate::cli::mcp::server::SERVER_INSTANCE
+        .set(Arc::new(server))
+        .map_err(|_| anyhow::anyhow!("Server instance already initialized"))?;
+
     eprintln!("[INFO] LeIndex MCP stdio server starting");
     eprintln!("[INFO] Project: {}", canonical_path.display());
     eprintln!("[INFO] Reading JSON-RPC from stdin, writing to stdout");
@@ -1027,10 +1037,10 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 
                 let response = match handle_mcp_request(request, project_path.clone()).await {
                     Ok(r) => r,
-                    Err(e) => JsonRpcResponse::error(
+                    Err(e) => Some(JsonRpcResponse::error(
                         request_id,
                         JsonRpcError::internal_error(e.to_string()),
-                    ),
+                    )),
                 };
 
                 let response_json = match serde_json::to_string(&response) {
@@ -1214,13 +1224,15 @@ fn find_tool_handler(name: &str) -> Option<ToolHandler> {
 
     all_tool_handlers().into_iter().find(|handler| {
         let handler_name = normalize_tool_name(handler.name());
+        let title = handler.title();
         handler_name == normalized
             || extract_short_name(&handler_name) == normalized
+            || normalize_tool_name(title) == normalized
     })
 }
 
 /// Extract short name from a tool name.
-/// For "leindex_foo" returns "foo", for "leindex [foo bar]" returns "foo_bar".
+/// For "leindex_foo" returns "foo", for "leindex [foo bar]" returns "foo_bar", for "leindex.foo-bar" returns "foo_bar".
 fn extract_short_name(name: &str) -> String {
     // Handle "leindex [foo bar]" format (normalized to "leindex [foo bar]")
     if let Some(inside) = name.strip_prefix("leindex [") {
@@ -1228,6 +1240,10 @@ fn extract_short_name(name: &str) -> String {
             let with_underscores = inside.replace(' ', "_");
             return normalize_tool_name(&with_underscores);
         }
+    }
+    // Handle "leindex.foo-bar" format (MCP-compliant: leindex.search, leindex.project-map)
+    if let Some(inside) = name.strip_prefix("leindex.") {
+        return normalize_tool_name(inside);
     }
     // Handle old "leindex_foo" format
     name.strip_prefix("leindex_")
@@ -1374,10 +1390,11 @@ async fn cmd_dashboard_impl(port: u16, prod: bool) -> AnyhowResult<()> {
 }
 
 /// Handle a single MCP request and return the response
+#[allow(clippy::needless_return)]
 async fn handle_mcp_request(
     request: JsonRpcRequest,
     _project_path: PathBuf,
-) -> anyhow::Result<JsonRpcResponse> {
+) -> anyhow::Result<Option<JsonRpcResponse>> {
     use crate::cli::mcp::server::{handle_tool_call, list_tools_json, HANDLERS, SERVER_INSTANCE, SERVER_STATE};
 
     let method_name = request.method.clone();
@@ -1387,10 +1404,10 @@ async fn handle_mcp_request(
     let server_instance = match SERVER_INSTANCE.get() {
         Some(s) => s,
         None => {
-            return Ok(JsonRpcResponse::error(
+            return Ok(Some(JsonRpcResponse::error(
                 id,
                 crate::cli::mcp::protocol::JsonRpcError::new(-32603, "Server instance not initialized"),
-            ));
+            )));
         }
     };
 
@@ -1398,10 +1415,10 @@ async fn handle_mcp_request(
     if !server_instance.handshake_complete.load(std::sync::atomic::Ordering::SeqCst)
         && method_name != "initialize"
     {
-        return Ok(JsonRpcResponse::error(
+        return Ok(Some(JsonRpcResponse::error(
             id,
             crate::cli::mcp::protocol::JsonRpcError::new(-32000, "Server not initialized. Call 'initialize' first."),
-        ));
+        )));
     }
 
     // Get the global state and handlers
@@ -1418,7 +1435,7 @@ async fn handle_mcp_request(
         "initialize" => {
             // MCP protocol initialization handshake
             // Return server capabilities with comprehensive description
-            Ok(JsonRpcResponse::success(
+            return Ok(Some(JsonRpcResponse::success(
                 id,
                 serde_json::json!({
                     "protocolVersion": "2024-11-05",
@@ -1442,31 +1459,31 @@ async fn handle_mcp_request(
                         "description": "LeIndex MCP Server - Semantic code indexing and analysis with PDG-based tools. Provides 18+ specialized tools for code comprehension: semantic search, symbol lookup, impact analysis, structural code queries, and intelligent editing. Uses Program Dependence Graphs for superior code understanding compared to traditional text-based tools."
                     }
                 }),
-            ))
+            )));
         }
 
         "notifications/initialized" => {
             // Client notification sent after successful initialization
             // No response needed for notifications
-            Ok(JsonRpcResponse::success(id, serde_json::json!({})))
+            return Ok(None);
         }
         "ping" => {
             // Simple health check
-            Ok(JsonRpcResponse::success(id, serde_json::json!({})))
+            Ok(Some(JsonRpcResponse::success(id, serde_json::json!({}))))
         }
         "tools/call" => {
             // Use the centralized tool call handler that formats for MCP
             let result = handle_tool_call(state, handlers, &request).await;
-            Ok(JsonRpcResponse::from_result(id, result))
+            Ok(Some(JsonRpcResponse::from_result(id, result)))
         }
         "tools/list" => {
             // List all available tools using centralized formatter
-            Ok(JsonRpcResponse::success(id, list_tools_json(handlers)))
+            Ok(Some(JsonRpcResponse::success(id, list_tools_json(handlers))))
         }
-        _ => Ok(JsonRpcResponse::error(
+        _ => Ok(Some(JsonRpcResponse::error(
             id,
             crate::cli::mcp::protocol::JsonRpcError::method_not_found(method_name),
-        )),
+        )))
     }
 }
 

@@ -11,6 +11,10 @@ pub struct ImpactAnalysisHandler;
 #[allow(missing_docs)]
 impl ImpactAnalysisHandler {
     pub fn name(&self) -> &str {
+        "leindex.impact-analysis"
+    }
+
+    pub fn title(&self) -> &str {
         "LeIndex [Impact Analysis]"
     }
 

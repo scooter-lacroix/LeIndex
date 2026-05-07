@@ -19,6 +19,10 @@ fn strip_line_ending(line: &str) -> &str {
 #[allow(missing_docs)]
 impl TextSearchHandler {
     pub fn name(&self) -> &str {
+        "leindex.text-search"
+    }
+
+    pub fn title(&self) -> &str {
         "LeIndex [Text Search]"
     }
 

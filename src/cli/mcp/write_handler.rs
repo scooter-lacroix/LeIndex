@@ -16,6 +16,10 @@ pub struct WriteHandler;
 #[allow(missing_docs)]
 impl WriteHandler {
     pub fn name(&self) -> &str {
+        "leindex.write"
+    }
+
+    pub fn title(&self) -> &str {
         "LeIndex [Write]"
     }
 

@@ -14,7 +14,7 @@ use leindex::cli::mcp::handlers::{
     FileSummaryHandler, GitStatusHandler, GrepSymbolsHandler, ImpactAnalysisHandler, IndexHandler,
     PhaseAnalysisAliasHandler, PhaseAnalysisHandler, ProjectMapHandler, ReadFileHandler,
     ReadSymbolHandler, RenameSymbolHandler, SearchHandler, SymbolLookupHandler, TextSearchHandler,
-    ToolHandler,
+    ToolHandler, WriteHandler,
 };
 use leindex::cli::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use leindex::cli::mcp::server::{handle_tool_call, list_tools_json};
@@ -41,6 +41,7 @@ fn all_handlers() -> Vec<ToolHandler> {
         ToolHandler::ProjectMap(ProjectMapHandler),
         ToolHandler::GrepSymbols(GrepSymbolsHandler),
         ToolHandler::ReadSymbol(ReadSymbolHandler),
+        ToolHandler::Write(WriteHandler),
         // Phase D: Context-Aware Editing
         ToolHandler::EditPreview(EditPreviewHandler),
         ToolHandler::EditApply(EditApplyHandler),
@@ -154,8 +155,8 @@ fn test_tools_list_returns_19_tools() {
     let tools = result["tools"].as_array().expect("tools must be an array");
     assert_eq!(
         tools.len(),
-        19,
-        "Expected exactly 19 registered tools, got {}",
+        20,
+        "Expected exactly 20 registered tools, got {}",
         tools.len()
     );
 }
@@ -172,28 +173,29 @@ fn test_tools_list_all_expected_names_present() {
         .collect();
 
     let expected_names = [
-        "LeIndex [Index]",
-        "LeIndex [Search]",
-        "LeIndex [Deep Analyze]",
-        "LeIndex [Context]",
-        "LeIndex [Diagnostics]",
-        "LeIndex [Phase Analysis]",
+        "leindex.index",
+        "leindex.search",
+        "leindex.deep-analyze",
+        "leindex.context",
+        "leindex.diagnostics",
+        "leindex.phase-analysis",
         "phase_analysis",
         // Phase C
-        "LeIndex [File Summary]",
-        "LeIndex [Symbol Lookup]",
-        "LeIndex [Project Map]",
-        "LeIndex [Grep Symbols]",
-        "LeIndex [Read Symbol]",
+        "leindex.file-summary",
+        "leindex.symbol-lookup",
+        "leindex.project-map",
+        "leindex.grep-symbols",
+        "leindex.read-symbol",
+        "leindex.write",
         // Phase D
-        "LeIndex [Edit Preview]",
-        "LeIndex [Edit Apply]",
-        "LeIndex [Rename Symbol]",
-        "LeIndex [Impact Analysis]",
+        "leindex.edit-preview",
+        "leindex.edit-apply",
+        "leindex.rename-symbol",
+        "leindex.impact-analysis",
         // Phase E
-        "LeIndex [Text Search]",
-        "LeIndex [Read File]",
-        "LeIndex [Git Status]",
+        "leindex.text-search",
+        "leindex.read-file",
+        "leindex.git-status",
     ];
 
     for expected in &expected_names {
@@ -270,7 +272,7 @@ async fn test_tools_call_file_summary_unindexed_returns_structured_response() {
 
     let req = make_tool_call(
         2,
-        "LeIndex [File Summary]",
+        "leindex.file-summary",
         serde_json::json!({ "file_path": "/nonexistent/file.rs" }),
     );
 
@@ -298,7 +300,7 @@ async fn test_tools_call_symbol_lookup_unindexed_returns_structured_response() {
 
     let req = make_tool_call(
         3,
-        "LeIndex [Symbol Lookup]",
+        "leindex.symbol-lookup",
         serde_json::json!({ "symbol": "some_function" }),
     );
 
@@ -319,7 +321,7 @@ async fn test_tools_call_project_map_unindexed_returns_structured_response() {
     let state = make_state(&tmp);
     let handlers = all_handlers();
 
-    let req = make_tool_call(4, "LeIndex [Project Map]", serde_json::json!({}));
+    let req = make_tool_call(4, "leindex.project-map", serde_json::json!({}));
 
     let result = handle_tool_call(&state, &handlers, &req).await;
     assert!(result.is_ok());
@@ -339,7 +341,7 @@ async fn test_tools_call_edit_preview_unindexed_returns_structured_response() {
 
     let req = make_tool_call(
         5,
-        "LeIndex [Edit Preview]",
+        "leindex.edit-preview",
         serde_json::json!({
             "file_path": "/nonexistent/file.rs",
             "changes": [{"type": "replace_text", "old_text": "foo", "new_text": "bar"}]
@@ -359,7 +361,7 @@ async fn test_tools_call_diagnostics_returns_ok() {
     let state = make_state(&tmp);
     let handlers = all_handlers();
 
-    let req = make_tool_call(6, "LeIndex [Diagnostics]", serde_json::json!({}));
+    let req = make_tool_call(6, "leindex.diagnostics", serde_json::json!({}));
     let result = handle_tool_call(&state, &handlers, &req).await;
     assert!(result.is_ok());
 

@@ -18,6 +18,10 @@ pub struct EditApplyHandler;
 #[allow(missing_docs)]
 impl EditApplyHandler {
     pub fn name(&self) -> &str {
+        "leindex.edit-apply"
+    }
+
+    pub fn title(&self) -> &str {
         "LeIndex [Edit Apply]"
     }
 

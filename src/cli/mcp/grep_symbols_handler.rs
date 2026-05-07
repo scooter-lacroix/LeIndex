@@ -95,6 +95,10 @@ pub struct GrepSymbolsHandler;
 #[allow(missing_docs)]
 impl GrepSymbolsHandler {
     pub fn name(&self) -> &str {
+        "leindex.grep-symbols"
+    }
+
+    pub fn title(&self) -> &str {
         "LeIndex [Grep Symbols]"
     }
 

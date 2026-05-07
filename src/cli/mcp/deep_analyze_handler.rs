@@ -11,8 +11,13 @@ use std::sync::Arc;
 pub struct DeepAnalyzeHandler;
 
 impl DeepAnalyzeHandler {
-    /// Returns the name of this RPC method
+    /// Returns the name of this MCP tool (MCP-compliant: ASCII letters, digits, underscore, hyphen, dot only)
     pub fn name(&self) -> &str {
+        "leindex.deep-analyze"
+    }
+
+    /// Returns the human-readable display title for this tool
+    pub fn title(&self) -> &str {
         "LeIndex [Deep Analyze]"
     }
 

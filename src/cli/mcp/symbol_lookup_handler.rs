@@ -14,6 +14,10 @@ pub struct SymbolLookupHandler;
 #[allow(missing_docs)]
 impl SymbolLookupHandler {
     pub fn name(&self) -> &str {
+        "leindex.symbol-lookup"
+    }
+
+    pub fn title(&self) -> &str {
         "LeIndex [Symbol Lookup]"
     }
 

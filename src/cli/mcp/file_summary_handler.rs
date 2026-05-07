@@ -14,6 +14,10 @@ pub struct FileSummaryHandler;
 #[allow(missing_docs)]
 impl FileSummaryHandler {
     pub fn name(&self) -> &str {
+        "leindex.file-summary"
+    }
+
+    pub fn title(&self) -> &str {
         "LeIndex [File Summary]"
     }
 

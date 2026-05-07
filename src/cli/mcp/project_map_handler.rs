@@ -12,6 +12,10 @@ pub struct ProjectMapHandler;
 #[allow(missing_docs)]
 impl ProjectMapHandler {
     pub fn name(&self) -> &str {
+        "leindex.project-map"
+    }
+
+    pub fn title(&self) -> &str {
         "LeIndex [Project Map]"
     }
 

@@ -11,8 +11,13 @@ use std::sync::Arc;
 pub struct SearchHandler;
 
 impl SearchHandler {
-    /// Returns the name of this RPC method
+    /// Returns the name of this MCP tool (MCP-compliant: ASCII letters, digits, underscore, hyphen, dot only)
     pub fn name(&self) -> &str {
+        "leindex.search"
+    }
+
+    /// Returns the human-readable display title for this tool
+    pub fn title(&self) -> &str {
         "LeIndex [Search]"
     }
 

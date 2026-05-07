@@ -17,6 +17,10 @@ pub struct EditPreviewHandler;
 #[allow(missing_docs)]
 impl EditPreviewHandler {
     pub fn name(&self) -> &str {
+        "leindex.edit-preview"
+    }
+
+    pub fn title(&self) -> &str {
         "LeIndex [Edit Preview]"
     }
 

@@ -175,6 +175,10 @@ fn build_pdg_enrichment(
 #[allow(missing_docs)]
 impl ReadFileHandler {
     pub fn name(&self) -> &str {
+        "leindex.read-file"
+    }
+
+    pub fn title(&self) -> &str {
         "LeIndex [Read File]"
     }
 
