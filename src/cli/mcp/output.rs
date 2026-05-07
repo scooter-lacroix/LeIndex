@@ -91,7 +91,7 @@ impl DiffFormatter {
                         output.push_str("\n  Changes:\n");
                         in_change = true;
                     }
-                    
+
                     if let Some(ol) = old_line {
                         output.push_str(&self.removed_line(i + 1, ol));
                         i += 1;
@@ -140,11 +140,7 @@ impl DiffFormatter {
 
     fn added_line(&self, line_num: usize, content: &str) -> String {
         if self.color {
-            format!(" {} │ {}{}{}\n", 
-                format!("{:>4}", line_num),
-                LIGHT_GREEN,
-                content,
-                RESET)
+            format!(" {:>4} │ {}{}{}\n", line_num, LIGHT_GREEN, content, RESET)
         } else {
             format!(" {:>4} │ {}\n", line_num, content)
         }
@@ -152,11 +148,7 @@ impl DiffFormatter {
 
     fn removed_line(&self, line_num: usize, content: &str) -> String {
         if self.color {
-            format!(" {} │ {}{}{}\n",
-                format!("{:>4}", line_num),
-                LIGHT_RED,
-                content,
-                RESET)
+            format!(" {:>4} │ {}{}{}\n", line_num, LIGHT_RED, content, RESET)
         } else {
             format!(" {:>4} │ {}\n", line_num, content)
         }
@@ -164,11 +156,7 @@ impl DiffFormatter {
 
     fn context_line(&self, line_num: usize, content: &str) -> String {
         if self.color {
-            format!(" {} │ {}{}{}\n",
-                format!("{:>4}", line_num),
-                DIM,
-                content,
-                RESET)
+            format!(" {:>4} │ {}{}{}\n", line_num, DIM, content, RESET)
         } else {
             format!(" {:>4} │ {}\n", line_num, content)
         }
@@ -238,18 +226,25 @@ impl SearchFormatter {
     }
 
     fn format_result(&self, result: &Value, rank: usize) -> String {
-        let file_path = result.get("file_path").and_then(|v| v.as_str()).unwrap_or("?");
+        let file_path = result
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
         let symbol = result.get("symbol").and_then(|v| v.as_str());
         let score = result.get("score").and_then(|v| v.as_f64());
         let line = result.get("line").and_then(|v| v.as_u64());
-        let snippet = result.get("snippet").and_then(|v| v.as_str())
+        let snippet = result
+            .get("snippet")
+            .and_then(|v| v.as_str())
             .or_else(|| result.get("content").and_then(|v| v.as_str()));
 
         let mut s = String::new();
-        
+
         if self.color {
-            s.push_str(&format!("{} {}. {}{}{}", 
-                BOLD, rank, LIGHT_YELLOW, file_path, RESET));
+            s.push_str(&format!(
+                "{} {}. {}{}{}",
+                BOLD, rank, LIGHT_YELLOW, file_path, RESET
+            ));
         } else {
             s.push_str(&format!("{}. {}", rank, file_path));
         }
@@ -275,11 +270,15 @@ impl SearchFormatter {
                 s.push_str(&format!(" [{}] {}%", bar, pct));
             }
         }
-        
+
         s.push('\n');
 
         if let Some(snip) = snippet {
-            let truncated = if snip.len() > 80 { format!("{}...", &snip[..77]) } else { snip.to_string() };
+            let truncated = if snip.len() > 80 {
+                format!("{}...", &snip[..77])
+            } else {
+                snip.to_string()
+            };
             if self.color {
                 s.push_str(&format!("    {}{}{}\n", DIM, truncated, RESET));
             } else {
@@ -349,10 +348,13 @@ impl ProjectMapFormatter {
 
     fn format_tree(&self, node: &Value, prefix: &str, is_last: bool) -> String {
         let mut s = String::new();
-        
+
         let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         let node_type = node.get("type").and_then(|v| v.as_str()).unwrap_or("file");
-        let symbol_count = node.get("symbol_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let symbol_count = node
+            .get("symbol_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let children = node.get("children").and_then(|v| v.as_array());
 
         let icon = match node_type {
@@ -369,17 +371,26 @@ impl ProjectMapFormatter {
                 "module" => LIGHT_MAGENTA,
                 _ => WHITE,
             };
-            s.push_str(&format!("{}{}{}{} {}{}[{}]{}",
-                prefix, connector, icon, type_color, name, DIM, symbol_count, RESET));
+            s.push_str(&format!(
+                "{}{}{}{} {}{}[{}]{}",
+                prefix, connector, icon, type_color, name, DIM, symbol_count, RESET
+            ));
         } else {
-            s.push_str(&format!("{}{}{} {} [{}]", prefix, connector, icon, name, symbol_count));
+            s.push_str(&format!(
+                "{}{}{} {} [{}]",
+                prefix, connector, icon, name, symbol_count
+            ));
         }
         s.push('\n');
 
         if let Some(kids) = children {
             let child_prefix = if is_last { "    " } else { "│   " };
             for (i, child) in kids.iter().enumerate() {
-                s.push_str(&self.format_tree(child, &format!("{}{}", prefix, child_prefix), i == kids.len() - 1));
+                s.push_str(&self.format_tree(
+                    child,
+                    &format!("{}{}", prefix, child_prefix),
+                    i == kids.len() - 1,
+                ));
             }
         }
 
@@ -391,7 +402,10 @@ impl ProjectMapFormatter {
         let symbols = file.get("symbols").and_then(|v| v.as_u64()).unwrap_or(0);
 
         if self.color {
-            format!("  📄 {}{}{} | {} symbols\n", LIGHT_YELLOW, path, RESET, symbols)
+            format!(
+                "  📄 {}{}{} | {} symbols\n",
+                LIGHT_YELLOW, path, RESET, symbols
+            )
         } else {
             format!("  📄 {} | {} symbols\n", path, symbols)
         }
@@ -461,9 +475,12 @@ impl DiagnosticsFormatter {
                 output.push('\n');
                 output.push_str("Issues:\n");
                 for issue in issues.iter().take(10) {
-                    let sev = issue.get("severity").and_then(|v| v.as_str()).unwrap_or("info");
+                    let sev = issue
+                        .get("severity")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("info");
                     let msg = issue.get("message").and_then(|v| v.as_str()).unwrap_or("?");
-                    
+
                     let icon = match sev {
                         "error" => "❌",
                         "warning" => "⚠️",
@@ -476,7 +493,10 @@ impl DiagnosticsFormatter {
                     };
 
                     if self.color {
-                        output.push_str(&format!("  {} {}{}{} {}\n", icon, sev_color, sev, RESET, msg));
+                        output.push_str(&format!(
+                            "  {} {}{}{} {}\n",
+                            icon, sev_color, sev, RESET, msg
+                        ));
                     } else {
                         output.push_str(&format!("  {} {}: {}\n", icon, sev, msg));
                     }
@@ -501,7 +521,10 @@ impl DiagnosticsFormatter {
 
     fn field(&self, name: &str, value: &str) -> String {
         if self.color {
-            format!("  {}{}:{} {}{}{}\n", BOLD, name, RESET, LIGHT_CYAN, value, RESET)
+            format!(
+                "  {}{}:{} {}{}{}\n",
+                BOLD, name, RESET, LIGHT_CYAN, value, RESET
+            )
         } else {
             format!("  {}: {}\n", name, value)
         }
@@ -547,7 +570,10 @@ impl ImpactFormatter {
                 _ => ("⚪", WHITE),
             };
             if self.color {
-                output.push_str(&format!("  {}{}:{} {}{}{}\n", BOLD, "Risk", RESET, color, risk, RESET));
+                output.push_str(&format!(
+                    "  {}{}:{} {}{}{}\n",
+                    BOLD, "Risk", RESET, color, risk, RESET
+                ));
             } else {
                 output.push_str(&format!("  Risk: {}\n", risk));
             }
@@ -561,7 +587,10 @@ impl ImpactFormatter {
                     let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                     let file = item.get("file").and_then(|v| v.as_str()).unwrap_or("");
                     if self.color {
-                        output.push_str(&format!("  → {}{}{} {}{}{}\n", LIGHT_CYAN, name, RESET, DIM, file, RESET));
+                        output.push_str(&format!(
+                            "  → {}{}{} {}{}{}\n",
+                            LIGHT_CYAN, name, RESET, DIM, file, RESET
+                        ));
                     } else {
                         output.push_str(&format!("  → {} {}\n", name, file));
                     }
@@ -601,7 +630,10 @@ impl ImpactFormatter {
 
     fn field(&self, name: &str, value: &str) -> String {
         if self.color {
-            format!("  {}{}:{} {}{}{}\n", BOLD, name, RESET, LIGHT_CYAN, value, RESET)
+            format!(
+                "  {}{}:{} {}{}{}\n",
+                BOLD, name, RESET, LIGHT_CYAN, value, RESET
+            )
         } else {
             format!("  {}: {}\n", name, value)
         }
@@ -666,7 +698,10 @@ impl SymbolLookupFormatter {
                 _ => WHITE,
             };
             if self.color {
-                output.push_str(&format!("  {}{}:{} {}{} {}{}\n", BOLD, "Type", RESET, color, icon, typ, RESET));
+                output.push_str(&format!(
+                    "  {}{}:{} {}{} {}{}\n",
+                    BOLD, "Type", RESET, color, icon, typ, RESET
+                ));
             } else {
                 output.push_str(&format!("  Type: {} {}\n", icon, typ));
             }
@@ -680,7 +715,10 @@ impl SymbolLookupFormatter {
                     let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                     let file = c.get("file").and_then(|v| v.as_str()).unwrap_or("");
                     if self.color {
-                        output.push_str(&format!("  → {}{}{} {}{}{}\n", LIGHT_CYAN, name, RESET, DIM, file, RESET));
+                        output.push_str(&format!(
+                            "  → {}{}{} {}{}{}\n",
+                            LIGHT_CYAN, name, RESET, DIM, file, RESET
+                        ));
                     } else {
                         output.push_str(&format!("  → {} {}\n", name, file));
                     }
@@ -720,7 +758,10 @@ impl SymbolLookupFormatter {
 
     fn field(&self, name: &str, value: &str) -> String {
         if self.color {
-            format!("  {}{}:{} {}{}{}\n", BOLD, name, RESET, LIGHT_CYAN, value, RESET)
+            format!(
+                "  {}{}:{} {}{}{}\n",
+                BOLD, name, RESET, LIGHT_CYAN, value, RESET
+            )
         } else {
             format!("  {}: {}\n", name, value)
         }
@@ -767,7 +808,7 @@ impl PhaseFormatter {
                 let status = phase.get("status").and_then(|v| v.as_str()).unwrap_or("?");
                 let findings = phase.get("findings").and_then(|v| v.as_u64()).unwrap_or(0);
 
-let (icon, color) = match status {
+                let (icon, color) = match status {
                     "completed" | "success" => ("✓", LIGHT_GREEN),
                     "failed" | "error" => ("✗", LIGHT_RED),
                     "skipped" => ("○", DIM),
@@ -775,19 +816,31 @@ let (icon, color) = match status {
                 };
 
                 if self.color {
-                    output.push_str(&format!("  {}{} {}{} Phase {}: {}{} ({})\n",
-                        color, icon, RESET, BOLD, num, RESET, name, findings));
+                    output.push_str(&format!(
+                        "  {}{} {}{} Phase {}: {}{} ({})\n",
+                        color, icon, RESET, BOLD, num, RESET, name, findings
+                    ));
                 } else {
-                    output.push_str(&format!("  {} Phase {}: {} ({})\n", icon, num, name, findings));
+                    output.push_str(&format!(
+                        "  {} Phase {}: {} ({})\n",
+                        icon, num, name, findings
+                    ));
                 }
             }
         }
 
         if let Some(summary) = data.get("summary").and_then(|v| v.as_str()) {
             output.push('\n');
-            let truncated = if summary.len() > 150 { format!("{}...", &summary[..147]) } else { summary.to_string() };
+            let truncated = if summary.len() > 150 {
+                format!("{}...", &summary[..147])
+            } else {
+                summary.to_string()
+            };
             if self.color {
-                output.push_str(&format!("  {}{}:{} {}{}{}\n", BOLD, "Summary", RESET, DIM, truncated, RESET));
+                output.push_str(&format!(
+                    "  {}{}:{} {}{}{}\n",
+                    BOLD, "Summary", RESET, DIM, truncated, RESET
+                ));
             } else {
                 output.push_str(&format!("  Summary: {}\n", truncated));
             }
@@ -810,7 +863,10 @@ let (icon, color) = match status {
 
     fn field(&self, name: &str, value: &str) -> String {
         if self.color {
-            format!("  {}{}:{} {}{}{}\n", BOLD, name, RESET, LIGHT_CYAN, value, RESET)
+            format!(
+                "  {}{}:{} {}{}{}\n",
+                BOLD, name, RESET, LIGHT_CYAN, value, RESET
+            )
         } else {
             format!("  {}: {}\n", name, value)
         }
@@ -855,7 +911,10 @@ impl GitStatusFormatter {
                 _ => ("?", WHITE),
             };
             if self.color {
-                output.push_str(&format!("  {}{}:{} {}{}{}\n", BOLD, "Status", RESET, color, status, RESET));
+                output.push_str(&format!(
+                    "  {}{}:{} {}{}{}\n",
+                    BOLD, "Status", RESET, color, status, RESET
+                ));
             } else {
                 output.push_str(&format!("  Status: {}\n", status));
             }
@@ -923,7 +982,10 @@ impl GitStatusFormatter {
 
     fn field(&self, name: &str, value: &str) -> String {
         if self.color {
-            format!("  {}{}:{} {}{}{}\n", BOLD, name, RESET, LIGHT_GREEN, value, RESET)
+            format!(
+                "  {}{}:{} {}{}{}\n",
+                BOLD, name, RESET, LIGHT_GREEN, value, RESET
+            )
         } else {
             format!("  {}: {}\n", name, value)
         }
@@ -974,8 +1036,10 @@ impl FileSummaryFormatter {
                 _ => ("High", LIGHT_RED),
             };
             if self.color {
-                output.push_str(&format!("  {}{}:{} {}{} ({}){}\n", 
-                    BOLD, "Complexity", RESET, color, complexity, label, RESET));
+                output.push_str(&format!(
+                    "  {}{}:{} {}{} ({}){}\n",
+                    BOLD, "Complexity", RESET, color, complexity, label, RESET
+                ));
             } else {
                 output.push_str(&format!("  Complexity: {} ({})\n", complexity, label));
             }
@@ -988,7 +1052,7 @@ impl FileSummaryFormatter {
                 for sym in symbols.iter().take(20) {
                     let name = sym.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                     let typ = sym.get("type").and_then(|v| v.as_str()).unwrap_or("symbol");
-                    
+
                     let icon = match typ {
                         "function" | "fn" => "ƒ",
                         "method" => "m",
@@ -1005,7 +1069,10 @@ impl FileSummaryFormatter {
                     };
 
                     if self.color {
-                        output.push_str(&format!("  {}{}{} {}{}{}\n", LIGHT_GREEN, icon, RESET, LIGHT_CYAN, name, RESET));
+                        output.push_str(&format!(
+                            "  {}{}{} {}{}{}\n",
+                            LIGHT_GREEN, icon, RESET, LIGHT_CYAN, name, RESET
+                        ));
                     } else {
                         output.push_str(&format!("  {} {}\n", icon, name));
                     }
@@ -1030,7 +1097,10 @@ impl FileSummaryFormatter {
 
     fn field(&self, name: &str, value: &str) -> String {
         if self.color {
-            format!("  {}{}:{} {}{}{}\n", BOLD, name, RESET, LIGHT_CYAN, value, RESET)
+            format!(
+                "  {}{}:{} {}{}{}\n",
+                BOLD, name, RESET, LIGHT_CYAN, value, RESET
+            )
         } else {
             format!("  {}: {}\n", name, value)
         }

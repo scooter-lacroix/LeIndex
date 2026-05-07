@@ -392,7 +392,9 @@ impl ProjectRegistry {
         })?;
 
         // Reject root directory (cross-platform: works on Windows too)
-        if canonical.components().count() == 1 {
+        // Using parent().is_none() correctly identifies root paths on all platforms,
+        // including Windows drive roots like C:\ which have multiple components.
+        if canonical.parent().is_none() {
             return Err(JsonRpcError::invalid_params(
                 "Refusing to index root directory. Specify a project subdirectory.".to_string(),
             ));

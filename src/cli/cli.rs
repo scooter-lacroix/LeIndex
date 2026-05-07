@@ -4,7 +4,10 @@
 
 use crate::cli::leindex::LeIndex;
 use crate::cli::mcp::handlers::{all_tool_handlers, ToolHandler};
-use crate::cli::mcp::output::{DiagnosticsFormatter, ImpactFormatter, PhaseFormatter, ProjectMapFormatter, SearchFormatter, SymbolLookupFormatter, FileSummaryFormatter};
+use crate::cli::mcp::output::{
+    DiagnosticsFormatter, FileSummaryFormatter, ImpactFormatter, PhaseFormatter,
+    ProjectMapFormatter, SearchFormatter, SymbolLookupFormatter,
+};
 use crate::cli::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::cli::mcp::McpServer;
 use crate::cli::registry::{ProjectRegistry, DEFAULT_MAX_PROJECTS};
@@ -632,7 +635,10 @@ async fn cmd_search_impl(
 
     // Use beautiful formatter
     let formatter = SearchFormatter::new();
-    println!("{}", formatter.format(&serde_json::json!(results_json), &query));
+    println!(
+        "{}",
+        formatter.format(&serde_json::json!(results_json), &query)
+    );
 
     Ok(())
 }
@@ -672,16 +678,30 @@ async fn cmd_analyze_impl(
 }
 
 fn format_analysis_output(query: &str, result: &crate::cli::leindex::AnalysisResult) -> String {
-    use crate::cli::mcp::output::{BOLD, LIGHT_CYAN, RESET, DIM};
-    
+    use crate::cli::mcp::output::{BOLD, DIM, LIGHT_CYAN, RESET};
+
     let mut out = String::new();
-    out.push_str(&format!("{}┌─ Analysis: {} ─┐{}\n", LIGHT_CYAN, query, RESET));
-    out.push_str(&format!("  {}Found:{} {} entry point(s)\n", BOLD, RESET, result.results.len()));
-    out.push_str(&format!("  {}Tokens:{} {}\n", BOLD, RESET, result.tokens_used));
-    out.push_str(&format!("  {}Time:{} {}ms\n", BOLD, RESET, result.processing_time_ms));
-    
+    out.push_str(&format!(
+        "{}┌─ Analysis: {} ─┐{}\n",
+        LIGHT_CYAN, query, RESET
+    ));
+    out.push_str(&format!(
+        "  {}Found:{} {} entry point(s)\n",
+        BOLD,
+        RESET,
+        result.results.len()
+    ));
+    out.push_str(&format!(
+        "  {}Tokens:{} {}\n",
+        BOLD, RESET, result.tokens_used
+    ));
+    out.push_str(&format!(
+        "  {}Time:{} {}ms\n",
+        BOLD, RESET, result.processing_time_ms
+    ));
+
     if let Some(context) = &result.context {
-        out.push_str("\n");
+        out.push('\n');
         out.push_str(&format!("  {}{}{}\n", BOLD, "Context:", RESET));
         let context_str: &str = context.as_str();
         let truncated = if context_str.len() > 300 {
@@ -691,7 +711,7 @@ fn format_analysis_output(query: &str, result: &crate::cli::leindex::AnalysisRes
         };
         out.push_str(&format!("  {}{}{}", DIM, truncated, RESET));
     }
-    
+
     out
 }
 
@@ -711,11 +731,11 @@ async fn cmd_context_impl(
     )?;
 
     let value = execute_tool_handler("leindex_context", args, project).await?;
-    
+
     // Use beautiful formatter for context output
     let formatter = SymbolLookupFormatter::new();
     println!("{}", formatter.format(&value));
-    
+
     Ok(())
 }
 
@@ -866,13 +886,19 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
             let parsed_args = parse_tool_args_json(&args_json)?;
             let args = merge_tool_args(parsed_args.clone(), &set, project.as_ref())?;
             let value = execute_tool_handler(&name, args, project).await?;
-            
+
             // Use appropriate formatter based on tool name
             let normalized_name = name.to_lowercase().replace('-', "_");
             let formatted = match normalized_name.as_str() {
                 "leindex_search" | "search" | "leindex.search" => {
                     let formatter = SearchFormatter::new();
-                    formatter.format(&value, &parsed_args.get("query").and_then(|v| v.as_str()).unwrap_or(""))
+                    formatter.format(
+                        &value,
+                        parsed_args
+                            .get("query")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                    )
                 }
                 "leindex_context" | "context" | "leindex.context" => {
                     let formatter = SymbolLookupFormatter::new();
@@ -908,7 +934,7 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
                     serde_json::to_string_pretty(&value).unwrap_or_default()
                 }
             };
-            
+
             println!("{}", formatted);
             Ok(())
         }
@@ -1287,15 +1313,15 @@ fn find_tool_handler(name: &str) -> Option<ToolHandler> {
         let handler_name = normalize_tool_name(handler.name());
         let title = handler.title();
         let short_name = extract_short_name(&handler_name);
-        
+
         // Check all possible formats:
         // 1. handler.name() - e.g., "leindex.context"
-        // 2. short name from handler - e.g., "context" 
+        // 2. short name from handler - e.g., "context"
         // 3. title - e.g., "leindex_context" (normalized)
         // 4. legacy format - e.g., "leindex_context" in input matches "context" from handler
-        // 5. MCP-compliant format - e.g., "leindex.context" in input matches "leindex.context" from handler
+        // 5. MCP-compliant format - e.g., "leindex.index" in input matches "leindex.index" from handler
         // 6. Direct legacy format - e.g., "leindex_search" matches handler name "leindex.search" after normalization
-        
+
         handler_name == normalized
             || short_name == normalized
             || normalize_tool_name(title) == normalized
@@ -1518,8 +1544,10 @@ async fn handle_mcp_request(
         "initialize" => {
             // MCP protocol initialization handshake
             // Mark handshake as complete
-            server_instance.handshake_complete.store(true, std::sync::atomic::Ordering::SeqCst);
-            
+            server_instance
+                .handshake_complete
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+
             // Return server capabilities with comprehensive description
             return Ok(Some(JsonRpcResponse::success(
                 id,

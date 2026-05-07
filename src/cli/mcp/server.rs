@@ -605,19 +605,11 @@ pub fn handle_resource_read(req: &JsonRpcRequest) -> Result<Value, JsonRpcError>
 
 /// List tools handler
 async fn list_tools_handler() -> Json<Value> {
-    let server_instance = match SERVER_INSTANCE.get() {
-        Some(s) => s,
-        None => {
-            return Json(serde_json::json!({
-                "error": "Server instance not initialized"
-            }));
-        }
-    };
-
-    // Check handshake completion
-    if !server_instance.handshake_complete.load(Ordering::SeqCst) {
+    // Tool list is a public discovery endpoint — no handshake required.
+    // Only verify that the server instance exists.
+    if SERVER_INSTANCE.get().is_none() {
         return Json(serde_json::json!({
-            "error": "Server not initialized. Call 'initialize' first."
+            "error": "Server instance not initialized"
         }));
     }
 
@@ -734,7 +726,7 @@ pub fn get_prompt(
             PromptMessage {
                 role: "user".to_string(),
                 content: PromptContent::Text {
-                    text: "Welcome to LeIndex! Here's how to get started:\n\n1. **Indexing**: First, index your project with `LeIndex [Index]`\n2. **Searching**: Use `LeIndex [Search]` for semantic code search\n3. **Analysis**: Use `LeIndex [Deep Analyze]` for comprehensive code analysis\n4. **Context**: Use `LeIndex [Context]` to expand around specific symbols\n\nPro tip: LeIndex auto-indexes on first use, so you can start searching immediately!".to_string(),
+                    text: "Welcome to LeIndex! Here's how to get started:\n\n1. **Indexing**: First, index your project with `leindex.index`\n2. **Searching**: Use `leindex.search` for semantic code search\n3. **Analysis**: Use `leindex.deep-analyze` for comprehensive code analysis\n4. **Context**: Use `leindex.context` to expand around specific symbols\n\nPro tip: LeIndex auto-indexes on first use, so you can start searching immediately!".to_string(),
                 },
             },
         ]),
@@ -750,7 +742,7 @@ pub fn get_prompt(
                     role: "user".to_string(),
                     content: PromptContent::Text {
                         text: format!(
-                            "Let me help you investigate: {}\n\nHere's the recommended workflow:\n\n1. **Start broad**: Use `LeIndex [Search]` with a natural language query like '{}'\n2. **Find entry points**: Look for the most relevant symbols in the results\n3. **Deep dive**: Use `LeIndex [Deep Analyze]` on the most relevant symbol\n4. **Expand context**: Use `LeIndex [Context]` to see how the symbol is used\n5. **Navigate**: Follow symbol references with `LeIndex [Read Symbol]`\n\nWould you like me to help you with any specific step?",
+                            "Let me help you investigate: {}\n\nHere's the recommended workflow:\n\n1. **Start broad**: Use `leindex.search` with a natural language query like '{}'\n2. **Find entry points**: Look for the most relevant symbols in the results\n3. **Deep dive**: Use `leindex.deep-analyze` on the most relevant symbol\n4. **Expand context**: Use `leindex.context` to see how the symbol is used\n5. **Navigate**: Follow symbol references with `leindex.read-symbol`\n\nWould you like me to help you with any specific step?",
                             query, query
                         ),
                     },
@@ -856,7 +848,7 @@ leindex index /path/to/project
 Or use the MCP tool:
 ```json
 {
-  "name": "LeIndex [Index]",
+  "name": "leindex.index",
   "arguments": {
     "project_path": "/path/to/project"
   }
@@ -872,7 +864,7 @@ leindex search "how is authentication handled"
 Or use the MCP tool:
 ```json
 {
-  "name": "LeIndex [Search]",
+  "name": "leindex.search",
   "arguments": {
     "query": "how is authentication handled",
     "limit": 10
@@ -889,7 +881,7 @@ leindex analyze --symbol "User::authenticate"
 Or use the MCP tool:
 ```json
 {
-  "name": "LeIndex [Deep Analyze]",
+  "name": "leindex.deep-analyze",
   "arguments": {
     "query": "User::authenticate"
   }
@@ -898,12 +890,12 @@ Or use the MCP tool:
 
 ## Available Tools
 
-- `LeIndex [Search]` - Semantic code search
-- `LeIndex [Deep Analyze]` - Comprehensive code analysis
-- `LeIndex [Context]` - Expand symbol context
-- `LeIndex [Grep Symbols]` - Search symbols by name
-- `LeIndex [Read File]` - Read file with PDG annotations
-- `LeIndex [File Summary]` - Get file structural summary
+- `leindex.search` - Semantic code search
+- `leindex.deep-analyze` - Comprehensive code analysis
+- `leindex.context` - Expand symbol context
+- `leindex.grep-symbols` - Search symbols by name
+- `leindex.read-file` - Read file with PDG annotations
+- `leindex.file-summary` - Get file structural summary
 
 ## Environment Variables
 
