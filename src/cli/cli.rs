@@ -4,6 +4,8 @@
 
 use crate::cli::leindex::LeIndex;
 use crate::cli::mcp::handlers::{all_tool_handlers, ToolHandler};
+#[allow(unused_imports)]
+use crate::cli::mcp::output::{DiagnosticsFormatter, ImpactFormatter, PhaseFormatter, ProjectMapFormatter, SearchFormatter, SymbolLookupFormatter};
 use crate::cli::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::cli::mcp::McpServer;
 use crate::cli::registry::{ProjectRegistry, DEFAULT_MAX_PROJECTS};
@@ -610,26 +612,28 @@ async fn cmd_search_impl(
         return Ok(());
     }
 
-    // Print results
-    println!("\nFound {} result(s) for: '{}'\n", results.len(), query);
-    for (i, result) in results.iter().enumerate() {
-        println!("{}. {} ({})", i + 1, result.symbol_name, result.file_path);
-        println!("   ID: {}", result.node_id);
-        println!("   Overall Score: {:.2}", result.score.overall);
-        println!(
-            "   Explanation: [Semantic: {:.2}, Text: {:.2}, Structural: {:.2}]",
-            result.score.semantic, result.score.text_match, result.score.structural
-        );
-        if let Some(context) = &result.context {
-            let context_preview = if context.len() > 100 {
-                format!("{}...", &context[..100])
-            } else {
-                context.clone()
-            };
-            println!("   Context: {}", context_preview);
-        }
-        println!();
-    }
+    // Convert results to JSON value for formatter
+    let results_json: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "rank": r.rank,
+                "symbol": r.symbol_name,
+                "file_path": r.file_path,
+                "node_id": r.node_id,
+                "score": r.score.overall,
+                "semantic_score": r.score.semantic,
+                "text_score": r.score.text_match,
+                "structural_score": r.score.structural,
+                "context": r.context,
+                "language": r.language,
+            })
+        })
+        .collect();
+
+    // Use beautiful formatter
+    let formatter = SearchFormatter::new();
+    println!("{}", formatter.format(&serde_json::json!(results_json), &query));
 
     Ok(())
 }
@@ -661,18 +665,35 @@ async fn cmd_analyze_impl(
         .analyze(&query, token_budget)
         .context("Analysis failed")?;
 
-    // Print results
-    println!("\nAnalysis Results for: '{}'", query);
-    println!("Found {} entry point(s)", result.results.len());
-    println!("Tokens used: {}", result.tokens_used);
-    println!("Processing time: {}ms\n", result.processing_time_ms);
-
-    if let Some(context) = &result.context {
-        println!("Context:");
-        println!("{}", context);
-    }
+    // Print results with nice formatting
+    let output = format_analysis_output(&query, &result);
+    println!("{}", output);
 
     Ok(())
+}
+
+fn format_analysis_output(query: &str, result: &crate::cli::leindex::AnalysisResult) -> String {
+    use crate::cli::mcp::output::{BOLD, LIGHT_CYAN, RESET, DIM};
+    
+    let mut out = String::new();
+    out.push_str(&format!("{}┌─ Analysis: {} ─┐{}\n", LIGHT_CYAN, query, RESET));
+    out.push_str(&format!("  {}Found:{} {} entry point(s)\n", BOLD, RESET, result.results.len()));
+    out.push_str(&format!("  {}Tokens:{} {}\n", BOLD, RESET, result.tokens_used));
+    out.push_str(&format!("  {}Time:{} {}ms\n", BOLD, RESET, result.processing_time_ms));
+    
+    if let Some(context) = &result.context {
+        out.push_str("\n");
+        out.push_str(&format!("  {}{}{}\n", BOLD, "Context:", RESET));
+        let context_str: &str = context.as_str();
+        let truncated = if context_str.len() > 300 {
+            format!("{}...", &context_str[..297])
+        } else {
+            context_str.to_string()
+        };
+        out.push_str(&format!("  {}{}{}", DIM, truncated, RESET));
+    }
+    
+    out
 }
 
 /// Context command implementation
@@ -798,31 +819,18 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         .get_diagnostics()
         .context("Failed to get diagnostics")?;
 
-    // Print diagnostics
-    println!("\nLeIndex Diagnostics\n");
-    println!("Project: {}", diag.project_id);
-    println!("Path: {}", diag.project_path);
-    println!("\nIndex Statistics:");
-    println!("  Files parsed: {}", diag.stats.files_parsed);
-    println!("  Successful: {}", diag.stats.successful_parses);
-    println!("  Failed: {}", diag.stats.failed_parses);
-    println!("  Total signatures: {}", diag.stats.total_signatures);
-    println!("  PDG nodes: {}", diag.stats.pdg_nodes);
-    println!("  PDG edges: {}", diag.stats.pdg_edges);
-    println!("  Indexed nodes: {}", diag.stats.indexed_nodes);
-    println!("\nMemory Usage:");
-    println!(
-        "  Current: {:.2} MB",
-        diag.memory_usage_bytes as f64 / 1024.0 / 1024.0
-    );
-    println!(
-        "  Total: {:.2} MB",
-        diag.total_memory_bytes as f64 / 1024.0 / 1024.0
-    );
-    println!("  Usage: {:.1}%", diag.memory_usage_percent);
-    if diag.memory_threshold_exceeded {
-        println!("  ⚠️  Memory threshold exceeded!");
-    }
+    // Convert to JSON for formatter
+    let diag_json = serde_json::json!({
+        "project_path": diag.project_path,
+        "indexed_files": diag.stats.files_parsed,
+        "index_size_mb": diag.memory_usage_bytes as f64 / 1024.0 / 1024.0,
+        "symbol_count": diag.stats.indexed_nodes,
+        "issues": []
+    });
+
+    // Use beautiful formatter
+    let formatter = DiagnosticsFormatter::new();
+    println!("{}", formatter.format(&diag_json));
 
     Ok(())
 }
@@ -1450,6 +1458,9 @@ async fn handle_mcp_request(
     match method_name.as_str() {
         "initialize" => {
             // MCP protocol initialization handshake
+            // Mark handshake as complete
+            server_instance.handshake_complete.store(true, std::sync::atomic::Ordering::SeqCst);
+            
             // Return server capabilities with comprehensive description
             return Ok(Some(JsonRpcResponse::success(
                 id,
