@@ -1043,6 +1043,12 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
                     )),
                 };
 
+                // Notifications (e.g. notifications/initialized) must not receive
+                // a response per JSON-RPC 2.0 spec — skip serializing/sending.
+                let Some(response) = response else {
+                    continue;
+                };
+
                 let response_json = match serde_json::to_string(&response) {
                     Ok(j) => j,
                     Err(e) => {
@@ -1395,7 +1401,9 @@ async fn handle_mcp_request(
     request: JsonRpcRequest,
     _project_path: PathBuf,
 ) -> anyhow::Result<Option<JsonRpcResponse>> {
-    use crate::cli::mcp::server::{handle_tool_call, list_tools_json, HANDLERS, SERVER_INSTANCE, SERVER_STATE};
+    use crate::cli::mcp::server::{
+        handle_tool_call, list_tools_json, HANDLERS, SERVER_INSTANCE, SERVER_STATE,
+    };
 
     let method_name = request.method.clone();
     let id = request.id.clone().unwrap_or(serde_json::Value::Null);
@@ -1406,18 +1414,26 @@ async fn handle_mcp_request(
         None => {
             return Ok(Some(JsonRpcResponse::error(
                 id,
-                crate::cli::mcp::protocol::JsonRpcError::new(-32603, "Server instance not initialized"),
+                crate::cli::mcp::protocol::JsonRpcError::new(
+                    -32603,
+                    "Server instance not initialized",
+                ),
             )));
         }
     };
 
     // Check handshake completion for non-initialize requests
-    if !server_instance.handshake_complete.load(std::sync::atomic::Ordering::SeqCst)
+    if !server_instance
+        .handshake_complete
+        .load(std::sync::atomic::Ordering::SeqCst)
         && method_name != "initialize"
     {
         return Ok(Some(JsonRpcResponse::error(
             id,
-            crate::cli::mcp::protocol::JsonRpcError::new(-32000, "Server not initialized. Call 'initialize' first."),
+            crate::cli::mcp::protocol::JsonRpcError::new(
+                -32000,
+                "Server not initialized. Call 'initialize' first.",
+            ),
         )));
     }
 
@@ -1478,12 +1494,15 @@ async fn handle_mcp_request(
         }
         "tools/list" => {
             // List all available tools using centralized formatter
-            Ok(Some(JsonRpcResponse::success(id, list_tools_json(handlers))))
+            Ok(Some(JsonRpcResponse::success(
+                id,
+                list_tools_json(handlers),
+            )))
         }
         _ => Ok(Some(JsonRpcResponse::error(
             id,
             crate::cli::mcp::protocol::JsonRpcError::method_not_found(method_name),
-        )))
+        ))),
     }
 }
 

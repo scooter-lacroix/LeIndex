@@ -149,7 +149,7 @@ fn test_no_double_newline_in_success_response() {
 // ============================================================================
 
 #[test]
-fn test_tools_list_returns_19_tools() {
+fn test_tools_list_returns_20_tools() {
     let handlers = all_handlers();
     let result = list_tools_json(&handlers);
     let tools = result["tools"].as_array().expect("tools must be an array");

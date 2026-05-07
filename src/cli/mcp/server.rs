@@ -8,9 +8,10 @@ use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::cli::registry::ProjectRegistry;
 use anyhow::Context;
 use axum_06::{
+    http::StatusCode,
     response::{
         sse::{Event, Sse},
-        Json,
+        IntoResponse, Json, Response,
     },
     routing::{get, post},
     Router, Server,
@@ -384,7 +385,7 @@ fn handle_ping() -> Value {
 }
 
 /// JSON-RPC request handler
-async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
+async fn json_rpc_handler(Json(body): Json<Value>) -> Response {
     // Parse JSON-RPC request
     let json_req: JsonRpcRequest = match serde_json::from_value(body.clone()) {
         Ok(r) => r,
@@ -397,7 +398,8 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
                     "code": -32700,
                     "message": "Invalid JSON"
                 }
-            }));
+            }))
+            .into_response();
         }
     };
 
@@ -412,7 +414,8 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
                     "code": -32603,
                     "message": "Server instance not initialized"
                 }
-            }));
+            }))
+            .into_response();
         }
     };
 
@@ -429,7 +432,8 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
                     "code": -32603,
                     "message": "Handlers not initialized"
                 }
-            }));
+            }))
+            .into_response();
         }
     };
 
@@ -439,7 +443,7 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
     if let Err(e) = json_req.validate() {
         warn!("Invalid JSON-RPC request: {}", e);
         let resp = JsonRpcResponse::error(id, e);
-        return Json(serde_json::to_value(&resp).unwrap());
+        return Json(serde_json::to_value(&resp).unwrap()).into_response();
     }
 
     // Check handshake completion for non-initialize requests
@@ -452,12 +456,18 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
                 "code": -32000,
                 "message": "Server not initialized. Call 'initialize' first."
             }
-        }));
+        }))
+        .into_response();
+    }
+
+    // Notifications must not receive a response per JSON-RPC 2.0 spec
+    if json_req.method == "notifications/initialized" {
+        debug!("Received notifications/initialized — no response per JSON-RPC 2.0 spec");
+        return StatusCode::NO_CONTENT.into_response();
     }
 
     let response = match json_req.method.as_str() {
         "initialize" => Ok(handle_initialize(server_instance)),
-        "notifications/initialized" => Ok(serde_json::json!({})),
         "ping" => Ok(handle_ping()),
         "tools/call" => handle_tool_call(&state, handlers, &json_req).await,
         "tools/list" => Ok(list_tools_json(handlers)),
@@ -479,7 +489,7 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
         }
     };
 
-    Json(serde_json::to_value(&resp).unwrap())
+    Json(serde_json::to_value(&resp).unwrap()).into_response()
 }
 
 /// Handle tool call requests

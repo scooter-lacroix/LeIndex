@@ -4,7 +4,7 @@ use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for LeIndex [diagnostics
+/// Handler for LeIndex [Diagnostics]
 ///
 /// Returns diagnostic information about the indexed project.
 #[derive(Clone)]

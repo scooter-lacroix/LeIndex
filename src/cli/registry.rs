@@ -33,12 +33,12 @@ use crate::cli::errors::detect_corruption;
 use crate::cli::leindex::{IndexStats, LeIndex};
 use crate::cli::mcp::protocol::JsonRpcError;
 use crate::cli::watcher::IndexWatcher;
+use dirs;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
-use dirs;
 
 /// Default maximum number of projects kept in memory simultaneously.
 pub const DEFAULT_MAX_PROJECTS: usize = 5;
@@ -391,8 +391,8 @@ impl ProjectRegistry {
             ))
         })?;
 
-        // Reject root directory
-        if canonical.as_path() == "/" {
+        // Reject root directory (cross-platform: works on Windows too)
+        if canonical.components().count() == 1 {
             return Err(JsonRpcError::invalid_params(
                 "Refusing to index root directory. Specify a project subdirectory.".to_string(),
             ));
