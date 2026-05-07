@@ -4,8 +4,7 @@
 
 use crate::cli::leindex::LeIndex;
 use crate::cli::mcp::handlers::{all_tool_handlers, ToolHandler};
-#[allow(unused_imports)]
-use crate::cli::mcp::output::{DiagnosticsFormatter, ImpactFormatter, PhaseFormatter, ProjectMapFormatter, SearchFormatter, SymbolLookupFormatter};
+use crate::cli::mcp::output::{DiagnosticsFormatter, ImpactFormatter, PhaseFormatter, ProjectMapFormatter, SearchFormatter, SymbolLookupFormatter, FileSummaryFormatter};
 use crate::cli::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::cli::mcp::McpServer;
 use crate::cli::registry::{ProjectRegistry, DEFAULT_MAX_PROJECTS};
@@ -712,7 +711,11 @@ async fn cmd_context_impl(
     )?;
 
     let value = execute_tool_handler("leindex_context", args, project).await?;
-    print_json_value(&value)?;
+    
+    // Use beautiful formatter for context output
+    let formatter = SymbolLookupFormatter::new();
+    println!("{}", formatter.format(&value));
+    
     Ok(())
 }
 
@@ -860,9 +863,53 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
             args_json,
             set,
         } => {
-            let args = merge_tool_args(parse_tool_args_json(&args_json)?, &set, project.as_ref())?;
+            let parsed_args = parse_tool_args_json(&args_json)?;
+            let args = merge_tool_args(parsed_args.clone(), &set, project.as_ref())?;
             let value = execute_tool_handler(&name, args, project).await?;
-            print_json_value(&value)?;
+            
+            // Use appropriate formatter based on tool name
+            let normalized_name = name.to_lowercase().replace('-', "_");
+            let formatted = match normalized_name.as_str() {
+                "leindex_search" | "search" | "leindex.search" => {
+                    let formatter = SearchFormatter::new();
+                    formatter.format(&value, &parsed_args.get("query").and_then(|v| v.as_str()).unwrap_or(""))
+                }
+                "leindex_context" | "context" | "leindex.context" => {
+                    let formatter = SymbolLookupFormatter::new();
+                    formatter.format(&value)
+                }
+                "leindex_diagnostics" | "diagnostics" | "leindex.diagnostics" => {
+                    let formatter = DiagnosticsFormatter::new();
+                    formatter.format(&value)
+                }
+                "leindex_project_map" | "project_map" | "leindex.project-map" => {
+                    let formatter = ProjectMapFormatter::new();
+                    formatter.format(&value)
+                }
+                "leindex_impact_analysis" | "impact_analysis" | "leindex.impact-analysis" => {
+                    let formatter = ImpactFormatter::new();
+                    formatter.format(&value)
+                }
+                "leindex_file_summary" | "file_summary" | "leindex.file-summary" => {
+                    let formatter = FileSummaryFormatter::new();
+                    formatter.format(&value)
+                }
+                "leindex_phase_analysis" | "phase_analysis" | "leindex.phase-analysis" => {
+                    let formatter = PhaseFormatter::new();
+                    formatter.format(&value)
+                }
+                "leindex_git_status" | "git_status" | "leindex.git-status" => {
+                    use crate::cli::mcp::output::GitStatusFormatter;
+                    let formatter = GitStatusFormatter::new();
+                    formatter.format(&value)
+                }
+                _ => {
+                    // Default to JSON output
+                    serde_json::to_string_pretty(&value).unwrap_or_default()
+                }
+            };
+            
+            println!("{}", formatted);
             Ok(())
         }
     }
@@ -1239,9 +1286,21 @@ fn find_tool_handler(name: &str) -> Option<ToolHandler> {
     all_tool_handlers().into_iter().find(|handler| {
         let handler_name = normalize_tool_name(handler.name());
         let title = handler.title();
+        let short_name = extract_short_name(&handler_name);
+        
+        // Check all possible formats:
+        // 1. handler.name() - e.g., "leindex.context"
+        // 2. short name from handler - e.g., "context" 
+        // 3. title - e.g., "leindex_context" (normalized)
+        // 4. legacy format - e.g., "leindex_context" in input matches "context" from handler
+        // 5. MCP-compliant format - e.g., "leindex.context" in input matches "leindex.context" from handler
+        // 6. Direct legacy format - e.g., "leindex_search" matches handler name "leindex.search" after normalization
+        
         handler_name == normalized
-            || extract_short_name(&handler_name) == normalized
+            || short_name == normalized
             || normalize_tool_name(title) == normalized
+            // Legacy leindex_* format - check if input has leindex_ prefix matching short name
+            || (normalized.starts_with("leindex_") && short_name == normalized.strip_prefix("leindex_").unwrap_or(""))
     })
 }
 
