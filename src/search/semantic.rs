@@ -120,6 +120,7 @@ mod tests {
                 complexity: 2,
                 embedding: None,
                 signature: None,
+                pre_tokenized: None,
             },
             NodeInfo {
                 node_id: "func2".to_string(),
@@ -131,6 +132,7 @@ mod tests {
                 complexity: 3,
                 embedding: None,
                 signature: None,
+                pre_tokenized: None,
             },
         ];
 

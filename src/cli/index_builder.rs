@@ -7,6 +7,7 @@ use crate::storage::{pdg_store, schema::Storage};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -350,12 +351,16 @@ impl TfIdfEmbedder {
         }
     }
 
+    pub(crate) fn is_fresh(&self, pdg_node_count: usize, pdg_edge_count: usize) -> bool {
+        self.pdg_nodes == pdg_node_count && self.pdg_edges == pdg_edge_count
+    }
+
     fn storage_path(project_path: &Path) -> PathBuf {
         project_path.join(".leindex").join("tfidf_embedder.bin")
     }
 
     #[allow(dead_code)]
-    fn load_from_storage(project_path: &Path) -> Result<Option<Self>> {
+    pub(crate) fn load_from_storage(project_path: &Path) -> Result<Option<Self>> {
         let path = Self::storage_path(project_path);
         if !path.exists() {
             return Ok(None);
@@ -394,12 +399,28 @@ impl TfIdfEmbedder {
 // ============================================================================
 
 /// Read a file once, returning both its BLAKE3 hash and contents.
+///
+/// Uses streaming I/O to compute the BLAKE3 hash during the read rather than
+/// in a separate pass after buffering the entire file (VAL-IO-004).
 pub(crate) fn read_file_once(path: &Path) -> Result<(String, std::sync::Arc<Vec<u8>>)> {
-    let bytes = std::sync::Arc::new(
-        std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?,
-    );
-    let hash = blake3::hash(bytes.as_slice()).to_hex().to_string();
-    Ok((hash, bytes))
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open file: {}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = blake3::Hasher::new();
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .with_context(|| format!("Failed to read file: {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        bytes.extend_from_slice(&buf[..n]);
+    }
+    let hash = hasher.finalize().to_hex().to_string();
+    Ok((hash, std::sync::Arc::new(bytes)))
 }
 
 /// Hash a file using BLAKE3.
@@ -408,14 +429,14 @@ pub(crate) fn hash_file(path: &Path) -> Result<String> {
 }
 
 #[derive(Debug)]
-struct FileReadCache {
+pub(crate) struct FileReadCache {
     capacity: usize,
     entries: HashMap<PathBuf, std::sync::Arc<Vec<u8>>>,
     order: VecDeque<PathBuf>,
 }
 
 impl FileReadCache {
-    fn new(capacity: usize) -> Self {
+    pub(crate) fn new(capacity: usize) -> Self {
         Self {
             capacity: capacity.max(1),
             entries: HashMap::new(),
@@ -423,7 +444,7 @@ impl FileReadCache {
         }
     }
 
-    fn get_or_read(&mut self, path: &Path) -> Result<std::sync::Arc<Vec<u8>>> {
+    pub(crate) fn get_or_read(&mut self, path: &Path) -> Result<std::sync::Arc<Vec<u8>>> {
         if let Some(bytes) = self.entries.get(path).cloned() {
             self.touch(path);
             return Ok(bytes);
@@ -539,12 +560,27 @@ pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan>
 }
 
 /// Collect source files with their content hashes.
+///
+/// If a `FileReadCache` is provided, it will be populated with file contents
+/// so that subsequent calls to `index_nodes` can reuse the same cache and
+/// avoid reading files twice.
 pub(crate) fn collect_source_files_with_hashes(
     scan: &ProjectFileScan,
+    mut file_cache: Option<&mut FileReadCache>,
 ) -> Result<Vec<(PathBuf, String)>> {
     scan.source_paths
         .iter()
-        .map(|path| Ok((path.clone(), read_file_once(path)?.0)))
+        .map(|path| {
+            let hash = if let Some(cache) = file_cache.as_deref_mut() {
+                // get_or_read already logs; extract just the hash
+                let bytes = cache.get_or_read(path)?;
+                // Compute hash from cached bytes (avoiding a second file read)
+                blake3::hash(bytes.as_slice()).to_hex().to_string()
+            } else {
+                read_file_once(path)?.0
+            };
+            Ok((path.clone(), hash))
+        })
         .collect()
 }
 
@@ -626,10 +662,21 @@ pub(crate) fn index_nodes(
     file_stats_cache: &mut Option<HashMap<String, FileStats>>,
     batch_size: usize,
 ) -> Result<TfIdfEmbedder> {
+    index_nodes_with_embedder(pdg, search_engine, file_stats_cache, batch_size, None, None)
+}
+
+pub(crate) fn index_nodes_with_embedder(
+    pdg: &ProgramDependenceGraph,
+    search_engine: &mut SearchEngine,
+    file_stats_cache: &mut Option<HashMap<String, FileStats>>,
+    batch_size: usize,
+    embedder: Option<TfIdfEmbedder>,
+    shared_file_cache: Option<FileReadCache>,
+) -> Result<TfIdfEmbedder> {
     *file_stats_cache = None;
 
     let batch_size = batch_size.max(1);
-    let mut file_cache = FileReadCache::new(100);
+    let mut file_cache = shared_file_cache.unwrap_or_else(|| FileReadCache::new(100));
     let connectivity_config = crate::graph::pdg::TraversalConfig {
         max_depth: Some(1),
         max_nodes: Some(1000),
@@ -723,7 +770,9 @@ pub(crate) fn index_nodes(
         }
     }
 
-    let embedder = if total_docs == 0 {
+    let embedder = if let Some(embedder) = embedder {
+        embedder
+    } else if total_docs == 0 {
         TfIdfEmbedder::build_from_tokens(&[])
     } else {
         let n_f = total_docs as f32;
@@ -791,6 +840,16 @@ pub(crate) fn index_nodes(
                     &tokenized.content,
                 );
 
+                // R8: Compute search-engine tokens from content. The search engine
+                // uses a different tokenizer than TF-IDF (splits on non-alphanumeric,
+                // lowercases, filters by length >= 2). Pre-computing avoids re-tokenization.
+                let search_tokens: Vec<String> = tokenized
+                    .content
+                    .split(|c: char| !c.is_alphanumeric())
+                    .map(|s| s.to_ascii_lowercase())
+                    .filter(|s| s.len() >= 2)
+                    .collect();
+
                 nodes.push(NodeInfo {
                     node_id: tokenized.id.clone(),
                     file_path: node.file_path.to_string(),
@@ -801,6 +860,7 @@ pub(crate) fn index_nodes(
                     embedding: Some(embedding),
                     complexity: node.complexity,
                     signature,
+                    pre_tokenized: Some(search_tokens),
                 });
             }
         }
@@ -1652,6 +1712,17 @@ mod tests {
             .unwrap()
             .is_none());
     }
+
+    #[test]
+    fn test_tfidf_embedder_freshness_checks_pdg_counts() {
+        let mut embedder = TfIdfEmbedder::build_from_tokens(&[]);
+        embedder.pdg_nodes = 3;
+        embedder.pdg_edges = 7;
+        assert!(embedder.is_fresh(3, 7));
+        assert!(!embedder.is_fresh(4, 7));
+        assert!(!embedder.is_fresh(3, 8));
+    }
+
     #[test]
     fn test_tfidf_build_from_tokens_is_deterministic_across_batch_sizes() {
         let docs: Vec<(String, String)> = (0..90)
@@ -1676,5 +1747,55 @@ mod tests {
 
         assert_eq!(embedder_a.vocab, embedder_b.vocab);
         assert_eq!(embedder_a.idf, embedder_b.idf);
+    }
+
+    #[test]
+    fn test_read_file_once_hash_and_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("test_file.txt");
+        let content = b"Hello, streaming BLAKE3 world!";
+        std::fs::write(&file_path, content).unwrap();
+
+        let (hash, bytes) = read_file_once(&file_path).unwrap();
+
+        // Verify hash matches independent blake3::hash() computation
+        let expected_hash = blake3::hash(content).to_hex().to_string();
+        assert_eq!(
+            hash, expected_hash,
+            "streaming BLAKE3 hash must match independent computation"
+        );
+
+        // Verify bytes match file contents
+        assert_eq!(
+            bytes.as_slice(),
+            content,
+            "file bytes must match original content"
+        );
+    }
+
+    #[test]
+    fn test_read_file_once_empty_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_path = temp.path().join("empty.txt");
+        std::fs::write(&file_path, b"").unwrap();
+
+        let (hash, bytes) = read_file_once(&file_path).unwrap();
+
+        // Empty file should produce the BLAKE3 hash of empty input
+        let expected_hash = blake3::hash(b"").to_hex().to_string();
+        assert_eq!(
+            hash, expected_hash,
+            "empty file hash must match blake3 of empty input"
+        );
+        assert!(bytes.is_empty(), "empty file bytes should be empty");
+    }
+
+    #[test]
+    fn test_read_file_once_error() {
+        let result = read_file_once(Path::new("/nonexistent/path/to/file.txt"));
+        assert!(
+            result.is_err(),
+            "reading a nonexistent file should return an error"
+        );
     }
 }

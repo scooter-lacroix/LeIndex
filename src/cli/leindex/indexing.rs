@@ -4,7 +4,7 @@ use super::LeIndex;
 use crate::cli::index_builder;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-use tracing::info;
+use tracing::{info, warn};
 
 impl LeIndex {
     pub(crate) fn incremental_reindex_from_watcher(&mut self) -> Result<super::IndexStats> {
@@ -17,7 +17,12 @@ impl LeIndex {
         let indexed_files =
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .context("Failed to load indexed files from storage")?;
-        let source_files_with_hashes = self.collect_source_files_with_hashes(true)?;
+
+        // Use a shared file cache so that file reads during hash collection
+        // can be reused later when building NodeInfo content.
+        let mut shared_file_cache = index_builder::FileReadCache::new(100);
+        let source_files_with_hashes =
+            self.collect_source_files_with_hashes(true, Some(&mut shared_file_cache))?;
         let source_file_hashes: std::collections::HashMap<String, String> =
             source_files_with_hashes
                 .iter()
@@ -64,7 +69,14 @@ impl LeIndex {
         };
 
         let mut pdg = self.pdg.take().unwrap_or_default();
+        let mut removed_node_ids = Vec::new();
         for path in &deleted_files {
+            removed_node_ids.extend(
+                pdg.node_indices()
+                    .filter_map(|node_idx| pdg.get_node(node_idx))
+                    .filter(|node| node.file_path.as_ref() == path.as_str())
+                    .map(|node| node.id.clone()),
+            );
             index_builder::remove_file_from_pdg(&mut pdg, path)?;
             let _ = crate::storage::pdg_store::delete_file_data(
                 &mut self.storage,
@@ -99,12 +111,141 @@ impl LeIndex {
             }
         }
 
-        let delta = crate::search::search::TextIndexDelta {
-            removed_node_ids: deleted_files.clone(),
-            updated_nodes: Vec::new(),
+        // Build the set of changed file paths so we only include nodes from
+        // those files in the incremental delta.
+        let changed_file_set: HashSet<String> = source_file_hashes
+            .keys()
+            .filter(|p| {
+                indexed_files.get(*p).map(|s| s.as_str())
+                    != source_file_hashes.get(*p).map(|s| s.as_str())
+            })
+            .cloned()
+            .collect();
+
+        // Load the persisted embedder (built during the last full index) so we
+        // can embed changed-file nodes with the same TF-IDF vocabulary.  Do NOT
+        // call index_nodes_with_embedder() here — that processes ALL nodes and
+        // populates the search engine from scratch (i.e. a full rebuild).
+        let embedder = index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| {
+                // No persisted embedder — build a minimal one from the
+                // changed-file node tokens so we can still produce embeddings.
+                index_builder::TfIdfEmbedder::build_from_tokens(&[])
+            });
+
+        // Read actual file content for changed files to populate NodeInfo
+        // entries with real source and pre-tokenized tokens.
+        let mut file_cache = shared_file_cache;
+        let connectivity_config = crate::graph::pdg::TraversalConfig {
+            max_depth: Some(1),
+            max_nodes: Some(1000),
+            allowed_edge_types: Some(&[
+                crate::graph::pdg::EdgeType::Call,
+                crate::graph::pdg::EdgeType::DataDependency,
+            ]),
+            excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
+            min_complexity: None,
+            min_edge_confidence: 0.0,
         };
-        self.search_engine.incremental_reindex(delta);
+
+        let updated_nodes: Vec<crate::search::search::NodeInfo> = pdg
+            .node_indices()
+            .filter_map(|node_idx| {
+                let node = pdg.get_node(node_idx)?;
+                let file_path_str = node.file_path.as_ref();
+                // Only include nodes belonging to changed files
+                if !changed_file_set.contains(file_path_str) {
+                    return None;
+                }
+                // Read actual file content and extract the node's source
+                let file_bytes = file_cache
+                    .get_or_read(std::path::Path::new(file_path_str))
+                    .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
+                let file_content = String::from_utf8_lossy(&file_bytes);
+                let content_bytes = file_content.as_bytes();
+                let start = node.byte_range.0.min(content_bytes.len());
+                let end = node.byte_range.1.min(content_bytes.len());
+
+                let mut enrichment = format!(
+                    "// type:{} lang:{}",
+                    match node.node_type {
+                        crate::graph::pdg::NodeType::Function => "function",
+                        crate::graph::pdg::NodeType::Class => "class",
+                        crate::graph::pdg::NodeType::Method => "method",
+                        crate::graph::pdg::NodeType::Variable => "variable",
+                        crate::graph::pdg::NodeType::Module => "module",
+                        crate::graph::pdg::NodeType::External => "external",
+                    },
+                    node.language,
+                );
+                let callers = pdg.backward_impact(node_idx, &connectivity_config);
+                let callees = pdg.forward_impact(node_idx, &connectivity_config);
+                enrichment.push_str(&format!(
+                    " callers:{} callees:{} complexity:{}",
+                    callers.len().min(50),
+                    callees.len().min(50),
+                    node.complexity,
+                ));
+
+                let node_content = if start < end {
+                    let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
+                    format!(
+                        "{}\n// {} in {}\n{}",
+                        enrichment, node.name, node.file_path, snippet
+                    )
+                } else {
+                    format!(
+                        "{}\n// {} in {}\n{}",
+                        enrichment, node.name, node.file_path, "// [No source code available]"
+                    )
+                };
+
+                let tokens: Vec<String> = node_content
+                    .split(|c: char| !c.is_alphanumeric())
+                    .map(|s| s.to_ascii_lowercase())
+                    .filter(|s| s.len() >= 2)
+                    .collect();
+
+                let signature = crate::search::search::SearchEngine::extract_signature_from_content(
+                    &node_content,
+                );
+                let embedding = embedder.embed_tokens(&index_builder::tokenize_code(&node_content));
+
+                Some(crate::search::search::NodeInfo {
+                    node_id: node.id.clone(),
+                    file_path: node.file_path.to_string(),
+                    symbol_name: node.name.clone(),
+                    language: node.language.clone(),
+                    content: node_content,
+                    byte_range: node.byte_range,
+                    embedding: Some(embedding),
+                    complexity: node.complexity,
+                    signature,
+                    pre_tokenized: Some(tokens),
+                })
+            })
+            .collect();
+
+        self.search_engine
+            .incremental_reindex(crate::search::search::TextIndexDelta {
+                removed_node_ids,
+                updated_nodes,
+            });
+
+        // Persist the updated PDG to storage so changes survive restart
+        index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
+
         self.pdg = Some(pdg);
+        self.embedder = Some(embedder);
+        if let Some(embedder) = &self.embedder {
+            if let Err(err) =
+                embedder.persist_to_storage(&self.project_path, self.pdg.as_ref().unwrap())
+            {
+                warn!("Failed to persist embedder: {err:#}");
+            }
+        }
         self.build_file_stats_cache();
         self.stats.indexing_time_ms = start_time.elapsed().as_millis() as u64;
         info!(
@@ -143,8 +284,12 @@ impl LeIndex {
                 .context("Failed to load indexed files from storage")?;
 
         // Step 2: Collect all source files and compute hashes.
+        // Use a shared file cache so files are read only once across both
+        // hash collection and node indexing (Issue 2 fix).
         let old_scan = self.get_project_scan(false).ok();
-        let source_files_with_hashes = self.collect_source_files_with_hashes(true)?;
+        let mut shared_file_cache = index_builder::FileReadCache::new(200);
+        let source_files_with_hashes =
+            self.collect_source_files_with_hashes(true, Some(&mut shared_file_cache))?;
         info!("Found {} source files", source_files_with_hashes.len());
 
         // Step 3: Identify changed/new/deleted files
@@ -338,15 +483,49 @@ impl LeIndex {
 
         // Step 6: Re-index nodes for search
         let batch_size = self.indexing_batch_size();
-        self.embedder = Some(index_builder::index_nodes(
-            &pdg,
-            &mut self.search_engine,
-            &mut self.cache.file_stats_cache,
-            batch_size,
-        )?);
+        let persisted_embedder =
+            index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
+                .ok()
+                .flatten();
+        let embedder = if let Some(embedder) = persisted_embedder {
+            if embedder.is_fresh(pdg_node_count, pdg_edge_count) {
+                info!("Loaded persisted embedder from storage");
+                index_builder::index_nodes_with_embedder(
+                    &pdg,
+                    &mut self.search_engine,
+                    &mut self.cache.file_stats_cache,
+                    batch_size,
+                    Some(embedder),
+                    Some(shared_file_cache),
+                )?
+            } else {
+                info!("Persisted embedder is stale; rebuilding TF-IDF index");
+                index_builder::index_nodes_with_embedder(
+                    &pdg,
+                    &mut self.search_engine,
+                    &mut self.cache.file_stats_cache,
+                    batch_size,
+                    None,
+                    Some(shared_file_cache),
+                )?
+            }
+        } else {
+            index_builder::index_nodes_with_embedder(
+                &pdg,
+                &mut self.search_engine,
+                &mut self.cache.file_stats_cache,
+                batch_size,
+                None,
+                Some(shared_file_cache),
+            )?
+        };
+        self.embedder = Some(embedder);
         if let Some(embedder) = &self.embedder {
-            let _ = embedder.persist_to_storage(&self.project_path, &pdg);
+            if let Err(err) = embedder.persist_to_storage(&self.project_path, &pdg) {
+                warn!("Failed to persist embedder: {err:#}");
+            }
         }
+
         let indexed_count = self.search_engine.node_count();
 
         info!("Indexed {} nodes for search", indexed_count);
@@ -428,14 +607,47 @@ impl LeIndex {
         }
 
         let batch_size = self.indexing_batch_size();
-        self.embedder = Some(index_builder::index_nodes(
-            &pdg,
-            &mut self.search_engine,
-            &mut self.cache.file_stats_cache,
-            batch_size,
-        )?);
+        let persisted_embedder =
+            index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
+                .ok()
+                .flatten();
+        let embedder = if let Some(embedder) = persisted_embedder {
+            if embedder.is_fresh(pdg_node_count, pdg_edge_count) {
+                info!("Loaded persisted embedder from storage");
+                index_builder::index_nodes_with_embedder(
+                    &pdg,
+                    &mut self.search_engine,
+                    &mut self.cache.file_stats_cache,
+                    batch_size,
+                    Some(embedder),
+                    None,
+                )?
+            } else {
+                info!("Persisted embedder is stale; rebuilding TF-IDF index");
+                index_builder::index_nodes_with_embedder(
+                    &pdg,
+                    &mut self.search_engine,
+                    &mut self.cache.file_stats_cache,
+                    batch_size,
+                    None,
+                    None,
+                )?
+            }
+        } else {
+            index_builder::index_nodes_with_embedder(
+                &pdg,
+                &mut self.search_engine,
+                &mut self.cache.file_stats_cache,
+                batch_size,
+                None,
+                None,
+            )?
+        };
+        self.embedder = Some(embedder);
         if let Some(embedder) = &self.embedder {
-            let _ = embedder.persist_to_storage(&self.project_path, &pdg);
+            if let Err(err) = embedder.persist_to_storage(&self.project_path, &pdg) {
+                warn!("Failed to persist embedder: {err:#}");
+            }
         }
         let indexed_count = self.search_engine.node_count();
 

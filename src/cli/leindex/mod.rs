@@ -256,9 +256,10 @@ impl LeIndex {
     fn collect_source_files_with_hashes(
         &mut self,
         refresh: bool,
+        file_cache: Option<&mut index_builder::FileReadCache>,
     ) -> Result<Vec<(PathBuf, String)>> {
         let scan = self.get_project_scan(refresh)?;
-        index_builder::collect_source_files_with_hashes(&scan)
+        index_builder::collect_source_files_with_hashes(&scan, file_cache)
     }
 
     fn collect_source_file_paths(&mut self, refresh: bool) -> Result<Vec<PathBuf>> {

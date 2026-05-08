@@ -190,6 +190,17 @@ pub struct NodeInfo {
     /// Cached signature extracted from content (for search results)
     /// This is extracted before content is cleared during T13 optimization
     pub signature: Option<String>,
+
+    /// Pre-tokenized search tokens (lowercased, filtered by length >= 2).
+    ///
+    /// When `Some`, these tokens are used directly for the inverted index
+    /// instead of re-tokenizing from `content`. This enables callers that
+    /// already have tokenized content (e.g., `index_builder`) to skip the
+    /// redundant split+lowercase pass.
+    ///
+    /// Backward-compatible: `None` falls back to `content.split()` tokenization.
+    #[serde(default)]
+    pub pre_tokenized: Option<Vec<String>>,
 }
 
 /// Pre-computed query data for optimized text scoring
@@ -476,16 +487,30 @@ impl SearchEngine {
             // Build inverted index for O(1) text lookups
             // This maps each token to the set of node IDs containing it
             // Also build per-node token cache for scoring (T14 optimization)
+            //
+            // R8: Use pre-tokenized tokens when available to skip re-tokenization.
+            // Falls back to content-based tokenization for backward compatibility.
             let mut tokens = HashSet::new();
-            for token in node.content.split(|c: char| !c.is_alphanumeric()) {
-                let normalized_token: String = token.to_ascii_lowercase();
-                // Skip empty tokens and very short ones (< 2 chars) to reduce noise
-                if normalized_token.len() >= 2 {
+            if let Some(pre_tok) = &node.pre_tokenized {
+                // Use pre-computed tokens directly (already lowercased, filtered >= 2 chars)
+                for token in pre_tok {
                     self.text_index
-                        .entry(normalized_token.clone())
+                        .entry(token.clone())
                         .or_default()
                         .insert(node.node_id.clone());
-                    tokens.insert(normalized_token);
+                    tokens.insert(token.clone());
+                }
+            } else {
+                for token in node.content.split(|c: char| !c.is_alphanumeric()) {
+                    let normalized_token: String = token.to_ascii_lowercase();
+                    // Skip empty tokens and very short ones (< 2 chars) to reduce noise
+                    if normalized_token.len() >= 2 {
+                        self.text_index
+                            .entry(normalized_token.clone())
+                            .or_default()
+                            .insert(node.node_id.clone());
+                        tokens.insert(normalized_token);
+                    }
                 }
             }
             self.node_tokens.insert(node.node_id.clone(), tokens);
@@ -644,15 +669,28 @@ impl SearchEngine {
         let new_idx = self.nodes.len();
 
         // Build inverted index entries and token cache for this node
+        //
+        // R8: Use pre-tokenized tokens when available to skip re-tokenization.
+        // Falls back to content-based tokenization for backward compatibility.
         let mut tokens = HashSet::new();
-        for token in node.content.split(|c: char| !c.is_alphanumeric()) {
-            let normalized_token: String = token.to_ascii_lowercase();
-            if normalized_token.len() >= 2 {
+        if let Some(pre_tok) = &node.pre_tokenized {
+            for token in pre_tok {
                 self.text_index
-                    .entry(normalized_token.clone())
+                    .entry(token.clone())
                     .or_default()
                     .insert(node_id.clone());
-                tokens.insert(normalized_token);
+                tokens.insert(token.clone());
+            }
+        } else {
+            for token in node.content.split(|c: char| !c.is_alphanumeric()) {
+                let normalized_token: String = token.to_ascii_lowercase();
+                if normalized_token.len() >= 2 {
+                    self.text_index
+                        .entry(normalized_token.clone())
+                        .or_default()
+                        .insert(node_id.clone());
+                    tokens.insert(normalized_token);
+                }
             }
         }
         self.node_tokens.insert(node_id.clone(), tokens);
@@ -1282,6 +1320,7 @@ mod tests {
                 embedding: Some(vec![1.0, 0.0, 0.0]),
                 complexity: 2,
                 signature: None,
+                pre_tokenized: None,
             },
             NodeInfo {
                 node_id: "func2".to_string(),
@@ -1293,6 +1332,7 @@ mod tests {
                 embedding: Some(vec![0.0, 1.0, 0.0]),
                 complexity: 2,
                 signature: None,
+                pre_tokenized: None,
             },
         ]
     }
@@ -1484,6 +1524,7 @@ mod tests {
             embedding: None,
             complexity: 1,
             signature: None,
+            pre_tokenized: None,
         }]);
         assert_eq!(engine.node_id_to_idx.len(), 1);
         assert_eq!(engine.node_id_to_idx.get("new_func"), Some(&0));
@@ -1588,6 +1629,7 @@ mod tests {
             embedding: None,
             complexity: 1,
             signature: None,
+            pre_tokenized: None,
         }]);
         assert_eq!(engine.node_tokens.len(), 1);
         assert!(engine.node_tokens.contains_key("new_func"));
@@ -1652,6 +1694,7 @@ mod tests {
                 embedding: Some(vec![0.0, 0.0, 1.0]),
                 complexity: 3,
                 signature: None,
+                pre_tokenized: None,
             }],
         };
         engine.incremental_reindex(delta);
@@ -1752,6 +1795,7 @@ mod tests {
                 embedding: Some(vec![0.5, 0.5, 0.0]),
                 complexity: 5,
                 signature: None,
+                pre_tokenized: None,
             }],
         };
         engine.incremental_reindex(delta);
@@ -1801,6 +1845,7 @@ mod tests {
                     embedding: None,
                     complexity: 1,
                     signature: None,
+                    pre_tokenized: None,
                 },
                 NodeInfo {
                     node_id: "func4".to_string(),
@@ -1812,6 +1857,7 @@ mod tests {
                     embedding: None,
                     complexity: 2,
                     signature: None,
+                    pre_tokenized: None,
                 },
             ],
         };
@@ -1875,6 +1921,7 @@ mod tests {
                 embedding: None,
                 complexity: 1,
                 signature: None,
+                pre_tokenized: None,
             },
             NodeInfo {
                 node_id: "unique2".to_string(),
@@ -1886,6 +1933,7 @@ mod tests {
                 embedding: None,
                 complexity: 1,
                 signature: None,
+                pre_tokenized: None,
             },
         ]);
 
@@ -1933,6 +1981,7 @@ mod tests {
                 embedding: Some(vec![1.0, 1.0, 0.0]),
                 complexity: 4,
                 signature: None,
+                pre_tokenized: None,
             }],
         };
         engine_inc.incremental_reindex(delta);
@@ -1949,6 +1998,7 @@ mod tests {
                 embedding: Some(vec![0.0, 1.0, 0.0]),
                 complexity: 2,
                 signature: None,
+                pre_tokenized: None,
             },
             NodeInfo {
                 node_id: "func3".to_string(),
@@ -1960,6 +2010,7 @@ mod tests {
                 embedding: Some(vec![1.0, 1.0, 0.0]),
                 complexity: 4,
                 signature: None,
+                pre_tokenized: None,
             },
         ]);
 
@@ -2022,6 +2073,7 @@ mod tests {
                 embedding: Some(vec![0.1, 0.1, 0.9]),
                 complexity: 1,
                 signature: None,
+                pre_tokenized: None,
             }],
         };
         engine.incremental_reindex(delta);
@@ -2051,6 +2103,7 @@ mod tests {
                 embedding: None,
                 complexity: 1,
                 signature: None,
+                pre_tokenized: None,
             }],
         });
 
@@ -2106,6 +2159,7 @@ mod tests {
                 embedding: None,
                 complexity: 3,
                 signature: None,
+                pre_tokenized: None,
             }],
         });
 
@@ -2125,5 +2179,232 @@ mod tests {
             .get("func3")
             .unwrap()
             .contains("important"));
+    }
+
+    // ----------------------------------------------------------------
+    // R8: Pre-tokenized search engine tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_pre_tokenized_produces_identical_search_results() {
+        // R8: NodeInfo with pre_tokenized = Some(...) should produce identical
+        // search results to the re-tokenization path.
+        let content = "fn calculate_total(price: f64, tax: f64) -> f64 { price + tax }";
+
+        // Compute search tokens the same way index_builder does
+        let search_tokens: Vec<String> = content
+            .split(|c: char| !c.is_alphanumeric())
+            .map(|s| s.to_ascii_lowercase())
+            .filter(|s| s.len() >= 2)
+            .collect();
+
+        // Engine with pre-tokenized tokens
+        let mut engine_pre = SearchEngine::new();
+        engine_pre.index_nodes(vec![NodeInfo {
+            node_id: "calc_total".to_string(),
+            file_path: "math.rs".to_string(),
+            symbol_name: "calculate_total".to_string(),
+            language: "rust".to_string(),
+            content: content.to_string(),
+            byte_range: (0, content.len()),
+            embedding: None,
+            complexity: 3,
+            signature: None,
+            pre_tokenized: Some(search_tokens),
+        }]);
+
+        // Engine with re-tokenization (pre_tokenized = None)
+        let mut engine_fallback = SearchEngine::new();
+        engine_fallback.index_nodes(vec![NodeInfo {
+            node_id: "calc_total".to_string(),
+            file_path: "math.rs".to_string(),
+            symbol_name: "calculate_total".to_string(),
+            language: "rust".to_string(),
+            content: content.to_string(),
+            byte_range: (0, content.len()),
+            embedding: None,
+            complexity: 3,
+            signature: None,
+            pre_tokenized: None,
+        }]);
+
+        // Both inverted indexes should be identical
+        assert_eq!(
+            engine_pre.text_index, engine_fallback.text_index,
+            "Pre-tokenized and fallback should produce identical text_index"
+        );
+        assert_eq!(
+            engine_pre.node_tokens, engine_fallback.node_tokens,
+            "Pre-tokenized and fallback should produce identical node_tokens"
+        );
+
+        // Search for "calculate" should find the node in both
+        let query = SearchQuery {
+            query: "calculate".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+        let results_pre = engine_pre.search(query.clone()).unwrap();
+        let results_fallback = engine_fallback.search(query).unwrap();
+        assert_eq!(results_pre.len(), results_fallback.len());
+        assert!(!results_pre.is_empty());
+        assert_eq!(results_pre[0].node_id, results_fallback[0].node_id);
+    }
+
+    #[test]
+    fn test_pre_tokenized_none_falls_back_to_content() {
+        // R8: NodeInfo with pre_tokenized = None should use content-based
+        // tokenization (backward compatibility).
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(vec![NodeInfo {
+            node_id: "backward_compat".to_string(),
+            file_path: "compat.rs".to_string(),
+            symbol_name: "legacy_func".to_string(),
+            language: "rust".to_string(),
+            content: "fn legacy_func() { return 42; }".to_string(),
+            byte_range: (0, 30),
+            embedding: None,
+            complexity: 1,
+            signature: None,
+            pre_tokenized: None,
+        }]);
+
+        // Should still find via content-based tokenization
+        assert!(engine.text_index.contains_key("legacy"));
+        assert!(engine.text_index.contains_key("func"));
+        assert!(engine.node_tokens.contains_key("backward_compat"));
+
+        let query = SearchQuery {
+            query: "legacy".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+        let results = engine.search(query).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].node_id, "backward_compat");
+    }
+
+    #[test]
+    fn test_pre_tokenized_and_content_produce_same_inverted_index() {
+        // R8: Both paths produce the same inverted index for the same content.
+        let content = "pub async fn handle_http_request(req: Request) -> Response { ... }";
+
+        let tokens: Vec<String> = content
+            .split(|c: char| !c.is_alphanumeric())
+            .map(|s| s.to_ascii_lowercase())
+            .filter(|s| s.len() >= 2)
+            .collect();
+
+        // Verify our manual tokenization produces expected tokens
+        assert!(tokens.contains(&"handle".to_string()));
+        assert!(tokens.contains(&"http".to_string()));
+        assert!(tokens.contains(&"request".to_string()));
+        assert!(tokens.contains(&"response".to_string()));
+
+        // Engine A: pre-tokenized
+        let mut engine_a = SearchEngine::new();
+        engine_a.index_nodes(vec![NodeInfo {
+            node_id: "handler".to_string(),
+            file_path: "server.rs".to_string(),
+            symbol_name: "handle_http_request".to_string(),
+            language: "rust".to_string(),
+            content: content.to_string(),
+            byte_range: (0, content.len()),
+            embedding: None,
+            complexity: 5,
+            signature: None,
+            pre_tokenized: Some(tokens),
+        }]);
+
+        // Engine B: content-based
+        let mut engine_b = SearchEngine::new();
+        engine_b.index_nodes(vec![NodeInfo {
+            node_id: "handler".to_string(),
+            file_path: "server.rs".to_string(),
+            symbol_name: "handle_http_request".to_string(),
+            language: "rust".to_string(),
+            content: content.to_string(),
+            byte_range: (0, content.len()),
+            embedding: None,
+            complexity: 5,
+            signature: None,
+            pre_tokenized: None,
+        }]);
+
+        // Both should have identical text_index entries
+        for token in &["handle", "http", "request", "response", "pub", "async"] {
+            assert_eq!(
+                engine_a.text_index.get(*token),
+                engine_b.text_index.get(*token),
+                "Mismatch for token '{}': pre_tokenized={:?}, content={:?}",
+                token,
+                engine_a.text_index.get(*token),
+                engine_b.text_index.get(*token)
+            );
+        }
+    }
+
+    #[test]
+    fn test_pre_tokenized_incremental_reindex() {
+        // R8: Pre-tokenized tokens should work correctly with incremental reindex.
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+
+        let new_content = "fn compute_metrics(data: &[f64]) -> Metrics { ... }";
+        let tokens: Vec<String> = new_content
+            .split(|c: char| !c.is_alphanumeric())
+            .map(|s| s.to_ascii_lowercase())
+            .filter(|s| s.len() >= 2)
+            .collect();
+
+        let delta = TextIndexDelta {
+            removed_node_ids: vec![],
+            updated_nodes: vec![NodeInfo {
+                node_id: "metrics".to_string(),
+                file_path: "metrics.rs".to_string(),
+                symbol_name: "compute_metrics".to_string(),
+                language: "rust".to_string(),
+                content: new_content.to_string(),
+                byte_range: (0, new_content.len()),
+                embedding: None,
+                complexity: 4,
+                signature: None,
+                pre_tokenized: Some(tokens),
+            }],
+        };
+        engine.incremental_reindex(delta);
+
+        // Should have 3 nodes now
+        assert_eq!(engine.node_count(), 3);
+
+        // Pre-tokenized tokens should be in the inverted index
+        assert!(engine.text_index.contains_key("compute"));
+        assert!(engine.text_index.contains_key("metrics"));
+        assert!(engine.text_index.contains_key("data"));
+
+        // Search should find the new node
+        let query = SearchQuery {
+            query: "compute metrics".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+        let results = engine.search(query).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].node_id, "metrics");
     }
 }
