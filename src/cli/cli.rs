@@ -1501,6 +1501,12 @@ async fn handle_mcp_request(
     let method_name = request.method.clone();
     let id = request.id.clone().unwrap_or(serde_json::Value::Null);
 
+    // Notifications (id is null) must not receive a response per JSON-RPC 2.0 spec
+    if request.id.is_none() {
+        tracing::debug!("Ignoring notification: {}", method_name);
+        return Ok(None);
+    }
+
     // Get server instance to check handshake status
     let server_instance = match SERVER_INSTANCE.get() {
         Some(s) => s,
@@ -1576,11 +1582,6 @@ async fn handle_mcp_request(
             )));
         }
 
-        "notifications/initialized" => {
-            // Client notification sent after successful initialization
-            // No response needed for notifications
-            return Ok(None);
-        }
         "ping" => {
             // Simple health check
             Ok(Some(JsonRpcResponse::success(id, serde_json::json!({}))))

@@ -460,9 +460,9 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Response {
         .into_response();
     }
 
-    // Notifications must not receive a response per JSON-RPC 2.0 spec
-    if json_req.method == "notifications/initialized" {
-        debug!("Received notifications/initialized — no response per JSON-RPC 2.0 spec");
+    // Notifications (id is null) must not receive a response per JSON-RPC 2.0 spec
+    if json_req.id.is_none() {
+        debug!("Ignoring notification: {}", json_req.method);
         return StatusCode::NO_CONTENT.into_response();
     }
 
