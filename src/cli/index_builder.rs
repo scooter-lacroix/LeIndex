@@ -485,10 +485,22 @@ pub(crate) fn is_dependency_manifest_name(name: &str) -> bool {
 }
 
 /// Scan the project directory for source and manifest files.
+///
+/// Enforces configurable limits from `ProjectConfig::indexing`:
+/// - `max_file_size`: individual files exceeding this are skipped with a warning.
+/// - `max_files`: scanning stops once this many source files have been collected.
+/// - `max_total_size`: scanning stops once the cumulative size of collected source
+///   files exceeds this threshold.
+///
+/// Oversized files do not count toward the file count or total size limits.
 pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan> {
     let project_config = crate::cli::config::ProjectConfig::load(project_path).unwrap_or_default();
+    let limits = &project_config.indexing;
+
     let mut source_paths = Vec::new();
     let mut manifest_paths = Vec::new();
+    let mut total_source_size: u64 = 0;
+    let mut oversized_count: usize = 0;
     let mut walker = walkdir::WalkDir::new(project_path).into_iter();
 
     while let Some(entry) = walker.next() {
@@ -536,9 +548,54 @@ pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan>
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_ascii_lowercase();
             if SOURCE_FILE_EXTENSIONS.contains(&ext_lower.as_str()) {
+                // Enforce individual file size limit
+                let file_size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                if limits.max_file_size > 0 && file_size > limits.max_file_size {
+                    oversized_count += 1;
+                    if oversized_count <= 5 {
+                        tracing::warn!(
+                            file = %path.display(),
+                            size_bytes = file_size,
+                            limit_bytes = limits.max_file_size,
+                            "Skipping file exceeding max_file_size limit"
+                        );
+                    }
+                    continue;
+                }
+
+                // Enforce max files count limit
+                if limits.max_files > 0 && source_paths.len() >= limits.max_files {
+                    tracing::warn!(
+                        count = source_paths.len(),
+                        limit = limits.max_files,
+                        "Reached max_files limit, stopping source file scan"
+                    );
+                    break;
+                }
+
+                // Enforce total size limit
+                if limits.max_total_size > 0
+                    && total_source_size + file_size > limits.max_total_size
+                {
+                    tracing::warn!(
+                        total_bytes = total_source_size + file_size,
+                        limit_bytes = limits.max_total_size,
+                        "Reached max_total_size limit, stopping source file scan"
+                    );
+                    break;
+                }
+
+                total_source_size += file_size;
                 source_paths.push(path.to_path_buf());
             }
         }
+    }
+
+    if oversized_count > 5 {
+        tracing::warn!(
+            total_oversized = oversized_count,
+            "Additional oversized files skipped (showing first 5 warnings)"
+        );
     }
 
     let source_directories = crate::cli::index_freshness::extract_unique_dirs(&source_paths);

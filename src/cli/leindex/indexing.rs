@@ -2,7 +2,8 @@
 
 use super::LeIndex;
 use crate::cli::index_builder;
-use anyhow::{Context, Result};
+use crate::cli::memory_cap::MemoryCapGuard;
+use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use tracing::{info, warn};
 
@@ -255,6 +256,36 @@ impl LeIndex {
         Ok(self.stats.clone())
     }
 
+    /// Index the project with an optional memory cap.
+    ///
+    /// This is the same as `index_project(force)` but additionally monitors RSS
+    /// memory usage throughout the indexing pipeline. When `max_memory_bytes` is
+    /// `Some(bytes)`, a `MemoryCapGuard` is created that:
+    /// - Logs a warning when RSS exceeds 90% of the cap
+    /// - Returns an error when RSS exceeds 100% of the cap
+    ///
+    /// The memory check is performed at key checkpoints during indexing to avoid
+    /// excessive overhead while still catching runaway memory usage.
+    pub fn index_project_with_memory_cap(
+        &mut self,
+        force: bool,
+        max_memory_bytes: Option<u64>,
+    ) -> Result<super::IndexStats> {
+        let mut cap_guard = match max_memory_bytes {
+            Some(bytes) => {
+                let mb = bytes / (1024 * 1024);
+                if mb == 0 {
+                    bail!("--max-memory must be at least 1 MB");
+                }
+                info!("Memory cap enabled: {} MB", mb);
+                Some(MemoryCapGuard::new(mb))
+            }
+            None => None,
+        };
+
+        self.index_project_inner(force, cap_guard.as_mut())
+    }
+
     /// Index the project
     ///
     /// This executes the full indexing pipeline:
@@ -271,6 +302,16 @@ impl LeIndex {
     ///
     /// `Result<IndexStats>` - Statistics from the indexing operation
     pub fn index_project(&mut self, force: bool) -> Result<super::IndexStats> {
+        self.index_project_inner(force, None)
+    }
+
+    /// Shared indexing implementation used by both `index_project` and
+    /// `index_project_with_memory_cap`.
+    fn index_project_inner(
+        &mut self,
+        force: bool,
+        mut cap_guard: Option<&mut MemoryCapGuard>,
+    ) -> Result<super::IndexStats> {
         let start_time = std::time::Instant::now();
 
         info!(
@@ -291,6 +332,11 @@ impl LeIndex {
         let source_files_with_hashes =
             self.collect_source_files_with_hashes(true, Some(&mut shared_file_cache))?;
         info!("Found {} source files", source_files_with_hashes.len());
+
+        // Memory cap checkpoint: after file scanning (file cache populated)
+        if let Some(ref mut guard) = cap_guard {
+            guard.check_now()?;
+        }
 
         // Step 3: Identify changed/new/deleted files
         let mut files_to_parse = Vec::new();
@@ -384,6 +430,11 @@ impl LeIndex {
         } else {
             Vec::new()
         };
+
+        // Memory cap checkpoint: after parallel parsing (ASTs in memory)
+        if let Some(ref mut guard) = cap_guard {
+            guard.check_now()?;
+        }
 
         // Step 5: Update PDG
         if !unchanged_files.is_empty() && self.pdg.is_none() {
@@ -480,6 +531,11 @@ impl LeIndex {
             "Updated PDG has {} nodes and {} edges",
             pdg_node_count, pdg_edge_count
         );
+
+        // Memory cap checkpoint: after PDG construction (peak PDG memory usage)
+        if let Some(ref mut guard) = cap_guard {
+            guard.check_now()?;
+        }
 
         // Step 6: Re-index nodes for search
         let batch_size = self.indexing_batch_size();

@@ -496,11 +496,41 @@ pub struct MemoryConfig {
 pub struct IndexingConfig {
     /// Batch size for TF-IDF/index construction
     pub batch_size: usize,
+
+    /// Maximum number of source files to index (0 = unlimited).
+    /// Oversized files (see `max_file_size`) do not count toward this limit.
+    #[serde(default = "default_max_files")]
+    pub max_files: usize,
+
+    /// Maximum individual file size in bytes. Files exceeding this limit are
+    /// skipped with a warning (0 = unlimited).
+    #[serde(default = "default_max_file_size")]
+    pub max_file_size: u64,
+
+    /// Maximum total size of all indexed source files in bytes. Scanning stops
+    /// when this limit is exceeded (0 = unlimited).
+    #[serde(default = "default_max_total_size")]
+    pub max_total_size: u64,
+}
+
+const fn default_max_files() -> usize {
+    100_000
+}
+const fn default_max_file_size() -> u64 {
+    10_485_760 // 10 MB
+}
+const fn default_max_total_size() -> u64 {
+    5_368_709_120 // 5 GB
 }
 
 impl Default for IndexingConfig {
     fn default() -> Self {
-        Self { batch_size: 10_000 }
+        Self {
+            batch_size: 10_000,
+            max_files: default_max_files(),
+            max_file_size: default_max_file_size(),
+            max_total_size: default_max_total_size(),
+        }
     }
 }
 

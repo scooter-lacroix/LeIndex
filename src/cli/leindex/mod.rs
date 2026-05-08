@@ -192,6 +192,12 @@ impl LeIndex {
         // Initialize storage with multi-location fallback and retry
         let storage_path = Self::resolve_storage_path(&project_path)?;
 
+        // Write artifact ownership marker for GC (only for non-in-project storage)
+        crate::cli::cleanup::write_artifact_marker(&storage_path);
+
+        // Register at-exit cleanup for temp-based storage
+        crate::cli::cleanup::register_at_exit_cleanup(storage_path.clone());
+
         let db_path = storage_path.join("leindex.db");
         let storage = Self::open_storage_with_retry(&db_path, 3)?;
 

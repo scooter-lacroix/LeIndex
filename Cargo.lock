@@ -1691,6 +1691,7 @@ dependencies = [
  "hnsw_rs",
  "http 1.4.0",
  "http-body-util",
+ "libc",
  "libsql",
  "lru",
  "notify",

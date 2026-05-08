@@ -71,6 +71,15 @@ pub enum Commands {
         /// Show detailed progress
         #[arg(long = "progress")]
         progress: bool,
+
+        /// Self-imposed RSS limit in megabytes.
+        ///
+        /// When set, indexing monitors RSS and stops gracefully if the limit
+        /// is approached (warning at 90%) or exceeded (error). On Linux a hard
+        /// RLIMIT_AS ceiling is also set at 110% of the cap to prevent system
+        /// OOM kills. No-op on non-Linux platforms if monitoring is unavailable.
+        #[arg(long = "max-memory", value_name = "MB")]
+        max_memory: Option<u64>,
     },
 
     /// Search indexed code
@@ -197,6 +206,17 @@ pub enum Commands {
         #[arg(long = "prod")]
         prod: bool,
     },
+
+    /// Remove stale LeIndex temp artifacts
+    Cleanup {
+        /// Maximum age in days for artifacts to keep (default: 7)
+        #[arg(long = "max-age-days", default_value = "7")]
+        max_age_days: u64,
+
+        /// Show what would be removed without actually removing
+        #[arg(long = "dry-run")]
+        dry_run: bool,
+    },
 }
 
 /// Subcommands for inspecting and executing MCP tools from the CLI.
@@ -256,7 +276,8 @@ impl Cli {
                 path,
                 force,
                 progress,
-            } => cmd_index_impl(path, force, progress).await,
+                max_memory,
+            } => cmd_index_impl(path, force, progress, max_memory).await,
             Commands::Search { query, top_k } => {
                 cmd_search_impl(query, top_k, global_project).await
             }
@@ -302,6 +323,10 @@ impl Cli {
             Commands::Serve { host, port } => cmd_serve_impl(host, port).await,
             Commands::Mcp { .. } => cmd_mcp_stdio_impl(global_project).await,
             Commands::Dashboard { port, prod } => cmd_dashboard_impl(port, prod).await,
+            Commands::Cleanup {
+                max_age_days,
+                dry_run,
+            } => cmd_cleanup_impl(max_age_days, dry_run).await,
         }
     }
 }
@@ -550,7 +575,12 @@ fn get_project_path(explicit: Option<PathBuf>) -> PathBuf {
 }
 
 /// Index command implementation
-async fn cmd_index_impl(path: PathBuf, force: bool, _progress: bool) -> AnyhowResult<()> {
+async fn cmd_index_impl(
+    path: PathBuf,
+    force: bool,
+    _progress: bool,
+    max_memory: Option<u64>,
+) -> AnyhowResult<()> {
     let canonical_path = path
         .canonicalize()
         .context("Failed to canonicalize project path")?;
@@ -560,13 +590,21 @@ async fn cmd_index_impl(path: PathBuf, force: bool, _progress: bool) -> AnyhowRe
     // Check if already indexed (unless force)
     // TODO: Add force check logic
 
+    // Apply hard RSS limit via rlimit if requested (Linux-only)
+    if let Some(mb) = max_memory {
+        crate::cli::memory_cap::apply_hard_limit(mb)?;
+    }
+
     // Create LeIndex and index the project
     let mut leindex = LeIndex::new(&canonical_path).context("Failed to create LeIndex instance")?;
 
-    let stats = tokio::task::spawn_blocking(move || leindex.index_project(force))
-        .await
-        .context("Indexing task failed")?
-        .context("Indexing failed")?;
+    let max_memory_bytes = max_memory.map(|mb| mb * 1024 * 1024);
+    let stats = tokio::task::spawn_blocking(move || {
+        leindex.index_project_with_memory_cap(force, max_memory_bytes)
+    })
+    .await
+    .context("Indexing task failed")?
+    .context("Indexing failed")?;
 
     // Print results
     println!("\n✓ Indexing complete!");
@@ -1498,6 +1536,112 @@ async fn cmd_dashboard_impl(port: u16, prod: bool) -> AnyhowResult<()> {
     Ok(())
 }
 
+/// Cleanup command implementation — remove stale LeIndex temp artifacts.
+async fn cmd_cleanup_impl(max_age_days: u64, dry_run: bool) -> AnyhowResult<()> {
+    use crate::cli::cleanup::run_gc;
+    use std::time::Duration;
+
+    let max_age = Duration::from_secs(max_age_days * 24 * 3600);
+
+    if dry_run {
+        // In dry-run mode we scan but do not remove
+        println!("LeIndex Cleanup (dry run)\n");
+        println!(
+            "Scanning for artifacts older than {} day(s)...\n",
+            max_age_days
+        );
+
+        let report = run_gc_dry_run(max_age);
+        println!("{}", report);
+    } else {
+        println!("LeIndex Cleanup\n");
+        println!("Removing artifacts older than {} day(s)...\n", max_age_days);
+
+        let report = run_gc(max_age);
+        println!("{}", report);
+    }
+
+    Ok(())
+}
+
+/// Dry-run GC: scan and report without removing anything.
+fn run_gc_dry_run(max_age: std::time::Duration) -> crate::cli::cleanup::GcReport {
+    use crate::cli::cleanup::artifact_scan_roots;
+    use std::time::SystemTime;
+    use tracing::debug;
+
+    let mut report = crate::cli::cleanup::GcReport::default();
+    let cutoff = SystemTime::now() - max_age;
+
+    for root in artifact_scan_roots() {
+        if !root.exists() {
+            continue;
+        }
+
+        if root
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with("lephase-"))
+            .unwrap_or(false)
+        {
+            count_artifact(&root, &cutoff, &mut report);
+            continue;
+        }
+
+        let entries = match std::fs::read_dir(&root) {
+            Ok(e) => e,
+            Err(err) => {
+                debug!("Cannot read {}: {}", root.display(), err);
+                continue;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.file_name().map(|n| n == ".leindex").unwrap_or(false) {
+                continue;
+            }
+            count_artifact(&path, &cutoff, &mut report);
+        }
+    }
+
+    report
+}
+
+fn count_artifact(
+    dir: &std::path::Path,
+    cutoff: &std::time::SystemTime,
+    report: &mut crate::cli::cleanup::GcReport,
+) {
+    use crate::cli::cleanup::{
+        artifact_age, dir_size, is_leindex_artifact, is_leindex_artifact_by_pattern,
+    };
+    use tracing::debug;
+
+    if !is_leindex_artifact(dir) && !is_leindex_artifact_by_pattern(dir) {
+        return;
+    }
+
+    report.scanned += 1;
+
+    let age = artifact_age(dir);
+    if age < *cutoff {
+        debug!("Artifact {} is not stale yet", dir.display());
+        return;
+    }
+
+    let size = dir_size(dir);
+    debug!(
+        "Would remove stale artifact: {} ({:.2} MB)",
+        dir.display(),
+        size as f64 / 1024.0 / 1024.0
+    );
+    report.removed += 1;
+    report.bytes_freed += size;
+}
+
 /// Handle a single MCP request and return the response
 #[allow(clippy::needless_return)]
 async fn handle_mcp_request(
@@ -1764,5 +1908,36 @@ mod tests {
         assert!(find_tool_handler("LeIndex [Project Map]").is_some());
         assert!(find_tool_handler("project_map").is_some());
         assert!(find_tool_handler("project-map").is_some());
+    }
+
+    #[test]
+    fn test_cleanup_command_parsing() {
+        let cli = Cli::try_parse_from(["leindex", "cleanup"]).unwrap();
+        match cli.command {
+            Some(Commands::Cleanup {
+                max_age_days,
+                dry_run,
+            }) => {
+                assert_eq!(max_age_days, 7);
+                assert!(!dry_run);
+            }
+            _ => panic!("Expected Cleanup command"),
+        }
+    }
+
+    #[test]
+    fn test_cleanup_command_with_flags() {
+        let cli = Cli::try_parse_from(["leindex", "cleanup", "--max-age-days", "14", "--dry-run"])
+            .unwrap();
+        match cli.command {
+            Some(Commands::Cleanup {
+                max_age_days,
+                dry_run,
+            }) => {
+                assert_eq!(max_age_days, 14);
+                assert!(dry_run);
+            }
+            _ => panic!("Expected Cleanup command"),
+        }
     }
 }

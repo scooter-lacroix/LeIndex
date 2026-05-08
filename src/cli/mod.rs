@@ -76,6 +76,8 @@
 #![warn(missing_docs)]
 #![warn(unused_extern_crates)]
 
+/// Stale artifact garbage collection.
+pub mod cleanup;
 #[allow(clippy::module_inception)]
 /// Command-line interface definitions and handling.
 pub mod cli;
@@ -93,6 +95,8 @@ pub mod index_freshness;
 pub mod leindex;
 /// Memory management and cache orchestration.
 pub mod memory;
+/// Memory cap enforcement (RSS monitoring and hard limits).
+pub mod memory_cap;
 /// Multi-project registry with per-project concurrency.
 #[cfg(feature = "mcp-server")]
 pub mod registry;
