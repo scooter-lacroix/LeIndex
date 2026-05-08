@@ -729,6 +729,21 @@ impl SearchEngine {
         self.nodes.len()
     }
 
+    /// Collect all (node_id, embedding) pairs from the indexed nodes.
+    ///
+    /// Returns only nodes that have an embedding. Used by the mmap
+    /// persistence layer to write embeddings to disk.
+    pub fn collect_embeddings(&self) -> Vec<(String, Vec<f32>)> {
+        self.nodes
+            .iter()
+            .filter_map(|n| {
+                n.embedding
+                    .as_ref()
+                    .map(|emb| (n.node_id.clone(), emb.clone()))
+            })
+            .collect()
+    }
+
     /// Check if the index is empty
     ///
     /// # Returns

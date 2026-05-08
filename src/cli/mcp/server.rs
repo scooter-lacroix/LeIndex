@@ -711,6 +711,307 @@ async fn health_check_handler() -> Json<Value> {
     }))
 }
 
+// ============================================================================
+// Unix Domain Socket Transport
+// ============================================================================
+
+/// RAII guard that removes the socket file on drop.
+#[cfg(unix)]
+pub struct SocketCleanupGuard {
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for SocketCleanupGuard {
+    fn drop(&mut self) {
+        if self.path.exists() {
+            let _ = std::fs::remove_file(&self.path);
+            debug!("Cleaned up socket file: {}", self.path.display());
+        }
+    }
+}
+
+#[cfg(unix)]
+impl McpServer {
+    /// Run the MCP server over a Unix domain socket.
+    ///
+    /// Binds to `socket_path`, accepts connections in a loop, and spawns a
+    /// tokio task per connection. Each connection gets its own session ID
+    /// registered in `session_handshakes`. The JSON-RPC message loop reuses
+    /// the same handler logic as the stdio transport.
+    ///
+    /// The socket file is removed when the returned future completes or is
+    /// dropped (via `SocketCleanupGuard`).
+    pub async fn run_socket(&self, socket_path: &std::path::Path) -> anyhow::Result<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        // Remove stale socket file if present
+        if socket_path.exists() {
+            std::fs::remove_file(socket_path).context("Failed to remove existing socket file")?;
+        }
+
+        // Ensure parent directory exists
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent).context("Failed to create socket directory")?;
+        }
+
+        let listener = UnixListener::bind(socket_path)
+            .with_context(|| format!("Failed to bind Unix socket at {}", socket_path.display()))?;
+
+        let _guard = SocketCleanupGuard {
+            path: socket_path.to_path_buf(),
+        };
+
+        info!(
+            "MCP server listening on Unix socket: {}",
+            socket_path.display()
+        );
+
+        loop {
+            let (stream, _addr) = listener
+                .accept()
+                .await
+                .context("Failed to accept connection")?;
+
+            let session_id = generate_session_id();
+            {
+                let mut sessions = self.session_handshakes.lock().unwrap();
+                sessions.insert(session_id.clone(), false);
+            }
+
+            let session_id_clone = session_id.clone();
+            let session_handshakes = self.session_handshakes.clone();
+            let handshake_complete = self.handshake_complete.clone();
+
+            tokio::spawn(async move {
+                debug!(
+                    "Accepted Unix socket connection (session: {})",
+                    session_id_clone
+                );
+
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut use_content_length = false;
+
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {}
+                        Err(e) => {
+                            debug!("Socket read error (session {}): {}", session_id_clone, e);
+                            break;
+                        }
+                    };
+
+                    let line_trim = line.trim_end();
+                    if line_trim.is_empty() {
+                        continue;
+                    }
+
+                    let json_payload = if line_trim
+                        .to_ascii_lowercase()
+                        .starts_with("content-length:")
+                    {
+                        let len_str = line_trim.split(':').nth(1).unwrap_or("").trim();
+                        let length: usize = match len_str.parse() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                debug!("Invalid Content-Length header: {}", e);
+                                continue;
+                            }
+                        };
+
+                        // Consume remaining header lines until blank line
+                        loop {
+                            let mut header = String::new();
+                            match reader.read_line(&mut header).await {
+                                Ok(0) => break,
+                                Err(_) => break,
+                                _ if header.trim().is_empty() => break,
+                                _ => {}
+                            }
+                        }
+
+                        let mut buf = vec![0u8; length];
+                        if let Err(e) = reader.read_exact(&mut buf).await {
+                            debug!("Failed to read JSON payload: {}", e);
+                            break;
+                        }
+
+                        use_content_length = true;
+                        String::from_utf8_lossy(&buf).to_string()
+                    } else {
+                        line_trim.to_string()
+                    };
+
+                    // Parse and handle the JSON-RPC message
+                    let response_json = match handle_socket_message(
+                        &json_payload,
+                        &session_id_clone,
+                        &session_handshakes,
+                        &handshake_complete,
+                    )
+                    .await
+                    {
+                        Some(json) => json,
+                        None => continue, // Notification, no response
+                    };
+
+                    // Send response
+                    if use_content_length {
+                        let msg = format!(
+                            "Content-Length: {}\r\n\r\n{}",
+                            response_json.len(),
+                            response_json
+                        );
+                        if writer.write_all(msg.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    } else {
+                        let msg = format!("{}\n", response_json);
+                        if writer.write_all(msg.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = writer.flush().await;
+                }
+
+                // Clean up session on disconnect
+                {
+                    let mut sessions = session_handshakes.lock().unwrap();
+                    sessions.remove(&session_id_clone);
+                }
+
+                debug!("Socket connection closed (session: {})", session_id_clone);
+            });
+        }
+
+        #[allow(unreachable_code)]
+        {
+            // _guard is dropped here, cleaning up the socket file
+            Ok(())
+        }
+    }
+}
+
+/// Handle a single JSON-RPC message received over a Unix socket connection.
+/// Returns `Some(response_json)` or `None` for notifications (no response).
+#[cfg(unix)]
+async fn handle_socket_message(
+    json_payload: &str,
+    session_id: &str,
+    session_handshakes: &Arc<Mutex<HashMap<String, bool>>>,
+    handshake_complete: &Arc<AtomicBool>,
+) -> Option<String> {
+    use super::protocol::{JsonRpcMessage, JsonRpcResponse};
+    use crate::cli::mcp::server::{handle_tool_call, list_tools_json, HANDLERS, SERVER_STATE};
+
+    let message = match JsonRpcMessage::from_json(json_payload) {
+        Ok(m) => m,
+        Err(e) => {
+            let error_response = JsonRpcResponse::error(serde_json::Value::Null, e);
+            return serde_json::to_string(&error_response).ok();
+        }
+    };
+
+    match message {
+        JsonRpcMessage::Notification(notification) => {
+            debug!("Ignoring notification on socket: {}", notification.method);
+            None
+        }
+        JsonRpcMessage::Request(request) => {
+            let request_id = request.id.clone().unwrap_or(serde_json::Value::Null);
+            let method_name = request.method.clone();
+
+            // Notifications with null id must not receive a response
+            if request.id.is_none() {
+                debug!("Ignoring notification: {}", method_name);
+                return None;
+            }
+
+            let state = match SERVER_STATE.get() {
+                Some(s) => s,
+                None => {
+                    let resp = JsonRpcResponse::error(
+                        request_id,
+                        super::protocol::JsonRpcError::new(-32603, "Server state not initialized"),
+                    );
+                    return serde_json::to_string(&resp).ok();
+                }
+            };
+
+            let handlers = match HANDLERS.get() {
+                Some(h) => h,
+                None => {
+                    let resp = JsonRpcResponse::error(
+                        request_id,
+                        super::protocol::JsonRpcError::new(-32603, "Handlers not initialized"),
+                    );
+                    return serde_json::to_string(&resp).ok();
+                }
+            };
+
+            let response = match method_name.as_str() {
+                "initialize" => {
+                    // Mark session as handshaked
+                    handshake_complete.store(true, Ordering::SeqCst);
+                    {
+                        let mut sessions = session_handshakes.lock().unwrap();
+                        sessions.insert(session_id.to_string(), true);
+                    }
+
+                    let result = serde_json::json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {
+                            "tools": { "listChanged": true },
+                            "prompts": { "listChanged": true },
+                            "resources": { "listChanged": true, "subscribe": false },
+                            "logging": {},
+                            "progress": true
+                        },
+                        "serverInfo": {
+                            "name": "leindex",
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "description": "LeIndex MCP Server - Semantic code indexing and analysis with PDG-based tools"
+                        }
+                    });
+                    JsonRpcResponse::success(request_id, result)
+                }
+                "ping" => JsonRpcResponse::success(request_id, serde_json::json!({})),
+                "tools/call" => {
+                    let result = handle_tool_call(state, handlers, &request).await;
+                    JsonRpcResponse::from_result(request_id, result)
+                }
+                "tools/list" => JsonRpcResponse::success(request_id, list_tools_json(handlers)),
+                "prompts/list" => JsonRpcResponse::success(request_id, list_prompts_json()),
+                "prompts/get" => {
+                    let result = handle_prompt_get(&request);
+                    match result {
+                        Ok(value) => JsonRpcResponse::success(request_id, value),
+                        Err(e) => JsonRpcResponse::error(request_id, e),
+                    }
+                }
+                "resources/list" => JsonRpcResponse::success(request_id, list_resources_json()),
+                "resources/read" => {
+                    let result = handle_resource_read(&request);
+                    match result {
+                        Ok(value) => JsonRpcResponse::success(request_id, value),
+                        Err(e) => JsonRpcResponse::error(request_id, e),
+                    }
+                }
+                _ => JsonRpcResponse::error(
+                    request_id,
+                    super::protocol::JsonRpcError::method_not_found(method_name),
+                ),
+            };
+
+            serde_json::to_string(&response).ok()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -722,6 +1023,25 @@ mod tests {
             config.bind_address,
             SocketAddr::from(([127, 0, 0, 1], 3000))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_socket_cleanup_guard_removes_file() {
+        let dir = std::env::temp_dir().join("leindex_test_socket_guard");
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("test.sock");
+        std::fs::write(&socket_path, b"").unwrap();
+        assert!(socket_path.exists());
+
+        {
+            let _guard = SocketCleanupGuard {
+                path: socket_path.clone(),
+            };
+        }
+        assert!(!socket_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

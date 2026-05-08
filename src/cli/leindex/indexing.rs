@@ -249,6 +249,14 @@ impl LeIndex {
         }
         self.build_file_stats_cache();
         self.stats.indexing_time_ms = start_time.elapsed().as_millis() as u64;
+
+        // R10: Persist embeddings to mmap file after watcher incremental reindex
+        if let Err(err) =
+            index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)
+        {
+            warn!("Failed to persist mmap embeddings: {err:#}");
+        }
+
         info!(
             "Watcher incremental reindex completed in {}ms",
             self.stats.indexing_time_ms
@@ -614,6 +622,13 @@ impl LeIndex {
         // Build file stats cache for performance
         self.build_file_stats_cache();
 
+        // R10: Persist embeddings to mmap file for fast read-only access
+        if let Err(err) =
+            index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)
+        {
+            warn!("Failed to persist mmap embeddings: {err:#}");
+        }
+
         info!("Indexing completed in {}ms", self.stats.indexing_time_ms);
 
         Ok(self.stats.clone())
@@ -716,6 +731,13 @@ impl LeIndex {
         self.pdg = Some(pdg);
 
         self.build_file_stats_cache();
+
+        // R10: Persist embeddings to mmap file for fast read-only access
+        if let Err(err) =
+            index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)
+        {
+            warn!("Failed to persist mmap embeddings: {err:#}");
+        }
 
         Ok(())
     }

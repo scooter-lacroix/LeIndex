@@ -1090,6 +1090,66 @@ pub(crate) fn analysis_cache_key_for(
 }
 
 // ============================================================================
+// MMAP EMBEDDING PERSISTENCE (R10)
+// ============================================================================
+
+/// Persist all embeddings from the search engine to an mmap-backed binary file.
+///
+/// After indexing completes, call this to write a `.leindex/embeddings.bin`
+/// file that can be memory-mapped for fast read-only access without loading
+/// the full embedding matrix into heap memory.
+pub(crate) fn persist_embeddings_to_mmap(
+    search_engine: &SearchEngine,
+    project_path: &Path,
+) -> Result<()> {
+    let embeddings = search_engine.collect_embeddings();
+    if embeddings.is_empty() {
+        return Ok(());
+    }
+    let path = crate::search::vector::mmap_embeddings_path(project_path);
+    crate::search::vector::write_mmap_embeddings(&path, &embeddings)
+        .map_err(|e| anyhow::anyhow!("Failed to write mmap embeddings: {e}"))?;
+    info!(
+        count = embeddings.len(),
+        path = %path.display(),
+        "Persisted embeddings to mmap file"
+    );
+    Ok(())
+}
+
+/// Try to load a previously persisted mmap embedding index.
+///
+/// Returns `None` if the file does not exist or is corrupt.
+#[allow(dead_code)]
+pub(crate) fn try_load_mmap_embeddings(
+    project_path: &Path,
+) -> Option<crate::search::vector::MmapEmbeddingIndex> {
+    let path = crate::search::vector::mmap_embeddings_path(project_path);
+    if !path.exists() {
+        return None;
+    }
+    match crate::search::vector::MmapEmbeddingIndex::open(&path) {
+        Ok(index) => {
+            info!(
+                nodes = index.len(),
+                dim = index.dimension(),
+                path = %path.display(),
+                "Loaded mmap embedding index"
+            );
+            Some(index)
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to load mmap embedding index"
+            );
+            None
+        }
+    }
+}
+
+// ============================================================================
 // TESTS (moved from leindex.rs)
 // ============================================================================
 

@@ -194,6 +194,13 @@ pub enum Commands {
         /// Compatibility flag for some AI tools
         #[arg(long = "stdio")]
         stdio: bool,
+
+        /// Path to a Unix domain socket to listen on (instead of stdio).
+        ///
+        /// Each connection gets its own MCP session. The socket file is
+        /// removed when the server shuts down. Only available on Unix.
+        #[arg(long = "socket")]
+        socket: Option<PathBuf>,
     },
 
     /// Start the frontend dashboard
@@ -264,9 +271,15 @@ impl Cli {
         // Execute the appropriate command
         // Default to Mcp if no command is provided or if --stdio is set
         let command = if self.stdio {
-            Commands::Mcp { stdio: true }
+            Commands::Mcp {
+                stdio: true,
+                socket: None,
+            }
         } else {
-            self.command.unwrap_or(Commands::Mcp { stdio: false })
+            self.command.unwrap_or(Commands::Mcp {
+                stdio: false,
+                socket: None,
+            })
         };
 
         maybe_complete_post_install_actions(&command);
@@ -321,7 +334,13 @@ impl Cli {
             Commands::Diagnostics => cmd_diagnostics_impl(global_project).await,
             Commands::Tools { command } => cmd_tools_impl(command, global_project).await,
             Commands::Serve { host, port } => cmd_serve_impl(host, port).await,
-            Commands::Mcp { .. } => cmd_mcp_stdio_impl(global_project).await,
+            Commands::Mcp { socket, .. } => {
+                if let Some(ref socket_path) = socket {
+                    cmd_mcp_socket_impl(socket_path, global_project).await
+                } else {
+                    cmd_mcp_stdio_impl(global_project).await
+                }
+            }
             Commands::Dashboard { port, prod } => cmd_dashboard_impl(port, prod).await,
             Commands::Cleanup {
                 max_age_days,
@@ -1207,6 +1226,60 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     }
 
     Ok(())
+}
+
+/// MCP Unix socket command implementation — run MCP server on a Unix domain socket.
+#[cfg(unix)]
+async fn cmd_mcp_socket_impl(
+    socket_path: &std::path::Path,
+    project: Option<PathBuf>,
+) -> AnyhowResult<()> {
+    let project_path = get_project_path(project);
+    let canonical_path = project_path
+        .canonicalize()
+        .context("Failed to canonicalize project path")?;
+
+    info!(
+        "Starting LeIndex MCP Unix socket server at {} for project: {}",
+        socket_path.display(),
+        canonical_path.display()
+    );
+
+    // Create LeIndex instance
+    let mut leindex = LeIndex::new(&canonical_path).context("Failed to create LeIndex instance")?;
+    let _ = leindex.load_from_storage();
+
+    // Initialize global state for handlers
+    let registry = Arc::new(ProjectRegistry::with_initial_project(
+        DEFAULT_MAX_PROJECTS,
+        leindex,
+    ));
+    let _ = crate::cli::mcp::server::SERVER_STATE.set(registry.clone());
+
+    // Initialize handlers
+    let _ = crate::cli::mcp::server::HANDLERS.set(all_tool_handlers());
+
+    // Create MCP server instance
+    let server = crate::cli::mcp::server::McpServer::new(
+        crate::cli::mcp::server::McpServerConfig::default(),
+    )
+    .context("Failed to create MCP server")?;
+
+    println!("\nLeIndex MCP Unix Socket Server\n");
+    println!("Socket: {}", socket_path.display());
+    println!("Project: {}", canonical_path.display());
+    println!("\nPress Ctrl+C to stop the server\n");
+
+    server.run_socket(socket_path).await
+}
+
+/// MCP Unix socket command implementation — stub for non-Unix platforms.
+#[cfg(not(unix))]
+async fn cmd_mcp_socket_impl(
+    _socket_path: &std::path::Path,
+    _project: Option<PathBuf>,
+) -> AnyhowResult<()> {
+    anyhow::bail!("Unix sockets are not supported on this platform");
 }
 
 fn parse_tool_args_json(args_json: &str) -> AnyhowResult<Value> {
