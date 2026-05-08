@@ -3,9 +3,117 @@
 use super::LeIndex;
 use crate::cli::index_builder;
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use tracing::info;
 
 impl LeIndex {
+    pub(crate) fn incremental_reindex_from_watcher(&mut self) -> Result<super::IndexStats> {
+        let start_time = std::time::Instant::now();
+        info!(
+            "Starting watcher incremental reindex for: {}",
+            self.project_id
+        );
+
+        let indexed_files =
+            crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
+                .context("Failed to load indexed files from storage")?;
+        let source_files_with_hashes = self.collect_source_files_with_hashes(true)?;
+        let source_file_hashes: std::collections::HashMap<String, String> =
+            source_files_with_hashes
+                .iter()
+                .map(|(path, hash)| (path.display().to_string(), hash.clone()))
+                .collect();
+        let current_file_paths: HashSet<String> = source_files_with_hashes
+            .iter()
+            .map(|(p, _)| p.display().to_string())
+            .collect();
+
+        let changed_files: Vec<_> = source_files_with_hashes
+            .iter()
+            .filter_map(|(path, hash)| {
+                let path_str = path.display().to_string();
+                if indexed_files.get(&path_str) != Some(hash) {
+                    Some(path.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let deleted_files: Vec<String> = indexed_files
+            .keys()
+            .filter(|p| !current_file_paths.contains(*p))
+            .cloned()
+            .collect();
+
+        info!(
+            "Watcher delta: {} changed, {} deleted",
+            changed_files.len(),
+            deleted_files.len()
+        );
+
+        if changed_files.is_empty() && deleted_files.is_empty() {
+            info!("Watcher found no delta, skipping incremental reindex");
+            return Ok(self.stats.clone());
+        }
+
+        let parser = crate::parse::parallel::ParallelParser::new();
+        let parsing_results = if changed_files.is_empty() {
+            Vec::new()
+        } else {
+            parser.parse_files(changed_files)
+        };
+
+        let mut pdg = self.pdg.take().unwrap_or_default();
+        for path in &deleted_files {
+            index_builder::remove_file_from_pdg(&mut pdg, path)?;
+            let _ = crate::storage::pdg_store::delete_file_data(
+                &mut self.storage,
+                &self.project_id,
+                path,
+            );
+        }
+
+        for result in parsing_results.into_iter() {
+            if !result.is_success() {
+                continue;
+            }
+
+            let file_path = result.file_path.display().to_string();
+            let language = result.language.as_deref().unwrap_or("unknown");
+            let source_bytes = result.source_bytes.as_deref().unwrap_or(&[]);
+            index_builder::remove_file_from_pdg(&mut pdg, &file_path)?;
+            let file_pdg = crate::graph::extract_pdg_from_signatures(
+                result.signatures,
+                source_bytes,
+                &file_path,
+                language,
+            );
+            index_builder::merge_pdgs(&mut pdg, file_pdg);
+            if let Some(hash) = source_file_hashes.get(&file_path) {
+                let _ = crate::storage::pdg_store::update_indexed_file(
+                    &mut self.storage,
+                    &self.project_id,
+                    &file_path,
+                    hash,
+                );
+            }
+        }
+
+        let delta = crate::search::search::TextIndexDelta {
+            removed_node_ids: deleted_files.clone(),
+            updated_nodes: Vec::new(),
+        };
+        self.search_engine.incremental_reindex(delta);
+        self.pdg = Some(pdg);
+        self.build_file_stats_cache();
+        self.stats.indexing_time_ms = start_time.elapsed().as_millis() as u64;
+        info!(
+            "Watcher incremental reindex completed in {}ms",
+            self.stats.indexing_time_ms
+        );
+        Ok(self.stats.clone())
+    }
+
     /// Index the project
     ///
     /// This executes the full indexing pipeline:
@@ -134,7 +242,7 @@ impl LeIndex {
 
         // Step 5: Update PDG
         if !unchanged_files.is_empty() && self.pdg.is_none() {
-            self.load_from_storage()
+            self.load_pdg_from_storage()
                 .context("Failed to load existing PDG for incremental reindex. Please reindex with --force if corruption persists.")?;
         }
 
@@ -229,11 +337,16 @@ impl LeIndex {
         );
 
         // Step 6: Re-index nodes for search
+        let batch_size = self.indexing_batch_size();
         self.embedder = Some(index_builder::index_nodes(
             &pdg,
             &mut self.search_engine,
             &mut self.cache.file_stats_cache,
+            batch_size,
         )?);
+        if let Some(embedder) = &self.embedder {
+            let _ = embedder.persist_to_storage(&self.project_path, &pdg);
+        }
         let indexed_count = self.search_engine.node_count();
 
         info!("Indexed {} nodes for search", indexed_count);
@@ -277,7 +390,20 @@ impl LeIndex {
     ///
     /// `Result<()>` - Success or error
     pub fn load_from_storage(&mut self) -> Result<()> {
-        info!("Loading project from storage: {}", self.project_id);
+        self.load_from_storage_inner(false)
+    }
+
+    /// Load PDG from storage without populating the search engine.
+    /// Used by index_project() when it will call index_nodes() afterwards.
+    pub fn load_pdg_from_storage(&mut self) -> Result<()> {
+        self.load_from_storage_inner(true)
+    }
+
+    fn load_from_storage_inner(&mut self, pdg_only: bool) -> Result<()> {
+        info!(
+            "Loading project from storage: {} (pdg_only={})",
+            self.project_id, pdg_only
+        );
 
         let mut pdg = crate::storage::pdg_store::load_pdg(&self.storage, &self.project_id)
             .context("Failed to load PDG from storage")?;
@@ -292,11 +418,25 @@ impl LeIndex {
 
         index_builder::normalize_external_nodes(&mut pdg);
 
+        if pdg_only {
+            // Skip search engine population — caller will call index_nodes() later.
+            self.embedder = None;
+            self.stats.pdg_nodes = pdg_node_count;
+            self.stats.pdg_edges = pdg_edge_count;
+            self.pdg = Some(pdg);
+            return Ok(());
+        }
+
+        let batch_size = self.indexing_batch_size();
         self.embedder = Some(index_builder::index_nodes(
             &pdg,
             &mut self.search_engine,
             &mut self.cache.file_stats_cache,
+            batch_size,
         )?);
+        if let Some(embedder) = &self.embedder {
+            let _ = embedder.persist_to_storage(&self.project_path, &pdg);
+        }
         let indexed_count = self.search_engine.node_count();
 
         info!("Rebuilt search index with {} nodes", indexed_count);

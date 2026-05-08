@@ -330,3 +330,7 @@ strip = true
 
 [profile.bench]
 debug = true
+[profile.release-debug]
+inherits = "release"
+debug = 2
+

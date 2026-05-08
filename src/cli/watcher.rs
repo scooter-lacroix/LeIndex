@@ -46,7 +46,7 @@ impl IndexWatcher {
                             let handle_clone = handle.clone();
                             tokio::task::spawn_blocking(move || {
                                 let mut idx = handle_clone.blocking_write();
-                                if let Err(e) = idx.index_project(false) {
+                                if let Err(e) = idx.incremental_reindex_from_watcher() {
                                     warn!("Auto-reindex failed: {}", e);
                                 }
                             });

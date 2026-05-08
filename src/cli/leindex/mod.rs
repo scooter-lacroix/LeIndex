@@ -59,6 +59,9 @@ pub struct LeIndex {
     /// Cache subsystem (spiller, project scan, file stats)
     cache: crate::cli::index_cache::IndexCache,
 
+    /// Cached project configuration.
+    project_config: crate::cli::config::ProjectConfig,
+
     /// Indexing statistics
     stats: IndexStats,
 
@@ -217,6 +220,8 @@ impl LeIndex {
         // Initialize cache subsystem
         let cache_dir = storage_path.join("cache");
         let cache = crate::cli::index_cache::IndexCache::new(cache_dir)?;
+        let project_config =
+            crate::cli::config::ProjectConfig::load(&project_path).unwrap_or_default();
 
         Ok(Self {
             project_path,
@@ -227,6 +232,7 @@ impl LeIndex {
             search_engine,
             pdg: None,
             cache,
+            project_config,
             stats: IndexStats {
                 total_files: 0,
                 files_parsed: 0,
@@ -294,6 +300,10 @@ impl LeIndex {
             project_scan: self.cache.project_scan.as_ref(),
             cache_spiller: &self.cache.cache_spiller,
         }
+    }
+
+    pub(crate) fn indexing_batch_size(&self) -> usize {
+        self.project_config.indexing.batch_size
     }
 
     fn search_cache_key_for(
@@ -526,10 +536,12 @@ impl LeIndex {
             .take()
             .ok_or_else(|| anyhow::anyhow!("No PDG available for vector rebuild"))?;
 
+        let batch_size = self.indexing_batch_size();
         self.embedder = Some(index_builder::index_nodes(
             &pdg,
             &mut self.search_engine,
             &mut self.cache.file_stats_cache,
+            batch_size,
         )?);
         let indexed_count = self.search_engine.node_count();
 

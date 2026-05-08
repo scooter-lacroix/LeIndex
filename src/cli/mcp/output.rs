@@ -64,60 +64,28 @@ impl DiffFormatter {
     /// Format a diff between original and modified content
     pub fn format(&self, original: &str, modified: &str, file_path: &str) -> String {
         let mut output = String::new();
-
         output.push_str(&self.header(file_path));
         output.push('\n');
 
-        let old_lines: Vec<&str> = original.lines().collect();
-        let new_lines: Vec<&str> = modified.lines().collect();
+        let patch = diffy::create_patch(original, modified);
+        let unified = patch.to_string();
+        if unified.is_empty() {
+            output.push_str("  (no changes)\n");
+            return output;
+        }
 
-        let mut i = 0;
-        let mut j = 0;
-        let mut in_change = false;
-
-        while i < old_lines.len() || j < new_lines.len() {
-            let old_line = old_lines.get(i);
-            let new_line = new_lines.get(j);
-
-            match (old_line, new_line) {
-                (Some(ol), Some(nl)) if ol == nl => {
-                    output.push_str(&self.context_line(i + 1, ol));
-                    i += 1;
-                    j += 1;
-                    in_change = false;
-                }
-                (Some(_), Some(_)) => {
-                    if !in_change {
-                        output.push_str("\n  Changes:\n");
-                        in_change = true;
-                    }
-
-                    if let Some(ol) = old_line {
-                        output.push_str(&self.removed_line(i + 1, ol));
-                        i += 1;
-                    }
-                    if let Some(nl) = new_line {
-                        output.push_str(&self.added_line(j + 1, nl));
-                        j += 1;
-                    }
-                }
-                (Some(ol), None) => {
-                    if !in_change {
-                        output.push_str("\n  Changes:\n");
-                        in_change = true;
-                    }
-                    output.push_str(&self.removed_line(i + 1, ol));
-                    i += 1;
-                }
-                (None, Some(nl)) => {
-                    if !in_change {
-                        output.push_str("\n  Changes:\n");
-                        in_change = true;
-                    }
-                    output.push_str(&self.added_line(j + 1, nl));
-                    j += 1;
-                }
-                (None, None) => break,
+        output.push_str("  Unified diff:\n");
+        for line in unified.lines() {
+            if line.starts_with("@@") || line.starts_with("---") || line.starts_with("+++") {
+                output.push_str(&format!("  {}\n", line));
+            } else if let Some(rest) = line.strip_prefix('+') {
+                output.push_str(&self.added_line(0, rest));
+            } else if let Some(rest) = line.strip_prefix('-') {
+                output.push_str(&self.removed_line(0, rest));
+            } else if let Some(rest) = line.strip_prefix(' ') {
+                output.push_str(&self.context_line(0, rest));
+            } else {
+                output.push_str(&format!("  {}\n", line));
             }
         }
 
@@ -188,8 +156,17 @@ impl SearchFormatter {
 
     /// Format search results with ranking and scoring
     pub fn format(&self, results: &Value, query: &str) -> String {
+        let owned_results;
         let results_array = match results {
             Value::Array(arr) => arr,
+            Value::Object(map) => {
+                owned_results = map
+                    .get("results")
+                    .and_then(|value| value.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                &owned_results
+            }
             _ => return "Invalid search results format".to_string(),
         };
 
@@ -274,11 +251,7 @@ impl SearchFormatter {
         s.push('\n');
 
         if let Some(snip) = snippet {
-            let truncated = if snip.len() > 80 {
-                format!("{}...", &snip[..77])
-            } else {
-                snip.to_string()
-            };
+            let truncated = truncate_chars(snip, 80);
             if self.color {
                 s.push_str(&format!("    {}{}{}\n", DIM, truncated, RESET));
             } else {
@@ -293,6 +266,15 @@ impl SearchFormatter {
 impl Default for SearchFormatter {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+pub(crate) fn truncate_chars(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        input.to_string()
+    } else {
+        let prefix: String = input.chars().take(max_chars).collect();
+        format!("{}...", prefix)
     }
 }
 
@@ -831,11 +813,7 @@ impl PhaseFormatter {
 
         if let Some(summary) = data.get("summary").and_then(|v| v.as_str()) {
             output.push('\n');
-            let truncated = if summary.len() > 150 {
-                format!("{}...", &summary[..147])
-            } else {
-                summary.to_string()
-            };
+            let truncated = truncate_chars(summary, 150);
             if self.color {
                 output.push_str(&format!(
                     "  {}{}:{} {}{}{}\n",

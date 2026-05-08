@@ -19,11 +19,12 @@ use axum_06::{
 use futures_util::stream::{Stream, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -40,6 +41,16 @@ pub static SERVER_INSTANCE: std::sync::OnceLock<Arc<McpServer>> = std::sync::Onc
 
 /// Global tool handlers list
 pub static HANDLERS: std::sync::OnceLock<Vec<ToolHandler>> = std::sync::OnceLock::new();
+
+/// Monotonic counter for generating session IDs (no `uuid` dependency).
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Generate a unique session ID string: `"leindex-<pid>-<seq>"`.
+fn generate_session_id() -> String {
+    let pid = std::process::id();
+    let seq = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("leindex-{pid}-{seq}")
+}
 
 /// MCP Server configuration
 #[derive(Clone, Debug)]
@@ -75,8 +86,11 @@ pub struct McpServer {
     pub config: McpServerConfig,
     /// Multi-project registry (kept alive for the server's lifetime).
     pub _registry: Arc<ProjectRegistry>,
-    /// Flag to track MCP handshake completion
+    /// Flag to track MCP handshake completion (used by stdio transport — single client).
     pub(crate) handshake_complete: Arc<AtomicBool>,
+    /// Per-session handshake state for HTTP transport (session ID → handshaked).
+    /// Keyed by the `Mcp-Session-Id` header value.
+    pub(crate) session_handshakes: Arc<Mutex<HashMap<String, bool>>>,
 }
 
 impl McpServer {
@@ -116,6 +130,7 @@ impl McpServer {
             config,
             _registry: registry,
             handshake_complete: Arc::new(AtomicBool::new(false)),
+            session_handshakes: Arc::new(Mutex::new(HashMap::new())),
         };
 
         SERVER_INSTANCE
@@ -345,11 +360,22 @@ pub async fn index_with_progress(
 ///
 /// Returns server capabilities and information as per MCP protocol.
 /// This is the first request sent by MCP clients to negotiate capabilities.
-fn handle_initialize(server: &McpServer) -> Value {
-    // Mark handshake as complete
+///
+/// For HTTP transport, generates a per-session ID and stores it in the session map.
+fn handle_initialize(server: &McpServer) -> (Value, Option<String>) {
+    // Mark global handshake as complete (stdio path)
     server.handshake_complete.store(true, Ordering::SeqCst);
 
-    serde_json::json!({
+    // Generate a session ID for HTTP transport
+    let session_id = generate_session_id();
+
+    // Store in per-session map
+    {
+        let mut sessions = server.session_handshakes.lock().unwrap();
+        sessions.insert(session_id.clone(), true);
+    }
+
+    let result = serde_json::json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {
             "tools": {
@@ -370,11 +396,13 @@ fn handle_initialize(server: &McpServer) -> Value {
             "version": env!("CARGO_PKG_VERSION"),
             "description": "LeIndex MCP Server - Semantic code indexing and analysis with PDG-based tools for superior code comprehension"
         },
-        "notes": [
+        "instructions": [
             "Projects are no longer auto-indexed on startup. Use explicit tool calls to index projects.",
             "The server must receive an 'initialize' call before processing other requests."
         ]
-    })
+    });
+
+    (result, Some(session_id))
 }
 
 /// Handle MCP ping request
@@ -385,7 +413,13 @@ fn handle_ping() -> Value {
 }
 
 /// JSON-RPC request handler
-async fn json_rpc_handler(Json(body): Json<Value>) -> Response {
+async fn json_rpc_handler(headers: axum_06::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    // Extract Mcp-Session-Id header (if present)
+    let incoming_session_id = headers
+        .get("Mcp-Session-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     // Parse JSON-RPC request
     let json_req: JsonRpcRequest = match serde_json::from_value(body.clone()) {
         Ok(r) => r,
@@ -446,28 +480,53 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Response {
         return Json(serde_json::to_value(&resp).unwrap()).into_response();
     }
 
-    // Check handshake completion for non-initialize requests
-    if !server_instance.handshake_complete.load(Ordering::SeqCst) && json_req.method != "initialize"
-    {
-        return Json(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": json_req.id,
-            "error": {
-                "code": -32000,
-                "message": "Server not initialized. Call 'initialize' first."
-            }
-        }))
-        .into_response();
-    }
-
     // Notifications (id is null) must not receive a response per JSON-RPC 2.0 spec
     if json_req.id.is_none() {
         debug!("Ignoring notification: {}", json_req.method);
         return StatusCode::NO_CONTENT.into_response();
     }
 
+    // Per-session handshake check for HTTP transport
+    if json_req.method == "initialize" {
+        // Generate new session, store, and return session ID header
+    } else {
+        // Non-initialize: validate session ID exists and is handshaked
+        let session_ok = match &incoming_session_id {
+            Some(sid) => {
+                let sessions = server_instance.session_handshakes.lock().unwrap();
+                sessions.get(sid).copied().unwrap_or(false)
+            }
+            None => false,
+        };
+
+        if !session_ok {
+            return Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": json_req.id,
+                "error": {
+                    "code": -32000,
+                    "message": "Server not initialized. Call 'initialize' first."
+                }
+            }))
+            .into_response();
+        }
+    }
+
     let response = match json_req.method.as_str() {
-        "initialize" => Ok(handle_initialize(server_instance)),
+        "initialize" => {
+            let (result, session_id) = handle_initialize(server_instance);
+            let resp = JsonRpcResponse::success(id.clone(), result);
+            let body = Json(serde_json::to_value(&resp).unwrap()).into_response();
+            // Attach Mcp-Session-Id response header
+            if let Some(sid) = session_id {
+                let mut response = body;
+                let sid_header = axum_06::http::HeaderValue::from_str(&sid)
+                    .unwrap_or_else(|_| axum_06::http::HeaderValue::from_static("unknown"));
+                response.headers_mut().insert("Mcp-Session-Id", sid_header);
+                return response;
+            }
+            return body;
+        }
         "ping" => Ok(handle_ping()),
         "tools/call" => handle_tool_call(&state, handlers, &json_req).await,
         "tools/list" => Ok(list_tools_json(handlers)),
@@ -604,8 +663,26 @@ pub fn handle_resource_read(req: &JsonRpcRequest) -> Result<Value, JsonRpcError>
 }
 
 /// List tools handler
-async fn list_tools_handler() -> Json<Value> {
-    // Tool list is a public discovery endpoint — no handshake required.
+///
+/// Public discovery endpoint — no handshake required.
+/// If a `Mcp-Session-Id` header is present, it is validated but
+/// the endpoint still functions without one.
+async fn list_tools_handler(headers: axum_06::http::HeaderMap) -> Json<Value> {
+    // Validate session ID if present, but don't require one
+    if let Some(sid) = headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok()) {
+        if let Some(server) = SERVER_INSTANCE.get() {
+            let sessions = server.session_handshakes.lock().unwrap();
+            if let Some(handshaked) = sessions.get(sid) {
+                if !handshaked {
+                    return Json(serde_json::json!({
+                        "error": "Invalid session. Call 'initialize' first."
+                    }));
+                }
+            }
+            // Unknown session ID on a discovery endpoint — allow it (client may be probing)
+        }
+    }
+
     // Only verify that the server instance exists.
     if SERVER_INSTANCE.get().is_none() {
         return Json(serde_json::json!({

@@ -530,26 +530,20 @@ impl ProjectRegistry {
         );
 
         let path_for_blocking = project_path.clone();
-        let stats = tokio::task::spawn_blocking(move || {
+        let temp = tokio::task::spawn_blocking(move || {
             let mut temp = LeIndex::new(&path_for_blocking).map_err(|e| {
                 JsonRpcError::init_failed(&path_for_blocking.display().to_string(), &e.to_string())
             })?;
             temp.index_project(force_reindex)
-                .map_err(|e| JsonRpcError::indexing_failed(format!("Indexing failed: {}", e)))
+                .map_err(|e| JsonRpcError::indexing_failed(format!("Indexing failed: {}", e)))?;
+            Ok::<LeIndex, JsonRpcError>(temp)
         })
         .await
         .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))??;
 
-        let mut fresh = LeIndex::new(&project_path).map_err(|e| {
-            JsonRpcError::init_failed(&project_path.display().to_string(), &e.to_string())
-        })?;
-        fresh.load_from_storage().map_err(|e| {
-            JsonRpcError::indexing_failed(format!("Failed to load indexed data: {}", e))
-        })?;
-
         {
             let mut idx = handle.write().await;
-            *idx = fresh;
+            *idx = temp;
         }
 
         // Invalidate stale-cache entry so get_or_create() won't reuse
@@ -558,6 +552,11 @@ impl ProjectRegistry {
             .canonicalize()
             .unwrap_or_else(|_| project_path.clone());
         self.stale_cache.write().await.remove(&canonical);
+
+        let stats = {
+            let idx = handle.read().await;
+            idx.get_stats().clone()
+        };
 
         Ok(stats)
     }

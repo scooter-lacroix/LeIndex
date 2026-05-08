@@ -28,6 +28,9 @@ pub struct ProjectConfig {
 
     /// Memory management settings
     pub memory: MemoryConfig,
+
+    /// Indexing settings
+    pub indexing: IndexingConfig,
 }
 
 impl ProjectConfig {
@@ -486,6 +489,19 @@ pub struct MemoryConfig {
 
     /// Maximum memory to use in MB (0 = unlimited)
     pub max_memory_mb: usize,
+}
+
+/// Indexing configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexingConfig {
+    /// Batch size for TF-IDF/index construction
+    pub batch_size: usize,
+}
+
+impl Default for IndexingConfig {
+    fn default() -> Self {
+        Self { batch_size: 10_000 }
+    }
 }
 
 impl Default for MemoryConfig {

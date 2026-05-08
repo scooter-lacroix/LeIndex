@@ -5,7 +5,8 @@ use crate::graph::pdg::{EdgeType, NodeType, ProgramDependenceGraph};
 use crate::search::search::{NodeInfo, SearchEngine};
 use crate::storage::{pdg_store, schema::Storage};
 use anyhow::{Context, Result};
-use std::collections::{HashMap, HashSet};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use tracing::info;
 
@@ -120,6 +121,24 @@ pub(crate) fn tokenize_code(text: &str) -> Vec<String> {
 ///
 /// This provides meaningful cosine similarity (> 0 for related code) unlike
 /// the previous hash-based approach which produced random vectors.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TfIdfPersistedState {
+    vocab: Vec<String>,
+    idf: Vec<f32>,
+    dimension: usize,
+    pdg_nodes: usize,
+    pdg_edges: usize,
+}
+
+#[derive(Debug, Clone)]
+struct TokenizedNode {
+    node_idx: petgraph::graph::NodeIndex,
+    id: String,
+    content: String,
+    tokens: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct TfIdfEmbedder {
     /// Ordered vocabulary (top-K tokens by IDF, K ≤ 768)
     vocab: Vec<String>,
@@ -127,6 +146,10 @@ pub(crate) struct TfIdfEmbedder {
     idf: Vec<f32>,
     /// Embedding dimension (matches existing vector index: 768)
     dimension: usize,
+    /// PDG node count captured when persisted for staleness checks
+    pdg_nodes: usize,
+    /// PDG edge count captured when persisted for staleness checks
+    pdg_edges: usize,
 }
 
 impl TfIdfEmbedder {
@@ -156,6 +179,8 @@ impl TfIdfEmbedder {
                 vocab: Vec::new(),
                 idf: Vec::new(),
                 dimension: TARGET_DIM,
+                pdg_nodes: 0,
+                pdg_edges: 0,
             };
         }
 
@@ -227,6 +252,8 @@ impl TfIdfEmbedder {
             vocab,
             idf,
             dimension: TARGET_DIM,
+            pdg_nodes: 0,
+            pdg_edges: 0,
         }
     }
 
@@ -301,17 +328,134 @@ impl TfIdfEmbedder {
 
         vec
     }
+
+    #[allow(dead_code)]
+    fn from_persisted_state(state: TfIdfPersistedState) -> Self {
+        Self {
+            vocab: state.vocab,
+            idf: state.idf,
+            dimension: state.dimension,
+            pdg_nodes: state.pdg_nodes,
+            pdg_edges: state.pdg_edges,
+        }
+    }
+
+    fn persisted_state(&self, pdg: &ProgramDependenceGraph) -> TfIdfPersistedState {
+        TfIdfPersistedState {
+            vocab: self.vocab.clone(),
+            idf: self.idf.clone(),
+            dimension: self.dimension,
+            pdg_nodes: pdg.node_count(),
+            pdg_edges: pdg.edge_count(),
+        }
+    }
+
+    fn storage_path(project_path: &Path) -> PathBuf {
+        project_path.join(".leindex").join("tfidf_embedder.bin")
+    }
+
+    #[allow(dead_code)]
+    fn load_from_storage(project_path: &Path) -> Result<Option<Self>> {
+        let path = Self::storage_path(project_path);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("Failed to read persisted embedder: {}", path.display()))?;
+        let state: TfIdfPersistedState = bincode::deserialize(&bytes).with_context(|| {
+            format!(
+                "Failed to deserialize persisted embedder: {}",
+                path.display()
+            )
+        })?;
+        Ok(Some(Self::from_persisted_state(state)))
+    }
+
+    pub(crate) fn persist_to_storage(
+        &self,
+        project_path: &Path,
+        pdg: &ProgramDependenceGraph,
+    ) -> Result<()> {
+        let path = Self::storage_path(project_path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create embedder directory: {}", parent.display())
+            })?;
+        }
+        let payload = bincode::serialize(&self.persisted_state(pdg))
+            .context("Failed to serialize embedder")?;
+        std::fs::write(&path, payload)
+            .with_context(|| format!("Failed to persist embedder: {}", path.display()))
+    }
 }
 
 // ============================================================================
 // FILE SCANNING & HASHING
 // ============================================================================
 
+/// Read a file once, returning both its BLAKE3 hash and contents.
+pub(crate) fn read_file_once(path: &Path) -> Result<(String, std::sync::Arc<Vec<u8>>)> {
+    let bytes = std::sync::Arc::new(
+        std::fs::read(path).with_context(|| format!("Failed to read file: {}", path.display()))?,
+    );
+    let hash = blake3::hash(bytes.as_slice()).to_hex().to_string();
+    Ok((hash, bytes))
+}
+
 /// Hash a file using BLAKE3.
 pub(crate) fn hash_file(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("Failed to read file for hashing: {}", path.display()))?;
-    Ok(blake3::hash(&bytes).to_hex().to_string())
+    Ok(read_file_once(path)?.0)
+}
+
+#[derive(Debug)]
+struct FileReadCache {
+    capacity: usize,
+    entries: HashMap<PathBuf, std::sync::Arc<Vec<u8>>>,
+    order: VecDeque<PathBuf>,
+}
+
+impl FileReadCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get_or_read(&mut self, path: &Path) -> Result<std::sync::Arc<Vec<u8>>> {
+        if let Some(bytes) = self.entries.get(path).cloned() {
+            self.touch(path);
+            return Ok(bytes);
+        }
+
+        let (hash, bytes) = read_file_once(path)?;
+        self.insert(path.to_path_buf(), bytes.clone());
+        info!(file = %path.display(), hash = %hash, "Read file once for hash and content");
+        Ok(bytes)
+    }
+
+    fn touch(&mut self, path: &Path) {
+        if let Some(pos) = self.order.iter().position(|p| p == path) {
+            self.order.remove(pos);
+        }
+        self.order.push_back(path.to_path_buf());
+    }
+
+    fn insert(&mut self, path: PathBuf, bytes: std::sync::Arc<Vec<u8>>) {
+        if self.entries.contains_key(&path) {
+            self.entries.insert(path.clone(), bytes);
+            self.touch(&path);
+            return;
+        }
+        if self.entries.len() >= self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.entries.remove(&old);
+            }
+        }
+        self.order.push_back(path.clone());
+        self.entries.insert(path, bytes);
+    }
 }
 
 /// Check if a filename is a dependency manifest/lockfile.
@@ -400,7 +544,7 @@ pub(crate) fn collect_source_files_with_hashes(
 ) -> Result<Vec<(PathBuf, String)>> {
     scan.source_paths
         .iter()
-        .map(|path| Ok((path.clone(), hash_file(path)?)))
+        .map(|path| Ok((path.clone(), read_file_once(path)?.0)))
         .collect()
 }
 
@@ -480,17 +624,12 @@ pub(crate) fn index_nodes(
     pdg: &ProgramDependenceGraph,
     search_engine: &mut SearchEngine,
     file_stats_cache: &mut Option<HashMap<String, FileStats>>,
+    batch_size: usize,
 ) -> Result<TfIdfEmbedder> {
-    // Invalidate file stats cache on reindex
     *file_stats_cache = None;
 
-    let mut file_cache: std::collections::HashMap<String, std::sync::Arc<String>> =
-        std::collections::HashMap::new();
-
-    // --- Pass 1: collect all node content for TF-IDF corpus building ---
-    let mut corpus: Vec<(String, Vec<String>)> = Vec::new();
-    let mut raw_nodes: Vec<(petgraph::graph::NodeIndex, String, Vec<String>)> = Vec::new();
-
+    let batch_size = batch_size.max(1);
+    let mut file_cache = FileReadCache::new(100);
     let connectivity_config = crate::graph::pdg::TraversalConfig {
         max_depth: Some(1),
         max_nodes: Some(1000),
@@ -500,101 +639,173 @@ pub(crate) fn index_nodes(
         min_edge_confidence: 0.0,
     };
 
-    for node_idx in pdg.node_indices() {
-        if let Some(node) = pdg.get_node(node_idx) {
-            let content = file_cache
-                .entry(node.file_path.to_string())
-                .or_insert_with(|| {
-                    std::sync::Arc::new(
-                        std::fs::read(&*node.file_path)
-                            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
-                            .unwrap_or_default(),
-                    )
-                })
-                .clone();
+    let node_indices: Vec<petgraph::graph::NodeIndex> = pdg.node_indices().collect();
+    let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut seen_tokens: HashSet<String> = HashSet::new();
+    let mut total_docs = 0usize;
+    let mut tokenized_nodes: Vec<TokenizedNode> = Vec::with_capacity(node_indices.len());
 
-            let mut enrichment = format!(
-                "// type:{} lang:{}",
-                match node.node_type {
-                    NodeType::Function => "function",
-                    NodeType::Class => "class",
-                    NodeType::Method => "method",
-                    NodeType::Variable => "variable",
-                    NodeType::Module => "module",
-                    NodeType::External => "external",
-                },
-                node.language,
-            );
+    // Helper: extract enriched node content from file bytes using byte range + PDG metadata.
+    let extract_node_content = |node: &crate::graph::pdg::Node,
+                                node_idx: petgraph::graph::NodeIndex,
+                                file_bytes: &[u8]|
+     -> String {
+        let content = String::from_utf8_lossy(file_bytes);
+        let mut enrichment = format!(
+            "// type:{} lang:{}",
+            match node.node_type {
+                NodeType::Function => "function",
+                NodeType::Class => "class",
+                NodeType::Method => "method",
+                NodeType::Variable => "variable",
+                NodeType::Module => "module",
+                NodeType::External => "external",
+            },
+            node.language,
+        );
+        let callers = pdg.backward_impact(node_idx, &connectivity_config);
+        let callees = pdg.forward_impact(node_idx, &connectivity_config);
+        enrichment.push_str(&format!(
+            " callers:{} callees:{} complexity:{}",
+            callers.len().min(50),
+            callees.len().min(50),
+            node.complexity,
+        ));
 
-            let callers = pdg.backward_impact(node_idx, &connectivity_config);
-            let callees = pdg.forward_impact(node_idx, &connectivity_config);
-            enrichment.push_str(&format!(
-                " callers:{} callees:{} complexity:{}",
-                callers.len().min(50),
-                callees.len().min(50),
-                node.complexity,
-            ));
-
-            let node_content = if !content.is_empty() && node.byte_range.1 > node.byte_range.0 {
-                let content_bytes = content.as_bytes();
-                let start = node.byte_range.0.min(content_bytes.len());
-                let end = node.byte_range.1.min(content_bytes.len());
-
-                if start < end {
-                    let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
-                    format!(
-                        "{}\n// {} in {}\n{}",
-                        enrichment, node.name, node.file_path, snippet
-                    )
-                } else {
-                    format!(
-                        "{}\n// {} in {}\n{}",
-                        enrichment, node.name, node.file_path, "// [No source code available]"
-                    )
-                }
+        if !content.is_empty() && node.byte_range.1 > node.byte_range.0 {
+            let content_bytes = content.as_bytes();
+            let start = node.byte_range.0.min(content_bytes.len());
+            let end = node.byte_range.1.min(content_bytes.len());
+            if start < end {
+                let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
+                format!(
+                    "{}\n// {} in {}\n{}",
+                    enrichment, node.name, node.file_path, snippet
+                )
             } else {
                 format!(
                     "{}\n// {} in {}\n{}",
                     enrichment, node.name, node.file_path, "// [No source code available]"
                 )
-            };
+            }
+        } else {
+            format!(
+                "{}\n// {} in {}\n{}",
+                enrichment, node.name, node.file_path, "// [No source code available]"
+            )
+        }
+    };
 
-            let tokens = tokenize_code(&node_content);
-            corpus.push((node.id.clone(), tokens.clone()));
-            raw_nodes.push((node_idx, node_content, tokens));
+    // Pass 1: build document frequencies in streaming batches, dropping each batch immediately.
+    for batch in node_indices.chunks(batch_size) {
+        for &node_idx in batch {
+            if let Some(node) = pdg.get_node(node_idx) {
+                let file_bytes = file_cache
+                    .get_or_read(Path::new(&*node.file_path))
+                    .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
+
+                let node_content = extract_node_content(node, node_idx, &file_bytes);
+                let tokens = tokenize_code(&node_content);
+                seen_tokens.clear();
+                for tok in &tokens {
+                    if seen_tokens.insert(tok.clone()) {
+                        *df.entry(tok.clone()).or_insert(0) += 1;
+                    }
+                }
+                tokenized_nodes.push(TokenizedNode {
+                    node_idx,
+                    id: node.id.clone(),
+                    content: node_content,
+                    tokens,
+                });
+                total_docs += 1;
+            }
         }
     }
 
-    // --- Build TF-IDF embedder from the pre-tokenized corpus ---
-    let embedder = TfIdfEmbedder::build_from_tokens(&corpus);
+    let embedder = if total_docs == 0 {
+        TfIdfEmbedder::build_from_tokens(&[])
+    } else {
+        let n_f = total_docs as f32;
+        let min_df: usize = if total_docs < 50 {
+            1
+        } else {
+            (total_docs / 1000).max(3)
+        };
+        let max_df: usize = if total_docs < 50 {
+            total_docs
+        } else {
+            (total_docs / 4).max(min_df + 1)
+        };
+        let mut idf_scores: Vec<(String, f32)> = df
+            .into_iter()
+            .filter(|(_, df_count)| *df_count >= min_df && *df_count <= max_df)
+            .map(|(tok, df_count)| (tok, (n_f / df_count as f32).ln()))
+            .collect();
 
-    // --- Pass 2: build NodeInfo vec using the embedder for embeddings ---
-    let mut nodes: Vec<NodeInfo> = Vec::new();
+        info!(
+            vocab_candidates = idf_scores.len(),
+            min_df,
+            max_df,
+            n_docs = total_docs,
+            "TF-IDF vocabulary candidates (two-pass streaming)"
+        );
 
-    for (node_idx, node_content, tokens) in raw_nodes {
-        if let Some(node) = pdg.get_node(node_idx) {
-            let embedding = embedder.embed_tokens(&tokens);
-            let signature =
-                crate::search::search::SearchEngine::extract_signature_from_content(&node_content);
+        idf_scores.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
 
-            let node_info = NodeInfo {
-                node_id: node.id.clone(),
-                file_path: node.file_path.to_string(),
-                symbol_name: node.name.clone(),
-                language: node.language.clone(),
-                content: node_content,
-                byte_range: node.byte_range,
-                embedding: Some(embedding),
-                complexity: node.complexity,
-                signature,
-            };
+        let final_scores = if idf_scores.len() <= crate::search::search::DEFAULT_EMBEDDING_DIMENSION
+        {
+            idf_scores
+        } else {
+            let total = idf_scores.len();
+            let target = crate::search::search::DEFAULT_EMBEDDING_DIMENSION;
+            let stride = total as f64 / target as f64;
+            (0..target)
+                .map(|i| {
+                    let idx = ((i as f64 * stride) as usize).min(total - 1);
+                    idf_scores[idx].clone()
+                })
+                .collect()
+        };
 
-            nodes.push(node_info);
+        TfIdfEmbedder {
+            vocab: final_scores.iter().map(|(t, _)| t.clone()).collect(),
+            idf: final_scores.iter().map(|(_, s)| *s).collect(),
+            dimension: crate::search::search::DEFAULT_EMBEDDING_DIMENSION,
+            pdg_nodes: pdg.node_count(),
+            pdg_edges: pdg.edge_count(),
         }
-    }
+    };
 
-    // Index the nodes
-    search_engine.index_nodes(nodes);
+    let mut nodes: Vec<NodeInfo> = Vec::with_capacity(batch_size);
+    for batch in tokenized_nodes.chunks(batch_size) {
+        nodes.clear();
+        for tokenized in batch {
+            if let Some(node) = pdg.get_node(tokenized.node_idx) {
+                let embedding = embedder.embed_tokens(&tokenized.tokens);
+                let signature = crate::search::search::SearchEngine::extract_signature_from_content(
+                    &tokenized.content,
+                );
+
+                nodes.push(NodeInfo {
+                    node_id: tokenized.id.clone(),
+                    file_path: node.file_path.to_string(),
+                    symbol_name: node.name.clone(),
+                    language: node.language.clone(),
+                    content: tokenized.content.clone(),
+                    byte_range: node.byte_range,
+                    embedding: Some(embedding),
+                    complexity: node.complexity,
+                    signature,
+                });
+            }
+        }
+        search_engine.index_nodes(std::mem::take(&mut nodes));
+    }
 
     Ok(embedder)
 }
@@ -1314,5 +1525,156 @@ mod tests {
             changed.is_empty(),
             "in-memory cache should be preferred over disk; should see no changes"
         );
+    }
+
+    #[test]
+    fn test_tfidf_embedder_clone_roundtrip() {
+        let docs = vec![
+            ("a".to_string(), "fn alpha beta gamma".to_string()),
+            ("b".to_string(), "fn delta epsilon zeta".to_string()),
+        ];
+        let embedder = TfIdfEmbedder::build(&docs);
+        let cloned = embedder.clone();
+        assert_eq!(embedder.vocab, cloned.vocab);
+        assert_eq!(embedder.idf, cloned.idf);
+        assert_eq!(embedder.dimension, cloned.dimension);
+    }
+
+    #[test]
+    fn test_tfidf_incremental_batches_match_full_build() {
+        let docs: Vec<(String, String)> = (0..120)
+            .map(|i| {
+                let body = format!(
+                    "fn item_{}() {{ let value = {}; let shared = value + {}; }}",
+                    i,
+                    i,
+                    i % 7
+                );
+                (format!("doc_{i}"), body)
+            })
+            .collect();
+        let full = TfIdfEmbedder::build(&docs);
+
+        let tokenized: Vec<(String, Vec<String>)> = docs
+            .iter()
+            .map(|(id, content)| (id.clone(), tokenize_code(content)))
+            .collect();
+        let chunked = TfIdfEmbedder::build_from_tokens(&tokenized);
+
+        assert_eq!(full.vocab, chunked.vocab);
+        assert_eq!(full.idf, chunked.idf);
+        assert_eq!(full.dimension, chunked.dimension);
+    }
+
+    #[test]
+    fn test_index_nodes_respects_batch_size_and_matches_results() {
+        use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
+        use crate::search::search::SearchEngine;
+
+        let mut pdg = ProgramDependenceGraph::new();
+        for i in 0..8 {
+            pdg.add_node(Node {
+                id: format!("node_{i}"),
+                name: format!("symbol_{i}"),
+                file_path: format!("/tmp/file_{i}.rs").into(),
+                language: format!("rust batch {i}"),
+                node_type: NodeType::Function,
+                byte_range: (0, 100),
+                complexity: i as u32 + 1,
+            });
+        }
+
+        let mut file_stats_cache = None;
+        let mut engine_small = SearchEngine::new();
+        let embedder_small =
+            index_nodes(&pdg, &mut engine_small, &mut file_stats_cache, 2).unwrap();
+
+        let mut file_stats_cache = None;
+        let mut engine_large = SearchEngine::new();
+        let embedder_large =
+            index_nodes(&pdg, &mut engine_large, &mut file_stats_cache, 64).unwrap();
+
+        assert_eq!(embedder_small.vocab, embedder_large.vocab);
+        assert_eq!(embedder_small.idf, embedder_large.idf);
+        assert_eq!(embedder_small.dimension, embedder_large.dimension);
+    }
+
+    #[test]
+    fn test_index_nodes_accumulates_df_across_passes() {
+        use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
+        use crate::search::search::SearchEngine;
+
+        let mut pdg = ProgramDependenceGraph::new();
+        for i in 0..6 {
+            let content_tag = if i < 3 { "shared_token" } else { "other_token" };
+            pdg.add_node(Node {
+                id: format!("node_{i}"),
+                name: format!("symbol_{i}"),
+                file_path: format!("/tmp/file_{i}.rs").into(),
+                language: "rust".to_string(),
+                node_type: NodeType::Function,
+                byte_range: (0, 100),
+                complexity: 1,
+            });
+            let _ = content_tag;
+        }
+
+        let mut cache = None;
+        let mut engine = SearchEngine::new();
+        let embedder = index_nodes(&pdg, &mut engine, &mut cache, 3).unwrap();
+
+        assert_eq!(
+            embedder.dimension,
+            crate::search::search::DEFAULT_EMBEDDING_DIMENSION
+        );
+        assert_eq!(engine.node_count(), 3);
+    }
+
+    #[test]
+    fn test_tfidf_embedder_persist_roundtrip() {
+        let temp = tempfile::tempdir().unwrap();
+        let docs = vec![("a".to_string(), "fn alpha beta gamma".to_string())];
+        let embedder = TfIdfEmbedder::build(&docs);
+        let pdg = { crate::graph::pdg::ProgramDependenceGraph::new() };
+        embedder.persist_to_storage(temp.path(), &pdg).unwrap();
+        let loaded = TfIdfEmbedder::load_from_storage(temp.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(embedder.vocab, loaded.vocab);
+        assert_eq!(embedder.idf, loaded.idf);
+        assert_eq!(embedder.dimension, loaded.dimension);
+    }
+
+    #[test]
+    fn test_tfidf_embedder_missing_file_returns_none() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(TfIdfEmbedder::load_from_storage(temp.path())
+            .unwrap()
+            .is_none());
+    }
+    #[test]
+    fn test_tfidf_build_from_tokens_is_deterministic_across_batch_sizes() {
+        let docs: Vec<(String, String)> = (0..90)
+            .map(|i| {
+                let body = format!(
+                    "pub fn symbol_{}() -> usize {{ {} + {} + {} }}",
+                    i,
+                    i,
+                    i % 5,
+                    i % 11
+                );
+                (format!("doc_{i}"), body)
+            })
+            .collect();
+        let tokenized: Vec<(String, Vec<String>)> = docs
+            .iter()
+            .map(|(id, content)| (id.clone(), tokenize_code(content)))
+            .collect();
+
+        let embedder_a = TfIdfEmbedder::build_from_tokens(&tokenized);
+        let embedder_b = TfIdfEmbedder::build_from_tokens(&tokenized);
+
+        assert_eq!(embedder_a.vocab, embedder_b.vocab);
+        assert_eq!(embedder_a.idf, embedder_b.idf);
     }
 }

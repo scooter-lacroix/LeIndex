@@ -6,7 +6,7 @@ use crate::cli::leindex::LeIndex;
 use crate::cli::mcp::handlers::{all_tool_handlers, ToolHandler};
 use crate::cli::mcp::output::{
     DiagnosticsFormatter, FileSummaryFormatter, ImpactFormatter, PhaseFormatter,
-    ProjectMapFormatter, SearchFormatter, SymbolLookupFormatter,
+    ProjectMapFormatter, SearchFormatter,
 };
 use crate::cli::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::cli::mcp::McpServer;
@@ -704,11 +704,7 @@ fn format_analysis_output(query: &str, result: &crate::cli::leindex::AnalysisRes
         out.push('\n');
         out.push_str(&format!("  {}{}{}\n", BOLD, "Context:", RESET));
         let context_str: &str = context.as_str();
-        let truncated = if context_str.len() > 300 {
-            format!("{}...", &context_str[..297])
-        } else {
-            context_str.to_string()
-        };
+        let truncated = crate::cli::mcp::output::truncate_chars(context_str, 300);
         out.push_str(&format!("  {}{}{}", DIM, truncated, RESET));
     }
 
@@ -732,9 +728,12 @@ async fn cmd_context_impl(
 
     let value = execute_tool_handler("leindex_context", args, project).await?;
 
-    // Use beautiful formatter for context output
-    let formatter = SymbolLookupFormatter::new();
-    println!("{}", formatter.format(&value));
+    let formatter = SearchFormatter::new();
+    let display_value = value
+        .get("results")
+        .cloned()
+        .unwrap_or_else(|| value.clone());
+    println!("{}", formatter.format(&display_value, &node_id));
 
     Ok(())
 }
@@ -901,8 +900,18 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
                     )
                 }
                 "leindex_context" | "context" | "leindex.context" => {
-                    let formatter = SymbolLookupFormatter::new();
-                    formatter.format(&value)
+                    let formatter = SearchFormatter::new();
+                    let display_value = value
+                        .get("results")
+                        .cloned()
+                        .unwrap_or_else(|| value.clone());
+                    formatter.format(
+                        &display_value,
+                        parsed_args
+                            .get("node_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                    )
                 }
                 "leindex_diagnostics" | "diagnostics" | "leindex.diagnostics" => {
                     let formatter = DiagnosticsFormatter::new();
@@ -1012,6 +1021,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         config: crate::cli::mcp::server::McpServerConfig::default(),
         _registry: registry.clone(),
         handshake_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        session_handshakes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
     crate::cli::mcp::server::SERVER_INSTANCE
         .set(Arc::new(server))
