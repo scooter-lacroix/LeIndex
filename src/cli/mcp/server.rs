@@ -308,7 +308,7 @@ pub async fn index_with_progress(
     let handle = registry.get_or_load(Some(project_path)).await?;
     let cached_stats = {
         let idx = handle.read().await;
-        if idx.is_indexed() && !force_reindex {
+        if idx.is_indexed() && !idx.is_stale_fast() && !force_reindex {
             Some(idx.get_stats().clone())
         } else {
             None
