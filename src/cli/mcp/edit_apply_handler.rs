@@ -213,7 +213,16 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             .clear(&storage_path, &canonical_path)
             .await;
 
-        // 5. PDG Context Enrichment
+        // 5. Incremental reindex to refresh the index with the edited file changes
+        // This ensures the index is fresh so subsequent tool calls don't show stale warnings
+        let mut guard = handle.write().await;
+        if let Err(e) = guard.incremental_reindex_from_watcher() {
+            tracing::warn!("Failed to refresh index after edit-apply: {}", e);
+            // Continue despite reindex failure - edit was applied successfully
+        }
+        drop(guard); // Release write lock before continuing
+
+        // 6. PDG Context Enrichment
         let mut affected_nodes: Vec<String> = Vec::new();
         let mut affected_files: std::collections::HashSet<String> =
             std::collections::HashSet::new();
