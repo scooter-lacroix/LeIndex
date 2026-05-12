@@ -207,7 +207,7 @@ fn maybe_remove_artifact(dir: &Path, cutoff: &SystemTime, report: &mut GcReport)
 
     // Determine age from the marker file or directory mtime
     let age = artifact_age(dir);
-    if age < *cutoff {
+    if age >= *cutoff {
         debug!(
             "Artifact {} is not stale yet (age: {:?})",
             dir.display(),

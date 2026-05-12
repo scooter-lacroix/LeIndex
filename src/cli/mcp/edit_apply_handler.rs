@@ -72,7 +72,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 },
                 "preview_token": {
                     "type": "string",
-                    "description":                     "The token returned by a previous LeIndex [Edit Preview] call. Required if using cached preview."
+                    "description": "The token returned by a previous LeIndex [Edit Preview] (tool: leindex.edit-preview) call. Required if using cached preview."
                 }
             },
             "required": ["file_path"]
@@ -204,7 +204,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 .await;
             return Err(JsonRpcError::invalid_params(
                 "Edit rejected: file content changed on disk since preview was generated. \
-                Please call LeIndex [Edit Preview] again.",
+                Please call LeIndex [Edit Preview] again (tool: leindex.edit-preview).",
             ));
         }
 

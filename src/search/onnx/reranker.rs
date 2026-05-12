@@ -214,10 +214,16 @@ impl QwenReranker {
                 .lock()
                 .map_err(|e| QwenRerankerError::RerankingFailed(format!("Failed to lock session: {}", e)))?;
             
-            let output_name = session.outputs().iter()
+            let outputs = session.outputs();
+            if outputs.is_empty() {
+                return Err(QwenRerankerError::RerankingFailed(
+                    "Model has no outputs".to_string()
+                ));
+            }
+            let output_name = outputs.iter()
                 .find(|output| output.name().contains("score") || output.name().contains("logits"))
                 .map(|output| output.name().to_string())
-                .unwrap_or_else(|| session.outputs()[0].name().to_string());
+                .unwrap_or_else(|| outputs[0].name().to_string());
             
             let outputs = session
                 .run(ort::inputs! {

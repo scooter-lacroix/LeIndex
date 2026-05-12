@@ -190,6 +190,12 @@ impl QwenEmbeddingProvider {
             let batch_size = 1;
             let seq_len = ids.len();
 
+            if seq_len == 0 {
+                return Err(QwenEmbeddingProviderError::Tokenizer(
+                    "Tokenization produced empty sequence".to_string()
+                ));
+            }
+
             // Create input tensors
             use ort::value::Tensor;
 
@@ -208,10 +214,16 @@ impl QwenEmbeddingProvider {
                 .map_err(|e| QwenEmbeddingProviderError::GenerationFailed(format!("Failed to lock session: {}", e)))?;
             
             // Get output names before running inference to avoid borrow issues
-            let output_name = session.outputs().iter()
+            let outputs = session.outputs();
+            if outputs.is_empty() {
+                return Err(QwenEmbeddingProviderError::GenerationFailed(
+                    "Model has no outputs".to_string()
+                ));
+            }
+            let output_name = outputs.iter()
                 .find(|output| output.name().contains("hidden") || output.name().contains("embedding"))
                 .map(|output| output.name().to_string())
-                .unwrap_or_else(|| session.outputs()[0].name().to_string());
+                .unwrap_or_else(|| outputs[0].name().to_string());
             
             let outputs = session
                 .run(ort::inputs! {
@@ -235,7 +247,7 @@ impl QwenEmbeddingProvider {
             if embedding.len() != self.embedding_dimension {
                 // If we got a different shape, we might need to pool or average
                 // For now, let's take the mean across the sequence length if needed
-                if embedding.len() % seq_len == 0 {
+                if seq_len > 0 && embedding.len() % seq_len == 0 {
                     let per_token_dim = embedding.len() / seq_len;
                     let mut pooled = vec![0.0f32; per_token_dim];
                     for (i, &val) in embedding.iter().enumerate() {
@@ -323,10 +335,16 @@ impl QwenEmbeddingProvider {
                 .lock()
                 .map_err(|e| QwenEmbeddingProviderError::GenerationFailed(format!("Failed to lock session: {}", e)))?;
             
-            let output_name = session.outputs().iter()
+            let outputs = session.outputs();
+            if outputs.is_empty() {
+                return Err(QwenEmbeddingProviderError::GenerationFailed(
+                    "Model has no outputs".to_string()
+                ));
+            }
+            let output_name = outputs.iter()
                 .find(|output| output.name().contains("hidden") || output.name().contains("embedding"))
                 .map(|output| output.name().to_string())
-                .unwrap_or_else(|| session.outputs()[0].name().to_string());
+                .unwrap_or_else(|| outputs[0].name().to_string());
             
             let outputs = session
                 .run(ort::inputs! {
@@ -359,7 +377,7 @@ impl QwenEmbeddingProvider {
                 // If the output has per-sequence embeddings, pool across sequence length
                 if per_token_dim > self.embedding_dimension {
                     let seq_len = encodings[i].len();
-                    if embedding.len() % seq_len == 0 {
+                    if seq_len > 0 && embedding.len() % seq_len == 0 {
                         let per_item_dim = embedding.len() / seq_len;
                         let mut pooled = vec![0.0f32; per_item_dim];
                         for (j, &val) in embedding.iter().enumerate() {
