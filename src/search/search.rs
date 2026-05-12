@@ -181,7 +181,15 @@ pub struct NodeInfo {
     /// Byte range in source
     pub byte_range: (usize, usize),
 
-    /// Node embedding (optional, for semantic search)
+    /// TF-IDF embedding (always present, 768-dim, for hybrid search)
+    #[serde(default)]
+    pub tfidf_embedding: Vec<f32>,
+
+    /// Neural/remote embedding (optional enhancement, for hybrid search)
+    pub neural_embedding: Option<Vec<f32>>,
+
+    /// Legacy embedding field (points to tfidf_embedding for backward compatibility)
+    #[serde(default)]
     pub embedding: Option<Vec<f32>>,
 
     /// Complexity score (0-100+, higher = more complex)
@@ -460,7 +468,7 @@ impl SearchEngine {
     /// # Panics
     ///
     /// Panics if node count exceeds MAX_NODES (prevents memory exhaustion).
-    pub fn index_nodes(&mut self, nodes: Vec<NodeInfo>) {
+    pub fn index_nodes(&mut self, mut nodes: Vec<NodeInfo>) {
         if nodes.len() > MAX_NODES {
             panic!(
                 "Cannot index more than {} nodes (provided: {})",
@@ -516,21 +524,29 @@ impl SearchEngine {
             self.node_tokens.insert(node.node_id.clone(), tokens);
         }
 
-        // Build vector index from embeddings — clone only embeddings (A4 optimization)
+        // Build vector index from TF-IDF embeddings — clone only embeddings (A4 optimization)
         // All other node content is moved via ownership, avoiding a full Vec clone
-        for node in &nodes {
-            if let Some(embedding) = &node.embedding {
+        for node in nodes.iter_mut() {
+            // Use tfidf_embedding (always present) instead of optional embedding
+            if !node.tfidf_embedding.is_empty() {
                 if let Err(e) = self
                     .vector_index
-                    .insert(node.node_id.clone(), embedding.clone())
+                    .insert(node.node_id.clone(), node.tfidf_embedding.clone())
                 {
                     tracing::warn!(
-                        "Failed to insert embedding for node {}: {:?}",
+                        "Failed to insert TF-IDF embedding for node {}: {:?}",
                         node.node_id,
                         e
                     );
                 }
             }
+
+            // For backward compatibility, set embedding to tfidf_embedding
+            node.embedding = if !node.tfidf_embedding.is_empty() {
+                Some(node.tfidf_embedding.clone())
+            } else {
+                None
+            };
         }
 
         // Move nodes into storage — no clone needed since indexes are already built
@@ -702,12 +718,19 @@ impl SearchEngine {
         self.complexity_cache
             .insert(node_id.clone(), node.complexity);
 
-        // Insert embedding into vector index
-        if let Some(embedding) = &node.embedding {
-            if let Err(e) = self.vector_index.insert(node_id.clone(), embedding.clone()) {
-                tracing::warn!("Failed to insert embedding for node {}: {:?}", node_id, e);
+        // Insert TF-IDF embedding into vector index (always present)
+        if !node.tfidf_embedding.is_empty() {
+            if let Err(e) = self.vector_index.insert(node_id.clone(), node.tfidf_embedding.clone()) {
+                tracing::warn!("Failed to insert TF-IDF embedding for node {}: {:?}", node_id, e);
             }
         }
+
+        // For backward compatibility, set embedding to tfidf_embedding
+        node.embedding = if !node.tfidf_embedding.is_empty() {
+            Some(node.tfidf_embedding.clone())
+        } else {
+            None
+        };
 
         // Extract signature before clearing content (same as index_nodes does)
         node.signature = Self::extract_signature_from_content(&node.content);
@@ -878,52 +901,50 @@ impl SearchEngine {
                 &node.file_path,
             );
 
-            // Get semantic score from vector search results
-            let semantic_score = if query.semantic {
+            // Get TF-IDF score from vector search results
+            let tfidf_score = if query.semantic {
                 *vector_results.get(&node.node_id).unwrap_or(&0.0)
             } else {
                 0.0
             };
 
             // For now, if no text match and not semantic, skip
-            if text_score == 0.0 && !query.semantic && semantic_score == 0.0 {
+            if text_score == 0.0 && !query.semantic && tfidf_score == 0.0 {
                 continue;
             }
 
             // Normalize complexity to 0-1 range (divide by 100, not 10)
             let structural_score = (node.complexity as f32 / 100.0).min(1.0);
 
+            // Neural score is 0.0 in this context (vector index only has TF-IDF embeddings)
+            let neural_score = 0.0;
+
             // Use custom weights based on query type if provided
             let score = if let Some(qt) = query.query_type {
                 match qt {
                     crate::search::ranking::QueryType::Text => {
                         // Prose/Text mode: heavily favor keyword overlap
-                        self.scorer.with_weights(0.2, 0.05, 0.75).score(
-                            semantic_score,
-                            structural_score,
-                            text_score,
-                        )
+                        self.scorer
+                            .with_weights_hybrid(0.2, 0.05, 0.05, 0.7)
+                            .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
                     }
                     crate::search::ranking::QueryType::Semantic => {
                         // Semantic-heavy mode
-                        self.scorer.with_weights(0.7, 0.1, 0.2).score(
-                            semantic_score,
-                            structural_score,
-                            text_score,
-                        )
+                        self.scorer
+                            .with_weights_hybrid(0.7, 0.1, 0.1, 0.1)
+                            .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
                     }
                     crate::search::ranking::QueryType::Structural => {
                         // Structural-heavy mode
-                        self.scorer.with_weights(0.3, 0.5, 0.2).score(
-                            semantic_score,
-                            structural_score,
-                            text_score,
-                        )
+                        self.scorer
+                            .with_weights_hybrid(0.3, 0.0, 0.5, 0.2)
+                            .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
                     }
                 }
             } else {
+                // Default hybrid scoring
                 self.scorer
-                    .score(semantic_score, structural_score, text_score)
+                    .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
             };
 
             if score.overall > 0.0 {
@@ -1333,6 +1354,8 @@ mod tests {
                 content: "fn func1() { println!(\"hello\"); }".to_string(),
                 byte_range: (0, 40),
                 embedding: Some(vec![1.0, 0.0, 0.0]),
+                tfidf_embedding: vec![1.0, 0.0, 0.0],
+                neural_embedding: None,
                 complexity: 2,
                 signature: None,
                 pre_tokenized: None,
@@ -1345,6 +1368,8 @@ mod tests {
                 content: "fn func2() { println!(\"world\"); }".to_string(),
                 byte_range: (42, 82),
                 embedding: Some(vec![0.0, 1.0, 0.0]),
+                tfidf_embedding: vec![0.0, 1.0, 0.0],
+                neural_embedding: None,
                 complexity: 2,
                 signature: None,
                 pre_tokenized: None,
@@ -1537,6 +1562,8 @@ mod tests {
             content: "fn new_func() {}".to_string(),
             byte_range: (0, 18),
             embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
             complexity: 1,
             signature: None,
             pre_tokenized: None,
@@ -1642,6 +1669,8 @@ mod tests {
             content: "fn new_func() {}".to_string(),
             byte_range: (0, 18),
             embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
             complexity: 1,
             signature: None,
             pre_tokenized: None,
@@ -1707,6 +1736,8 @@ mod tests {
                 content: "fn func3() { db_query(); }".to_string(),
                 byte_range: (100, 130),
                 embedding: Some(vec![0.0, 0.0, 1.0]),
+                tfidf_embedding: vec![0.0, 0.0, 1.0],
+                neural_embedding: None,
                 complexity: 3,
                 signature: None,
                 pre_tokenized: None,
@@ -1808,6 +1839,8 @@ mod tests {
                 content: "fn func1_renamed() { new_logic(); }".to_string(),
                 byte_range: (0, 35),
                 embedding: Some(vec![0.5, 0.5, 0.0]),
+                tfidf_embedding: vec![0.5, 0.5, 0.0],
+                neural_embedding: None,
                 complexity: 5,
                 signature: None,
                 pre_tokenized: None,
@@ -1858,6 +1891,8 @@ mod tests {
                     content: "fn func3() {}".to_string(),
                     byte_range: (0, 14),
                     embedding: None,
+                    tfidf_embedding: vec![],
+                    neural_embedding: None,
                     complexity: 1,
                     signature: None,
                     pre_tokenized: None,
@@ -1870,6 +1905,8 @@ mod tests {
                     content: "fn func4() { helper(); }".to_string(),
                     byte_range: (15, 40),
                     embedding: None,
+                    tfidf_embedding: vec![],
+                    neural_embedding: None,
                     complexity: 2,
                     signature: None,
                     pre_tokenized: None,
@@ -1934,6 +1971,8 @@ mod tests {
                 content: "fn unique1() { zebra(); }".to_string(),
                 byte_range: (0, 25),
                 embedding: None,
+                tfidf_embedding: vec![],
+                neural_embedding: None,
                 complexity: 1,
                 signature: None,
                 pre_tokenized: None,
@@ -1946,6 +1985,8 @@ mod tests {
                 content: "fn unique2() { apple(); }".to_string(),
                 byte_range: (26, 52),
                 embedding: None,
+                tfidf_embedding: vec![],
+                neural_embedding: None,
                 complexity: 1,
                 signature: None,
                 pre_tokenized: None,
@@ -1994,6 +2035,8 @@ mod tests {
                 content: "fn func3() { compute(); }".to_string(),
                 byte_range: (0, 25),
                 embedding: Some(vec![1.0, 1.0, 0.0]),
+                tfidf_embedding: vec![1.0, 1.0, 0.0],
+                neural_embedding: None,
                 complexity: 4,
                 signature: None,
                 pre_tokenized: None,
@@ -2011,6 +2054,8 @@ mod tests {
                 content: "fn func2() { println!(\"world\"); }".to_string(),
                 byte_range: (42, 82),
                 embedding: Some(vec![0.0, 1.0, 0.0]),
+                tfidf_embedding: vec![0.0, 1.0, 0.0],
+                neural_embedding: None,
                 complexity: 2,
                 signature: None,
                 pre_tokenized: None,
@@ -2023,6 +2068,8 @@ mod tests {
                 content: "fn func3() { compute(); }".to_string(),
                 byte_range: (0, 25),
                 embedding: Some(vec![1.0, 1.0, 0.0]),
+                tfidf_embedding: vec![1.0, 1.0, 0.0],
+                neural_embedding: None,
                 complexity: 4,
                 signature: None,
                 pre_tokenized: None,
@@ -2086,6 +2133,8 @@ mod tests {
                 content: "fn func3() {}".to_string(),
                 byte_range: (0, 14),
                 embedding: Some(vec![0.1, 0.1, 0.9]),
+                tfidf_embedding: vec![0.1, 0.1, 0.9],
+                neural_embedding: None,
                 complexity: 1,
                 signature: None,
                 pre_tokenized: None,
@@ -2116,6 +2165,8 @@ mod tests {
                 content: "fn func3() {}".to_string(),
                 byte_range: (0, 14),
                 embedding: None,
+                tfidf_embedding: vec![],
+                neural_embedding: None,
                 complexity: 1,
                 signature: None,
                 pre_tokenized: None,
@@ -2172,6 +2223,8 @@ mod tests {
                 content: "fn func3() { important_content(); }".to_string(),
                 byte_range: (0, 40),
                 embedding: None,
+                tfidf_embedding: vec![],
+                neural_embedding: None,
                 complexity: 3,
                 signature: None,
                 pre_tokenized: None,
@@ -2223,6 +2276,8 @@ mod tests {
             content: content.to_string(),
             byte_range: (0, content.len()),
             embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
             complexity: 3,
             signature: None,
             pre_tokenized: Some(search_tokens),
@@ -2238,6 +2293,8 @@ mod tests {
             content: content.to_string(),
             byte_range: (0, content.len()),
             embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
             complexity: 3,
             signature: None,
             pre_tokenized: None,
@@ -2284,6 +2341,8 @@ mod tests {
             content: "fn legacy_func() { return 42; }".to_string(),
             byte_range: (0, 30),
             embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
             complexity: 1,
             signature: None,
             pre_tokenized: None,
@@ -2336,6 +2395,8 @@ mod tests {
             content: content.to_string(),
             byte_range: (0, content.len()),
             embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
             complexity: 5,
             signature: None,
             pre_tokenized: Some(tokens),
@@ -2351,6 +2412,8 @@ mod tests {
             content: content.to_string(),
             byte_range: (0, content.len()),
             embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
             complexity: 5,
             signature: None,
             pre_tokenized: None,
@@ -2392,6 +2455,8 @@ mod tests {
                 content: new_content.to_string(),
                 byte_range: (0, new_content.len()),
                 embedding: None,
+                tfidf_embedding: vec![],
+                neural_embedding: None,
                 complexity: 4,
                 signature: None,
                 pre_tokenized: Some(tokens),

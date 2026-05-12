@@ -491,6 +491,50 @@ pub struct MemoryConfig {
     pub max_memory_mb: usize,
 }
 
+/// Embedding configuration for hybrid embedding system
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmbeddingConfig {
+    /// Enable hybrid embeddings (TF-IDF + neural/remote)
+    #[serde(default = "default_enable_hybrid")]
+    pub enable_hybrid: bool,
+
+    /// Neural embedding weight in hybrid scoring (0.0-1.0)
+    #[serde(default = "default_neural_weight")]
+    pub neural_weight: f32,
+
+    /// Remote embedding API endpoint (if using remote embeddings)
+    #[serde(default)]
+    pub remote_endpoint: Option<String>,
+
+    /// Remote embedding API key (if using remote embeddings)
+    #[serde(default)]
+    pub remote_api_key: Option<String>,
+
+    /// Local ONNX model path (if using local neural embeddings)
+    #[serde(default)]
+    pub onnx_model_path: Option<String>,
+}
+
+const fn default_enable_hybrid() -> bool {
+    false // Default to TF-IDF only for compatibility
+}
+
+const fn default_neural_weight() -> f32 {
+    0.4 // Default neural weight from HybridScoringWeights
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            enable_hybrid: default_enable_hybrid(),
+            neural_weight: default_neural_weight(),
+            remote_endpoint: None,
+            remote_api_key: None,
+            onnx_model_path: None,
+        }
+    }
+}
+
 /// Indexing configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexingConfig {
@@ -511,6 +555,10 @@ pub struct IndexingConfig {
     /// when this limit is exceeded (0 = unlimited).
     #[serde(default = "default_max_total_size")]
     pub max_total_size: u64,
+
+    /// Embedding configuration for hybrid system
+    #[serde(default)]
+    pub embeddings: EmbeddingConfig,
 }
 
 const fn default_max_files() -> usize {
@@ -530,6 +578,7 @@ impl Default for IndexingConfig {
             max_files: default_max_files(),
             max_file_size: default_max_file_size(),
             max_total_size: default_max_total_size(),
+            embeddings: EmbeddingConfig::default(),
         }
     }
 }

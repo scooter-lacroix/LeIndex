@@ -607,7 +607,16 @@ async fn cmd_index_impl(
     info!("Indexing project at: {}", canonical_path.display());
 
     // Check if already indexed (unless force)
-    // TODO: Add force check logic
+    if !force {
+        // Create temporary LeIndex to check if already indexed
+        if let Ok(check_leindex) = LeIndex::new(&canonical_path) {
+            if check_leindex.is_indexed() {
+                println!("Project already indexed. Use --force to re-index.");
+                println!("  Use --force to re-index if you have made changes.");
+                return Ok(());
+            }
+        }
+    }
 
     // Apply hard RSS limit via rlimit if requested (Linux-only)
     if let Some(mb) = max_memory {
@@ -681,7 +690,8 @@ async fn cmd_search_impl(
                 "file_path": r.file_path,
                 "node_id": r.node_id,
                 "score": r.score.overall,
-                "semantic_score": r.score.semantic,
+                "tfidf_score": r.score.tfidf,
+                "neural_score": r.score.neural,
                 "text_score": r.score.text_match,
                 "structural_score": r.score.structural,
                 "context": r.context,

@@ -475,7 +475,8 @@ pub mod languages {
         }
     }
 
-    // Swift language implementation - disabled due to tree-sitter version incompatibility (grammar v15 vs library v13-14)
+    /// Swift language implementation (disabled due to tree-sitter version conflicts)
+    // #[cfg(feature = "parse")]
     // pub mod swift {
     //     use super::{LanguageConfig, Language};
     //     use once_cell::sync::Lazy;
@@ -491,8 +492,8 @@ pub mod languages {
     //     }
     // }
 
-    // TODO: Kotlin support disabled due to tree-sitter version incompatibility (0.20.10 vs 0.24.7)
-    // The kotlin crate depends on an older version of tree-sitter, causing duplicate symbol errors
+    /// Kotlin language implementation (disabled due to tree-sitter version conflicts)
+    // #[cfg(feature = "parse")]
     // pub mod kotlin {
     //     use super::{LanguageConfig, Language};
     //     use once_cell::sync::Lazy;
@@ -504,11 +505,12 @@ pub mod languages {
     //     });
     //
     //     pub fn language() -> Language {
-    //         tree_sitter_kotlin::language()
+    //         unsafe { std::mem::transmute(tree_sitter_kotlin::language()) }
     //     }
     // }
 
-    // Dart language implementation - disabled due to parsing issues
+    /// Dart language implementation (disabled due to tree-sitter version conflicts)
+    // #[cfg(feature = "parse")]
     // pub mod dart {
     //     use super::{LanguageConfig, Language};
     //     use once_cell::sync::Lazy;
@@ -520,7 +522,7 @@ pub mod languages {
     //     });
     //
     //     pub fn language() -> Language {
-    //         tree_sitter_dart::language()
+    //         tree_sitter_dart::LANGUAGE.into()
     //     }
     // }
 

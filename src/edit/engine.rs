@@ -1194,6 +1194,9 @@ impl WorktreeSession {
 
     /// Synchronous merge implementation — performs file I/O.
     /// Separated from the async wrapper to avoid blocking the executor.
+    /// 
+    /// Uses a streaming approach with temp-file renames for atomicity without 
+    /// full buffering, suitable for projects with very large files.
     fn merge_blocking(session: WorktreeSession) -> Result<()> {
         let WorktreeSession {
             path,
@@ -1203,37 +1206,16 @@ impl WorktreeSession {
         let mut staged_entries: Vec<(PathBuf, PathBuf)> = tracked_files.into_iter().collect();
         staged_entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-        // Phase 1 (prepare): read all staged files, back up originals, create dirs.
-        // If any prepare step fails, nothing has been written yet — just return the error.
-        let mut backups: Vec<(PathBuf, bool, Option<String>)> = Vec::new();
-        // TODO: The two-phase approach reads all staged content into memory for
-        // rollback safety. For projects with very large files, consider a streaming
-        // approach with temp-file renames for atomicity without full buffering.
-        let mut prepared: Vec<(PathBuf, String)> = Vec::new(); // (original, staged_content)
+        // Phase 1 (prepare): create directories and prepare backup paths.
+        // This phase does not modify any existing files.
+        let mut backups: Vec<(PathBuf, PathBuf, bool)> = Vec::new(); // (original, backup_path, file_existed)
 
         for (original, staged) in &staged_entries {
             let file_existed = original.exists();
-            let backup = if file_existed {
-                Some(std::fs::read_to_string(original).map_err(|e| {
-                    EditError::WorktreeError(format!(
-                        "Failed to back up original file '{}': {}",
-                        original.display(),
-                        e
-                    ))
-                })?)
-            } else {
-                None
-            };
-            backups.push((original.clone(), file_existed, backup));
+            let backup_path = PathBuf::from(format!("{}.leindex_bak", original.display()));
+            backups.push((original.clone(), backup_path, file_existed));
 
-            let content = std::fs::read_to_string(staged).map_err(|e| {
-                EditError::WorktreeError(format!(
-                    "Failed to read staged file '{}': {}",
-                    staged.display(),
-                    e
-                ))
-            })?;
-
+            // Create destination directory if needed
             if let Some(parent) = original.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| {
                     EditError::WorktreeError(format!(
@@ -1244,37 +1226,74 @@ impl WorktreeSession {
                 })?;
             }
 
-            prepared.push((original.clone(), content));
+            // Ensure staged file exists
+            if !staged.exists() {
+                return Err(EditError::WorktreeError(format!(
+                    "Staged file '{}' does not exist",
+                    staged.display()
+                )));
+            }
         }
 
-        // Phase 2 (write): apply all prepared writes. On failure, roll back everything.
-        for (written, (original, content)) in prepared.iter().enumerate() {
-            if let Err(e) = std::fs::write(original, content.as_bytes()) {
-                // Roll back all previously written files AND the failed file
-                for (backup_path, file_existed, backup_content) in
-                    backups.iter().take(written + 1).rev()
-                {
-                    if !file_existed {
-                        let _ = std::fs::remove_file(backup_path);
-                    } else if let Some(previous) = backup_content {
-                        if let Err(restore_err) = std::fs::write(backup_path, previous.as_bytes()) {
-                            tracing::error!(
-                                "CRITICAL: Failed to restore '{}' during rollback: {}",
-                                backup_path.display(),
-                                restore_err
-                            );
-                        }
+        // Phase 2 (apply): For each file, use atomic rename operations for safety.
+        // Process files in reverse order during rollback.
+        for (written, (original, staged)) in staged_entries.iter().enumerate() {
+            let backup_path = &backups[written].1;
+            let file_existed = backups[written].2;
+
+            // Step 1: Backup original file by renaming (atomic)
+            if file_existed {
+                if let Err(e) = std::fs::rename(original, backup_path) {
+                    // Roll back previously processed files
+                    Self::rollback_merge(&backups[..written], &path);
+                    return Err(EditError::WorktreeError(format!(
+                        "Failed to backup original file '{}' to '{}': {}",
+                        original.display(),
+                        backup_path.display(),
+                        e
+                    )));
+                }
+            }
+
+            // Step 2: Rename staged file to original (atomic)
+            if let Err(e) = std::fs::rename(staged, original) {
+                // Restore backup if it was created
+                if file_existed && backup_path.exists() {
+                    if let Err(restore_err) = std::fs::rename(backup_path, original) {
+                        tracing::error!(
+                            "CRITICAL: Failed to restore '{}' from backup during rollback: {}",
+                            original.display(),
+                            restore_err
+                        );
                     }
                 }
+                
+                // Roll back previously processed files
+                Self::rollback_merge(&backups[..written], &path);
+                
                 return Err(EditError::WorktreeError(format!(
-                    "Failed to merge staged file into '{}': {}",
+                    "Failed to merge staged file '{}' into '{}': {}",
+                    staged.display(),
                     original.display(),
                     e
                 )));
             }
         }
 
-        // Cleanup: remove the worktree directory
+        // Phase 3 (cleanup): remove backup files and worktree directory
+        for (_original, backup_path, file_existed) in &backups {
+            if *file_existed && backup_path.exists() {
+                if let Err(e) = std::fs::remove_file(backup_path) {
+                    tracing::warn!(
+                        "Failed to remove backup file '{}': {}",
+                        backup_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+
+        // Remove the worktree directory
         if path.exists() {
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 // Post-commit cleanup failure — log but don't fail the merge
@@ -1282,6 +1301,33 @@ impl WorktreeSession {
             }
         }
         Ok(())
+    }
+
+    /// Roll back merge by restoring backup files
+    fn rollback_merge(backups: &[(PathBuf, PathBuf, bool)], _worktree_path: &Path) {
+        for (original, backup_path, file_existed) in backups.iter().rev() {
+            // If a backup exists, restore it
+            if *file_existed && backup_path.exists() {
+                if let Err(e) = std::fs::rename(backup_path, original) {
+                    tracing::error!(
+                        "CRITICAL: Failed to restore '{}' from backup during rollback: {}",
+                        original.display(),
+                        e
+                    );
+                }
+            }
+            // If original was newly created (didn't exist), remove it
+            else if original.exists() {
+                let _ = std::fs::remove_file(original);
+            }
+        }
+        
+        // Clean up any remaining backup files
+        for (_, backup_path, file_existed) in backups {
+            if *file_existed && backup_path.exists() {
+                let _ = std::fs::remove_file(backup_path);
+            }
+        }
     }
 }
 

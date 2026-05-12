@@ -100,7 +100,8 @@ pub async fn list_codebases(
                 COALESCE(nc.node_count, 0) AS node_count,
                 COALESCE(ec.edge_count, 0) AS edge_count,
                 pm.is_clone,
-                pm.cloned_from
+                pm.cloned_from,
+                pm.last_indexed
             FROM project_metadata pm
             LEFT JOIN (
                 SELECT project_id, COUNT(*) AS file_count
@@ -128,6 +129,9 @@ pub async fn list_codebases(
 
     let projects = stmt
         .query_map([], |row| {
+            let last_indexed: Option<String> = row.get(11).ok();
+            let last_indexed_str = last_indexed.unwrap_or_else(|| "Unknown".to_string());
+            
             Ok(CodebaseResponse {
                 id: row.get::<_, String>(0)?,
                 unique_project_id: row.get::<_, String>(0)?,
@@ -137,7 +141,7 @@ pub async fn list_codebases(
                 project_path: row.get(4)?,
                 display_name: row.get(5)?,
                 project_type: "Rust".to_string(), // Default for now
-                last_indexed: "Unknown".to_string(), // TODO: Add timestamp tracking
+                last_indexed: last_indexed_str,
                 file_count: row.get(6)?,
                 node_count: row.get(7)?,
                 edge_count: row.get(8)?,
@@ -622,6 +626,18 @@ pub async fn get_file_tree(
 
     let conn = storage.conn();
 
+    // Get project path for file size resolution
+    let project_path: String = conn
+        .query_row(
+            "SELECT canonical_path FROM project_metadata WHERE unique_project_id = ?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .map_err(|e| {
+            error!("Failed to query project path: {}", e);
+            ApiError::internal(format!("Database query error: {}", e))
+        })?;
+
     // Query indexed files for the project
     let mut stmt = conn
         .prepare(
@@ -642,6 +658,13 @@ pub async fn get_file_tree(
     let files = stmt
         .query_map([&id], |row| {
             let file_path: String = row.get(0)?;
+            
+            // Get actual file size
+            let full_path = std::path::PathBuf::from(&project_path).join(&file_path);
+            let size = std::fs::metadata(&full_path)
+                .map(|m| Some(m.len()))
+                .unwrap_or(None);
+            
             Ok(FileNode {
                 name: file_path
                     .rsplit('/')
@@ -650,7 +673,7 @@ pub async fn get_file_tree(
                     .to_string(),
                 node_type: "file".to_string(),
                 path: file_path.clone(),
-                size: None, // TODO: Get actual file size
+                size,
                 last_modified: None,
                 children: vec![],
             })
@@ -814,8 +837,23 @@ pub async fn websocket_handler(
                                 Message::Close(_) => {
                                     break;
                                 }
+                                Message::Text(text) => {
+                                    // Parse client message
+                                    if let Ok(client_message) = serde_json::from_str::<crate::server::websocket::WsClientMessage>(&text) {
+                                        let conn_id_str = conn_id.clone();
+                                        let manager_clone = manager.clone();
+                                        tokio::spawn(async move {
+                                            manager_clone.handle_client_message(&conn_id_str, client_message).await;
+                                        });
+                                    } else {
+                                        tracing::warn!("Failed to parse WebSocket message: {}", text);
+                                    }
+                                }
+                                Message::Ping(_) | Message::Pong(_) => {
+                                    // Handle ping/pong frames (WebSocket protocol-level)
+                                }
                                 _ => {
-                                    // TODO: Handle client messages (subscriptions, etc.)
+                                    // Ignore binary and other message types
                                 }
                             }
                         }

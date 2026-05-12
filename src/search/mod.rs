@@ -21,12 +21,25 @@ pub mod semantic;
 /// Vector storage and indexing.
 pub mod vector;
 
+/// ONNX Runtime neural embeddings (R15 - optional feature)
+#[cfg(feature = "onnx")]
+pub mod onnx;
+
 pub use hnsw::{HNSWIndex, HNSWParams, IndexError};
 pub use query::{ParsedQuery, QueryIntent, QueryParser};
 pub use ranking::{HybridScorer, Score};
 pub use search::{NodeInfo, SearchEngine, SearchQuery, SearchResult, SemanticEntry};
 pub use semantic::SemanticProcessor;
 pub use vector::VectorIndex;
+
+#[cfg(feature = "onnx")]
+pub use onnx::{QwenEmbeddingProvider, QwenReranker};
+
+#[cfg(feature = "remote-embeddings")]
+pub use onnx::{
+    GenericRemoteProvider, OpenAIEmbeddingProvider, RemoteEmbeddingConfig, RemoteEmbeddingError,
+    RemoteProvider,
+};
 
 /// Search library initialization
 pub fn init() {

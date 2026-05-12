@@ -12,6 +12,32 @@ pub const MAX_WS_MESSAGE_SIZE: usize = 1_000_000;
 /// Maximum WebSocket frame size (16KB) to prevent memory exhaustion
 pub const MAX_WS_FRAME_SIZE: usize = 16_384;
 
+/// Client-to-server WebSocket message types
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum WsClientMessage {
+    /// Subscribe to project updates
+    #[serde(rename = "subscribe")]
+    Subscribe {
+        /// Project ID to subscribe to
+        project_id: String,
+    },
+
+    /// Unsubscribe from project updates
+    #[serde(rename = "unsubscribe")]
+    Unsubscribe {
+        /// Project ID to unsubscribe from
+        project_id: String,
+    },
+
+    /// Ping/heartbeat
+    #[serde(rename = "ping")]
+    Ping {
+        /// Optional timestamp
+        timestamp: Option<u64>,
+    },
+}
+
 /// WebSocket event types
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -199,6 +225,46 @@ impl WsManager {
     /// Get connection info by ID
     pub async fn get_connection(&self, id: &str) -> Option<ConnectionState> {
         self.connections.read().await.get(id).cloned()
+    }
+
+    /// Handle client message and update connection state
+    pub async fn handle_client_message(&self, conn_id: &str, message: WsClientMessage) {
+        match message {
+            WsClientMessage::Subscribe { project_id } => {
+                info!(
+                    "Connection {} subscribing to project {}",
+                    conn_id, project_id
+                );
+                let mut connections = self.connections.write().await;
+                if let Some(state) = connections.get_mut(conn_id) {
+                    state.subscribe(project_id);
+                }
+            }
+            WsClientMessage::Unsubscribe { project_id } => {
+                info!(
+                    "Connection {} unsubscribing from project {}",
+                    conn_id, project_id
+                );
+                let mut connections = self.connections.write().await;
+                if let Some(state) = connections.get_mut(conn_id) {
+                    state.unsubscribe(&project_id);
+                }
+            }
+            WsClientMessage::Ping { timestamp } => {
+                // Respond with pong (heartbeat)
+                let pong_timestamp = timestamp.unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap()
+                        .as_millis() as u64
+                });
+                let event = WsEvent::Heartbeat {
+                    timestamp: pong_timestamp,
+                };
+                // Send heartbeat to all clients (broadcast)
+                self.broadcast(event).await;
+            }
+        }
     }
 }
 

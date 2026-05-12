@@ -127,7 +127,7 @@ impl LeIndex {
         // can embed changed-file nodes with the same TF-IDF vocabulary.  Do NOT
         // call index_nodes_with_embedder() here — that processes ALL nodes and
         // populates the search engine from scratch (i.e. a full rebuild).
-        let embedder = index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
+        let tfidf_embedder = index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
             .ok()
             .flatten()
             .unwrap_or_else(|| {
@@ -135,6 +135,9 @@ impl LeIndex {
                 // changed-file node tokens so we can still produce embeddings.
                 index_builder::TfIdfEmbedder::build_from_tokens(&[])
             });
+
+        // Wrap in HybridEmbedder for compatibility
+        let embedder = index_builder::HybridEmbedder::tfidf_only(tfidf_embedder);
 
         // Read actual file content for changed files to populate NodeInfo
         // entries with real source and pre-tokenized tokens.
@@ -212,7 +215,7 @@ impl LeIndex {
                 let signature = crate::search::search::SearchEngine::extract_signature_from_content(
                     &node_content,
                 );
-                let embedding = embedder.embed_tokens(&index_builder::tokenize_code(&node_content));
+                let tfidf_embedding = embedder.embed_tfidf(&index_builder::tokenize_code(&node_content));
 
                 Some(crate::search::search::NodeInfo {
                     node_id: node.id.clone(),
@@ -221,7 +224,9 @@ impl LeIndex {
                     language: node.language.clone(),
                     content: node_content,
                     byte_range: node.byte_range,
-                    embedding: Some(embedding),
+                    tfidf_embedding: tfidf_embedding.clone(),
+                    neural_embedding: None, // Will be enhanced if embedder supports it
+                    embedding: Some(tfidf_embedding.clone()), // Backward compatibility
                     complexity: node.complexity,
                     signature,
                     pre_tokenized: Some(tokens),
@@ -554,12 +559,13 @@ impl LeIndex {
         let embedder = if let Some(embedder) = persisted_embedder {
             if embedder.is_fresh(pdg_node_count, pdg_edge_count) {
                 info!("Loaded persisted embedder from storage");
+                let hybrid_embedder = index_builder::HybridEmbedder::tfidf_only(embedder);
                 index_builder::index_nodes_with_embedder(
                     &pdg,
                     &mut self.search_engine,
                     &mut self.cache.file_stats_cache,
                     batch_size,
-                    Some(embedder),
+                    Some(hybrid_embedder),
                     Some(shared_file_cache),
                 )?
             } else {
@@ -629,9 +635,25 @@ impl LeIndex {
             warn!("Failed to persist mmap embeddings: {err:#}");
         }
 
+        // Update last_indexed timestamp in project_metadata
+        if let Err(err) = self.update_last_indexed_timestamp() {
+            warn!("Failed to update last_indexed timestamp: {err:#}");
+        }
+
         info!("Indexing completed in {}ms", self.stats.indexing_time_ms);
 
         Ok(self.stats.clone())
+    }
+
+    /// Update the last_indexed timestamp in project_metadata
+    fn update_last_indexed_timestamp(&self) -> Result<()> {
+        let conn = self.storage.conn();
+        conn.execute(
+            "UPDATE project_metadata SET last_indexed = CURRENT_TIMESTAMP WHERE unique_project_id = ?1",
+            [&self.project_id],
+        )
+        .context("Failed to update last_indexed timestamp")?;
+        Ok(())
     }
 
     /// Load a previously indexed project from storage
@@ -685,12 +707,13 @@ impl LeIndex {
         let embedder = if let Some(embedder) = persisted_embedder {
             if embedder.is_fresh(pdg_node_count, pdg_edge_count) {
                 info!("Loaded persisted embedder from storage");
+                let hybrid_embedder = index_builder::HybridEmbedder::tfidf_only(embedder);
                 index_builder::index_nodes_with_embedder(
                     &pdg,
                     &mut self.search_engine,
                     &mut self.cache.file_stats_cache,
                     batch_size,
-                    Some(embedder),
+                    Some(hybrid_embedder),
                     None,
                 )?
             } else {

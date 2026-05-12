@@ -17,7 +17,7 @@ pub(crate) use types::{
     ProjectFileScan, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS, SOURCE_FILE_EXTENSIONS,
 };
 
-use crate::cli::index_builder::{self, TfIdfEmbedder};
+use crate::cli::index_builder;
 use crate::cli::memory::WarmStrategy;
 use crate::graph::pdg::ProgramDependenceGraph;
 use crate::search::search::SearchEngine;
@@ -66,7 +66,7 @@ pub struct LeIndex {
     stats: IndexStats,
 
     /// TF-IDF embedder (None until index_nodes() runs).
-    embedder: Option<TfIdfEmbedder>,
+    embedder: Option<index_builder::HybridEmbedder>,
 }
 
 impl LeIndex {
