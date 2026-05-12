@@ -139,14 +139,6 @@ struct TfIdfPersistedState {
     pdg_edges: usize,
 }
 
-#[derive(Debug, Clone)]
-struct TokenizedNode {
-    node_idx: petgraph::graph::NodeIndex,
-    id: String,
-    content: String,
-    tokens: Vec<String>,
-}
-
 /// TF-IDF embedding provider for code search
 ///
 /// Implements term frequency-inverse document frequency (TF-IDF) embeddings
@@ -1029,7 +1021,6 @@ pub(crate) fn index_nodes_with_embedder(
     let mut df: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut seen_tokens: HashSet<String> = HashSet::new();
     let mut total_docs = 0usize;
-    let mut tokenized_nodes: Vec<TokenizedNode> = Vec::with_capacity(node_indices.len());
 
     // Helper: extract enriched node content from file bytes using byte range + PDG metadata.
     let extract_node_content = |node: &crate::graph::pdg::Node,
@@ -1082,7 +1073,7 @@ pub(crate) fn index_nodes_with_embedder(
         }
     };
 
-    // Pass 1: build document frequencies in streaming batches, dropping each batch immediately.
+    // Pass 1: build document frequencies in streaming batches, dropping content immediately.
     for batch in node_indices.chunks(batch_size) {
         for &node_idx in batch {
             if let Some(node) = pdg.get_node(node_idx) {
@@ -1098,12 +1089,6 @@ pub(crate) fn index_nodes_with_embedder(
                         *df.entry(tok.clone()).or_insert(0) += 1;
                     }
                 }
-                tokenized_nodes.push(TokenizedNode {
-                    node_idx,
-                    id: node.id.clone(),
-                    content: node_content,
-                    tokens,
-                });
                 total_docs += 1;
             }
         }
@@ -1172,19 +1157,26 @@ pub(crate) fn index_nodes_with_embedder(
     };
 
     let mut nodes: Vec<NodeInfo> = Vec::with_capacity(batch_size);
-    for batch in tokenized_nodes.chunks(batch_size) {
+    for batch in node_indices.chunks(batch_size) {
         nodes.clear();
-        for tokenized in batch {
-            if let Some(node) = pdg.get_node(tokenized.node_idx) {
+        for &node_idx in batch {
+            if let Some(node) = pdg.get_node(node_idx) {
+                // Re-read and re-tokenize node content for Pass 2
+                let file_bytes = file_cache
+                    .get_or_read(Path::new(&*node.file_path))
+                    .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
+
+                let node_content = extract_node_content(node, node_idx, &file_bytes);
+                let tokens = tokenize_code(&node_content);
+
                 // Generate TF-IDF embedding (always available)
-                let tfidf_embedding = embedder.embed_tfidf(&tokenized.tokens);
+                let tfidf_embedding = embedder.embed_tfidf(&tokens);
 
                 // Generate neural embedding (if available)
                 let neural_embedding = if embedder.has_neural() {
                     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
                     {
-                        let text = &tokenized.content;
-                        embedder.embed_neural_blocking(text).ok().flatten()
+                        embedder.embed_neural_blocking(&node_content).ok().flatten()
                     }
                     #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
                     {
@@ -1195,25 +1187,24 @@ pub(crate) fn index_nodes_with_embedder(
                 };
 
                 let signature = crate::search::search::SearchEngine::extract_signature_from_content(
-                    &tokenized.content,
+                    &node_content,
                 );
 
                 // R8: Compute search-engine tokens from content. The search engine
                 // uses a different tokenizer than TF-IDF (splits on non-alphanumeric,
                 // lowercases, filters by length >= 2). Pre-computing avoids re-tokenization.
-                let search_tokens: Vec<String> = tokenized
-                    .content
+                let search_tokens: Vec<String> = node_content
                     .split(|c: char| !c.is_alphanumeric())
                     .map(|s| s.to_ascii_lowercase())
                     .filter(|s| s.len() >= 2)
                     .collect();
 
                 nodes.push(NodeInfo {
-                    node_id: tokenized.id.clone(),
+                    node_id: node.id.clone(),
                     file_path: node.file_path.to_string(),
                     symbol_name: node.name.clone(),
                     language: node.language.clone(),
-                    content: tokenized.content.clone(),
+                    content: node_content.clone(),
                     byte_range: node.byte_range,
                     tfidf_embedding,
                     neural_embedding,

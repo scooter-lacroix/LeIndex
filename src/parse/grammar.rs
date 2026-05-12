@@ -183,9 +183,8 @@ impl LanguageId {
             "cs" => Some(LanguageId::CSharp),
             "rb" => Some(LanguageId::Ruby),
             "php" => Some(LanguageId::Php),
-            "swift" => Some(LanguageId::Swift),
-            "kt" | "kts" => Some(LanguageId::Kotlin),
-            "dart" => Some(LanguageId::Dart),
+            // Swift, Kotlin, and Dart extensions intentionally excluded
+            // as their parsers are disabled due to tree-sitter version conflicts
             "lua" => Some(LanguageId::Lua),
             "scala" | "sc" => Some(LanguageId::Scala),
             "sh" | "bash" => Some(LanguageId::Bash),

@@ -1710,7 +1710,7 @@ fn count_artifact(
     report.scanned += 1;
 
     let age = artifact_age(dir);
-    if age < *cutoff {
+    if age >= *cutoff {
         debug!("Artifact {} is not stale yet", dir.display());
         return;
     }

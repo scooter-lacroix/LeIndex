@@ -363,9 +363,6 @@ pub async fn index_with_progress(
 ///
 /// For HTTP transport, generates a per-session ID and stores it in the session map.
 fn handle_initialize(server: &McpServer) -> (Value, Option<String>) {
-    // Mark global handshake as complete (stdio path)
-    server.handshake_complete.store(true, Ordering::SeqCst);
-
     // Generate a session ID for HTTP transport
     let session_id = generate_session_id();
 
@@ -794,11 +791,20 @@ impl McpServer {
                 let mut reader = BufReader::new(reader);
                 let mut use_content_length = false;
 
+                // Security limits to prevent memory exhaustion attacks
+                const MAX_LINE_LENGTH: usize = 10_240; // 10KB max line length
+                const MAX_PAYLOAD_SIZE: usize = 10_485_760; // 10MB max payload size
+
                 loop {
                     let mut line = String::new();
                     match reader.read_line(&mut line).await {
                         Ok(0) => break, // EOF
-                        Ok(_) => {}
+                        Ok(_) => {
+                            if line.len() > MAX_LINE_LENGTH {
+                                debug!("Line too long (session {}): {} bytes", session_id_clone, line.len());
+                                break;
+                            }
+                        }
                         Err(e) => {
                             debug!("Socket read error (session {}): {}", session_id_clone, e);
                             break;
@@ -823,14 +829,27 @@ impl McpServer {
                             }
                         };
 
+                        // Reject excessively large payloads to prevent OOM
+                        if length > MAX_PAYLOAD_SIZE {
+                            debug!("Payload too large (session {}): {} bytes", session_id_clone, length);
+                            break;
+                        }
+
                         // Consume remaining header lines until blank line
                         loop {
                             let mut header = String::new();
                             match reader.read_line(&mut header).await {
                                 Ok(0) => break,
+                                Ok(_) => {
+                                    if header.len() > MAX_LINE_LENGTH {
+                                        debug!("Header line too long (session {}): {} bytes", session_id_clone, header.len());
+                                        break;
+                                    }
+                                    if header.trim().is_empty() {
+                                        break;
+                                    }
+                                }
                                 Err(_) => break,
-                                _ if header.trim().is_empty() => break,
-                                _ => {}
                             }
                         }
 
@@ -952,6 +971,18 @@ async fn handle_socket_message(
                     return serde_json::to_string(&resp).ok();
                 }
             };
+
+            // Check handshake state for this session (allow initialize and ping before handshake)
+            if method_name != "initialize" && method_name != "ping" {
+                let sessions = session_handshakes.lock().unwrap();
+                if !sessions.get(session_id).copied().unwrap_or(false) {
+                    let resp = JsonRpcResponse::error(
+                        request_id,
+                        super::protocol::JsonRpcError::new(-32600, "Server not initialized. Call 'initialize' first."),
+                    );
+                    return serde_json::to_string(&resp).ok();
+                }
+            }
 
             let response = match method_name.as_str() {
                 "initialize" => {
