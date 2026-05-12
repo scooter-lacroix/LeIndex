@@ -1,6 +1,6 @@
 [package]
 name = "leindex"
-version = "1.6.3"
+version = "1.9.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["LeIndex Contributors"]

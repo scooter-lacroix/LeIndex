@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "leindex"
-version = "1.6.3"
+version = "1.9.0"
 description = "LeIndex MCP bootstrap wrapper for the Rust LeIndex binary"
 readme = "README.md"
 requires-python = ">=3.10"

@@ -2,7 +2,7 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
-## [1.6.4] - 2026-05-12
+## [1.9.0] - 2026-05-12
 
 ### ✨ New Features
 - **Hybrid Embedding System**: Unified embedding architecture combining TF-IDF with neural/remote embeddings for enhanced search quality. TF-IDF serves as the base signal, with neural embeddings added as enhancement layers through configurable hybrid scoring (weights: TF-IDF 0.30, neural 0.40, structural 0.15, text match 0.15).
