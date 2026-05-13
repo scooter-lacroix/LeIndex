@@ -1165,6 +1165,9 @@ pub(crate) fn index_nodes_with_embedder(
     };
 
     let mut nodes: Vec<NodeInfo> = Vec::with_capacity(batch_size);
+    #[cfg(feature = "remote-embeddings")]
+    let mut warned_remote_blocking = false;
+
     for batch in node_indices.chunks(batch_size) {
         nodes.clear();
         for &node_idx in batch {
@@ -1198,10 +1201,12 @@ pub(crate) fn index_nodes_with_embedder(
                     }
                     #[cfg(feature = "remote-embeddings")]
                     HybridEmbedder::HybridRemote { .. } => {
-                        tracing::warn!(
-                            "Remote embeddings require async runtime, node {} will use TF-IDF only",
-                            node.id
-                        );
+                        if !warned_remote_blocking {
+                            tracing::warn!(
+                                "Remote embeddings require async runtime; falling back to TF-IDF-only for this indexing run"
+                            );
+                            warned_remote_blocking = true;
+                        }
                         None
                     }
                 };
