@@ -35,7 +35,7 @@ pub use vector::VectorIndex;
 #[cfg(feature = "onnx")]
 pub use onnx::{QwenEmbeddingProvider, QwenReranker};
 
-#[cfg(feature = "remote-embeddings")]
+#[cfg(all(feature = "remote-embeddings", feature = "onnx"))]
 pub use onnx::{
     GenericRemoteProvider, OpenAIEmbeddingProvider, RemoteEmbeddingConfig, RemoteEmbeddingError,
     RemoteProvider,

@@ -1,6 +1,6 @@
 [package]
 name = "leindex"
-version = "1.9.0"
+version = "1.6.6"
 edition = "2021"
 rust-version = "1.75"
 authors = ["LeIndex Contributors"]
@@ -209,8 +209,9 @@ onnx = ["search", "dep:ort", "dep:tokenizers", "dep:dirs"]
 
 # Remote embedding API support (OpenAI, etc.)
 # Opt-in feature: Use cloud-based embedding services instead of local models
-# Use with: cargo build --features remote-embeddings
-remote-embeddings = ["search", "dep:reqwest", "dep:async-trait"]
+# Use with: cargo build --features "remote-embeddings"
+# Note: Requires onnx feature for remote embedding providers
+remote-embeddings = ["search", "onnx", "dep:reqwest", "dep:async-trait"]
 
 [dependencies]
 # Core dependencies (used by most modules)
