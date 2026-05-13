@@ -1012,4 +1012,27 @@ mod tests {
         let result = MmapEmbeddingIndex::open(&path);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_mmap_overflow_in_size_computation_returns_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overflow.bin");
+
+        // Header with extreme values to trigger checked arithmetic overflow
+        // magic=LIEE, version=1, node_count=usize::MAX (as u32), dimension=usize::MAX (as u32)
+        let mut header = Vec::new();
+        header.extend_from_slice(b"LIEE");
+        header.extend_from_slice(&1u32.to_le_bytes());
+        header.extend_from_slice(&u32::MAX.to_le_bytes()); // node_count
+        header.extend_from_slice(&u32::MAX.to_le_bytes()); // dimension
+        std::fs::write(&path, header).unwrap();
+
+        let result = MmapEmbeddingIndex::open(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("overflow") || err.contains("Corrupt"),
+            "expected overflow or corrupt error, got: {err}"
+        );
+    }
 }

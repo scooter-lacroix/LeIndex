@@ -1183,17 +1183,27 @@ pub(crate) fn index_nodes_with_embedder(
                 // Generate neural embedding (if available)
                 // Note: Remote embeddings are not supported in synchronous indexing context
                 // Only local ONNX embeddings are used here to avoid async runtime issues
-                let neural_embedding = if embedder.has_neural() {
+                let neural_embedding = match &embedder {
+                    HybridEmbedder::TfIdfOnly(_) => None,
                     #[cfg(feature = "onnx")]
-                    {
-                        embedder.embed_neural_blocking(&node_content).and_then(|r| r.ok())
+                    HybridEmbedder::HybridLocal { .. } => {
+                        match embedder.embed_neural_blocking(&node_content) {
+                            Some(Ok(v)) => Some(v),
+                            Some(Err(e)) => {
+                                tracing::warn!("Neural embedding failed for node {}: {}", node.id, e);
+                                None
+                            }
+                            None => None,
+                        }
                     }
-                    #[cfg(not(feature = "onnx"))]
-                    {
+                    #[cfg(feature = "remote-embeddings")]
+                    HybridEmbedder::HybridRemote { .. } => {
+                        tracing::warn!(
+                            "Remote embeddings require async runtime, node {} will use TF-IDF only",
+                            node.id
+                        );
                         None
                     }
-                } else {
-                    None
                 };
 
                 let signature = crate::search::search::SearchEngine::extract_signature_from_content(
