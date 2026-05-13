@@ -28,6 +28,7 @@
 - `tools/memcheck/src/workload.rs` — TOML workload script loader & runner
 - `tools/memcheck/src/report.rs` — JSON report shape + writer
 - `tools/memcheck/src/diff.rs` — baseline comparison logic
+- `tools/memcheck/src/driver.rs` — harness runner that ties workload, sampler, report, and diff together
 - `tools/memcheck/workloads/small_repo.toml` — workload definition for the small-repo fixture
 - `tools/xtask/Cargo.toml` — workspace member for `cargo xtask`
 - `tools/xtask/src/main.rs` — xtask entry; only memcheck commands for now
