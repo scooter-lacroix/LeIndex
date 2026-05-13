@@ -1242,41 +1242,103 @@ impl WorktreeSession {
             let file_existed = backups[written].2;
 
             // Step 1: Backup original file by renaming (atomic)
+            // Fallback to copy+remove if rename fails (cross-device)
             if file_existed {
-                if let Err(e) = std::fs::rename(original, backup_path) {
-                    // Roll back previously processed files
-                    Self::rollback_merge(&backups[..written], &path);
-                    return Err(EditError::WorktreeError(format!(
-                        "Failed to backup original file '{}' to '{}': {}",
-                        original.display(),
-                        backup_path.display(),
-                        e
-                    )));
+                let backup_result = std::fs::rename(original, backup_path);
+                if let Err(e) = backup_result {
+                    // Check if it's a cross-device error (EXDEV)
+                    if e.raw_os_error() == Some(18) {
+                        // Fallback to copy + remove for cross-device moves
+                        if let Err(copy_err) = std::fs::copy(original, backup_path) {
+                            // Roll back previously processed files
+                            Self::rollback_merge(&backups[..written], &path);
+                            return Err(EditError::WorktreeError(format!(
+                                "Failed to backup original file '{}' to '{}' (cross-device copy failed): {}",
+                                original.display(),
+                                backup_path.display(),
+                                copy_err
+                            )));
+                        }
+                        if let Err(remove_err) = std::fs::remove_file(original) {
+                            // Roll back previously processed files
+                            Self::rollback_merge(&backups[..written], &path);
+                            return Err(EditError::WorktreeError(format!(
+                                "Failed to remove original file '{}' after cross-device backup: {}",
+                                original.display(),
+                                remove_err
+                            )));
+                        }
+                    } else {
+                        // Roll back previously processed files
+                        Self::rollback_merge(&backups[..written], &path);
+                        return Err(EditError::WorktreeError(format!(
+                            "Failed to backup original file '{}' to '{}': {}",
+                            original.display(),
+                            backup_path.display(),
+                            e
+                        )));
+                    }
                 }
             }
 
             // Step 2: Rename staged file to original (atomic)
-            if let Err(e) = std::fs::rename(staged, original) {
-                // Restore backup if it was created
-                if file_existed && backup_path.exists() {
-                    if let Err(restore_err) = std::fs::rename(backup_path, original) {
-                        tracing::error!(
-                            "CRITICAL: Failed to restore '{}' from backup during rollback: {}",
+            // Fallback to copy+remove if rename fails (cross-device)
+            let move_result = std::fs::rename(staged, original);
+            if let Err(e) = move_result {
+                // Check if it's a cross-device error (EXDEV)
+                if e.raw_os_error() == Some(18) {
+                    // Fallback to copy + remove for cross-device moves
+                    if let Err(copy_err) = std::fs::copy(staged, original) {
+                        // Restore backup if it was created
+                        if file_existed && backup_path.exists() {
+                            if let Err(restore_err) = std::fs::rename(backup_path, original) {
+                                tracing::error!(
+                                    "CRITICAL: Failed to restore '{}' from backup during rollback: {}",
+                                    original.display(),
+                                    restore_err
+                                );
+                            }
+                        }
+
+                        // Roll back previously processed files
+                        Self::rollback_merge(&backups[..written], &path);
+
+                        return Err(EditError::WorktreeError(format!(
+                            "Failed to move staged file '{}' to '{}' (cross-device copy failed): {}",
+                            staged.display(),
                             original.display(),
-                            restore_err
+                            copy_err
+                        )));
+                    }
+                    if let Err(remove_err) = std::fs::remove_file(staged) {
+                        tracing::warn!(
+                            "Failed to remove staged file '{}' after cross-device move: {}",
+                            staged.display(),
+                            remove_err
                         );
                     }
+                } else {
+                    // Restore backup if it was created
+                    if file_existed && backup_path.exists() {
+                        if let Err(restore_err) = std::fs::rename(backup_path, original) {
+                            tracing::error!(
+                                "CRITICAL: Failed to restore '{}' from backup during rollback: {}",
+                                original.display(),
+                                restore_err
+                            );
+                        }
+                    }
+
+                    // Roll back previously processed files
+                    Self::rollback_merge(&backups[..written], &path);
+
+                    return Err(EditError::WorktreeError(format!(
+                        "Failed to merge staged file '{}' into '{}': {}",
+                        staged.display(),
+                        original.display(),
+                        e
+                    )));
                 }
-                
-                // Roll back previously processed files
-                Self::rollback_merge(&backups[..written], &path);
-                
-                return Err(EditError::WorktreeError(format!(
-                    "Failed to merge staged file '{}' into '{}': {}",
-                    staged.display(),
-                    original.display(),
-                    e
-                )));
             }
         }
 

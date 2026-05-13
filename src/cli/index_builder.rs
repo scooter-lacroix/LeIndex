@@ -1173,12 +1173,14 @@ pub(crate) fn index_nodes_with_embedder(
                 let tfidf_embedding = embedder.embed_tfidf(&tokens);
 
                 // Generate neural embedding (if available)
+                // Note: Remote embeddings are not supported in synchronous indexing context
+                // Only local ONNX embeddings are used here to avoid async runtime issues
                 let neural_embedding = if embedder.has_neural() {
-                    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+                    #[cfg(feature = "onnx")]
                     {
                         embedder.embed_neural_blocking(&node_content).ok().flatten()
                     }
-                    #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+                    #[cfg(not(feature = "onnx"))]
                     {
                         None
                     }

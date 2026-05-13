@@ -133,6 +133,12 @@ impl LeIndex {
             .unwrap_or_else(|| {
                 // No persisted embedder — build a minimal one from the
                 // changed-file node tokens so we can still produce embeddings.
+                tracing::warn!(
+                    "Failed to load persisted TF-IDF embedder for incremental reindex. \
+                    This will result in degraded search quality (zero-vector embeddings) \
+                    for new/modified nodes until a full reindex is performed. \
+                    Consider running a full reindex to restore search quality."
+                );
                 index_builder::TfIdfEmbedder::build_from_tokens(&[])
             });
 

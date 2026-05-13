@@ -954,7 +954,7 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
             let value = execute_tool_handler(&name, args, project).await?;
 
             // Use appropriate formatter based on tool name
-            let normalized_name = name.to_lowercase().replace('-', "_");
+            let normalized_name = name.to_lowercase().replace(['-', '.'], "_");
             let formatted = match normalized_name.as_str() {
                 "leindex_search" | "search" | "leindex.search" => {
                     let formatter = SearchFormatter::new();
@@ -1763,6 +1763,7 @@ async fn handle_mcp_request(
         .handshake_complete
         .load(std::sync::atomic::Ordering::SeqCst)
         && method_name != "initialize"
+        && method_name != "ping"
     {
         return Ok(Some(JsonRpcResponse::error(
             id,

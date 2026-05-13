@@ -146,22 +146,18 @@ pub enum LanguageId {
     Ruby = 8,
     /// PHP programming language
     Php = 9,
-    /// Swift programming language
-    Swift = 10,
-    /// Kotlin programming language
-    Kotlin = 11,
-    /// Dart programming language
-    Dart = 12,
+    // Swift, Kotlin, and Dart language support removed due to tree-sitter version conflicts
+    /// These variants will be re-added when parser support is restored
     /// Lua programming language
-    Lua = 13,
+    Lua = 10,
     /// Scala programming language
-    Scala = 14,
+    Scala = 11,
     /// C programming language
-    C = 15,
+    C = 12,
     /// Bash programming language
-    Bash = 16,
+    Bash = 13,
     /// JSON data format
-    Json = 17,
+    Json = 14,
 }
 
 impl LanguageId {
@@ -209,9 +205,6 @@ impl LanguageId {
             LanguageId::CSharp => &crate::parse::traits::languages::csharp::CONFIG,
             LanguageId::Ruby => &crate::parse::traits::languages::ruby::CONFIG,
             LanguageId::Php => &crate::parse::traits::languages::php::CONFIG,
-            LanguageId::Swift => panic!("Swift language support is disabled due to tree-sitter version conflicts"),
-            LanguageId::Kotlin => panic!("Kotlin language support is disabled due to tree-sitter version conflicts"),
-            LanguageId::Dart => panic!("Dart language support is disabled due to tree-sitter version conflicts"),
             LanguageId::Lua => &crate::parse::traits::languages::lua::CONFIG,
             LanguageId::Scala => &crate::parse::traits::languages::scala::CONFIG,
             LanguageId::C => &crate::parse::traits::languages::c::CONFIG,
@@ -236,9 +229,6 @@ impl LanguageId {
             LanguageId::CSharp => crate::parse::traits::languages::csharp::language(),
             LanguageId::Ruby => crate::parse::traits::languages::ruby::language(),
             LanguageId::Php => crate::parse::traits::languages::php::language(),
-            LanguageId::Swift => panic!("Swift language support is disabled due to tree-sitter version conflicts"),
-            LanguageId::Kotlin => panic!("Kotlin language support is disabled due to tree-sitter version conflicts"),
-            LanguageId::Dart => panic!("Dart language support is disabled due to tree-sitter version conflicts"),
             LanguageId::Lua => crate::parse::traits::languages::lua::language(),
             LanguageId::Scala => crate::parse::traits::languages::scala::language(),
             LanguageId::C => crate::parse::traits::languages::c::language(),

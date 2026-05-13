@@ -477,11 +477,8 @@ async fn json_rpc_handler(headers: axum_06::http::HeaderMap, Json(body): Json<Va
         return Json(serde_json::to_value(&resp).unwrap()).into_response();
     }
 
-    // Notifications (id is null) must not receive a response per JSON-RPC 2.0 spec
-    if json_req.id.is_none() {
-        debug!("Ignoring notification: {}", json_req.method);
-        return StatusCode::NO_CONTENT.into_response();
-    }
+    // Track if this is a notification (no response should be sent per JSON-RPC 2.0 spec)
+    let is_notification = json_req.id.is_none();
 
     // Per-session handshake check for HTTP transport
     if json_req.method == "initialize" {
@@ -545,7 +542,13 @@ async fn json_rpc_handler(headers: axum_06::http::HeaderMap, Json(body): Json<Va
         }
     };
 
-    Json(serde_json::to_value(&resp).unwrap()).into_response()
+    // For notifications, return NO_CONTENT (no response body per JSON-RPC 2.0 spec)
+    // For requests, return the response body
+    if is_notification {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        Json(serde_json::to_value(&resp).unwrap()).into_response()
+    }
 }
 
 /// Handle tool call requests
