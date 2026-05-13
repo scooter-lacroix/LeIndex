@@ -507,10 +507,18 @@ impl MmapEmbeddingIndex {
         };
 
         // Pad to 4-byte alignment for the embedding matrix
-        let embedding_matrix_offset = (ids_section_end + 3) & !3;
+        let embedding_matrix_offset = ids_section_end
+            .checked_add(3)
+            .ok_or_else(|| MmapError::Corrupt("embedding matrix offset overflow".to_string()))? & !3;
 
         // Validate total file size
-        let expected_size = embedding_matrix_offset + n * (dimension as usize) * 4;
+        let embedding_matrix_size = (dimension as usize)
+            .checked_mul(4)
+            .and_then(|v| n.checked_mul(v))
+            .ok_or_else(|| MmapError::Corrupt("embedding matrix size overflow".to_string()))?;
+        let expected_size = embedding_matrix_offset
+            .checked_add(embedding_matrix_size)
+            .ok_or_else(|| MmapError::Corrupt("expected file size overflow".to_string()))?;
         if mmap.len() < expected_size {
             return Err(MmapError::Corrupt(format!(
                 "file too small: expected {} bytes, got {}",
