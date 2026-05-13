@@ -146,9 +146,11 @@ pub enum LanguageId {
     Ruby = 8,
     /// PHP programming language
     Php = 9,
-    // Swift = 10, // TODO: Disabled due to tree-sitter version incompatibility (grammar v15 vs library v13-14)
-    // Kotlin = 11, // TODO: Disabled due to tree-sitter version incompatibility (0.20.10 vs 0.24.7)
-    // Dart = 11, // TODO: Disabled due to parsing issues
+    // BREAKING CHANGE: Swift (10), Kotlin (11), and Dart (12) variants removed in v1.6.6
+    // due to tree-sitter version conflicts. These languages are unsupported until
+    // conflicts are resolved. Downstream crates depending on these numeric values
+    // or variants will need to update. LanguageId enum discriminants are now
+    // renumbered to: Lua=10, Scala=11, C=12, Bash=13, Json=14.
     /// Lua programming language
     Lua = 10,
     /// Scala programming language
@@ -180,9 +182,8 @@ impl LanguageId {
             "cs" => Some(LanguageId::CSharp),
             "rb" => Some(LanguageId::Ruby),
             "php" => Some(LanguageId::Php),
-            // "swift" => Some(LanguageId::Swift), // TODO: Disabled
-            // "kt" | "kts" => Some(LanguageId::Kotlin), // TODO: Disabled
-            // "dart" => Some(LanguageId::Dart), // TODO: Disabled
+            // Swift, Kotlin, and Dart extensions intentionally excluded
+            // as their parsers are disabled due to tree-sitter version conflicts
             "lua" => Some(LanguageId::Lua),
             "scala" | "sc" => Some(LanguageId::Scala),
             "sh" | "bash" => Some(LanguageId::Bash),
@@ -207,9 +208,6 @@ impl LanguageId {
             LanguageId::CSharp => &crate::parse::traits::languages::csharp::CONFIG,
             LanguageId::Ruby => &crate::parse::traits::languages::ruby::CONFIG,
             LanguageId::Php => &crate::parse::traits::languages::php::CONFIG,
-            // LanguageId::Swift => &crate::parse::traits::languages::swift::CONFIG, // TODO: Disabled
-            // LanguageId::Kotlin => &crate::parse::traits::languages::kotlin::CONFIG, // TODO: Disabled
-            // LanguageId::Dart => &crate::parse::traits::languages::dart::CONFIG, // TODO: Disabled
             LanguageId::Lua => &crate::parse::traits::languages::lua::CONFIG,
             LanguageId::Scala => &crate::parse::traits::languages::scala::CONFIG,
             LanguageId::C => &crate::parse::traits::languages::c::CONFIG,
@@ -234,9 +232,6 @@ impl LanguageId {
             LanguageId::CSharp => crate::parse::traits::languages::csharp::language(),
             LanguageId::Ruby => crate::parse::traits::languages::ruby::language(),
             LanguageId::Php => crate::parse::traits::languages::php::language(),
-            // LanguageId::Swift => crate::parse::traits::languages::swift::language(), // TODO: Disabled
-            // LanguageId::Kotlin => crate::parse::traits::languages::kotlin::language(), // TODO: Disabled
-            // LanguageId::Dart => crate::parse::traits::languages::dart::language(), // TODO: Disabled
             LanguageId::Lua => crate::parse::traits::languages::lua::language(),
             LanguageId::Scala => crate::parse::traits::languages::scala::language(),
             LanguageId::C => crate::parse::traits::languages::c::language(),

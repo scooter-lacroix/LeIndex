@@ -4,16 +4,21 @@ use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_search
+/// Handler for LeIndex [search
 ///
 /// Performs semantic search on the indexed code.
 #[derive(Clone)]
 pub struct SearchHandler;
 
 impl SearchHandler {
-    /// Returns the name of this RPC method
+    /// Returns the name of this MCP tool (MCP-compliant: ASCII letters, digits, underscore, hyphen, dot only)
     pub fn name(&self) -> &str {
-        "leindex_search"
+        "leindex.search"
+    }
+
+    /// Returns the human-readable display title for this tool
+    pub fn title(&self) -> &str {
+        "LeIndex [Search]"
     }
 
     /// Returns the description of this RPC method
@@ -173,7 +178,7 @@ to auto-switch/auto-index projects."
                     "has_more": false,
                     "suggestion": format!(
                         "No semantic matches found for '{}'. The project contains {} indexed files. \
-                        Try: rephrase query, use different keywords, or try leindex_grep_symbols for exact symbol names.",
+                        Try: rephrase query, use different keywords, or try LeIndex [Grep Symbols] for exact symbol names.",
                         query,
                         guard.source_file_paths().map(|p| p.len()).unwrap_or(0)
                     )

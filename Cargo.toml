@@ -1,6 +1,6 @@
 [package]
 name = "leindex"
-version = "1.6.1"
+version = "1.6.6"
 edition = "2021"
 rust-version = "1.75"
 authors = ["LeIndex Contributors"]
@@ -48,6 +48,9 @@ include = [
     "/docs/TOOL_SUPREMACY_BENCHMARKS.md",
 ]
 
+# Note: ONNX models (models/*.onnx) will be added to includes when R15 model conversion is complete
+# See docs/R15_MODEL_DISTRIBUTION.md for the complete model distribution strategy
+
 [features]
 default = ["full"]
 
@@ -87,6 +90,9 @@ parse = [
     "dep:tree-sitter-json",
     "dep:tree-sitter-lua",
     "dep:tree-sitter-scala",
+    # "dep:tree-sitter-kotlin",  # Disabled due to tree-sitter version conflict
+    # "dep:tree-sitter-swift",   # Disabled due to tree-sitter version conflict
+    # "dep:tree-sitter-dart",    # Disabled due to tree-sitter version conflict
     "dep:rayon",
     "dep:once_cell",
 ]
@@ -113,6 +119,9 @@ search = [
     "dep:bytemuck",
     "dep:wide",
     "dep:unicode-normalization",
+    "dep:memmap2",
+    "dep:reqwest",
+    "dep:async-trait",
 ]
 
 # Phase depends on parse, graph, search, storage
@@ -191,6 +200,19 @@ validation = [
     "graph",
 ]
 
+# Neural embeddings with ONNX Runtime and tokenizers
+# Opt-in feature: R15 - True neural embeddings with cross-language support
+# Use with: cargo build --features onnx
+# Default model: Qwen3-Embedding-0.6B (~300MB) - user-specified
+# Reranker: Qwen3-Reranker-0.6B (~300MB) - optional quality improvement
+onnx = ["search", "dep:ort", "dep:tokenizers", "dep:dirs"]
+
+# Remote embedding API support (OpenAI, etc.)
+# Opt-in feature: Use cloud-based embedding services instead of local models
+# Use with: cargo build --features "remote-embeddings"
+# Note: Requires onnx feature for remote embedding providers
+remote-embeddings = ["search", "onnx", "dep:reqwest", "dep:async-trait"]
+
 [dependencies]
 # Core dependencies (used by most modules)
 serde = { version = "1.0", features = ["derive"] }
@@ -202,27 +224,31 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1.40", features = ["full"] }
 blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
+libc = "0.2"
 
 # Serialization
 bincode = "1.3"
 
 # Parse feature dependencies
-tree-sitter = { version = "0.24", optional = true }
-tree-sitter-python = { version = "0.23", optional = true }
-tree-sitter-javascript = { version = "0.23", optional = true }
+tree-sitter = { version = "0.25", optional = true }
+tree-sitter-python = { version = "0.25", optional = true }
+tree-sitter-javascript = { version = "0.25", optional = true }
 tree-sitter-typescript = { version = "0.23", optional = true }
-tree-sitter-go = { version = "0.23", optional = true }
-tree-sitter-rust = { version = "0.23", optional = true }
+tree-sitter-go = { version = "0.25", optional = true }
+tree-sitter-rust = { version = "0.24", optional = true }
 tree-sitter-java = { version = "0.23", optional = true }
 tree-sitter-cpp = { version = "0.23", optional = true }
 tree-sitter-c-sharp = { version = "0.23", optional = true }
 tree-sitter-ruby = { version = "0.23", optional = true }
-tree-sitter-php = { version = "0.23", optional = true }
-tree-sitter-c = { version = "0.23", optional = true }
-tree-sitter-bash = { version = "0.23", optional = true }
-tree-sitter-json = { version = "0.23", optional = true }
-tree-sitter-lua = { version = "0.2", optional = true }
-tree-sitter-scala = { version = "0.24", optional = true }
+tree-sitter-php = { version = "0.24", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-bash = { version = "0.25", optional = true }
+tree-sitter-json = { version = "0.24", optional = true }
+tree-sitter-lua = { version = "0.5", optional = true }
+tree-sitter-scala = { version = "0.25", optional = true }
+# tree-sitter-kotlin = { version = "0.3", optional = true }  # Disabled due to tree-sitter version conflict
+# tree-sitter-swift = { version = "0.7", optional = true }  # Disabled due to tree-sitter version conflict
+# tree-sitter-dart = { version = "0.2", optional = true }  # Disabled due to tree-sitter version conflict
 rayon = { version = "1.10", optional = true }
 once_cell = { version = "1.19", optional = true }
 
@@ -241,6 +267,14 @@ lru = { version = "0.12", optional = true }
 bytemuck = { version = "1.15", optional = true }
 wide = { version = "0.7", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
+
+# ONNX Runtime dependencies (for R15 neural embeddings)
+ort = { version = "2.0.0-rc.12", optional = true, features = ["ndarray"] }
+tokenizers = { version = "0.20", optional = true }
+
+# Remote embedding API dependencies (for cloud-based embeddings)
+reqwest = { version = "0.12", features = ["json"], optional = true }
+async-trait = { version = "0.1", optional = true }
 
 # Phase/CLI/Global/Server/Edit feature dependencies
 walkdir = { version = "2.5", optional = true }
@@ -277,6 +311,9 @@ futures = { version = "0.3", optional = true }
 tokio-tungstenite = { version = "0.21", optional = true }
 
 tempfile = { version = "3.13", optional = true }
+
+# Search mmap embedding persistence
+memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -330,3 +367,7 @@ strip = true
 
 [profile.bench]
 debug = true
+[profile.release-debug]
+inherits = "release"
+debug = 2
+strip = false

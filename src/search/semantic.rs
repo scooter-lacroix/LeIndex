@@ -119,7 +119,10 @@ mod tests {
                 byte_range: (0, 50),
                 complexity: 2,
                 embedding: None,
+                tfidf_embedding: vec![],
+                neural_embedding: None,
                 signature: None,
+                pre_tokenized: None,
             },
             NodeInfo {
                 node_id: "func2".to_string(),
@@ -130,7 +133,10 @@ mod tests {
                 byte_range: (60, 100),
                 complexity: 3,
                 embedding: None,
+                tfidf_embedding: vec![],
+                neural_embedding: None,
                 signature: None,
+                pre_tokenized: None,
             },
         ];
 

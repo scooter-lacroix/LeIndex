@@ -7,14 +7,18 @@ use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_read_symbol — targeted symbol source read.
+/// Handler for LeIndex [read_symbol — targeted symbol source read.
 #[derive(Clone)]
 pub struct ReadSymbolHandler;
 
 #[allow(missing_docs)]
 impl ReadSymbolHandler {
     pub fn name(&self) -> &str {
-        "leindex_read_symbol"
+        "leindex.read-symbol"
+    }
+
+    pub fn title(&self) -> &str {
+        "LeIndex [Read Symbol]"
     }
 
     pub fn description(&self) -> &str {

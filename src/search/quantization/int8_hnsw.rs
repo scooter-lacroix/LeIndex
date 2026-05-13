@@ -264,7 +264,7 @@ impl Int8HnswIndex {
         self.next_id += 1;
 
         // Insert into HNSW
-        self.hnsw.insert((&vec![quantized], internal_id));
+        self.hnsw.insert((&[quantized], internal_id));
 
         // Update mappings
         self.id_map.insert(internal_id, node_id.clone());

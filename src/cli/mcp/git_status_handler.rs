@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// Handler for leindex_git_status — PDG-aware git status.
+/// Handler for LeIndex [git_status — PDG-aware git status.
 ///
 /// Unlike plain `git status`, maps changed files to affected PDG symbols
 /// and computes forward impact (blast radius).
@@ -17,7 +17,11 @@ pub struct GitStatusHandler;
 #[allow(missing_docs)]
 impl GitStatusHandler {
     pub fn name(&self) -> &str {
-        "leindex_git_status"
+        "leindex.git-status"
+    }
+
+    pub fn title(&self) -> &str {
+        "LeIndex [Git Status]"
     }
 
     pub fn description(&self) -> &str {

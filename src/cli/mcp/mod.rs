@@ -29,48 +29,50 @@ pub mod macros;
 pub mod handlers;
 /// Shared helpers for MCP request processing.
 pub mod helpers;
+/// Beautiful output formatting for LeIndex tools.
+pub mod output;
 /// MCP protocol definitions and JSON-RPC types.
 pub mod protocol;
 
-/// Handler for leindex_context — PDG-based context expansion.
+/// Handler for LeIndex [Context] — PDG-based context expansion.
 pub mod context_handler;
-/// Handler for leindex_deep_analyze — deep code analysis.
+/// Handler for LeIndex [Deep Analyze] — deep code analysis.
 pub mod deep_analyze_handler;
-/// Handler for leindex_diagnostics — project diagnostics.
+/// Handler for LeIndex [Diagnostics] — project diagnostics.
 pub mod diagnostics_handler;
-/// Handler for leindex_edit_apply — atomic code modifications.
+/// Handler for LeIndex [Edit Apply] — atomic code modifications.
 pub mod edit_apply_handler;
 /// Disk-persistent cache for edit previews.
 pub mod edit_cache;
-/// Handler for leindex_edit_preview — dry-run code changes.
+/// Handler for LeIndex [Edit Preview] — dry-run code changes.
 pub mod edit_preview_handler;
-/// Handler for leindex_file_summary — structured file analysis.
+/// Handler for LeIndex [File Summary] — structured file analysis.
 pub mod file_summary_handler;
-/// Handler for leindex_git_status — PDG-aware git status.
+/// Handler for LeIndex [Git Status] — PDG-aware git status.
 pub mod git_status_handler;
-/// Handler for leindex_grep_symbols — structurally-aware symbol search.
+/// Handler for LeIndex [Grep Symbols] — structurally-aware symbol search.
 pub mod grep_symbols_handler;
-/// Handler for leindex_impact_analysis — transitive dependency impact.
+/// Handler for LeIndex [Impact Analysis] — transitive dependency impact.
 pub mod impact_analysis_handler;
-/// Handler for leindex_index — project indexing.
+/// Handler for LeIndex [Index] — project indexing.
 pub mod index_handler;
-/// Handler for leindex_phase_analysis — multi-phase analysis.
+/// Handler for LeIndex [Phase Analysis] — multi-phase analysis.
 pub mod phase_handler;
-/// Handler for leindex_project_map — annotated project tree.
+/// Handler for LeIndex [Project Map] — annotated project tree.
 pub mod project_map_handler;
-/// Handler for leindex_read_file — PDG-annotated file read.
+/// Handler for LeIndex [Read File] — PDG-annotated file read.
 pub mod read_file_handler;
-/// Handler for leindex_read_symbol — targeted symbol source read.
+/// Handler for LeIndex [Read Symbol] — targeted symbol source read.
 pub mod read_symbol_handler;
-/// Handler for leindex_rename_symbol — cross-file symbol rename.
+/// Handler for LeIndex [Rename Symbol] — cross-file symbol rename.
 pub mod rename_symbol_handler;
-/// Handler for leindex_search — semantic code search.
+/// Handler for LeIndex [Search] — semantic code search.
 pub mod search_handler;
-/// Handler for leindex_symbol_lookup — full call graph lookup.
+/// Handler for LeIndex [Symbol Lookup] — full call graph lookup.
 pub mod symbol_lookup_handler;
-/// Handler for leindex_text_search — raw text/regex search.
+/// Handler for LeIndex [Text Search] — raw text/regex search.
 pub mod text_search_handler;
-/// Handler for leindex_write — atomic file creation with PDG surfacing.
+/// Handler for LeIndex [Write] — atomic file creation with PDG surfacing.
 pub mod write_handler;
 
 /// MCP server implementation.

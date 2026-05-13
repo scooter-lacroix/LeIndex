@@ -119,7 +119,7 @@ pub(crate) fn wrap_with_meta(mut result: Value, index: &crate::cli::leindex::LeI
             obj.insert(
                 "_warning".to_string(),
                 Value::String(
-                    "Index may be stale. Call leindex_index with force_reindex=true for fresh results."
+                    "Index may be stale. Call LeIndex [Index] with force_reindex=true for fresh results."
                         .to_string(),
                 ),
             );

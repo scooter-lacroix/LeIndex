@@ -7,21 +7,25 @@ use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_file_summary — structured file analysis replacing Read.
+/// Handler for LeIndex [file_summary — structured file analysis replacing Read.
 #[derive(Clone)]
 pub struct FileSummaryHandler;
 
 #[allow(missing_docs)]
 impl FileSummaryHandler {
     pub fn name(&self) -> &str {
-        "leindex_file_summary"
+        "leindex.file-summary"
+    }
+
+    pub fn title(&self) -> &str {
+        "LeIndex [File Summary]"
     }
 
     pub fn description(&self) -> &str {
         "File overview: symbol inventory, complexity scores, cross-file dependencies, \
 and module role. Use for understanding structure without reading raw content. \
-For exact file contents use leindex_read_file; for a specific implementation \
-use leindex_read_symbol."
+For exact file contents use LeIndex [Read File]; for a specific implementation \
+use LeIndex [Read Symbol]."
     }
 
     pub fn argument_schema(&self) -> Value {

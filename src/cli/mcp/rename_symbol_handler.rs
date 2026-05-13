@@ -7,14 +7,18 @@ use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Handler for leindex_rename_symbol — rename a symbol across all files.
+/// Handler for LeIndex [rename_symbol — rename a symbol across all files.
 #[derive(Clone)]
 pub struct RenameSymbolHandler;
 
 #[allow(missing_docs)]
 impl RenameSymbolHandler {
     pub fn name(&self) -> &str {
-        "leindex_rename_symbol"
+        "leindex.rename-symbol"
+    }
+
+    pub fn title(&self) -> &str {
+        "LeIndex [Rename Symbol]"
     }
 
     pub fn description(&self) -> &str {
@@ -101,7 +105,7 @@ Grep + multi-file Edit with a single atomic operation."
                 return Err(JsonRpcError::invalid_params(format!(
                     "Rename conflict: symbol '{}' already exists in the project index. \
                     Renaming '{}' to '{}' would create a duplicate. \
-                    Use leindex_grep_symbols to inspect '{}'.",
+                    Use LeIndex [Grep Symbols] to inspect '{}'.",
                     new_name, old_name, new_name, new_name
                 )));
             }
@@ -134,7 +138,7 @@ Grep + multi-file Edit with a single atomic operation."
             return Err(JsonRpcError::invalid_params(format!(
                 "Symbol '{}' not found in project index. The index uses short symbol names \
                 (e.g., 'health_check', not 'ClassName.health_check'). \
-                Try leindex_grep_symbols to find the exact name.",
+                Try LeIndex [Grep Symbols] to find the exact name.",
                 old_name
             )));
         }

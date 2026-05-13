@@ -181,7 +181,15 @@ pub struct NodeInfo {
     /// Byte range in source
     pub byte_range: (usize, usize),
 
-    /// Node embedding (optional, for semantic search)
+    /// TF-IDF embedding (always present, 768-dim, for hybrid search)
+    #[serde(default)]
+    pub tfidf_embedding: Vec<f32>,
+
+    /// Neural/remote embedding (optional enhancement, for hybrid search)
+    pub neural_embedding: Option<Vec<f32>>,
+
+    /// Legacy embedding field (points to tfidf_embedding for backward compatibility)
+    #[serde(default)]
     pub embedding: Option<Vec<f32>>,
 
     /// Complexity score (0-100+, higher = more complex)
@@ -190,6 +198,17 @@ pub struct NodeInfo {
     /// Cached signature extracted from content (for search results)
     /// This is extracted before content is cleared during T13 optimization
     pub signature: Option<String>,
+
+    /// Pre-tokenized search tokens (lowercased, filtered by length >= 2).
+    ///
+    /// When `Some`, these tokens are used directly for the inverted index
+    /// instead of re-tokenizing from `content`. This enables callers that
+    /// already have tokenized content (e.g., `index_builder`) to skip the
+    /// redundant split+lowercase pass.
+    ///
+    /// Backward-compatible: `None` falls back to `content.split()` tokenization.
+    #[serde(default)]
+    pub pre_tokenized: Option<Vec<String>>,
 }
 
 /// Pre-computed query data for optimized text scoring
@@ -449,7 +468,7 @@ impl SearchEngine {
     /// # Panics
     ///
     /// Panics if node count exceeds MAX_NODES (prevents memory exhaustion).
-    pub fn index_nodes(&mut self, nodes: Vec<NodeInfo>) {
+    pub fn index_nodes(&mut self, mut nodes: Vec<NodeInfo>) {
         if nodes.len() > MAX_NODES {
             panic!(
                 "Cannot index more than {} nodes (provided: {})",
@@ -476,36 +495,58 @@ impl SearchEngine {
             // Build inverted index for O(1) text lookups
             // This maps each token to the set of node IDs containing it
             // Also build per-node token cache for scoring (T14 optimization)
+            //
+            // R8: Use pre-tokenized tokens when available to skip re-tokenization.
+            // Falls back to content-based tokenization for backward compatibility.
             let mut tokens = HashSet::new();
-            for token in node.content.split(|c: char| !c.is_alphanumeric()) {
-                let normalized_token: String = token.to_ascii_lowercase();
-                // Skip empty tokens and very short ones (< 2 chars) to reduce noise
-                if normalized_token.len() >= 2 {
+            if let Some(pre_tok) = &node.pre_tokenized {
+                // Use pre-computed tokens directly (already lowercased, filtered >= 2 chars)
+                for token in pre_tok {
                     self.text_index
-                        .entry(normalized_token.clone())
+                        .entry(token.clone())
                         .or_default()
                         .insert(node.node_id.clone());
-                    tokens.insert(normalized_token);
+                    tokens.insert(token.clone());
+                }
+            } else {
+                for token in node.content.split(|c: char| !c.is_alphanumeric()) {
+                    let normalized_token: String = token.to_ascii_lowercase();
+                    // Skip empty tokens and very short ones (< 2 chars) to reduce noise
+                    if normalized_token.len() >= 2 {
+                        self.text_index
+                            .entry(normalized_token.clone())
+                            .or_default()
+                            .insert(node.node_id.clone());
+                        tokens.insert(normalized_token);
+                    }
                 }
             }
             self.node_tokens.insert(node.node_id.clone(), tokens);
         }
 
-        // Build vector index from embeddings — clone only embeddings (A4 optimization)
+        // Build vector index from TF-IDF embeddings — clone only embeddings (A4 optimization)
         // All other node content is moved via ownership, avoiding a full Vec clone
-        for node in &nodes {
-            if let Some(embedding) = &node.embedding {
+        for node in nodes.iter_mut() {
+            // Use tfidf_embedding (always present) instead of optional embedding
+            if !node.tfidf_embedding.is_empty() {
                 if let Err(e) = self
                     .vector_index
-                    .insert(node.node_id.clone(), embedding.clone())
+                    .insert(node.node_id.clone(), node.tfidf_embedding.clone())
                 {
                     tracing::warn!(
-                        "Failed to insert embedding for node {}: {:?}",
+                        "Failed to insert TF-IDF embedding for node {}: {:?}",
                         node.node_id,
                         e
                     );
                 }
             }
+
+            // For backward compatibility, set embedding to tfidf_embedding
+            node.embedding = if !node.tfidf_embedding.is_empty() {
+                Some(node.tfidf_embedding.clone())
+            } else {
+                None
+            };
         }
 
         // Move nodes into storage — no clone needed since indexes are already built
@@ -644,15 +685,28 @@ impl SearchEngine {
         let new_idx = self.nodes.len();
 
         // Build inverted index entries and token cache for this node
+        //
+        // R8: Use pre-tokenized tokens when available to skip re-tokenization.
+        // Falls back to content-based tokenization for backward compatibility.
         let mut tokens = HashSet::new();
-        for token in node.content.split(|c: char| !c.is_alphanumeric()) {
-            let normalized_token: String = token.to_ascii_lowercase();
-            if normalized_token.len() >= 2 {
+        if let Some(pre_tok) = &node.pre_tokenized {
+            for token in pre_tok {
                 self.text_index
-                    .entry(normalized_token.clone())
+                    .entry(token.clone())
                     .or_default()
                     .insert(node_id.clone());
-                tokens.insert(normalized_token);
+                tokens.insert(token.clone());
+            }
+        } else {
+            for token in node.content.split(|c: char| !c.is_alphanumeric()) {
+                let normalized_token: String = token.to_ascii_lowercase();
+                if normalized_token.len() >= 2 {
+                    self.text_index
+                        .entry(normalized_token.clone())
+                        .or_default()
+                        .insert(node_id.clone());
+                    tokens.insert(normalized_token);
+                }
             }
         }
         self.node_tokens.insert(node_id.clone(), tokens);
@@ -664,12 +718,19 @@ impl SearchEngine {
         self.complexity_cache
             .insert(node_id.clone(), node.complexity);
 
-        // Insert embedding into vector index
-        if let Some(embedding) = &node.embedding {
-            if let Err(e) = self.vector_index.insert(node_id.clone(), embedding.clone()) {
-                tracing::warn!("Failed to insert embedding for node {}: {:?}", node_id, e);
+        // Insert TF-IDF embedding into vector index (always present)
+        if !node.tfidf_embedding.is_empty() {
+            if let Err(e) = self.vector_index.insert(node_id.clone(), node.tfidf_embedding.clone()) {
+                tracing::warn!("Failed to insert TF-IDF embedding for node {}: {:?}", node_id, e);
             }
         }
+
+        // For backward compatibility, set embedding to tfidf_embedding
+        node.embedding = if !node.tfidf_embedding.is_empty() {
+            Some(node.tfidf_embedding.clone())
+        } else {
+            None
+        };
 
         // Extract signature before clearing content (same as index_nodes does)
         node.signature = Self::extract_signature_from_content(&node.content);
@@ -689,6 +750,21 @@ impl SearchEngine {
     #[must_use]
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Collect all (node_id, embedding) pairs from the indexed nodes.
+    ///
+    /// Returns only nodes that have an embedding. Used by the mmap
+    /// persistence layer to write embeddings to disk.
+    pub fn collect_embeddings(&self) -> Vec<(String, Vec<f32>)> {
+        self.nodes
+            .iter()
+            .filter_map(|n| {
+                n.embedding
+                    .as_ref()
+                    .map(|emb| (n.node_id.clone(), emb.clone()))
+            })
+            .collect()
     }
 
     /// Check if the index is empty
@@ -825,52 +901,50 @@ impl SearchEngine {
                 &node.file_path,
             );
 
-            // Get semantic score from vector search results
-            let semantic_score = if query.semantic {
+            // Get TF-IDF score from vector search results
+            let tfidf_score = if query.semantic {
                 *vector_results.get(&node.node_id).unwrap_or(&0.0)
             } else {
                 0.0
             };
 
             // For now, if no text match and not semantic, skip
-            if text_score == 0.0 && !query.semantic && semantic_score == 0.0 {
+            if text_score == 0.0 && !query.semantic && tfidf_score == 0.0 {
                 continue;
             }
 
             // Normalize complexity to 0-1 range (divide by 100, not 10)
             let structural_score = (node.complexity as f32 / 100.0).min(1.0);
 
+            // Neural score is 0.0 in this context (vector index only has TF-IDF embeddings)
+            let neural_score = 0.0;
+
             // Use custom weights based on query type if provided
             let score = if let Some(qt) = query.query_type {
                 match qt {
                     crate::search::ranking::QueryType::Text => {
                         // Prose/Text mode: heavily favor keyword overlap
-                        self.scorer.with_weights(0.2, 0.05, 0.75).score(
-                            semantic_score,
-                            structural_score,
-                            text_score,
-                        )
+                        self.scorer
+                            .with_weights_hybrid(0.2, 0.05, 0.05, 0.7)
+                            .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
                     }
                     crate::search::ranking::QueryType::Semantic => {
                         // Semantic-heavy mode
-                        self.scorer.with_weights(0.7, 0.1, 0.2).score(
-                            semantic_score,
-                            structural_score,
-                            text_score,
-                        )
+                        self.scorer
+                            .with_weights_hybrid(0.7, 0.1, 0.1, 0.1)
+                            .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
                     }
                     crate::search::ranking::QueryType::Structural => {
                         // Structural-heavy mode
-                        self.scorer.with_weights(0.3, 0.5, 0.2).score(
-                            semantic_score,
-                            structural_score,
-                            text_score,
-                        )
+                        self.scorer
+                            .with_weights_hybrid(0.3, 0.0, 0.5, 0.2)
+                            .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
                     }
                 }
             } else {
+                // Default hybrid scoring
                 self.scorer
-                    .score(semantic_score, structural_score, text_score)
+                    .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
             };
 
             if score.overall > 0.0 {
@@ -1280,8 +1354,11 @@ mod tests {
                 content: "fn func1() { println!(\"hello\"); }".to_string(),
                 byte_range: (0, 40),
                 embedding: Some(vec![1.0, 0.0, 0.0]),
+                tfidf_embedding: vec![1.0, 0.0, 0.0],
+                neural_embedding: None,
                 complexity: 2,
                 signature: None,
+                pre_tokenized: None,
             },
             NodeInfo {
                 node_id: "func2".to_string(),
@@ -1291,8 +1368,11 @@ mod tests {
                 content: "fn func2() { println!(\"world\"); }".to_string(),
                 byte_range: (42, 82),
                 embedding: Some(vec![0.0, 1.0, 0.0]),
+                tfidf_embedding: vec![0.0, 1.0, 0.0],
+                neural_embedding: None,
                 complexity: 2,
                 signature: None,
+                pre_tokenized: None,
             },
         ]
     }
@@ -1482,8 +1562,11 @@ mod tests {
             content: "fn new_func() {}".to_string(),
             byte_range: (0, 18),
             embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
             complexity: 1,
             signature: None,
+            pre_tokenized: None,
         }]);
         assert_eq!(engine.node_id_to_idx.len(), 1);
         assert_eq!(engine.node_id_to_idx.get("new_func"), Some(&0));
@@ -1586,8 +1669,11 @@ mod tests {
             content: "fn new_func() {}".to_string(),
             byte_range: (0, 18),
             embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
             complexity: 1,
             signature: None,
+            pre_tokenized: None,
         }]);
         assert_eq!(engine.node_tokens.len(), 1);
         assert!(engine.node_tokens.contains_key("new_func"));
@@ -1650,8 +1736,11 @@ mod tests {
                 content: "fn func3() { db_query(); }".to_string(),
                 byte_range: (100, 130),
                 embedding: Some(vec![0.0, 0.0, 1.0]),
+                tfidf_embedding: vec![0.0, 0.0, 1.0],
+                neural_embedding: None,
                 complexity: 3,
                 signature: None,
+                pre_tokenized: None,
             }],
         };
         engine.incremental_reindex(delta);
@@ -1750,8 +1839,11 @@ mod tests {
                 content: "fn func1_renamed() { new_logic(); }".to_string(),
                 byte_range: (0, 35),
                 embedding: Some(vec![0.5, 0.5, 0.0]),
+                tfidf_embedding: vec![0.5, 0.5, 0.0],
+                neural_embedding: None,
                 complexity: 5,
                 signature: None,
+                pre_tokenized: None,
             }],
         };
         engine.incremental_reindex(delta);
@@ -1799,8 +1891,11 @@ mod tests {
                     content: "fn func3() {}".to_string(),
                     byte_range: (0, 14),
                     embedding: None,
+                    tfidf_embedding: vec![],
+                    neural_embedding: None,
                     complexity: 1,
                     signature: None,
+                    pre_tokenized: None,
                 },
                 NodeInfo {
                     node_id: "func4".to_string(),
@@ -1810,8 +1905,11 @@ mod tests {
                     content: "fn func4() { helper(); }".to_string(),
                     byte_range: (15, 40),
                     embedding: None,
+                    tfidf_embedding: vec![],
+                    neural_embedding: None,
                     complexity: 2,
                     signature: None,
+                    pre_tokenized: None,
                 },
             ],
         };
@@ -1873,8 +1971,11 @@ mod tests {
                 content: "fn unique1() { zebra(); }".to_string(),
                 byte_range: (0, 25),
                 embedding: None,
+                tfidf_embedding: vec![],
+                neural_embedding: None,
                 complexity: 1,
                 signature: None,
+                pre_tokenized: None,
             },
             NodeInfo {
                 node_id: "unique2".to_string(),
@@ -1884,8 +1985,11 @@ mod tests {
                 content: "fn unique2() { apple(); }".to_string(),
                 byte_range: (26, 52),
                 embedding: None,
+                tfidf_embedding: vec![],
+                neural_embedding: None,
                 complexity: 1,
                 signature: None,
+                pre_tokenized: None,
             },
         ]);
 
@@ -1931,8 +2035,11 @@ mod tests {
                 content: "fn func3() { compute(); }".to_string(),
                 byte_range: (0, 25),
                 embedding: Some(vec![1.0, 1.0, 0.0]),
+                tfidf_embedding: vec![1.0, 1.0, 0.0],
+                neural_embedding: None,
                 complexity: 4,
                 signature: None,
+                pre_tokenized: None,
             }],
         };
         engine_inc.incremental_reindex(delta);
@@ -1947,8 +2054,11 @@ mod tests {
                 content: "fn func2() { println!(\"world\"); }".to_string(),
                 byte_range: (42, 82),
                 embedding: Some(vec![0.0, 1.0, 0.0]),
+                tfidf_embedding: vec![0.0, 1.0, 0.0],
+                neural_embedding: None,
                 complexity: 2,
                 signature: None,
+                pre_tokenized: None,
             },
             NodeInfo {
                 node_id: "func3".to_string(),
@@ -1958,8 +2068,11 @@ mod tests {
                 content: "fn func3() { compute(); }".to_string(),
                 byte_range: (0, 25),
                 embedding: Some(vec![1.0, 1.0, 0.0]),
+                tfidf_embedding: vec![1.0, 1.0, 0.0],
+                neural_embedding: None,
                 complexity: 4,
                 signature: None,
+                pre_tokenized: None,
             },
         ]);
 
@@ -2020,8 +2133,11 @@ mod tests {
                 content: "fn func3() {}".to_string(),
                 byte_range: (0, 14),
                 embedding: Some(vec![0.1, 0.1, 0.9]),
+                tfidf_embedding: vec![0.1, 0.1, 0.9],
+                neural_embedding: None,
                 complexity: 1,
                 signature: None,
+                pre_tokenized: None,
             }],
         };
         engine.incremental_reindex(delta);
@@ -2049,8 +2165,11 @@ mod tests {
                 content: "fn func3() {}".to_string(),
                 byte_range: (0, 14),
                 embedding: None,
+                tfidf_embedding: vec![],
+                neural_embedding: None,
                 complexity: 1,
                 signature: None,
+                pre_tokenized: None,
             }],
         });
 
@@ -2104,8 +2223,11 @@ mod tests {
                 content: "fn func3() { important_content(); }".to_string(),
                 byte_range: (0, 40),
                 embedding: None,
+                tfidf_embedding: vec![],
+                neural_embedding: None,
                 complexity: 3,
                 signature: None,
+                pre_tokenized: None,
             }],
         });
 
@@ -2125,5 +2247,244 @@ mod tests {
             .get("func3")
             .unwrap()
             .contains("important"));
+    }
+
+    // ----------------------------------------------------------------
+    // R8: Pre-tokenized search engine tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_pre_tokenized_produces_identical_search_results() {
+        // R8: NodeInfo with pre_tokenized = Some(...) should produce identical
+        // search results to the re-tokenization path.
+        let content = "fn calculate_total(price: f64, tax: f64) -> f64 { price + tax }";
+
+        // Compute search tokens the same way index_builder does
+        let search_tokens: Vec<String> = content
+            .split(|c: char| !c.is_alphanumeric())
+            .map(|s| s.to_ascii_lowercase())
+            .filter(|s| s.len() >= 2)
+            .collect();
+
+        // Engine with pre-tokenized tokens
+        let mut engine_pre = SearchEngine::new();
+        engine_pre.index_nodes(vec![NodeInfo {
+            node_id: "calc_total".to_string(),
+            file_path: "math.rs".to_string(),
+            symbol_name: "calculate_total".to_string(),
+            language: "rust".to_string(),
+            content: content.to_string(),
+            byte_range: (0, content.len()),
+            embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
+            complexity: 3,
+            signature: None,
+            pre_tokenized: Some(search_tokens),
+        }]);
+
+        // Engine with re-tokenization (pre_tokenized = None)
+        let mut engine_fallback = SearchEngine::new();
+        engine_fallback.index_nodes(vec![NodeInfo {
+            node_id: "calc_total".to_string(),
+            file_path: "math.rs".to_string(),
+            symbol_name: "calculate_total".to_string(),
+            language: "rust".to_string(),
+            content: content.to_string(),
+            byte_range: (0, content.len()),
+            embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
+            complexity: 3,
+            signature: None,
+            pre_tokenized: None,
+        }]);
+
+        // Both inverted indexes should be identical
+        assert_eq!(
+            engine_pre.text_index, engine_fallback.text_index,
+            "Pre-tokenized and fallback should produce identical text_index"
+        );
+        assert_eq!(
+            engine_pre.node_tokens, engine_fallback.node_tokens,
+            "Pre-tokenized and fallback should produce identical node_tokens"
+        );
+
+        // Search for "calculate" should find the node in both
+        let query = SearchQuery {
+            query: "calculate".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+        let results_pre = engine_pre.search(query.clone()).unwrap();
+        let results_fallback = engine_fallback.search(query).unwrap();
+        assert_eq!(results_pre.len(), results_fallback.len());
+        assert!(!results_pre.is_empty());
+        assert_eq!(results_pre[0].node_id, results_fallback[0].node_id);
+    }
+
+    #[test]
+    fn test_pre_tokenized_none_falls_back_to_content() {
+        // R8: NodeInfo with pre_tokenized = None should use content-based
+        // tokenization (backward compatibility).
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(vec![NodeInfo {
+            node_id: "backward_compat".to_string(),
+            file_path: "compat.rs".to_string(),
+            symbol_name: "legacy_func".to_string(),
+            language: "rust".to_string(),
+            content: "fn legacy_func() { return 42; }".to_string(),
+            byte_range: (0, 30),
+            embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
+            complexity: 1,
+            signature: None,
+            pre_tokenized: None,
+        }]);
+
+        // Should still find via content-based tokenization
+        assert!(engine.text_index.contains_key("legacy"));
+        assert!(engine.text_index.contains_key("func"));
+        assert!(engine.node_tokens.contains_key("backward_compat"));
+
+        let query = SearchQuery {
+            query: "legacy".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+        let results = engine.search(query).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].node_id, "backward_compat");
+    }
+
+    #[test]
+    fn test_pre_tokenized_and_content_produce_same_inverted_index() {
+        // R8: Both paths produce the same inverted index for the same content.
+        let content = "pub async fn handle_http_request(req: Request) -> Response { ... }";
+
+        let tokens: Vec<String> = content
+            .split(|c: char| !c.is_alphanumeric())
+            .map(|s| s.to_ascii_lowercase())
+            .filter(|s| s.len() >= 2)
+            .collect();
+
+        // Verify our manual tokenization produces expected tokens
+        assert!(tokens.contains(&"handle".to_string()));
+        assert!(tokens.contains(&"http".to_string()));
+        assert!(tokens.contains(&"request".to_string()));
+        assert!(tokens.contains(&"response".to_string()));
+
+        // Engine A: pre-tokenized
+        let mut engine_a = SearchEngine::new();
+        engine_a.index_nodes(vec![NodeInfo {
+            node_id: "handler".to_string(),
+            file_path: "server.rs".to_string(),
+            symbol_name: "handle_http_request".to_string(),
+            language: "rust".to_string(),
+            content: content.to_string(),
+            byte_range: (0, content.len()),
+            embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
+            complexity: 5,
+            signature: None,
+            pre_tokenized: Some(tokens),
+        }]);
+
+        // Engine B: content-based
+        let mut engine_b = SearchEngine::new();
+        engine_b.index_nodes(vec![NodeInfo {
+            node_id: "handler".to_string(),
+            file_path: "server.rs".to_string(),
+            symbol_name: "handle_http_request".to_string(),
+            language: "rust".to_string(),
+            content: content.to_string(),
+            byte_range: (0, content.len()),
+            embedding: None,
+            tfidf_embedding: vec![],
+            neural_embedding: None,
+            complexity: 5,
+            signature: None,
+            pre_tokenized: None,
+        }]);
+
+        // Both should have identical text_index entries
+        for token in &["handle", "http", "request", "response", "pub", "async"] {
+            assert_eq!(
+                engine_a.text_index.get(*token),
+                engine_b.text_index.get(*token),
+                "Mismatch for token '{}': pre_tokenized={:?}, content={:?}",
+                token,
+                engine_a.text_index.get(*token),
+                engine_b.text_index.get(*token)
+            );
+        }
+    }
+
+    #[test]
+    fn test_pre_tokenized_incremental_reindex() {
+        // R8: Pre-tokenized tokens should work correctly with incremental reindex.
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+
+        let new_content = "fn compute_metrics(data: &[f64]) -> Metrics { ... }";
+        let tokens: Vec<String> = new_content
+            .split(|c: char| !c.is_alphanumeric())
+            .map(|s| s.to_ascii_lowercase())
+            .filter(|s| s.len() >= 2)
+            .collect();
+
+        let delta = TextIndexDelta {
+            removed_node_ids: vec![],
+            updated_nodes: vec![NodeInfo {
+                node_id: "metrics".to_string(),
+                file_path: "metrics.rs".to_string(),
+                symbol_name: "compute_metrics".to_string(),
+                language: "rust".to_string(),
+                content: new_content.to_string(),
+                byte_range: (0, new_content.len()),
+                embedding: None,
+                tfidf_embedding: vec![],
+                neural_embedding: None,
+                complexity: 4,
+                signature: None,
+                pre_tokenized: Some(tokens),
+            }],
+        };
+        engine.incremental_reindex(delta);
+
+        // Should have 3 nodes now
+        assert_eq!(engine.node_count(), 3);
+
+        // Pre-tokenized tokens should be in the inverted index
+        assert!(engine.text_index.contains_key("compute"));
+        assert!(engine.text_index.contains_key("metrics"));
+        assert!(engine.text_index.contains_key("data"));
+
+        // Search should find the new node
+        let query = SearchQuery {
+            query: "compute metrics".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+        let results = engine.search(query).unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].node_id, "metrics");
     }
 }

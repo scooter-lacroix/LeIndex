@@ -177,9 +177,17 @@ mod tests {
 
     #[test]
     fn test_server_default_config() {
-        let config = ServerConfig::default();
+        // Use a temporary database path to avoid conflicts
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("leindex_test_{}.db", std::process::id()));
+        let mut config = ServerConfig::default();
+        config.db_path = db_path.to_string_lossy().to_string();
+
         let server = LeIndexServer::new(config);
         assert!(server.is_ok());
+
+        // Clean up the test database
+        let _ = std::fs::remove_file(db_path);
     }
 }
 

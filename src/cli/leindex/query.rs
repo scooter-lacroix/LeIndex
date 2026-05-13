@@ -1,6 +1,7 @@
 // Search, analysis, and context expansion methods for LeIndex.
 
 use super::LeIndex;
+use crate::cli::index_builder;
 use crate::cli::memory::CacheEntry;
 use crate::graph::{
     pdg::ProgramDependenceGraph,
@@ -326,7 +327,8 @@ impl LeIndex {
     /// Falls back to deterministic hashing for edge cases (empty corpus, not yet indexed).
     pub fn generate_query_embedding(&self, query: &str) -> Vec<f32> {
         if let Some(ref emb) = self.embedder {
-            emb.embed(query)
+            let tokens = index_builder::tokenize_code(query);
+            emb.embed_tfidf(&tokens)
         } else {
             generate_deterministic_embedding(query)
         }

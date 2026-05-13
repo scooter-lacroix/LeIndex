@@ -4,16 +4,21 @@ use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_index
+/// Handler for LeIndex [index
 ///
 /// Indexes a project by parsing all source files and building the search index.
 #[derive(Clone)]
 pub struct IndexHandler;
 
 impl IndexHandler {
-    /// Returns the name of this RPC method
+    /// Returns the name of this MCP tool (MCP-compliant: ASCII letters, digits, underscore, hyphen, dot only)
     pub fn name(&self) -> &str {
-        "leindex_index"
+        "leindex.index"
+    }
+
+    /// Returns the human-readable display title for this tool
+    pub fn title(&self) -> &str {
+        "LeIndex [Index]"
     }
 
     /// Returns the description of this RPC method

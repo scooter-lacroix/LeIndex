@@ -8,9 +8,10 @@ use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::cli::registry::ProjectRegistry;
 use anyhow::Context;
 use axum_06::{
+    http::StatusCode,
     response::{
         sse::{Event, Sse},
-        Json,
+        IntoResponse, Json, Response,
     },
     routing::{get, post},
     Router, Server,
@@ -18,9 +19,14 @@ use axum_06::{
 use futures_util::stream::{Stream, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
@@ -31,8 +37,21 @@ use tracing::{debug, info, warn};
 /// be loaded in one process, with per-project coordination in `ProjectRegistry`.
 pub static SERVER_STATE: std::sync::OnceLock<Arc<ProjectRegistry>> = std::sync::OnceLock::new();
 
+/// Global server instance — for handshake and state management.
+pub static SERVER_INSTANCE: std::sync::OnceLock<Arc<McpServer>> = std::sync::OnceLock::new();
+
 /// Global tool handlers list
 pub static HANDLERS: std::sync::OnceLock<Vec<ToolHandler>> = std::sync::OnceLock::new();
+
+/// Monotonic counter for generating session IDs (no `uuid` dependency).
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Generate a unique session ID string: `"leindex-<pid>-<seq>"`.
+fn generate_session_id() -> String {
+    let pid = std::process::id();
+    let seq = SESSION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("leindex-{pid}-{seq}")
+}
 
 /// MCP Server configuration
 #[derive(Clone, Debug)]
@@ -62,11 +81,17 @@ impl Default for McpServerConfig {
 }
 
 /// MCP Server
+#[derive(Clone)]
 pub struct McpServer {
     /// Configuration for the server
     pub config: McpServerConfig,
     /// Multi-project registry (kept alive for the server's lifetime).
     pub _registry: Arc<ProjectRegistry>,
+    /// Flag to track MCP handshake completion (used by stdio transport — single client).
+    pub(crate) handshake_complete: Arc<AtomicBool>,
+    /// Per-session handshake state for HTTP and stdio transports (session ID → (handshaked, last_access_time)).
+    /// Keyed by the `Mcp-Session-Id` header value for HTTP, and generated session ID for stdio.
+    pub(crate) session_handshakes: Arc<Mutex<HashMap<String, (bool, Instant)>>>,
 }
 
 impl McpServer {
@@ -75,23 +100,17 @@ impl McpServer {
     /// # Arguments
     ///
     /// * `config` - Server configuration
-    /// * `leindex` - Initial LeIndex instance (the startup project)
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let leindex = LeIndex::new("/path/to/project")?;
     /// let config = McpServerConfig::default();
-    /// let server = McpServer::new(config, leindex)?;
+    /// let server = McpServer::new(config)?;
     /// server.run().await?;
     /// ```
-    pub fn new(
-        config: McpServerConfig,
-        leindex: crate::cli::leindex::LeIndex,
-    ) -> anyhow::Result<Self> {
-        let registry = Arc::new(ProjectRegistry::with_initial_project(
+    pub fn new(config: McpServerConfig) -> anyhow::Result<Self> {
+        let registry = Arc::new(ProjectRegistry::new(
             crate::cli::registry::DEFAULT_MAX_PROJECTS,
-            leindex,
         ));
         SERVER_STATE
             .set(registry.clone())
@@ -108,10 +127,18 @@ impl McpServer {
             crate::cli::registry::DEFAULT_MAX_PROJECTS
         );
 
-        Ok(Self {
+        let server = Self {
             config,
             _registry: registry,
-        })
+            handshake_complete: Arc::new(AtomicBool::new(false)),
+            session_handshakes: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        SERVER_INSTANCE
+            .set(Arc::new(server.clone()))
+            .map_err(|_| anyhow::anyhow!("Server instance already initialized"))?;
+
+        Ok(server)
     }
 
     /// Create MCP server with custom configuration
@@ -119,20 +146,16 @@ impl McpServer {
     /// # Arguments
     ///
     /// * `bind_address` - Address to bind the server to
-    /// * `leindex` - LeIndex instance to use for operations
     ///
     /// # Returns
     ///
     /// `Result<McpServer>` - New server instance or error
-    pub fn with_address(
-        bind_address: SocketAddr,
-        leindex: crate::cli::leindex::LeIndex,
-    ) -> anyhow::Result<Self> {
+    pub fn with_address(bind_address: SocketAddr) -> anyhow::Result<Self> {
         let config = McpServerConfig {
             bind_address,
             ..Default::default()
         };
-        Self::new(config, leindex)
+        Self::new(config)
     }
 
     /// Run the MCP server
@@ -286,7 +309,7 @@ pub async fn index_with_progress(
     let handle = registry.get_or_load(Some(project_path)).await?;
     let cached_stats = {
         let idx = handle.read().await;
-        if idx.is_indexed() && !force_reindex {
+        if idx.is_indexed() && !idx.is_stale_fast() && !force_reindex {
             Some(idx.get_stats().clone())
         } else {
             None
@@ -338,8 +361,28 @@ pub async fn index_with_progress(
 ///
 /// Returns server capabilities and information as per MCP protocol.
 /// This is the first request sent by MCP clients to negotiate capabilities.
-fn handle_initialize() -> Value {
-    serde_json::json!({
+///
+/// For HTTP transport, generates a per-session ID and stores it in the session map.
+fn handle_initialize(server: &McpServer) -> (Value, Option<String>) {
+    // Generate a session ID for HTTP transport
+    let session_id = generate_session_id();
+
+    // Store in per-session map with eviction logic
+    {
+        let mut sessions = server.session_handshakes.lock().unwrap();
+        // Evict oldest sessions if we exceed a reasonable limit (1000 sessions)
+        const MAX_HTTP_SESSIONS: usize = 1000;
+        if sessions.len() >= MAX_HTTP_SESSIONS {
+            // Find and remove the oldest session (by last_access_time)
+            if let Some((oldest_id, _)) = sessions.iter().min_by_key(|&(_, (_, time))| time) {
+                let oldest_id = oldest_id.to_string();
+                sessions.remove(&oldest_id);
+            }
+        }
+        sessions.insert(session_id.clone(), (true, Instant::now()));
+    }
+
+    let result = serde_json::json!({
         "protocolVersion": "2024-11-05",
         "capabilities": {
             "tools": {
@@ -359,8 +402,14 @@ fn handle_initialize() -> Value {
             "name": "leindex",
             "version": env!("CARGO_PKG_VERSION"),
             "description": "LeIndex MCP Server - Semantic code indexing and analysis with PDG-based tools for superior code comprehension"
-        }
-    })
+        },
+        "instructions": [
+            "Projects are no longer auto-indexed on startup. Use explicit tool calls to index projects.",
+            "The server must receive an 'initialize' call before processing other requests."
+        ]
+    });
+
+    (result, Some(session_id))
 }
 
 /// Handle MCP ping request
@@ -371,7 +420,13 @@ fn handle_ping() -> Value {
 }
 
 /// JSON-RPC request handler
-async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
+async fn json_rpc_handler(headers: axum_06::http::HeaderMap, Json(body): Json<Value>) -> Response {
+    // Extract Mcp-Session-Id header (if present)
+    let incoming_session_id = headers
+        .get("Mcp-Session-Id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
     // Parse JSON-RPC request
     let json_req: JsonRpcRequest = match serde_json::from_value(body.clone()) {
         Ok(r) => r,
@@ -384,24 +439,28 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
                     "code": -32700,
                     "message": "Invalid JSON"
                 }
-            }));
+            }))
+            .into_response();
         }
     };
 
-    let state = match SERVER_STATE.get() {
+    let server_instance = match SERVER_INSTANCE.get() {
         Some(s) => s,
         None => {
-            warn!("Server state not initialized");
+            warn!("Server instance not initialized");
             return Json(serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": json_req.id,
                 "error": {
                     "code": -32603,
-                    "message": "Server not initialized"
+                    "message": "Server instance not initialized"
                 }
-            }));
+            }))
+            .into_response();
         }
     };
+
+    let state = server_instance._registry.clone();
 
     let handlers = match HANDLERS.get() {
         Some(h) => h,
@@ -414,7 +473,8 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
                     "code": -32603,
                     "message": "Handlers not initialized"
                 }
-            }));
+            }))
+            .into_response();
         }
     };
 
@@ -424,13 +484,66 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
     if let Err(e) = json_req.validate() {
         warn!("Invalid JSON-RPC request: {}", e);
         let resp = JsonRpcResponse::error(id, e);
-        return Json(serde_json::to_value(&resp).unwrap());
+        return Json(serde_json::to_value(&resp).unwrap()).into_response();
+    }
+
+    // Track if this is a notification (no response should be sent per JSON-RPC 2.0 spec)
+    let is_notification = json_req.id.is_none();
+
+    // Per-session handshake check for HTTP transport
+    // Notifications (id is null) must not receive a response per JSON-RPC 2.0 spec
+    if is_notification {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
+    if json_req.method == "initialize" {
+        // Generate new session, store, and return session ID header
+    } else {
+        // Non-initialize: validate session ID exists and is handshaked
+        let session_ok = match &incoming_session_id {
+            Some(sid) => {
+                let mut sessions = server_instance.session_handshakes.lock().unwrap();
+                if let Some((handshaked, last_access)) = sessions.get_mut(sid) {
+                    // Update last access time
+                    *last_access = Instant::now();
+                    *handshaked
+                } else {
+                    false
+                }
+            }
+            None => false,
+        };
+
+        if !session_ok {
+            return Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": json_req.id,
+                "error": {
+                    "code": -32000,
+                    "message": "Server not initialized. Call 'initialize' first."
+                }
+            }))
+            .into_response();
+        }
     }
 
     let response = match json_req.method.as_str() {
-        "initialize" => Ok(handle_initialize()),
+        "initialize" => {
+            let (result, session_id) = handle_initialize(server_instance);
+            let resp = JsonRpcResponse::success(id.clone(), result);
+            let body = Json(serde_json::to_value(&resp).unwrap()).into_response();
+            // Attach Mcp-Session-Id response header
+            if let Some(sid) = session_id {
+                let mut response = body;
+                let sid_header = axum_06::http::HeaderValue::from_str(&sid)
+                    .unwrap_or_else(|_| axum_06::http::HeaderValue::from_static("unknown"));
+                response.headers_mut().insert("Mcp-Session-Id", sid_header);
+                return response;
+            }
+            return body;
+        }
         "ping" => Ok(handle_ping()),
-        "tools/call" => handle_tool_call(state, handlers, &json_req).await,
+        "tools/call" => handle_tool_call(&state, handlers, &json_req).await,
         "tools/list" => Ok(list_tools_json(handlers)),
         "prompts/list" => Ok(list_prompts_json()),
         "prompts/get" => handle_prompt_get(&json_req),
@@ -450,7 +563,8 @@ async fn json_rpc_handler(Json(body): Json<Value>) -> Json<Value> {
         }
     };
 
-    Json(serde_json::to_value(&resp).unwrap())
+    // Return response body (notifications already handled at function entry)
+    Json(serde_json::to_value(&resp).unwrap()).into_response()
 }
 
 /// Handle tool call requests
@@ -565,7 +679,35 @@ pub fn handle_resource_read(req: &JsonRpcRequest) -> Result<Value, JsonRpcError>
 }
 
 /// List tools handler
-async fn list_tools_handler() -> Json<Value> {
+///
+/// Public discovery endpoint — no handshake required.
+/// If a `Mcp-Session-Id` header is present, it is validated but
+/// the endpoint still functions without one.
+async fn list_tools_handler(headers: axum_06::http::HeaderMap) -> Json<Value> {
+    // Validate session ID if present, but don't require one
+    if let Some(sid) = headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok()) {
+        if let Some(server) = SERVER_INSTANCE.get() {
+            let mut sessions = server.session_handshakes.lock().unwrap();
+            if let Some((handshaked, last_access)) = sessions.get_mut(sid) {
+                // Update last access time
+                *last_access = Instant::now();
+                if !*handshaked {
+                    return Json(serde_json::json!({
+                        "error": "Invalid session. Call 'initialize' first."
+                    }));
+                }
+            }
+            // Unknown session ID on a discovery endpoint — allow it (client may be probing)
+        }
+    }
+
+    // Only verify that the server instance exists.
+    if SERVER_INSTANCE.get().is_none() {
+        return Json(serde_json::json!({
+            "error": "Server instance not initialized"
+        }));
+    }
+
     let handlers = match HANDLERS.get() {
         Some(h) => h,
         None => {
@@ -587,6 +729,348 @@ async fn health_check_handler() -> Json<Value> {
     }))
 }
 
+// ============================================================================
+// Unix Domain Socket Transport
+// ============================================================================
+
+/// RAII guard that removes the socket file on drop.
+#[cfg(unix)]
+pub struct SocketCleanupGuard {
+    path: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for SocketCleanupGuard {
+    fn drop(&mut self) {
+        if self.path.exists() {
+            let _ = std::fs::remove_file(&self.path);
+            debug!("Cleaned up socket file: {}", self.path.display());
+        }
+    }
+}
+
+#[cfg(unix)]
+impl McpServer {
+    /// Run the MCP server over a Unix domain socket.
+    ///
+    /// Binds to `socket_path`, accepts connections in a loop, and spawns a
+    /// tokio task per connection. Each connection gets its own session ID
+    /// registered in `session_handshakes`. The JSON-RPC message loop reuses
+    /// the same handler logic as the stdio transport.
+    ///
+    /// The socket file is removed when the returned future completes or is
+    /// dropped (via `SocketCleanupGuard`).
+    pub async fn run_socket(&self, socket_path: &std::path::Path) -> anyhow::Result<()> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        // Remove stale socket file if present
+        if socket_path.exists() {
+            std::fs::remove_file(socket_path).context("Failed to remove existing socket file")?;
+        }
+
+        // Ensure parent directory exists
+        if let Some(parent) = socket_path.parent() {
+            std::fs::create_dir_all(parent).context("Failed to create socket directory")?;
+        }
+
+        let listener = UnixListener::bind(socket_path)
+            .with_context(|| format!("Failed to bind Unix socket at {}", socket_path.display()))?;
+
+        let _guard = SocketCleanupGuard {
+            path: socket_path.to_path_buf(),
+        };
+
+        info!(
+            "MCP server listening on Unix socket: {}",
+            socket_path.display()
+        );
+
+        loop {
+            let (stream, _addr) = listener
+                .accept()
+                .await
+                .context("Failed to accept connection")?;
+
+            let session_id = generate_session_id();
+            {
+                let mut sessions = self.session_handshakes.lock().unwrap();
+                sessions.insert(session_id.clone(), (false, Instant::now()));
+            }
+
+            let session_id_clone = session_id.clone();
+            let session_handshakes = self.session_handshakes.clone();
+            let handshake_complete = self.handshake_complete.clone();
+
+            tokio::spawn(async move {
+                debug!(
+                    "Accepted Unix socket connection (session: {})",
+                    session_id_clone
+                );
+
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut use_content_length = false;
+
+                // Security limits to prevent memory exhaustion attacks
+                const MAX_LINE_LENGTH: usize = 10_240; // 10KB max line length
+                const MAX_PAYLOAD_SIZE: usize = 10_485_760; // 10MB max payload size
+
+                loop {
+                    let mut line = String::new();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) => break, // EOF
+                        Ok(_) => {
+                            if line.len() > MAX_LINE_LENGTH {
+                                debug!("Line too long (session {}): {} bytes", session_id_clone, line.len());
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            debug!("Socket read error (session {}): {}", session_id_clone, e);
+                            break;
+                        }
+                    };
+
+                    let line_trim = line.trim_end();
+                    if line_trim.is_empty() {
+                        continue;
+                    }
+
+                    let json_payload = if line_trim
+                        .to_ascii_lowercase()
+                        .starts_with("content-length:")
+                    {
+                        let len_str = line_trim.split(':').nth(1).unwrap_or("").trim();
+                        let length: usize = match len_str.parse() {
+                            Ok(v) => v,
+                            Err(e) => {
+                                debug!("Invalid Content-Length header: {}", e);
+                                continue;
+                            }
+                        };
+
+                        // Reject excessively large payloads to prevent OOM
+                        if length > MAX_PAYLOAD_SIZE {
+                            debug!("Payload too large (session {}): {} bytes", session_id_clone, length);
+                            break;
+                        }
+
+                        // Consume remaining header lines until blank line
+                        loop {
+                            let mut header = String::new();
+                            match reader.read_line(&mut header).await {
+                                Ok(0) => break,
+                                Ok(_) => {
+                                    if header.len() > MAX_LINE_LENGTH {
+                                        debug!("Header line too long (session {}): {} bytes", session_id_clone, header.len());
+                                        break;
+                                    }
+                                    if header.trim().is_empty() {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+
+                        let mut buf = vec![0u8; length];
+                        if let Err(e) = reader.read_exact(&mut buf).await {
+                            debug!("Failed to read JSON payload: {}", e);
+                            break;
+                        }
+
+                        use_content_length = true;
+                        String::from_utf8_lossy(&buf).to_string()
+                    } else {
+                        line_trim.to_string()
+                    };
+
+                    // Parse and handle the JSON-RPC message
+                    let response_json = match handle_socket_message(
+                        &json_payload,
+                        &session_id_clone,
+                        &session_handshakes,
+                        &handshake_complete,
+                    )
+                    .await
+                    {
+                        Some(json) => json,
+                        None => continue, // Notification, no response
+                    };
+
+                    // Send response
+                    if use_content_length {
+                        let msg = format!(
+                            "Content-Length: {}\r\n\r\n{}",
+                            response_json.len(),
+                            response_json
+                        );
+                        if writer.write_all(msg.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    } else {
+                        let msg = format!("{}\n", response_json);
+                        if writer.write_all(msg.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = writer.flush().await;
+                }
+
+                // Clean up session on disconnect
+                {
+                    let mut sessions = session_handshakes.lock().unwrap();
+                    sessions.remove(&session_id_clone);
+                }
+
+                debug!("Socket connection closed (session: {})", session_id_clone);
+            });
+        }
+
+        #[allow(unreachable_code)]
+        {
+            // _guard is dropped here, cleaning up the socket file
+            Ok(())
+        }
+    }
+}
+
+/// Handle a single JSON-RPC message received over a Unix socket connection.
+/// Returns `Some(response_json)` or `None` for notifications (no response).
+#[cfg(unix)]
+async fn handle_socket_message(
+    json_payload: &str,
+    session_id: &str,
+    session_handshakes: &Arc<Mutex<HashMap<String, (bool, Instant)>>>,
+    handshake_complete: &Arc<AtomicBool>,
+) -> Option<String> {
+    use super::protocol::{JsonRpcMessage, JsonRpcResponse};
+    use crate::cli::mcp::server::{handle_tool_call, list_tools_json, HANDLERS, SERVER_STATE};
+
+    let message = match JsonRpcMessage::from_json(json_payload) {
+        Ok(m) => m,
+        Err(e) => {
+            let error_response = JsonRpcResponse::error(serde_json::Value::Null, e);
+            return serde_json::to_string(&error_response).ok();
+        }
+    };
+
+    match message {
+        JsonRpcMessage::Notification(notification) => {
+            debug!("Ignoring notification on socket: {}", notification.method);
+            None
+        }
+        JsonRpcMessage::Request(request) => {
+            let request_id = request.id.clone().unwrap_or(serde_json::Value::Null);
+            let method_name = request.method.clone();
+
+            // Notifications with null id must not receive a response
+            if request.id.is_none() {
+                debug!("Ignoring notification: {}", method_name);
+                return None;
+            }
+
+            let state = match SERVER_STATE.get() {
+                Some(s) => s,
+                None => {
+                    let resp = JsonRpcResponse::error(
+                        request_id,
+                        super::protocol::JsonRpcError::new(-32603, "Server state not initialized"),
+                    );
+                    return serde_json::to_string(&resp).ok();
+                }
+            };
+
+            let handlers = match HANDLERS.get() {
+                Some(h) => h,
+                None => {
+                    let resp = JsonRpcResponse::error(
+                        request_id,
+                        super::protocol::JsonRpcError::new(-32603, "Handlers not initialized"),
+                    );
+                    return serde_json::to_string(&resp).ok();
+                }
+            };
+
+            // Check handshake state for this session (allow initialize and ping before handshake)
+            if method_name != "initialize" && method_name != "ping" {
+                let mut sessions = session_handshakes.lock().unwrap();
+                let handshaked = if let Some((handshaked, last_access)) = sessions.get_mut(session_id) {
+                    // Update last access time to prevent eviction
+                    *last_access = Instant::now();
+                    *handshaked
+                } else {
+                    false
+                };
+                if !handshaked {
+                    let resp = JsonRpcResponse::error(
+                        request_id,
+                        super::protocol::JsonRpcError::new(-32600, "Server not initialized. Call 'initialize' first."),
+                    );
+                    return serde_json::to_string(&resp).ok();
+                }
+            }
+
+            let response = match method_name.as_str() {
+                "initialize" => {
+                    // Mark session as handshaked
+                    handshake_complete.store(true, Ordering::SeqCst);
+                    {
+                        let mut sessions = session_handshakes.lock().unwrap();
+                        sessions.insert(session_id.to_string(), (true, Instant::now()));
+                    }
+
+                    let result = serde_json::json!({
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {
+                            "tools": { "listChanged": true },
+                            "prompts": { "listChanged": true },
+                            "resources": { "listChanged": true, "subscribe": false },
+                            "logging": {},
+                            "progress": true
+                        },
+                        "serverInfo": {
+                            "name": "leindex",
+                            "version": env!("CARGO_PKG_VERSION"),
+                            "description": "LeIndex MCP Server - Semantic code indexing and analysis with PDG-based tools"
+                        }
+                    });
+                    JsonRpcResponse::success(request_id, result)
+                }
+                "ping" => JsonRpcResponse::success(request_id, serde_json::json!({})),
+                "tools/call" => {
+                    let result = handle_tool_call(state, handlers, &request).await;
+                    JsonRpcResponse::from_result(request_id, result)
+                }
+                "tools/list" => JsonRpcResponse::success(request_id, list_tools_json(handlers)),
+                "prompts/list" => JsonRpcResponse::success(request_id, list_prompts_json()),
+                "prompts/get" => {
+                    let result = handle_prompt_get(&request);
+                    match result {
+                        Ok(value) => JsonRpcResponse::success(request_id, value),
+                        Err(e) => JsonRpcResponse::error(request_id, e),
+                    }
+                }
+                "resources/list" => JsonRpcResponse::success(request_id, list_resources_json()),
+                "resources/read" => {
+                    let result = handle_resource_read(&request);
+                    match result {
+                        Ok(value) => JsonRpcResponse::success(request_id, value),
+                        Err(e) => JsonRpcResponse::error(request_id, e),
+                    }
+                }
+                _ => JsonRpcResponse::error(
+                    request_id,
+                    super::protocol::JsonRpcError::method_not_found(method_name),
+                ),
+            };
+
+            serde_json::to_string(&response).ok()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -598,6 +1082,25 @@ mod tests {
             config.bind_address,
             SocketAddr::from(([127, 0, 0, 1], 3000))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_socket_cleanup_guard_removes_file() {
+        let dir = std::env::temp_dir().join("leindex_test_socket_guard");
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket_path = dir.join("test.sock");
+        std::fs::write(&socket_path, b"").unwrap();
+        assert!(socket_path.exists());
+
+        {
+            let _guard = SocketCleanupGuard {
+                path: socket_path.clone(),
+            };
+        }
+        assert!(!socket_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -679,7 +1182,7 @@ pub fn get_prompt(
             PromptMessage {
                 role: "user".to_string(),
                 content: PromptContent::Text {
-                    text: "Welcome to LeIndex! Here's how to get started:\n\n1. **Indexing**: First, index your project with `leindex_index`\n2. **Searching**: Use `leindex_search` for semantic code search\n3. **Analysis**: Use `leindex_deep_analyze` for comprehensive code analysis\n4. **Context**: Use `leindex_context` to expand around specific symbols\n\nPro tip: LeIndex auto-indexes on first use, so you can start searching immediately!".to_string(),
+                    text: "Welcome to LeIndex! Here's how to get started:\n\n1. **Indexing**: First, index your project with `leindex.index`\n2. **Searching**: Use `leindex.search` for semantic code search\n3. **Analysis**: Use `leindex.deep-analyze` for comprehensive code analysis\n4. **Context**: Use `leindex.context` to expand around specific symbols\n\nPro tip: LeIndex auto-indexes on first use, so you can start searching immediately!".to_string(),
                 },
             },
         ]),
@@ -695,7 +1198,7 @@ pub fn get_prompt(
                     role: "user".to_string(),
                     content: PromptContent::Text {
                         text: format!(
-                            "Let me help you investigate: {}\n\nHere's the recommended workflow:\n\n1. **Start broad**: Use `leindex_search` with a natural language query like '{}'\n2. **Find entry points**: Look for the most relevant symbols in the results\n3. **Deep dive**: Use `leindex_deep_analyze` on the most relevant symbol\n4. **Expand context**: Use `leindex_context` to see how the symbol is used\n5. **Navigate**: Follow symbol references with `leindex_read_symbol`\n\nWould you like me to help you with any specific step?",
+                            "Let me help you investigate: {}\n\nHere's the recommended workflow:\n\n1. **Start broad**: Use `leindex.search` with a natural language query like '{}'\n2. **Find entry points**: Look for the most relevant symbols in the results\n3. **Deep dive**: Use `leindex.deep-analyze` on the most relevant symbol\n4. **Expand context**: Use `leindex.context` to see how the symbol is used\n5. **Navigate**: Follow symbol references with `leindex.read-symbol`\n\nWould you like me to help you with any specific step?",
                             query, query
                         ),
                     },
@@ -801,7 +1304,7 @@ leindex index /path/to/project
 Or use the MCP tool:
 ```json
 {
-  "name": "leindex_index",
+  "name": "leindex.index",
   "arguments": {
     "project_path": "/path/to/project"
   }
@@ -817,7 +1320,7 @@ leindex search "how is authentication handled"
 Or use the MCP tool:
 ```json
 {
-  "name": "leindex_search",
+  "name": "leindex.search",
   "arguments": {
     "query": "how is authentication handled",
     "limit": 10
@@ -834,7 +1337,7 @@ leindex analyze --symbol "User::authenticate"
 Or use the MCP tool:
 ```json
 {
-  "name": "leindex_deep_analyze",
+  "name": "leindex.deep-analyze",
   "arguments": {
     "query": "User::authenticate"
   }
@@ -843,12 +1346,12 @@ Or use the MCP tool:
 
 ## Available Tools
 
-- `leindex_search` - Semantic code search
-- `leindex_deep_analyze` - Comprehensive code analysis
-- `leindex_context` - Expand symbol context
-- `leindex_grep_symbols` - Search symbols by name
-- `leindex_read_file` - Read file with PDG annotations
-- `leindex_file_summary` - Get file structural summary
+- `leindex.search` - Semantic code search
+- `leindex.deep-analyze` - Comprehensive code analysis
+- `leindex.context` - Expand symbol context
+- `leindex.grep-symbols` - Search symbols by name
+- `leindex.read-file` - Read file with PDG annotations
+- `leindex.file-summary` - Get file structural summary
 
 ## Environment Variables
 

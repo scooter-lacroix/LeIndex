@@ -26,7 +26,7 @@ pub struct Phase4Summary {
 
 /// Run phase 4 critical-path analysis.
 pub fn run(context: &PhaseExecutionContext, options: &PhaseOptions) -> Phase4Summary {
-    let scorer = HybridScorer::new().with_weights(0.45, 0.45, 0.10);
+    let scorer = HybridScorer::new().with_weights_hybrid(0.45, 0.0, 0.45, 0.10);
     let keyword_signals = options
         .hotspot_keywords
         .iter()
@@ -54,11 +54,13 @@ pub fn run(context: &PhaseExecutionContext, options: &PhaseOptions) -> Phase4Sum
     let mut hotspots = raw
         .into_iter()
         .map(|(node_id, complexity, impact, name)| {
-            let complexity_signal = complexity as f32 / max_complexity as f32;
-            let impact_signal = impact as f32 / max_impact as f32;
+            let structural_score = complexity as f32 / max_complexity as f32;
+            let tfidf_score = impact as f32 / max_impact as f32;
+            // Neural score not available in this context
+            let neural_score = 0.0;
             // Heuristic text signal with configurable keyword list from PhaseOptions.
             let normalized_name = name.to_ascii_lowercase();
-            let text_signal = if keyword_signals
+            let text_score = if keyword_signals
                 .iter()
                 .any(|keyword| normalized_name.contains(keyword))
             {
@@ -68,7 +70,7 @@ pub fn run(context: &PhaseExecutionContext, options: &PhaseOptions) -> Phase4Sum
             };
 
             let score = scorer
-                .score(complexity_signal, impact_signal, text_signal)
+                .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
                 .overall;
 
             Hotspot {

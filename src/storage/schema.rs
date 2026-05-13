@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS project_metadata (
     is_clone BOOLEAN DEFAULT 0,
     cloned_from TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_indexed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(canonical_path)
 )
 "#;
@@ -390,7 +391,7 @@ CREATE TABLE IF NOT EXISTS project_metadata (
     }
 
     /// Current schema version. Increment when adding migrations.
-    const SCHEMA_VERSION: u32 = 1;
+    const SCHEMA_VERSION: u32 = 2;
 
     /// Run database migrations based on the stored schema version.
     /// Creates the version tracking table if it doesn't exist.
@@ -424,9 +425,10 @@ CREATE TABLE IF NOT EXISTS project_metadata (
             )));
         }
 
-        // Add future migrations here:
-        // if current < 2 { self.migrate_v1_to_v2()?; }
-        // if current < 3 { self.migrate_v2_to_v3()?; }
+        // Migration v1 to v2: Add last_indexed column to project_metadata
+        if current < 2 {
+            self.migrate_v1_to_v2()?;
+        }
 
         // Update stored version
         self.conn.execute(
@@ -434,6 +436,24 @@ CREATE TABLE IF NOT EXISTS project_metadata (
             [Self::SCHEMA_VERSION],
         )?;
 
+        Ok(())
+    }
+
+    /// Migration from v1 to v2: Add last_indexed column to project_metadata table
+    fn migrate_v1_to_v2(&mut self) -> SqliteResult<()> {
+        // Check if column already exists
+        let columns: Vec<String> = self
+            .conn
+            .prepare("PRAGMA table_info(project_metadata)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<SqliteResult<Vec<_>>>()?;
+
+        if !columns.iter().any(|c| c == "last_indexed") {
+            self.conn.execute(
+                "ALTER TABLE project_metadata ADD COLUMN last_indexed TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+                [],
+            )?;
+        }
         Ok(())
     }
 }

@@ -2,6 +2,69 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [1.9.0] - 2026-05-12
+
+### ✨ New Features
+- **Hybrid Embedding System**: Unified embedding architecture combining TF-IDF with neural/remote embeddings for enhanced search quality. TF-IDF serves as the base signal, with neural embeddings added as enhancement layers through configurable hybrid scoring (weights: TF-IDF 0.30, neural 0.40, structural 0.15, text match 0.15).
+- **Remote Embedding Provider Support**: New integration with cloud-based embedding services (OpenAI, Cohere) as an alternative to local ONNX models
+- **R15 True Neural Embeddings**: Complete implementation of production-grade neural embeddings using Qwen3 models via ONNX Runtime
+- **Cross-Language Semantic Understanding**: Advanced code chunking and semantic analysis supporting multiple programming languages
+- **ONNX Reranker**: Optional Qwen3-Reranker-0.6B for quality-aware result refinement with combined scoring (70% rerank, 30% initial)
+- **Shared MCP Unix Socket Server**: R9-R10 milestone implementation for efficient inter-process communication
+- **Memory-Mapped Vector Embeddings**: R9-R10 milestone for zero-copy embedding persistence and retrieval
+- **Batch Embedding Generation**: Optimized batch processing for remote embedding providers to reduce API calls and improve performance
+- **Flexible Embedding Configuration**: New configuration methods to switch between TF-IDF, local ONNX, and remote cloud embeddings
+
+### 🚀 Performance Optimizations
+- **Indexing Efficiency Milestones**: R3-R8 comprehensive performance improvements across the indexing pipeline
+- **Memory Remediation**: R1-R7 memory management improvements with better resource utilization and leak prevention
+- **Session-Scoped MCP Handshake**: Multi-client deployment support with per-session state management (addresses P2 badge issue)
+- **Notification Guard Fix**: JSON-RPC 2.0 compliance for notification handling (placed before handshake check)
+- **Force Check Optimization**: Prevents unnecessary re-indexing when project is already indexed
+- **Streaming Atomic File Operations**: Zero-downtime large file editing with rollback capabilities
+
+### 🔧 Code Quality & Refactoring
+- **Beautiful Output Formatters**: Restructured MCP tool output presentation with standardized formatters
+- **MCP Tool Naming**: Renamed tools to 'LeIndex [Tool Name]' format for MCP compliance
+- **Legacy Tool Aliases**: Fixed legacy tool name aliases for backward compatibility
+- **Output Formatter Titles**: Added `title()` method to MCP tools for better tool identification
+- **Swift/Kotlin/Dart Parser Infrastructure**: Fixed compilation errors and struct field mismatches (temporarily disabled due to tree-sitter version conflicts)
+- **Tree-Sitter Version Compatibility**: Updated tree-sitter crate versions to resolve compatibility issues across language parsers
+- **Graph/Block Field Updates**: Fixed trait API mismatches in parser implementations
+
+### 🔒 Security & Safety
+- **MCP Handshake Enforcement**: Per-session handshake validation for HTTP transport (P2 badge fix)
+- **Path Validation**: Enhanced path validation in MCP server with project boundary checks
+- **JSON-RPC Spec Compliance**: Notification guard properly placed to avoid violating JSON-RPC 2.0 specification
+- **Project Initialization Deferral**: Deferred project initialization until explicit indexing request to prevent auto-indexing
+
+### 🐛 Bug Fixes
+- **MCP Auto-Indexing**: Fixed defer project initialization, add path validation, and enforce handshake
+- **JSON-RPC Notification Guard**: Generalized to check null id instead of specific method
+- **Tool Formatters**: Properly utilize formatters across all MCP tools
+- **Batched Embedding Generation**: Fixed compilation errors with proper type conversions and tensor operations
+- **ONNX Reranker Integration**: Implemented clone handling and batch processing for query-document pairs
+- **Streaming File Atomicity**: Replaced buffered two-phase approach with atomic rename operations for safety
+- **Last Indexed Timestamp**: Added tracking and migration for last_indexed metadata
+- **File Size Resolution**: Implemented actual file size lookup using std::fs::metadata
+- **WebSocket Client Messages**: Added proper handling for client subscriptions and pings
+
+### 🏗️ Infrastructure
+- **Operational Milestones**: R9-R14 architecture and operational improvements
+- **Architecture Documentation**: Updated architecture docs with new embedding and MCP capabilities
+- **Model Distribution Strategy**: R15 model distribution plan for local and remote embeddings
+- **Feature Flags**: Added `remote-embeddings` feature flag for cloud-based embedding support
+- **Dependency Updates**: Added reqwest and async-trait for remote API integration
+
+### 📊 Testing
+- **E2E Test Updates**: Updated tests for renamed MCP tool names and new functionality
+- **Remote Provider Tests**: Added unit tests for remote embedding providers and configuration
+
+### Migration Notes
+No breaking changes. All new features are opt-in via feature flags. Remote embeddings require API key configuration. Swift/Kotlin/Dart parsers remain disabled due to tree-sitter version conflicts.
+
+---
+
 ## [1.6.1] - 2026-05-04
 
 ### ✨ New Features

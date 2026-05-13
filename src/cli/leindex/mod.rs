@@ -17,7 +17,7 @@ pub(crate) use types::{
     ProjectFileScan, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS, SOURCE_FILE_EXTENSIONS,
 };
 
-use crate::cli::index_builder::{self, TfIdfEmbedder};
+use crate::cli::index_builder;
 use crate::cli::memory::WarmStrategy;
 use crate::graph::pdg::ProgramDependenceGraph;
 use crate::search::search::SearchEngine;
@@ -59,11 +59,14 @@ pub struct LeIndex {
     /// Cache subsystem (spiller, project scan, file stats)
     cache: crate::cli::index_cache::IndexCache,
 
+    /// Cached project configuration.
+    project_config: crate::cli::config::ProjectConfig,
+
     /// Indexing statistics
     stats: IndexStats,
 
     /// TF-IDF embedder (None until index_nodes() runs).
-    embedder: Option<TfIdfEmbedder>,
+    embedder: Option<index_builder::HybridEmbedder>,
 }
 
 impl LeIndex {
@@ -189,6 +192,12 @@ impl LeIndex {
         // Initialize storage with multi-location fallback and retry
         let storage_path = Self::resolve_storage_path(&project_path)?;
 
+        // Write artifact ownership marker for GC (only for non-in-project storage)
+        crate::cli::cleanup::write_artifact_marker(&storage_path);
+
+        // Register at-exit cleanup for temp-based storage
+        crate::cli::cleanup::register_at_exit_cleanup(storage_path.clone());
+
         let db_path = storage_path.join("leindex.db");
         let storage = Self::open_storage_with_retry(&db_path, 3)?;
 
@@ -217,6 +226,8 @@ impl LeIndex {
         // Initialize cache subsystem
         let cache_dir = storage_path.join("cache");
         let cache = crate::cli::index_cache::IndexCache::new(cache_dir)?;
+        let project_config =
+            crate::cli::config::ProjectConfig::load(&project_path).unwrap_or_default();
 
         Ok(Self {
             project_path,
@@ -227,6 +238,7 @@ impl LeIndex {
             search_engine,
             pdg: None,
             cache,
+            project_config,
             stats: IndexStats {
                 total_files: 0,
                 files_parsed: 0,
@@ -250,9 +262,10 @@ impl LeIndex {
     fn collect_source_files_with_hashes(
         &mut self,
         refresh: bool,
+        file_cache: Option<&mut index_builder::FileReadCache>,
     ) -> Result<Vec<(PathBuf, String)>> {
         let scan = self.get_project_scan(refresh)?;
-        index_builder::collect_source_files_with_hashes(&scan)
+        index_builder::collect_source_files_with_hashes(&scan, file_cache)
     }
 
     fn collect_source_file_paths(&mut self, refresh: bool) -> Result<Vec<PathBuf>> {
@@ -294,6 +307,10 @@ impl LeIndex {
             project_scan: self.cache.project_scan.as_ref(),
             cache_spiller: &self.cache.cache_spiller,
         }
+    }
+
+    pub(crate) fn indexing_batch_size(&self) -> usize {
+        self.project_config.indexing.batch_size
     }
 
     fn search_cache_key_for(
@@ -526,10 +543,12 @@ impl LeIndex {
             .take()
             .ok_or_else(|| anyhow::anyhow!("No PDG available for vector rebuild"))?;
 
+        let batch_size = self.indexing_batch_size();
         self.embedder = Some(index_builder::index_nodes(
             &pdg,
             &mut self.search_engine,
             &mut self.cache.file_stats_cache,
+            batch_size,
         )?);
         let indexed_count = self.search_engine.node_count();
 

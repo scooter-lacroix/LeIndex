@@ -11,14 +11,18 @@ use crate::validation::validation_to_json;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_edit_apply — atomic code modifications.
+/// Handler for LeIndex [edit_apply — atomic code modifications.
 #[derive(Clone)]
 pub struct EditApplyHandler;
 
 #[allow(missing_docs)]
 impl EditApplyHandler {
     pub fn name(&self) -> &str {
-        "leindex_edit_apply"
+        "leindex.edit-apply"
+    }
+
+    pub fn title(&self) -> &str {
+        "LeIndex [Edit Apply]"
     }
 
     pub fn description(&self) -> &str {
@@ -68,7 +72,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 },
                 "preview_token": {
                     "type": "string",
-                    "description": "The token returned by a previous leindex_edit_preview call. Required if using cached preview."
+                    "description": "The token returned by a previous LeIndex [Edit Preview] (tool: leindex.edit-preview) call. Required if using cached preview."
                 }
             },
             "required": ["file_path"]
@@ -200,7 +204,7 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
                 .await;
             return Err(JsonRpcError::invalid_params(
                 "Edit rejected: file content changed on disk since preview was generated. \
-                Please call leindex_edit_preview again."
+                Please call LeIndex [Edit Preview] again (tool: leindex.edit-preview).",
             ));
         }
 
@@ -209,7 +213,16 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             .clear(&storage_path, &canonical_path)
             .await;
 
-        // 5. PDG Context Enrichment
+        // 5. Incremental reindex to refresh the index with the edited file changes
+        // This ensures the index is fresh so subsequent tool calls don't show stale warnings
+        let mut guard = handle.write().await;
+        if let Err(e) = guard.incremental_reindex_from_watcher() {
+            tracing::warn!("Failed to refresh index after edit-apply: {}", e);
+            // Continue despite reindex failure - edit was applied successfully
+        }
+        drop(guard); // Release write lock before continuing
+
+        // 6. PDG Context Enrichment
         let mut affected_nodes: Vec<String> = Vec::new();
         let mut affected_files: std::collections::HashSet<String> =
             std::collections::HashSet::new();

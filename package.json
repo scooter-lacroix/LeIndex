@@ -1,6 +1,6 @@
 {
   "name": "leindex-workspace",
-  "version": "1.6.1",
+  "version": "1.6.6",
   "description": "LeIndex Rust workspace metadata and dashboard helper scripts",
   "type": "module",
   "scripts": {

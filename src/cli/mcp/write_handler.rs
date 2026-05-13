@@ -9,14 +9,18 @@ use std::sync::Arc;
 
 static GLOBAL_PARSER: Lazy<ParallelParser> = Lazy::new(|| ParallelParser::new().without_stats());
 
-/// Handler for leindex_write — atomic file creation/overwrite with immediate PDG surfacing.
+/// Handler for LeIndex [write — atomic file creation/overwrite with immediate PDG surfacing.
 #[derive(Clone)]
 pub struct WriteHandler;
 
 #[allow(missing_docs)]
 impl WriteHandler {
     pub fn name(&self) -> &str {
-        "leindex_write"
+        "leindex.write"
+    }
+
+    pub fn title(&self) -> &str {
+        "LeIndex [Write]"
     }
 
     pub fn description(&self) -> &str {
@@ -132,9 +136,7 @@ context (symbols, types) immediately so the model knows how the new file fits in
                 GLOBAL_PARSER.parse_files(vec![abs_path_for_spawn])
             })
             .await
-            .map_err(|e| {
-                JsonRpcError::internal_error(format!("Parser task panicked: {}", e))
-            })?;
+            .map_err(|e| JsonRpcError::internal_error(format!("Parser task panicked: {}", e)))?;
 
             if let Some(res) = results.first() {
                 res.signatures.clone()

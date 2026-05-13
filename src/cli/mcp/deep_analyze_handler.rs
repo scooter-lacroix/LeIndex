@@ -4,16 +4,21 @@ use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_deep_analyze
+/// Handler for LeIndex [deep_analyze
 ///
 /// Performs deep analysis with PDG-based context expansion.
 #[derive(Clone)]
 pub struct DeepAnalyzeHandler;
 
 impl DeepAnalyzeHandler {
-    /// Returns the name of this RPC method
+    /// Returns the name of this MCP tool (MCP-compliant: ASCII letters, digits, underscore, hyphen, dot only)
     pub fn name(&self) -> &str {
-        "leindex_deep_analyze"
+        "leindex.deep-analyze"
+    }
+
+    /// Returns the human-readable display title for this tool
+    pub fn title(&self) -> &str {
+        "LeIndex [Deep Analyze]"
     }
 
     /// Returns the description of this RPC method

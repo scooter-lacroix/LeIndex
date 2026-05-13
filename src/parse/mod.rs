@@ -51,13 +51,13 @@ pub mod ruby;
 /// PHP language implementation.
 pub mod php;
 
-// Swift language implementation - disabled due to tree-sitter version incompatibility
+/// Swift language implementation (disabled due to tree-sitter version conflicts)
 // pub mod swift;
 
-// Kotlin language implementation - disabled due to tree-sitter version incompatibility
+/// Kotlin language implementation (disabled due to tree-sitter version conflicts)
 // pub mod kotlin;
 
-// Dart language implementation - disabled due to parsing issues
+/// Dart language implementation (disabled due to tree-sitter version conflicts)
 // pub mod dart;
 
 /// Lua language implementation.

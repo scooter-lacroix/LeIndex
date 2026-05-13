@@ -33,6 +33,7 @@ use crate::cli::errors::detect_corruption;
 use crate::cli::leindex::{IndexStats, LeIndex};
 use crate::cli::mcp::protocol::JsonRpcError;
 use crate::cli::watcher::IndexWatcher;
+use dirs;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -369,13 +370,8 @@ impl ProjectRegistry {
 
     /// Resolve an optional `project_path` string to a canonical `PathBuf`.
     async fn resolve_path(&self, project_path: Option<&str>) -> Result<PathBuf, JsonRpcError> {
-        if let Some(raw) = project_path {
-            Path::new(raw).canonicalize().map_err(|e| {
-                JsonRpcError::invalid_params(format!(
-                    "Cannot resolve project_path '{}': {}",
-                    raw, e
-                ))
-            })
+        let path = if let Some(raw) = project_path {
+            Path::new(raw).to_path_buf()
         } else {
             let default = self.default_project.read().await;
             default.clone().ok_or_else(|| {
@@ -383,8 +379,38 @@ impl ProjectRegistry {
                     "No project_path provided and no project has been loaded yet. \
                      Pass project_path on the first call.",
                 )
-            })
+            })?
+        };
+
+        // Canonicalize first to resolve symlinks and relative paths
+        let canonical = path.canonicalize().map_err(|e| {
+            JsonRpcError::invalid_params(format!(
+                "Cannot resolve project_path '{}': {}",
+                path.display(),
+                e
+            ))
+        })?;
+
+        // Reject root directory (cross-platform: works on Windows too)
+        // Using parent().is_none() correctly identifies root paths on all platforms,
+        // including Windows drive roots like C:\ which have multiple components.
+        if canonical.parent().is_none() {
+            return Err(JsonRpcError::invalid_params(
+                "Refusing to index root directory. Specify a project subdirectory.".to_string(),
+            ));
         }
+
+        // Reject home directory (cross-platform)
+        if let Some(home_dir) = dirs::home_dir() {
+            let home_canonical = home_dir.canonicalize().unwrap_or(home_dir);
+            if canonical == home_canonical {
+                return Err(JsonRpcError::invalid_params(
+                    "Refusing to index home directory. Specify a project subdirectory.".to_string(),
+                ));
+            }
+        }
+
+        Ok(canonical)
     }
 
     /// Create a new `LeIndex`, attempt to load from storage, and insert into
@@ -504,26 +530,20 @@ impl ProjectRegistry {
         );
 
         let path_for_blocking = project_path.clone();
-        let stats = tokio::task::spawn_blocking(move || {
+        let temp = tokio::task::spawn_blocking(move || {
             let mut temp = LeIndex::new(&path_for_blocking).map_err(|e| {
                 JsonRpcError::init_failed(&path_for_blocking.display().to_string(), &e.to_string())
             })?;
             temp.index_project(force_reindex)
-                .map_err(|e| JsonRpcError::indexing_failed(format!("Indexing failed: {}", e)))
+                .map_err(|e| JsonRpcError::indexing_failed(format!("Indexing failed: {}", e)))?;
+            Ok::<LeIndex, JsonRpcError>(temp)
         })
         .await
         .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))??;
 
-        let mut fresh = LeIndex::new(&project_path).map_err(|e| {
-            JsonRpcError::init_failed(&project_path.display().to_string(), &e.to_string())
-        })?;
-        fresh.load_from_storage().map_err(|e| {
-            JsonRpcError::indexing_failed(format!("Failed to load indexed data: {}", e))
-        })?;
-
         {
             let mut idx = handle.write().await;
-            *idx = fresh;
+            *idx = temp;
         }
 
         // Invalidate stale-cache entry so get_or_create() won't reuse
@@ -532,6 +552,11 @@ impl ProjectRegistry {
             .canonicalize()
             .unwrap_or_else(|_| project_path.clone());
         self.stale_cache.write().await.remove(&canonical);
+
+        let stats = {
+            let idx = handle.read().await;
+            idx.get_stats().clone()
+        };
 
         Ok(stats)
     }

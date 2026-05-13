@@ -4,14 +4,18 @@ use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
 
-/// Handler for leindex_impact_analysis — transitive dependency impact.
+/// Handler for LeIndex [impact_analysis — transitive dependency impact.
 #[derive(Clone)]
 pub struct ImpactAnalysisHandler;
 
 #[allow(missing_docs)]
 impl ImpactAnalysisHandler {
     pub fn name(&self) -> &str {
-        "leindex_impact_analysis"
+        "leindex.impact-analysis"
+    }
+
+    pub fn title(&self) -> &str {
+        "LeIndex [Impact Analysis]"
     }
 
     pub fn description(&self) -> &str {

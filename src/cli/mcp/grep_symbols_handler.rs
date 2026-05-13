@@ -88,14 +88,18 @@ fn build_symbol_entry(pdg: &ProgramDependenceGraph, nid: NodeId, opts: &SymbolEn
     entry
 }
 
-/// Handler for leindex_grep_symbols — structurally-aware symbol search.
+/// Handler for LeIndex [grep_symbols — structurally-aware symbol search.
 #[derive(Clone)]
 pub struct GrepSymbolsHandler;
 
 #[allow(missing_docs)]
 impl GrepSymbolsHandler {
     pub fn name(&self) -> &str {
-        "leindex_grep_symbols"
+        "leindex.grep-symbols"
+    }
+
+    pub fn title(&self) -> &str {
+        "LeIndex [Grep Symbols]"
     }
 
     pub fn description(&self) -> &str {

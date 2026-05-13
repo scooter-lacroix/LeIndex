@@ -220,6 +220,7 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 - **Dashboard** — Bun + React operational UI with project metrics and graph telemetry
 - **Low resource mode** — works on constrained hardware
 - **Built in Rust** — fast indexing, low memory, safe concurrency
+- **Flexible embedding backends** — choose between TF-IDF, local ONNX models, or remote cloud providers (OpenAI, Cohere)
 
 ---
 
@@ -512,6 +513,69 @@ leindex mcp                           # MCP stdio mode
 leindex serve                         # HTTP/WebSocket server
 leindex dashboard                     # Launch dashboard UI
 ```
+
+---
+
+## Embedding Configuration
+
+LeIndex supports multiple embedding backends for semantic search:
+
+### Local ONNX Models (default)
+
+Build with the default features to use local Qwen3 embedding models via ONNX Runtime:
+
+```bash
+cargo build --release
+```
+
+Local models provide:
+- Privacy (data never leaves your machine)
+- No API costs
+- Zero network latency
+- Support for Qwen3-Embedding-0.6B and optional Qwen3-Reranker-0.6B
+
+### Remote Cloud Providers
+
+Build with the `remote-embeddings` feature to use cloud-based embedding services:
+
+```bash
+cargo build --release --features remote-embeddings
+```
+
+Supported providers:
+- **OpenAI** (`text-embedding-3-small`, `text-embedding-3-large`)
+- **Cohere** (`embed-english-v3.0`, `embed-multilingual-v3.0`)
+- **Custom** (any OpenAI-compatible endpoint)
+
+Configure via environment variables:
+
+```bash
+# OpenAI
+export OPENAI_API_KEY="your-key"
+# LeIndex will automatically use OpenAI embeddings
+
+# Cohere
+export COHERE_API_KEY="your-key"
+# LeIndex will automatically use Cohere embeddings
+
+# Custom provider
+export LEINDEX_EMBEDDING_PROVIDER="custom"
+export LEINDEX_EMBEDDING_API_KEY="your-key"
+export LEINDEX_EMBEDDING_BASE_URL="https://your-endpoint.com/v1"
+export LEINDEX_EMBEDDING_MODEL="your-model-name"
+```
+
+Remote embeddings offer:
+- Higher accuracy with state-of-the-art models
+- No local resource requirements
+- Automatic model updates
+- Multi-language support (Cohere)
+
+**Note**: Remote embeddings require network access and API keys from your provider.
+
+### TF-IDF Fallback
+
+If no embedding backend is configured, LeIndex falls back to TF-IDF for keyword-based search. This is lightweight and works offline but lacks semantic understanding.
 
 ---
 

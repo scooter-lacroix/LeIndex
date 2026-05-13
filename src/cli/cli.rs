@@ -4,6 +4,10 @@
 
 use crate::cli::leindex::LeIndex;
 use crate::cli::mcp::handlers::{all_tool_handlers, ToolHandler};
+use crate::cli::mcp::output::{
+    DiagnosticsFormatter, FileSummaryFormatter, ImpactFormatter, PhaseFormatter,
+    ProjectMapFormatter, SearchFormatter,
+};
 use crate::cli::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::cli::mcp::McpServer;
 use crate::cli::registry::{ProjectRegistry, DEFAULT_MAX_PROJECTS};
@@ -67,6 +71,15 @@ pub enum Commands {
         /// Show detailed progress
         #[arg(long = "progress")]
         progress: bool,
+
+        /// Self-imposed RSS limit in megabytes.
+        ///
+        /// When set, indexing monitors RSS and stops gracefully if the limit
+        /// is approached (warning at 90%) or exceeded (error). On Linux a hard
+        /// RLIMIT_AS ceiling is also set at 110% of the cap to prevent system
+        /// OOM kills. No-op on non-Linux platforms if monitoring is unavailable.
+        #[arg(long = "max-memory", value_name = "MB")]
+        max_memory: Option<u64>,
     },
 
     /// Search indexed code
@@ -181,6 +194,13 @@ pub enum Commands {
         /// Compatibility flag for some AI tools
         #[arg(long = "stdio")]
         stdio: bool,
+
+        /// Path to a Unix domain socket to listen on (instead of stdio).
+        ///
+        /// Each connection gets its own MCP session. The socket file is
+        /// removed when the server shuts down. Only available on Unix.
+        #[arg(long = "socket")]
+        socket: Option<PathBuf>,
     },
 
     /// Start the frontend dashboard
@@ -192,6 +212,17 @@ pub enum Commands {
         /// Build for production instead of dev server
         #[arg(long = "prod")]
         prod: bool,
+    },
+
+    /// Remove stale LeIndex temp artifacts
+    Cleanup {
+        /// Maximum age in days for artifacts to keep (default: 7)
+        #[arg(long = "max-age-days", default_value = "7")]
+        max_age_days: u64,
+
+        /// Show what would be removed without actually removing
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 }
 
@@ -240,9 +271,15 @@ impl Cli {
         // Execute the appropriate command
         // Default to Mcp if no command is provided or if --stdio is set
         let command = if self.stdio {
-            Commands::Mcp { stdio: true }
+            Commands::Mcp {
+                stdio: true,
+                socket: None,
+            }
         } else {
-            self.command.unwrap_or(Commands::Mcp { stdio: false })
+            self.command.unwrap_or(Commands::Mcp {
+                stdio: false,
+                socket: None,
+            })
         };
 
         maybe_complete_post_install_actions(&command);
@@ -252,7 +289,8 @@ impl Cli {
                 path,
                 force,
                 progress,
-            } => cmd_index_impl(path, force, progress).await,
+                max_memory,
+            } => cmd_index_impl(path, force, progress, max_memory).await,
             Commands::Search { query, top_k } => {
                 cmd_search_impl(query, top_k, global_project).await
             }
@@ -296,8 +334,18 @@ impl Cli {
             Commands::Diagnostics => cmd_diagnostics_impl(global_project).await,
             Commands::Tools { command } => cmd_tools_impl(command, global_project).await,
             Commands::Serve { host, port } => cmd_serve_impl(host, port).await,
-            Commands::Mcp { .. } => cmd_mcp_stdio_impl(global_project).await,
+            Commands::Mcp { socket, .. } => {
+                if let Some(ref socket_path) = socket {
+                    cmd_mcp_socket_impl(socket_path, global_project).await
+                } else {
+                    cmd_mcp_stdio_impl(global_project).await
+                }
+            }
             Commands::Dashboard { port, prod } => cmd_dashboard_impl(port, prod).await,
+            Commands::Cleanup {
+                max_age_days,
+                dry_run,
+            } => cmd_cleanup_impl(max_age_days, dry_run).await,
         }
     }
 }
@@ -546,7 +594,12 @@ fn get_project_path(explicit: Option<PathBuf>) -> PathBuf {
 }
 
 /// Index command implementation
-async fn cmd_index_impl(path: PathBuf, force: bool, _progress: bool) -> AnyhowResult<()> {
+async fn cmd_index_impl(
+    path: PathBuf,
+    force: bool,
+    _progress: bool,
+    max_memory: Option<u64>,
+) -> AnyhowResult<()> {
     let canonical_path = path
         .canonicalize()
         .context("Failed to canonicalize project path")?;
@@ -554,15 +607,32 @@ async fn cmd_index_impl(path: PathBuf, force: bool, _progress: bool) -> AnyhowRe
     info!("Indexing project at: {}", canonical_path.display());
 
     // Check if already indexed (unless force)
-    // TODO: Add force check logic
+    if !force {
+        // Create temporary LeIndex to check if already indexed
+        if let Ok(check_leindex) = LeIndex::new(&canonical_path) {
+            if check_leindex.is_indexed() {
+                println!("Project already indexed. Use --force to re-index.");
+                println!("  Use --force to re-index if you have made changes.");
+                return Ok(());
+            }
+        }
+    }
+
+    // Apply hard RSS limit via rlimit if requested (Linux-only)
+    if let Some(mb) = max_memory {
+        crate::cli::memory_cap::apply_hard_limit(mb)?;
+    }
 
     // Create LeIndex and index the project
     let mut leindex = LeIndex::new(&canonical_path).context("Failed to create LeIndex instance")?;
 
-    let stats = tokio::task::spawn_blocking(move || leindex.index_project(force))
-        .await
-        .context("Indexing task failed")?
-        .context("Indexing failed")?;
+    let max_memory_bytes = max_memory.map(|mb| mb * 1024 * 1024);
+    let stats = tokio::task::spawn_blocking(move || {
+        leindex.index_project_with_memory_cap(force, max_memory_bytes)
+    })
+    .await
+    .context("Indexing task failed")?
+    .context("Indexing failed")?;
 
     // Print results
     println!("\n✓ Indexing complete!");
@@ -610,26 +680,32 @@ async fn cmd_search_impl(
         return Ok(());
     }
 
-    // Print results
-    println!("\nFound {} result(s) for: '{}'\n", results.len(), query);
-    for (i, result) in results.iter().enumerate() {
-        println!("{}. {} ({})", i + 1, result.symbol_name, result.file_path);
-        println!("   ID: {}", result.node_id);
-        println!("   Overall Score: {:.2}", result.score.overall);
-        println!(
-            "   Explanation: [Semantic: {:.2}, Text: {:.2}, Structural: {:.2}]",
-            result.score.semantic, result.score.text_match, result.score.structural
-        );
-        if let Some(context) = &result.context {
-            let context_preview = if context.len() > 100 {
-                format!("{}...", &context[..100])
-            } else {
-                context.clone()
-            };
-            println!("   Context: {}", context_preview);
-        }
-        println!();
-    }
+    // Convert results to JSON value for formatter
+    let results_json: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "rank": r.rank,
+                "symbol": r.symbol_name,
+                "file_path": r.file_path,
+                "node_id": r.node_id,
+                "score": r.score.overall,
+                "tfidf_score": r.score.tfidf,
+                "neural_score": r.score.neural,
+                "text_score": r.score.text_match,
+                "structural_score": r.score.structural,
+                "context": r.context,
+                "language": r.language,
+            })
+        })
+        .collect();
+
+    // Use beautiful formatter
+    let formatter = SearchFormatter::new();
+    println!(
+        "{}",
+        formatter.format(&serde_json::json!(results_json), &query)
+    );
 
     Ok(())
 }
@@ -661,18 +737,45 @@ async fn cmd_analyze_impl(
         .analyze(&query, token_budget)
         .context("Analysis failed")?;
 
-    // Print results
-    println!("\nAnalysis Results for: '{}'", query);
-    println!("Found {} entry point(s)", result.results.len());
-    println!("Tokens used: {}", result.tokens_used);
-    println!("Processing time: {}ms\n", result.processing_time_ms);
-
-    if let Some(context) = &result.context {
-        println!("Context:");
-        println!("{}", context);
-    }
+    // Print results with nice formatting
+    let output = format_analysis_output(&query, &result);
+    println!("{}", output);
 
     Ok(())
+}
+
+fn format_analysis_output(query: &str, result: &crate::cli::leindex::AnalysisResult) -> String {
+    use crate::cli::mcp::output::{BOLD, DIM, LIGHT_CYAN, RESET};
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "{}┌─ Analysis: {} ─┐{}\n",
+        LIGHT_CYAN, query, RESET
+    ));
+    out.push_str(&format!(
+        "  {}Found:{} {} entry point(s)\n",
+        BOLD,
+        RESET,
+        result.results.len()
+    ));
+    out.push_str(&format!(
+        "  {}Tokens:{} {}\n",
+        BOLD, RESET, result.tokens_used
+    ));
+    out.push_str(&format!(
+        "  {}Time:{} {}ms\n",
+        BOLD, RESET, result.processing_time_ms
+    ));
+
+    if let Some(context) = &result.context {
+        out.push('\n');
+        out.push_str(&format!("  {}{}{}\n", BOLD, "Context:", RESET));
+        let context_str: &str = context.as_str();
+        let truncated = crate::cli::mcp::output::truncate_chars(context_str, 300);
+        out.push_str(&format!("  {}{}{}", DIM, truncated, RESET));
+    }
+
+    out
 }
 
 /// Context command implementation
@@ -691,7 +794,14 @@ async fn cmd_context_impl(
     )?;
 
     let value = execute_tool_handler("leindex_context", args, project).await?;
-    print_json_value(&value)?;
+
+    let formatter = SearchFormatter::new();
+    let display_value = value
+        .get("results")
+        .cloned()
+        .unwrap_or_else(|| value.clone());
+    println!("{}", formatter.format(&display_value, &node_id));
+
     Ok(())
 }
 
@@ -798,31 +908,18 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         .get_diagnostics()
         .context("Failed to get diagnostics")?;
 
-    // Print diagnostics
-    println!("\nLeIndex Diagnostics\n");
-    println!("Project: {}", diag.project_id);
-    println!("Path: {}", diag.project_path);
-    println!("\nIndex Statistics:");
-    println!("  Files parsed: {}", diag.stats.files_parsed);
-    println!("  Successful: {}", diag.stats.successful_parses);
-    println!("  Failed: {}", diag.stats.failed_parses);
-    println!("  Total signatures: {}", diag.stats.total_signatures);
-    println!("  PDG nodes: {}", diag.stats.pdg_nodes);
-    println!("  PDG edges: {}", diag.stats.pdg_edges);
-    println!("  Indexed nodes: {}", diag.stats.indexed_nodes);
-    println!("\nMemory Usage:");
-    println!(
-        "  Current: {:.2} MB",
-        diag.memory_usage_bytes as f64 / 1024.0 / 1024.0
-    );
-    println!(
-        "  Total: {:.2} MB",
-        diag.total_memory_bytes as f64 / 1024.0 / 1024.0
-    );
-    println!("  Usage: {:.1}%", diag.memory_usage_percent);
-    if diag.memory_threshold_exceeded {
-        println!("  ⚠️  Memory threshold exceeded!");
-    }
+    // Convert to JSON for formatter
+    let diag_json = serde_json::json!({
+        "project_path": diag.project_path,
+        "indexed_files": diag.stats.files_parsed,
+        "index_size_mb": diag.memory_usage_bytes as f64 / 1024.0 / 1024.0,
+        "symbol_count": diag.stats.indexed_nodes,
+        "issues": []
+    });
+
+    // Use beautiful formatter
+    let formatter = DiagnosticsFormatter::new();
+    println!("{}", formatter.format(&diag_json));
 
     Ok(())
 }
@@ -852,9 +949,69 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
             args_json,
             set,
         } => {
-            let args = merge_tool_args(parse_tool_args_json(&args_json)?, &set, project.as_ref())?;
+            let parsed_args = parse_tool_args_json(&args_json)?;
+            let args = merge_tool_args(parsed_args.clone(), &set, project.as_ref())?;
             let value = execute_tool_handler(&name, args, project).await?;
-            print_json_value(&value)?;
+
+            // Use appropriate formatter based on tool name
+            let normalized_name = name.to_lowercase().replace(['-', '.'], "_");
+            let formatted = match normalized_name.as_str() {
+                "leindex_search" | "search" => {
+                    let formatter = SearchFormatter::new();
+                    formatter.format(
+                        &value,
+                        parsed_args
+                            .get("query")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                    )
+                }
+                "leindex_context" | "context" => {
+                    let formatter = SearchFormatter::new();
+                    let display_value = value
+                        .get("results")
+                        .cloned()
+                        .unwrap_or_else(|| value.clone());
+                    formatter.format(
+                        &display_value,
+                        parsed_args
+                            .get("node_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                    )
+                }
+                "leindex_diagnostics" | "diagnostics" => {
+                    let formatter = DiagnosticsFormatter::new();
+                    formatter.format(&value)
+                }
+                "leindex_project_map" | "project_map" => {
+                    let formatter = ProjectMapFormatter::new();
+                    formatter.format(&value)
+                }
+                "leindex_impact_analysis" | "impact_analysis" => {
+                    let formatter = ImpactFormatter::new();
+                    formatter.format(&value)
+                }
+                "leindex_file_summary" | "file_summary" => {
+                    let formatter = FileSummaryFormatter::new();
+                    formatter.format(&value)
+                }
+                "leindex_phase_analysis" | "phase_analysis" => {
+                    let formatter = PhaseFormatter::new();
+                    formatter.format(&value)
+                }
+                "leindex_git_status" | "git_status" => {
+                    use crate::cli::mcp::output::GitStatusFormatter;
+                    let formatter = GitStatusFormatter::new();
+                    formatter.format(&value)
+                }
+                _ => {
+                    // Default to JSON output
+                    serde_json::to_string_pretty(&value).unwrap_or_default()
+                }
+            };
+
+            println!("{}", formatted);
             Ok(())
         }
     }
@@ -876,14 +1033,8 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
 
     info!("Starting MCP server on {}", addr);
 
-    // Create a default LeIndex instance for the server
-    // The server will use the current directory as the project path
-    let current_dir = std::env::current_dir().context("Failed to get current directory")?;
-
-    let leindex = LeIndex::new(&current_dir).context("Failed to create LeIndex instance")?;
-
     // Create and run the MCP server
-    let server = McpServer::with_address(addr, leindex).context("Failed to create MCP server")?;
+    let server = McpServer::with_address(addr).context("Failed to create MCP server")?;
 
     println!("\nLeIndex MCP Server\n");
     println!("Server starting on http://{}\n", addr);
@@ -931,6 +1082,17 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 
     // Initialize handlers
     let _ = crate::cli::mcp::server::HANDLERS.set(all_tool_handlers());
+
+    // Initialize SERVER_INSTANCE for stdio mode
+    let server = crate::cli::mcp::server::McpServer {
+        config: crate::cli::mcp::server::McpServerConfig::default(),
+        _registry: registry.clone(),
+        handshake_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        session_handshakes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    };
+    crate::cli::mcp::server::SERVER_INSTANCE
+        .set(Arc::new(server))
+        .map_err(|_| anyhow::anyhow!("Server instance already initialized"))?;
 
     eprintln!("[INFO] LeIndex MCP stdio server starting");
     eprintln!("[INFO] Project: {}", canonical_path.display());
@@ -1033,10 +1195,16 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 
                 let response = match handle_mcp_request(request, project_path.clone()).await {
                     Ok(r) => r,
-                    Err(e) => JsonRpcResponse::error(
+                    Err(e) => Some(JsonRpcResponse::error(
                         request_id,
                         JsonRpcError::internal_error(e.to_string()),
-                    ),
+                    )),
+                };
+
+                // Notifications (e.g. notifications/initialized) must not receive
+                // a response per JSON-RPC 2.0 spec — skip serializing/sending.
+                let Some(response) = response else {
+                    continue;
                 };
 
                 let response_json = match serde_json::to_string(&response) {
@@ -1068,6 +1236,60 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     }
 
     Ok(())
+}
+
+/// MCP Unix socket command implementation — run MCP server on a Unix domain socket.
+#[cfg(unix)]
+async fn cmd_mcp_socket_impl(
+    socket_path: &std::path::Path,
+    project: Option<PathBuf>,
+) -> AnyhowResult<()> {
+    let project_path = get_project_path(project);
+    let canonical_path = project_path
+        .canonicalize()
+        .context("Failed to canonicalize project path")?;
+
+    info!(
+        "Starting LeIndex MCP Unix socket server at {} for project: {}",
+        socket_path.display(),
+        canonical_path.display()
+    );
+
+    // Create LeIndex instance
+    let mut leindex = LeIndex::new(&canonical_path).context("Failed to create LeIndex instance")?;
+    let _ = leindex.load_from_storage();
+
+    // Initialize global state for handlers
+    let registry = Arc::new(ProjectRegistry::with_initial_project(
+        DEFAULT_MAX_PROJECTS,
+        leindex,
+    ));
+    let _ = crate::cli::mcp::server::SERVER_STATE.set(registry.clone());
+
+    // Initialize handlers
+    let _ = crate::cli::mcp::server::HANDLERS.set(all_tool_handlers());
+
+    // Create MCP server instance
+    let server = crate::cli::mcp::server::McpServer::new(
+        crate::cli::mcp::server::McpServerConfig::default(),
+    )
+    .context("Failed to create MCP server")?;
+
+    println!("\nLeIndex MCP Unix Socket Server\n");
+    println!("Socket: {}", socket_path.display());
+    println!("Project: {}", canonical_path.display());
+    println!("\nPress Ctrl+C to stop the server\n");
+
+    server.run_socket(socket_path).await
+}
+
+/// MCP Unix socket command implementation — stub for non-Unix platforms.
+#[cfg(not(unix))]
+async fn cmd_mcp_socket_impl(
+    _socket_path: &std::path::Path,
+    _project: Option<PathBuf>,
+) -> AnyhowResult<()> {
+    anyhow::bail!("Unix sockets are not supported on this platform");
 }
 
 fn parse_tool_args_json(args_json: &str) -> AnyhowResult<Value> {
@@ -1220,12 +1442,43 @@ fn find_tool_handler(name: &str) -> Option<ToolHandler> {
 
     all_tool_handlers().into_iter().find(|handler| {
         let handler_name = normalize_tool_name(handler.name());
+        let title = handler.title();
+        let short_name = extract_short_name(&handler_name);
+
+        // Check all possible formats:
+        // 1. handler.name() - e.g., "leindex.context"
+        // 2. short name from handler - e.g., "context"
+        // 3. title - e.g., "leindex_context" (normalized)
+        // 4. legacy format - e.g., "leindex_context" in input matches "context" from handler
+        // 5. MCP-compliant format - e.g., "leindex.index" in input matches "leindex.index" from handler
+        // 6. Direct legacy format - e.g., "leindex_search" matches handler name "leindex.search" after normalization
+
         handler_name == normalized
-            || handler_name
-                .strip_prefix("leindex_")
-                .map(|short| short == normalized)
-                .unwrap_or(false)
+            || short_name == normalized
+            || normalize_tool_name(title) == normalized
+            // Legacy leindex_* format - check if input has leindex_ prefix matching short name
+            || (normalized.starts_with("leindex_") && short_name == normalized.strip_prefix("leindex_").unwrap_or(""))
     })
+}
+
+/// Extract short name from a tool name.
+/// For "leindex_foo" returns "foo", for "leindex [foo bar]" returns "foo_bar", for "leindex.foo-bar" returns "foo_bar".
+fn extract_short_name(name: &str) -> String {
+    // Handle "leindex [foo bar]" format (normalized to "leindex [foo bar]")
+    if let Some(inside) = name.strip_prefix("leindex [") {
+        if let Some(inside) = inside.strip_suffix(']') {
+            let with_underscores = inside.replace(' ', "_");
+            return normalize_tool_name(&with_underscores);
+        }
+    }
+    // Handle "leindex.foo-bar" format (MCP-compliant: leindex.search, leindex.project-map)
+    if let Some(inside) = name.strip_prefix("leindex.") {
+        return normalize_tool_name(inside);
+    }
+    // Handle old "leindex_foo" format
+    name.strip_prefix("leindex_")
+        .map(normalize_tool_name)
+        .unwrap_or_else(|| normalize_tool_name(name))
 }
 
 async fn execute_tool_handler(
@@ -1366,15 +1619,160 @@ async fn cmd_dashboard_impl(port: u16, prod: bool) -> AnyhowResult<()> {
     Ok(())
 }
 
+/// Cleanup command implementation — remove stale LeIndex temp artifacts.
+async fn cmd_cleanup_impl(max_age_days: u64, dry_run: bool) -> AnyhowResult<()> {
+    use crate::cli::cleanup::run_gc;
+    use std::time::Duration;
+
+    let max_age = Duration::from_secs(max_age_days * 24 * 3600);
+
+    if dry_run {
+        // In dry-run mode we scan but do not remove
+        println!("LeIndex Cleanup (dry run)\n");
+        println!(
+            "Scanning for artifacts older than {} day(s)...\n",
+            max_age_days
+        );
+
+        let report = run_gc_dry_run(max_age);
+        println!("{}", report);
+    } else {
+        println!("LeIndex Cleanup\n");
+        println!("Removing artifacts older than {} day(s)...\n", max_age_days);
+
+        let report = run_gc(max_age);
+        println!("{}", report);
+    }
+
+    Ok(())
+}
+
+/// Dry-run GC: scan and report without removing anything.
+fn run_gc_dry_run(max_age: std::time::Duration) -> crate::cli::cleanup::GcReport {
+    use crate::cli::cleanup::artifact_scan_roots;
+    use std::time::SystemTime;
+    use tracing::debug;
+
+    let mut report = crate::cli::cleanup::GcReport::default();
+    let cutoff = SystemTime::now() - max_age;
+
+    for root in artifact_scan_roots() {
+        if !root.exists() {
+            continue;
+        }
+
+        if root
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with("lephase-"))
+            .unwrap_or(false)
+        {
+            count_artifact(&root, &cutoff, &mut report);
+            continue;
+        }
+
+        let entries = match std::fs::read_dir(&root) {
+            Ok(e) => e,
+            Err(err) => {
+                debug!("Cannot read {}: {}", root.display(), err);
+                continue;
+            }
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path.file_name().map(|n| n == ".leindex").unwrap_or(false) {
+                continue;
+            }
+            count_artifact(&path, &cutoff, &mut report);
+        }
+    }
+
+    report
+}
+
+fn count_artifact(
+    dir: &std::path::Path,
+    cutoff: &std::time::SystemTime,
+    report: &mut crate::cli::cleanup::GcReport,
+) {
+    use crate::cli::cleanup::{
+        artifact_age, dir_size, is_leindex_artifact, is_leindex_artifact_by_pattern,
+    };
+    use tracing::debug;
+
+    if !is_leindex_artifact(dir) && !is_leindex_artifact_by_pattern(dir) {
+        return;
+    }
+
+    report.scanned += 1;
+
+    let age = artifact_age(dir);
+    if age >= *cutoff {
+        debug!("Artifact {} is not stale yet", dir.display());
+        return;
+    }
+
+    let size = dir_size(dir);
+    debug!(
+        "Would remove stale artifact: {} ({:.2} MB)",
+        dir.display(),
+        size as f64 / 1024.0 / 1024.0
+    );
+    report.removed += 1;
+    report.bytes_freed += size;
+}
+
 /// Handle a single MCP request and return the response
+#[allow(clippy::needless_return)]
 async fn handle_mcp_request(
     request: JsonRpcRequest,
     _project_path: PathBuf,
-) -> anyhow::Result<JsonRpcResponse> {
-    use crate::cli::mcp::server::{handle_tool_call, list_tools_json, HANDLERS, SERVER_STATE};
+) -> anyhow::Result<Option<JsonRpcResponse>> {
+    use crate::cli::mcp::server::{
+        handle_tool_call, list_tools_json, HANDLERS, SERVER_INSTANCE, SERVER_STATE,
+    };
 
     let method_name = request.method.clone();
     let id = request.id.clone().unwrap_or(serde_json::Value::Null);
+
+    // Notifications (id is null) must not receive a response per JSON-RPC 2.0 spec
+    if request.id.is_none() {
+        tracing::debug!("Ignoring notification: {}", method_name);
+        return Ok(None);
+    }
+
+    // Get server instance to check handshake status
+    let server_instance = match SERVER_INSTANCE.get() {
+        Some(s) => s,
+        None => {
+            return Ok(Some(JsonRpcResponse::error(
+                id,
+                crate::cli::mcp::protocol::JsonRpcError::new(
+                    -32603,
+                    "Server instance not initialized",
+                ),
+            )));
+        }
+    };
+
+    // Check handshake completion for non-initialize requests
+    if !server_instance
+        .handshake_complete
+        .load(std::sync::atomic::Ordering::SeqCst)
+        && method_name != "initialize"
+        && method_name != "ping"
+    {
+        return Ok(Some(JsonRpcResponse::error(
+            id,
+            crate::cli::mcp::protocol::JsonRpcError::new(
+                -32000,
+                "Server not initialized. Call 'initialize' first.",
+            ),
+        )));
+    }
 
     // Get the global state and handlers
     let state = SERVER_STATE
@@ -1389,8 +1787,13 @@ async fn handle_mcp_request(
     match method_name.as_str() {
         "initialize" => {
             // MCP protocol initialization handshake
+            // Mark handshake as complete
+            server_instance
+                .handshake_complete
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+
             // Return server capabilities with comprehensive description
-            Ok(JsonRpcResponse::success(
+            return Ok(Some(JsonRpcResponse::success(
                 id,
                 serde_json::json!({
                     "protocolVersion": "2024-11-05",
@@ -1414,31 +1817,29 @@ async fn handle_mcp_request(
                         "description": "LeIndex MCP Server - Semantic code indexing and analysis with PDG-based tools. Provides 18+ specialized tools for code comprehension: semantic search, symbol lookup, impact analysis, structural code queries, and intelligent editing. Uses Program Dependence Graphs for superior code understanding compared to traditional text-based tools."
                     }
                 }),
-            ))
+            )));
         }
 
-        "notifications/initialized" => {
-            // Client notification sent after successful initialization
-            // No response needed for notifications
-            Ok(JsonRpcResponse::success(id, serde_json::json!({})))
-        }
         "ping" => {
             // Simple health check
-            Ok(JsonRpcResponse::success(id, serde_json::json!({})))
+            Ok(Some(JsonRpcResponse::success(id, serde_json::json!({}))))
         }
         "tools/call" => {
             // Use the centralized tool call handler that formats for MCP
             let result = handle_tool_call(state, handlers, &request).await;
-            Ok(JsonRpcResponse::from_result(id, result))
+            Ok(Some(JsonRpcResponse::from_result(id, result)))
         }
         "tools/list" => {
             // List all available tools using centralized formatter
-            Ok(JsonRpcResponse::success(id, list_tools_json(handlers)))
+            Ok(Some(JsonRpcResponse::success(
+                id,
+                list_tools_json(handlers),
+            )))
         }
-        _ => Ok(JsonRpcResponse::error(
+        _ => Ok(Some(JsonRpcResponse::error(
             id,
             crate::cli::mcp::protocol::JsonRpcError::method_not_found(method_name),
-        )),
+        ))),
     }
 }
 
@@ -1588,8 +1989,39 @@ mod tests {
 
     #[test]
     fn test_find_tool_handler_accepts_short_and_full_names() {
-        assert!(find_tool_handler("leindex_project_map").is_some());
+        assert!(find_tool_handler("LeIndex [Project Map]").is_some());
         assert!(find_tool_handler("project_map").is_some());
         assert!(find_tool_handler("project-map").is_some());
+    }
+
+    #[test]
+    fn test_cleanup_command_parsing() {
+        let cli = Cli::try_parse_from(["leindex", "cleanup"]).unwrap();
+        match cli.command {
+            Some(Commands::Cleanup {
+                max_age_days,
+                dry_run,
+            }) => {
+                assert_eq!(max_age_days, 7);
+                assert!(!dry_run);
+            }
+            _ => panic!("Expected Cleanup command"),
+        }
+    }
+
+    #[test]
+    fn test_cleanup_command_with_flags() {
+        let cli = Cli::try_parse_from(["leindex", "cleanup", "--max-age-days", "14", "--dry-run"])
+            .unwrap();
+        match cli.command {
+            Some(Commands::Cleanup {
+                max_age_days,
+                dry_run,
+            }) => {
+                assert_eq!(max_age_days, 14);
+                assert!(dry_run);
+            }
+            _ => panic!("Expected Cleanup command"),
+        }
     }
 }

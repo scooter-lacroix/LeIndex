@@ -56,11 +56,20 @@ macro_rules! dispatch_handler {
         }
 
         impl ToolHandler {
-            /// Get the tool name
+            /// Get the tool name (MCP-compliant: leindex.search)
             pub fn name(&self) -> &str {
                 match self {
                     $(
                         ToolHandler::$variant(h) => h.name(),
+                    )*
+                }
+            }
+
+            /// Get the tool title (human-readable: LeIndex [Search])
+            pub fn title(&self) -> &str {
+                match self {
+                    $(
+                        ToolHandler::$variant(h) => h.title(),
                     )*
                 }
             }
@@ -86,7 +95,7 @@ macro_rules! dispatch_handler {
             /// Execute the tool
             pub async fn execute(
                 &self,
-                registry: &std::sync::Arc<crate::cli::registry::ProjectRegistry>,
+                registry: &std::sync::Arc<$crate::cli::registry::ProjectRegistry>,
                 args: serde_json::Value,
             ) -> Result<serde_json::Value, $crate::cli::mcp::protocol::JsonRpcError> {
                 match self {
