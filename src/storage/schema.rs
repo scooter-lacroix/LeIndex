@@ -441,6 +441,18 @@ CREATE TABLE IF NOT EXISTS project_metadata (
 
     /// Migration from v1 to v2: Add last_indexed column to project_metadata table
     fn migrate_v1_to_v2(&mut self) -> SqliteResult<()> {
+        let table_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = 'project_metadata'
+            )",
+            [],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            return Ok(());
+        }
+
         // Check if column already exists
         let columns: Vec<String> = self
             .conn

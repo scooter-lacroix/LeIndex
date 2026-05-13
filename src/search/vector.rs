@@ -507,10 +507,18 @@ impl MmapEmbeddingIndex {
         };
 
         // Pad to 4-byte alignment for the embedding matrix
-        let embedding_matrix_offset = (ids_section_end + 3) & !3;
+        let embedding_matrix_offset = ids_section_end
+            .checked_add(3)
+            .ok_or_else(|| MmapError::Corrupt("embedding matrix offset overflow".to_string()))? & !3;
 
         // Validate total file size
-        let expected_size = embedding_matrix_offset + n * (dimension as usize) * 4;
+        let embedding_matrix_size = (dimension as usize)
+            .checked_mul(4)
+            .and_then(|v| n.checked_mul(v))
+            .ok_or_else(|| MmapError::Corrupt("embedding matrix size overflow".to_string()))?;
+        let expected_size = embedding_matrix_offset
+            .checked_add(embedding_matrix_size)
+            .ok_or_else(|| MmapError::Corrupt("expected file size overflow".to_string()))?;
         if mmap.len() < expected_size {
             return Err(MmapError::Corrupt(format!(
                 "file too small: expected {} bytes, got {}",
@@ -1003,5 +1011,28 @@ mod tests {
 
         let result = MmapEmbeddingIndex::open(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mmap_overflow_in_size_computation_returns_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overflow.bin");
+
+        // Header with extreme values to trigger checked arithmetic overflow
+        // magic=LIEE, version=1, node_count=usize::MAX (as u32), dimension=usize::MAX (as u32)
+        let mut header = Vec::new();
+        header.extend_from_slice(b"LIEE");
+        header.extend_from_slice(&1u32.to_le_bytes());
+        header.extend_from_slice(&u32::MAX.to_le_bytes()); // node_count
+        header.extend_from_slice(&u32::MAX.to_le_bytes()); // dimension
+        std::fs::write(&path, header).unwrap();
+
+        let result = MmapEmbeddingIndex::open(&path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("overflow") || err.contains("Corrupt"),
+            "expected overflow or corrupt error, got: {err}"
+        );
     }
 }

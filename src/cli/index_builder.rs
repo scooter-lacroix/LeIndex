@@ -18,6 +18,8 @@ use crate::search::onnx::QwenEmbeddingProvider;
 use crate::search::onnx::{
     GenericRemoteProvider, RemoteEmbeddingConfig, RemoteEmbeddingError,
 };
+#[cfg(feature = "remote-embeddings")]
+use crate::search::onnx::remote::RemoteEmbeddingProvider;
 
 use super::leindex::{
     FileStats, IndexStats, ProjectFileScan, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS,
@@ -430,16 +432,22 @@ pub enum HybridEmbedder {
     /// TF-IDF + Local ONNX neural embeddings
     #[cfg(feature = "onnx")]
     HybridLocal {
+        /// TF-IDF embedder for keyword-based search
         tfidf: TfIdfEmbedder,
+        /// Local ONNX neural embedder for semantic search
         neural: QwenEmbeddingProvider,
+        /// Weight for neural embeddings in hybrid scoring (0.0-1.0)
         neural_weight: f32,
     },
 
     /// TF-IDF + Remote embeddings (OpenAI, Cohere, custom)
     #[cfg(feature = "remote-embeddings")]
     HybridRemote {
+        /// TF-IDF embedder for keyword-based search
         tfidf: TfIdfEmbedder,
+        /// Remote embedding provider for semantic search
         remote: GenericRemoteProvider,
+        /// Weight for remote embeddings in hybrid scoring (0.0-1.0)
         remote_weight: f32,
     },
 }
@@ -1157,6 +1165,9 @@ pub(crate) fn index_nodes_with_embedder(
     };
 
     let mut nodes: Vec<NodeInfo> = Vec::with_capacity(batch_size);
+    #[cfg(feature = "remote-embeddings")]
+    let mut warned_remote_blocking = false;
+
     for batch in node_indices.chunks(batch_size) {
         nodes.clear();
         for &node_idx in batch {
@@ -1175,17 +1186,29 @@ pub(crate) fn index_nodes_with_embedder(
                 // Generate neural embedding (if available)
                 // Note: Remote embeddings are not supported in synchronous indexing context
                 // Only local ONNX embeddings are used here to avoid async runtime issues
-                let neural_embedding = if embedder.has_neural() {
+                let neural_embedding = match &embedder {
+                    HybridEmbedder::TfIdfOnly(_) => None,
                     #[cfg(feature = "onnx")]
-                    {
-                        embedder.embed_neural_blocking(&node_content).ok().flatten()
+                    HybridEmbedder::HybridLocal { .. } => {
+                        match embedder.embed_neural_blocking(&node_content) {
+                            Some(Ok(v)) => Some(v),
+                            Some(Err(e)) => {
+                                tracing::warn!("Neural embedding failed for node {}: {}", node.id, e);
+                                None
+                            }
+                            None => None,
+                        }
                     }
-                    #[cfg(not(feature = "onnx"))]
-                    {
+                    #[cfg(feature = "remote-embeddings")]
+                    HybridEmbedder::HybridRemote { .. } => {
+                        if !warned_remote_blocking {
+                            tracing::warn!(
+                                "Remote embeddings require async runtime; falling back to TF-IDF-only for this indexing run"
+                            );
+                            warned_remote_blocking = true;
+                        }
                         None
                     }
-                } else {
-                    None
                 };
 
                 let signature = crate::search::search::SearchEngine::extract_signature_from_content(
