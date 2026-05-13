@@ -464,17 +464,44 @@ impl MmapEmbeddingIndex {
         let ids_section_end = {
             let mut max_end: usize = ids_section_offset;
             for i in 0..n {
+                // Use checked arithmetic for slice indices to prevent overflow
+                let offset_idx_start = offsets_start.checked_add(i.checked_mul(8).ok_or_else(|| MmapError::Corrupt("offset index overflow".to_string()))?)
+                    .ok_or_else(|| MmapError::Corrupt("offset start overflow".to_string()))?;
+                let offset_idx_end = offset_idx_start.checked_add(8)
+                    .ok_or_else(|| MmapError::Corrupt("offset end overflow".to_string()))?;
+                let len_idx_start = lengths_start.checked_add(i.checked_mul(4).ok_or_else(|| MmapError::Corrupt("length index overflow".to_string()))?)
+                    .ok_or_else(|| MmapError::Corrupt("length start overflow".to_string()))?;
+                let len_idx_end = len_idx_start.checked_add(4)
+                    .ok_or_else(|| MmapError::Corrupt("length end overflow".to_string()))?;
+
+                if offset_idx_end > mmap.len() {
+                    return Err(MmapError::Corrupt(format!(
+                        "offset slice exceeds file size: [{}, {}], file size {}",
+                        offset_idx_start, offset_idx_end, mmap.len()
+                    )));
+                }
+                if len_idx_end > mmap.len() {
+                    return Err(MmapError::Corrupt(format!(
+                        "length slice exceeds file size: [{}, {}], file size {}",
+                        len_idx_start, len_idx_end, mmap.len()
+                    )));
+                }
+
                 let off = u64::from_le_bytes(
-                    mmap[offsets_start + i * 8..offsets_start + i * 8 + 8]
+                    mmap[offset_idx_start..offset_idx_end]
                         .try_into()
                         .unwrap(),
                 ) as usize;
                 let len = u32::from_le_bytes(
-                    mmap[lengths_start + i * 4..lengths_start + i * 4 + 4]
+                    mmap[len_idx_start..len_idx_end]
                         .try_into()
                         .unwrap(),
                 ) as usize;
-                max_end = max_end.max(ids_section_offset + off + len);
+                // Use checked addition for ID section end calculation to prevent overflow
+                let section_end = ids_section_offset.checked_add(off)
+                    .and_then(|v| v.checked_add(len))
+                    .ok_or_else(|| MmapError::Corrupt("ID section end overflow".to_string()))?;
+                max_end = max_end.max(section_end);
             }
             max_end
         };

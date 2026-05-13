@@ -89,8 +89,8 @@ pub struct McpServer {
     pub _registry: Arc<ProjectRegistry>,
     /// Flag to track MCP handshake completion (used by stdio transport — single client).
     pub(crate) handshake_complete: Arc<AtomicBool>,
-    /// Per-session handshake state for HTTP transport (session ID → (handshaked, last_access_time)).
-    /// Keyed by the `Mcp-Session-Id` header value.
+    /// Per-session handshake state for HTTP and stdio transports (session ID → (handshaked, last_access_time)).
+    /// Keyed by the `Mcp-Session-Id` header value for HTTP, and generated session ID for stdio.
     pub(crate) session_handshakes: Arc<Mutex<HashMap<String, (bool, Instant)>>>,
 }
 
@@ -995,9 +995,11 @@ async fn handle_socket_message(
 
             // Check handshake state for this session (allow initialize and ping before handshake)
             if method_name != "initialize" && method_name != "ping" {
-                let sessions = session_handshakes.lock().unwrap();
-                let handshaked = if let Some((h, _)) = sessions.get(session_id) {
-                    *h
+                let mut sessions = session_handshakes.lock().unwrap();
+                let handshaked = if let Some((handshaked, last_access)) = sessions.get_mut(session_id) {
+                    // Update last access time to prevent eviction
+                    *last_access = Instant::now();
+                    *handshaked
                 } else {
                     false
                 };
