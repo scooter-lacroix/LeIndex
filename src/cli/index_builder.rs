@@ -18,6 +18,8 @@ use crate::search::onnx::QwenEmbeddingProvider;
 use crate::search::onnx::{
     GenericRemoteProvider, RemoteEmbeddingConfig, RemoteEmbeddingError,
 };
+#[cfg(feature = "remote-embeddings")]
+use crate::search::onnx::remote::RemoteEmbeddingProvider;
 
 use super::leindex::{
     FileStats, IndexStats, ProjectFileScan, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS,
@@ -430,16 +432,22 @@ pub enum HybridEmbedder {
     /// TF-IDF + Local ONNX neural embeddings
     #[cfg(feature = "onnx")]
     HybridLocal {
+        /// TF-IDF embedder for keyword-based search
         tfidf: TfIdfEmbedder,
+        /// Local ONNX neural embedder for semantic search
         neural: QwenEmbeddingProvider,
+        /// Weight for neural embeddings in hybrid scoring (0.0-1.0)
         neural_weight: f32,
     },
 
     /// TF-IDF + Remote embeddings (OpenAI, Cohere, custom)
     #[cfg(feature = "remote-embeddings")]
     HybridRemote {
+        /// TF-IDF embedder for keyword-based search
         tfidf: TfIdfEmbedder,
+        /// Remote embedding provider for semantic search
         remote: GenericRemoteProvider,
+        /// Weight for remote embeddings in hybrid scoring (0.0-1.0)
         remote_weight: f32,
     },
 }
@@ -1178,7 +1186,7 @@ pub(crate) fn index_nodes_with_embedder(
                 let neural_embedding = if embedder.has_neural() {
                     #[cfg(feature = "onnx")]
                     {
-                        embedder.embed_neural_blocking(&node_content).ok().flatten()
+                        embedder.embed_neural_blocking(&node_content).and_then(|r| r.ok())
                     }
                     #[cfg(not(feature = "onnx"))]
                     {

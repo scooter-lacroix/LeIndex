@@ -35,7 +35,9 @@ pub enum RemoteEmbeddingError {
     /// Invalid embedding dimension
     #[error("Invalid embedding dimension: expected {expected}, got {got}")]
     InvalidDimension {
+        /// Expected embedding dimension from the provider
         expected: usize,
+        /// Actual embedding dimension received
         got: usize,
     },
 
@@ -48,11 +50,20 @@ pub enum RemoteEmbeddingError {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RemoteProvider {
     /// OpenAI embeddings (text-embedding-3-small, text-embedding-3-large)
-    OpenAI { model: String },
+    OpenAI {
+        /// Model name (e.g., "text-embedding-3-small")
+        model: String,
+    },
     /// Cohere embeddings (embed-english-v3.0, embed-multilingual-v3.0)
-    Cohere { model: String },
+    Cohere {
+        /// Model name (e.g., "embed-english-v3.0")
+        model: String,
+    },
     /// Custom HTTP endpoint
-    Custom { endpoint: String },
+    Custom {
+        /// Custom HTTP endpoint URL
+        endpoint: String,
+    },
 }
 
 impl Default for RemoteProvider {
@@ -359,8 +370,17 @@ impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
 }
 
 /// Generic remote embedding provider that wraps specific implementations
+#[derive(Clone)]
 pub struct GenericRemoteProvider {
     provider: Arc<dyn RemoteEmbeddingProvider>,
+}
+
+impl std::fmt::Debug for GenericRemoteProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenericRemoteProvider")
+            .field("provider", &"<RemoteEmbeddingProvider>")
+            .finish()
+    }
 }
 
 impl GenericRemoteProvider {
