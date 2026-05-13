@@ -26,6 +26,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
@@ -88,9 +89,9 @@ pub struct McpServer {
     pub _registry: Arc<ProjectRegistry>,
     /// Flag to track MCP handshake completion (used by stdio transport — single client).
     pub(crate) handshake_complete: Arc<AtomicBool>,
-    /// Per-session handshake state for HTTP transport (session ID → handshaked).
+    /// Per-session handshake state for HTTP transport (session ID → (handshaked, last_access_time)).
     /// Keyed by the `Mcp-Session-Id` header value.
-    pub(crate) session_handshakes: Arc<Mutex<HashMap<String, bool>>>,
+    pub(crate) session_handshakes: Arc<Mutex<HashMap<String, (bool, Instant)>>>,
 }
 
 impl McpServer {
@@ -366,10 +367,19 @@ fn handle_initialize(server: &McpServer) -> (Value, Option<String>) {
     // Generate a session ID for HTTP transport
     let session_id = generate_session_id();
 
-    // Store in per-session map
+    // Store in per-session map with eviction logic
     {
         let mut sessions = server.session_handshakes.lock().unwrap();
-        sessions.insert(session_id.clone(), true);
+        // Evict oldest sessions if we exceed a reasonable limit (1000 sessions)
+        const MAX_HTTP_SESSIONS: usize = 1000;
+        if sessions.len() >= MAX_HTTP_SESSIONS {
+            // Find and remove the oldest session (by last_access_time)
+            if let Some((oldest_id, _)) = sessions.iter().min_by_key(|&(_, (_, time))| time) {
+                let oldest_id = oldest_id.to_string();
+                sessions.remove(&oldest_id);
+            }
+        }
+        sessions.insert(session_id.clone(), (true, Instant::now()));
     }
 
     let result = serde_json::json!({
@@ -492,8 +502,14 @@ async fn json_rpc_handler(headers: axum_06::http::HeaderMap, Json(body): Json<Va
         // Non-initialize: validate session ID exists and is handshaked
         let session_ok = match &incoming_session_id {
             Some(sid) => {
-                let sessions = server_instance.session_handshakes.lock().unwrap();
-                sessions.get(sid).copied().unwrap_or(false)
+                let mut sessions = server_instance.session_handshakes.lock().unwrap();
+                if let Some((handshaked, last_access)) = sessions.get_mut(sid) {
+                    // Update last access time
+                    *last_access = Instant::now();
+                    *handshaked
+                } else {
+                    false
+                }
             }
             None => false,
         };
@@ -671,9 +687,11 @@ async fn list_tools_handler(headers: axum_06::http::HeaderMap) -> Json<Value> {
     // Validate session ID if present, but don't require one
     if let Some(sid) = headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok()) {
         if let Some(server) = SERVER_INSTANCE.get() {
-            let sessions = server.session_handshakes.lock().unwrap();
-            if let Some(handshaked) = sessions.get(sid) {
-                if !handshaked {
+            let mut sessions = server.session_handshakes.lock().unwrap();
+            if let Some((handshaked, last_access)) = sessions.get_mut(sid) {
+                // Update last access time
+                *last_access = Instant::now();
+                if !*handshaked {
                     return Json(serde_json::json!({
                         "error": "Invalid session. Call 'initialize' first."
                     }));
@@ -777,7 +795,7 @@ impl McpServer {
             let session_id = generate_session_id();
             {
                 let mut sessions = self.session_handshakes.lock().unwrap();
-                sessions.insert(session_id.clone(), false);
+                sessions.insert(session_id.clone(), (false, Instant::now()));
             }
 
             let session_id_clone = session_id.clone();
@@ -924,7 +942,7 @@ impl McpServer {
 async fn handle_socket_message(
     json_payload: &str,
     session_id: &str,
-    session_handshakes: &Arc<Mutex<HashMap<String, bool>>>,
+    session_handshakes: &Arc<Mutex<HashMap<String, (bool, Instant)>>>,
     handshake_complete: &Arc<AtomicBool>,
 ) -> Option<String> {
     use super::protocol::{JsonRpcMessage, JsonRpcResponse};
@@ -978,7 +996,12 @@ async fn handle_socket_message(
             // Check handshake state for this session (allow initialize and ping before handshake)
             if method_name != "initialize" && method_name != "ping" {
                 let sessions = session_handshakes.lock().unwrap();
-                if !sessions.get(session_id).copied().unwrap_or(false) {
+                let handshaked = if let Some((h, _)) = sessions.get(session_id) {
+                    *h
+                } else {
+                    false
+                };
+                if !handshaked {
                     let resp = JsonRpcResponse::error(
                         request_id,
                         super::protocol::JsonRpcError::new(-32600, "Server not initialized. Call 'initialize' first."),
@@ -993,7 +1016,7 @@ async fn handle_socket_message(
                     handshake_complete.store(true, Ordering::SeqCst);
                     {
                         let mut sessions = session_handshakes.lock().unwrap();
-                        sessions.insert(session_id.to_string(), true);
+                        sessions.insert(session_id.to_string(), (true, Instant::now()));
                     }
 
                     let result = serde_json::json!({

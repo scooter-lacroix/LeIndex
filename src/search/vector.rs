@@ -434,18 +434,26 @@ impl MmapEmbeddingIndex {
         // ID strings start after offset+length tables.
         // Read the maximum offset+length to determine the end of the ID section.
         let ids_section_offset = lengths_end;
-        
+
         // Verify offset and length tables fit in file before accessing
-        let offsets_table_size = n * 8;
-        let lengths_table_size = n * 4;
-        if offsets_start + offsets_table_size > mmap.len() {
+        // Use checked arithmetic to prevent overflow on malicious node_count
+        let offsets_table_size = n.checked_mul(8)
+            .ok_or_else(|| MmapError::Corrupt("offset table size overflow".to_string()))?;
+        let lengths_table_size = n.checked_mul(4)
+            .ok_or_else(|| MmapError::Corrupt("length table size overflow".to_string()))?;
+        let offsets_end_checked = offsets_start.checked_add(offsets_table_size)
+            .ok_or_else(|| MmapError::Corrupt("offset table end overflow".to_string()))?;
+        let lengths_end_checked = lengths_start.checked_add(lengths_table_size)
+            .ok_or_else(|| MmapError::Corrupt("length table end overflow".to_string()))?;
+
+        if offsets_end_checked > mmap.len() {
             return Err(MmapError::Corrupt(format!(
                 "offset table exceeds file size: table size {}, file size {}",
                 offsets_table_size,
                 mmap.len()
             )));
         }
-        if lengths_start + lengths_table_size > mmap.len() {
+        if lengths_end_checked > mmap.len() {
             return Err(MmapError::Corrupt(format!(
                 "length table exceeds file size: table size {}, file size {}",
                 lengths_table_size,

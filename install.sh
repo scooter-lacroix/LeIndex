@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 1.6.3 - Rust Edition + Dashboard Assets
+# Version: 1.6.6 - Rust Edition + Dashboard Assets
 # Platform: Linux/Unix
 #
 # Installer:
@@ -25,7 +25,7 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="1.6.3"
+readonly SCRIPT_VERSION="1.6.6"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
