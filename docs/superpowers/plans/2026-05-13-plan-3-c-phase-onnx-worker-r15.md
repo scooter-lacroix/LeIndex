@@ -48,7 +48,8 @@
 - `src/search/onnx/qwen.rs` - delegate embedding calls to the worker client
 - `src/search/onnx/reranker.rs` - delegate reranker calls to the worker client
 - `src/cli/index_builder.rs` - route batch embedding and chunking into the worker-backed path
-- `tools/memcheck/src/driver.rs` - sample worker-active runs and record combined / per-process RSS
+- `tools/memcheck/src/main.rs` - sample worker-active runs and record combined / per-process RSS
+- `tools/memcheck/src/workload.rs` - add worker-aware workload execution hooks if the current runner shape needs them
 - `tools/memcheck/src/report.rs` - add worker-aware fields to the per-phase JSON
 - `tools/memcheck/workloads/small_repo.toml` - add a dedicated C-phase workload profile for worker exercise
 - `docs/memory/budgets/current.json` - add C-phase ceilings for main and combined RSS, if the worker path changes the budget table
@@ -66,7 +67,7 @@
 - `models/README.md` - replace the manual-download story with the bundled-worker story
 - `docs/R15_MODEL_DISTRIBUTION.md` - supersede the old single-binary model layout
 - `docs/R15_IMPLEMENTATION_SUMMARY.md` - replace the old "in-process ONNX" summary with the worker topology
-- `.github/pull_request_template.md` - note the bundle / baseline expectation if the release surface changes
+- `.github/PULL_REQUEST_TEMPLATE.md` - note the bundle / baseline expectation if the release surface changes
 
 **Test:**
 - `crates/leindex-embed/tests/protocol_roundtrip.rs`
@@ -74,7 +75,7 @@
 - `tests/search/onnx_worker_fallback.rs`
 - `packages/npm-leindex-mcp/test.js`
 - `packages/pypi-leindex/tests/test_bootstrap.py`
-- `tools/memcheck/src/driver.rs` and the existing memcheck report / baseline outputs
+- `tools/memcheck/src/main.rs`, `tools/memcheck/src/workload.rs`, and the existing memcheck report / baseline outputs
 
 ---
 
@@ -459,7 +460,7 @@ git commit -m "ci(release): ship leindex-embed and model bundles"
 - Modify: `models/README.md`
 - Modify: `docs/R15_MODEL_DISTRIBUTION.md`
 - Modify: `docs/R15_IMPLEMENTATION_SUMMARY.md`
-- Modify: `.github/pull_request_template.md`
+- Modify: `.github/PULL_REQUEST_TEMPLATE.md`
 
 - [ ] **Step 1: Update the top-level embedding section**
 
@@ -485,7 +486,7 @@ git commit -m "ci(release): ship leindex-embed and model bundles"
 
 - [ ] **Step 4: Tighten the PR template note**
 
-Update `.github/pull_request_template.md` so changes to:
+Update `.github/PULL_REQUEST_TEMPLATE.md` so changes to:
 - worker bundle layout
 - model assets
 - memory budgets
@@ -507,7 +508,7 @@ Expected:
 - [ ] **Step 6: Commit**
 
 ```bash
-git add README.md packages/npm-leindex-mcp/README.md packages/pypi-leindex/README.md models/README.md docs/R15_MODEL_DISTRIBUTION.md docs/R15_IMPLEMENTATION_SUMMARY.md .github/pull_request_template.md
+git add README.md packages/npm-leindex-mcp/README.md packages/pypi-leindex/README.md models/README.md docs/R15_MODEL_DISTRIBUTION.md docs/R15_IMPLEMENTATION_SUMMARY.md .github/PULL_REQUEST_TEMPLATE.md
 git commit -m "docs(r15): align worker bundle and public install surfaces"
 ```
 
@@ -516,7 +517,8 @@ git commit -m "docs(r15): align worker bundle and public install surfaces"
 ## Task 7: Extend memcheck and the C-phase acceptance gate
 
 **Files:**
-- Modify: `tools/memcheck/src/driver.rs`
+- Modify: `tools/memcheck/src/main.rs`
+- Modify: `tools/memcheck/src/workload.rs`
 - Modify: `tools/memcheck/src/report.rs`
 - Modify: `tools/memcheck/workloads/small_repo.toml`
 - Modify: `docs/memory/budgets/current.json`
@@ -524,7 +526,7 @@ git commit -m "docs(r15): align worker bundle and public install surfaces"
 
 - [ ] **Step 1: Teach memcheck about the worker-active path**
 
-The memcheck driver should:
+The memcheck harness should:
 - capture the worker PID once the embed request starts
 - record main RSS and worker RSS separately
 - record a combined peak for the embed phase
@@ -532,7 +534,7 @@ The memcheck driver should:
 
 - [ ] **Step 2: Add a C-phase workload profile**
 
-Update `tools/memcheck/workloads/small_repo.toml` so the C-phase fixture includes:
+Update `tools/memcheck/workloads/small_repo.toml` and the corresponding workload runner wiring so the C-phase fixture includes:
 - an idle phase before the first embed request
 - a phase that exercises the worker-backed embedding path
 - a query or reindex phase that confirms the worker teardown / restart cycle
@@ -632,4 +634,3 @@ git status
 - [ ] Placeholder scan: no `TBD` / `TODO` / `implement later` markers in this plan. ✅
 - [ ] Type consistency: worker request / response, bundle paths, and memcheck targets are named consistently across tasks. ✅
 - [ ] All file paths are exact; all commands are runnable; all expected outputs are concrete.
-

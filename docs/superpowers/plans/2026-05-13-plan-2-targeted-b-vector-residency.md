@@ -22,7 +22,7 @@ This plan assumes the measurement harness from Plan 0 exists and will be used as
 - `cargo test --test search_vector_mmap` passes and proves the mmap read path can return borrowed slices without cloning.
 - `cargo test --test search_residency` passes and proves heap-to-mmap swaps, tombstones, and compaction preserve row stability.
 - `cargo test --test cache_budget` passes and proves search/edit/index caches stay under their byte ceilings.
-- `cargo test --test cli_runtime_discipline` and `cargo test --test storage_reader_pool` pass and prove the runtime, watcher, and SQLite topology changes are in place.
+- `cargo test --test storage_reader_pool` passes and proves the SQLite reader-pool topology changes are in place.
 - `cargo test --test search_int8_gate` passes with the spec thresholds: NDCG@10 drop <= 1%, p50 latency <= baseline +5%, p99 latency <= baseline +10%.
 - `cargo xtask memcheck` on `tests/fixtures/memcheck/small_repo/` shows idle RSS <= 100 MiB, peak indexing RSS <= 300 MiB, and peak query RSS <= 180 MiB.
 - `cargo test --features full` passes on Linux after all B-phase edits land.
@@ -35,7 +35,6 @@ This plan assumes the measurement harness from Plan 0 exists and will be used as
 - `tests/search_vector_mmap.rs` - borrowed slice and row lookup coverage for `MmapEmbeddingIndex`
 - `tests/search_residency.rs` - heap-to-mmap swap, tombstone, and compaction coverage
 - `tests/cache_budget.rs` - byte ceiling coverage for search/edit/index caches
-- `tests/cli_runtime_discipline.rs` - tokio, rayon, watcher, and MCP session-state coverage
 - `tests/storage_reader_pool.rs` - SQLite reader pool and connection-topology coverage
 - `tests/search_int8_gate.rs` - INT8 recall/latency gate coverage
 
@@ -51,11 +50,7 @@ This plan assumes the measurement harness from Plan 0 exists and will be used as
 - `src/cli/mcp/edit_cache.rs` - hard byte ceiling for edit previews
 - `src/cli/index_cache.rs` - bounded scan/index caches and per-project accounting
 - `src/cli/memory.rs` - byte-size accounting hooks for caches and memory telemetry
-- `src/bin/leindex.rs` - explicit tokio runtime builder
-- `src/parse/parallel.rs` - bounded rayon pool construction
-- `src/cli/mcp/server.rs` - `DashMap`-backed session handshake state
-- `src/cli/registry.rs` - keep `index_slots` bounded to live projects
-- `src/cli/watcher.rs` - keep the 500 ms debounce path and harden it with tests
+- `src/parse/parallel.rs` - bounded rayon pool construction for B-phase indexing backpressure
 - `src/storage/schema.rs` - fixed-size SQLite reader pool
 - `src/storage/turso_config.rs` - connection-role audit and reader/writer classification
 - `src/global/registry.rs` - SQLite initializer audit for the no-surprises pass
@@ -87,7 +82,7 @@ Expected assertions:
 - the row lookup returns the expected `u32`
 - the owned-copy shim matches the borrowed slice
 
-- [ ] **Step 2: Verify the legacy `leann_index/` tree stays gone**
+- [ ] **Step 2: Verify whether the legacy `leann_index/` tree or callers still exist**
 
 Run:
 
@@ -97,8 +92,8 @@ rg --files src | rg '^src/leann_index/'
 
 Expected output:
 
-- no paths are printed
-- if a stale caller or module reappears in the tree, remove it before the commit and keep the grep clean
+- no paths are printed if the tree is already gone
+- if paths or stale callers still exist, remove / migrate them in this plan and keep the grep clean before the commit
 
 - [ ] **Step 3: Implement the API in `src/search/vector.rs`**
 
@@ -330,74 +325,43 @@ git commit -m "perf(memory): bound search and edit caches"
 
 ---
 
-## Task 5: Runtime, watcher, and SQLite discipline
+## Task 5: Indexing backpressure and SQLite reader topology
 
 **Files:**
-- Modify: `src/bin/leindex.rs`
 - Modify: `src/parse/parallel.rs`
 - Modify: `src/cli/leindex/indexing.rs`
-- Modify: `src/cli/mcp/server.rs`
-- Modify: `src/cli/registry.rs`
-- Modify: `src/cli/watcher.rs`
 - Modify: `src/storage/schema.rs`
 - Modify: `src/storage/turso_config.rs`
 - Modify: `src/global/registry.rs`
-- Create: `tests/cli_runtime_discipline.rs`
 - Create: `tests/storage_reader_pool.rs`
 
-- [ ] **Step 1: Replace the default tokio macro with an explicit runtime**
-
-Change `src/bin/leindex.rs` so the daemon uses a manually configured multi-thread runtime instead of the blanket `#[tokio::main]` default.
-
-Spec target:
-
-- worker threads: 2
-- blocking threads: 8
-- stack size: 1 MiB
-
-Keep short bridges as `spawn_blocking`, but avoid using the async executor as a place to run long CPU-bound work.
-
-- [ ] **Step 2: Bound rayon and parsing work**
+- [ ] **Step 1: Bound rayon and parsing work**
 
 In `src/parse/parallel.rs`, construct the rayon pool explicitly with the small stack size from the spec and a modest thread cap.
 
 Wire the pool through the indexing path in `src/cli/leindex/indexing.rs` so parse/index work uses the bounded pool instead of the global default.
 
-- [ ] **Step 3: Replace the MCP session mutex hotspot**
-
-Switch `src/cli/mcp/server.rs` from `Arc<Mutex<HashMap<...>>>` to `DashMap` for the per-session handshake state.
-
-Keep `src/cli/registry.rs` as the legitimate per-project coordination point, but cap the project map to live projects only.
-
-- [ ] **Step 4: Keep watcher coalescing and prove it**
-
-`src/cli/watcher.rs` already has a 500 ms coalescing window; this task keeps that shape and adds tests so the debounce stays a batch, not a per-event reindex storm.
-
-- [ ] **Step 5: Give SQLite a fixed reader pool**
+- [ ] **Step 2: Give SQLite a fixed reader pool**
 
 Move storage access in `src/storage/schema.rs` to the fixed reader-pool shape from the spec, then audit `src/storage/turso_config.rs`, `src/global/registry.rs`, and any other SQLite connection initializers to make sure each connection is using the right role and cache behavior.
 
-- [ ] **Step 6: Run the runtime/storage tests**
+- [ ] **Step 3: Run the storage-reader-pool test**
 
 Run:
 
 ```bash
-cargo test --test cli_runtime_discipline
 cargo test --test storage_reader_pool
 ```
 
 Expected output:
 
-- runtime-builder assertions pass
-- watcher debounce assertions pass
-- MCP session-state assertions pass
 - SQLite reader-pool assertions pass
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add src/bin/leindex.rs src/parse/parallel.rs src/cli/leindex/indexing.rs src/cli/mcp/server.rs src/cli/registry.rs src/cli/watcher.rs src/storage/schema.rs src/storage/turso_config.rs src/global/registry.rs tests/cli_runtime_discipline.rs tests/storage_reader_pool.rs
-git commit -m "perf(runtime): tighten executor and sqlite topology"
+git add src/parse/parallel.rs src/cli/leindex/indexing.rs src/storage/schema.rs src/storage/turso_config.rs src/global/registry.rs tests/storage_reader_pool.rs
+git commit -m "perf(indexing): add backpressure and sqlite reader topology"
 ```
 
 ---
@@ -493,13 +457,23 @@ git commit -m "feat(search): gate INT8 promotion on quality metrics"
 - `src/cli/mcp/edit_cache.rs` - edit-preview byte ceiling
 - `src/cli/index_cache.rs` - project scan and file stats bounds
 - `src/cli/memory.rs` - cache accounting hooks
-- `src/bin/leindex.rs:7` - runtime builder entrypoint
 - `src/parse/parallel.rs:1-220` - bounded rayon pool
-- `src/cli/mcp/server.rs:1-120` - session handshake state
-- `src/cli/registry.rs:1-260` - live-project coordination
-- `src/cli/watcher.rs:1-60` - 500 ms debounce
 - `src/storage/schema.rs` and `src/storage/turso_config.rs` - SQLite reader/writer topology
 - `src/global/registry.rs:117` - SQLite initializer audit point
 - `src/storage/pdg_store.rs` and `src/storage/nodes.rs` - additional SQLite initializer audit points if they own connection setup
 - `src/search/quantization/int8_hnsw.rs` - INT8 promotion gate
 - `tests/search_hnsw_integration.rs` - fixtures that need the `NodeInfo` shape updated
+
+## Self-Review (mandatory; per writing-plans skill)
+
+- [ ] Re-read the plan against the spec and confirm it stays in targeted-B scope: vector residency, row stability, row-oriented cache/state redesign, and only the runtime/storage changes required to support those pieces.
+- [ ] Confirm no A+-only ownership remains here for the explicit tokio runtime builder, MCP handshake map, registry slot cleanup, or watcher debounce baseline work.
+- [ ] Confirm all commands are executable from the repo root and the files listed in each task match the commit blocks.
+- [ ] Confirm the plan still depends on Plan 0 for measurement and Plan 1 for already-landed surgical caps / dependency cleanup.
+- [ ] Confirm the INT8 gate thresholds and memcheck targets still match the approved spec.
+
+## Hand-off Notes
+
+- Plan 2 owns the row-oriented search/cache redesign that Plan 1 intentionally left out; do not duplicate the A+ cache-cap work unless the B-phase implementation must extend it.
+- If implementation discovers a runtime or watcher issue that is not required for vector residency or SQLite reader topology, move it back to Plan 1 instead of expanding B-scope.
+- Any memcheck baseline movement must reference Plan 0's harness and metadata gate so Plan 3 can inherit the same accounting surfaces for worker-active runs.

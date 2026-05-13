@@ -28,9 +28,9 @@
 - `src/global/registry.rs` - lower the global SQLite cache pragma.
 - `src/storage/schema.rs` - express the per-project SQLite cache caps and mmap cap in the storage open path.
 - `src/storage/turso_config.rs` - stay behind the `turso` feature gate only.
-- `src/search/search.rs` - remove the legacy embedding alias, trim SearchEngine caches, and reduce duplicate owned state.
-- `src/search/vector.rs` - update `SearchResult` and any node-id handling that needs `Arc<str>` interning.
-- `src/search/ranking.rs` - update score result node-id ownership if the interning change crosses this boundary.
+- `src/search/search.rs` - remove the legacy embedding alias, stop duplicate owned TF-IDF state, and keep only low-risk cache-cap / compatibility edits.
+- `src/search/vector.rs` - update vector insertion / result handling only where the duplicate embedding write is removed.
+- `src/search/ranking.rs` - touch only if the duplicate-embedding cleanup forces a narrow compatibility update.
 - `src/search/onnx/qwen.rs` - convert the session to `Option<Session>` and add explicit unload support.
 - `src/search/onnx/reranker.rs` - same session lifecycle change for the reranker.
 - `src/cli/index_builder.rs` - stop re-cloning TF-IDF embeddings where a slice will do, and hook idle unload after batch work.
@@ -156,7 +156,7 @@ git commit -m "feat(mem): cap SQLite and hot cache residency"
 
 ---
 
-## Task 3: SearchEngine de-dup and NodeInfo compatibility
+## Task 3: Search-side de-dup and NodeInfo compatibility
 
 **Files:**
 - Modify: `src/search/search.rs`
@@ -185,19 +185,26 @@ That gives the A+ de-dup win the spec is aiming for without changing the search 
 
 - [ ] Expected check: the search tests that used to depend on the alias still pass, but the clone-only path is gone.
 
-**Step 3: Compress the internal search indexes**
+**Step 3: Keep A+ search changes surgical**
 
-Replace the current `SearchEngine` maps in `src/search/search.rs` as follows:
+Do **not** land the row-oriented cache redesign in this plan. That belongs to Plan 2.
 
-- `complexity_cache: HashMap<String, u32>` -> row-indexed `Vec<u32>`
-- `text_index: HashMap<String, HashSet<String>>` -> `HashMap<String, Vec<u32>>`
-- `node_id_to_idx: HashMap<String, usize>` -> `HashMap<Arc<str>, u32>` or the equivalent row-indexed shape
-- `node_tokens: HashMap<String, HashSet<String>>` -> a compact row-indexed token store
-- `search_cache: LruCache<String, Vec<SearchResult>>` -> a byte-bounded cache with estimated value sizes and a hard ceiling of 16 MiB, plus a `max_entries` guard of 256
+The only search-state changes allowed in A+ are:
 
-Intern `node_id` as `Arc<str>` wherever it crosses a boundary that was previously cloning strings. Keep the public result shape stable if the leaf API needs to stay on `String`, but do not leave the internal lookups on owned strings if a pointer copy will do.
+- byte-bound `search_cache` with a hard ceiling of 16 MiB and `max_entries = 256`
+- any tiny compatibility edits needed because the legacy embedding alias disappeared
+- keeping existing content-clear behavior intact after indexing
 
-- [ ] Expected check: `cargo test -p leindex search::tests` still passes, including the node lookup and token-scoring tests.
+Leave these B-phase changes for Plan 2:
+
+- row-indexed `complexity_cache`
+- `text_index` postings rewritten to `Vec<u32>`
+- compact `node_tokens`
+- `Arc<str>` node-id interning across resident search structures
+
+This split is deliberate: Plan 1 owns caps and duplicate-write removal, while Plan 2 owns the row-oriented resident-state redesign.
+
+- [ ] Expected check: `cargo test -p leindex search::tests` still passes, and the search cache now enforces its byte ceiling without changing query semantics.
 
 **Step 4: Keep the content-clear behavior intact**
 
@@ -328,3 +335,17 @@ git commit -m "test(mem): verify A+ memory cuts and cache caps"
 - Do not start the B-phase flat-store or mmap rewrite here. Those belong to the targeted-B plan.
 - Do not introduce a worker process for ONNX here. The in-process unload win is the only A+ model-lifecycle change in scope.
 - Do not build a general-purpose centralized eviction controller here. The A+ plan only needs hard caps and local hygiene.
+
+## Self-Review (mandatory; per writing-plans skill)
+
+- [ ] Re-read the plan against the spec and confirm it stays in A+ scope only: no row-oriented cache redesign, no mmap residency flip, no worker-process packaging.
+- [ ] Confirm every listed file belongs to this plan's ownership boundary and does not duplicate Plan 2 or Plan 3 ownership without an explicit dependency note.
+- [ ] Confirm all commands are executable from the repo root and match the files touched in each task.
+- [ ] Confirm the local exit criteria still align with Plan 0 memcheck / baseline rules and the A+ budget band from the spec.
+- [ ] Confirm any compatibility note about legacy embeddings matches the spec's one-minor read-compat promise.
+
+## Hand-off Notes
+
+- Plan 1 must leave the codebase ready for Plan 2 to own the row-oriented search/cache redesign without undoing A+ work.
+- If implementation discovers a search cache cap or compatibility tweak that really requires row-indexed state, stop and move that work to Plan 2 instead of expanding A+ scope.
+- Any memcheck baseline movement must reference Plan 0's harness and metadata gate so later plans inherit the same accounting rules.
