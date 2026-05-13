@@ -146,8 +146,11 @@ pub enum LanguageId {
     Ruby = 8,
     /// PHP programming language
     Php = 9,
-    // Swift, Kotlin, and Dart language support removed due to tree-sitter version conflicts
-    /// These variants will be re-added when parser support is restored
+    // BREAKING CHANGE: Swift (10), Kotlin (11), and Dart (12) variants removed in v1.6.6
+    // due to tree-sitter version conflicts. These languages are unsupported until
+    // conflicts are resolved. Downstream crates depending on these numeric values
+    // or variants will need to update. LanguageId enum discriminants are now
+    // renumbered to: Lua=10, Scala=11, C=12, Bash=13, Json=14.
     /// Lua programming language
     Lua = 10,
     /// Scala programming language

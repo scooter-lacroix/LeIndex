@@ -956,7 +956,7 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
             // Use appropriate formatter based on tool name
             let normalized_name = name.to_lowercase().replace(['-', '.'], "_");
             let formatted = match normalized_name.as_str() {
-                "leindex_search" | "search" | "leindex.search" => {
+                "leindex_search" | "search" => {
                     let formatter = SearchFormatter::new();
                     formatter.format(
                         &value,
@@ -966,7 +966,7 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
                             .unwrap_or(""),
                     )
                 }
-                "leindex_context" | "context" | "leindex.context" => {
+                "leindex_context" | "context" => {
                     let formatter = SearchFormatter::new();
                     let display_value = value
                         .get("results")
@@ -980,27 +980,27 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
                             .unwrap_or(""),
                     )
                 }
-                "leindex_diagnostics" | "diagnostics" | "leindex.diagnostics" => {
+                "leindex_diagnostics" | "diagnostics" => {
                     let formatter = DiagnosticsFormatter::new();
                     formatter.format(&value)
                 }
-                "leindex_project_map" | "project_map" | "leindex.project-map" => {
+                "leindex_project_map" | "project_map" => {
                     let formatter = ProjectMapFormatter::new();
                     formatter.format(&value)
                 }
-                "leindex_impact_analysis" | "impact_analysis" | "leindex.impact-analysis" => {
+                "leindex_impact_analysis" | "impact_analysis" => {
                     let formatter = ImpactFormatter::new();
                     formatter.format(&value)
                 }
-                "leindex_file_summary" | "file_summary" | "leindex.file-summary" => {
+                "leindex_file_summary" | "file_summary" => {
                     let formatter = FileSummaryFormatter::new();
                     formatter.format(&value)
                 }
-                "leindex_phase_analysis" | "phase_analysis" | "leindex.phase-analysis" => {
+                "leindex_phase_analysis" | "phase_analysis" => {
                     let formatter = PhaseFormatter::new();
                     formatter.format(&value)
                 }
-                "leindex_git_status" | "git_status" | "leindex.git-status" => {
+                "leindex_git_status" | "git_status" => {
                     use crate::cli::mcp::output::GitStatusFormatter;
                     let formatter = GitStatusFormatter::new();
                     formatter.format(&value)

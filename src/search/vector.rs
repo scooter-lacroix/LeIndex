@@ -434,6 +434,25 @@ impl MmapEmbeddingIndex {
         // ID strings start after offset+length tables.
         // Read the maximum offset+length to determine the end of the ID section.
         let ids_section_offset = lengths_end;
+        
+        // Verify offset and length tables fit in file before accessing
+        let offsets_table_size = n * 8;
+        let lengths_table_size = n * 4;
+        if offsets_start + offsets_table_size > mmap.len() {
+            return Err(MmapError::Corrupt(format!(
+                "offset table exceeds file size: table size {}, file size {}",
+                offsets_table_size,
+                mmap.len()
+            )));
+        }
+        if lengths_start + lengths_table_size > mmap.len() {
+            return Err(MmapError::Corrupt(format!(
+                "length table exceeds file size: table size {}, file size {}",
+                lengths_table_size,
+                mmap.len()
+            )));
+        }
+        
         let ids_section_end = {
             let mut max_end: usize = ids_section_offset;
             for i in 0..n {

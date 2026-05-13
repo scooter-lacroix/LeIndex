@@ -1246,8 +1246,8 @@ impl WorktreeSession {
             if file_existed {
                 let backup_result = std::fs::rename(original, backup_path);
                 if let Err(e) = backup_result {
-                    // Check if it's a cross-device error (EXDEV)
-                    if e.raw_os_error() == Some(18) {
+                    // Check if it's a cross-device error
+                    if e.kind() == std::io::ErrorKind::CrossesDevices {
                         // Fallback to copy + remove for cross-device moves
                         if let Err(copy_err) = std::fs::copy(original, backup_path) {
                             // Roll back previously processed files
@@ -1285,8 +1285,8 @@ impl WorktreeSession {
             // Fallback to copy+remove if rename fails (cross-device)
             let move_result = std::fs::rename(staged, original);
             if let Err(e) = move_result {
-                // Check if it's a cross-device error (EXDEV)
-                if e.raw_os_error() == Some(18) {
+                // Check if it's a cross-device error
+                if e.kind() == std::io::ErrorKind::CrossesDevices {
                     // Fallback to copy + remove for cross-device moves
                     if let Err(copy_err) = std::fs::copy(staged, original) {
                         // Restore backup if it was created

@@ -366,7 +366,7 @@ pub struct GenericRemoteProvider {
 impl GenericRemoteProvider {
     /// Create a remote provider from configuration
     pub fn from_config(config: RemoteEmbeddingConfig) -> Result<Self, RemoteEmbeddingError> {
-        let provider: Arc<dyn RemoteEmbeddingProvider> = match config.provider {
+        let provider: Arc<dyn RemoteEmbeddingProvider> = match &config.provider {
             RemoteProvider::OpenAI { .. } => {
                 Arc::new(OpenAIEmbeddingProvider::new(config)?)
             }
