@@ -144,8 +144,14 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
             timestamp: chrono::Utc::now(),
         };
 
-        if let Err(e) = GLOBAL_EDIT_CACHE.set(&storage_path, cache_entry).await {
-            tracing::warn!("Failed to store edit in cache: {}", e);
+        match GLOBAL_EDIT_CACHE.set(&storage_path, cache_entry).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("Edit preview too large for cache: {}", e);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to store edit in cache: {}", e);
+            }
         }
 
         // 5. Generate diff and compute impact

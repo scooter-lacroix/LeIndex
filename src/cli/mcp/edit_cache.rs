@@ -6,6 +6,18 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 
+// ============================================================================
+// A+ Edit-preview cache budget constants (Section 8.2)
+// ============================================================================
+
+/// Maximum bytes for a single edit-preview entry.
+/// Entries larger than this are rejected to avoid inflating hot resident state.
+pub const EDIT_CACHE_MAX_ENTRY_BYTES: usize = 256 * 1024; // 256 KiB
+
+/// Maximum total bytes for the hot edit-preview cache.
+/// Inserts that would exceed this cap trigger LRU eviction.
+pub const EDIT_CACHE_TOTAL_CAP_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+
 /// Entry in the edit cache, representing a previewed but not yet applied edit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditCacheEntry {
@@ -23,16 +35,53 @@ pub struct EditCacheEntry {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
+impl EditCacheEntry {
+    /// Estimated byte size of this entry in the hot cache.
+    pub fn estimated_size(&self) -> usize {
+        self.file_path.as_os_str().len()
+            + self.preview_token.len()
+            + self.original_text.len()
+            + self.modified_text.len()
+            + self.changes.iter().map(|c| c.estimated_size()).sum::<usize>()
+            + 64 // overhead estimate for timestamp, metadata
+    }
+}
+
+/// Error returned when an edit-preview entry exceeds the per-entry size limit.
+#[derive(Debug)]
+pub struct EntryTooLargeError {
+    /// Actual size of the entry in bytes.
+    pub size: usize,
+    /// Configured per-entry limit in bytes.
+    pub limit: usize,
+}
+
+impl std::fmt::Display for EntryTooLargeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "edit-preview entry ({} bytes) exceeds per-entry limit ({} bytes)",
+            self.size, self.limit
+        )
+    }
+}
+
+impl std::error::Error for EntryTooLargeError {}
+
 /// A cache for edit previews, supporting both in-memory (hot) and on-disk (cold) storage.
+/// The hot cache is bounded by both per-entry and total-byte caps.
 pub struct EditCache {
     /// Hot cache in memory for fast access during a session.
     entries: Mutex<HashMap<PathBuf, EditCacheEntry>>,
+    /// Tracked total bytes in the hot cache.
+    total_bytes: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for EditCache {
     fn default() -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            total_bytes: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -66,11 +115,24 @@ impl EditCache {
     }
 
     /// Store an edit preview in the cache.
+    ///
+    /// Returns `Ok(Err(EntryTooLargeError))` if the entry exceeds the per-entry
+    /// byte limit. Returns `Err(JsonRpcError)` for I/O failures.
     pub async fn set(
         &self,
         project_storage: &Path,
         entry: EditCacheEntry,
-    ) -> Result<(), JsonRpcError> {
+    ) -> Result<Result<(), EntryTooLargeError>, JsonRpcError> {
+        let entry_size = entry.estimated_size();
+
+        // Reject oversized entries synchronously (VAL-APLUS-012)
+        if entry_size > EDIT_CACHE_MAX_ENTRY_BYTES {
+            return Ok(Err(EntryTooLargeError {
+                size: entry_size,
+                limit: EDIT_CACHE_MAX_ENTRY_BYTES,
+            }));
+        }
+
         let (abs_path, cache_file) = self
             .get_abs_path_and_cache_file(project_storage, &entry.file_path)
             .await;
@@ -83,7 +145,7 @@ impl EditCache {
                     "Failed to create edit cache directory: {}",
                     e
                 ))
-            })?
+            })?;
         }
 
         let json = serde_json::to_string_pretty(&entry).map_err(|e| {
@@ -94,13 +156,43 @@ impl EditCache {
             JsonRpcError::internal_error(format!("Failed to write edit cache to disk: {}", e))
         })?;
 
-        // Update hot cache only AFTER successful disk persistence
+        // Update hot cache only AFTER successful disk persistence.
+        // Enforce total-byte cap via synchronous eviction (VAL-APLUS-013).
         {
             let mut entries = self.entries.lock().await;
+
+            // Account for replacing an existing entry
+            if let Some(existing) = entries.get(&abs_path) {
+                self.total_bytes
+                    .fetch_sub(existing.estimated_size(), std::sync::atomic::Ordering::Relaxed);
+            }
+
+            // Evict until there is room
+            while self.total_bytes.load(std::sync::atomic::Ordering::Relaxed) + entry_size
+                > EDIT_CACHE_TOTAL_CAP_BYTES
+                && !entries.is_empty()
+            {
+                // Find the oldest entry to evict (simplest LRU approximation)
+                if let Some(oldest_key) = entries
+                    .iter()
+                    .min_by_key(|(_, e)| e.timestamp)
+                    .map(|(k, _)| k.clone())
+                {
+                    if let Some(removed) = entries.remove(&oldest_key) {
+                        self.total_bytes.fetch_sub(
+                            removed.estimated_size(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
+                }
+            }
+
             entries.insert(abs_path, entry);
+            self.total_bytes
+                .fetch_add(entry_size, std::sync::atomic::Ordering::Relaxed);
         }
 
-        Ok(())
+        Ok(Ok(()))
     }
 
     /// Retrieve an edit preview from the cache.
@@ -120,9 +212,32 @@ impl EditCache {
         // Try cold storage fallback
         if let Ok(json) = tokio::fs::read_to_string(&cache_file).await {
             if let Ok(entry) = serde_json::from_str::<EditCacheEntry>(&json) {
-                // Backfill hot cache
-                let mut entries = self.entries.lock().await;
-                entries.insert(abs_path, entry.clone());
+                // Backfill hot cache only if within budget
+                let entry_size = entry.estimated_size();
+                if entry_size <= EDIT_CACHE_MAX_ENTRY_BYTES {
+                    let mut entries = self.entries.lock().await;
+                    // Evict if needed
+                    while self.total_bytes.load(std::sync::atomic::Ordering::Relaxed) + entry_size
+                        > EDIT_CACHE_TOTAL_CAP_BYTES
+                        && !entries.is_empty()
+                    {
+                        if let Some(oldest_key) = entries
+                            .iter()
+                            .min_by_key(|(_, e)| e.timestamp)
+                            .map(|(k, _)| k.clone())
+                        {
+                            if let Some(removed) = entries.remove(&oldest_key) {
+                                self.total_bytes.fetch_sub(
+                                    removed.estimated_size(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                            }
+                        }
+                    }
+                    self.total_bytes
+                        .fetch_add(entry_size, std::sync::atomic::Ordering::Relaxed);
+                    entries.insert(abs_path, entry.clone());
+                }
                 return Some(entry);
             }
         }
@@ -138,12 +253,102 @@ impl EditCache {
 
         {
             let mut entries = self.entries.lock().await;
-            entries.remove(&abs_path);
+            if let Some(removed) = entries.remove(&abs_path) {
+                self.total_bytes.fetch_sub(
+                    removed.estimated_size(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+            }
         }
 
         let _ = tokio::fs::remove_file(cache_file).await;
+    }
+
+    /// Current total bytes in the hot cache (for testing/telemetry).
+    pub fn hot_cache_bytes(&self) -> usize {
+        self.total_bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
 /// Global singleton for edit caching.
 pub static GLOBAL_EDIT_CACHE: Lazy<EditCache> = Lazy::new(EditCache::new);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::edit::EditChange;
+    use std::path::PathBuf;
+
+    fn make_entry(original_len: usize, modified_len: usize) -> EditCacheEntry {
+        EditCacheEntry {
+            file_path: PathBuf::from("/test/file.rs"),
+            preview_token: "test-token".to_string(),
+            original_text: "x".repeat(original_len),
+            modified_text: "y".repeat(modified_len),
+            changes: vec![EditChange::ReplaceText {
+                start: 0,
+                end: original_len.min(1),
+                new_text: "y".to_string(),
+            }],
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    // A+ VAL-APLUS-012: MCP edit preview cache rejects oversized entries
+    #[tokio::test]
+    async fn test_edit_cache_rejects_oversized_entry() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache = EditCache::new();
+
+        // Create an entry larger than EDIT_CACHE_MAX_ENTRY_BYTES (256 KiB)
+        let oversized = make_entry(EDIT_CACHE_MAX_ENTRY_BYTES + 1000, 10);
+        let result = cache
+            .set(temp_dir.path(), oversized)
+            .await
+            .expect("no IO error");
+
+        assert!(
+            result.is_err(),
+            "oversized entry should be rejected, but was accepted"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(err.limit, EDIT_CACHE_MAX_ENTRY_BYTES);
+        assert!(err.size > EDIT_CACHE_MAX_ENTRY_BYTES);
+    }
+
+    // A+ VAL-APLUS-013: MCP edit preview cache total residency is capped
+    #[tokio::test]
+    async fn test_edit_cache_total_residency_capped() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache = EditCache::new();
+
+        // Insert many small entries that together exceed the total cap
+        let entry_size = 100_000; // ~100 KiB each
+        let entries_to_fill = (EDIT_CACHE_TOTAL_CAP_BYTES / entry_size) + 3;
+
+        for i in 0..entries_to_fill {
+            let mut entry = make_entry(entry_size / 2, entry_size / 2);
+            entry.file_path = PathBuf::from(format!("/test/file_{}.rs", i));
+            let result = cache
+                .set(temp_dir.path(), entry)
+                .await
+                .expect("no IO error");
+            assert!(result.is_ok(), "entry {} should be accepted", i);
+        }
+
+        // Total hot cache bytes should not exceed the cap
+        assert!(
+            cache.hot_cache_bytes() <= EDIT_CACHE_TOTAL_CAP_BYTES + 10_000,
+            "hot cache bytes ({}) should not exceed cap ({})",
+            cache.hot_cache_bytes(),
+            EDIT_CACHE_TOTAL_CAP_BYTES
+        );
+    }
+
+    #[test]
+    fn test_edit_cache_entry_estimated_size() {
+        let entry = make_entry(100, 200);
+        let size = entry.estimated_size();
+        assert!(size > 300, "estimated size should account for text content");
+    }
+}

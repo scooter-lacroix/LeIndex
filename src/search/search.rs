@@ -382,9 +382,17 @@ pub struct SearchEngine {
     /// Per-node token cache: node_id -> set of normalized tokens
     /// Populated during index_nodes() to avoid re-tokenization in scoring
     node_tokens: HashMap<String, HashSet<String>>,
-    /// Result cache for repeated queries
+    /// Result cache for repeated queries (A+ Section 8.1: bounded by entries and bytes)
     search_cache: LruCache<String, Vec<SearchResult>>,
+    /// Tracked byte estimate for the search cache
+    search_cache_bytes: usize,
 }
+
+// A+ Search cache budget constants (Section 8.1)
+/// Maximum entries in the search cache.
+const SEARCH_CACHE_MAX_ENTRIES: usize = 256;
+/// Maximum total bytes for the search cache.
+const SEARCH_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
 impl SearchEngine {
     /// Create a new search engine with default 768-dim embeddings
@@ -406,7 +414,8 @@ impl SearchEngine {
             text_index: HashMap::new(),
             node_id_to_idx: HashMap::new(),
             node_tokens: HashMap::new(),
-            search_cache: LruCache::new(NonZeroUsize::new(1000).unwrap()),
+            search_cache: LruCache::new(NonZeroUsize::new(SEARCH_CACHE_MAX_ENTRIES).unwrap()),
+            search_cache_bytes: 0,
         }
     }
 
@@ -445,7 +454,8 @@ impl SearchEngine {
             text_index: HashMap::new(),
             node_id_to_idx: HashMap::new(),
             node_tokens: HashMap::new(),
-            search_cache: LruCache::new(NonZeroUsize::new(1000).unwrap()),
+            search_cache: LruCache::new(NonZeroUsize::new(SEARCH_CACHE_MAX_ENTRIES).unwrap()),
+            search_cache_bytes: 0,
         }
     }
 
@@ -481,6 +491,7 @@ impl SearchEngine {
         self.complexity_cache.clear();
         self.text_index.clear();
         self.search_cache.clear();
+        self.search_cache_bytes = 0;
         self.node_id_to_idx.clear();
         self.node_tokens.clear();
         self.vector_index.clear();
@@ -609,6 +620,7 @@ impl SearchEngine {
     pub fn incremental_reindex(&mut self, delta: TextIndexDelta) {
         // Invalidate search cache — results may change
         self.search_cache.clear();
+        self.search_cache_bytes = 0;
 
         // Phase 1: Remove nodes
         for node_id in &delta.removed_node_ids {
@@ -999,8 +1011,28 @@ impl SearchEngine {
             result.rank = i + 1;
         }
 
-        // Cache results
-        self.search_cache.put(cache_key, final_results.clone());
+        // Cache results with byte-budget enforcement (A+ Section 8.1)
+        {
+            let results_bytes = Self::estimate_search_results_bytes(&final_results);
+            // If replacing an existing entry, subtract its bytes first
+            if let Some(existing) = self.search_cache.get(&cache_key) {
+                self.search_cache_bytes = self
+                    .search_cache_bytes
+                    .saturating_sub(Self::estimate_search_results_bytes(existing));
+            }
+            // Evict until there is room
+            while self.search_cache_bytes + results_bytes > SEARCH_CACHE_MAX_BYTES
+                && !self.search_cache.is_empty()
+            {
+                if let Some((_, evicted)) = self.search_cache.pop_lru() {
+                    self.search_cache_bytes = self
+                        .search_cache_bytes
+                        .saturating_sub(Self::estimate_search_results_bytes(&evicted));
+                }
+            }
+            self.search_cache_bytes += results_bytes;
+            self.search_cache.put(cache_key, final_results.clone());
+        }
 
         Ok(final_results)
     }
@@ -1265,6 +1297,23 @@ impl SearchEngine {
             .sum::<usize>();
 
         nodes_size + cache_size + text_index_size + self.vector_index.estimated_memory_bytes()
+    }
+
+    /// Estimate byte size of a slice of search results for cache accounting.
+    fn estimate_search_results_bytes(results: &[SearchResult]) -> usize {
+        results
+            .iter()
+            .map(|r| {
+                r.node_id.len()
+                    + r.file_path.len()
+                    + r.symbol_name.len()
+                    + r.symbol_type.as_ref().map_or(0, |s| s.len())
+                    + r.signature.as_ref().map_or(0, |s| s.len())
+                    + r.language.len()
+                    + r.context.as_ref().map_or(0, |c| c.len())
+                    + 128 // overhead estimate for rank, score, complexity, byte_range, etc.
+            })
+            .sum()
     }
 }
 
@@ -2493,5 +2542,75 @@ mod tests {
         let results = engine.search(query).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].node_id, "metrics");
+    }
+
+    // A+ VAL-APLUS-014: Search cache is hard-capped without semantic regression
+    #[test]
+    fn test_search_cache_hard_capped() {
+        let mut engine = SearchEngine::new();
+
+        // Index some nodes
+        let nodes: Vec<NodeInfo> = (0..50)
+            .map(|i| NodeInfo {
+                node_id: format!("node_{}", i),
+                file_path: format!("file_{}.rs", i),
+                symbol_name: format!("symbol_{}", i),
+                language: "rust".to_string(),
+                content: format!("fn symbol_{}() {{}}", i),
+                byte_range: (0, 16),
+                tfidf_embedding: vec![0.0; 768],
+                neural_embedding: None,
+                embedding: None,
+                complexity: 1,
+                signature: None,
+                pre_tokenized: None,
+            })
+            .collect();
+        engine.index_nodes(nodes);
+
+        // Run many searches to fill the cache
+        for i in 0..300 {
+            let query = SearchQuery {
+                query: format!("query_{}", i),
+                top_k: 10,
+                token_budget: None,
+                semantic: false,
+                expand_context: false,
+                query_embedding: None,
+                threshold: None,
+                query_type: None,
+            };
+            let _ = engine.search(query);
+        }
+
+        // Cache should not exceed entry limit
+        assert!(
+            engine.search_cache.len() <= SEARCH_CACHE_MAX_ENTRIES,
+            "search cache entries ({}) should not exceed max ({})",
+            engine.search_cache.len(),
+            SEARCH_CACHE_MAX_ENTRIES
+        );
+
+        // Cache bytes should not exceed byte limit
+        assert!(
+            engine.search_cache_bytes <= SEARCH_CACHE_MAX_BYTES,
+            "search cache bytes ({}) should not exceed max ({})",
+            engine.search_cache_bytes,
+            SEARCH_CACHE_MAX_BYTES
+        );
+
+        // Verify search still returns correct results (no semantic regression)
+        let query = SearchQuery {
+            query: "symbol_0".to_string(),
+            top_k: 5,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+        let results = engine.search(query).unwrap();
+        assert!(!results.is_empty(), "search should still return results");
     }
 }

@@ -40,10 +40,10 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            spill_threshold: 0.85,
+            spill_threshold: 0.75,
             check_interval_secs: 30,
             auto_spill: true,
-            max_cache_bytes: 500_000_000, // 500MB default
+            max_cache_bytes: 96_000_000, // 96 MiB (A+ Section 5.6)
             cache_dir: PathBuf::from(".leindex/cache"),
         }
     }
@@ -1290,10 +1290,10 @@ mod tests {
     #[test]
     fn test_spill_config_default() {
         let config = MemoryConfig::default();
-        assert_eq!(config.spill_threshold, 0.85);
+        assert_eq!(config.spill_threshold, 0.75); // A+ Section 5.6: lowered from 0.85
         assert_eq!(config.check_interval_secs, 30);
         assert!(config.auto_spill);
-        assert_eq!(config.max_cache_bytes, 500_000_000);
+        assert_eq!(config.max_cache_bytes, 96_000_000); // A+ Section 5.6: lowered from 500 MB
     }
 
     #[test]
@@ -1474,5 +1474,32 @@ mod tests {
 
         // Should be empty now
         assert!(store.pop_lru().is_none());
+    }
+
+    // A+ VAL-APLUS-011: Cache growth is synchronously bounded
+    #[test]
+    fn test_cache_synchronous_byte_bound() {
+        let config = MemoryConfig {
+            max_cache_bytes: 500, // Very small cap
+            ..Default::default()
+        };
+        let mut store = CacheStore::new(&config);
+
+        // Insert entries that together would exceed the cap
+        for i in 0..20 {
+            let entry = CacheEntry::Binary {
+                metadata: HashMap::new(),
+                serialized_data: vec![0u8; 100],
+            };
+            store.insert(format!("key_{}", i), entry).unwrap();
+        }
+
+        // Total bytes should never exceed max_cache_bytes
+        assert!(
+            store.total_bytes() <= config.max_cache_bytes,
+            "cache total_bytes ({}) should not exceed max ({})",
+            store.total_bytes(),
+            config.max_cache_bytes
+        );
     }
 }

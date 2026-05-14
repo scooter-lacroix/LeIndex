@@ -4,6 +4,10 @@
 
 use crate::global::DEFAULT_DB_PATH;
 use crate::storage::UniqueProjectId;
+use crate::storage::schema::{
+    GLOBAL_REGISTRY_CACHE_SIZE_KIB,
+    GLOBAL_REGISTRY_MMAP_SIZE,
+};
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -113,8 +117,9 @@ impl GlobalRegistry {
         // Enable WAL mode for better concurrency
         self.conn.pragma_update(None, "journal_mode", "WAL")?;
 
-        // Set cache size
-        self.conn.pragma_update(None, "cache_size", 10000i64)?;
+        // Thin global-registry cache budget (A+ Section 5.2)
+        self.conn.pragma_update(None, "cache_size", GLOBAL_REGISTRY_CACHE_SIZE_KIB)?;
+        self.conn.pragma_update(None, "mmap_size", GLOBAL_REGISTRY_MMAP_SIZE)?;
 
         // Create global_projects table
         self.conn.execute(
@@ -651,5 +656,35 @@ mod tests {
         let registry = GlobalRegistry::init(&db_path).unwrap();
 
         assert!(registry.is_healthy());
+    }
+
+    // A+ VAL-APLUS-006: Global registry SQLite cache is capped to thin-budget values
+    #[test]
+    fn test_global_registry_thin_cache_budget() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let registry = GlobalRegistry::init(&db_path).unwrap();
+
+        // Verify cache_size pragma matches the thin global budget
+        let cache_size: i64 = registry
+            .conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            cache_size, GLOBAL_REGISTRY_CACHE_SIZE_KIB,
+            "global registry cache_size should be {} (2 MiB), got {}",
+            GLOBAL_REGISTRY_CACHE_SIZE_KIB, cache_size
+        );
+
+        // Verify mmap_size is 0 (no mmap for global registry)
+        let mmap_size: i64 = registry
+            .conn
+            .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            mmap_size, GLOBAL_REGISTRY_MMAP_SIZE,
+            "global registry mmap_size should be 0, got {}",
+            mmap_size
+        );
     }
 }

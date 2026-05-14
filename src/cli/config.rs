@@ -444,8 +444,12 @@ pub struct StorageConfig {
     /// Whether to enable WAL mode
     pub wal_enabled: bool,
 
-    /// Cache size in pages
-    pub cache_size_pages: Option<usize>,
+    /// Cache size in KiB (negative = KiB units per SQLite convention).
+    /// Defaults to the writer budget.
+    pub cache_size_kib: Option<i64>,
+
+    /// mmap_size cap in bytes. Defaults to 64 MiB.
+    pub mmap_size: Option<i64>,
 
     /// Connection timeout in seconds
     pub connection_timeout_secs: Option<u64>,
@@ -457,7 +461,8 @@ impl Default for StorageConfig {
             backend: StorageBackend::SQLite,
             db_path: None, // Use default
             wal_enabled: true,
-            cache_size_pages: Some(10000),
+            cache_size_kib: Some(-16000), // 16 MiB writer budget
+            mmap_size: Some(67_108_864),  // 64 MiB mmap cap
             connection_timeout_secs: Some(30),
         }
     }
@@ -586,9 +591,9 @@ impl Default for IndexingConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            spill_threshold: 0.9,
+            spill_threshold: 0.75,
             auto_spill: true,
-            max_memory_mb: 8192, // 8 GB default
+            max_memory_mb: 4096, // 4 GB default (lowered from 8 GB for A+)
         }
     }
 }
