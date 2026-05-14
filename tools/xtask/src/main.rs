@@ -3,11 +3,13 @@
 //! Provides `cargo xtask <subcommand>` entrypoints for local development
 //! workflows including memory measurement via the memcheck harness.
 //!
-//! This is the Plan 0 bootstrap skeleton — subcommand implementations
-//! will be filled in by subsequent features.
+//! VAL-MEASURE-012: `cargo xtask memcheck` is the supported local entrypoint.
+//! VAL-MEASURE-013: `cargo xtask memcheck --update-baseline` regenerates baselines.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use std::process::Command;
 
 /// LeIndex development task runner.
 #[derive(Parser, Debug)]
@@ -20,30 +22,97 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Run the memcheck harness against the canonical small fixture.
+    ///
+    /// Builds the release binary if needed, runs the memcheck workload,
+    /// diffs against committed baselines and budget ceilings, and exits
+    /// non-zero on regression (VAL-MEASURE-012).
     Memcheck {
-        /// Update committed baselines instead of comparing.
+        /// Update committed baselines instead of comparing (VAL-MEASURE-013).
         #[arg(long)]
         update_baseline: bool,
     },
+}
+
+/// Workspace root — xtask lives at `<root>/tools/xtask`.
+fn workspace_root() -> PathBuf {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    PathBuf::from(manifest_dir)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Some(Commands::Memcheck { update_baseline }) => {
-            eprintln!(
-                "xtask memcheck: bootstrap skeleton — not yet implemented (update_baseline={})",
-                update_baseline
-            );
-            // The full implementation will invoke the memcheck binary
-            // and handle baseline comparison/update logic.
-            Ok(())
-        }
+        Some(Commands::Memcheck { update_baseline }) => run_memcheck(update_baseline),
         None => {
-            // No subcommand — print help.
             Args::parse_from(["xtask", "--help"]);
             Ok(())
         }
     }
+}
+
+fn run_memcheck(update_baseline: bool) -> Result<()> {
+    let root = workspace_root();
+    let fixture = root.join("tests/fixtures/memcheck/small_repo");
+    let leindex_bin = root.join("target/release/leindex");
+    let memcheck_bin = root.join("target/release/memcheck");
+
+    // Ensure the release binary exists
+    if !leindex_bin.exists() {
+        eprintln!("xtask: building release binary...");
+        let status = Command::new("cargo")
+            .args(["build", "--release", "--bin", "leindex"])
+            .current_dir(&root)
+            .status()
+            .context("failed to run cargo build")?;
+        if !status.success() {
+            anyhow::bail!("cargo build --release failed");
+        }
+    }
+
+    // Ensure the memcheck binary exists
+    if !memcheck_bin.exists() {
+        eprintln!("xtask: building memcheck binary...");
+        let status = Command::new("cargo")
+            .args(["build", "--release", "-p", "memcheck"])
+            .current_dir(&root)
+            .status()
+            .context("failed to build memcheck")?;
+        if !status.success() {
+            anyhow::bail!("cargo build -p memcheck failed");
+        }
+    }
+
+    if !fixture.exists() {
+        anyhow::bail!("fixture not found at {}", fixture.display());
+    }
+
+    // Build the memcheck command
+    let mut cmd = Command::new(&memcheck_bin);
+    cmd.arg(&fixture).arg("--verbose");
+
+    if update_baseline {
+        cmd.arg("--update-baseline");
+    }
+
+    eprintln!("xtask: running memcheck against {}...", fixture.display());
+    if update_baseline {
+        eprintln!("  mode: update-baseline");
+    } else {
+        eprintln!("  mode: compare against baselines + budget");
+    }
+
+    // Run memcheck and propagate its exit code
+    let status = cmd.status().context("failed to run memcheck")?;
+
+    if !status.success() {
+        anyhow::bail!("memcheck exited with {}", status);
+    }
+
+    Ok(())
 }

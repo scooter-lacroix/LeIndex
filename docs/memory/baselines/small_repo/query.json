@@ -1,0 +1,10 @@
+{
+  "phase": "query",
+  "rss_min_kib": 2108,
+  "rss_max_kib": 17476,
+  "rss_p95_kib": 17476,
+  "mapped_file_kib": 17216,
+  "anon_kib": 328,
+  "sample_count": 6,
+  "duration_ms": 70
+}

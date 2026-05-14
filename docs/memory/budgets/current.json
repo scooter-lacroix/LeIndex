@@ -1,0 +1,34 @@
+{
+  "description": "Absolute memory budget ceilings for memcheck regression gating. Single source of truth consumed by cargo xtask memcheck and CI.",
+  "fixture": "small_repo",
+  "regression_rules": {
+    "baseline_tolerance_pct": 5,
+    "ceiling_tolerance_pct": 10
+  },
+  "phases": {
+    "idle_warm": {
+      "rss_max_kib": 470000,
+      "description": "Pre-work idle ceiling (~459 MiB). After A+: 184320 KiB (180 MiB). After B: 102400 KiB (100 MiB)."
+    },
+    "index": {
+      "rss_max_kib": 740000,
+      "description": "Pre-work peak indexing ceiling (~723 MiB). After A+: 460800 KiB (450 MiB). After B: 307200 KiB (300 MiB)."
+    },
+    "idle_post": {
+      "rss_max_kib": 470000,
+      "description": "Pre-work idle ceiling (~459 MiB). After A+: 184320 KiB (180 MiB). After B: 102400 KiB (100 MiB)."
+    },
+    "query": {
+      "rss_max_kib": 530000,
+      "description": "Pre-work peak query ceiling (~518 MiB). After A+: 256000 KiB (250 MiB). After B: 184320 KiB (180 MiB)."
+    },
+    "reindex": {
+      "rss_max_kib": 740000,
+      "description": "Pre-work peak reindex ceiling (~723 MiB). After A+: 460800 KiB (450 MiB). After B: 307200 KiB (300 MiB)."
+    },
+    "idle_final": {
+      "rss_max_kib": 470000,
+      "description": "Pre-work idle ceiling (~459 MiB). After A+: 184320 KiB (180 MiB). After B: 102400 KiB (100 MiB)."
+    }
+  }
+}

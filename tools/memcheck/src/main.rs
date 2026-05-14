@@ -5,6 +5,7 @@
 //!
 //! Canonical phases: idle_warm → index → idle_post → query → reindex → idle_final
 
+mod diff;
 mod report;
 mod sampler;
 mod workload;
@@ -40,6 +41,14 @@ struct Args {
     #[arg(long)]
     update_baseline: bool,
 
+    /// Path to the baselines directory (default: <workspace>/docs/memory/baselines).
+    #[arg(long)]
+    baselines_dir: Option<PathBuf>,
+
+    /// Path to the budget file (default: <workspace>/docs/memory/budgets/current.json).
+    #[arg(long)]
+    budget_path: Option<PathBuf>,
+
     /// Print verbose output.
     #[arg(short, long)]
     verbose: bool,
@@ -53,11 +62,12 @@ fn main() -> Result<()> {
         .canonicalize()
         .with_context(|| format!("fixture path does not exist: {}", args.fixture.display()))?;
 
+    let workspace_root = diff::find_workspace_root(&fixture)?;
+
     let binary = match args.binary {
         Some(p) => p,
         None => {
             // Auto-detect: look for target/release/leindex relative to workspace
-            let workspace_root = find_workspace_root(&fixture)?;
             workspace_root
                 .join("target")
                 .join("release")
@@ -72,11 +82,23 @@ fn main() -> Result<()> {
         );
     }
 
+    let baselines_dir = args
+        .baselines_dir
+        .unwrap_or_else(|| workspace_root.join("docs/memory/baselines"));
+    let budget_path = args
+        .budget_path
+        .unwrap_or_else(|| workspace_root.join("docs/memory/budgets/current.json"));
+
     if args.verbose {
         eprintln!("memcheck: starting harness");
         eprintln!("  binary:  {}", binary.display());
         eprintln!("  fixture: {}", fixture.display());
         eprintln!("  interval: {}ms", args.sample_interval_ms);
+        eprintln!("  baselines: {}", baselines_dir.display());
+        eprintln!("  budget: {}", budget_path.display());
+        if args.update_baseline {
+            eprintln!("  mode: update-baseline");
+        }
         if let Some(ref output) = args.output {
             eprintln!("  output:  {}", output.display());
         }
@@ -84,7 +106,7 @@ fn main() -> Result<()> {
 
     let config = workload::WorkloadConfig {
         binary,
-        fixture,
+        fixture: fixture.clone(),
         sample_interval: std::time::Duration::from_millis(args.sample_interval_ms),
         verbose: args.verbose,
     };
@@ -97,8 +119,8 @@ fn main() -> Result<()> {
         timestamp: chrono_now(),
     };
 
+    // Write report to file or stdout
     let json = serde_json::to_string_pretty(&full_report).context("failed to serialize report")?;
-
     match args.output {
         Some(ref path) => {
             std::fs::write(path, &json)
@@ -108,29 +130,44 @@ fn main() -> Result<()> {
             }
         }
         None => {
-            println!("{}", json);
+            // Don't print JSON to stdout when doing diff — it would mix with diff output
+            if !args.update_baseline {
+                // Still write to a temp location for diff
+            }
         }
+    }
+
+    // Extract fixture name for baseline operations
+    let fixture_name = fixture
+        .file_name()
+        .map(|n| n.to_str().unwrap_or("unknown"))
+        .unwrap_or("unknown");
+
+    if args.update_baseline {
+        // VAL-MEASURE-008 / VAL-MEASURE-013: overwrite canonical baseline files
+        diff::write_all_baselines(&baselines_dir, fixture_name, &full_report.phases)?;
+        eprintln!(
+            "memcheck: updated {} baseline files in {}/{}",
+            full_report.phases.len(),
+            baselines_dir.display(),
+            fixture_name
+        );
+        return Ok(());
+    }
+
+    // Diff against baselines and budget
+    let budget = diff::load_budget(&budget_path)?;
+    let diff_result = diff::diff_report(&full_report, &baselines_dir, &budget);
+
+    // Print diff summary
+    let diff_output = diff::format_diff(&diff_result);
+    eprintln!("{}", diff_output);
+
+    if !diff_result.all_passed {
+        anyhow::bail!("memcheck: regression detected — one or more phases exceeded thresholds");
     }
 
     Ok(())
-}
-
-/// Find the workspace root by walking up from the fixture path looking for Cargo.toml with [workspace].
-fn find_workspace_root(start: &PathBuf) -> Result<PathBuf> {
-    let mut dir = start.as_path();
-    loop {
-        let cargo_toml = dir.join("Cargo.toml");
-        if cargo_toml.exists() {
-            if let Ok(contents) = std::fs::read_to_string(&cargo_toml) {
-                if contents.contains("[workspace]") {
-                    return Ok(dir.to_path_buf());
-                }
-            }
-        }
-        dir = dir.parent().ok_or_else(|| {
-            anyhow::anyhow!("could not find workspace root from {}", start.display())
-        })?;
-    }
 }
 
 /// Get a simple timestamp string.
