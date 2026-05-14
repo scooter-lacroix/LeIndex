@@ -3,20 +3,24 @@
 //! Each phase report exposes the metrics required by VAL-MEASURE-003:
 //! RSS min/max/p95, mapped-file vs anonymous memory, sample count, and
 //! duration.
+//!
+//! Worker-aware extensions (VAL-CPHASE-035): C-phase reports expose
+//! per-phase main RSS, worker RSS, and combined RSS rather than a single
+//! undifferentiated number.
 
 use crate::workload::CANONICAL_PHASES;
 use serde::{Deserialize, Serialize};
 
-/// Per-phase memory report (VAL-MEASURE-003).
+/// Per-phase memory report (VAL-MEASURE-003, VAL-CPHASE-035).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PhaseReport {
-    /// Phase name (e.g., "idle_warm", "index").
+    /// Phase name (e.g., "idle_warm", "index", "embed_active").
     pub phase: String,
-    /// Minimum RSS observed during the phase, in KiB.
+    /// Minimum RSS observed during the phase, in KiB (main process).
     pub rss_min_kib: u64,
-    /// Maximum RSS observed during the phase, in KiB.
+    /// Maximum RSS observed during the phase, in KiB (main process).
     pub rss_max_kib: u64,
-    /// 95th percentile RSS, in KiB.
+    /// 95th percentile RSS, in KiB (main process).
     pub rss_p95_kib: u64,
     /// Mapped-file memory in KiB (Linux, 0 if unavailable).
     pub mapped_file_kib: u64,
@@ -26,6 +30,14 @@ pub struct PhaseReport {
     pub sample_count: usize,
     /// Phase duration in milliseconds.
     pub duration_ms: u64,
+    /// Peak worker process RSS in KiB during this phase (VAL-CPHASE-035).
+    /// 0 for phases where no worker was active or detected.
+    #[serde(default)]
+    pub worker_rss_max_kib: u64,
+    /// Peak combined (main + worker) RSS in KiB during this phase
+    /// (VAL-CPHASE-035). Equal to rss_max_kib when no worker is active.
+    #[serde(default)]
+    pub combined_rss_max_kib: u64,
 }
 
 /// Full memcheck report containing all phases.
@@ -82,6 +94,8 @@ mod tests {
             anon_kib: 100,
             sample_count: 5,
             duration_ms: 1000,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 200,
         }
     }
 
@@ -96,6 +110,8 @@ mod tests {
             anon_kib: 150000,
             sample_count: 12,
             duration_ms: 3000,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 200000,
         };
 
         let json = serde_json::to_string(&report).unwrap();
@@ -127,10 +143,12 @@ mod tests {
             anon_kib: 60000,
             sample_count: 8,
             duration_ms: 2000,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 80000,
         };
 
         let json = serde_json::to_value(&report).unwrap();
-        // Verify all required fields are present (VAL-MEASURE-003)
+        // Verify all required fields are present (VAL-MEASURE-003, VAL-CPHASE-035)
         for field in &[
             "phase",
             "rss_min_kib",
@@ -140,6 +158,8 @@ mod tests {
             "anon_kib",
             "sample_count",
             "duration_ms",
+            "worker_rss_max_kib",
+            "combined_rss_max_kib",
         ] {
             assert!(json.get(field).is_some(), "missing field: {}", field);
         }
@@ -166,7 +186,7 @@ mod tests {
             timestamp: "2024-01-01T00:00:00Z".to_string(),
         };
         let err = report.validate_canonical_phases().unwrap_err();
-        assert!(err.contains("expected 6 phases"));
+        assert!(err.contains("expected 9 phases"));
     }
 
     #[test]

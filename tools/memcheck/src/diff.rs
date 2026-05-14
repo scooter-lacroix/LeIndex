@@ -42,11 +42,15 @@ pub struct RegressionRules {
 /// Per-phase budget ceiling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PhaseBudget {
-    /// Absolute RSS ceiling in KiB.
+    /// Absolute RSS ceiling in KiB for the main process.
     pub rss_max_kib: u64,
     /// Human-readable description of the ceiling.
     #[serde(default)]
     pub description: String,
+    /// Absolute combined (main + worker) RSS ceiling in KiB (VAL-CPHASE-040).
+    /// If absent, combined RSS is not checked separately.
+    #[serde(default)]
+    pub combined_rss_max_kib: Option<u64>,
 }
 
 /// Result of comparing a single phase against its baseline and ceiling.
@@ -54,7 +58,7 @@ pub struct PhaseBudget {
 pub struct PhaseDiff {
     /// Phase name.
     pub phase: String,
-    /// Measured rss_max_kib from the current run.
+    /// Measured rss_max_kib from the current run (main process).
     pub measured_kib: u64,
     /// Committed baseline rss_max_kib, if available.
     pub baseline_kib: Option<u64>,
@@ -68,6 +72,14 @@ pub struct PhaseDiff {
     pub ceiling_threshold_kib: Option<u64>,
     /// Whether the ceiling rule passed (true if no ceiling exists).
     pub ceiling_passed: bool,
+    /// Measured combined (main + worker) rss_max_kib (VAL-CPHASE-035).
+    pub combined_measured_kib: u64,
+    /// Combined ceiling from budget file, if available (VAL-CPHASE-040).
+    pub combined_ceiling_kib: Option<u64>,
+    /// Combined ceiling threshold = combined_ceiling + ceiling_tolerance_pct.
+    pub combined_ceiling_threshold_kib: Option<u64>,
+    /// Whether the combined ceiling rule passed.
+    pub combined_ceiling_passed: bool,
     /// Overall pass for this phase.
     pub passed: bool,
 }
@@ -128,6 +140,11 @@ pub fn write_all_baselines(
 /// Compare a memcheck report against committed baselines and budget ceilings.
 ///
 /// Returns a `DiffResult` with per-phase pass/fail status.
+///
+/// Worker-aware extensions (VAL-CPHASE-040, VAL-CPHASE-041):
+/// - For phases with a `combined_rss_max_kib` budget, the combined RSS
+///   (main + worker) is also checked against the combined ceiling.
+/// - Regression output identifies whether the violation is main or combined.
 pub fn diff_report(
     report: &MemcheckReport,
     baselines_dir: &Path,
@@ -169,7 +186,25 @@ pub fn diff_report(
             }
         };
 
-        let passed = baseline_passed && ceiling_passed;
+        // Combined ceiling rule (VAL-CPHASE-040): combined <= combined_ceiling + tolerance_pct
+        let combined_measured = phase.combined_rss_max_kib;
+        let (combined_ceiling_kib, combined_ceiling_threshold, combined_ceiling_passed) =
+            match budget.phases.get(&phase.phase) {
+                Some(pb) => match pb.combined_rss_max_kib {
+                    Some(combined_ceiling) => {
+                        let threshold = apply_pct(combined_ceiling, rules.ceiling_tolerance_pct);
+                        let passed = combined_measured <= threshold;
+                        (Some(combined_ceiling), Some(threshold), passed)
+                    }
+                    None => {
+                        // No combined ceiling → combined rule skipped
+                        (None, None, true)
+                    }
+                },
+                None => (None, None, true),
+            };
+
+        let passed = baseline_passed && ceiling_passed && combined_ceiling_passed;
 
         phase_diffs.push(PhaseDiff {
             phase: phase.phase.clone(),
@@ -180,6 +215,10 @@ pub fn diff_report(
             ceiling_kib,
             ceiling_threshold_kib: ceiling_threshold,
             ceiling_passed,
+            combined_measured_kib: combined_measured,
+            combined_ceiling_kib,
+            combined_ceiling_threshold_kib: combined_ceiling_threshold,
+            combined_ceiling_passed,
             passed,
         });
     }
@@ -193,15 +232,18 @@ pub fn diff_report(
 }
 
 /// Format a diff result as a human-readable summary.
+///
+/// VAL-CPHASE-041: Regression output identifies whether the violation is
+/// main or combined, not just that a phase failed.
 pub fn format_diff(diff: &DiffResult) -> String {
     let mut lines = Vec::new();
 
     lines.push("═══ Memcheck Phase Diff ═══".to_string());
     lines.push(format!(
-        "{:<15} {:>12} {:>12} {:>12} {:>8}",
-        "Phase", "Measured", "Baseline+5%", "Ceiling+10%", "Status"
+        "{:<15} {:>12} {:>12} {:>12} {:>12} {:>8}",
+        "Phase", "Main RSS", "Baseline+5%", "Ceiling+10%", "Combined", "Status"
     ));
-    lines.push("─".repeat(65));
+    lines.push("─".repeat(80));
 
     for pd in &diff.phases {
         let status = if pd.passed { "PASS" } else { "FAIL" };
@@ -216,16 +258,22 @@ pub fn format_diff(diff: &DiffResult) -> String {
             .map(|v| format!("{} KiB", v))
             .unwrap_or_else(|| "—".to_string());
 
+        let combined_str = if pd.combined_measured_kib > 0 {
+            format!("{} KiB", pd.combined_measured_kib)
+        } else {
+            "—".to_string()
+        };
+
         lines.push(format!(
-            "{:<15} {:>9} KiB {:>12} {:>12} {:>8}",
-            pd.phase, pd.measured_kib, baseline_str, ceiling_str, status
+            "{:<15} {:>9} KiB {:>12} {:>12} {:>12} {:>8}",
+            pd.phase, pd.measured_kib, baseline_str, ceiling_str, combined_str, status
         ));
 
-        // Add detail lines for failures
+        // Add detail lines for failures — identify main vs combined (VAL-CPHASE-041)
         if !pd.baseline_passed {
             if let (Some(bl), Some(_thr)) = (pd.baseline_kib, pd.baseline_threshold_kib) {
                 lines.push(format!(
-                    "  ⚠ baseline regression: {} KiB > baseline({} KiB) + {}%",
+                    "  ⚠ MAIN RSS baseline regression: {} KiB > baseline({} KiB) + {}%",
                     pd.measured_kib,
                     bl,
                     diff_phases_rules(diff).baseline_tolerance_pct
@@ -235,8 +283,18 @@ pub fn format_diff(diff: &DiffResult) -> String {
         if !pd.ceiling_passed {
             if let (Some(ce), Some(_thr)) = (pd.ceiling_kib, pd.ceiling_threshold_kib) {
                 lines.push(format!(
-                    "  ⚠ ceiling regression: {} KiB > ceiling({} KiB) + {}%",
+                    "  ⚠ MAIN RSS ceiling regression: {} KiB > ceiling({} KiB) + {}%",
                     pd.measured_kib,
+                    ce,
+                    diff_phases_rules(diff).ceiling_tolerance_pct
+                ));
+            }
+        }
+        if !pd.combined_ceiling_passed {
+            if let (Some(ce), Some(_thr)) = (pd.combined_ceiling_kib, pd.combined_ceiling_threshold_kib) {
+                lines.push(format!(
+                    "  ⚠ COMBINED RSS ceiling regression: {} KiB > combined ceiling({} KiB) + {}%",
+                    pd.combined_measured_kib,
                     ce,
                     diff_phases_rules(diff).ceiling_tolerance_pct
                 ));
@@ -244,7 +302,7 @@ pub fn format_diff(diff: &DiffResult) -> String {
         }
     }
 
-    lines.push("─".repeat(65));
+    lines.push("─".repeat(80));
     if diff.all_passed {
         lines.push("Result: ALL PHASES PASSED ✓".to_string());
     } else {
@@ -254,11 +312,38 @@ pub fn format_diff(diff: &DiffResult) -> String {
             .filter(|p| !p.passed)
             .map(|p| p.phase.as_str())
             .collect();
+
+        // Identify which type of failure (VAL-CPHASE-041)
+        let main_failures: Vec<&str> = diff
+            .phases
+            .iter()
+            .filter(|p| !p.baseline_passed || !p.ceiling_passed)
+            .map(|p| p.phase.as_str())
+            .collect();
+        let combined_failures: Vec<&str> = diff
+            .phases
+            .iter()
+            .filter(|p| !p.combined_ceiling_passed)
+            .map(|p| p.phase.as_str())
+            .collect();
+
         lines.push(format!(
             "Result: FAILED — {} phase(s) regressed: {}",
             failed.len(),
             failed.join(", ")
         ));
+        if !main_failures.is_empty() {
+            lines.push(format!(
+                "  Main RSS failures: {}",
+                main_failures.join(", ")
+            ));
+        }
+        if !combined_failures.is_empty() {
+            lines.push(format!(
+                "  Combined RSS failures: {}",
+                combined_failures.join(", ")
+            ));
+        }
     }
 
     lines.join("\n")
@@ -326,6 +411,7 @@ mod tests {
             PhaseBudget {
                 rss_max_kib: 470000,
                 description: "test".to_string(),
+                combined_rss_max_kib: None,
             },
         );
         phases.insert(
@@ -333,6 +419,7 @@ mod tests {
             PhaseBudget {
                 rss_max_kib: 740000,
                 description: "test".to_string(),
+                combined_rss_max_kib: None,
             },
         );
         BudgetFile {
@@ -360,6 +447,8 @@ mod tests {
                     anon_kib: 0,
                     sample_count: 10,
                     duration_ms: 3000,
+                    worker_rss_max_kib: 0,
+                    combined_rss_max_kib: *rss,
                 })
                 .collect(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
@@ -397,6 +486,8 @@ mod tests {
             anon_kib: 0,
             sample_count: 10,
             duration_ms: 3000,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 400000,
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
@@ -411,6 +502,8 @@ mod tests {
             anon_kib: 0,
             sample_count: 10,
             duration_ms: 3000,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 700000,
         };
         let json2 = serde_json::to_string_pretty(&baseline2).unwrap();
         std::fs::write(small_repo_dir.join("index.json"), json2).unwrap();
@@ -452,6 +545,8 @@ mod tests {
             anon_kib: 0,
             sample_count: 10,
             duration_ms: 3000,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 400000,
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
@@ -530,6 +625,8 @@ mod tests {
             anon_kib: 0,
             sample_count: 10,
             duration_ms: 3000,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 400000,
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
@@ -560,6 +657,8 @@ mod tests {
             anon_kib: 300000,
             sample_count: 12,
             duration_ms: 3000,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 400000,
         };
 
         write_baseline(&baselines_dir, "small_repo", &phase).unwrap();
@@ -588,6 +687,8 @@ mod tests {
                 anon_kib: 0,
                 sample_count: 10,
                 duration_ms: 3000,
+                worker_rss_max_kib: 0,
+                combined_rss_max_kib: 200000 + i as u64 * 10000,
             })
             .collect::<Vec<_>>();
 
@@ -621,6 +722,8 @@ mod tests {
             anon_kib: 0,
             sample_count: 10,
             duration_ms: 3000,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 400000,
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
@@ -652,6 +755,8 @@ mod tests {
             anon_kib: 0,
             sample_count: 10,
             duration_ms: 3000,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 400000,
         };
         let json = serde_json::to_string_pretty(&baseline).unwrap();
         std::fs::write(small_repo_dir.join("idle_warm.json"), json).unwrap();
@@ -663,7 +768,7 @@ mod tests {
         let output = format_diff(&result);
 
         assert!(output.contains("FAIL"));
-        assert!(output.contains("baseline regression"));
+        assert!(output.contains("MAIN RSS baseline regression"));
     }
 
     #[test]

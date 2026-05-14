@@ -60,6 +60,7 @@ fn run_memcheck(update_baseline: bool) -> Result<()> {
     let root = workspace_root();
     let fixture = root.join("tests/fixtures/memcheck/small_repo");
     let leindex_bin = root.join("target/release/leindex");
+    let leindex_embed_bin = root.join("target/release/leindex-embed");
     let memcheck_bin = root.join("target/release/memcheck");
 
     // Ensure the release binary exists
@@ -72,6 +73,19 @@ fn run_memcheck(update_baseline: bool) -> Result<()> {
             .context("failed to run cargo build")?;
         if !status.success() {
             anyhow::bail!("cargo build --release failed");
+        }
+    }
+
+    // Ensure the worker binary exists (for worker-active phases)
+    if !leindex_embed_bin.exists() {
+        eprintln!("xtask: building leindex-embed worker binary...");
+        let status = Command::new("cargo")
+            .args(["build", "--release", "-p", "leindex-embed"])
+            .current_dir(&root)
+            .status()
+            .context("failed to build leindex-embed")?;
+        if !status.success() {
+            eprintln!("xtask: warning — leindex-embed build failed, worker-active phases will be skipped");
         }
     }
 

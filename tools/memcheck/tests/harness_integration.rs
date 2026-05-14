@@ -101,8 +101,8 @@ fn test_val_measure_001_canonical_multi_phase_report() {
         .expect("report should have 'phases' field");
     let phases_arr = phases.as_array().expect("'phases' should be an array");
 
-    // Should have exactly 6 canonical phases
-    assert_eq!(phases_arr.len(), 6, "should have 6 canonical phases");
+    // Should have exactly 9 canonical phases (6 original + 3 worker-active)
+    assert_eq!(phases_arr.len(), 9, "should have 9 canonical phases");
 
     // Phase names should match canonical order
     let expected = [
@@ -112,6 +112,9 @@ fn test_val_measure_001_canonical_multi_phase_report() {
         "query",
         "reindex",
         "idle_final",
+        "embed_idle",
+        "embed_active",
+        "embed_teardown",
     ];
     for (i, expected_name) in expected.iter().enumerate() {
         let phase_name = phases_arr[i]
@@ -153,6 +156,9 @@ fn test_val_measure_002_phase_order_is_canonical() {
         "query",
         "reindex",
         "idle_final",
+        "embed_idle",
+        "embed_active",
+        "embed_teardown",
     ];
 
     // No missing phases
@@ -201,6 +207,8 @@ fn test_val_measure_003_per_phase_schema_has_required_metrics() {
         "anon_kib",
         "sample_count",
         "duration_ms",
+        "worker_rss_max_kib",
+        "combined_rss_max_kib",
     ];
 
     for (i, phase) in phases.iter().enumerate() {
@@ -226,17 +234,25 @@ fn test_val_measure_003_per_phase_schema_has_required_metrics() {
             );
         }
 
-        // sample_count should be positive (we did sample)
+        // sample_count should be positive for the first 6 phases (original canonical).
+        // Worker-active phases (embed_*) may have 0 samples if the worker binary
+        // is not available.
+        let phase_name = phase.get("phase").unwrap().as_str().unwrap_or("");
         let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
-        assert!(
-            sample_count > 0,
-            "phase {} should have at least 1 sample",
-            i
-        );
+        if !phase_name.starts_with("embed_") {
+            assert!(
+                sample_count > 0,
+                "phase {} ('{}') should have at least 1 sample",
+                i,
+                phase_name
+            );
+        }
 
-        // duration_ms should be positive
+        // duration_ms should be positive for the first 6 phases
         let duration = phase.get("duration_ms").unwrap().as_u64().unwrap();
-        assert!(duration > 0, "phase {} should have positive duration", i);
+        if !phase_name.starts_with("embed_") {
+            assert!(duration > 0, "phase {} ('{}') should have positive duration", i, phase_name);
+        }
     }
 }
 
@@ -291,8 +307,14 @@ fn test_val_measure_005_linux_rss_is_primary_metric() {
     for phase in phases {
         let phase_name = phase.get("phase").unwrap().as_str().unwrap();
         let rss_max = phase.get("rss_max_kib").unwrap().as_u64().unwrap();
+        let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
 
-        // RSS should be positive for all phases (process was sampled)
+        // Skip worker-active phases that had no samples (worker binary not available)
+        if phase_name.starts_with("embed_") && sample_count == 0 {
+            continue;
+        }
+
+        // RSS should be positive for all sampled phases
         assert!(
             rss_max > 0,
             "phase '{}' should have positive rss_max_kib, got {}",
@@ -431,9 +453,16 @@ fn test_idle_phases_have_reasonable_duration() {
     let phases = report.get("phases").unwrap().as_array().unwrap();
 
     // Idle phases should have duration >= 3 seconds (IDLE_DWELL)
+    // Worker-active idle phases (embed_idle, embed_teardown) may have 0 duration
+    // if the worker binary is not available.
     for phase in phases {
         let name = phase.get("phase").unwrap().as_str().unwrap();
-        if name.starts_with("idle_") {
+        let sample_count = phase.get("sample_count").unwrap().as_u64().unwrap();
+        if name.starts_with("idle_") || (name.starts_with("embed_") && name != "embed_active") {
+            // Skip phases with no samples (worker binary not available)
+            if name.starts_with("embed_") && sample_count == 0 {
+                continue;
+            }
             let duration = phase.get("duration_ms").unwrap().as_u64().unwrap();
             assert!(
                 duration >= 2500,

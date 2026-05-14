@@ -12,7 +12,7 @@ mod workload;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Memcheck harness for LeIndex memory measurement.
 #[derive(Parser, Debug)]
@@ -65,7 +65,7 @@ fn main() -> Result<()> {
     let workspace_root = diff::find_workspace_root(&fixture)?;
 
     let binary = match args.binary {
-        Some(p) => p,
+        Some(ref p) => p.clone(),
         None => {
             // Auto-detect: look for target/release/leindex relative to workspace
             workspace_root
@@ -109,6 +109,22 @@ fn main() -> Result<()> {
         fixture: fixture.clone(),
         sample_interval: std::time::Duration::from_millis(args.sample_interval_ms),
         verbose: args.verbose,
+        worker_binary: Some(
+            args.binary
+                .as_ref()
+                .map(|p| {
+                    // If the user specified a binary path, look for the worker
+                    // in the same directory
+                    let dir = p.parent().unwrap_or(Path::new("."));
+                    dir.join("leindex-embed").to_path_buf()
+                })
+                .unwrap_or_else(|| {
+                    workspace_root
+                        .join("target")
+                        .join("release")
+                        .join("leindex-embed")
+                }),
+        ),
     };
 
     let phases = workload::run_workload(&config)?;

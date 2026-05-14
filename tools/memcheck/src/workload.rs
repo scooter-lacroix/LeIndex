@@ -4,6 +4,10 @@
 //! samples its RSS using `/proc` (VAL-MEASURE-005). The canonical phase order
 //! is `idle_warm → index → idle_post → query → reindex → idle_final`
 //! (VAL-MEASURE-001, VAL-MEASURE-002).
+//!
+//! Worker-aware extensions (VAL-CPHASE-036): the canonical workload includes
+//! an idle pre-embed phase, a worker-active embed phase, and a phase that
+//! exercises teardown/restart behavior.
 
 use crate::report::PhaseReport;
 use crate::sampler;
@@ -14,7 +18,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Canonical phase names in execution order (VAL-MEASURE-002).
+/// Canonical phase names in execution order (VAL-MEASURE-002, VAL-CPHASE-036).
+///
+/// The original 6 phases are preserved. Three worker-active phases are added
+/// after the original phases to exercise the worker lifecycle:
+/// - `embed_idle`: idle MCP process before any embed demand
+/// - `embed_active`: MCP process with worker-active embedding (triggers worker spawn)
+/// - `embed_teardown`: idle after worker teardown, verifying worker process cleanup
 pub const CANONICAL_PHASES: &[&str] = &[
     "idle_warm",
     "index",
@@ -22,7 +32,13 @@ pub const CANONICAL_PHASES: &[&str] = &[
     "query",
     "reindex",
     "idle_final",
+    "embed_idle",
+    "embed_active",
+    "embed_teardown",
 ];
+
+/// The worker binary name used for child-process detection.
+const WORKER_BINARY_NAME: &str = "leindex-embed";
 
 /// Idle phase dwell time (seconds).
 const IDLE_DWELL: Duration = Duration::from_secs(3);
@@ -36,12 +52,18 @@ pub struct WorkloadConfig {
     pub fixture: PathBuf,
     pub sample_interval: Duration,
     pub verbose: bool,
+    /// Path to the leindex-embed worker binary (for worker-active phases).
+    /// If None, worker-active phases are skipped.
+    pub worker_binary: Option<PathBuf>,
 }
 
 /// Run the full canonical workload and return per-phase reports.
 ///
 /// Each phase launches a fresh `leindex` process, samples it for the
 /// appropriate duration, then cleans up before the next phase.
+///
+/// Worker-active phases (VAL-CPHASE-036) are appended after the original
+/// 6 phases. They exercise the worker spawn/embed/teardown lifecycle.
 pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
     let mut reports = Vec::with_capacity(CANONICAL_PHASES.len());
 
@@ -50,7 +72,7 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
 
     // ── Phase 1: idle_warm ──────────────────────────────────────────────
     // Launch a fresh leindex MCP process and let it sit idle.
-    let (child, report) = run_idle_phase(config, "idle_warm", IDLE_DWELL)?;
+    let (child, report) = run_idle_phase(config, "idle_warm", IDLE_DWELL, false)?;
     reports.push(report);
     kill_child(child);
 
@@ -65,7 +87,7 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
 
     // ── Phase 3: idle_post ──────────────────────────────────────────────
     // Launch a fresh MCP process against the now-indexed fixture.
-    let (child, report) = run_idle_phase(config, "idle_post", IDLE_DWELL)?;
+    let (child, report) = run_idle_phase(config, "idle_post", IDLE_DWELL, false)?;
     reports.push(report);
     kill_child(child);
 
@@ -91,9 +113,66 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
     reports.push(report);
 
     // ── Phase 6: idle_final ─────────────────────────────────────────────
-    let (child, report) = run_idle_phase(config, "idle_final", IDLE_DWELL)?;
+    let (child, report) = run_idle_phase(config, "idle_final", IDLE_DWELL, false)?;
     reports.push(report);
     kill_child(child);
+
+    // ── Worker-active phases (VAL-CPHASE-036) ───────────────────────────
+    // These phases exercise the worker lifecycle. They require the
+    // leindex-embed binary to be available alongside the main binary.
+    let worker_available = config
+        .worker_binary
+        .as_ref()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+
+    if worker_available {
+        // ── Phase 7: embed_idle ─────────────────────────────────────────
+        // Launch MCP process and let it sit idle (no worker spawned yet).
+        let (child, report) = run_idle_phase(config, "embed_idle", IDLE_DWELL, false)?;
+        reports.push(report);
+        kill_child(child);
+
+        // ── Phase 8: embed_active ───────────────────────────────────────
+        // Launch MCP process, trigger a search that would use ONNX embeddings
+        // (which spawns the worker), and sample both main + worker RSS.
+        let (child, report) = run_embed_active_phase(config)?;
+        reports.push(report);
+        kill_child(child);
+
+        // ── Phase 9: embed_teardown ─────────────────────────────────────
+        // Launch MCP process after the worker has been torn down. This verifies
+        // that the worker process is cleaned up and doesn't leak RSS.
+        let (child, report) = run_idle_phase(config, "embed_teardown", IDLE_DWELL, false)?;
+        reports.push(report);
+        kill_child(child);
+    } else {
+        if config.verbose {
+            eprintln!(
+                "memcheck: skipping worker-active phases ({} not found)",
+                config
+                    .worker_binary
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "worker binary path not set".to_string())
+            );
+        }
+        // Still add placeholder phases so the report has the right phase count
+        for phase_name in &["embed_idle", "embed_active", "embed_teardown"] {
+            reports.push(PhaseReport {
+                phase: phase_name.to_string(),
+                rss_min_kib: 0,
+                rss_max_kib: 0,
+                rss_p95_kib: 0,
+                mapped_file_kib: 0,
+                anon_kib: 0,
+                sample_count: 0,
+                duration_ms: 0,
+                worker_rss_max_kib: 0,
+                combined_rss_max_kib: 0,
+            });
+        }
+    }
 
     Ok(reports)
 }
@@ -101,10 +180,14 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
 // ─── Phase implementations ──────────────────────────────────────────────
 
 /// Run an idle phase: launch a fresh leindex MCP process, sample for `dwell`.
+///
+/// When `track_worker` is true, the sampler also looks for child worker
+/// processes (VAL-CPHASE-034).
 fn run_idle_phase(
     config: &WorkloadConfig,
     phase_name: &str,
     dwell: Duration,
+    track_worker: bool,
 ) -> Result<(Child, PhaseReport)> {
     if config.verbose {
         eprintln!("memcheck: phase '{}' starting (idle)", phase_name);
@@ -116,12 +199,74 @@ fn run_idle_phase(
     // Give the process time to initialise before sampling.
     std::thread::sleep(STARTUP_GRACE);
 
-    let report = sample_pid_for_duration(pid, phase_name, dwell, config.sample_interval)?;
+    let worker_name = if track_worker {
+        Some(WORKER_BINARY_NAME)
+    } else {
+        None
+    };
+    let report = sample_pid_for_duration(pid, phase_name, dwell, config.sample_interval, worker_name)?;
 
     if config.verbose {
         eprintln!(
-            "memcheck: phase '{}' complete — rss_max: {} KiB, samples: {}",
-            phase_name, report.rss_max_kib, report.sample_count
+            "memcheck: phase '{}' complete — rss_max: {} KiB, worker_rss_max: {} KiB, samples: {}",
+            phase_name, report.rss_max_kib, report.worker_rss_max_kib, report.sample_count
+        );
+    }
+
+    Ok((child, report))
+}
+
+/// Run the embed_active phase: launch MCP process, trigger a search that
+/// activates the ONNX worker, and sample both main + worker RSS.
+///
+/// VAL-CPHASE-036: The canonical workload includes a worker-active embed phase.
+/// VAL-CPHASE-034: The memcheck harness detects the worker process once
+/// embedding begins and records it separately from the main daemon.
+fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport)> {
+    if config.verbose {
+        eprintln!("memcheck: phase 'embed_active' starting (worker-active)");
+    }
+
+    let child = launch_mcp_process(config)?;
+    let pid = child.id();
+
+    // Give the process time to initialise
+    std::thread::sleep(STARTUP_GRACE);
+
+    // Trigger a search that would use ONNX embeddings, spawning the worker.
+    // We run a search command against the same fixture in a separate process
+    // to trigger the MCP server's embed path. The MCP server (our sampled
+    // process) will spawn the worker as a child.
+    let search_handle = std::thread::spawn({
+        let binary = config.binary.clone();
+        let fixture = config.fixture.clone();
+        move || {
+            let _ = Command::new(&binary)
+                .arg("search")
+                .arg("function")
+                .arg("--project")
+                .arg(&fixture)
+                .output();
+        }
+    });
+
+    // Sample the MCP process (and its worker child) for the dwell period.
+    let dwell = Duration::from_secs(5);
+    let report = sample_pid_for_duration(
+        pid,
+        "embed_active",
+        dwell,
+        config.sample_interval,
+        Some(WORKER_BINARY_NAME),
+    )?;
+
+    // Wait for the search to finish (ignore result)
+    let _ = search_handle.join();
+
+    if config.verbose {
+        eprintln!(
+            "memcheck: phase 'embed_active' complete — main_rss_max: {} KiB, worker_rss_max: {} KiB, combined_rss_max: {} KiB, samples: {}",
+            report.rss_max_kib, report.worker_rss_max_kib, report.combined_rss_max_kib, report.sample_count
         );
     }
 
@@ -167,7 +312,7 @@ fn run_command_phase(
         // commands.  The outer `done` flag is checked between samples.
         let fast_interval = Duration::from_millis(10);
         while !done_clone.load(Ordering::Relaxed) {
-            if let Ok(s) = sampler::sample(pid) {
+            if let Ok(s) = sampler::sample(pid, None) {
                 samples.push(s);
             }
             std::thread::sleep(fast_interval);
@@ -231,17 +376,21 @@ fn kill_child(mut child: Child) {
 }
 
 /// Sample a PID for a fixed duration, collecting full memory samples.
+///
+/// When `worker_name` is `Some`, also samples any child worker process
+/// matching that name (VAL-CPHASE-034).
 fn sample_pid_for_duration(
     pid: u32,
     phase_name: &str,
     dwell: Duration,
     sample_interval: Duration,
+    worker_name: Option<&str>,
 ) -> Result<PhaseReport> {
     let start = Instant::now();
     let mut samples = Vec::new();
 
     while start.elapsed() < dwell {
-        if let Ok(s) = sampler::sample(pid) {
+        if let Ok(s) = sampler::sample(pid, worker_name) {
             samples.push(s);
         }
         std::thread::sleep(sample_interval);
@@ -256,6 +405,10 @@ fn sample_pid_for_duration(
 /// RSS min/max/p95 are computed from the sample set. Mapped-file and
 /// anonymous memory use the **peak** values across all samples so that
 /// mmap-heavy phases are captured correctly (VAL-MEASURE-003, VAL-MEASURE-006).
+///
+/// Worker-aware extensions (VAL-CPHASE-035): worker_rss_max_kib is the peak
+/// worker RSS across all samples. combined_rss_max_kib is the peak of
+/// (main_rss + worker_rss) across all samples.
 fn build_phase_report(
     phase_name: &str,
     samples: &mut Vec<sampler::MemorySample>,
@@ -271,6 +424,8 @@ fn build_phase_report(
             anon_kib: 0,
             sample_count: 0,
             duration_ms: duration.as_millis() as u64,
+            worker_rss_max_kib: 0,
+            combined_rss_max_kib: 0,
         };
     }
 
@@ -291,6 +446,14 @@ fn build_phase_report(
     let mapped_file = samples.iter().map(|s| s.mapped_file_kib).max().unwrap_or(0);
     let anon = samples.iter().map(|s| s.anon_kib).max().unwrap_or(0);
 
+    // Worker-aware metrics (VAL-CPHASE-035)
+    let worker_rss_max = samples.iter().map(|s| s.worker_rss_kib).max().unwrap_or(0);
+    let combined_rss_max = samples
+        .iter()
+        .map(|s| s.rss_kib + s.worker_rss_kib)
+        .max()
+        .unwrap_or(rss_max);
+
     PhaseReport {
         phase: phase_name.to_string(),
         rss_min_kib: rss_min,
@@ -300,6 +463,8 @@ fn build_phase_report(
         anon_kib: anon,
         sample_count: samples.len(),
         duration_ms: duration.as_millis() as u64,
+        worker_rss_max_kib: worker_rss_max,
+        combined_rss_max_kib: combined_rss_max,
     }
 }
 
@@ -328,13 +493,16 @@ mod tests {
                 "query",
                 "reindex",
                 "idle_final",
+                "embed_idle",
+                "embed_active",
+                "embed_teardown",
             ]
         );
     }
 
     #[test]
     fn test_canonical_phases_count() {
-        assert_eq!(CANONICAL_PHASES.len(), 6);
+        assert_eq!(CANONICAL_PHASES.len(), 9);
     }
 
     #[test]
@@ -348,6 +516,8 @@ mod tests {
         assert_eq!(report.rss_p95_kib, 0);
         assert_eq!(report.mapped_file_kib, 0);
         assert_eq!(report.anon_kib, 0);
+        assert_eq!(report.worker_rss_max_kib, 0);
+        assert_eq!(report.combined_rss_max_kib, 0);
     }
 
     #[test]
@@ -358,18 +528,21 @@ mod tests {
                 mapped_file_kib: 10,
                 anon_kib: 90,
                 pss_kib: 100,
+                worker_rss_kib: 0,
             },
             sampler::MemorySample {
                 rss_kib: 200,
                 mapped_file_kib: 20,
                 anon_kib: 180,
                 pss_kib: 200,
+                worker_rss_kib: 50,
             },
             sampler::MemorySample {
                 rss_kib: 150,
                 mapped_file_kib: 15,
                 anon_kib: 135,
                 pss_kib: 150,
+                worker_rss_kib: 30,
             },
         ];
         let report = build_phase_report("test", &mut samples, Duration::from_millis(500));
@@ -383,6 +556,9 @@ mod tests {
         // Peak mapped_file and anon
         assert_eq!(report.mapped_file_kib, 20);
         assert_eq!(report.anon_kib, 180);
+        // Worker-aware metrics
+        assert_eq!(report.worker_rss_max_kib, 50);
+        assert_eq!(report.combined_rss_max_kib, 250); // 200 + 50
     }
 
     #[test]
@@ -394,6 +570,7 @@ mod tests {
                 mapped_file_kib: 0,
                 anon_kib: 0,
                 pss_kib: i * 10,
+                worker_rss_kib: 0,
             })
             .collect();
         let report = build_phase_report("test", &mut samples, Duration::from_secs(1));
@@ -409,22 +586,57 @@ mod tests {
                 mapped_file_kib: 50,
                 anon_kib: 50,
                 pss_kib: 100,
+                worker_rss_kib: 0,
             },
             sampler::MemorySample {
                 rss_kib: 120,
                 mapped_file_kib: 80,
                 anon_kib: 40,
                 pss_kib: 120,
+                worker_rss_kib: 0,
             },
             sampler::MemorySample {
                 rss_kib: 110,
                 mapped_file_kib: 30,
                 anon_kib: 80,
                 pss_kib: 110,
+                worker_rss_kib: 0,
             },
         ];
         let report = build_phase_report("test", &mut samples, Duration::from_secs(1));
         assert_eq!(report.mapped_file_kib, 80); // peak
         assert_eq!(report.anon_kib, 80); // peak
+    }
+
+    #[test]
+    fn test_build_phase_report_worker_aware() {
+        // Test that worker RSS is tracked and combined correctly
+        let mut samples = vec![
+            sampler::MemorySample {
+                rss_kib: 50000,
+                mapped_file_kib: 0,
+                anon_kib: 0,
+                pss_kib: 0,
+                worker_rss_kib: 0,
+            },
+            sampler::MemorySample {
+                rss_kib: 60000,
+                mapped_file_kib: 0,
+                anon_kib: 0,
+                pss_kib: 0,
+                worker_rss_kib: 80000,
+            },
+            sampler::MemorySample {
+                rss_kib: 55000,
+                mapped_file_kib: 0,
+                anon_kib: 0,
+                pss_kib: 0,
+                worker_rss_kib: 90000,
+            },
+        ];
+        let report = build_phase_report("embed_active", &mut samples, Duration::from_secs(1));
+        assert_eq!(report.rss_max_kib, 60000);
+        assert_eq!(report.worker_rss_max_kib, 90000);
+        assert_eq!(report.combined_rss_max_kib, 145000); // 55000 + 90000
     }
 }
