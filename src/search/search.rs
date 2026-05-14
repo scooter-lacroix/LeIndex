@@ -1246,6 +1246,126 @@ impl SearchEngine {
         self.nodes.is_empty()
     }
 
+    // ----------------------------------------------------------------
+    // B-phase residency accessors (Plan 2)
+    // ----------------------------------------------------------------
+
+    /// Return the internal index position for a given node ID.
+    ///
+    /// Returns `None` if the node is not in the index. This is the
+    /// row-oriented position used by the residency layer.
+    pub fn node_index(&self, node_id: &str) -> Option<usize> {
+        self.node_id_to_idx.get(node_id).copied()
+    }
+
+    /// Return the number of live (non-tombstoned) nodes in the index.
+    ///
+    /// Equivalent to `node_count()` but named for clarity in residency
+    /// contexts where the distinction between live and tombstoned matters.
+    pub fn live_node_count(&self) -> usize {
+        self.node_id_to_idx.len()
+    }
+
+    /// Check whether a node ID is currently in the live index.
+    pub fn contains_node(&self, node_id: &str) -> bool {
+        self.node_id_to_idx.contains_key(node_id)
+    }
+
+    /// Return the node IDs currently in the live index.
+    pub fn live_node_ids(&self) -> Vec<String> {
+        self.node_id_to_idx.keys().cloned().collect()
+    }
+
+    /// Return the complexity score for a given node.
+    pub fn node_complexity(&self, node_id: &str) -> Option<u32> {
+        self.complexity_cache.get(node_id).copied()
+    }
+
+    /// Return the tokens associated with a given node.
+    pub fn node_tokens(&self, node_id: &str) -> Option<&HashSet<String>> {
+        self.node_tokens.get(node_id)
+    }
+
+    /// Check whether a token exists in the text index and, if so, which
+    /// node IDs contain it.
+    pub fn token_lookup(&self, token: &str) -> Option<&HashSet<String>> {
+        self.text_index.get(token)
+    }
+
+    /// Validate internal coherence of all index structures.
+    ///
+    /// Returns `Ok(())` if all structures agree, or a description of the
+    /// first incoherence found. Used by residency tests to verify that
+    /// compaction and delta updates maintain structural coherence.
+    pub fn validate_coherence(&self) -> Result<(), String> {
+        // node_id_to_idx and nodes must agree on count
+        if self.node_id_to_idx.len() != self.nodes.len() {
+            return Err(format!(
+                "node_id_to_idx len ({}) != nodes len ({})",
+                self.node_id_to_idx.len(),
+                self.nodes.len()
+            ));
+        }
+
+        // Every entry in node_id_to_idx must point to the correct node
+        for (id, &idx) in &self.node_id_to_idx {
+            if idx >= self.nodes.len() {
+                return Err(format!(
+                    "node_id_to_idx[{}] = {} >= nodes.len() = {}",
+                    id,
+                    idx,
+                    self.nodes.len()
+                ));
+            }
+            if self.nodes[idx].node_id != *id {
+                return Err(format!(
+                    "nodes[{}].node_id = '{}' != node_id_to_idx key '{}'",
+                    idx, self.nodes[idx].node_id, id
+                ));
+            }
+        }
+
+        // complexity_cache must have an entry for every live node
+        for node in &self.nodes {
+            match self.complexity_cache.get(&node.node_id) {
+                Some(c) if *c == node.complexity => {}
+                Some(c) => {
+                    return Err(format!(
+                        "complexity_cache[{}] = {} != node.complexity = {}",
+                        node.node_id, c, node.complexity
+                    ))
+                }
+                None => {
+                    return Err(format!(
+                        "complexity_cache missing entry for {}",
+                        node.node_id
+                    ))
+                }
+            }
+        }
+
+        // node_tokens must have an entry for every live node
+        for node in &self.nodes {
+            if !self.node_tokens.contains_key(&node.node_id) {
+                return Err(format!("node_tokens missing entry for {}", node.node_id));
+            }
+        }
+
+        // text_index must not reference removed nodes
+        for (token, node_ids) in &self.text_index {
+            for id in node_ids {
+                if !self.node_id_to_idx.contains_key(id) {
+                    return Err(format!(
+                        "text_index token '{}' references non-live node '{}'",
+                        token, id
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Execute a search query
     ///
     /// This performs a hybrid search combining:
@@ -3544,8 +3664,8 @@ mod tests {
         // Must NOT contain the legacy "embedding" field (not "tfidf_embedding")
         // We check for the exact key by looking for the pattern that would indicate
         // a standalone "embedding" key (not preceded by "tfidf_")
-        let has_legacy_embedding = json.contains("\"embedding\":")
-            && !json.contains("\"tfidf_embedding\":");
+        let has_legacy_embedding =
+            json.contains("\"embedding\":") && !json.contains("\"tfidf_embedding\":");
         assert!(
             !has_legacy_embedding,
             "Serialized output must not contain legacy 'embedding' field. JSON: {}",
@@ -3574,12 +3694,13 @@ mod tests {
             "pre_tokenized": null
         }"#;
 
-        let node: NodeInfo = serde_json::from_str(dual_json)
-            .expect("Dual-shape payload must deserialize");
+        let node: NodeInfo =
+            serde_json::from_str(dual_json).expect("Dual-shape payload must deserialize");
 
         // Should prefer tfidf_embedding (the new field)
         assert_eq!(
-            node.tfidf_embedding, vec![0.5, 0.6, 0.7],
+            node.tfidf_embedding,
+            vec![0.5, 0.6, 0.7],
             "Must prefer tfidf_embedding when both fields are present"
         );
     }
@@ -3606,10 +3727,11 @@ mod tests {
             "pre_tokenized": null
         }"#;
 
-        let node: NodeInfo = serde_json::from_str(legacy_only_json)
-            .expect("Legacy-only payload must deserialize");
+        let node: NodeInfo =
+            serde_json::from_str(legacy_only_json).expect("Legacy-only payload must deserialize");
         assert_eq!(
-            node.tfidf_embedding, vec![0.9, 0.8, 0.7],
+            node.tfidf_embedding,
+            vec![0.9, 0.8, 0.7],
             "Must promote legacy embedding when tfidf_embedding is absent"
         );
 
@@ -3632,7 +3754,8 @@ mod tests {
         let node2: NodeInfo = serde_json::from_str(empty_new_json)
             .expect("Empty-new + legacy payload must deserialize");
         assert_eq!(
-            node2.tfidf_embedding, vec![0.4, 0.5, 0.6],
+            node2.tfidf_embedding,
+            vec![0.4, 0.5, 0.6],
             "Must promote legacy embedding when tfidf_embedding is empty"
         );
     }
