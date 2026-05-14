@@ -1924,13 +1924,13 @@ dependencies = [
  "futures",
  "futures-util",
  "hnsw_rs",
+ "leindex-embed",
  "libc",
  "libsql",
  "lru",
  "memmap2",
  "notify",
  "once_cell",
- "ort",
  "petgraph",
  "proptest",
  "rand 0.8.5",
@@ -1946,7 +1946,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tikv-jemallocator",
- "tokenizers",
  "tokio",
  "tokio-stream",
  "tokio-test",
@@ -1975,6 +1974,23 @@ dependencies = [
  "unicode-normalization",
  "walkdir",
  "wide",
+]
+
+[[package]]
+name = "leindex-embed"
+version = "1.6.6"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "dirs",
+ "ort",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokenizers",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

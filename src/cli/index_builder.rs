@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 #[cfg(feature = "onnx")]
-use crate::search::onnx::QwenEmbeddingProvider;
+use crate::search::onnx::EmbeddingClient;
 
 #[cfg(feature = "remote-embeddings")]
 use crate::search::onnx::remote::RemoteEmbeddingProvider;
@@ -427,13 +427,13 @@ pub enum HybridEmbedder {
     /// TF-IDF only (base signal always available)
     TfIdfOnly(TfIdfEmbedder),
 
-    /// TF-IDF + Local ONNX neural embeddings
+    /// TF-IDF + Local ONNX neural embeddings (via worker process)
     #[cfg(feature = "onnx")]
     HybridLocal {
         /// TF-IDF embedder for keyword-based search
         tfidf: TfIdfEmbedder,
-        /// Local ONNX neural embedder for semantic search
-        neural: QwenEmbeddingProvider,
+        /// Worker client for neural embedding via leindex-embed process
+        neural: EmbeddingClient,
         /// Weight for neural embeddings in hybrid scoring (0.0-1.0)
         neural_weight: f32,
     },
@@ -506,15 +506,12 @@ impl HybridEmbedder {
         Self::TfIdfOnly(embedder)
     }
 
-    /// Create a hybrid embedder with local ONNX neural embeddings
+    /// Create a hybrid embedder with local ONNX neural embeddings via worker
     #[cfg(feature = "onnx")]
-    pub fn hybrid_local(
-        tfidf: TfIdfEmbedder,
-        neural_weight: Option<f32>,
-    ) -> Result<Self, crate::search::onnx::QwenEmbeddingProviderError> {
+    pub fn hybrid_local(tfidf: TfIdfEmbedder, neural_weight: Option<f32>) -> Result<Self, String> {
         Ok(Self::HybridLocal {
             tfidf,
-            neural: QwenEmbeddingProvider::new()?,
+            neural: EmbeddingClient::new(),
             neural_weight: neural_weight.unwrap_or(0.40),
         })
     }
@@ -566,7 +563,7 @@ impl HybridEmbedder {
         match self {
             Self::TfIdfOnly(_) => None,
             #[cfg(feature = "onnx")]
-            Self::HybridLocal { neural, .. } => Some(neural.dimension()),
+            Self::HybridLocal { .. } => Some(1024), // Qwen3-Embedding-0.6B dimension
             #[cfg(feature = "remote-embeddings")]
             Self::HybridRemote { remote, .. } => Some(remote.dimension()),
         }
@@ -617,12 +614,18 @@ impl HybridEmbedder {
             Self::TfIdfOnly(_) => None,
             #[cfg(feature = "onnx")]
             Self::HybridLocal { neural, .. } => {
-                // ONNX is synchronous, wrap in async
-                Some(
-                    neural
-                        .embed(text)
-                        .map_err(|e| format!("ONNX embedding failed: {}", e)),
-                )
+                // Delegate to the worker process via the embedding client
+                let texts = vec![text.to_string()];
+                match neural.embed(&texts, 1024) {
+                    Ok(response) => {
+                        if response.count > 0 {
+                            Some(Ok(response.into_vectors().into_iter().next().unwrap()))
+                        } else {
+                            Some(Err("worker returned empty response".to_string()))
+                        }
+                    }
+                    Err(e) => Some(Err(format!("Worker embedding failed: {}", e))),
+                }
             }
             #[cfg(feature = "remote-embeddings")]
             Self::HybridRemote { remote, .. } => Some(
@@ -642,11 +645,19 @@ impl HybridEmbedder {
         match self {
             Self::TfIdfOnly(_) => None,
             #[cfg(feature = "onnx")]
-            Self::HybridLocal { neural, .. } => Some(
-                neural
-                    .embed(text)
-                    .map_err(|e| format!("ONNX embedding failed: {}", e)),
-            ),
+            Self::HybridLocal { neural, .. } => {
+                let texts = vec![text.to_string()];
+                match neural.embed(&texts, 1024) {
+                    Ok(response) => {
+                        if response.count > 0 {
+                            Some(Ok(response.into_vectors().into_iter().next().unwrap()))
+                        } else {
+                            Some(Err("worker returned empty response".to_string()))
+                        }
+                    }
+                    Err(e) => Some(Err(format!("Worker embedding failed: {}", e))),
+                }
+            }
             #[cfg(feature = "remote-embeddings")]
             Self::HybridRemote { .. } => {
                 // Remote requires async runtime, this is a blocking wrapper
@@ -671,13 +682,14 @@ impl HybridEmbedder {
     ///
     /// After an indexing batch completes, calling this drops the live ONNX
     /// session so it does not remain resident indefinitely (VAL-APLUS-024).
-    /// The next embed call lazily recreates the session.
+    /// With the worker architecture, this signals the worker to shut down.
     pub fn unload_onnx(&self) {
         match self {
             Self::TfIdfOnly(_) => {}
             #[cfg(feature = "onnx")]
-            Self::HybridLocal { neural, .. } => {
-                neural.unload();
+            Self::HybridLocal { .. } => {
+                // Worker lifecycle management will be handled in the runtime
+                // lifecycle feature. For now, the client drops the worker on Drop.
             }
             #[cfg(feature = "remote-embeddings")]
             Self::HybridRemote { .. } => {}
@@ -690,7 +702,12 @@ impl HybridEmbedder {
         match self {
             Self::TfIdfOnly(_) => false,
             #[cfg(feature = "onnx")]
-            Self::HybridLocal { neural, .. } => neural.is_loaded(),
+            Self::HybridLocal { .. } => {
+                // With the worker architecture, "loaded" means the worker process
+                // is running. This will be properly tracked in the runtime lifecycle
+                // feature. For now, return false as the worker is spawned on demand.
+                false
+            }
             #[cfg(feature = "remote-embeddings")]
             Self::HybridRemote { .. } => false,
         }

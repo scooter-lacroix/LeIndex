@@ -205,7 +205,10 @@ turso = ["dep:libsql", "dep:rusqlite_migration"]
 # Use with: cargo build --features onnx
 # Default model: Qwen3-Embedding-0.6B (~300MB) - user-specified
 # Reranker: Qwen3-Reranker-0.6B (~300MB) - optional quality improvement
-onnx = ["search", "dep:ort", "dep:tokenizers", "dep:dirs"]
+#
+# VAL-CPHASE-002: The main crate no longer owns ONNX runtime deps directly.
+# ONNX inference is delegated to the leindex-embed worker process.
+onnx = ["search", "dep:leindex-embed"]
 
 # Remote embedding API support (OpenAI, etc.)
 # Opt-in feature: Use cloud-based embedding services instead of local models
@@ -280,9 +283,10 @@ bytemuck = { version = "1.15", optional = true }
 wide = { version = "0.7", optional = true }
 unicode-normalization = { version = "0.1", optional = true }
 
-# ONNX Runtime dependencies (for R15 neural embeddings)
-ort = { version = "2.0.0-rc.12", optional = true, features = ["ndarray"] }
-tokenizers = { version = "0.20", optional = true }
+# ONNX Runtime dependencies — delegated to the worker crate (VAL-CPHASE-002)
+# The main crate depends only on the protocol types (no ONNX runtime deps).
+# The worker binary enables the `onnx` feature separately.
+leindex-embed = { path = "crates/leindex-embed", optional = true, default-features = false }
 
 # Remote embedding API dependencies (for cloud-based embeddings)
 reqwest = { version = "0.12", features = ["json", "rustls-tls-webpki-roots", "gzip", "deflate"], optional = true, default-features = false }
@@ -380,6 +384,7 @@ strip = false
 [workspace]
 members = [
     ".",
+    "crates/leindex-embed",
     "tools/memcheck",
     "tools/xtask",
 ]
