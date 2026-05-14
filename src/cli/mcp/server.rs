@@ -7,14 +7,15 @@ use super::handlers::{all_tool_handlers, ToolHandler};
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::cli::registry::ProjectRegistry;
 use anyhow::Context;
-use axum_06::{
-    http::StatusCode,
+use axum::{
+    extract::Json,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{
-        sse::{Event, Sse},
-        IntoResponse, Json, Response,
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
     },
     routing::{get, post},
-    Router, Server,
+    Router,
 };
 use futures_util::stream::{Stream, StreamExt};
 use serde::Serialize;
@@ -180,8 +181,10 @@ impl McpServer {
 
         info!("Starting MCP server on {}", bind_address);
 
-        Server::bind(&bind_address)
-            .serve(router.into_make_service())
+        let listener = tokio::net::TcpListener::bind(bind_address)
+            .await
+            .context("Failed to bind TCP listener")?;
+        axum::serve(listener, router.into_make_service())
             .await
             .context("Server error")?;
 
@@ -286,7 +289,7 @@ pub async fn index_stream_handler(
     });
 
     Sse::new(stream).keep_alive(
-        axum_06::response::sse::KeepAlive::new()
+        KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text("keep-alive"),
     )
@@ -420,7 +423,7 @@ fn handle_ping() -> Value {
 }
 
 /// JSON-RPC request handler
-async fn json_rpc_handler(headers: axum_06::http::HeaderMap, Json(body): Json<Value>) -> Response {
+async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Response {
     // Extract Mcp-Session-Id header (if present)
     let incoming_session_id = headers
         .get("Mcp-Session-Id")
@@ -535,8 +538,8 @@ async fn json_rpc_handler(headers: axum_06::http::HeaderMap, Json(body): Json<Va
             // Attach Mcp-Session-Id response header
             if let Some(sid) = session_id {
                 let mut response = body;
-                let sid_header = axum_06::http::HeaderValue::from_str(&sid)
-                    .unwrap_or_else(|_| axum_06::http::HeaderValue::from_static("unknown"));
+                let sid_header = HeaderValue::from_str(&sid)
+                    .unwrap_or_else(|_| HeaderValue::from_static("unknown"));
                 response.headers_mut().insert("Mcp-Session-Id", sid_header);
                 return response;
             }
@@ -683,7 +686,7 @@ pub fn handle_resource_read(req: &JsonRpcRequest) -> Result<Value, JsonRpcError>
 /// Public discovery endpoint — no handshake required.
 /// If a `Mcp-Session-Id` header is present, it is validated but
 /// the endpoint still functions without one.
-async fn list_tools_handler(headers: axum_06::http::HeaderMap) -> Json<Value> {
+async fn list_tools_handler(headers: HeaderMap) -> Json<Value> {
     // Validate session ID if present, but don't require one
     if let Some(sid) = headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok()) {
         if let Some(server) = SERVER_INSTANCE.get() {

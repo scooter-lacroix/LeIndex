@@ -31,7 +31,7 @@ pub type Result<T> = std::result::Result<T, ValidationError>;
 pub enum ValidationError {
     /// Storage error
     #[error("Storage error: {0}")]
-    Storage(#[from] crate::storage::StorageError),
+    Storage(String),
 
     /// I/O error
     #[error("IO error: {0}")]
