@@ -221,7 +221,8 @@ impl LeIndex {
                 let signature = crate::search::search::SearchEngine::extract_signature_from_content(
                     &node_content,
                 );
-                let tfidf_embedding = embedder.embed_tfidf(&index_builder::tokenize_code(&node_content));
+                let tfidf_embedding =
+                    embedder.embed_tfidf(&index_builder::tokenize_code(&node_content));
 
                 Some(crate::search::search::NodeInfo {
                     node_id: node.id.clone(),

@@ -41,6 +41,6 @@ pub use reranker::{QwenReranker, QwenRerankerError};
 
 #[cfg(feature = "remote-embeddings")]
 pub use remote::{
-    CohereEmbeddingProvider, GenericRemoteProvider, OpenAIEmbeddingProvider,
-    RemoteEmbeddingConfig, RemoteEmbeddingError, RemoteProvider,
+    CohereEmbeddingProvider, GenericRemoteProvider, OpenAIEmbeddingProvider, RemoteEmbeddingConfig,
+    RemoteEmbeddingError, RemoteProvider,
 };

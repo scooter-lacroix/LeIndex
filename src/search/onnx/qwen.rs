@@ -80,13 +80,21 @@ impl QwenEmbeddingProvider {
 
             // Load ONNX session
             let session = Session::builder()
-                .map_err(|e| QwenEmbeddingProviderError::OnnxRuntime(format!("Failed to create session builder: {}", e)))?
+                .map_err(|e| {
+                    QwenEmbeddingProviderError::OnnxRuntime(format!(
+                        "Failed to create session builder: {}",
+                        e
+                    ))
+                })?
                 .commit_from_file(&model_path)
-                .map_err(|e| QwenEmbeddingProviderError::OnnxRuntime(format!("Failed to load model: {}", e)))?;
+                .map_err(|e| {
+                    QwenEmbeddingProviderError::OnnxRuntime(format!("Failed to load model: {}", e))
+                })?;
 
             // Load tokenizer
-            let tokenizer = Tokenizer::from_file(tokenizer_path)
-                .map_err(|e| QwenEmbeddingProviderError::Tokenizer(format!("Failed to load tokenizer: {}", e)))?;
+            let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| {
+                QwenEmbeddingProviderError::Tokenizer(format!("Failed to load tokenizer: {}", e))
+            })?;
 
             Ok(Self {
                 model_path,
@@ -130,7 +138,7 @@ impl QwenEmbeddingProvider {
         }
 
         Err(QwenEmbeddingProviderError::ModelNotFound(
-            "Qwen3 model not found in any standard location".to_string()
+            "Qwen3 model not found in any standard location".to_string(),
         ))
     }
 
@@ -167,7 +175,7 @@ impl QwenEmbeddingProvider {
         }
 
         Err(QwenEmbeddingProviderError::ModelNotFound(
-            "Qwen3 tokenizer not found in any standard location".to_string()
+            "Qwen3 tokenizer not found in any standard location".to_string(),
         ))
     }
 
@@ -178,9 +186,9 @@ impl QwenEmbeddingProvider {
         #[cfg(feature = "onnx")]
         {
             // Tokenize the input text
-            let encoding = self.tokenizer
-                .encode(text, true)
-                .map_err(|e| QwenEmbeddingProviderError::Tokenizer(format!("Tokenization failed: {}", e)))?;
+            let encoding = self.tokenizer.encode(text, true).map_err(|e| {
+                QwenEmbeddingProviderError::Tokenizer(format!("Tokenization failed: {}", e))
+            })?;
 
             let ids = encoding.get_ids();
             let attention_mask = encoding.get_attention_mask();
@@ -192,7 +200,7 @@ impl QwenEmbeddingProvider {
 
             if seq_len == 0 {
                 return Err(QwenEmbeddingProviderError::Tokenizer(
-                    "Tokenization produced empty sequence".to_string()
+                    "Tokenization produced empty sequence".to_string(),
                 ));
             }
 
@@ -200,45 +208,78 @@ impl QwenEmbeddingProvider {
             use ort::value::Tensor;
 
             let input_ids_data = ids.iter().map(|&id| id as i64).collect::<Vec<i64>>();
-            let attention_mask_data = attention_mask.iter().map(|&mask| mask as i64).collect::<Vec<i64>>();
+            let attention_mask_data = attention_mask
+                .iter()
+                .map(|&mask| mask as i64)
+                .collect::<Vec<i64>>();
 
             let input_ids_tensor = Tensor::from_array(([batch_size, seq_len], input_ids_data))
-                .map_err(|e| QwenEmbeddingProviderError::OnnxRuntime(format!("Failed to create input_ids tensor: {}", e)))?;
+                .map_err(|e| {
+                    QwenEmbeddingProviderError::OnnxRuntime(format!(
+                        "Failed to create input_ids tensor: {}",
+                        e
+                    ))
+                })?;
 
-            let attention_mask_tensor = Tensor::from_array(([batch_size, seq_len], attention_mask_data))
-                .map_err(|e| QwenEmbeddingProviderError::OnnxRuntime(format!("Failed to create attention_mask tensor: {}", e)))?;
+            let attention_mask_tensor =
+                Tensor::from_array(([batch_size, seq_len], attention_mask_data)).map_err(|e| {
+                    QwenEmbeddingProviderError::OnnxRuntime(format!(
+                        "Failed to create attention_mask tensor: {}",
+                        e
+                    ))
+                })?;
 
             // Run inference
-            let mut session = self.session
-                .lock()
-                .map_err(|e| QwenEmbeddingProviderError::GenerationFailed(format!("Failed to lock session: {}", e)))?;
-            
+            let mut session = self.session.lock().map_err(|e| {
+                QwenEmbeddingProviderError::GenerationFailed(format!(
+                    "Failed to lock session: {}",
+                    e
+                ))
+            })?;
+
             // Get output names before running inference to avoid borrow issues
             let outputs = session.outputs();
             if outputs.is_empty() {
                 return Err(QwenEmbeddingProviderError::GenerationFailed(
-                    "Model has no outputs".to_string()
+                    "Model has no outputs".to_string(),
                 ));
             }
-            let output_name = outputs.iter()
-                .find(|output| output.name().contains("hidden") || output.name().contains("embedding"))
+            let output_name = outputs
+                .iter()
+                .find(|output| {
+                    output.name().contains("hidden") || output.name().contains("embedding")
+                })
                 .map(|output| output.name().to_string())
                 .unwrap_or_else(|| outputs[0].name().to_string());
-            
+
             let outputs = session
                 .run(ort::inputs! {
                     "input_ids" => input_ids_tensor,
                     "attention_mask" => attention_mask_tensor
                 })
-                .map_err(|e| QwenEmbeddingProviderError::GenerationFailed(format!("ONNX inference failed: {}", e)))?;
+                .map_err(|e| {
+                    QwenEmbeddingProviderError::GenerationFailed(format!(
+                        "ONNX inference failed: {}",
+                        e
+                    ))
+                })?;
 
-            let output_tensor = outputs.get(&output_name)
-                .ok_or_else(|| QwenEmbeddingProviderError::GenerationFailed(format!("Output '{}' not found", output_name)))?;
+            let output_tensor = outputs.get(&output_name).ok_or_else(|| {
+                QwenEmbeddingProviderError::GenerationFailed(format!(
+                    "Output '{}' not found",
+                    output_name
+                ))
+            })?;
 
             // Extract the tensor data as a flat Vec<f32>
             let embedding = output_tensor
                 .try_extract_array::<f32>()
-                .map_err(|e| QwenEmbeddingProviderError::GenerationFailed(format!("Failed to extract output tensor: {}", e)))?
+                .map_err(|e| {
+                    QwenEmbeddingProviderError::GenerationFailed(format!(
+                        "Failed to extract output tensor: {}",
+                        e
+                    ))
+                })?
                 .iter()
                 .copied()
                 .collect::<Vec<f32>>();
@@ -260,7 +301,7 @@ impl QwenEmbeddingProvider {
                         return Ok(pooled);
                     }
                 }
-                
+
                 return Err(QwenEmbeddingProviderError::InvalidDimension {
                     expected: self.embedding_dimension,
                     got: embedding.len(),
@@ -280,7 +321,10 @@ impl QwenEmbeddingProvider {
     ///
     /// More efficient than calling `embed` multiple times.
     /// Processes texts in batches for better ONNX Runtime performance.
-    pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, QwenEmbeddingProviderError> {
+    pub fn embed_batch(
+        &self,
+        texts: &[String],
+    ) -> Result<Vec<Vec<f32>>, QwenEmbeddingProviderError> {
         #[cfg(feature = "onnx")]
         {
             if texts.is_empty() {
@@ -289,9 +333,9 @@ impl QwenEmbeddingProvider {
 
             // Batch tokenize all texts - convert to Vec for encode_batch
             let texts_vec: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
-            let encodings = self.tokenizer
-                .encode_batch(texts_vec, true)
-                .map_err(|e| QwenEmbeddingProviderError::Tokenizer(format!("Batch tokenization failed: {}", e)))?;
+            let encodings = self.tokenizer.encode_batch(texts_vec, true).map_err(|e| {
+                QwenEmbeddingProviderError::Tokenizer(format!("Batch tokenization failed: {}", e))
+            })?;
 
             if encodings.is_empty() {
                 return Ok(vec![]);
@@ -308,7 +352,7 @@ impl QwenEmbeddingProvider {
                 let ids = encoding.get_ids();
                 let mask = encoding.get_attention_mask();
                 let offset = i * max_seq_len;
-                
+
                 for (j, &id) in ids.iter().enumerate() {
                     if j < max_seq_len {
                         input_ids_batch[offset + j] = id as i64;
@@ -325,41 +369,73 @@ impl QwenEmbeddingProvider {
             use ort::value::Tensor;
 
             let input_ids_tensor = Tensor::from_array(([batch_size, max_seq_len], input_ids_batch))
-                .map_err(|e| QwenEmbeddingProviderError::OnnxRuntime(format!("Failed to create batch input_ids tensor: {}", e)))?;
+                .map_err(|e| {
+                    QwenEmbeddingProviderError::OnnxRuntime(format!(
+                        "Failed to create batch input_ids tensor: {}",
+                        e
+                    ))
+                })?;
 
-            let attention_mask_tensor = Tensor::from_array(([batch_size, max_seq_len], attention_mask_batch))
-                .map_err(|e| QwenEmbeddingProviderError::OnnxRuntime(format!("Failed to create batch attention_mask tensor: {}", e)))?;
+            let attention_mask_tensor =
+                Tensor::from_array(([batch_size, max_seq_len], attention_mask_batch)).map_err(
+                    |e| {
+                        QwenEmbeddingProviderError::OnnxRuntime(format!(
+                            "Failed to create batch attention_mask tensor: {}",
+                            e
+                        ))
+                    },
+                )?;
 
             // Run batch inference
-            let mut session = self.session
-                .lock()
-                .map_err(|e| QwenEmbeddingProviderError::GenerationFailed(format!("Failed to lock session: {}", e)))?;
-            
+            let mut session = self.session.lock().map_err(|e| {
+                QwenEmbeddingProviderError::GenerationFailed(format!(
+                    "Failed to lock session: {}",
+                    e
+                ))
+            })?;
+
             let outputs = session.outputs();
             if outputs.is_empty() {
                 return Err(QwenEmbeddingProviderError::GenerationFailed(
-                    "Model has no outputs".to_string()
+                    "Model has no outputs".to_string(),
                 ));
             }
-            let output_name = outputs.iter()
-                .find(|output| output.name().contains("hidden") || output.name().contains("embedding"))
+            let output_name = outputs
+                .iter()
+                .find(|output| {
+                    output.name().contains("hidden") || output.name().contains("embedding")
+                })
                 .map(|output| output.name().to_string())
                 .unwrap_or_else(|| outputs[0].name().to_string());
-            
+
             let outputs = session
                 .run(ort::inputs! {
                     "input_ids" => input_ids_tensor,
                     "attention_mask" => attention_mask_tensor
                 })
-                .map_err(|e| QwenEmbeddingProviderError::GenerationFailed(format!("Batch ONNX inference failed: {}", e)))?;
+                .map_err(|e| {
+                    QwenEmbeddingProviderError::GenerationFailed(format!(
+                        "Batch ONNX inference failed: {}",
+                        e
+                    ))
+                })?;
 
             // Extract batch output tensor
-            let output_tensor = outputs.get(&output_name)
-                .ok_or_else(|| QwenEmbeddingProviderError::GenerationFailed(format!("Output '{}' not found", output_name)))?;
+            let output_tensor = outputs.get(&output_name).ok_or_else(|| {
+                QwenEmbeddingProviderError::GenerationFailed(format!(
+                    "Output '{}' not found",
+                    output_name
+                ))
+            })?;
 
             let batch_embeddings = output_tensor
                 .try_extract_array::<f32>()
-                .map_err(|e| QwenEmbeddingProviderError::GenerationFailed(format!("Failed to extract batch output tensor: {}", e)))?
+                .map_err(|e| {
+                    QwenEmbeddingProviderError::GenerationFailed(format!(
+                        "Failed to extract batch output tensor: {}",
+                        e
+                    ))
+                })?
                 .into_owned();
 
             // Convert ndarray to Vec<f32> for processing
@@ -452,7 +528,10 @@ mod tests {
     #[cfg(not(feature = "onnx"))]
     fn test_feature_not_enabled() {
         let result = QwenEmbeddingProvider::new();
-        assert!(matches!(result, Err(QwenEmbeddingProviderError::FeatureNotEnabled)));
+        assert!(matches!(
+            result,
+            Err(QwenEmbeddingProviderError::FeatureNotEnabled)
+        ));
     }
 
     #[test]
@@ -460,7 +539,7 @@ mod tests {
     fn test_embedding_dimension() {
         // Test with real provider if available
         let result = QwenEmbeddingProvider::new();
-        
+
         if result.is_ok() {
             let provider = result.unwrap();
             assert_eq!(provider.dimension(), 1024);
@@ -473,13 +552,16 @@ mod tests {
     fn test_placeholder_embedding_generation() {
         // Test with real provider if available
         let result = QwenEmbeddingProvider::new();
-        
+
         if result.is_ok() {
             let provider = result.unwrap();
             let embedding = provider.embed("test code").unwrap();
             assert_eq!(embedding.len(), 1024);
             // Real embeddings should have non-zero values
-            assert!(!embedding.iter().all(|&x| x == 0.0), "Real embeddings should contain non-zero values");
+            assert!(
+                !embedding.iter().all(|&x| x == 0.0),
+                "Real embeddings should contain non-zero values"
+            );
         }
         // If provider creation fails (e.g., model files not found), skip test gracefully
     }
@@ -489,7 +571,7 @@ mod tests {
     fn test_batch_embedding_generation() {
         // Test with real provider if available
         let result = QwenEmbeddingProvider::new();
-        
+
         if result.is_ok() {
             let provider = result.unwrap();
             let texts = vec!["test 1".to_string(), "test 2".to_string()];
@@ -498,8 +580,14 @@ mod tests {
             assert_eq!(embeddings[0].len(), 1024);
             assert_eq!(embeddings[1].len(), 1024);
             // Real embeddings should have non-zero values
-            assert!(!embeddings[0].iter().all(|&x| x == 0.0), "Real embeddings should contain non-zero values");
-            assert!(!embeddings[1].iter().all(|&x| x == 0.0), "Real embeddings should contain non-zero values");
+            assert!(
+                !embeddings[0].iter().all(|&x| x == 0.0),
+                "Real embeddings should contain non-zero values"
+            );
+            assert!(
+                !embeddings[1].iter().all(|&x| x == 0.0),
+                "Real embeddings should contain non-zero values"
+            );
         }
         // If provider creation fails (e.g., model files not found), skip test gracefully
     }
@@ -509,17 +597,17 @@ mod tests {
     fn test_semantic_embeddings_differ() {
         // Test that different texts produce different embeddings (semantic property)
         let result = QwenEmbeddingProvider::new();
-        
+
         if result.is_ok() {
             let provider = result.unwrap();
             let embedding1 = provider.embed("function that calculates sum").unwrap();
             let embedding2 = provider.embed("variable holding user data").unwrap();
             let embedding3 = provider.embed("function that calculates sum").unwrap(); // same as first
-            
+
             // Embeddings should have correct dimension
             assert_eq!(embedding1.len(), 1024);
             assert_eq!(embedding2.len(), 1024);
-            
+
             // Different texts should produce different embeddings
             let cosine_sim = |a: &[f32], b: &[f32]| -> f32 {
                 let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
@@ -531,16 +619,22 @@ mod tests {
                     0.0
                 }
             };
-            
+
             let sim_12 = cosine_sim(&embedding1, &embedding2);
             let sim_13 = cosine_sim(&embedding1, &embedding3);
-            
+
             // Same text should produce identical embeddings
-            assert!((sim_13 - 1.0).abs() < 0.01, "Same text should produce identical embeddings");
-            
+            assert!(
+                (sim_13 - 1.0).abs() < 0.01,
+                "Same text should produce identical embeddings"
+            );
+
             // Different texts should produce different embeddings
-            assert!(sim_12 < 0.99, "Different texts should produce different embeddings");
-            
+            assert!(
+                sim_12 < 0.99,
+                "Different texts should produce different embeddings"
+            );
+
             // All embeddings should be non-zero
             assert!(!embedding1.iter().all(|&x| x == 0.0));
             assert!(!embedding2.iter().all(|&x| x == 0.0));

@@ -1194,8 +1194,8 @@ impl WorktreeSession {
 
     /// Synchronous merge implementation — performs file I/O.
     /// Separated from the async wrapper to avoid blocking the executor.
-    /// 
-    /// Uses a streaming approach with temp-file renames for atomicity without 
+    ///
+    /// Uses a streaming approach with temp-file renames for atomicity without
     /// full buffering, suitable for projects with very large files.
     fn merge_blocking(session: WorktreeSession) -> Result<()> {
         let WorktreeSession {
@@ -1383,7 +1383,7 @@ impl WorktreeSession {
                 let _ = std::fs::remove_file(original);
             }
         }
-        
+
         // Clean up any remaining backup files
         for (_, backup_path, file_existed) in backups {
             if *file_existed && backup_path.exists() {

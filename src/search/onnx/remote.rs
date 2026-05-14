@@ -201,7 +201,11 @@ impl RemoteEmbeddingProvider for OpenAIEmbeddingProvider {
     async fn embed_batch(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
         let model_name = match &self.config.provider {
             RemoteProvider::OpenAI { model } => model.clone(),
-            _ => return Err(RemoteEmbeddingError::ApiError("Invalid provider".to_string())),
+            _ => {
+                return Err(RemoteEmbeddingError::ApiError(
+                    "Invalid provider".to_string(),
+                ))
+            }
         };
 
         #[derive(Serialize)]
@@ -247,7 +251,9 @@ impl RemoteEmbeddingProvider for OpenAIEmbeddingProvider {
 
         if !status.is_success() {
             if status.as_u16() == 429 {
-                return Err(RemoteEmbeddingError::RateLimitExceeded("OpenAI".to_string()));
+                return Err(RemoteEmbeddingError::RateLimitExceeded(
+                    "OpenAI".to_string(),
+                ));
             }
             return Err(RemoteEmbeddingError::ApiError(format!(
                 "API returned {}: {}",
@@ -258,7 +264,11 @@ impl RemoteEmbeddingProvider for OpenAIEmbeddingProvider {
         let openai_response: OpenAIResponse = serde_json::from_str(&response_text)
             .map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
 
-        Ok(openai_response.data.into_iter().map(|e| e.embedding).collect())
+        Ok(openai_response
+            .data
+            .into_iter()
+            .map(|e| e.embedding)
+            .collect())
     }
 
     fn dimension(&self) -> usize {
@@ -300,7 +310,11 @@ impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
     async fn embed_batch(&self, texts: Vec<&str>) -> Result<Vec<Vec<f32>>, RemoteEmbeddingError> {
         let model_name = match &self.config.provider {
             RemoteProvider::Cohere { model } => model.clone(),
-            _ => return Err(RemoteEmbeddingError::ApiError("Invalid provider".to_string())),
+            _ => {
+                return Err(RemoteEmbeddingError::ApiError(
+                    "Invalid provider".to_string(),
+                ))
+            }
         };
 
         let base_url = self.config.base_url.as_ref().unwrap();
@@ -350,7 +364,9 @@ impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
 
         if !status.is_success() {
             if status.as_u16() == 429 {
-                return Err(RemoteEmbeddingError::RateLimitExceeded("Cohere".to_string()));
+                return Err(RemoteEmbeddingError::RateLimitExceeded(
+                    "Cohere".to_string(),
+                ));
             }
             return Err(RemoteEmbeddingError::ApiError(format!(
                 "API returned {}: {}",
@@ -361,7 +377,11 @@ impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
         let cohere_response: CohereResponse = serde_json::from_str(&response_text)
             .map_err(|e| RemoteEmbeddingError::InvalidResponse(e.to_string()))?;
 
-        Ok(cohere_response.embeddings.into_iter().map(|e| e.embedding).collect())
+        Ok(cohere_response
+            .embeddings
+            .into_iter()
+            .map(|e| e.embedding)
+            .collect())
     }
 
     fn dimension(&self) -> usize {
@@ -387,12 +407,8 @@ impl GenericRemoteProvider {
     /// Create a remote provider from configuration
     pub fn from_config(config: RemoteEmbeddingConfig) -> Result<Self, RemoteEmbeddingError> {
         let provider: Arc<dyn RemoteEmbeddingProvider> = match &config.provider {
-            RemoteProvider::OpenAI { .. } => {
-                Arc::new(OpenAIEmbeddingProvider::new(config)?)
-            }
-            RemoteProvider::Cohere { .. } => {
-                Arc::new(CohereEmbeddingProvider::new(config)?)
-            }
+            RemoteProvider::OpenAI { .. } => Arc::new(OpenAIEmbeddingProvider::new(config)?),
+            RemoteProvider::Cohere { .. } => Arc::new(CohereEmbeddingProvider::new(config)?),
             RemoteProvider::Custom { .. } => {
                 return Err(RemoteEmbeddingError::ApiError(
                     "Custom provider not yet implemented".to_string(),

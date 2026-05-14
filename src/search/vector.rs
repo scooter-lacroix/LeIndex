@@ -437,13 +437,17 @@ impl MmapEmbeddingIndex {
 
         // Verify offset and length tables fit in file before accessing
         // Use checked arithmetic to prevent overflow on malicious node_count
-        let offsets_table_size = n.checked_mul(8)
+        let offsets_table_size = n
+            .checked_mul(8)
             .ok_or_else(|| MmapError::Corrupt("offset table size overflow".to_string()))?;
-        let lengths_table_size = n.checked_mul(4)
+        let lengths_table_size = n
+            .checked_mul(4)
             .ok_or_else(|| MmapError::Corrupt("length table size overflow".to_string()))?;
-        let offsets_end_checked = offsets_start.checked_add(offsets_table_size)
+        let offsets_end_checked = offsets_start
+            .checked_add(offsets_table_size)
             .ok_or_else(|| MmapError::Corrupt("offset table end overflow".to_string()))?;
-        let lengths_end_checked = lengths_start.checked_add(lengths_table_size)
+        let lengths_end_checked = lengths_start
+            .checked_add(lengths_table_size)
             .ok_or_else(|| MmapError::Corrupt("length table end overflow".to_string()))?;
 
         if offsets_end_checked > mmap.len() {
@@ -460,45 +464,55 @@ impl MmapEmbeddingIndex {
                 mmap.len()
             )));
         }
-        
+
         let ids_section_end = {
             let mut max_end: usize = ids_section_offset;
             for i in 0..n {
                 // Use checked arithmetic for slice indices to prevent overflow
-                let offset_idx_start = offsets_start.checked_add(i.checked_mul(8).ok_or_else(|| MmapError::Corrupt("offset index overflow".to_string()))?)
-                    .ok_or_else(|| MmapError::Corrupt("offset start overflow".to_string()))?;
-                let offset_idx_end = offset_idx_start.checked_add(8)
+                let offset_idx_start =
+                    offsets_start
+                        .checked_add(i.checked_mul(8).ok_or_else(|| {
+                            MmapError::Corrupt("offset index overflow".to_string())
+                        })?)
+                        .ok_or_else(|| MmapError::Corrupt("offset start overflow".to_string()))?;
+                let offset_idx_end = offset_idx_start
+                    .checked_add(8)
                     .ok_or_else(|| MmapError::Corrupt("offset end overflow".to_string()))?;
-                let len_idx_start = lengths_start.checked_add(i.checked_mul(4).ok_or_else(|| MmapError::Corrupt("length index overflow".to_string()))?)
-                    .ok_or_else(|| MmapError::Corrupt("length start overflow".to_string()))?;
-                let len_idx_end = len_idx_start.checked_add(4)
+                let len_idx_start =
+                    lengths_start
+                        .checked_add(i.checked_mul(4).ok_or_else(|| {
+                            MmapError::Corrupt("length index overflow".to_string())
+                        })?)
+                        .ok_or_else(|| MmapError::Corrupt("length start overflow".to_string()))?;
+                let len_idx_end = len_idx_start
+                    .checked_add(4)
                     .ok_or_else(|| MmapError::Corrupt("length end overflow".to_string()))?;
 
                 if offset_idx_end > mmap.len() {
                     return Err(MmapError::Corrupt(format!(
                         "offset slice exceeds file size: [{}, {}], file size {}",
-                        offset_idx_start, offset_idx_end, mmap.len()
+                        offset_idx_start,
+                        offset_idx_end,
+                        mmap.len()
                     )));
                 }
                 if len_idx_end > mmap.len() {
                     return Err(MmapError::Corrupt(format!(
                         "length slice exceeds file size: [{}, {}], file size {}",
-                        len_idx_start, len_idx_end, mmap.len()
+                        len_idx_start,
+                        len_idx_end,
+                        mmap.len()
                     )));
                 }
 
-                let off = u64::from_le_bytes(
-                    mmap[offset_idx_start..offset_idx_end]
-                        .try_into()
-                        .unwrap(),
-                ) as usize;
-                let len = u32::from_le_bytes(
-                    mmap[len_idx_start..len_idx_end]
-                        .try_into()
-                        .unwrap(),
-                ) as usize;
+                let off =
+                    u64::from_le_bytes(mmap[offset_idx_start..offset_idx_end].try_into().unwrap())
+                        as usize;
+                let len = u32::from_le_bytes(mmap[len_idx_start..len_idx_end].try_into().unwrap())
+                    as usize;
                 // Use checked addition for ID section end calculation to prevent overflow
-                let section_end = ids_section_offset.checked_add(off)
+                let section_end = ids_section_offset
+                    .checked_add(off)
                     .and_then(|v| v.checked_add(len))
                     .ok_or_else(|| MmapError::Corrupt("ID section end overflow".to_string()))?;
                 max_end = max_end.max(section_end);
@@ -509,7 +523,8 @@ impl MmapEmbeddingIndex {
         // Pad to 4-byte alignment for the embedding matrix
         let embedding_matrix_offset = ids_section_end
             .checked_add(3)
-            .ok_or_else(|| MmapError::Corrupt("embedding matrix offset overflow".to_string()))? & !3;
+            .ok_or_else(|| MmapError::Corrupt("embedding matrix offset overflow".to_string()))?
+            & !3;
 
         // Validate total file size
         let embedding_matrix_size = (dimension as usize)

@@ -23,7 +23,10 @@ pub struct Score {
 
 impl Score {
     /// Create a new score using default code-search weights (legacy method for compatibility)
-    #[deprecated(since = "1.6.4", note = "Use new_hybrid instead for TF-IDF + neural scoring")]
+    #[deprecated(
+        since = "1.6.4",
+        note = "Use new_hybrid instead for TF-IDF + neural scoring"
+    )]
     pub fn new(semantic: f32, structural: f32, text_match: f32) -> Self {
         Self::new_hybrid(semantic, 0.0, structural, text_match)
     }
@@ -141,19 +144,16 @@ impl HybridScorer {
     }
 
     /// Calculate combined score (legacy method for compatibility)
-    #[deprecated(since = "1.6.4", note = "Use score_hybrid instead for TF-IDF + neural scoring")]
+    #[deprecated(
+        since = "1.6.4",
+        note = "Use score_hybrid instead for TF-IDF + neural scoring"
+    )]
     pub fn score(&self, semantic: f32, structural: f32, text_match: f32) -> Score {
         self.score_hybrid(semantic, 0.0, structural, text_match)
     }
 
     /// Calculate combined hybrid score with TF-IDF and neural components
-    pub fn score_hybrid(
-        &self,
-        tfidf: f32,
-        neural: f32,
-        structural: f32,
-        text_match: f32,
-    ) -> Score {
+    pub fn score_hybrid(&self, tfidf: f32, neural: f32, structural: f32, text_match: f32) -> Score {
         let overall = tfidf * self.tfidf_weight
             + neural * self.neural_weight
             + structural * self.structural_weight
@@ -169,13 +169,20 @@ impl HybridScorer {
     }
 
     /// Re-rank results based on query type (legacy method for compatibility)
-    #[deprecated(since = "1.6.4", note = "Use rerank_hybrid instead for TF-IDF + neural reranking")]
+    #[deprecated(
+        since = "1.6.4",
+        note = "Use rerank_hybrid instead for TF-IDF + neural reranking"
+    )]
     pub fn rerank(&self, results: Vec<ScoreResult>, query_type: QueryType) -> Vec<ScoreResult> {
         self.rerank_hybrid(results, query_type)
     }
 
     /// Re-rank hybrid results based on query type
-    pub fn rerank_hybrid(&self, results: Vec<ScoreResult>, query_type: QueryType) -> Vec<ScoreResult> {
+    pub fn rerank_hybrid(
+        &self,
+        results: Vec<ScoreResult>,
+        query_type: QueryType,
+    ) -> Vec<ScoreResult> {
         let mut ranked = results;
         match query_type {
             QueryType::Semantic => {

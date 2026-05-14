@@ -15,11 +15,9 @@ use tracing::info;
 use crate::search::onnx::QwenEmbeddingProvider;
 
 #[cfg(feature = "remote-embeddings")]
-use crate::search::onnx::{
-    GenericRemoteProvider, RemoteEmbeddingConfig, RemoteEmbeddingError,
-};
-#[cfg(feature = "remote-embeddings")]
 use crate::search::onnx::remote::RemoteEmbeddingProvider;
+#[cfg(feature = "remote-embeddings")]
+use crate::search::onnx::{GenericRemoteProvider, RemoteEmbeddingConfig, RemoteEmbeddingError};
 
 use super::leindex::{
     FileStats, IndexStats, ProjectFileScan, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS,
@@ -627,14 +625,12 @@ impl HybridEmbedder {
                 )
             }
             #[cfg(feature = "remote-embeddings")]
-            Self::HybridRemote { remote, .. } => {
-                Some(
-                    remote
-                        .embed(text)
-                        .await
-                        .map_err(|e| format!("Remote embedding failed: {}", e)),
-                )
-            }
+            Self::HybridRemote { remote, .. } => Some(
+                remote
+                    .embed(text)
+                    .await
+                    .map_err(|e| format!("Remote embedding failed: {}", e)),
+            ),
         }
     }
 
@@ -646,13 +642,11 @@ impl HybridEmbedder {
         match self {
             Self::TfIdfOnly(_) => None,
             #[cfg(feature = "onnx")]
-            Self::HybridLocal { neural, .. } => {
-                Some(
-                    neural
-                        .embed(text)
-                        .map_err(|e| format!("ONNX embedding failed: {}", e)),
-                )
-            }
+            Self::HybridLocal { neural, .. } => Some(
+                neural
+                    .embed(text)
+                    .map_err(|e| format!("ONNX embedding failed: {}", e)),
+            ),
             #[cfg(feature = "remote-embeddings")]
             Self::HybridRemote { .. } => {
                 // Remote requires async runtime, this is a blocking wrapper
@@ -665,7 +659,11 @@ impl HybridEmbedder {
     /// Persist the TF-IDF embedder to storage
     ///
     /// Delegates to the inner TfIdfEmbedder's persist_to_storage method
-    pub fn persist_to_storage(&self, project_path: &Path, pdg: &ProgramDependenceGraph) -> Result<()> {
+    pub fn persist_to_storage(
+        &self,
+        project_path: &Path,
+        pdg: &ProgramDependenceGraph,
+    ) -> Result<()> {
         self.tfidf().persist_to_storage(project_path, pdg)
     }
 }
@@ -1193,7 +1191,11 @@ pub(crate) fn index_nodes_with_embedder(
                         match embedder.embed_neural_blocking(&node_content) {
                             Some(Ok(v)) => Some(v),
                             Some(Err(e)) => {
-                                tracing::warn!("Neural embedding failed for node {}: {}", node.id, e);
+                                tracing::warn!(
+                                    "Neural embedding failed for node {}: {}",
+                                    node.id,
+                                    e
+                                );
                                 None
                             }
                             None => None,
@@ -2255,9 +2257,8 @@ mod tests {
     #[test]
     #[cfg(feature = "onnx")]
     fn test_hybrid_embedder_local_creation() {
-        let docs: Vec<(String, String)> = vec![
-            ("test".to_string(), "fn test_function() -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> =
+            vec![("test".to_string(), "fn test_function() -> bool".to_string())];
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         let result = HybridEmbedder::hybrid_local(tfidf_embedder, None);
         // May fail if model not found, but tests the API
@@ -2267,9 +2268,8 @@ mod tests {
     #[test]
     #[cfg(not(feature = "onnx"))]
     fn test_hybrid_embedder_local_feature_not_enabled() {
-        let docs: Vec<(String, String)> = vec![
-            ("test".to_string(), "fn test_function() -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> =
+            vec![("test".to_string(), "fn test_function() -> bool".to_string())];
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         // When ONNX feature is not enabled, only TfIdfOnly is available
         let _ = HybridEmbedder::tfidf_only(tfidf_embedder);
@@ -2279,16 +2279,27 @@ mod tests {
     #[test]
     fn test_hybrid_embedder_tfidf_only_default() {
         let embedder = HybridEmbedder::default();
-        assert!(!embedder.has_neural(), "default embedder should be TF-IDF only");
-        assert_eq!(embedder.tfidf_dimension(), 768, "TF-IDF dimension should be 768");
-        assert!(embedder.neural_dimension().is_none(), "neural dimension should be None");
+        assert!(
+            !embedder.has_neural(),
+            "default embedder should be TF-IDF only"
+        );
+        assert_eq!(
+            embedder.tfidf_dimension(),
+            768,
+            "TF-IDF dimension should be 768"
+        );
+        assert!(
+            embedder.neural_dimension().is_none(),
+            "neural dimension should be None"
+        );
     }
 
     #[test]
     fn test_hybrid_embedder_tfidf_only() {
-        let docs: Vec<(String, String)> = vec![
-            ("auth".to_string(), "fn authenticate_user(token: &str) -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> = vec![(
+            "auth".to_string(),
+            "fn authenticate_user(token: &str) -> bool".to_string(),
+        )];
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         let embedder = HybridEmbedder::tfidf_only(tfidf_embedder);
 
@@ -2297,60 +2308,104 @@ mod tests {
         assert_eq!(embedder.neural_weight(), 0.0);
 
         let weights = embedder.scoring_weights();
-        assert_eq!(weights.tfidf, 0.60, "TF-IDF weight should be 0.60 without neural");
-        assert_eq!(weights.neural, 0.00, "neural weight should be 0.00 without neural");
+        assert_eq!(
+            weights.tfidf, 0.60,
+            "TF-IDF weight should be 0.60 without neural"
+        );
+        assert_eq!(
+            weights.neural, 0.00,
+            "neural weight should be 0.00 without neural"
+        );
     }
 
     #[test]
     #[cfg(feature = "onnx")]
     fn test_hybrid_embedder_local_dimension() {
-        let docs: Vec<(String, String)> = vec![
-            ("test".to_string(), "fn test_function() -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> =
+            vec![("test".to_string(), "fn test_function() -> bool".to_string())];
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         if let Ok(embedder) = HybridEmbedder::hybrid_local(tfidf_embedder, None) {
-            assert!(embedder.has_neural(), "hybrid local embedder should have neural");
-            assert_eq!(embedder.tfidf_dimension(), 768, "TF-IDF dimension should be 768");
-            assert!(embedder.neural_dimension().is_some(), "neural dimension should be Some");
-            assert_eq!(embedder.neural_weight(), 0.40, "neural weight should be 0.40");
+            assert!(
+                embedder.has_neural(),
+                "hybrid local embedder should have neural"
+            );
+            assert_eq!(
+                embedder.tfidf_dimension(),
+                768,
+                "TF-IDF dimension should be 768"
+            );
+            assert!(
+                embedder.neural_dimension().is_some(),
+                "neural dimension should be Some"
+            );
+            assert_eq!(
+                embedder.neural_weight(),
+                0.40,
+                "neural weight should be 0.40"
+            );
 
             let weights = embedder.scoring_weights();
-            assert_eq!(weights.tfidf, 0.30, "TF-IDF weight should be 0.30 with neural");
-            assert_eq!(weights.neural, 0.40, "neural weight should be 0.40 with neural");
+            assert_eq!(
+                weights.tfidf, 0.30,
+                "TF-IDF weight should be 0.30 with neural"
+            );
+            assert_eq!(
+                weights.neural, 0.40,
+                "neural weight should be 0.40 with neural"
+            );
         }
     }
 
     #[test]
     fn test_hybrid_embedder_embed_tfidf() {
-        let docs: Vec<(String, String)> = vec![
-            ("auth".to_string(), "fn authenticate_user(token: &str) -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> = vec![(
+            "auth".to_string(),
+            "fn authenticate_user(token: &str) -> bool".to_string(),
+        )];
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         let embedder = HybridEmbedder::tfidf_only(tfidf_embedder);
 
-        let tokens = vec!["authenticate".to_string(), "user".to_string(), "token".to_string()];
+        let tokens = vec![
+            "authenticate".to_string(),
+            "user".to_string(),
+            "token".to_string(),
+        ];
         let embedding = embedder.embed_tfidf(&tokens);
 
-        assert_eq!(embedding.len(), 768, "TF-IDF embedding dimension should be 768");
+        assert_eq!(
+            embedding.len(),
+            768,
+            "TF-IDF embedding dimension should be 768"
+        );
     }
 
     #[test]
     #[cfg(feature = "onnx")]
     fn test_hybrid_embedder_embed_neural_local() {
-        let docs: Vec<(String, String)> = vec![
-            ("test".to_string(), "fn test_function() -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> =
+            vec![("test".to_string(), "fn test_function() -> bool".to_string())];
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         if let Ok(embedder) = HybridEmbedder::hybrid_local(tfidf_embedder, None) {
-            let tokens = vec!["test".to_string(), "code".to_string(), "embedding".to_string()];
+            let tokens = vec![
+                "test".to_string(),
+                "code".to_string(),
+                "embedding".to_string(),
+            ];
             let tfidf_embedding = embedder.embed_tfidf(&tokens);
 
-            assert_eq!(tfidf_embedding.len(), 768, "TF-IDF embedding dimension should be 768");
+            assert_eq!(
+                tfidf_embedding.len(),
+                768,
+                "TF-IDF embedding dimension should be 768"
+            );
 
             // Test neural embedding generation (blocking version for sync test)
             let text = "test code embedding";
             if let Some(Ok(neural_embedding)) = embedder.embed_neural_blocking(text) {
-                assert!(neural_embedding.len() > 0, "neural embedding should have non-zero dimension");
+                assert!(
+                    neural_embedding.len() > 0,
+                    "neural embedding should have non-zero dimension"
+                );
                 // Real embeddings should have non-zero values
                 let has_nonzero = neural_embedding.iter().any(|&v| v != 0.0);
                 assert!(has_nonzero, "neural embeddings should have non-zero values");
@@ -2365,14 +2420,30 @@ mod tests {
         assert_eq!(weights_with_neural.neural, 0.40);
         assert_eq!(weights_with_neural.structural, 0.15);
         assert_eq!(weights_with_neural.text_match, 0.15);
-        assert!((weights_with_neural.tfidf + weights_with_neural.neural + weights_with_neural.structural + weights_with_neural.text_match - 1.0).abs() < 0.001);
+        assert!(
+            (weights_with_neural.tfidf
+                + weights_with_neural.neural
+                + weights_with_neural.structural
+                + weights_with_neural.text_match
+                - 1.0)
+                .abs()
+                < 0.001
+        );
 
         let weights_without_neural = HybridScoringWeights::without_neural();
         assert_eq!(weights_without_neural.tfidf, 0.60);
         assert_eq!(weights_without_neural.neural, 0.00);
         assert_eq!(weights_without_neural.structural, 0.20);
         assert_eq!(weights_without_neural.text_match, 0.20);
-        assert!((weights_without_neural.tfidf + weights_without_neural.neural + weights_without_neural.structural + weights_without_neural.text_match - 1.0).abs() < 0.001);
+        assert!(
+            (weights_without_neural.tfidf
+                + weights_without_neural.neural
+                + weights_without_neural.structural
+                + weights_without_neural.text_match
+                - 1.0)
+                .abs()
+                < 0.001
+        );
     }
 
     #[test]
@@ -2384,14 +2455,21 @@ mod tests {
             text_match: 0.1,
         };
         custom_weights = custom_weights.normalize();
-        assert!((custom_weights.tfidf + custom_weights.neural + custom_weights.structural + custom_weights.text_match - 1.0).abs() < 0.001);
+        assert!(
+            (custom_weights.tfidf
+                + custom_weights.neural
+                + custom_weights.structural
+                + custom_weights.text_match
+                - 1.0)
+                .abs()
+                < 0.001
+        );
     }
 
     #[test]
     fn test_hybrid_embedder_compare_backends() {
-        let docs: Vec<(String, String)> = vec![
-            ("test".to_string(), "fn test_function() -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> =
+            vec![("test".to_string(), "fn test_function() -> bool".to_string())];
 
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         let tfidf_only = HybridEmbedder::tfidf_only(tfidf_embedder.clone());

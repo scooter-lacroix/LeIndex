@@ -93,18 +93,30 @@ impl QwenReranker {
 
             // Initialize ONNX Runtime session
             let session = Session::builder()
-                .map_err(|e| QwenRerankerError::OnnxRuntime(format!("Failed to create session builder: {}", e)))?
+                .map_err(|e| {
+                    QwenRerankerError::OnnxRuntime(format!(
+                        "Failed to create session builder: {}",
+                        e
+                    ))
+                })?
                 .commit_from_file(&model_path)
-                .map_err(|e| QwenRerankerError::OnnxRuntime(format!("Failed to load model: {}", e)))?;
+                .map_err(|e| {
+                    QwenRerankerError::OnnxRuntime(format!("Failed to load model: {}", e))
+                })?;
 
             // Initialize tokenizer - use the same tokenizer as the embedding model
             let tokenizer_path = model_path
                 .parent()
                 .ok_or_else(|| QwenRerankerError::ModelNotFound("Invalid model path".to_string()))?
                 .join("tokenizer.json");
-            
-            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-                .map_err(|e| QwenRerankerError::Tokenizer(format!("Failed to load tokenizer from {}: {}", tokenizer_path.display(), e)))?;
+
+            let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+                QwenRerankerError::Tokenizer(format!(
+                    "Failed to load tokenizer from {}: {}",
+                    tokenizer_path.display(),
+                    e
+                ))
+            })?;
 
             Ok(Self {
                 session: Arc::new(Mutex::new(session)),
@@ -141,7 +153,7 @@ impl QwenReranker {
         }
 
         Err(QwenRerankerError::ModelNotFound(
-            "Qwen3 reranker model not found in any standard location".to_string()
+            "Qwen3 reranker model not found in any standard location".to_string(),
         ))
     }
 
@@ -170,9 +182,9 @@ impl QwenReranker {
 
             // Batch tokenize the query-document pairs
             let texts_vec: Vec<&str> = query_doc_pairs.iter().map(|s| s.as_str()).collect();
-            let encodings = self.tokenizer
-                .encode_batch(texts_vec, true)
-                .map_err(|e| QwenRerankerError::Tokenizer(format!("Batch tokenization failed: {}", e)))?;
+            let encodings = self.tokenizer.encode_batch(texts_vec, true).map_err(|e| {
+                QwenRerankerError::Tokenizer(format!("Batch tokenization failed: {}", e))
+            })?;
 
             if encodings.is_empty() {
                 return Ok(vec![]);
@@ -189,7 +201,7 @@ impl QwenReranker {
                 let ids = encoding.get_ids();
                 let mask = encoding.get_attention_mask();
                 let offset = i * max_seq_len;
-                
+
                 for (j, &id) in ids.iter().enumerate() {
                     if j < max_seq_len {
                         input_ids_batch[offset + j] = id as i64;
@@ -204,41 +216,65 @@ impl QwenReranker {
 
             // Create batch input tensors
             let input_ids_tensor = Tensor::from_array(([batch_size, max_seq_len], input_ids_batch))
-                .map_err(|e| QwenRerankerError::OnnxRuntime(format!("Failed to create batch input_ids tensor: {}", e)))?;
+                .map_err(|e| {
+                    QwenRerankerError::OnnxRuntime(format!(
+                        "Failed to create batch input_ids tensor: {}",
+                        e
+                    ))
+                })?;
 
-            let attention_mask_tensor = Tensor::from_array(([batch_size, max_seq_len], attention_mask_batch))
-                .map_err(|e| QwenRerankerError::OnnxRuntime(format!("Failed to create batch attention_mask tensor: {}", e)))?;
+            let attention_mask_tensor =
+                Tensor::from_array(([batch_size, max_seq_len], attention_mask_batch)).map_err(
+                    |e| {
+                        QwenRerankerError::OnnxRuntime(format!(
+                            "Failed to create batch attention_mask tensor: {}",
+                            e
+                        ))
+                    },
+                )?;
 
             // Run batch inference
-            let mut session = self.session
-                .lock()
-                .map_err(|e| QwenRerankerError::RerankingFailed(format!("Failed to lock session: {}", e)))?;
-            
+            let mut session = self.session.lock().map_err(|e| {
+                QwenRerankerError::RerankingFailed(format!("Failed to lock session: {}", e))
+            })?;
+
             let outputs = session.outputs();
             if outputs.is_empty() {
                 return Err(QwenRerankerError::RerankingFailed(
-                    "Model has no outputs".to_string()
+                    "Model has no outputs".to_string(),
                 ));
             }
-            let output_name = outputs.iter()
+            let output_name = outputs
+                .iter()
                 .find(|output| output.name().contains("score") || output.name().contains("logits"))
                 .map(|output| output.name().to_string())
                 .unwrap_or_else(|| outputs[0].name().to_string());
-            
+
             let outputs = session
                 .run(ort::inputs! {
                     "input_ids" => input_ids_tensor,
                     "attention_mask" => attention_mask_tensor
                 })
-                .map_err(|e| QwenRerankerError::RerankingFailed(format!("Rerank ONNX inference failed: {}", e)))?;
+                .map_err(|e| {
+                    QwenRerankerError::RerankingFailed(format!(
+                        "Rerank ONNX inference failed: {}",
+                        e
+                    ))
+                })?;
 
             // Extract batch output tensor
-            let output_tensor = outputs.get(&output_name)
-                .ok_or_else(|| QwenRerankerError::RerankingFailed(format!("Output '{}' not found", output_name)))?;
+            let output_tensor = outputs.get(&output_name).ok_or_else(|| {
+                QwenRerankerError::RerankingFailed(format!("Output '{}' not found", output_name))
+            })?;
 
             let batch_scores = output_tensor
                 .try_extract_array::<f32>()
-                .map_err(|e| QwenRerankerError::RerankingFailed(format!("Failed to extract batch output tensor: {}", e)))?
+                .map_err(|e| {
+                    QwenRerankerError::RerankingFailed(format!(
+                        "Failed to extract batch output tensor: {}",
+                        e
+                    ))
+                })?
                 .into_owned();
 
             // Convert ndarray to Vec<f32>
@@ -265,7 +301,11 @@ impl QwenReranker {
             }
 
             // Sort by combined score (descending)
-            reranked_results.sort_by(|a, b| b.combined_score.partial_cmp(&a.combined_score).unwrap_or(std::cmp::Ordering::Equal));
+            reranked_results.sort_by(|a, b| {
+                b.combined_score
+                    .partial_cmp(&a.combined_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
 
             Ok(reranked_results)
         }

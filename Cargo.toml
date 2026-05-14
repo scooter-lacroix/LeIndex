@@ -371,3 +371,11 @@ debug = true
 inherits = "release"
 debug = 2
 strip = false
+
+# ── Workspace ────────────────────────────────────────────────────────────────
+[workspace]
+members = [
+    ".",
+    "tools/memcheck",
+    "tools/xtask",
+]

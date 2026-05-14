@@ -720,8 +720,15 @@ impl SearchEngine {
 
         // Insert TF-IDF embedding into vector index (always present)
         if !node.tfidf_embedding.is_empty() {
-            if let Err(e) = self.vector_index.insert(node_id.clone(), node.tfidf_embedding.clone()) {
-                tracing::warn!("Failed to insert TF-IDF embedding for node {}: {:?}", node_id, e);
+            if let Err(e) = self
+                .vector_index
+                .insert(node_id.clone(), node.tfidf_embedding.clone())
+            {
+                tracing::warn!(
+                    "Failed to insert TF-IDF embedding for node {}: {:?}",
+                    node_id,
+                    e
+                );
             }
         }
 

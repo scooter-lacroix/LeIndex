@@ -822,7 +822,11 @@ impl McpServer {
                         Ok(0) => break, // EOF
                         Ok(_) => {
                             if line.len() > MAX_LINE_LENGTH {
-                                debug!("Line too long (session {}): {} bytes", session_id_clone, line.len());
+                                debug!(
+                                    "Line too long (session {}): {} bytes",
+                                    session_id_clone,
+                                    line.len()
+                                );
                                 break;
                             }
                         }
@@ -852,7 +856,10 @@ impl McpServer {
 
                         // Reject excessively large payloads to prevent OOM
                         if length > MAX_PAYLOAD_SIZE {
-                            debug!("Payload too large (session {}): {} bytes", session_id_clone, length);
+                            debug!(
+                                "Payload too large (session {}): {} bytes",
+                                session_id_clone, length
+                            );
                             break;
                         }
 
@@ -863,7 +870,11 @@ impl McpServer {
                                 Ok(0) => break,
                                 Ok(_) => {
                                     if header.len() > MAX_LINE_LENGTH {
-                                        debug!("Header line too long (session {}): {} bytes", session_id_clone, header.len());
+                                        debug!(
+                                            "Header line too long (session {}): {} bytes",
+                                            session_id_clone,
+                                            header.len()
+                                        );
                                         break;
                                     }
                                     if header.trim().is_empty() {
@@ -996,17 +1007,21 @@ async fn handle_socket_message(
             // Check handshake state for this session (allow initialize and ping before handshake)
             if method_name != "initialize" && method_name != "ping" {
                 let mut sessions = session_handshakes.lock().unwrap();
-                let handshaked = if let Some((handshaked, last_access)) = sessions.get_mut(session_id) {
-                    // Update last access time to prevent eviction
-                    *last_access = Instant::now();
-                    *handshaked
-                } else {
-                    false
-                };
+                let handshaked =
+                    if let Some((handshaked, last_access)) = sessions.get_mut(session_id) {
+                        // Update last access time to prevent eviction
+                        *last_access = Instant::now();
+                        *handshaked
+                    } else {
+                        false
+                    };
                 if !handshaked {
                     let resp = JsonRpcResponse::error(
                         request_id,
-                        super::protocol::JsonRpcError::new(-32600, "Server not initialized. Call 'initialize' first."),
+                        super::protocol::JsonRpcError::new(
+                            -32600,
+                            "Server not initialized. Call 'initialize' first.",
+                        ),
                     );
                     return serde_json::to_string(&resp).ok();
                 }
