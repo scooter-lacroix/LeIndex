@@ -934,6 +934,84 @@ pub const SEARCH_CACHE_MAX_ENTRIES: usize = 256;
 /// Maximum total bytes for the search cache.
 pub const SEARCH_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
+// ============================================================================
+// STAGED RETRIEVAL (Plan 2 — VAL-BPHASE-044, VAL-BPHASE-045)
+// ============================================================================
+
+/// Configuration for staged retrieval: coarse candidate generation followed
+/// by exact rerank.
+///
+/// Staged retrieval reduces exact-stage work by first narrowing the candidate
+/// set with a cheap coarse pass (TF-IDF vector similarity only), then applying
+/// the full hybrid scoring (text + TF-IDF + structural) only to the reduced
+/// candidate set.
+///
+/// **Important**: This is a coarse-prefilter-plus-exact-rerank design. It does
+/// **not** replace the approved INT8/default quality-gated path with
+/// binary-quantization-first search. The existing `search()` method remains
+/// the authoritative default; staged retrieval is an opt-in optimization.
+#[derive(Debug, Clone)]
+pub struct StagedRetrievalConfig {
+    /// Whether staged retrieval is enabled.
+    ///
+    /// When `false`, `search_staged` falls back to the standard `search` path.
+    /// When `true`, the coarse-then-exact pipeline is used.
+    pub enabled: bool,
+
+    /// Multiplier applied to `top_k` to determine the coarse candidate set
+    /// size. For example, with `top_k = 10` and `coarse_multiplier = 5`,
+    /// the coarse phase retrieves `50` candidates, then the exact rerank
+    /// narrows to the best `10`.
+    ///
+    /// Must be >= 1. Higher values improve recall at the cost of more exact
+    /// scoring work.
+    pub coarse_multiplier: usize,
+}
+
+impl Default for StagedRetrievalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            coarse_multiplier: 5,
+        }
+    }
+}
+
+impl StagedRetrievalConfig {
+    /// Create a new config with staged retrieval enabled and the given
+    /// coarse multiplier.
+    pub fn enabled_with_multiplier(coarse_multiplier: usize) -> Self {
+        Self {
+            enabled: true,
+            coarse_multiplier: coarse_multiplier.max(1),
+        }
+    }
+
+    /// Create a disabled config (staged retrieval off).
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Default::default()
+        }
+    }
+}
+
+/// Metrics reported by a staged retrieval pass.
+///
+/// Allows tests and callers to observe that the staged path actually reduced
+/// exact-stage work (VAL-BPHASE-045).
+#[derive(Debug, Clone, Default)]
+pub struct StagedRetrievalMetrics {
+    /// Number of candidates produced by the coarse phase.
+    pub coarse_candidates: usize,
+    /// Number of candidates scored by the exact rerank phase.
+    pub exact_scored: usize,
+    /// Final number of results returned after rerank.
+    pub results_returned: usize,
+    /// Whether staged retrieval was actually used (vs. fallback to standard).
+    pub staged_used: bool,
+}
+
 impl SearchEngine {
     /// Create a new search engine with default 768-dim embeddings
     ///
@@ -1734,6 +1812,257 @@ impl SearchEngine {
         }
 
         Ok(final_results)
+    }
+
+    /// Execute a staged retrieval search: coarse candidate generation followed
+    /// by exact rerank (Plan 2 — VAL-BPHASE-044, VAL-BPHASE-045).
+    ///
+    /// When `config.enabled` is `false`, this falls back to the standard
+    /// [`search`](Self::search) path and reports `staged_used: false`.
+    ///
+    /// When enabled, the pipeline is:
+    /// 1. **Coarse phase**: Retrieve `top_k * coarse_multiplier` candidates
+    ///    using TF-IDF vector similarity only (cheap).
+    /// 2. **Exact rerank phase**: Apply the full hybrid scoring (text +
+    ///    TF-IDF + structural) only to the coarse candidate set, then return
+    ///    the top-K results.
+    ///
+    /// This reduces exact-stage work without replacing the approved
+    /// INT8/default quality-gated path with binary-quantization-first search.
+    /// The staged path is opt-in; the existing `search()` method remains the
+    /// authoritative default.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(results, metrics)` where `metrics` carries observability
+    /// data about the staged pipeline (candidate counts, whether staged was
+    /// used, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Same error conditions as [`search`](Self::search).
+    pub fn search_staged(
+        &mut self,
+        query: SearchQuery,
+        config: &StagedRetrievalConfig,
+    ) -> Result<(Vec<SearchResult>, StagedRetrievalMetrics), Error> {
+        // If staged retrieval is disabled, fall back to the standard path.
+        if !config.enabled {
+            let results = self.search(query)?;
+            let count = results.len();
+            return Ok((
+                results,
+                StagedRetrievalMetrics {
+                    coarse_candidates: 0,
+                    exact_scored: count,
+                    results_returned: count,
+                    staged_used: false,
+                },
+            ));
+        }
+
+        if self.nodes.is_empty() {
+            return Ok((
+                Vec::new(),
+                StagedRetrievalMetrics {
+                    staged_used: true,
+                    ..Default::default()
+                },
+            ));
+        }
+
+        // Check cache first (same cache key logic as search())
+        let cache_key = format!(
+            "staged:{}:{}:{:?}:{}:{}",
+            query.query, query.top_k, query.threshold, query.semantic, config.coarse_multiplier
+        );
+        if let Some(cached) = self.search_cache.get(&cache_key) {
+            let count = cached.len();
+            return Ok((
+                cached.clone(),
+                StagedRetrievalMetrics {
+                    coarse_candidates: 0,
+                    exact_scored: count,
+                    results_returned: count,
+                    staged_used: true,
+                },
+            ));
+        }
+
+        let mut metrics = StagedRetrievalMetrics {
+            staged_used: true,
+            ..Default::default()
+        };
+
+        // ====================================================================
+        // Phase 1: Coarse candidate generation
+        //
+        // Use TF-IDF vector similarity AND text-index lookup to retrieve a
+        // larger candidate set. This is cheap because vector search computes
+        // cosine similarity against the index without text/structural scoring,
+        // and text lookup is O(1) per token via the inverted index.
+        //
+        // The coarse candidate set is the UNION of vector-similarity hits and
+        // text-index hits, ensuring that nodes relevant by either signal are
+        // included for the exact rerank phase.
+        // ====================================================================
+        let coarse_top_k = query.top_k.saturating_mul(config.coarse_multiplier);
+
+        // Start with text-index candidates (always included)
+        let text_query = TextQueryPreprocessed::from_query(&query.query);
+        let mut coarse_candidate_ids: HashSet<String> = HashSet::new();
+        for token in &text_query.query_tokens {
+            if let Some(node_ids) = self.text_index.get(token) {
+                for id in node_ids {
+                    coarse_candidate_ids.insert(id.clone());
+                }
+            }
+        }
+
+        // Add vector-similarity candidates if semantic search is requested
+        let vector_results: HashMap<String, f32> = if query.semantic {
+            if let Some(ref emb) = query.query_embedding {
+                let vec_hits = self.vector_index.search(emb, coarse_top_k);
+                for (id, _) in &vec_hits {
+                    coarse_candidate_ids.insert(id.clone());
+                }
+                vec_hits.into_iter().collect()
+            } else {
+                HashMap::new()
+            }
+        } else {
+            HashMap::new()
+        };
+
+        metrics.coarse_candidates = coarse_candidate_ids.len();
+
+        // If no coarse candidates, return early
+        if coarse_candidate_ids.is_empty() {
+            return Ok((Vec::new(), metrics));
+        }
+
+        // ====================================================================
+        // Phase 2: Exact rerank
+        //
+        // Apply the full hybrid scoring (text + TF-IDF + structural) only to
+        // the reduced candidate set from the coarse phase.
+        // ====================================================================
+
+        let mut results = Vec::new();
+
+        for node in &self.nodes {
+            // Only score nodes that passed the coarse filter
+            if !coarse_candidate_ids.contains(&node.node_id) {
+                continue;
+            }
+
+            let text_score = self.calculate_text_score_optimized(
+                &text_query,
+                &node.node_id,
+                &node.symbol_name,
+                &node.file_path,
+            );
+
+            let tfidf_score = if query.semantic {
+                *vector_results.get(&node.node_id).unwrap_or(&0.0)
+            } else {
+                0.0
+            };
+
+            if text_score == 0.0 && !query.semantic && tfidf_score == 0.0 {
+                continue;
+            }
+
+            let structural_score = (node.complexity as f32 / 100.0).min(1.0);
+            let neural_score = 0.0;
+
+            let score = if let Some(qt) = query.query_type {
+                match qt {
+                    crate::search::ranking::QueryType::Text => self
+                        .scorer
+                        .with_weights_hybrid(0.2, 0.05, 0.05, 0.7)
+                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score),
+                    crate::search::ranking::QueryType::Semantic => self
+                        .scorer
+                        .with_weights_hybrid(0.7, 0.1, 0.1, 0.1)
+                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score),
+                    crate::search::ranking::QueryType::Structural => self
+                        .scorer
+                        .with_weights_hybrid(0.3, 0.0, 0.5, 0.2)
+                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score),
+                }
+            } else {
+                self.scorer
+                    .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
+            };
+
+            if score.overall > 0.0 {
+                if let Some(threshold) = query.threshold {
+                    if score.overall < threshold {
+                        continue;
+                    }
+                }
+
+                let signature = node.signature.clone();
+                results.push(SearchResult {
+                    rank: 0,
+                    node_id: node.node_id.clone(),
+                    file_path: node.file_path.clone(),
+                    symbol_name: node.symbol_name.clone(),
+                    symbol_type: None,
+                    signature,
+                    complexity: node.complexity,
+                    caller_count: None,
+                    dependency_count: None,
+                    language: node.language.clone(),
+                    score,
+                    context: None,
+                    byte_range: node.byte_range,
+                });
+            }
+        }
+
+        metrics.exact_scored = results.len();
+
+        // Sort by score (descending)
+        results.sort_by(|a, b| {
+            b.score
+                .overall
+                .partial_cmp(&a.score.overall)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Take top_k
+        let mut final_results: Vec<SearchResult> =
+            results.into_iter().take(query.top_k).collect();
+        for (i, result) in final_results.iter_mut().enumerate() {
+            result.rank = i + 1;
+        }
+
+        metrics.results_returned = final_results.len();
+
+        // Cache results with byte-budget enforcement
+        {
+            let results_bytes = Self::estimate_search_results_bytes(&final_results);
+            if let Some(existing) = self.search_cache.get(&cache_key) {
+                self.search_cache_bytes = self
+                    .search_cache_bytes
+                    .saturating_sub(Self::estimate_search_results_bytes(existing));
+            }
+            while self.search_cache_bytes + results_bytes > SEARCH_CACHE_MAX_BYTES
+                && !self.search_cache.is_empty()
+            {
+                if let Some((_, evicted)) = self.search_cache.pop_lru() {
+                    self.search_cache_bytes = self
+                        .search_cache_bytes
+                        .saturating_sub(Self::estimate_search_results_bytes(&evicted));
+                }
+            }
+            self.search_cache_bytes += results_bytes;
+            self.search_cache.put(cache_key, final_results.clone());
+        }
+
+        Ok((final_results, metrics))
     }
 
     /// Optimized text score calculation using cached node tokens and pre-computed query data

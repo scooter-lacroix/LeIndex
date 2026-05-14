@@ -30,7 +30,8 @@ pub use query::{ParsedQuery, QueryIntent, QueryParser};
 pub use ranking::{HybridScorer, Score};
 pub use search::{
     CompactNodeMetadata, CompactTokenIndex, ContentPruner, IndexingAdmissionGate, NodeInfo,
-    PruningDecision, SearchEngine, SearchQuery, SearchResult, SemanticEntry, WorkHoister,
+    PruningDecision, SearchEngine, SearchQuery, SearchResult, SemanticEntry, StagedRetrievalConfig,
+    StagedRetrievalMetrics, WorkHoister,
 };
 pub use semantic::SemanticProcessor;
 pub use vector::VectorIndex;

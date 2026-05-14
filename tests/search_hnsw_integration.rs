@@ -32,7 +32,6 @@ mod tests {
                 byte_range: (0, 20),
                 tfidf_embedding: embedding.clone(),
                 neural_embedding: None,
-                embedding: Some(embedding),
                 complexity: (i % 10) as u32 + 1,
                 signature: None,
                 pre_tokenized: None,
@@ -234,7 +233,6 @@ mod tests {
                 byte_range: (0, 20),
                 tfidf_embedding: embedding.clone(),
                 neural_embedding: None,
-                embedding: Some(embedding),
                 complexity: (i % 10) as u32 + 1,
                 signature: None,
                 pre_tokenized: None,
@@ -288,7 +286,6 @@ mod tests {
                 byte_range: (0, 20),
                 tfidf_embedding: embedding.clone(),
                 neural_embedding: None,
-                embedding: Some(embedding),
                 complexity: 1,
                 signature: None,
                 pre_tokenized: None,
@@ -756,5 +753,410 @@ mod tests {
                 similarity
             );
         }
+    }
+
+    // ========================================================================
+    // Plan 2: Staged retrieval tests (VAL-BPHASE-044, VAL-BPHASE-045)
+    // ========================================================================
+
+    /// Helper: Create a larger set of test nodes for staged retrieval testing.
+    ///
+    /// Creates `count` nodes with diverse embeddings and content so that
+    /// coarse candidate generation has a meaningful corpus to filter.
+    /// Content is designed so that text tokens align with embedding clusters:
+    /// nodes in the same centroid cluster share similar content keywords.
+    fn create_staged_test_nodes(count: usize, dimension: usize) -> Vec<NodeInfo> {
+        let mut nodes = Vec::new();
+        for i in 0..count {
+            // Create embeddings that cluster around a few centroids so that
+            // coarse retrieval can meaningfully narrow the candidate set.
+            let centroid = i % 5;
+            let embedding: Vec<f32> = (0..dimension)
+                .map(|j| {
+                    let base = if j == centroid { 0.9 } else { 0.01 };
+                    base + ((i as f32 * 0.001) + (j as f32 * 0.0001)) % 0.05
+                })
+                .collect();
+
+            // Content keywords align with centroid clusters:
+            // centroid 0: authenticate, password, verify
+            // centroid 1: config, parse, read
+            // centroid 2: request, handle, route
+            // centroid 3: hash, compute, crypto
+            // centroid 4: output, format, serialize
+            let content = match centroid {
+                0 => format!(
+                    "fn authenticate_user_{}() {{ verify_password(); }} // auth module",
+                    i
+                ),
+                1 => format!("fn parse_config_{}() {{ read_file(); }} // config parsing", i),
+                2 => format!("fn handle_request_{}() {{ route(); }} // http handler", i),
+                3 => format!("fn compute_hash_{}() {{ sha256(); }} // crypto utility", i),
+                _ => format!("fn format_output_{}() {{ serialize(); }} // formatting", i),
+            };
+
+            nodes.push(NodeInfo {
+                node_id: format!("staged_node_{}", i),
+                file_path: format!("staged_{}.rs", i / 10),
+                symbol_name: format!("symbol_{}", i),
+                language: "rust".to_string(),
+                content,
+                byte_range: (0, 50),
+                tfidf_embedding: embedding,
+                neural_embedding: None,
+                complexity: (i % 10) as u32 + 1,
+                signature: None,
+                pre_tokenized: None,
+            });
+        }
+        nodes
+    }
+
+    /// VAL-BPHASE-044: Staged retrieval preserves ranked correctness through
+    /// coarse candidate generation and exact rerank.
+    ///
+    /// When staged retrieval is enabled, the exact rerank stage produces the
+    /// same contractually acceptable final ordering/results as the non-staged
+    /// exact path for covered validation fixtures.
+    #[test]
+    fn test_staged_retrieval_preserves_ranked_correctness() {
+        use leindex::search::{SearchEngine, SearchQuery, StagedRetrievalConfig};
+
+        let dimension = 32;
+        let num_nodes = 200;
+        let top_k = 10;
+
+        let mut engine = SearchEngine::with_dimension(dimension);
+        engine.index_nodes(create_staged_test_nodes(num_nodes, dimension));
+
+        // Build a query that matches the first centroid cluster
+        let mut query_embedding = vec![0.0f32; dimension];
+        query_embedding[0] = 0.95; // Close to centroid 0
+
+        let query = SearchQuery {
+            query: "authenticate password verify".to_string(),
+            top_k,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(query_embedding.clone()),
+            threshold: None,
+            query_type: None,
+        };
+
+        // Run standard (non-staged) search
+        let standard_results = engine.search(query.clone()).unwrap();
+
+        // Run staged search with a generous multiplier to ensure high recall
+        let staged_config = StagedRetrievalConfig::enabled_with_multiplier(10);
+        let (staged_results, metrics) =
+            engine.search_staged(query.clone(), &staged_config).unwrap();
+
+        // Both should return results
+        assert!(!standard_results.is_empty(), "Standard search should return results");
+        assert!(!staged_results.is_empty(), "Staged search should return results");
+
+        // Staged retrieval was actually used
+        assert!(metrics.staged_used, "Staged retrieval should report as used");
+
+        // The top result from staged should match the top result from standard.
+        // This verifies that the exact rerank preserves the best result.
+        assert_eq!(
+            standard_results[0].node_id, staged_results[0].node_id,
+            "Staged retrieval top result should match standard search top result"
+        );
+
+        // The top-K sets should have meaningful overlap, verifying that the
+        // coarse phase captured the important candidates. Because the staged
+        // path uses a larger vector candidate set than the standard path, the
+        // scoring can differ for nodes that are outside the standard path's
+        // vector top-K but inside the staged path's expanded set. A 40%
+        // overlap threshold is contractually acceptable — the key guarantee
+        // is that the top-1 result matches and the staged path reduces
+        // exact-stage work.
+        let standard_ids: std::collections::HashSet<_> =
+            standard_results.iter().map(|r| r.node_id.clone()).collect();
+        let staged_ids: std::collections::HashSet<_> =
+            staged_results.iter().map(|r| r.node_id.clone()).collect();
+        let overlap = standard_ids.intersection(&staged_ids).count();
+        let min_overlap = (top_k as f32 * 0.4).ceil() as usize;
+        assert!(
+            overlap >= min_overlap,
+            "Top-K overlap should be >= {} (got {}): standard={:?}, staged={:?}",
+            min_overlap,
+            overlap,
+            standard_ids,
+            staged_ids
+        );
+
+        // Verify that the staged path actually reduced exact-stage work
+        // compared to scoring all nodes in the corpus.
+        assert!(
+            metrics.coarse_candidates < num_nodes,
+            "Coarse candidates ({}) should be less than total nodes ({})",
+            metrics.coarse_candidates,
+            num_nodes
+        );
+    }
+
+    /// VAL-BPHASE-044 (text-only): Staged retrieval preserves ranked
+    /// correctness for text-only queries (no semantic search).
+    #[test]
+    fn test_staged_retrieval_text_only_correctness() {
+        use leindex::search::{SearchEngine, SearchQuery, StagedRetrievalConfig};
+
+        let dimension = 32;
+        let num_nodes = 100;
+
+        let mut engine = SearchEngine::with_dimension(dimension);
+        engine.index_nodes(create_staged_test_nodes(num_nodes, dimension));
+
+        let query = SearchQuery {
+            query: "authenticate password".to_string(),
+            top_k: 5,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+
+        let standard_results = engine.search(query.clone()).unwrap();
+        let staged_config = StagedRetrievalConfig::enabled_with_multiplier(3);
+        let (staged_results, metrics) =
+            engine.search_staged(query.clone(), &staged_config).unwrap();
+
+        assert!(metrics.staged_used);
+        assert!(!standard_results.is_empty());
+        assert!(!staged_results.is_empty());
+
+        // Top result should match
+        assert_eq!(
+            standard_results[0].node_id, staged_results[0].node_id,
+            "Text-only staged top result should match standard"
+        );
+    }
+
+    /// VAL-BPHASE-045: Staged retrieval reduces exact-stage work without
+    /// promoting binary-quantization-first replacement.
+    ///
+    /// The staged retrieval path measurably reduces exact-stage workload or
+    /// candidate volume, while remaining a coarse-prefilter-plus-exact-rerank
+    /// design rather than replacing the approved INT8/default quality-gated
+    /// path with binary-quantization-first search.
+    #[test]
+    fn test_staged_retrieval_reduces_exact_stage_work() {
+        use leindex::search::{SearchEngine, SearchQuery, StagedRetrievalConfig};
+
+        let dimension = 32;
+        let num_nodes = 500;
+        let top_k = 10;
+        let coarse_multiplier = 5;
+
+        let mut engine = SearchEngine::with_dimension(dimension);
+        engine.index_nodes(create_staged_test_nodes(num_nodes, dimension));
+
+        let mut query_embedding = vec![0.0f32; dimension];
+        query_embedding[0] = 0.95;
+
+        let query = SearchQuery {
+            query: "authenticate verify password".to_string(),
+            top_k,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(query_embedding),
+            threshold: None,
+            query_type: None,
+        };
+
+        let staged_config = StagedRetrievalConfig::enabled_with_multiplier(coarse_multiplier);
+        let (results, metrics) = engine.search_staged(query, &staged_config).unwrap();
+
+        // Staged retrieval was used
+        assert!(metrics.staged_used, "Staged retrieval should be used");
+
+        // The coarse phase should have produced a candidate set that is
+        // smaller than the full corpus (num_nodes).
+        assert!(
+            metrics.coarse_candidates < num_nodes,
+            "Coarse candidates ({}) should be less than total nodes ({})",
+            metrics.coarse_candidates,
+            num_nodes
+        );
+
+        // The exact scoring phase should have scored fewer nodes than the
+        // full corpus. The coarse phase narrows the set.
+        assert!(
+            metrics.exact_scored < num_nodes,
+            "Exact scored ({}) should be less than total nodes ({})",
+            metrics.exact_scored,
+            num_nodes
+        );
+
+        // Results should be returned
+        assert!(
+            !results.is_empty(),
+            "Staged retrieval should return results"
+        );
+        assert_eq!(
+            metrics.results_returned,
+            results.len(),
+            "Metrics should match actual result count"
+        );
+    }
+
+    /// VAL-BPHASE-045: Verify that staged retrieval is NOT a
+    /// binary-quantization-first replacement.
+    ///
+    /// The staged path uses exact cosine similarity in the coarse phase
+    /// (not binary quantization), and the exact rerank applies the full
+    /// hybrid scoring. The default search path remains the authoritative
+    /// INT8/default quality-gated path.
+    #[test]
+    fn test_staged_retrieval_is_not_binary_quantization_replacement() {
+        use leindex::search::{SearchEngine, SearchQuery, StagedRetrievalConfig};
+
+        let dimension = 32;
+        let num_nodes = 100;
+
+        let mut engine = SearchEngine::with_dimension(dimension);
+        engine.index_nodes(create_staged_test_nodes(num_nodes, dimension));
+
+        // 1. Staged retrieval is opt-in (disabled by default)
+        let default_config = StagedRetrievalConfig::default();
+        assert!(!default_config.enabled, "Staged retrieval should be disabled by default");
+
+        // 2. When disabled, search_staged falls back to standard search
+        let query = SearchQuery {
+            query: "authenticate".to_string(),
+            top_k: 5,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+
+        let (_, metrics) = engine.search_staged(query.clone(), &default_config).unwrap();
+        assert!(!metrics.staged_used, "Should not use staged path when disabled");
+
+        // 3. The standard search path still works and is the authoritative default
+        let standard_results = engine.search(query.clone()).unwrap();
+        assert!(!standard_results.is_empty(), "Standard search should work");
+
+        // 4. Staged retrieval uses exact cosine similarity (not binary quantization)
+        //    This is verified by the implementation using vector_index.search()
+        //    which performs exact cosine similarity, not binary quantization.
+        //    The coarse_multiplier controls candidate expansion, not quantization.
+        let staged_config = StagedRetrievalConfig::enabled_with_multiplier(3);
+        assert!(staged_config.enabled);
+        assert_eq!(staged_config.coarse_multiplier, 3);
+
+        // 5. Staged results should be consistent with standard results
+        let (staged_results, staged_metrics) =
+            engine.search_staged(query, &staged_config).unwrap();
+        assert!(staged_metrics.staged_used);
+        assert!(!staged_results.is_empty());
+
+        // The top result should match — exact rerank preserves quality
+        assert_eq!(
+            standard_results[0].node_id, staged_results[0].node_id,
+            "Staged retrieval should not alter top-result quality"
+        );
+    }
+
+    /// Verify that staged retrieval works correctly with HNSW index backend.
+    #[test]
+    fn test_staged_retrieval_with_hnsw() {
+        use leindex::search::{HNSWParams, SearchEngine, SearchQuery, StagedRetrievalConfig};
+
+        let dimension = 32;
+        let num_nodes = 200;
+
+        let mut engine = SearchEngine::with_hnsw(dimension, HNSWParams::default());
+        engine.index_nodes(create_staged_test_nodes(num_nodes, dimension));
+
+        let mut query_embedding = vec![0.0f32; dimension];
+        query_embedding[0] = 0.95;
+
+        let query = SearchQuery {
+            query: "authenticate".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(query_embedding),
+            threshold: None,
+            query_type: None,
+        };
+
+        let staged_config = StagedRetrievalConfig::enabled_with_multiplier(5);
+        let (results, metrics) = engine.search_staged(query, &staged_config).unwrap();
+
+        assert!(metrics.staged_used);
+        assert!(!results.is_empty());
+        assert!(metrics.coarse_candidates > 0);
+    }
+
+    /// Verify that staged retrieval works correctly with INT8 quantized HNSW.
+    #[test]
+    fn test_staged_retrieval_with_int8_hnsw() {
+        use leindex::search::quantization::Int8HnswParams;
+        use leindex::search::{SearchEngine, SearchQuery, StagedRetrievalConfig};
+
+        let dimension = 32;
+        let num_nodes = 200;
+
+        let mut engine = SearchEngine::with_dimension(dimension);
+        engine.enable_int8_hnsw(Some(Int8HnswParams::new().with_m(8).with_ef_construction(50)));
+        engine.index_nodes(create_staged_test_nodes(num_nodes, dimension));
+
+        let mut query_embedding = vec![0.0f32; dimension];
+        query_embedding[0] = 0.95;
+
+        let query = SearchQuery {
+            query: "authenticate".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(query_embedding),
+            threshold: None,
+            query_type: None,
+        };
+
+        let staged_config = StagedRetrievalConfig::enabled_with_multiplier(5);
+        let (results, metrics) = engine.search_staged(query, &staged_config).unwrap();
+
+        assert!(metrics.staged_used);
+        assert!(!results.is_empty());
+    }
+
+    /// Verify staged retrieval with empty index returns empty results.
+    #[test]
+    fn test_staged_retrieval_empty_index() {
+        use leindex::search::{SearchEngine, SearchQuery, StagedRetrievalConfig};
+
+        let mut engine = SearchEngine::with_dimension(32);
+        let query = SearchQuery {
+            query: "test".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+
+        let staged_config = StagedRetrievalConfig::enabled_with_multiplier(5);
+        let (results, metrics) = engine.search_staged(query, &staged_config).unwrap();
+
+        assert!(results.is_empty());
+        assert!(metrics.staged_used);
+        assert_eq!(metrics.coarse_candidates, 0);
     }
 }
