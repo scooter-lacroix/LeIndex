@@ -67,11 +67,14 @@ pub struct RerankedResult {
 /// Qwen3 Reranker
 ///
 /// Loads and runs Qwen3-Reranker-0.6B model for quality-aware reranking.
+///
+/// Supports the A+ idle-unload lifecycle: `unload()` drops the live ONNX
+/// session and `ensure_session()` lazily recreates it on the next rerank call.
 #[derive(Debug)]
 pub struct QwenReranker {
     /// ONNX Runtime session for reranking inference
     #[cfg(feature = "onnx")]
-    session: Arc<Mutex<Session>>,
+    session: Arc<Mutex<Option<Session>>>,
     model_path: PathBuf,
     /// Tokenizer for processing query and document text
     #[cfg(feature = "onnx")]
@@ -119,11 +122,64 @@ impl QwenReranker {
             })?;
 
             Ok(Self {
-                session: Arc::new(Mutex::new(session)),
+                session: Arc::new(Mutex::new(Some(session))),
                 model_path,
                 tokenizer: Arc::new(tokenizer),
             })
         }
+    }
+
+    /// Unload the ONNX session, releasing resident memory (A+ idle-unload).
+    pub fn unload(&self) {
+        #[cfg(feature = "onnx")]
+        {
+            if let Ok(mut guard) = self.session.lock() {
+                *guard = None;
+            }
+        }
+    }
+
+    /// Check whether the ONNX session is currently loaded.
+    #[must_use]
+    pub fn is_loaded(&self) -> bool {
+        #[cfg(feature = "onnx")]
+        {
+            self.session
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false)
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            false
+        }
+    }
+
+    /// Ensure the ONNX session is loaded, recreating it lazily if needed.
+    #[cfg(feature = "onnx")]
+    fn ensure_session(&self) -> Result<(), QwenRerankerError> {
+        let mut guard = self.session.lock().map_err(|e| {
+            QwenRerankerError::RerankingFailed(format!("Failed to lock session: {}", e))
+        })?;
+
+        if guard.is_some() {
+            return Ok(());
+        }
+
+        let session = Session::builder()
+            .map_err(|e| {
+                QwenRerankerError::OnnxRuntime(format!(
+                    "Failed to create session builder on reload: {}",
+                    e
+                ))
+            })?
+            .commit_from_file(&self.model_path)
+            .map_err(|e| {
+                QwenRerankerError::OnnxRuntime(format!("Failed to reload model: {}", e))
+            })?;
+
+        *guard = Some(session);
+        Ok(())
     }
 
     /// Resolve the reranker model path
@@ -171,6 +227,9 @@ impl QwenReranker {
             if results.is_empty() {
                 return Ok(vec![]);
             }
+
+            // Lazy reload if the session was previously unloaded
+            self.ensure_session()?;
 
             use ort::value::Tensor;
 
@@ -234,8 +293,14 @@ impl QwenReranker {
                 )?;
 
             // Run batch inference
-            let mut session = self.session.lock().map_err(|e| {
+            let mut guard = self.session.lock().map_err(|e| {
                 QwenRerankerError::RerankingFailed(format!("Failed to lock session: {}", e))
+            })?;
+
+            let session = guard.as_mut().ok_or_else(|| {
+                QwenRerankerError::RerankingFailed(
+                    "ONNX session not available after ensure_session".to_string(),
+                )
             })?;
 
             let outputs = session.outputs();

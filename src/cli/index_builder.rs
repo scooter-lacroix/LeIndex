@@ -666,6 +666,35 @@ impl HybridEmbedder {
     ) -> Result<()> {
         self.tfidf().persist_to_storage(project_path, pdg)
     }
+
+    /// Unload the ONNX session if the hybrid backend uses one (A+ idle-unload).
+    ///
+    /// After an indexing batch completes, calling this drops the live ONNX
+    /// session so it does not remain resident indefinitely (VAL-APLUS-024).
+    /// The next embed call lazily recreates the session.
+    pub fn unload_onnx(&self) {
+        match self {
+            Self::TfIdfOnly(_) => {}
+            #[cfg(feature = "onnx")]
+            Self::HybridLocal { neural, .. } => {
+                neural.unload();
+            }
+            #[cfg(feature = "remote-embeddings")]
+            Self::HybridRemote { .. } => {}
+        }
+    }
+
+    /// Check whether the ONNX session is currently loaded.
+    #[must_use]
+    pub fn is_onnx_loaded(&self) -> bool {
+        match self {
+            Self::TfIdfOnly(_) => false,
+            #[cfg(feature = "onnx")]
+            Self::HybridLocal { neural, .. } => neural.is_loaded(),
+            #[cfg(feature = "remote-embeddings")]
+            Self::HybridRemote { .. } => false,
+        }
+    }
 }
 
 impl Default for HybridEmbedder {
@@ -2146,9 +2175,17 @@ mod tests {
         // Extract TfIdfEmbedder from HybridEmbedder to access internal fields
         let tfidf_small = match embedder_small {
             HybridEmbedder::TfIdfOnly(emb) => emb,
+            #[cfg(feature = "onnx")]
+            HybridEmbedder::HybridLocal { tfidf, .. } => tfidf,
+            #[cfg(feature = "remote-embeddings")]
+            HybridEmbedder::HybridRemote { tfidf, .. } => tfidf,
         };
         let tfidf_large = match embedder_large {
             HybridEmbedder::TfIdfOnly(emb) => emb,
+            #[cfg(feature = "onnx")]
+            HybridEmbedder::HybridLocal { tfidf, .. } => tfidf,
+            #[cfg(feature = "remote-embeddings")]
+            HybridEmbedder::HybridRemote { tfidf, .. } => tfidf,
         };
 
         assert_eq!(tfidf_small.vocab, tfidf_large.vocab);
@@ -2183,6 +2220,10 @@ mod tests {
         // Extract TfIdfEmbedder from HybridEmbedder to access dimension
         let tfidf_embedder = match embedder {
             HybridEmbedder::TfIdfOnly(emb) => emb,
+            #[cfg(feature = "onnx")]
+            HybridEmbedder::HybridLocal { tfidf, .. } => tfidf,
+            #[cfg(feature = "remote-embeddings")]
+            HybridEmbedder::HybridRemote { tfidf, .. } => tfidf,
         };
 
         assert_eq!(

@@ -231,9 +231,8 @@ impl LeIndex {
                     language: node.language.clone(),
                     content: node_content,
                     byte_range: node.byte_range,
-                    tfidf_embedding: tfidf_embedding.clone(),
+                    tfidf_embedding,
                     neural_embedding: None, // Will be enhanced if embedder supports it
-                    embedding: Some(tfidf_embedding.clone()), // Backward compatibility
                     complexity: node.complexity,
                     signature,
                     pre_tokenized: Some(tokens),
@@ -645,6 +644,13 @@ impl LeIndex {
         // Update last_indexed timestamp in project_metadata
         if let Err(err) = self.update_last_indexed_timestamp() {
             warn!("Failed to update last_indexed timestamp: {err:#}");
+        }
+
+        // A+ idle-unload: drop the ONNX session after indexing batch so it
+        // does not remain resident indefinitely (VAL-APLUS-024). The session
+        // will be lazily recreated on the next embed/rerank demand.
+        if let Some(embedder) = &self.embedder {
+            embedder.unload_onnx();
         }
 
         info!("Indexing completed in {}ms", self.stats.indexing_time_ms);

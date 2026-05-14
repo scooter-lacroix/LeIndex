@@ -47,12 +47,17 @@ pub enum QwenEmbeddingProviderError {
 ///
 /// Loads and runs Qwen3-Embedding-0.6B model using ONNX Runtime for
 /// cross-language code understanding.
+///
+/// Supports an A+ idle-unload lifecycle: after an indexing batch completes,
+/// calling `unload()` drops the live ONNX session to release resident memory.
+/// The next embed/rerank request lazily recreates the session via
+/// `ensure_session()`.
 #[derive(Debug)]
 pub struct QwenEmbeddingProvider {
     model_path: PathBuf,
     embedding_dimension: usize,
     #[cfg(feature = "onnx")]
-    session: Arc<Mutex<Session>>,
+    session: Arc<Mutex<Option<Session>>>,
     #[cfg(feature = "onnx")]
     tokenizer: Arc<Tokenizer>,
 }
@@ -99,10 +104,78 @@ impl QwenEmbeddingProvider {
             Ok(Self {
                 model_path,
                 embedding_dimension: 1024, // Qwen3-Embedding-0.6B output dimension
-                session: Arc::new(Mutex::new(session)),
+                session: Arc::new(Mutex::new(Some(session))),
                 tokenizer: Arc::new(tokenizer),
             })
         }
+    }
+
+    /// Unload the ONNX session, releasing resident memory.
+    ///
+    /// After calling this, the provider enters an unloaded state. The next
+    /// embed/rerank request will lazily recreate the session via
+    /// `ensure_session()`. This is the A+ idle-unload lifecycle hook
+    /// (VAL-APLUS-022).
+    pub fn unload(&self) {
+        #[cfg(feature = "onnx")]
+        {
+            if let Ok(mut guard) = self.session.lock() {
+                *guard = None;
+            }
+        }
+    }
+
+    /// Check whether the ONNX session is currently loaded.
+    ///
+    /// Returns `true` when a live session exists, `false` after `unload()`.
+    #[must_use]
+    pub fn is_loaded(&self) -> bool {
+        #[cfg(feature = "onnx")]
+        {
+            self.session
+                .lock()
+                .map(|guard| guard.is_some())
+                .unwrap_or(false)
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            false
+        }
+    }
+
+    /// Ensure the ONNX session is loaded, recreating it lazily if needed.
+    ///
+    /// This is the lazy-reload path (VAL-APLUS-023): after `unload()`, the
+    /// next embed call invokes this to recreate the session from the same
+    /// model path.
+    #[cfg(feature = "onnx")]
+    fn ensure_session(&self) -> Result<(), QwenEmbeddingProviderError> {
+        let mut guard = self.session.lock().map_err(|e| {
+            QwenEmbeddingProviderError::GenerationFailed(format!("Failed to lock session: {}", e))
+        })?;
+
+        if guard.is_some() {
+            return Ok(());
+        }
+
+        // Lazily recreate the session
+        let session = Session::builder()
+            .map_err(|e| {
+                QwenEmbeddingProviderError::OnnxRuntime(format!(
+                    "Failed to create session builder on reload: {}",
+                    e
+                ))
+            })?
+            .commit_from_file(&self.model_path)
+            .map_err(|e| {
+                QwenEmbeddingProviderError::OnnxRuntime(format!(
+                    "Failed to reload model: {}",
+                    e
+                ))
+            })?;
+
+        *guard = Some(session);
+        Ok(())
     }
 
     /// Resolve the model path from bundled models or system path
@@ -185,6 +258,9 @@ impl QwenEmbeddingProvider {
     pub fn embed(&self, text: &str) -> Result<Vec<f32>, QwenEmbeddingProviderError> {
         #[cfg(feature = "onnx")]
         {
+            // Lazy reload if the session was previously unloaded (VAL-APLUS-023)
+            self.ensure_session()?;
+
             // Tokenize the input text
             let encoding = self.tokenizer.encode(text, true).map_err(|e| {
                 QwenEmbeddingProviderError::Tokenizer(format!("Tokenization failed: {}", e))
@@ -230,11 +306,17 @@ impl QwenEmbeddingProvider {
                 })?;
 
             // Run inference
-            let mut session = self.session.lock().map_err(|e| {
+            let mut guard = self.session.lock().map_err(|e| {
                 QwenEmbeddingProviderError::GenerationFailed(format!(
                     "Failed to lock session: {}",
                     e
                 ))
+            })?;
+
+            let session = guard.as_mut().ok_or_else(|| {
+                QwenEmbeddingProviderError::GenerationFailed(
+                    "ONNX session not available after ensure_session".to_string(),
+                )
             })?;
 
             // Get output names before running inference to avoid borrow issues
@@ -331,6 +413,9 @@ impl QwenEmbeddingProvider {
                 return Ok(vec![]);
             }
 
+            // Lazy reload if the session was previously unloaded (VAL-APLUS-023)
+            self.ensure_session()?;
+
             // Batch tokenize all texts - convert to Vec for encode_batch
             let texts_vec: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
             let encodings = self.tokenizer.encode_batch(texts_vec, true).map_err(|e| {
@@ -387,11 +472,17 @@ impl QwenEmbeddingProvider {
                 )?;
 
             // Run batch inference
-            let mut session = self.session.lock().map_err(|e| {
+            let mut guard = self.session.lock().map_err(|e| {
                 QwenEmbeddingProviderError::GenerationFailed(format!(
                     "Failed to lock session: {}",
                     e
                 ))
+            })?;
+
+            let session = guard.as_mut().ok_or_else(|| {
+                QwenEmbeddingProviderError::GenerationFailed(
+                    "ONNX session not available after ensure_session".to_string(),
+                )
             })?;
 
             let outputs = session.outputs();
@@ -640,5 +731,62 @@ mod tests {
             assert!(!embedding2.iter().all(|&x| x == 0.0));
         }
         // If provider creation fails, skip test gracefully
+    }
+
+    // ---- A+ ONNX unload lifecycle tests (VAL-APLUS-022, VAL-APLUS-023) ----
+
+    /// VAL-APLUS-022: ONNX provider can unload after work completes.
+    ///
+    /// After an embedding batch, the provider supports explicit unload that
+    /// drops the live session without breaking later use.
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_onnx_unload_drops_session() {
+        let result = QwenEmbeddingProvider::new();
+        if let Ok(provider) = result {
+            // Provider starts loaded
+            assert!(provider.is_loaded(), "provider should start loaded");
+
+            // Unload should succeed
+            provider.unload();
+            assert!(!provider.is_loaded(), "provider should not be loaded after unload");
+        }
+    }
+
+    /// VAL-APLUS-023: ONNX provider lazily reloads on next demand.
+    ///
+    /// After unload, the next embed request recreates the session and still
+    /// returns valid output.
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_onnx_lazy_reload_after_unload() {
+        let result = QwenEmbeddingProvider::new();
+        if let Ok(provider) = result {
+            // Use → unload → use cycle
+            let _first = provider.embed("test input").expect("first embed should work");
+            assert!(provider.is_loaded());
+
+            provider.unload();
+            assert!(!provider.is_loaded(), "should be unloaded after unload()");
+
+            // Lazy reload on next embed
+            let second = provider.embed("test input after reload").expect("embed after unload should trigger lazy reload");
+            assert_eq!(second.len(), provider.dimension());
+            assert!(provider.is_loaded(), "should be reloaded after embed");
+        }
+    }
+
+    /// VAL-APLUS-022 variant: unload is idempotent and safe to call repeatedly.
+    #[test]
+    #[cfg(feature = "onnx")]
+    fn test_onnx_unload_is_idempotent() {
+        let result = QwenEmbeddingProvider::new();
+        if let Ok(provider) = result {
+            provider.unload();
+            assert!(!provider.is_loaded());
+            // Second unload should not panic
+            provider.unload();
+            assert!(!provider.is_loaded());
+        }
     }
 }

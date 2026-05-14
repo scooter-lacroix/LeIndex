@@ -159,6 +159,22 @@ impl McpServer {
         Self::new(config)
     }
 
+    /// Clean up stale sessions that have not been accessed within the timeout.
+    ///
+    /// A+ hotspot cleanup: prevents session-tracking state from growing
+    /// monotonically across long-lived server sessions (VAL-APLUS-025).
+    pub fn cleanup_stale_sessions(&self, max_idle: std::time::Duration) -> usize {
+        let mut sessions = self.session_handshakes.lock().unwrap();
+        let before = sessions.len();
+        sessions.retain(|_, (_, last_access)| last_access.elapsed() < max_idle);
+        before - sessions.len()
+    }
+
+    /// Get the number of active sessions (for diagnostics and testing).
+    pub fn active_session_count(&self) -> usize {
+        self.session_handshakes.lock().unwrap().len()
+    }
+
     /// Run the MCP server
     ///
     /// Starts the axum HTTP server and handles incoming requests.
@@ -1119,6 +1135,114 @@ mod tests {
         assert!(!socket_path.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- A+ MCP session cleanup tests (VAL-APLUS-025, VAL-APLUS-026) ----
+
+    /// VAL-APLUS-025: MCP session handshake handling preserves behavior under
+    /// concurrent sessions. Multiple sessions can be initialized and tracked
+    /// independently without corrupting each other.
+    #[test]
+    fn test_concurrent_session_handshake_isolation() {
+        let registry = Arc::new(ProjectRegistry::new(5));
+        let server = McpServer {
+            config: McpServerConfig::default(),
+            _registry: registry,
+            handshake_complete: Arc::new(AtomicBool::new(false)),
+            session_handshakes: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        // Simulate multiple concurrent session handshakes
+        let (result1, sid1) = handle_initialize_for_test(&server);
+        let (result2, sid2) = handle_initialize_for_test(&server);
+        let (result3, sid3) = handle_initialize_for_test(&server);
+
+        // All should succeed with unique session IDs
+        assert!(result1.get("protocolVersion").is_some());
+        assert!(result2.get("protocolVersion").is_some());
+        assert!(result3.get("protocolVersion").is_some());
+
+        // Session IDs must be unique
+        assert_ne!(sid1, sid2);
+        assert_ne!(sid2, sid3);
+        assert_ne!(sid1, sid3);
+
+        // All sessions should be tracked
+        assert_eq!(server.active_session_count(), 3);
+
+        // All sessions should be marked as handshaked
+        {
+            let sessions = server.session_handshakes.lock().unwrap();
+            assert!(sessions.get(&sid1).unwrap().0);
+            assert!(sessions.get(&sid2).unwrap().0);
+            assert!(sessions.get(&sid3).unwrap().0);
+        }
+    }
+
+    /// VAL-APLUS-026: MCP session tracking remains isolated per session.
+    /// Operations on one session do not corrupt or block unrelated session state.
+    #[test]
+    fn test_session_isolation_per_session() {
+        let registry = Arc::new(ProjectRegistry::new(5));
+        let server = McpServer {
+            config: McpServerConfig::default(),
+            _registry: registry,
+            handshake_complete: Arc::new(AtomicBool::new(false)),
+            session_handshakes: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let (_, sid1) = handle_initialize_for_test(&server);
+        let (_, sid2) = handle_initialize_for_test(&server);
+
+        // Remove session 1
+        {
+            let mut sessions = server.session_handshakes.lock().unwrap();
+            sessions.remove(&sid1);
+        }
+
+        // Session 2 should still be valid
+        {
+            let sessions = server.session_handshakes.lock().unwrap();
+            assert!(sessions.get(&sid2).is_some());
+            assert!(sessions.get(&sid2).unwrap().0);
+        }
+
+        assert_eq!(server.active_session_count(), 1);
+    }
+
+    /// VAL-APLUS-025 variant: stale session cleanup removes only expired sessions.
+    #[test]
+    fn test_stale_session_cleanup() {
+        let registry = Arc::new(ProjectRegistry::new(5));
+        let server = McpServer {
+            config: McpServerConfig::default(),
+            _registry: registry,
+            handshake_complete: Arc::new(AtomicBool::new(false)),
+            session_handshakes: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        // Create a session
+        let (_, sid) = handle_initialize_for_test(&server);
+        assert_eq!(server.active_session_count(), 1);
+
+        // Manually age the session's last_access time to simulate staleness
+        {
+            let mut sessions = server.session_handshakes.lock().unwrap();
+            if let Some((_, last_access)) = sessions.get_mut(&sid) {
+                *last_access = Instant::now() - std::time::Duration::from_secs(600);
+            }
+        }
+
+        // Cleanup with a 60-second idle timeout should remove the stale session
+        let removed = server.cleanup_stale_sessions(std::time::Duration::from_secs(60));
+        assert_eq!(removed, 1);
+        assert_eq!(server.active_session_count(), 0);
+    }
+
+    /// Helper: simulate an initialize call and return (result, session_id).
+    fn handle_initialize_for_test(server: &McpServer) -> (Value, String) {
+        let (result, sid) = handle_initialize(server);
+        (result, sid.unwrap())
     }
 }
 
