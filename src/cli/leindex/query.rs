@@ -238,6 +238,13 @@ impl LeIndex {
     /// - Short symbol name (`"health_check"`)
     /// - Qualified name (`"ClassName.method_name"`)
     /// - `"file_path:symbol_name"` partial IDs
+    /// - Fuzzy/partial name match (e.g., `"event_loop"` matches `run_event_loop`)
+    ///
+    /// When the initial lookup fails, performs an on-demand expansion scan
+    /// of the PDG to discover nodes whose names contain the query as a
+    /// substring. This ensures event-loop-heavy files (e.g., winit
+    /// entrypoints) are discoverable even when the exact symbol name
+    /// differs from the query.
     ///
     /// Populates the SearchResult with real metadata from the PDG node.
     pub fn expand_node_context(
@@ -255,10 +262,12 @@ impl LeIndex {
         // 1. Exact ID match (full "file_path:qualified_name")
         // 2. By name (short display name like "health_check")
         // 3. Case-insensitive substring match on name or id
+        // 4. On-demand fuzzy scan: find nodes whose name contains the query
         let resolved_nid = pdg
             .find_by_symbol(node_id)
             .or_else(|| pdg.find_by_name(node_id))
-            .or_else(|| pdg.find_by_name_in_file(node_id, None));
+            .or_else(|| pdg.find_by_name_in_file(node_id, None))
+            .or_else(|| fuzzy_find_node(pdg, node_id));
 
         let (result_node_id, file_path, symbol_name, language, byte_range, complexity) =
             if let Some(nid) = resolved_nid {
@@ -348,13 +357,15 @@ impl LeIndex {
         let traversal = GravityTraversal::with_config(config);
 
         // Map SearchResult entries to PDG node IDs for the traversal call.
-        // Try exact ID match first, then fall back to name-based lookup.
+        // Try exact ID match first, then fall back to name-based lookup,
+        // then fuzzy substring match for event-loop-heavy files.
         let entry_points: Vec<_> = results
             .iter()
             .filter_map(|r| {
                 pdg.find_by_symbol(&r.node_id)
                     .or_else(|| pdg.find_by_name(&r.node_id))
                     .or_else(|| pdg.find_by_name(&r.symbol_name))
+                    .or_else(|| fuzzy_find_node(pdg, &r.symbol_name))
             })
             .collect();
 
@@ -416,4 +427,69 @@ fn generate_deterministic_embedding(symbol_name: &str) -> Vec<f32> {
     }
 
     embedding
+}
+
+/// On-demand fuzzy node discovery for event-loop-heavy files.
+///
+/// When exact lookup fails, this function scans the PDG for nodes whose
+/// name or ID contains the query as a case-insensitive substring. This
+/// ensures that winit event-loop entrypoints (e.g., `run_event_loop`,
+/// `EventLoop::run`, `main`) are discoverable even when the user's query
+/// doesn't exactly match the symbol name.
+///
+/// Returns the best-matching NodeId, preferring:
+/// 1. Nodes whose name contains the query as a substring
+/// 2. Nodes whose ID contains the query as a substring
+/// 3. Higher-complexity nodes (event loops tend to be complex)
+fn fuzzy_find_node(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    query: &str,
+) -> Option<crate::graph::pdg::NodeId> {
+    let query_lower = query.to_lowercase();
+
+    // Keywords that suggest event-loop or entry-point patterns.
+    // If the query contains any of these, also search for common aliases.
+    let event_loop_aliases: &[&str] = &["run", "main", "start", "event_loop", "event loop", "loop"];
+
+    let mut best_match: Option<(crate::graph::pdg::NodeId, usize)> = None;
+
+    for node_id in pdg.node_indices() {
+        if let Some(node) = pdg.get_node(node_id) {
+            let name_lower = node.name.to_lowercase();
+            let id_lower = node.id.to_lowercase();
+
+            // Check if the query is a substring of the name or ID
+            let score = if name_lower.contains(&query_lower) {
+                // Prefer name matches with higher complexity
+                100 + node.complexity.min(50) as usize
+            } else if id_lower.contains(&query_lower) {
+                50 + node.complexity.min(50) as usize
+            } else {
+                // Check if any event-loop alias matches and the node looks
+                // like an entry point (high complexity, function type)
+                let is_event_loop_candidate = event_loop_aliases
+                    .iter()
+                    .any(|alias| query_lower.contains(alias));
+                let name_matches_alias = event_loop_aliases
+                    .iter()
+                    .any(|alias| name_lower.contains(alias));
+
+                if is_event_loop_candidate && name_matches_alias {
+                    25 + node.complexity.min(50) as usize
+                } else {
+                    continue;
+                }
+            };
+
+            match &best_match {
+                None => best_match = Some((node_id, score)),
+                Some((_, best_score)) if score > *best_score => {
+                    best_match = Some((node_id, score));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    best_match.map(|(nid, _)| nid)
 }

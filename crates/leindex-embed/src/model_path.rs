@@ -41,10 +41,7 @@ impl ModelResolver {
         if let Ok(path) = std::env::var("LEINDEX_MODEL_PATH") {
             let model_path = PathBuf::from(path).join(&model_filename);
             if model_path.exists() {
-                tracing::debug!(
-                    "model resolved via env override: {}",
-                    model_path.display()
-                );
+                tracing::debug!("model resolved via env override: {}", model_path.display());
                 return Ok(model_path);
             }
         }
@@ -55,10 +52,7 @@ impl ModelResolver {
                 let bundled_dir = parent.join("models");
                 let model_path = bundled_dir.join(&model_filename);
                 if model_path.exists() {
-                    tracing::debug!(
-                        "model resolved via bundled path: {}",
-                        model_path.display()
-                    );
+                    tracing::debug!("model resolved via bundled path: {}", model_path.display());
                     return Ok(model_path);
                 }
             }
@@ -69,10 +63,7 @@ impl ModelResolver {
             let user_models = home.join(".leindex").join("models");
             let model_path = user_models.join(&model_filename);
             if model_path.exists() {
-                tracing::debug!(
-                    "model resolved via user cache: {}",
-                    model_path.display()
-                );
+                tracing::debug!("model resolved via user cache: {}", model_path.display());
                 return Ok(model_path);
             }
         }
@@ -129,12 +120,13 @@ impl ModelResolver {
     ///
     /// Returns one of: "env_override", "bundled", "user_cache".
     pub fn source_for_path(path: &PathBuf) -> &'static str {
-        if std::env::var("LEINDEX_MODEL_PATH").is_ok() {
-            // If the env var is set and the path matches, it's from env override
-            if let Ok(env_path) = std::env::var("LEINDEX_MODEL_PATH") {
-                if path.starts_with(PathBuf::from(env_path)) {
-                    return "env_override";
-                }
+        // Check env override first — if the env var is set and the path is
+        // rooted under it, report as env_override regardless of whether the
+        // file also happens to live near the binary.
+        if let Ok(env_path) = std::env::var("LEINDEX_MODEL_PATH") {
+            let env_dir = PathBuf::from(env_path);
+            if path.starts_with(&env_dir) {
+                return "env_override";
             }
         }
 
@@ -173,10 +165,7 @@ mod tests {
 
         let result = ModelResolver::resolve_tokenizer("nonexistent");
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .message
-            .contains("tokenizer not found"));
+        assert!(result.unwrap_err().message.contains("tokenizer not found"));
     }
 
     #[test]

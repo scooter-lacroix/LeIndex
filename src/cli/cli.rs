@@ -366,12 +366,20 @@ impl Cli {
     }
 }
 
-/// Initialize logging implementation
+/// Initialize logging implementation.
+///
+/// In non-verbose mode the default level is WARN so that routine `info!()`
+/// chatter (storage paths, cache hits, PDG node counts, etc.) stays off the
+/// terminal.  Only warnings and errors reach stderr unless `--verbose` is
+/// passed, in which case DEBUG-level output is enabled.
+///
+/// This keeps CLI output clean and token-efficient for LLM consumers while
+/// preserving full diagnostics behind the `--verbose` flag.
 fn init_logging_impl(verbose: bool) {
     let level = if verbose {
         tracing::Level::DEBUG
     } else {
-        tracing::Level::INFO
+        tracing::Level::WARN
     };
 
     let subscriber = tracing_subscriber::fmt()
@@ -1110,11 +1118,6 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         .set(Arc::new(server))
         .map_err(|_| anyhow::anyhow!("Server instance already initialized"))?;
 
-    eprintln!("[INFO] LeIndex MCP stdio server starting");
-    eprintln!("[INFO] Project: {}", canonical_path.display());
-    eprintln!("[INFO] Reading JSON-RPC from stdin, writing to stdout");
-    eprintln!("[INFO] Press Ctrl+C to stop\n");
-
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     let mut reader = io::BufReader::new(stdin.lock());
@@ -1125,7 +1128,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         let bytes = match reader.read_line(&mut line) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("[ERROR] Failed to read stdin: {}", e);
+                tracing::debug!("MCP stdio: failed to read stdin: {}", e);
                 continue;
             }
         };
@@ -1146,7 +1149,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
             let length: usize = match len_str.parse() {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("[ERROR] Invalid Content-Length header: {}", e);
+                    tracing::debug!("MCP stdio: invalid Content-Length header: {}", e);
                     continue;
                 }
             };
@@ -1164,7 +1167,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 
             let mut buf = vec![0u8; length];
             if let Err(e) = reader.read_exact(&mut buf) {
-                eprintln!("[ERROR] Failed to read JSON payload: {}", e);
+                tracing::debug!("MCP stdio: failed to read JSON payload: {}", e);
                 break;
             }
 
@@ -1198,14 +1201,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 
         // Handle based on message type
         match message {
-            JsonRpcMessage::Notification(notification) => {
-                eprintln!(
-                    "[INFO] Received notification: {} (type: {})",
-                    notification.method,
-                    notification.notification_type()
-                );
-                continue;
-            }
+            JsonRpcMessage::Notification(_notification) => continue,
             JsonRpcMessage::Request(request) => {
                 let request_id = request.id.clone().unwrap_or(serde_json::Value::Null);
 
@@ -1239,11 +1235,11 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
                     )
                     .is_err()
                     {
-                        eprintln!("[ERROR] Failed to write to stdout");
+                        tracing::debug!("MCP stdio: failed to write to stdout");
                         break;
                     }
                 } else if writeln!(stdout, "{}", response_json).is_err() {
-                    eprintln!("[ERROR] Failed to write to stdout");
+                    tracing::debug!("MCP stdio: failed to write to stdout");
                     break;
                 }
                 let _ = stdout.flush();
@@ -1367,7 +1363,7 @@ fn print_tool_help(handler: &ToolHandler) {
     let kebab_short = short_name.replace('_', "-");
     let kebab_full = normalized.replace('_', "-");
 
-    println!("{}", handler.name());
+    println!("{}", format_tool_title(handler.title()));
     println!("{}", handler.description());
     println!();
     println!("Aliases:");
@@ -1451,6 +1447,17 @@ fn print_tool_help(handler: &ToolHandler) {
 
 fn normalize_tool_name(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn format_tool_title(title: &str) -> String {
+    if let Some(rest) = title
+        .strip_prefix("LeIndex [")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        format!("LEINDEX [{}]", rest)
+    } else {
+        title.to_string()
+    }
 }
 
 fn find_tool_handler(name: &str) -> Option<ToolHandler> {
