@@ -108,6 +108,8 @@ curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/inst
 bash install-leindex.sh
 ```
 
+The install script builds and installs both `leindex` and `leindex-embed` (ONNX worker), plus bundled model assets.
+
 **Via PyPI bootstrap wrapper:**
 
 ```bash
@@ -125,6 +127,8 @@ automatic setup is supported on the current platform.
 ```bash
 npm install -g @leindex/mcp
 ```
+
+The npm package downloads a platform-specific bundle containing the main binary, the ONNX worker (`leindex-embed`), and model assets.
 
 **Environment Variables:**
 
@@ -249,6 +253,8 @@ git clone https://github.com/scooter-lacroix/LeIndex.git
 cd leindex
 cargo build --release
 ```
+
+This produces both `target/release/leindex` (main binary) and `target/release/leindex-embed` (ONNX worker). The worker must be discoverable alongside the main binary or in `PATH` for local ONNX inference.
 
 **Feature flags:** Use `--features` to customize the build:
 - `full` (default) — Full library plus the `leindex` CLI binary
@@ -501,6 +507,17 @@ leindex dashboard
 
 ---
 
+## Memory Measurement and Profiling
+
+Plan 0 adds a lightweight memory measurement foundation so you can track LeIndex's RSS behavior without wiring up custom scripts.
+
+- `cargo xtask memcheck` builds the release binary when needed, runs the canonical `small_repo` workload, compares the results against committed baselines and budget ceilings, and exits non-zero on regressions.
+- The Linux CI workflow in `.github/workflows/memory-budget.yml` runs the same memcheck path and uploads the report artifact so baseline and budget enforcement stay consistent in automation.
+- `--memory-report PATH` and `LEINDEX_MEMORY_REPORT=PATH` opt into a compact shutdown JSON with peak RSS and phase summaries; they stay off by default for normal runs.
+- Build with `--features memprof` to enable the optional heap profiling surface for deeper memory investigations when the lightweight report is not enough.
+
+---
+
 ## CLI Reference
 
 ```bash
@@ -522,7 +539,7 @@ LeIndex supports multiple embedding backends for semantic search:
 
 ### Local ONNX Models (default)
 
-Build with the default features to use local Qwen3 embedding models via ONNX Runtime:
+Build with the default features to use local Qwen3 embedding models via ONNX Runtime. LeIndex uses a **worker-sidecar architecture** — the main `leindex` process delegates ONNX inference to a separate `leindex-embed` worker process, keeping the main daemon lightweight.
 
 ```bash
 cargo build --release
@@ -533,6 +550,9 @@ Local models provide:
 - No API costs
 - Zero network latency
 - Support for Qwen3-Embedding-0.6B and optional Qwen3-Reranker-0.6B
+- Worker-sidecar ONNX inference keeps main process memory low
+
+The worker binary (`leindex-embed`) is built alongside the main binary and is discovered automatically at runtime. Bundled model assets are shipped in the `models/` directory next to the binaries.
 
 ### Remote Cloud Providers
 

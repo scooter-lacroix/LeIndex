@@ -38,7 +38,10 @@ delete process.env.LEINDEX_BINARY_CHANNEL;
 delete process.env.LEINDEX_BINARY_VERSION;
 assert.strictEqual(installer.getRequestedRelease(), 'latest', 'Default selector should be latest');
 assert.strictEqual(installer.getAssetName('1.5.2', 'linux', 'x86_64'), 'leindex-1.5.2-linux-x86_64');
-console.log('  ✓ Installer resolves latest by default\n');
+assert.strictEqual(installer.getBundleAssetName('1.6.6', 'linux', 'x86_64'), 'leindex-1.6.6-linux-x86_64.tar.gz');
+assert.strictEqual(installer.getBundleAssetName('1.6.6', 'windows', 'x86_64'), 'leindex-1.6.6-windows-x86_64.zip');
+assert.strictEqual(installer.getBundleAssetName('1.6.6', 'macos', 'aarch64'), 'leindex-1.6.6-macos-aarch64.tar.gz');
+console.log('  ✓ Installer resolves latest by default and knows bundle asset names\n');
 
 // Test 4: Checksum parsing and verification helpers
 console.log('Test 4: Checksum verification helpers');
@@ -54,8 +57,10 @@ console.log('  ✓ Checksum helpers are valid\n');
 // Test 5: JS wrapper uses direct argv execution rather than shell interpolation
 console.log('Test 5: JS wrapper safety');
 assert.strictEqual(typeof mcp.exec, 'function', 'Wrapper should export exec');
+assert.strictEqual(typeof mcp.getWorkerBinaryPath, 'function', 'Wrapper should export getWorkerBinaryPath');
+assert.strictEqual(typeof mcp.getModelsPath, 'function', 'Wrapper should export getModelsPath');
 assert(!fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8').includes("args.join(' ')"), 'Wrapper should not shell-interpolate args');
-console.log('  ✓ Wrapper executes with argv arrays\n');
+console.log('  ✓ Wrapper executes with argv arrays and exposes worker/model paths\n');
 
 // Test 6: Binary check (if installed)
 console.log('Test 6: Binary installation');

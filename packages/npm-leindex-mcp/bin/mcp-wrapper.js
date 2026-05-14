@@ -5,6 +5,7 @@
  * 
  * Launches the LeIndex binary in MCP stdio mode.
  * This wrapper is used by MCP clients to communicate with LeIndex.
+ * Sets up the environment so the ONNX worker can discover bundled model assets.
  */
 
 const { spawn } = require('child_process');
@@ -12,6 +13,7 @@ const path = require('path');
 const fs = require('fs');
 
 const BIN_DIR = path.join(__dirname);
+const MODELS_DIR = path.join(__dirname, '..', 'models');
 const binaryName = process.platform === 'win32' ? 'leindex.exe' : 'leindex';
 
 // Allow override with environment variable for testing/development
@@ -28,9 +30,18 @@ if (!fs.existsSync(binaryPath)) {
   process.exit(1);
 }
 
+// Prepare environment for worker discovery
+const env = Object.assign({}, process.env);
+
+// Point the worker to bundled models if available and not already overridden
+if (fs.existsSync(MODELS_DIR) && !env.LEINDEX_MODEL_PATH) {
+  env.LEINDEX_MODEL_PATH = MODELS_DIR;
+}
+
 // Launch LeIndex in MCP mode
 const leindex = spawn(binaryPath, ['mcp', '--stdio'], {
-  stdio: ['pipe', 'pipe', 'pipe']
+  stdio: ['pipe', 'pipe', 'pipe'],
+  env: env
 });
 
 // Forward stdin to LeIndex

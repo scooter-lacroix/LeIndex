@@ -639,8 +639,9 @@ install_leindex() {
         exit 1
     fi
 
-    # Install binary
+    # Install main binary
     local binary="target/release/$PROJECT_SLUG"
+    local worker_binary="target/release/leindex-embed"
     if [[ -f "$binary" ]]; then
         log_info "Installing to cargo bin: $INSTALL_BIN_DIR"
         echo ""
@@ -663,6 +664,21 @@ install_leindex() {
         exit 1
     fi
 
+    # Install ONNX worker binary
+    if [[ -f "$worker_binary" ]]; then
+        local worker_install_path="${INSTALL_BIN_DIR}/leindex-embed"
+        if cp "$worker_binary" "$worker_install_path" && chmod +x "$worker_install_path"; then
+            log_success "Worker binary installed to: $worker_install_path"
+        else
+            log_warn "Failed to install worker binary to $worker_install_path"
+        fi
+    else
+        log_warn "Worker binary not found (leindex-embed); ONNX inference will use in-process fallback"
+    fi
+
+    # Install bundled model assets
+    install_model_assets "$repo_dir"
+
     # Install dashboard assets for packaged installs and convenience.
     install_dashboard_assets "$repo_dir"
 
@@ -673,6 +689,41 @@ install_leindex() {
         rm -rf "$repo_dir"
         log_success "Cleanup complete"
     fi
+}
+
+install_model_assets() {
+    local repo_dir="$1"
+    local source_dir="$repo_dir/models"
+
+    if [[ ! -d "$source_dir" ]]; then
+        log_warn "Model bundle directory not found; skipping model asset install"
+        return 0
+    fi
+
+    # Check for required model files
+    if [[ ! -f "$source_dir/qwen3-embed-0.6b.onnx" ]]; then
+        log_warn "ONNX model file not found in bundle; skipping model asset install"
+        return 0
+    fi
+
+    local model_dir="${LEINDEX_HOME}/models"
+    log_info "Installing model assets to $model_dir"
+    mkdir -p "$model_dir"
+
+    # Copy model assets atomically
+    local temp_model_dir="${model_dir}.tmp"
+    rm -rf "$temp_model_dir"
+    mkdir -p "$temp_model_dir"
+
+    for asset in qwen3-embed-0.6b.onnx tokenizer.json config.json checksums.sha256 LICENSE; do
+        if [[ -f "$source_dir/$asset" ]]; then
+            cp "$source_dir/$asset" "$temp_model_dir/"
+        fi
+    done
+
+    rm -rf "$model_dir"
+    mv "$temp_model_dir" "$model_dir"
+    log_success "Model assets installed to $model_dir"
 }
 
 install_dashboard_assets() {
