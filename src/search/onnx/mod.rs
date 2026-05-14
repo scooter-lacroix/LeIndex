@@ -33,7 +33,7 @@ pub mod remote;
 pub use chunking::{ChunkConfig, CrossLanguageChunker, SemanticChunk};
 
 #[cfg(feature = "onnx")]
-pub use client::EmbeddingClient;
+pub use client::{ClientError, EmbedResult, EmbeddingClient};
 
 #[cfg(feature = "remote-embeddings")]
 pub use remote::{

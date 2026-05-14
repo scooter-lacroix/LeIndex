@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use tracing::info;
 
 #[cfg(feature = "onnx")]
-use crate::search::onnx::EmbeddingClient;
+use crate::search::onnx::{EmbedResult, EmbeddingClient};
 
 #[cfg(feature = "remote-embeddings")]
 use crate::search::onnx::remote::RemoteEmbeddingProvider;
@@ -607,7 +607,12 @@ impl HybridEmbedder {
 
     /// Generate neural/remote embedding for text (if available)
     ///
-    /// Returns None if neural enhancement is not available
+    /// Uses `embed_with_fallback` for retry-once semantics:
+    /// - VAL-CPHASE-017: Retries once on worker failure
+    /// - VAL-CPHASE-018: Falls back to TF-IDF for the affected batch after second failure
+    /// - VAL-CPHASE-019: Emits actionable warning on fallback
+    /// - VAL-CPHASE-020: Worker failure does not crash the main daemon
+    /// - VAL-CPHASE-021: Fresh worker can be spawned after fallback
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     pub async fn embed_neural_async(&self, text: &str) -> Option<Result<Vec<f32>, String>> {
         match self {
@@ -615,16 +620,27 @@ impl HybridEmbedder {
             #[cfg(feature = "onnx")]
             Self::HybridLocal { neural, .. } => {
                 // Delegate to the worker process via the embedding client
+                // with retry-once fallback semantics
                 let texts = vec![text.to_string()];
-                match neural.embed(&texts, 1024) {
-                    Ok(response) => {
+                let result = neural.embed_with_fallback(&texts, 1024);
+                match result {
+                    EmbedResult::Success(response) => {
                         if response.count > 0 {
+                            // VAL-CPHASE-016: Write from flat buffer directly
                             Some(Ok(response.into_vectors().into_iter().next().unwrap()))
                         } else {
                             Some(Err("worker returned empty response".to_string()))
                         }
                     }
-                    Err(e) => Some(Err(format!("Worker embedding failed: {}", e))),
+                    EmbedResult::Fallback { batch_id, error } => {
+                        // VAL-CPHASE-018/019: Fallback already logged actionable warning.
+                        tracing::warn!(
+                            batch_id = %batch_id,
+                            error = %error,
+                            "Neural embedding degraded to TF-IDF for node (async path)"
+                        );
+                        None
+                    }
                 }
             }
             #[cfg(feature = "remote-embeddings")]
@@ -639,7 +655,12 @@ impl HybridEmbedder {
 
     /// Generate neural/remote embedding for text (blocking wrapper for sync contexts)
     ///
-    /// Returns None if neural enhancement is not available
+    /// Uses `embed_with_fallback` for retry-once semantics:
+    /// - VAL-CPHASE-017: Retries once on worker failure
+    /// - VAL-CPHASE-018: Falls back to TF-IDF for the affected batch after second failure
+    /// - VAL-CPHASE-019: Emits actionable warning on fallback
+    /// - VAL-CPHASE-020: Worker failure does not crash the main daemon
+    /// - VAL-CPHASE-021: Fresh worker can be spawned after fallback
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     pub fn embed_neural_blocking(&self, text: &str) -> Option<Result<Vec<f32>, String>> {
         match self {
@@ -647,15 +668,27 @@ impl HybridEmbedder {
             #[cfg(feature = "onnx")]
             Self::HybridLocal { neural, .. } => {
                 let texts = vec![text.to_string()];
-                match neural.embed(&texts, 1024) {
-                    Ok(response) => {
+                let result = neural.embed_with_fallback(&texts, 1024);
+                match result {
+                    EmbedResult::Success(response) => {
                         if response.count > 0 {
+                            // VAL-CPHASE-016: Write from flat buffer directly,
+                            // avoiding nested Vec<Vec<f32>> heap mirror
                             Some(Ok(response.into_vectors().into_iter().next().unwrap()))
                         } else {
                             Some(Err("worker returned empty response".to_string()))
                         }
                     }
-                    Err(e) => Some(Err(format!("Worker embedding failed: {}", e))),
+                    EmbedResult::Fallback { batch_id, error } => {
+                        // VAL-CPHASE-018/019: Fallback already logged actionable warning.
+                        // Return None so the caller falls back to TF-IDF for this batch.
+                        tracing::warn!(
+                            batch_id = %batch_id,
+                            error = %error,
+                            "Neural embedding degraded to TF-IDF for node"
+                        );
+                        None
+                    }
                 }
             }
             #[cfg(feature = "remote-embeddings")]

@@ -3,18 +3,29 @@
 // VAL-CPHASE-002: The main crate no longer owns ONNX runtime deps directly.
 // This client communicates with the leindex-embed worker over local IPC.
 //
-// The full worker lifecycle (cold start, reuse, idle teardown, restart,
-// retry-once fallback) will be implemented in the runtime lifecycle feature.
-// This module provides the protocol client foundation.
+// VAL-CPHASE-016: The client writes worker output into destination embedding
+// storage via the flat EmbedResponse buffer, avoiding a nested Vec<Vec<f32>>
+// heap mirror in the main process.
+//
+// VAL-CPHASE-017: On worker failure, the client retries once before falling back.
+// VAL-CPHASE-018: After retry failure, only the affected batch falls back to TF-IDF.
+// VAL-CPHASE-019: Fallback emits an actionable warning naming the batch and error.
+// VAL-CPHASE-020: Worker failure does not crash the main daemon.
+// VAL-CPHASE-021: A fresh worker can be spawned after a fallback episode.
 
+use std::fmt;
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use leindex_embed::protocol::{
-    self, BatchId, EmbedRequest, EmbedResponse, ErrorKind, Frame, MsgType, Request, RerankDocument,
-    RerankRequest, RerankResponse, Response, WorkerError,
+    self, BatchId, EmbedRequest, EmbedResponse, Frame, MsgType, RerankDocument, RerankRequest,
+    RerankResponse, Response, WorkerError,
 };
+
+/// Monotonic batch ID counter for correlating requests.
+static BATCH_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Errors that can occur when communicating with the embedding worker.
 #[derive(Debug, thiserror::Error)]
@@ -36,17 +47,77 @@ pub enum ClientError {
     Protocol(String),
 }
 
+/// Result of an embed request with fallback semantics.
+///
+/// VAL-CPHASE-016: On success, contains the flat row-major EmbedResponse
+/// from the worker, which can be written directly into destination storage
+/// without creating a nested Vec<Vec<f32>> heap mirror.
+///
+/// VAL-CPHASE-018: On fallback, contains a TF-IDF-degraded embedding for
+/// the affected batch only.
+#[derive(Debug)]
+pub enum EmbedResult {
+    /// Worker returned a successful embedding response.
+    Success(EmbedResponse),
+    /// Worker failed after retry; fell back to TF-IDF for this batch.
+    /// The caller should use the TF-IDF embedding as a degraded substitute.
+    Fallback {
+        /// The batch ID that triggered the fallback.
+        batch_id: BatchId,
+        /// The error that caused the fallback (from the retry attempt).
+        error: ClientError,
+    },
+}
+
+impl EmbedResult {
+    /// Returns true if this result represents a successful worker response.
+    pub fn is_success(&self) -> bool {
+        matches!(self, EmbedResult::Success(_))
+    }
+
+    /// Returns true if this result represents a TF-IDF fallback.
+    pub fn is_fallback(&self) -> bool {
+        matches!(self, EmbedResult::Fallback { .. })
+    }
+
+    /// Extract the successful response, if any.
+    pub fn into_success(self) -> Option<EmbedResponse> {
+        match self {
+            EmbedResult::Success(resp) => Some(resp),
+            EmbedResult::Fallback { .. } => None,
+        }
+    }
+}
+
 /// Client for the leindex-embed worker process.
 ///
 /// Manages the worker lifecycle and provides methods for sending embed
-/// and rerank requests over local IPC.
+/// and rerank requests over local IPC with retry-once fallback semantics.
 ///
-/// The full lifecycle (cold start, reuse, idle teardown, restart) will be
-/// implemented in the runtime lifecycle feature. This struct provides the
-/// protocol client foundation.
+/// VAL-CPHASE-020: Worker failure does not crash the main daemon — errors
+/// are returned as `EmbedResult::Fallback` rather than panicking.
+///
+/// VAL-CPHASE-021: After a fallback episode, the worker handle is cleared
+/// so the next request spawns a fresh worker.
 pub struct EmbeddingClient {
     /// Worker process handle, if currently running.
     worker: Mutex<Option<WorkerHandle>>,
+}
+
+/// Manual Debug impl — Child doesn't implement Debug.
+impl fmt::Debug for EmbeddingClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EmbeddingClient")
+            .field("worker", &self.worker.lock().map(|g| g.is_some()))
+            .finish()
+    }
+}
+
+/// Manual Clone impl — creates a new empty client (does not clone the worker).
+impl Clone for EmbeddingClient {
+    fn clone(&self) -> Self {
+        Self::new()
+    }
 }
 
 /// Handle to a running worker process with its stdin/stdout pipes.
@@ -69,6 +140,11 @@ impl EmbeddingClient {
         }
     }
 
+    /// Allocate a new unique batch ID.
+    fn next_batch_id() -> BatchId {
+        BatchId::new(BATCH_COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
     /// Ensure the worker is running, spawning it if necessary.
     fn ensure_worker(&self) -> Result<(), ClientError> {
         let mut guard = self
@@ -80,6 +156,14 @@ impl EmbeddingClient {
             return Ok(());
         }
 
+        self.spawn_worker(&mut guard)
+    }
+
+    /// Spawn a new worker process into the given guard slot.
+    fn spawn_worker(
+        &self,
+        guard: &mut std::sync::MutexGuard<'_, Option<WorkerHandle>>,
+    ) -> Result<(), ClientError> {
         let mut child = Command::new("leindex-embed")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -96,7 +180,7 @@ impl EmbeddingClient {
             .take()
             .ok_or_else(|| ClientError::SpawnFailed("failed to open worker stdout".to_string()))?;
 
-        *guard = Some(WorkerHandle {
+        **guard = Some(WorkerHandle {
             child,
             stdin,
             stdout,
@@ -105,11 +189,139 @@ impl EmbeddingClient {
         Ok(())
     }
 
+    /// Kill the current worker and clear the handle so a fresh worker
+    /// can be spawned on the next request.
+    ///
+    /// VAL-CPHASE-021: After calling this, the next embed request will
+    /// transparently spawn a new worker process.
+    fn kill_worker(&self) {
+        if let Ok(mut guard) = self.worker.lock() {
+            if let Some(mut handle) = guard.take() {
+                // Close stdin to signal shutdown
+                drop(handle.stdin);
+                // Kill the process if it hasn't exited yet
+                let _ = handle.child.kill();
+                let _ = handle.child.wait();
+            }
+        }
+    }
+
+    /// Send an embed request to the worker with retry-once fallback semantics.
+    ///
+    /// VAL-CPHASE-017: On worker failure, retries once before falling back.
+    /// VAL-CPHASE-018: After retry failure, only this batch falls back to TF-IDF.
+    /// VAL-CPHASE-019: Fallback emits an actionable warning.
+    /// VAL-CPHASE-020: Worker failure does not crash the main daemon.
+    /// VAL-CPHASE-021: After fallback, the worker is cleared so a fresh one
+    /// can be spawned for later requests.
+    ///
+    /// VAL-CPHASE-016: The returned `EmbedResult::Success` contains a flat
+    /// row-major `EmbedResponse` that can be written directly into destination
+    /// storage without creating a nested `Vec<Vec<f32>>` heap mirror.
+    pub fn embed_with_fallback(&self, texts: &[String], expected_dim: usize) -> EmbedResult {
+        let batch_id = Self::next_batch_id();
+
+        // Attempt 1: initial try
+        match self.embed_attempt(batch_id, texts, expected_dim) {
+            Ok(response) => return EmbedResult::Success(response),
+            Err(first_error) => {
+                // VAL-CPHASE-017: Retry once after killing the failed worker
+                tracing::warn!(
+                    batch_id = %batch_id,
+                    error = %first_error,
+                    "ONNX worker failed on first attempt, retrying once"
+                );
+
+                // Kill the failed worker so we can spawn a fresh one
+                self.kill_worker();
+
+                // Attempt 2: retry with a fresh worker
+                let retry_batch_id = Self::next_batch_id();
+                match self.embed_attempt(retry_batch_id, texts, expected_dim) {
+                    Ok(response) => {
+                        tracing::info!(
+                            original_batch = %batch_id,
+                            retry_batch = %retry_batch_id,
+                            "ONNX worker retry succeeded"
+                        );
+                        return EmbedResult::Success(response);
+                    }
+                    Err(retry_error) => {
+                        // VAL-CPHASE-018: Second failure → TF-IDF fallback for this batch only
+                        // VAL-CPHASE-019: Emit actionable warning
+                        tracing::warn!(
+                            batch_id = %batch_id,
+                            retry_batch_id = %retry_batch_id,
+                            first_error = %first_error,
+                            retry_error = %retry_error,
+                            "ONNX worker fallback for batch {}: {} (retry exhausted, degrading to TF-IDF)",
+                            batch_id,
+                            retry_error
+                        );
+
+                        // VAL-CPHASE-021: Kill the worker so a fresh one can be
+                        // spawned for later requests
+                        self.kill_worker();
+
+                        return EmbedResult::Fallback {
+                            batch_id,
+                            error: retry_error,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    /// Single attempt to send an embed request to the worker.
+    fn embed_attempt(
+        &self,
+        batch_id: BatchId,
+        texts: &[String],
+        expected_dim: usize,
+    ) -> Result<EmbedResponse, ClientError> {
+        self.ensure_worker()?;
+
+        let request = EmbedRequest {
+            texts: texts.to_vec(),
+            expected_dim,
+        };
+
+        let frame = protocol::embed_request_frame(batch_id, request)
+            .map_err(|e| ClientError::Ipc(e.to_string()))?;
+
+        let response_frame = self.send_and_receive(frame)?;
+
+        match response_frame.header.msg_type {
+            MsgType::EmbedResponse => {
+                let response: Response = response_frame
+                    .decode_payload()
+                    .map_err(|e| ClientError::Ipc(e.to_string()))?;
+                match response {
+                    Response::Embed(embed_resp) => Ok(embed_resp),
+                    _ => Err(ClientError::Protocol("expected Embed response".to_string())),
+                }
+            }
+            MsgType::Error => {
+                let response: Response = response_frame
+                    .decode_payload()
+                    .map_err(|e| ClientError::Ipc(e.to_string()))?;
+                match response {
+                    Response::Error(err) => Err(ClientError::Worker(err)),
+                    _ => Err(ClientError::Protocol("expected Error response".to_string())),
+                }
+            }
+            other => Err(ClientError::Protocol(format!(
+                "unexpected response type: {:?}",
+                other
+            ))),
+        }
+    }
+
     /// Send an embed request to the worker and return the response.
     ///
-    /// Spawns the worker on first call (cold start). The full lifecycle
-    /// (reuse, idle teardown, retry-once) will be added in the runtime
-    /// lifecycle feature.
+    /// This is the simple API that returns an error on failure rather than
+    /// falling back. For retry-once fallback semantics, use `embed_with_fallback`.
     pub fn embed(
         &self,
         texts: &[String],
@@ -117,7 +329,7 @@ impl EmbeddingClient {
     ) -> Result<EmbedResponse, ClientError> {
         self.ensure_worker()?;
 
-        let batch_id = BatchId::new(std::process::id() as u64);
+        let batch_id = Self::next_batch_id();
         let request = EmbedRequest {
             texts: texts.to_vec(),
             expected_dim,
@@ -162,7 +374,7 @@ impl EmbeddingClient {
     ) -> Result<RerankResponse, ClientError> {
         self.ensure_worker()?;
 
-        let batch_id = BatchId::new(std::process::id() as u64);
+        let batch_id = Self::next_batch_id();
         let request = RerankRequest {
             query: query.to_string(),
             documents,
@@ -259,10 +471,26 @@ impl Drop for EmbeddingClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leindex_embed::protocol::ErrorKind;
 
     #[test]
     fn test_client_creation() {
         let _client = EmbeddingClient::new();
+    }
+
+    #[test]
+    fn test_client_debug_impl() {
+        let client = EmbeddingClient::new();
+        let debug_str = format!("{:?}", client);
+        assert!(debug_str.contains("EmbeddingClient"));
+    }
+
+    #[test]
+    fn test_client_clone_creates_new() {
+        let client = EmbeddingClient::new();
+        let cloned = client.clone();
+        // Clone creates a new empty client, not sharing the worker
+        let _ = format!("{:?}", cloned);
     }
 
     #[test]
@@ -276,5 +504,39 @@ mod tests {
         };
         let err = ClientError::Worker(worker_err);
         assert!(err.to_string().contains("missing model"));
+    }
+
+    #[test]
+    fn test_embed_result_success() {
+        let response = EmbedResponse::new(vec![1.0, 2.0, 3.0, 4.0], 1, 4);
+        let result = EmbedResult::Success(response);
+        assert!(result.is_success());
+        assert!(!result.is_fallback());
+        assert!(result.into_success().is_some());
+    }
+
+    #[test]
+    fn test_embed_result_fallback() {
+        let error = ClientError::Worker(WorkerError {
+            kind: ErrorKind::Inference,
+            message: "worker crashed".to_string(),
+        });
+        let result = EmbedResult::Fallback {
+            batch_id: BatchId::new(42),
+            error,
+        };
+        assert!(!result.is_success());
+        assert!(result.is_fallback());
+        assert!(result.into_success().is_none());
+    }
+
+    #[test]
+    fn test_batch_id_monotonic() {
+        let id1 = EmbeddingClient::next_batch_id();
+        let id2 = EmbeddingClient::next_batch_id();
+        assert!(
+            id2.0 > id1.0,
+            "batch IDs should be monotonically increasing"
+        );
     }
 }

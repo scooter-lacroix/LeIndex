@@ -38,7 +38,7 @@ pub use semantic::SemanticProcessor;
 pub use vector::VectorIndex;
 
 #[cfg(feature = "onnx")]
-pub use onnx::EmbeddingClient;
+pub use onnx::{ClientError, EmbedResult, EmbeddingClient};
 
 #[cfg(all(feature = "remote-embeddings", feature = "onnx"))]
 pub use onnx::{
