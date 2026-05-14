@@ -29,7 +29,8 @@ pub use hnsw::{HNSWIndex, HNSWParams, IndexError};
 pub use query::{ParsedQuery, QueryIntent, QueryParser};
 pub use ranking::{HybridScorer, Score};
 pub use search::{
-    CompactNodeMetadata, CompactTokenIndex, ContentPruner, IndexingAdmissionGate, NodeInfo,
+    CompactNodeMetadata, CompactTokenIndex, ContentPruner, IndexingAdmissionGate,
+    Int8PromotionDecision, Int8QualityGate, Int8QualityReport, Int8QualityThresholds, NodeInfo,
     PruningDecision, SearchEngine, SearchQuery, SearchResult, SemanticEntry, StagedRetrievalConfig,
     StagedRetrievalMetrics, WorkHoister,
 };
