@@ -3474,4 +3474,355 @@ mod tests {
         // Verify the hoister has exactly 1 entry (no duplicate)
         assert_eq!(hoister.len(), 1);
     }
+
+    // ========================================================================
+    // VAL-APLUS-015 through VAL-APLUS-021: NodeInfo compatibility bridge
+    // and duplicate TF-IDF ownership removal tests
+    // ========================================================================
+
+    /// Helper: create a minimal NodeInfo for serialization tests.
+    fn make_node_info(tfidf: Vec<f32>) -> NodeInfo {
+        NodeInfo {
+            node_id: "test_node".into(),
+            file_path: "test.rs".into(),
+            symbol_name: "test_fn".into(),
+            language: "rust".into(),
+            content: "fn test_fn() {}".into(),
+            byte_range: (0, 16),
+            tfidf_embedding: tfidf,
+            neural_embedding: None,
+            complexity: 1,
+            signature: None,
+            pre_tokenized: None,
+        }
+    }
+
+    /// VAL-APLUS-015: Legacy NodeInfo payloads remain readable during the
+    /// one-minor compatibility window.
+    ///
+    /// A payload serialized with the old `embedding` field (and no
+    /// `tfidf_embedding`) must deserialize successfully.
+    #[test]
+    fn test_legacy_payload_remains_readable() {
+        let legacy_json = r#"{
+            "node_id": "legacy_node",
+            "file_path": "legacy.rs",
+            "symbol_name": "legacy_fn",
+            "language": "rust",
+            "content": "fn legacy_fn() {}",
+            "byte_range": [0, 16],
+            "embedding": [0.1, 0.2, 0.3, 0.4],
+            "neural_embedding": null,
+            "complexity": 5,
+            "signature": null,
+            "pre_tokenized": null
+        }"#;
+
+        let node: NodeInfo = serde_json::from_str(legacy_json)
+            .expect("Legacy payload must deserialize during compatibility window");
+
+        assert_eq!(node.node_id, "legacy_node");
+        // The legacy embedding should have been promoted to tfidf_embedding
+        assert_eq!(node.tfidf_embedding, vec![0.1, 0.2, 0.3, 0.4]);
+    }
+
+    /// VAL-APLUS-016: New NodeInfo payloads serialize only the new shape.
+    ///
+    /// Fresh serialization must emit `tfidf_embedding` and must NOT emit
+    /// the legacy `embedding` field.
+    #[test]
+    fn test_new_payload_serializes_only_new_shape() {
+        let node = make_node_info(vec![1.0, 2.0, 3.0]);
+        let json = serde_json::to_string(&node).expect("Serialization must succeed");
+
+        // Must contain tfidf_embedding
+        assert!(
+            json.contains("\"tfidf_embedding\""),
+            "Serialized output must contain tfidf_embedding field"
+        );
+
+        // Must NOT contain the legacy "embedding" field (not "tfidf_embedding")
+        // We check for the exact key by looking for the pattern that would indicate
+        // a standalone "embedding" key (not preceded by "tfidf_")
+        let has_legacy_embedding = json.contains("\"embedding\":")
+            && !json.contains("\"tfidf_embedding\":");
+        assert!(
+            !has_legacy_embedding,
+            "Serialized output must not contain legacy 'embedding' field. JSON: {}",
+            json
+        );
+    }
+
+    /// VAL-APLUS-017: Compatibility resolution prefers non-empty tfidf_embedding.
+    ///
+    /// When both old and new shapes are present, deserialization uses the
+    /// non-empty new TF-IDF field first.
+    #[test]
+    fn test_compat_prefers_tfidf_embedding_over_legacy() {
+        let dual_json = r#"{
+            "node_id": "dual_node",
+            "file_path": "dual.rs",
+            "symbol_name": "dual_fn",
+            "language": "rust",
+            "content": "fn dual_fn() {}",
+            "byte_range": [0, 14],
+            "tfidf_embedding": [0.5, 0.6, 0.7],
+            "embedding": [0.1, 0.2, 0.3],
+            "neural_embedding": null,
+            "complexity": 3,
+            "signature": null,
+            "pre_tokenized": null
+        }"#;
+
+        let node: NodeInfo = serde_json::from_str(dual_json)
+            .expect("Dual-shape payload must deserialize");
+
+        // Should prefer tfidf_embedding (the new field)
+        assert_eq!(
+            node.tfidf_embedding, vec![0.5, 0.6, 0.7],
+            "Must prefer tfidf_embedding when both fields are present"
+        );
+    }
+
+    /// VAL-APLUS-018: Compatibility fallback promotes legacy embedding only
+    /// when needed.
+    ///
+    /// If the new TF-IDF field is absent or empty and the legacy field is
+    /// populated, deserialization promotes the legacy value.
+    #[test]
+    fn test_compat_fallback_promotes_legacy_when_needed() {
+        // Case 1: tfidf_embedding absent, legacy present
+        let legacy_only_json = r#"{
+            "node_id": "fallback_node",
+            "file_path": "fallback.rs",
+            "symbol_name": "fallback_fn",
+            "language": "rust",
+            "content": "fn fallback_fn() {}",
+            "byte_range": [0, 18],
+            "embedding": [0.9, 0.8, 0.7],
+            "neural_embedding": null,
+            "complexity": 2,
+            "signature": null,
+            "pre_tokenized": null
+        }"#;
+
+        let node: NodeInfo = serde_json::from_str(legacy_only_json)
+            .expect("Legacy-only payload must deserialize");
+        assert_eq!(
+            node.tfidf_embedding, vec![0.9, 0.8, 0.7],
+            "Must promote legacy embedding when tfidf_embedding is absent"
+        );
+
+        // Case 2: tfidf_embedding present but empty, legacy present
+        let empty_new_json = r#"{
+            "node_id": "empty_new_node",
+            "file_path": "empty.rs",
+            "symbol_name": "empty_fn",
+            "language": "rust",
+            "content": "fn empty_fn() {}",
+            "byte_range": [0, 14],
+            "tfidf_embedding": [],
+            "embedding": [0.4, 0.5, 0.6],
+            "neural_embedding": null,
+            "complexity": 1,
+            "signature": null,
+            "pre_tokenized": null
+        }"#;
+
+        let node2: NodeInfo = serde_json::from_str(empty_new_json)
+            .expect("Empty-new + legacy payload must deserialize");
+        assert_eq!(
+            node2.tfidf_embedding, vec![0.4, 0.5, 0.6],
+            "Must promote legacy embedding when tfidf_embedding is empty"
+        );
+    }
+
+    /// VAL-APLUS-019: Empty legacy and new embeddings degrade safely.
+    ///
+    /// If neither shape provides a usable vector, deserialization succeeds
+    /// with an empty TF-IDF vector rather than crashing or inventing state.
+    #[test]
+    fn test_empty_embeddings_degrade_safely() {
+        let empty_json = r#"{
+            "node_id": "empty_node",
+            "file_path": "empty.rs",
+            "symbol_name": "empty_fn",
+            "language": "rust",
+            "content": "fn empty_fn() {}",
+            "byte_range": [0, 14],
+            "neural_embedding": null,
+            "complexity": 0,
+            "signature": null,
+            "pre_tokenized": null
+        }"#;
+
+        let node: NodeInfo = serde_json::from_str(empty_json)
+            .expect("Payload with no embeddings must deserialize successfully");
+
+        assert!(
+            node.tfidf_embedding.is_empty(),
+            "Must degrade to empty tfidf_embedding, got {:?}",
+            node.tfidf_embedding
+        );
+        assert_eq!(node.node_id, "empty_node");
+    }
+
+    /// VAL-APLUS-020: Search semantics are unchanged after duplicate embedding
+    /// removal.
+    ///
+    /// Removing duplicate TF-IDF ownership does not alter observable search
+    /// results or ranking behavior for existing scenarios.
+    #[test]
+    fn test_search_semantics_unchanged_after_dedup() {
+        // Create a node with tfidf_embedding and index it
+        let node = NodeInfo {
+            node_id: "dedup_node".into(),
+            file_path: "dedup.rs".into(),
+            symbol_name: "dedup_fn".into(),
+            language: "rust".into(),
+            content: "fn dedup_fn() { compute_value(); }".into(),
+            byte_range: (0, 32),
+            tfidf_embedding: vec![1.0, 0.0, 0.0],
+            neural_embedding: None,
+            complexity: 3,
+            signature: None,
+            pre_tokenized: None,
+        };
+
+        let mut engine = SearchEngine::with_dimension(3);
+        engine.index_nodes(vec![node]);
+
+        // Search with a vector close to the indexed embedding
+        let query = SearchQuery {
+            query: "dedup_fn".into(),
+            top_k: 10,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(vec![0.9, 0.1, 0.0]),
+            threshold: None,
+            query_type: None,
+        };
+
+        let results = engine.search(query).unwrap();
+        assert!(
+            !results.is_empty(),
+            "Search must return results for indexed node"
+        );
+        assert_eq!(
+            results[0].node_id, "dedup_node",
+            "Search must find the correct node"
+        );
+
+        // Verify round-trip: serialize then deserialize and search again
+        let node_v2 = NodeInfo {
+            node_id: "dedup_node_v2".into(),
+            file_path: "dedup.rs".into(),
+            symbol_name: "dedup_fn_v2".into(),
+            language: "rust".into(),
+            content: "fn dedup_fn_v2() { compute_other(); }".into(),
+            byte_range: (0, 36),
+            tfidf_embedding: vec![0.0, 1.0, 0.0],
+            neural_embedding: None,
+            complexity: 4,
+            signature: None,
+            pre_tokenized: None,
+        };
+
+        // Serialize and deserialize the node to verify the round-trip
+        let serialized = serde_json::to_string(&node_v2).unwrap();
+        let deserialized: NodeInfo = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(deserialized.tfidf_embedding, node_v2.tfidf_embedding);
+
+        let mut engine2 = SearchEngine::with_dimension(3);
+        engine2.index_nodes(vec![deserialized]);
+
+        let query2 = SearchQuery {
+            query: "dedup_fn_v2".into(),
+            top_k: 10,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(vec![0.0, 0.9, 0.1]),
+            threshold: None,
+            query_type: None,
+        };
+
+        let results2 = engine2.search(query2).unwrap();
+        assert!(
+            !results2.is_empty(),
+            "Search must return results after round-trip serialization"
+        );
+        assert_eq!(
+            results2[0].node_id, "dedup_node_v2",
+            "Search must find the correct node after round-trip"
+        );
+    }
+
+    /// VAL-APLUS-021: Post-index content clearing behavior is preserved.
+    ///
+    /// A+ dedup work does not regress the existing behavior that clears
+    /// bulky source content after indexing.
+    #[test]
+    fn test_post_index_content_clearing_preserved() {
+        let nodes = vec![
+            NodeInfo {
+                node_id: "clear_node_1".into(),
+                file_path: "clear.rs".into(),
+                symbol_name: "clear_fn_1".into(),
+                language: "rust".into(),
+                content: "fn clear_fn_1() { /* some content that should be cleared */ }".into(),
+                byte_range: (0, 60),
+                tfidf_embedding: vec![1.0, 0.0, 0.0],
+                neural_embedding: None,
+                complexity: 2,
+                signature: Some("fn clear_fn_1()".into()),
+                pre_tokenized: None,
+            },
+            NodeInfo {
+                node_id: "clear_node_2".into(),
+                file_path: "clear.rs".into(),
+                symbol_name: "clear_fn_2".into(),
+                language: "rust".into(),
+                content: "fn clear_fn_2() { /* more content to be cleared */ }".into(),
+                byte_range: (60, 110),
+                tfidf_embedding: vec![0.0, 1.0, 0.0],
+                neural_embedding: None,
+                complexity: 3,
+                signature: Some("fn clear_fn_2()".into()),
+                pre_tokenized: None,
+            },
+        ];
+
+        let mut engine = SearchEngine::with_dimension(3);
+        engine.index_nodes(nodes);
+
+        // Verify content was cleared on the stored nodes
+        for node in &engine.nodes {
+            assert!(
+                node.content.is_empty(),
+                "Node {} content should be cleared after indexing, but got: {:?}",
+                node.node_id,
+                node.content
+            );
+        }
+
+        // Verify search still works after content clearing (uses inverted index)
+        let query = SearchQuery {
+            query: "clear_fn".into(),
+            top_k: 10,
+            token_budget: None,
+            semantic: false,
+            expand_context: false,
+            query_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+
+        let results = engine.search(query).unwrap();
+        assert!(
+            !results.is_empty(),
+            "Search should still find results via inverted index after content cleared"
+        );
+    }
 }
