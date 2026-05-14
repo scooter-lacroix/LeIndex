@@ -49,6 +49,14 @@ pub struct Cli {
     #[arg(long = "stdio")]
     pub stdio: bool,
 
+    /// Write a lightweight memory summary to PATH on graceful shutdown.
+    ///
+    /// The report is a compact JSON file containing peak RSS and phase-level
+    /// max/sample information. Also enabled by the `LEINDEX_MEMORY_REPORT`
+    /// environment variable (the CLI flag takes precedence).
+    #[arg(global = true, long = "memory-report", value_name = "PATH")]
+    pub memory_report: Option<PathBuf>,
+
     /// Subcommand to execute
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -264,6 +272,14 @@ impl Cli {
     pub async fn run(self) -> AnyhowResult<()> {
         // Initialize logging
         init_logging_impl(self.verbose);
+
+        // Set up optional memory report tracker.
+        // The tracker observes RSS during execution and writes a compact JSON
+        // summary on drop (graceful shutdown). Also enabled via
+        // LEINDEX_MEMORY_REPORT env var; CLI flag takes precedence.
+        let _memory_report_guard =
+            crate::cli::memory_report::resolve_report_path(self.memory_report.as_deref())
+                .map(crate::cli::memory_report::MemoryReportTracker::new);
 
         // Get global project path
         let global_project = self.project_path;
@@ -2023,5 +2039,29 @@ mod tests {
             }
             _ => panic!("Expected Cleanup command"),
         }
+    }
+
+    #[test]
+    fn test_memory_report_flag_parsing() {
+        // VAL-MEASURE-020: --memory-report is an opt-in CLI surface
+        let cli = Cli::try_parse_from([
+            "leindex",
+            "--memory-report",
+            "/tmp/mem-report.json",
+            "index",
+            "/tmp/project",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.memory_report,
+            Some(PathBuf::from("/tmp/mem-report.json"))
+        );
+        assert!(matches!(cli.command, Some(Commands::Index { .. })));
+    }
+
+    #[test]
+    fn test_memory_report_flag_absent_by_default() {
+        let cli = Cli::try_parse_from(["leindex", "index", "/tmp/project"]).unwrap();
+        assert!(cli.memory_report.is_none());
     }
 }

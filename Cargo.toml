@@ -213,6 +213,18 @@ onnx = ["search", "dep:ort", "dep:tokenizers", "dep:dirs"]
 # Note: Requires onnx feature for remote embedding providers
 remote-embeddings = ["search", "onnx", "dep:reqwest", "dep:async-trait"]
 
+# Deep heap profiling support (opt-in, build-time gated).
+#
+# Enables jemalloc heap profiling via the `jemalloc` allocator with profiling
+# enabled. Default builds and CI are unaffected when this feature is not
+# requested.
+#
+# Use with: cargo build --features memprof
+# VAL-MEASURE-025: memprof is opt-in and build-time gated.
+# VAL-MEASURE-026: Building with --features memprof succeeds.
+# VAL-MEASURE-027: memprof is excluded from CI gating.
+memprof = ["dep:tikv-jemallocator"]
+
 [dependencies]
 # Core dependencies (used by most modules)
 serde = { version = "1.0", features = ["derive"] }
@@ -314,6 +326,9 @@ tempfile = { version = "3.13", optional = true }
 
 # Search mmap embedding persistence
 memmap2 = { version = "0.9", optional = true }
+
+# Heap profiling allocator (opt-in memprof feature)
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
