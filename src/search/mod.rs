@@ -28,7 +28,10 @@ pub mod onnx;
 pub use hnsw::{HNSWIndex, HNSWParams, IndexError};
 pub use query::{ParsedQuery, QueryIntent, QueryParser};
 pub use ranking::{HybridScorer, Score};
-pub use search::{NodeInfo, SearchEngine, SearchQuery, SearchResult, SemanticEntry};
+pub use search::{
+    ContentPruner, IndexingAdmissionGate, NodeInfo, PruningDecision, SearchEngine, SearchQuery,
+    SearchResult, SemanticEntry, WorkHoister,
+};
 pub use semantic::SemanticProcessor;
 pub use vector::VectorIndex;
 

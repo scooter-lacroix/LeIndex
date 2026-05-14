@@ -1162,6 +1162,14 @@ pub(crate) fn index_nodes_with_embedder(
         HybridEmbedder::tfidf_only(tfidf_embedder)
     };
 
+    // A+ bound-gated admission, selective pruning, and work hoisting.
+    let pruner = crate::search::search::ContentPruner::new();
+    let mut admission_gate = crate::search::search::IndexingAdmissionGate::new();
+    let mut work_hoister = crate::search::search::WorkHoister::new();
+    let mut pruned_count: usize = 0;
+    let mut shed_count: usize = 0;
+    let mut hoisted_count: usize = 0;
+
     let mut nodes: Vec<NodeInfo> = Vec::with_capacity(batch_size);
     #[cfg(feature = "remote-embeddings")]
     let mut warned_remote_blocking = false;
@@ -1170,16 +1178,49 @@ pub(crate) fn index_nodes_with_embedder(
         nodes.clear();
         for &node_idx in batch {
             if let Some(node) = pdg.get_node(node_idx) {
+                // A+ VAL-APLUS-038: Selective pruning — skip generated/low-info nodes.
+                let pruning_decision = pruner.evaluate(
+                    &node.file_path,
+                    "", // content not yet extracted; use path-only check
+                    &node.name,
+                );
+                if pruning_decision != crate::search::search::PruningDecision::Keep {
+                    pruned_count += 1;
+                    continue;
+                }
+
                 // Re-read and re-tokenize node content for Pass 2
                 let file_bytes = file_cache
                     .get_or_read(Path::new(&*node.file_path))
                     .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
 
                 let node_content = extract_node_content(node, node_idx, &file_bytes);
+
+                // A+ VAL-APLUS-038: Full content pruning check (now that we have content).
+                let pruning_decision = pruner.evaluate(&node.file_path, &node_content, &node.name);
+                if pruning_decision != crate::search::search::PruningDecision::Keep {
+                    pruned_count += 1;
+                    continue;
+                }
+
+                // A+ VAL-APLUS-037: Bound-gated admission — shed oversized/bursty work.
+                if !admission_gate.try_admit(node_content.len()) {
+                    shed_count += 1;
+                    continue;
+                }
+
                 let tokens = tokenize_code(&node_content);
 
-                // Generate TF-IDF embedding (always available)
-                let tfidf_embedding = embedder.embed_tfidf(&tokens);
+                // A+ VAL-APLUS-039: Repeated-work hoisting — reuse cached embedding
+                // if we've already computed one for identical content.
+                let tfidf_embedding = if let Some(cached) = work_hoister.lookup(&node_content) {
+                    hoisted_count += 1;
+                    cached
+                } else {
+                    let embedding = embedder.embed_tfidf(&tokens);
+                    work_hoister.store(&node_content, embedding.clone());
+                    embedding
+                };
 
                 // Generate neural embedding (if available)
                 // Note: Remote embeddings are not supported in synchronous indexing context
@@ -1235,7 +1276,6 @@ pub(crate) fn index_nodes_with_embedder(
                     byte_range: node.byte_range,
                     tfidf_embedding,
                     neural_embedding,
-                    embedding: None, // Will be set backward-compat after indexing
                     complexity: node.complexity,
                     signature,
                     pre_tokenized: Some(search_tokens),
@@ -1243,6 +1283,17 @@ pub(crate) fn index_nodes_with_embedder(
             }
         }
         search_engine.index_nodes(std::mem::take(&mut nodes));
+    }
+
+    // A+ logging: report pruning, shedding, and hoisting stats.
+    if pruned_count > 0 || shed_count > 0 || hoisted_count > 0 {
+        info!(
+            pruned = pruned_count,
+            shed = shed_count,
+            hoisted = hoisted_count,
+            admitted = admission_gate.nodes_admitted(),
+            "A+ bound-gated indexing stats"
+        );
     }
 
     Ok(embedder)
