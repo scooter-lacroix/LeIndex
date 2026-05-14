@@ -29,8 +29,8 @@ pub use hnsw::{HNSWIndex, HNSWParams, IndexError};
 pub use query::{ParsedQuery, QueryIntent, QueryParser};
 pub use ranking::{HybridScorer, Score};
 pub use search::{
-    ContentPruner, IndexingAdmissionGate, NodeInfo, PruningDecision, SearchEngine, SearchQuery,
-    SearchResult, SemanticEntry, WorkHoister,
+    CompactNodeMetadata, CompactTokenIndex, ContentPruner, IndexingAdmissionGate, NodeInfo,
+    PruningDecision, SearchEngine, SearchQuery, SearchResult, SemanticEntry, WorkHoister,
 };
 pub use semantic::SemanticProcessor;
 pub use vector::VectorIndex;

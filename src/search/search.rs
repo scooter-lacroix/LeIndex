@@ -811,6 +811,78 @@ pub struct SearchResult {
 // SEARCH ENGINE
 // ============================================================================
 
+// ---------------------------------------------------------------------------
+// B-phase compact resident metadata (Plan 2)
+// ---------------------------------------------------------------------------
+
+/// Compact token-to-rows index using integer-backed addressing.
+///
+/// Maps each token to a set of row indices (`u32`) instead of string node IDs.
+/// This is the compressed form of the inverted index for resident search state.
+#[derive(Debug, Clone)]
+pub struct CompactTokenIndex {
+    /// Token → set of row indices.
+    token_rows: HashMap<String, HashSet<u32>>,
+}
+
+impl CompactTokenIndex {
+    /// Return the set of row indices that contain the given token.
+    ///
+    /// Returns an empty set if the token is not in the index.
+    pub fn nodes_for_token(&self, token: &str) -> &HashSet<u32> {
+        static EMPTY: std::sync::OnceLock<HashSet<u32>> = std::sync::OnceLock::new();
+        self.token_rows.get(token).unwrap_or_else(|| EMPTY.get_or_init(HashSet::new))
+    }
+
+    /// Return the number of distinct tokens in the index.
+    pub fn token_count(&self) -> usize {
+        self.token_rows.len()
+    }
+}
+
+/// Compact, row-oriented snapshot of resident search metadata.
+///
+/// Uses `u32` row indices instead of string-heavy node-ID maps. This is the
+/// B-phase compressed resident state that reduces memory overhead while
+/// preserving stable lookup semantics (VAL-BPHASE-041).
+#[derive(Debug, Clone)]
+pub struct CompactNodeMetadata {
+    /// Node ID → row index mapping (compact u32 addressing).
+    row_map: Vec<(String, u32)>,
+    /// Complexity values indexed by row (compact u32 array).
+    complexity_by_row: Vec<u32>,
+    /// Token index using row-based addressing.
+    token_index: CompactTokenIndex,
+}
+
+impl CompactNodeMetadata {
+    /// Look up the row index for a given node ID.
+    ///
+    /// Returns `None` if the node is not in the compact metadata.
+    pub fn row_index(&self, node_id: &str) -> Option<u32> {
+        self.row_map
+            .iter()
+            .find(|(id, _)| id == node_id)
+            .map(|(_, row)| *row)
+    }
+
+    /// Look up the complexity for a given row index.
+    ///
+    /// Returns `None` if the row is out of range.
+    pub fn complexity_by_row(&self, row: u32) -> Option<u32> {
+        self.complexity_by_row.get(row as usize).copied()
+    }
+
+    /// Return the compact token index.
+    pub fn token_index(&self) -> &CompactTokenIndex {
+        &self.token_index
+    }
+
+    /// Return the number of nodes in the compact metadata.
+    pub fn node_count(&self) -> usize {
+        self.row_map.len()
+    }
+}
 /// Search engine combining vector and graph search
 ///
 /// This is the main entry point for search operations. It combines:
@@ -858,9 +930,9 @@ pub struct SearchEngine {
 
 // A+ Search cache budget constants (Section 8.1)
 /// Maximum entries in the search cache.
-const SEARCH_CACHE_MAX_ENTRIES: usize = 256;
+pub const SEARCH_CACHE_MAX_ENTRIES: usize = 256;
 /// Maximum total bytes for the search cache.
-const SEARCH_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+pub const SEARCH_CACHE_MAX_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
 
 impl SearchEngine {
     /// Create a new search engine with default 768-dim embeddings
@@ -1290,6 +1362,56 @@ impl SearchEngine {
     /// node IDs contain it.
     pub fn token_lookup(&self, token: &str) -> Option<&HashSet<String>> {
         self.text_index.get(token)
+    }
+
+    /// Return the number of entries currently in the search cache.
+    ///
+    /// Part of the B-phase memory accounting surface (VAL-BPHASE-024).
+    pub fn search_cache_len(&self) -> usize {
+        self.search_cache.len()
+    }
+
+    /// Return the tracked byte estimate for the search cache.
+    ///
+    /// Part of the B-phase memory accounting surface (VAL-BPHASE-024).
+    pub fn search_cache_bytes(&self) -> usize {
+        self.search_cache_bytes
+    }
+
+    /// Produce a compact, row-oriented snapshot of the resident search
+    /// metadata.
+    ///
+    /// The returned [`CompactNodeMetadata`] uses compact integer-backed
+    /// addressing (row indices as `u32`) instead of string-heavy
+    /// identifier-based maps. This is the B-phase compressed resident
+    /// state (VAL-BPHASE-041).
+    pub fn compact_metadata(&self) -> CompactNodeMetadata {
+        // Build compact node-id → row index map (u32 keys)
+        let mut row_map: Vec<(String, u32)> = Vec::with_capacity(self.nodes.len());
+        let mut complexity_by_row: Vec<u32> = Vec::with_capacity(self.nodes.len());
+
+        for (idx, node) in self.nodes.iter().enumerate() {
+            row_map.push((node.node_id.clone(), idx as u32));
+            complexity_by_row.push(node.complexity);
+        }
+
+        // Build compact token → set-of-rows index
+        let mut token_rows: HashMap<String, HashSet<u32>> = HashMap::new();
+        for (token, node_ids) in &self.text_index {
+            let mut rows = HashSet::new();
+            for node_id in node_ids {
+                if let Some(&idx) = self.node_id_to_idx.get(node_id) {
+                    rows.insert(idx as u32);
+                }
+            }
+            token_rows.insert(token.clone(), rows);
+        }
+
+        CompactNodeMetadata {
+            row_map,
+            complexity_by_row,
+            token_index: CompactTokenIndex { token_rows },
+        }
     }
 
     /// Validate internal coherence of all index structures.
