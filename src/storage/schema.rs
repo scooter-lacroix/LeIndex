@@ -5,6 +5,9 @@ use rusqlite::{Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Default number of reader connections in the fixed reader pool.
+pub const DEFAULT_READER_POOL_SIZE: usize = 2;
+
 // ============================================================================
 // A+ SQLite budget constants (Section 5.2)
 // ============================================================================
@@ -592,4 +595,130 @@ mod tests {
             PROJECT_READER_CACHE_SIZE_KIB, cache_size
         );
     }
+}
+
+// ============================================================================
+// B-phase fixed reader topology (VAL-BPHASE-026..028)
+// ============================================================================
+
+/// Role of a storage connection within the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageRole {
+    /// Writer connection: larger cache, write-capable.
+    Writer,
+    /// Reader connection: thin cache, read-only queries.
+    Reader,
+}
+
+/// Fixed-size storage connection pool: one writer + a bounded reader pool.
+///
+/// This replaces ad-hoc `Storage::open` calls with a topology that keeps
+/// SQLite residency bounded: one writer with a larger cache budget and a
+/// fixed small set of thin-cache reader connections.
+pub struct StoragePool {
+    writer: Storage,
+    readers: Vec<Storage>,
+}
+
+impl StoragePool {
+    /// Open a storage pool at the given path with the specified writer and
+    /// reader configurations.
+    ///
+    /// Creates one writer connection and `DEFAULT_READER_POOL_SIZE` reader
+    /// connections, all pointing at the same database file.
+    pub fn open<P: AsRef<Path>>(
+        db_path: P,
+        writer_config: StorageConfig,
+        reader_config: StorageConfig,
+    ) -> SqliteResult<Self> {
+        let writer = Storage::open_with_config(&db_path, writer_config)?;
+
+        let mut readers = Vec::with_capacity(DEFAULT_READER_POOL_SIZE);
+        for _ in 0..DEFAULT_READER_POOL_SIZE {
+            let reader = Storage::open_with_config(&db_path, reader_config.clone())?;
+            readers.push(reader);
+        }
+
+        Ok(Self { writer, readers })
+    }
+
+    /// Open a storage pool with a custom reader pool size.
+    pub fn open_with_pool_size<P: AsRef<Path>>(
+        db_path: P,
+        writer_config: StorageConfig,
+        reader_config: StorageConfig,
+        pool_size: usize,
+    ) -> SqliteResult<Self> {
+        let writer = Storage::open_with_config(&db_path, writer_config)?;
+
+        let mut readers = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let reader = Storage::open_with_config(&db_path, reader_config.clone())?;
+            readers.push(reader);
+        }
+
+        Ok(Self { writer, readers })
+    }
+
+    /// Returns true if the writer connection is present.
+    pub fn has_writer(&self) -> bool {
+        true // writer is always present after open
+    }
+
+    /// Get a reference to the writer connection.
+    pub fn writer(&self) -> &Storage {
+        &self.writer
+    }
+
+    /// Get a mutable reference to the writer connection.
+    pub fn writer_mut(&mut self) -> &mut Storage {
+        &mut self.writer
+    }
+
+    /// Get a reference to a reader connection by index.
+    ///
+    /// Returns an error if the index is out of bounds.
+    pub fn reader(&self, index: usize) -> Result<&Storage, StoragePoolError> {
+        self.readers
+            .get(index)
+            .ok_or(StoragePoolError::ReaderOutOfBounds {
+                index,
+                pool_size: self.readers.len(),
+            })
+    }
+
+    /// Get a mutable reference to a reader connection by index.
+    pub fn reader_mut(&mut self, index: usize) -> Result<&mut Storage, StoragePoolError> {
+        let pool_size = self.readers.len();
+        self.readers
+            .get_mut(index)
+            .ok_or(StoragePoolError::ReaderOutOfBounds { index, pool_size })
+    }
+
+    /// Number of reader connections in the pool.
+    pub fn reader_count(&self) -> usize {
+        self.readers.len()
+    }
+
+    /// Close all connections in the pool.
+    pub fn close_all(&mut self) -> SqliteResult<()> {
+        self.writer.close()?;
+        for reader in &mut self.readers {
+            reader.close()?;
+        }
+        Ok(())
+    }
+}
+
+/// Errors from storage pool operations.
+#[derive(Debug, thiserror::Error)]
+pub enum StoragePoolError {
+    /// Requested reader index exceeds the fixed pool size.
+    #[error("reader index {index} out of bounds (pool size: {pool_size})")]
+    ReaderOutOfBounds {
+        /// Requested index.
+        index: usize,
+        /// Actual pool size.
+        pool_size: usize,
+    },
 }
