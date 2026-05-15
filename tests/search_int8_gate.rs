@@ -10,10 +10,10 @@
 
 #[cfg(test)]
 mod tests {
+    use leindex::search::quantization::Int8HnswParams;
     use leindex::search::{
         Int8PromotionDecision, Int8QualityGate, Int8QualityThresholds, NodeInfo, SearchEngine,
     };
-    use leindex::search::quantization::Int8HnswParams;
     use std::collections::HashSet;
     use std::time::Instant;
 
@@ -138,8 +138,8 @@ mod tests {
 
         // Simulate metrics where INT8 has a meaningful NDCG drop
         let report = gate.evaluate(
-            0.95, // baseline NDCG@10
-            0.90, // INT8 NDCG@10 — 5.3% drop, well above 0.1% threshold
+            0.95,                         // baseline NDCG@10
+            0.90,                         // INT8 NDCG@10 — 5.3% drop, well above 0.1% threshold
             &[100_000, 110_000, 120_000], // baseline latencies
             &[105_000, 115_000, 125_000], // INT8 latencies
         );
@@ -174,8 +174,8 @@ mod tests {
 
         // NDCG is fine, but p50 latency is way over
         let report = gate.evaluate(
-            0.95, // baseline NDCG
-            0.95, // INT8 NDCG — no drop
+            0.95,       // baseline NDCG
+            0.95,       // INT8 NDCG — no drop
             &[100_000], // baseline p50 = 100µs
             &[200_000], // INT8 p50 = 200µs — 100% increase, way over 5%
         );
@@ -205,7 +205,7 @@ mod tests {
             0.95,
             0.95,
             &[100_000, 100_000, 100_000, 100_000, 100_000], // baseline
-            &[100_000, 100_000, 100_000, 100_000, 500_000],  // INT8: p99 is 500µs
+            &[100_000, 100_000, 100_000, 100_000, 500_000], // INT8: p99 is 500µs
         );
 
         assert!(report.ndcg10_passed, "NDCG should pass");
@@ -291,8 +291,7 @@ mod tests {
         );
 
         // Case 3: First 5 are relevant, last 5 are not
-        let partial_relevant: HashSet<String> =
-            (0..5).map(|i| format!("doc_{}", i)).collect();
+        let partial_relevant: HashSet<String> = (0..5).map(|i| format!("doc_{}", i)).collect();
         let ndcg_partial = Int8QualityGate::ndcg_at_10(&returned, &partial_relevant);
         // When the 5 relevant docs are all in the top-5 positions, DCG equals
         // ideal DCG (which also assumes 5 relevant docs in the best positions),
@@ -351,12 +350,7 @@ mod tests {
         let gate = Int8QualityGate::with_default_thresholds();
 
         // INT8 p99 is 8% above baseline — within 10%
-        let report = gate.evaluate(
-            0.95,
-            0.95,
-            &[100_000; 100],
-            &[108_000; 100],
-        );
+        let report = gate.evaluate(0.95, 0.95, &[100_000; 100], &[108_000; 100]);
 
         assert!(
             report.p99_passed,
@@ -369,12 +363,7 @@ mod tests {
         let gate = Int8QualityGate::with_default_thresholds();
 
         // INT8 p99 is 15% above baseline — exceeds 10%
-        let report = gate.evaluate(
-            0.95,
-            0.95,
-            &[100_000; 100],
-            &[115_000; 100],
-        );
+        let report = gate.evaluate(0.95, 0.95, &[100_000; 100], &[115_000; 100]);
 
         assert!(
             !report.p99_passed,
@@ -478,10 +467,7 @@ mod tests {
         let query = query_embedding_for_cluster(dimension, 2);
         let results = fp32_hnsw_engine.semantic_search(&query, 10).unwrap();
 
-        assert!(
-            !results.is_empty(),
-            "FP32 HNSW path must return results"
-        );
+        assert!(!results.is_empty(), "FP32 HNSW path must return results");
     }
 
     #[test]
@@ -620,8 +606,8 @@ mod tests {
 
         // All metrics within thresholds
         let report = gate.evaluate(
-            0.95, // baseline NDCG
-            0.945, // INT8 NDCG — 0.53% drop, within 1%
+            0.95,           // baseline NDCG
+            0.945,          // INT8 NDCG — 0.53% drop, within 1%
             &[100_000; 50], // baseline latencies
             &[103_000; 50], // INT8 latencies — 3% increase, within 5%
         );
@@ -779,7 +765,10 @@ mod tests {
         // 5 relevant out of 10 returned, but the relevant ones are NOT all at
         // the top — they're interleaved with irrelevant ones.
         // Relevant: doc_0, doc_2, doc_4, doc_6, doc_8
-        let relevant: HashSet<String> = [0, 2, 4, 6, 8].iter().map(|i| format!("doc_{}", i)).collect();
+        let relevant: HashSet<String> = [0, 2, 4, 6, 8]
+            .iter()
+            .map(|i| format!("doc_{}", i))
+            .collect();
         // Returned in order: doc_0, doc_1, doc_2, doc_3, doc_4, doc_5, doc_6, doc_7, doc_8, doc_9
         let returned: Vec<String> = (0..10).map(|i| format!("doc_{}", i)).collect();
 

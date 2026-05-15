@@ -85,7 +85,9 @@ fn run_memcheck(update_baseline: bool) -> Result<()> {
             .status()
             .context("failed to build leindex-embed")?;
         if !status.success() {
-            eprintln!("xtask: warning — leindex-embed build failed, worker-active phases will be skipped");
+            eprintln!(
+                "xtask: warning — leindex-embed build failed, worker-active phases will be skipped"
+            );
         }
     }
 

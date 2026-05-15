@@ -7,7 +7,7 @@
 // The startup report is logged as a single structured line at INFO level
 // so the main daemon and operators can observe runtime bundle choices.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Startup report emitted by the worker on launch.
@@ -131,8 +131,8 @@ impl StartupReporter {
     }
 
     /// Set the resolved model path and its source.
-    pub fn set_model_path(&mut self, path: &PathBuf, source: &str) {
-        self.model_path = Some(path.clone());
+    pub fn set_model_path(&mut self, path: &Path, source: &str) {
+        self.model_path = Some(path.to_path_buf());
         self.model_path_source = Some(source.to_string());
         self.model_error = None;
     }
@@ -202,7 +202,9 @@ mod tests {
             model_name: "qwen3-embed-0.6b".to_string(),
             quantization_mode: "int8".to_string(),
             warm_load_latency: Duration::from_millis(200),
-            model_path: Some(PathBuf::from("/home/user/.leindex/models/qwen3-embed-0.6b.onnx")),
+            model_path: Some(PathBuf::from(
+                "/home/user/.leindex/models/qwen3-embed-0.6b.onnx",
+            )),
             model_path_source: Some("user_cache".to_string()),
             model_error: None,
         };
@@ -261,10 +263,7 @@ mod tests {
         reporter.set_execution_provider("cuda", false, Some("no CUDA driver"));
         let report = reporter.build();
         assert!(!report.provider_available);
-        assert_eq!(
-            report.fallback_reason,
-            Some("no CUDA driver".to_string())
-        );
+        assert_eq!(report.fallback_reason, Some("no CUDA driver".to_string()));
     }
 
     #[test]

@@ -67,7 +67,7 @@ without reading the entire file. Accepts project_path to auto-switch between pro
         let mut guard = handle.write().await;
 
         guard
-            .ensure_pdg_loaded()
+            .ensure_analysis_context_loaded()
             .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
 
         if !guard.is_indexed() {

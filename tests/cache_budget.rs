@@ -6,13 +6,15 @@
 //            VAL-BPHASE-021, VAL-BPHASE-022, VAL-BPHASE-023, VAL-BPHASE-024,
 //            VAL-BPHASE-025, VAL-BPHASE-041, VAL-BPHASE-042, VAL-BPHASE-043
 
+use leindex::cli::mcp::edit_cache::{
+    EditCache, EditCacheEntry, EDIT_CACHE_MAX_ENTRY_BYTES, EDIT_CACHE_TOTAL_CAP_BYTES,
+};
+use leindex::edit::EditChange;
 use leindex::search::search::{
-    NodeInfo, SearchEngine, SearchQuery, TextIndexDelta,
-    SEARCH_CACHE_MAX_BYTES, SEARCH_CACHE_MAX_ENTRIES,
+    NodeInfo, SearchEngine, SearchQuery, TextIndexDelta, SEARCH_CACHE_MAX_BYTES,
+    SEARCH_CACHE_MAX_ENTRIES,
 };
 use leindex::search::vector::{write_mmap_embeddings, MmapEmbeddingIndex};
-use leindex::cli::mcp::edit_cache::{EditCache, EditCacheEntry, EDIT_CACHE_MAX_ENTRY_BYTES, EDIT_CACHE_TOTAL_CAP_BYTES};
-use leindex::edit::EditChange;
 
 // ============================================================================
 // Helpers
@@ -54,7 +56,12 @@ fn search_ids(engine: &mut SearchEngine, query: &str) -> Vec<String> {
         threshold: None,
         query_type: None,
     };
-    engine.search(q).unwrap().into_iter().map(|r| r.node_id).collect()
+    engine
+        .search(q)
+        .unwrap()
+        .into_iter()
+        .map(|r| r.node_id)
+        .collect()
 }
 
 /// Run a semantic search and return node IDs.
@@ -131,7 +138,10 @@ fn test_complexity_correct_after_incremental_update() {
     });
 
     assert_eq!(engine.node_complexity("a"), Some(42));
-    assert_eq!(engine.node_complexity("b"), Some(make_node("b", "", vec![]).complexity));
+    assert_eq!(
+        engine.node_complexity("b"),
+        Some(make_node("b", "", vec![]).complexity)
+    );
 }
 
 // ============================================================================
@@ -144,34 +154,54 @@ fn test_text_postings_correct_after_compression() {
     // Keyword/token-assisted retrieval returns the correct node set after
     // postings are stored in compact row-based form.
     let nodes = vec![
-        make_node("search_fn", "fn search_fn() { find_items(); }", vec![1.0, 0.0, 0.0]),
-        make_node("render_fn", "fn render_fn() { draw_screen(); }", vec![0.0, 1.0, 0.0]),
-        make_node("validate_fn", "fn validate_fn() { check_input(); }", vec![0.0, 0.0, 1.0]),
+        make_node(
+            "search_fn",
+            "fn search_fn() { find_items(); }",
+            vec![1.0, 0.0, 0.0],
+        ),
+        make_node(
+            "render_fn",
+            "fn render_fn() { draw_screen(); }",
+            vec![0.0, 1.0, 0.0],
+        ),
+        make_node(
+            "validate_fn",
+            "fn validate_fn() { check_input(); }",
+            vec![0.0, 0.0, 1.0],
+        ),
     ];
 
     let mut engine = make_engine(nodes);
 
     // Token "find" should map to search_fn
     let results = search_ids(&mut engine, "find_items");
-    assert!(results.contains(&"search_fn".to_string()),
-        "token 'find_items' should find search_fn");
+    assert!(
+        results.contains(&"search_fn".to_string()),
+        "token 'find_items' should find search_fn"
+    );
 
     // Token "draw" should map to render_fn
     let results = search_ids(&mut engine, "draw_screen");
-    assert!(results.contains(&"render_fn".to_string()),
-        "token 'draw_screen' should find render_fn");
+    assert!(
+        results.contains(&"render_fn".to_string()),
+        "token 'draw_screen' should find render_fn"
+    );
 
     // Token "check" should map to validate_fn
     let results = search_ids(&mut engine, "check_input");
-    assert!(results.contains(&"validate_fn".to_string()),
-        "token 'check_input' should find validate_fn");
+    assert!(
+        results.contains(&"validate_fn".to_string()),
+        "token 'check_input' should find validate_fn"
+    );
 }
 
 #[test]
 fn test_text_postings_correct_after_delta_update() {
-    let nodes = vec![
-        make_node("a", "fn a() { old_keyword(); }", vec![1.0, 0.0, 0.0]),
-    ];
+    let nodes = vec![make_node(
+        "a",
+        "fn a() { old_keyword(); }",
+        vec![1.0, 0.0, 0.0],
+    )];
 
     let mut engine = make_engine(nodes);
 
@@ -181,7 +211,11 @@ fn test_text_postings_correct_after_delta_update() {
     // Update a with new content
     engine.incremental_reindex(TextIndexDelta {
         removed_node_ids: vec![],
-        updated_nodes: vec![make_node("a", "fn a() { new_keyword(); }", vec![1.0, 0.0, 0.0])],
+        updated_nodes: vec![make_node(
+            "a",
+            "fn a() { new_keyword(); }",
+            vec![1.0, 0.0, 0.0],
+        )],
     });
 
     // "new_keyword" should now find a
@@ -208,20 +242,40 @@ fn test_node_tokens_correct_after_compact_rewrite() {
     // Search/filter behavior that depends on per-node token metadata still
     // works after resident token structures are compacted and re-keyed by row.
     let nodes = vec![
-        make_node("handler", "fn handler() { process_request(); }", vec![1.0, 0.0, 0.0]),
-        make_node("parser", "fn parser() { parse_data(); }", vec![0.0, 1.0, 0.0]),
+        make_node(
+            "handler",
+            "fn handler() { process_request(); }",
+            vec![1.0, 0.0, 0.0],
+        ),
+        make_node(
+            "parser",
+            "fn parser() { parse_data(); }",
+            vec![0.0, 1.0, 0.0],
+        ),
     ];
 
     let engine = make_engine(nodes);
 
     // Verify node_tokens are populated
     let handler_tokens = engine.node_tokens("handler").unwrap();
-    assert!(handler_tokens.contains("process"), "handler tokens should contain 'process'");
-    assert!(handler_tokens.contains("request"), "handler tokens should contain 'request'");
+    assert!(
+        handler_tokens.contains("process"),
+        "handler tokens should contain 'process'"
+    );
+    assert!(
+        handler_tokens.contains("request"),
+        "handler tokens should contain 'request'"
+    );
 
     let parser_tokens = engine.node_tokens("parser").unwrap();
-    assert!(parser_tokens.contains("parse"), "parser tokens should contain 'parse'");
-    assert!(parser_tokens.contains("data"), "parser tokens should contain 'data'");
+    assert!(
+        parser_tokens.contains("parse"),
+        "parser tokens should contain 'parse'"
+    );
+    assert!(
+        parser_tokens.contains("data"),
+        "parser tokens should contain 'data'"
+    );
 }
 
 #[test]
@@ -261,9 +315,8 @@ fn test_large_content_not_retained_after_indexing() {
     // strategy.
 
     // Create nodes with large content
-    let large_content: String = "fn big_fn() { ".to_string()
-        + &"large_data(); ".repeat(10_000)
-        + "}";
+    let large_content: String =
+        "fn big_fn() { ".to_string() + &"large_data(); ".repeat(10_000) + "}";
     let nodes = vec![
         make_node("big_fn", &large_content, vec![1.0, 0.0, 0.0]),
         make_node("small_fn", "fn small_fn() {}", vec![0.0, 1.0, 0.0]),
@@ -283,16 +336,21 @@ fn test_large_content_not_retained_after_indexing() {
     // Search should still work via inverted index (content was tokenized before clearing)
     let mut engine = engine;
     let results = search_ids(&mut engine, "large_data");
-    assert!(results.contains(&"big_fn".to_string()),
-        "search should find big_fn via inverted index even after content clearing");
+    assert!(
+        results.contains(&"big_fn".to_string()),
+        "search should find big_fn via inverted index even after content clearing"
+    );
 
     // Memory estimate should not include the large content
     let mem = engine.estimated_memory_bytes();
     // The large content was ~130KB. If retained, memory would be much higher.
     // With 2 nodes and 3-dim embeddings, memory should be well under 100KB
     // (just metadata + small embeddings + index structures)
-    assert!(mem < 500_000,
-        "estimated memory ({}) should not include large content blobs", mem);
+    assert!(
+        mem < 500_000,
+        "estimated memory ({}) should not include large content blobs",
+        mem
+    );
 }
 
 #[test]
@@ -322,7 +380,13 @@ fn test_search_cache_entry_limit() {
     // Under repeated queries, the search cache never grows beyond the
     // configured entry limit while still returning valid search results.
     let nodes: Vec<NodeInfo> = (0..20)
-        .map(|i| make_node(&format!("node_{}", i), &format!("fn node_{}() {{}}", i), vec![0.0; 3]))
+        .map(|i| {
+            make_node(
+                &format!("node_{}", i),
+                &format!("fn node_{}() {{}}", i),
+                vec![0.0; 3],
+            )
+        })
         .collect();
 
     let mut engine = make_engine(nodes);
@@ -354,7 +418,13 @@ fn test_search_cache_entry_limit() {
 #[test]
 fn test_search_cache_byte_limit() {
     let nodes: Vec<NodeInfo> = (0..20)
-        .map(|i| make_node(&format!("node_{}", i), &format!("fn node_{}() {{}}", i), vec![0.0; 3]))
+        .map(|i| {
+            make_node(
+                &format!("node_{}", i),
+                &format!("fn node_{}() {{}}", i),
+                vec![0.0; 3],
+            )
+        })
         .collect();
 
     let mut engine = make_engine(nodes);
@@ -439,7 +509,10 @@ async fn test_edit_cache_rejects_oversized() {
         timestamp: chrono::Utc::now(),
     };
 
-    let result = cache.set(temp_dir.path(), oversized).await.expect("no IO error");
+    let result = cache
+        .set(temp_dir.path(), oversized)
+        .await
+        .expect("no IO error");
     assert!(result.is_err(), "oversized entry should be rejected");
 }
 
@@ -465,7 +538,10 @@ async fn test_edit_cache_total_cap_enforced() {
             }],
             timestamp: chrono::Utc::now(),
         };
-        let result = cache.set(temp_dir.path(), entry).await.expect("no IO error");
+        let result = cache
+            .set(temp_dir.path(), entry)
+            .await
+            .expect("no IO error");
         assert!(result.is_ok(), "entry {} should be accepted", i);
     }
 
@@ -486,7 +562,7 @@ async fn test_edit_cache_total_cap_enforced() {
 fn test_work_hoister_is_bounded() {
     // The work hoister cache is bounded by entries and bytes.
     use leindex::search::search::WorkHoister;
-    use leindex::search::search::{WORK_HOISTER_MAX_ENTRIES, WORK_HOISTER_MAX_BYTES};
+    use leindex::search::search::{WORK_HOISTER_MAX_BYTES, WORK_HOISTER_MAX_ENTRIES};
 
     let mut hoister = WorkHoister::new();
 
@@ -579,14 +655,26 @@ fn test_search_engine_exposes_cache_bytes() {
     let _ = engine.search(q);
 
     // After search, cache should have entries and bytes
-    assert!(engine.search_cache_len() > 0, "cache should have entries after search");
-    assert!(engine.search_cache_bytes() > 0, "cache should have bytes after search");
+    assert!(
+        engine.search_cache_len() > 0,
+        "cache should have entries after search"
+    );
+    assert!(
+        engine.search_cache_bytes() > 0,
+        "cache should have bytes after search"
+    );
 }
 
 #[test]
 fn test_search_engine_estimated_memory() {
     let nodes: Vec<NodeInfo> = (0..50)
-        .map(|i| make_node(&format!("n{}", i), &format!("fn n{}() {{}}", i), vec![0.0; 3]))
+        .map(|i| {
+            make_node(
+                &format!("n{}", i),
+                &format!("fn n{}() {{}}", i),
+                vec![0.0; 3],
+            )
+        })
         .collect();
 
     let engine = make_engine(nodes);
@@ -596,8 +684,11 @@ fn test_search_engine_estimated_memory() {
 
     // Memory should be reasonable for 50 nodes with 3-dim embeddings
     // (no content stored, just metadata + embeddings + index structures)
-    assert!(mem < 10_000_000,
-        "estimated memory ({}) should be reasonable for 50 small nodes", mem);
+    assert!(
+        mem < 10_000_000,
+        "estimated memory ({}) should be reasonable for 50 small nodes",
+        mem
+    );
 }
 
 #[test]
@@ -608,10 +699,17 @@ fn test_work_hoister_exposes_byte_accounting() {
     assert_eq!(hoister.bytes_used(), 0);
 
     hoister.store("test content", vec![1.0f32; 128]);
-    assert!(hoister.bytes_used() > 0, "hoister should track bytes after store");
+    assert!(
+        hoister.bytes_used() > 0,
+        "hoister should track bytes after store"
+    );
 
     hoister.clear();
-    assert_eq!(hoister.bytes_used(), 0, "hoister bytes should be 0 after clear");
+    assert_eq!(
+        hoister.bytes_used(),
+        0,
+        "hoister bytes should be 0 after clear"
+    );
 }
 
 // ============================================================================
@@ -705,9 +803,21 @@ fn test_compact_node_metadata_uses_row_addressing() {
     // addressing in place of wider identifier-heavy representations.
 
     let nodes = vec![
-        make_node("func_alpha", "fn func_alpha() { compute(); }", vec![1.0, 0.0, 0.0]),
-        make_node("func_beta", "fn func_beta() { render(); }", vec![0.0, 1.0, 0.0]),
-        make_node("func_gamma", "fn func_gamma() { validate(); }", vec![0.0, 0.0, 1.0]),
+        make_node(
+            "func_alpha",
+            "fn func_alpha() { compute(); }",
+            vec![1.0, 0.0, 0.0],
+        ),
+        make_node(
+            "func_beta",
+            "fn func_beta() { render(); }",
+            vec![0.0, 1.0, 0.0],
+        ),
+        make_node(
+            "func_gamma",
+            "fn func_gamma() { validate(); }",
+            vec![0.0, 0.0, 1.0],
+        ),
     ];
 
     let engine = make_engine(nodes);
@@ -723,7 +833,12 @@ fn test_compact_node_metadata_uses_row_addressing() {
     // Row indices should be valid u32 values
     for id in &["func_alpha", "func_beta", "func_gamma"] {
         let row = compact.row_index(id).unwrap();
-        assert!(row < engine.node_count() as u32, "row {} should be < {}", row, engine.node_count());
+        assert!(
+            row < engine.node_count() as u32,
+            "row {} should be < {}",
+            row,
+            engine.node_count()
+        );
     }
 
     // Complexity should be accessible by row
@@ -731,8 +846,11 @@ fn test_compact_node_metadata_uses_row_addressing() {
         let row = compact.row_index(id).unwrap();
         let compact_complexity = compact.complexity_by_row(row);
         let engine_complexity = engine.node_complexity(id);
-        assert_eq!(compact_complexity, engine_complexity,
-            "compact complexity for row {} should match engine", row);
+        assert_eq!(
+            compact_complexity, engine_complexity,
+            "compact complexity for row {} should match engine",
+            row
+        );
     }
 }
 
@@ -740,7 +858,13 @@ fn test_compact_node_metadata_uses_row_addressing() {
 fn test_compact_metadata_stable_lookup() {
     // Compact addressing provides stable lookup semantics.
     let nodes: Vec<NodeInfo> = (0..20)
-        .map(|i| make_node(&format!("n{}", i), &format!("fn n{}() {{}}", i), vec![0.0; 3]))
+        .map(|i| {
+            make_node(
+                &format!("n{}", i),
+                &format!("fn n{}() {{}}", i),
+                vec![0.0; 3],
+            )
+        })
         .collect();
 
     let engine = make_engine(nodes);
@@ -768,9 +892,21 @@ fn test_search_correct_after_integer_compaction() {
     // behaviorally correct after compaction to row-oriented integer-backed forms.
 
     let nodes = vec![
-        make_node("search_fn", "fn search_fn() { find(); query(); }", vec![1.0, 0.0, 0.0]),
-        make_node("index_fn", "fn index_fn() { build(); store(); }", vec![0.0, 1.0, 0.0]),
-        make_node("cache_fn", "fn cache_fn() { get(); put(); evict(); }", vec![0.0, 0.0, 1.0]),
+        make_node(
+            "search_fn",
+            "fn search_fn() { find(); query(); }",
+            vec![1.0, 0.0, 0.0],
+        ),
+        make_node(
+            "index_fn",
+            "fn index_fn() { build(); store(); }",
+            vec![0.0, 1.0, 0.0],
+        ),
+        make_node(
+            "cache_fn",
+            "fn cache_fn() { get(); put(); evict(); }",
+            vec![0.0, 0.0, 1.0],
+        ),
     ];
 
     let mut engine = make_engine(nodes.clone());
@@ -781,18 +917,27 @@ fn test_search_correct_after_integer_compaction() {
 
     // "find" should map to search_fn's row
     let find_row = compact.row_index("search_fn").unwrap();
-    assert!(token_idx.nodes_for_token("find").contains(&find_row),
-        "token 'find' should map to search_fn row {}", find_row);
+    assert!(
+        token_idx.nodes_for_token("find").contains(&find_row),
+        "token 'find' should map to search_fn row {}",
+        find_row
+    );
 
     // "build" should map to index_fn's row
     let build_row = compact.row_index("index_fn").unwrap();
-    assert!(token_idx.nodes_for_token("build").contains(&build_row),
-        "token 'build' should map to index_fn row {}", build_row);
+    assert!(
+        token_idx.nodes_for_token("build").contains(&build_row),
+        "token 'build' should map to index_fn row {}",
+        build_row
+    );
 
     // "evict" should map to cache_fn's row
     let evict_row = compact.row_index("cache_fn").unwrap();
-    assert!(token_idx.nodes_for_token("evict").contains(&evict_row),
-        "token 'evict' should map to cache_fn row {}", evict_row);
+    assert!(
+        token_idx.nodes_for_token("evict").contains(&evict_row),
+        "token 'evict' should map to cache_fn row {}",
+        evict_row
+    );
 
     // Full search should still work correctly
     let results = search_ids(&mut engine, "find query");
@@ -847,7 +992,9 @@ fn test_compaction_coherence_after_delta_update() {
     assert!(token_idx.nodes_for_token("gamma").contains(&c_row));
 
     // Coherence check
-    engine.validate_coherence().expect("index should be coherent");
+    engine
+        .validate_coherence()
+        .expect("index should be coherent");
 }
 
 // ============================================================================
@@ -982,20 +1129,33 @@ fn test_full_compression_cycle_under_load() {
     for i in (0..200).step_by(10) {
         let query = format!("task{}", i);
         let results = search_ids(&mut engine, &query);
-        assert!(results.contains(&format!("fn_{}", i)),
-            "search for '{}' should find fn_{}, got: {:?}", query, i, results);
+        assert!(
+            results.contains(&format!("fn_{}", i)),
+            "search for '{}' should find fn_{}, got: {:?}",
+            query,
+            i,
+            results
+        );
     }
 
     // Incremental update
     engine.incremental_reindex(TextIndexDelta {
         removed_node_ids: (0..50).map(|i| format!("fn_{}", i)).collect(),
-        updated_nodes: (200..210).map(|i| {
-            make_node(&format!("fn_{}", i), &format!("fn fn_{}() {{ new_op(); }}", i), vec![0.5; 3])
-        }).collect(),
+        updated_nodes: (200..210)
+            .map(|i| {
+                make_node(
+                    &format!("fn_{}", i),
+                    &format!("fn fn_{}() {{ new_op(); }}", i),
+                    vec![0.5; 3],
+                )
+            })
+            .collect(),
     });
 
     // Verify coherence
-    engine.validate_coherence().expect("index should be coherent after updates");
+    engine
+        .validate_coherence()
+        .expect("index should be coherent after updates");
 
     // Compact metadata should reflect changes
     let compact = engine.compact_metadata();
@@ -1003,14 +1163,20 @@ fn test_full_compression_cycle_under_load() {
 
     // Removed nodes should not be in compact metadata
     for i in 0..50 {
-        assert!(compact.row_index(&format!("fn_{}", i)).is_none(),
-            "fn_{} should not be in compact metadata after removal", i);
+        assert!(
+            compact.row_index(&format!("fn_{}", i)).is_none(),
+            "fn_{} should not be in compact metadata after removal",
+            i
+        );
     }
 
     // New nodes should be in compact metadata
     for i in 200..210 {
-        assert!(compact.row_index(&format!("fn_{}", i)).is_some(),
-            "fn_{} should be in compact metadata after addition", i);
+        assert!(
+            compact.row_index(&format!("fn_{}", i)).is_some(),
+            "fn_{} should be in compact metadata after addition",
+            i
+        );
     }
 
     // Cache should be bounded

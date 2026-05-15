@@ -12,7 +12,7 @@
 use crate::report::PhaseReport;
 use crate::sampler;
 use anyhow::{Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -204,7 +204,8 @@ fn run_idle_phase(
     } else {
         None
     };
-    let report = sample_pid_for_duration(pid, phase_name, dwell, config.sample_interval, worker_name)?;
+    let report =
+        sample_pid_for_duration(pid, phase_name, dwell, config.sample_interval, worker_name)?;
 
     if config.verbose {
         eprintln!(
@@ -411,7 +412,7 @@ fn sample_pid_for_duration(
 /// (main_rss + worker_rss) across all samples.
 fn build_phase_report(
     phase_name: &str,
-    samples: &mut Vec<sampler::MemorySample>,
+    samples: &mut [sampler::MemorySample],
     duration: Duration,
 ) -> PhaseReport {
     if samples.is_empty() {
@@ -469,7 +470,7 @@ fn build_phase_report(
 }
 
 /// Clean any existing leindex index state from the fixture directory.
-fn clean_index_state(fixture: &PathBuf) {
+fn clean_index_state(fixture: &Path) {
     let leindex_dir = fixture.join(".leindex");
     if leindex_dir.exists() {
         let _ = std::fs::remove_dir_all(&leindex_dir);

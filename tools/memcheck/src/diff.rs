@@ -291,7 +291,9 @@ pub fn format_diff(diff: &DiffResult) -> String {
             }
         }
         if !pd.combined_ceiling_passed {
-            if let (Some(ce), Some(_thr)) = (pd.combined_ceiling_kib, pd.combined_ceiling_threshold_kib) {
+            if let (Some(ce), Some(_thr)) =
+                (pd.combined_ceiling_kib, pd.combined_ceiling_threshold_kib)
+            {
                 lines.push(format!(
                     "  ⚠ COMBINED RSS ceiling regression: {} KiB > combined ceiling({} KiB) + {}%",
                     pd.combined_measured_kib,
@@ -333,10 +335,7 @@ pub fn format_diff(diff: &DiffResult) -> String {
             failed.join(", ")
         ));
         if !main_failures.is_empty() {
-            lines.push(format!(
-                "  Main RSS failures: {}",
-                main_failures.join(", ")
-            ));
+            lines.push(format!("  Main RSS failures: {}", main_failures.join(", ")));
         }
         if !combined_failures.is_empty() {
             lines.push(format!(

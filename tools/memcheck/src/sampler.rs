@@ -223,11 +223,9 @@ fn read_pss_from_rollup(pid: u32) -> u64 {
 
     for line in content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            if parts[0] == "Pss:" {
-                if let Ok(v) = parts[1].parse::<u64>() {
-                    return v;
-                }
+        if parts.len() >= 2 && parts[0] == "Pss:" {
+            if let Ok(v) = parts[1].parse::<u64>() {
+                return v;
             }
         }
     }
@@ -273,13 +271,7 @@ fn read_mapped_anon_smaps(pid: u32) -> (u64, u64) {
         }
 
         if let Some(rest) = trimmed.strip_prefix("Rss:") {
-            if let Ok(value) = rest
-                .trim()
-                .split_whitespace()
-                .next()
-                .unwrap_or("0")
-                .parse::<u64>()
-            {
+            if let Ok(value) = rest.split_whitespace().next().unwrap_or("0").parse::<u64>() {
                 if is_file_mapped {
                     mapped_file += value;
                 } else {
@@ -403,7 +395,10 @@ mod tests {
     fn test_read_proc_comm() {
         let pid = std::process::id();
         let comm = read_proc_comm(pid);
-        assert!(comm.is_some(), "should be able to read comm for current process");
+        assert!(
+            comm.is_some(),
+            "should be able to read comm for current process"
+        );
         // The process name should be non-empty
         assert!(!comm.unwrap().is_empty());
     }

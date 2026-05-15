@@ -168,10 +168,7 @@ impl QwenEmbeddingProvider {
             })?
             .commit_from_file(&self.model_path)
             .map_err(|e| {
-                QwenEmbeddingProviderError::OnnxRuntime(format!(
-                    "Failed to reload model: {}",
-                    e
-                ))
+                QwenEmbeddingProviderError::OnnxRuntime(format!("Failed to reload model: {}", e))
             })?;
 
         *guard = Some(session);
@@ -749,7 +746,10 @@ mod tests {
 
             // Unload should succeed
             provider.unload();
-            assert!(!provider.is_loaded(), "provider should not be loaded after unload");
+            assert!(
+                !provider.is_loaded(),
+                "provider should not be loaded after unload"
+            );
         }
     }
 
@@ -763,14 +763,18 @@ mod tests {
         let result = QwenEmbeddingProvider::new();
         if let Ok(provider) = result {
             // Use → unload → use cycle
-            let _first = provider.embed("test input").expect("first embed should work");
+            let _first = provider
+                .embed("test input")
+                .expect("first embed should work");
             assert!(provider.is_loaded());
 
             provider.unload();
             assert!(!provider.is_loaded(), "should be unloaded after unload()");
 
             // Lazy reload on next embed
-            let second = provider.embed("test input after reload").expect("embed after unload should trigger lazy reload");
+            let second = provider
+                .embed("test input after reload")
+                .expect("embed after unload should trigger lazy reload");
             assert_eq!(second.len(), provider.dimension());
             assert!(provider.is_loaded(), "should be reloaded after embed");
         }

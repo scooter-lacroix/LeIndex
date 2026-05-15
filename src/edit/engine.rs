@@ -1247,6 +1247,7 @@ impl WorktreeSession {
                 let backup_result = std::fs::rename(original, backup_path);
                 if let Err(e) = backup_result {
                     // Check if it's a cross-device error
+                    #[allow(clippy::incompatible_msrv)]
                     if e.kind() == std::io::ErrorKind::CrossesDevices {
                         // Fallback to copy + remove for cross-device moves
                         if let Err(copy_err) = std::fs::copy(original, backup_path) {
@@ -1286,6 +1287,7 @@ impl WorktreeSession {
             let move_result = std::fs::rename(staged, original);
             if let Err(e) = move_result {
                 // Check if it's a cross-device error
+                #[allow(clippy::incompatible_msrv)]
                 if e.kind() == std::io::ErrorKind::CrossesDevices {
                     // Fallback to copy + remove for cross-device moves
                     if let Err(copy_err) = std::fs::copy(staged, original) {

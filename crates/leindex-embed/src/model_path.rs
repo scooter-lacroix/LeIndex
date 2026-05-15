@@ -8,7 +8,7 @@
 // The resolver is used by the worker runtime to locate model and tokenizer
 // files without requiring the main daemon to pass paths explicitly.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Error during model path resolution.
 #[derive(Debug, Clone)]
@@ -119,7 +119,7 @@ impl ModelResolver {
     /// Determine the source of a resolved path for reporting.
     ///
     /// Returns one of: "env_override", "bundled", "user_cache".
-    pub fn source_for_path(path: &PathBuf) -> &'static str {
+    pub fn source_for_path(path: &Path) -> &'static str {
         // Check env override first — if the env var is set and the path is
         // rooted under it, report as env_override regardless of whether the
         // file also happens to live near the binary.

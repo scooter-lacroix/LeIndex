@@ -128,9 +128,7 @@ impl ExecutionProviderSelector {
                     Err(ProviderSelection {
                         provider: Provider::Cpu,
                         is_requested: false,
-                        fallback_reason: Some(
-                            "ROCm runtime not found on this system".to_string(),
-                        ),
+                        fallback_reason: Some("ROCm runtime not found on this system".to_string()),
                     })
                 }
             }
@@ -145,9 +143,7 @@ impl ExecutionProviderSelector {
                     Err(ProviderSelection {
                         provider: Provider::Cpu,
                         is_requested: false,
-                        fallback_reason: Some(
-                            "CoreML is only available on macOS".to_string(),
-                        ),
+                        fallback_reason: Some("CoreML is only available on macOS".to_string()),
                     })
                 }
             }

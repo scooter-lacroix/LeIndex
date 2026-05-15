@@ -22,7 +22,7 @@ impl Default for BatchConfig {
     fn default() -> Self {
         Self {
             max_frame_size: 16 * 1024 * 1024, // 16 MiB
-            max_text_size: 1024 * 1024,        // 1 MiB
+            max_text_size: 1024 * 1024,       // 1 MiB
         }
     }
 }

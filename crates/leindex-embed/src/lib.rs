@@ -24,20 +24,23 @@
 // VAL-CPHASE-014: Oversized batch is split before transport and re-stitched.
 // VAL-CPHASE-015: Single oversized text is reduced before IPC framing.
 
+pub mod batch;
+pub mod model_path;
 pub mod protocol;
+pub mod provider;
 pub mod runtime;
 pub mod startup;
-pub mod model_path;
-pub mod provider;
-pub mod batch;
 
 pub use protocol::{
     BatchId, EmbedRequest, EmbedResponse, ErrorKind, Frame, FrameHeader, Request, RerankRequest,
     RerankResponse, Response,
 };
 
-pub use runtime::{RuntimeConfig, WorkerRuntime, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_TEXT_SIZE};
-pub use startup::{StartupReport, StartupReporter};
+pub use batch::{split_request, stitch_responses, truncate_text, BatchConfig};
 pub use model_path::ModelResolver;
 pub use provider::ExecutionProviderSelector;
-pub use batch::{BatchConfig, split_request, stitch_responses, truncate_text};
+pub use runtime::{
+    RuntimeConfig, WorkerRuntime, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_FRAME_SIZE,
+    DEFAULT_MAX_TEXT_SIZE,
+};
+pub use startup::{StartupReport, StartupReporter};

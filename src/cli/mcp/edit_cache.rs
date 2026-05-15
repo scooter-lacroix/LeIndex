@@ -42,7 +42,11 @@ impl EditCacheEntry {
             + self.preview_token.len()
             + self.original_text.len()
             + self.modified_text.len()
-            + self.changes.iter().map(|c| c.estimated_size()).sum::<usize>()
+            + self
+                .changes
+                .iter()
+                .map(|c| c.estimated_size())
+                .sum::<usize>()
             + 64 // overhead estimate for timestamp, metadata
     }
 }
@@ -163,8 +167,10 @@ impl EditCache {
 
             // Account for replacing an existing entry
             if let Some(existing) = entries.get(&abs_path) {
-                self.total_bytes
-                    .fetch_sub(existing.estimated_size(), std::sync::atomic::Ordering::Relaxed);
+                self.total_bytes.fetch_sub(
+                    existing.estimated_size(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
             }
 
             // Evict until there is room

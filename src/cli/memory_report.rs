@@ -78,7 +78,12 @@ impl MemoryReportTracker {
     }
 
     /// Record a completed phase summary.
-    pub fn record_phase(&mut self, name: impl Into<String>, peak_rss_bytes: u64, sample_count: u64) {
+    pub fn record_phase(
+        &mut self,
+        name: impl Into<String>,
+        peak_rss_bytes: u64,
+        sample_count: u64,
+    ) {
         self.phases.push(PhaseSummary {
             name: name.into(),
             peak_rss_bytes,
@@ -220,7 +225,11 @@ mod tests {
         std::env::remove_var(MEMORY_REPORT_ENV);
         std::env::set_var(MEMORY_REPORT_ENV, "");
         let result = resolve_report_path(None);
-        assert!(result.is_none(), "empty env var should be ignored, got {:?}", result);
+        assert!(
+            result.is_none(),
+            "empty env var should be ignored, got {:?}",
+            result
+        );
         std::env::remove_var(MEMORY_REPORT_ENV);
     }
 

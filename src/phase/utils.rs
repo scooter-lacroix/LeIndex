@@ -22,8 +22,9 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
         "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Systems languages
         "cs",  // C#
         "rb", "php", "lua", "scala", "sc", // Scripting languages
-        "sh", "bash", // Shell
-        "json", // Data
+        "sh", "bash",  // Shell
+        "rs.in", // Winit-generated Rust bindings / event-loop scaffolding
+        "json",  // Data
     ];
 
     // Optional focused-file mode (used by MCP when path points to a single file).

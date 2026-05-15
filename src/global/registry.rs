@@ -3,11 +3,8 @@
 //! Provides persistent storage for discovered projects with automatic reconnection.
 
 use crate::global::DEFAULT_DB_PATH;
+use crate::storage::schema::{GLOBAL_REGISTRY_CACHE_SIZE_KIB, GLOBAL_REGISTRY_MMAP_SIZE};
 use crate::storage::UniqueProjectId;
-use crate::storage::schema::{
-    GLOBAL_REGISTRY_CACHE_SIZE_KIB,
-    GLOBAL_REGISTRY_MMAP_SIZE,
-};
 use rusqlite::{params, Connection};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -118,8 +115,10 @@ impl GlobalRegistry {
         self.conn.pragma_update(None, "journal_mode", "WAL")?;
 
         // Thin global-registry cache budget (A+ Section 5.2)
-        self.conn.pragma_update(None, "cache_size", GLOBAL_REGISTRY_CACHE_SIZE_KIB)?;
-        self.conn.pragma_update(None, "mmap_size", GLOBAL_REGISTRY_MMAP_SIZE)?;
+        self.conn
+            .pragma_update(None, "cache_size", GLOBAL_REGISTRY_CACHE_SIZE_KIB)?;
+        self.conn
+            .pragma_update(None, "mmap_size", GLOBAL_REGISTRY_MMAP_SIZE)?;
 
         // Create global_projects table
         self.conn.execute(

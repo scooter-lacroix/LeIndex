@@ -789,7 +789,10 @@ mod tests {
                     "fn authenticate_user_{}() {{ verify_password(); }} // auth module",
                     i
                 ),
-                1 => format!("fn parse_config_{}() {{ read_file(); }} // config parsing", i),
+                1 => format!(
+                    "fn parse_config_{}() {{ read_file(); }} // config parsing",
+                    i
+                ),
                 2 => format!("fn handle_request_{}() {{ route(); }} // http handler", i),
                 3 => format!("fn compute_hash_{}() {{ sha256(); }} // crypto utility", i),
                 _ => format!("fn format_output_{}() {{ serialize(); }} // formatting", i),
@@ -853,11 +856,20 @@ mod tests {
             engine.search_staged(query.clone(), &staged_config).unwrap();
 
         // Both should return results
-        assert!(!standard_results.is_empty(), "Standard search should return results");
-        assert!(!staged_results.is_empty(), "Staged search should return results");
+        assert!(
+            !standard_results.is_empty(),
+            "Standard search should return results"
+        );
+        assert!(
+            !staged_results.is_empty(),
+            "Staged search should return results"
+        );
 
         // Staged retrieval was actually used
-        assert!(metrics.staged_used, "Staged retrieval should report as used");
+        assert!(
+            metrics.staged_used,
+            "Staged retrieval should report as used"
+        );
 
         // The top result from staged should match the top result from standard.
         // This verifies that the exact rerank preserves the best result.
@@ -1026,7 +1038,10 @@ mod tests {
 
         // 1. Staged retrieval is opt-in (disabled by default)
         let default_config = StagedRetrievalConfig::default();
-        assert!(!default_config.enabled, "Staged retrieval should be disabled by default");
+        assert!(
+            !default_config.enabled,
+            "Staged retrieval should be disabled by default"
+        );
 
         // 2. When disabled, search_staged falls back to standard search
         let query = SearchQuery {
@@ -1040,8 +1055,13 @@ mod tests {
             query_type: None,
         };
 
-        let (_, metrics) = engine.search_staged(query.clone(), &default_config).unwrap();
-        assert!(!metrics.staged_used, "Should not use staged path when disabled");
+        let (_, metrics) = engine
+            .search_staged(query.clone(), &default_config)
+            .unwrap();
+        assert!(
+            !metrics.staged_used,
+            "Should not use staged path when disabled"
+        );
 
         // 3. The standard search path still works and is the authoritative default
         let standard_results = engine.search(query.clone()).unwrap();
@@ -1056,8 +1076,7 @@ mod tests {
         assert_eq!(staged_config.coarse_multiplier, 3);
 
         // 5. Staged results should be consistent with standard results
-        let (staged_results, staged_metrics) =
-            engine.search_staged(query, &staged_config).unwrap();
+        let (staged_results, staged_metrics) = engine.search_staged(query, &staged_config).unwrap();
         assert!(staged_metrics.staged_used);
         assert!(!staged_results.is_empty());
 
@@ -1111,7 +1130,9 @@ mod tests {
         let num_nodes = 200;
 
         let mut engine = SearchEngine::with_dimension(dimension);
-        engine.enable_int8_hnsw(Some(Int8HnswParams::new().with_m(8).with_ef_construction(50)));
+        engine.enable_int8_hnsw(Some(
+            Int8HnswParams::new().with_m(8).with_ef_construction(50),
+        ));
         engine.index_nodes(create_staged_test_nodes(num_nodes, dimension));
 
         let mut query_embedding = vec![0.0f32; dimension];

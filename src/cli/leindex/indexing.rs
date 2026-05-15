@@ -10,11 +10,6 @@ use tracing::{info, warn};
 impl LeIndex {
     pub(crate) fn incremental_reindex_from_watcher(&mut self) -> Result<super::IndexStats> {
         let start_time = std::time::Instant::now();
-        info!(
-            "Starting watcher incremental reindex for: {}",
-            self.project_id
-        );
-
         let indexed_files =
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .context("Failed to load indexed files from storage")?;
@@ -51,14 +46,7 @@ impl LeIndex {
             .cloned()
             .collect();
 
-        info!(
-            "Watcher delta: {} changed, {} deleted",
-            changed_files.len(),
-            deleted_files.len()
-        );
-
         if changed_files.is_empty() && deleted_files.is_empty() {
-            info!("Watcher found no delta, skipping incremental reindex");
             return Ok(self.stats.clone());
         }
 

@@ -251,7 +251,12 @@ fn test_val_measure_003_per_phase_schema_has_required_metrics() {
         // duration_ms should be positive for the first 6 phases
         let duration = phase.get("duration_ms").unwrap().as_u64().unwrap();
         if !phase_name.starts_with("embed_") {
-            assert!(duration > 0, "phase {} ('{}') should have positive duration", i, phase_name);
+            assert!(
+                duration > 0,
+                "phase {} ('{}') should have positive duration",
+                i,
+                phase_name
+            );
         }
     }
 }

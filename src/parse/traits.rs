@@ -491,7 +491,6 @@ pub mod languages {
     //         tree_sitter_swift::LANGUAGE.into()
     //     }
     // }
-
     /// Kotlin language implementation (disabled due to tree-sitter version conflicts)
     // #[cfg(feature = "parse")]
     // pub mod kotlin {
@@ -508,7 +507,6 @@ pub mod languages {
     //         unsafe { std::mem::transmute(tree_sitter_kotlin::language()) }
     //     }
     // }
-
     /// Dart language implementation (disabled due to tree-sitter version conflicts)
     // #[cfg(feature = "parse")]
     // pub mod dart {
@@ -525,7 +523,6 @@ pub mod languages {
     //         tree_sitter_dart::LANGUAGE.into()
     //     }
     // }
-
     /// Lua language support.
     pub mod lua {
         use super::{Language, LanguageConfig};

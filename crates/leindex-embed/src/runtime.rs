@@ -18,13 +18,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::protocol::{
-    self, BatchId, EmbedResponse, ErrorKind, Frame, MsgType, Request,
-    RerankResponse, WorkerError,
-};
-use crate::startup::{StartupReport, StartupReporter};
 use crate::model_path::ModelResolver;
+use crate::protocol::{
+    self, BatchId, EmbedResponse, ErrorKind, Frame, MsgType, Request, RerankResponse, WorkerError,
+};
 use crate::provider::ExecutionProviderSelector;
+use crate::startup::{StartupReport, StartupReporter};
 
 /// Default idle timeout in seconds before the worker tears itself down.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes
@@ -167,11 +166,7 @@ impl WorkerRuntime {
             Ok(path) => {
                 let source = if std::env::var("LEINDEX_MODEL_PATH").is_ok() {
                     "env_override"
-                } else if path
-                    .to_str()
-                    .map(|s| s.contains("models"))
-                    .unwrap_or(false)
-                {
+                } else if path.to_str().map(|s| s.contains("models")).unwrap_or(false) {
                     // Check if it's near the binary
                     if let Ok(exe) = std::env::current_exe() {
                         if let Some(parent) = exe.parent() {
@@ -199,8 +194,7 @@ impl WorkerRuntime {
         };
 
         // Determine execution provider
-        let provider_result =
-            ExecutionProviderSelector::select(&self.config.execution_provider);
+        let provider_result = ExecutionProviderSelector::select(&self.config.execution_provider);
         match provider_result {
             Ok(provider) => {
                 reporter.set_execution_provider(&provider.name(), true, None);

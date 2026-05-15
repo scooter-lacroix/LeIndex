@@ -1133,8 +1133,8 @@ impl Int8QualityGate {
         // DCG@10
         let k = 10.min(returned_ids.len());
         let mut dcg: f64 = 0.0;
-        for i in 0..k {
-            if relevant_ids.contains(&returned_ids[i]) {
+        for (i, id) in returned_ids.iter().take(k).enumerate() {
+            if relevant_ids.contains(id) {
                 let rank = (i + 1) as f64;
                 dcg += 1.0 / (rank + 1.0).log2();
             }

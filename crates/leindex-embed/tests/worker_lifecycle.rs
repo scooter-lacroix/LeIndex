@@ -17,14 +17,14 @@
 use std::io::Cursor;
 use std::time::Duration;
 
+use leindex_embed::batch::{self, BatchConfig, SplitResult};
+use leindex_embed::model_path::ModelResolver;
 use leindex_embed::protocol::{
     self, BatchId, EmbedRequest, EmbedResponse, MsgType, Request, Response,
 };
-use leindex_embed::runtime::{RuntimeConfig, WorkerRuntime};
-use leindex_embed::batch::{self, BatchConfig, SplitResult};
-use leindex_embed::startup::{StartupReport, StartupReporter};
-use leindex_embed::model_path::ModelResolver;
 use leindex_embed::provider::ExecutionProviderSelector;
+use leindex_embed::runtime::{RuntimeConfig, WorkerRuntime};
+use leindex_embed::startup::{StartupReport, StartupReporter};
 
 // ── VAL-CPHASE-004: Worker transport uses local IPC only ────────────────
 
@@ -253,17 +253,16 @@ fn test_startup_report_with_fallback_reason() {
         model_name: "qwen3-embed-0.6b".to_string(),
         quantization_mode: "none".to_string(),
         warm_load_latency: Duration::from_millis(100),
-        model_path: Some(std::path::PathBuf::from("/home/user/.leindex/models/model.onnx")),
+        model_path: Some(std::path::PathBuf::from(
+            "/home/user/.leindex/models/model.onnx",
+        )),
         model_path_source: Some("user_cache".to_string()),
         model_error: None,
     };
 
     let line = report.to_log_line();
     assert!(line.contains("cuda"), "should mention requested provider");
-    assert!(
-        line.contains("unavailable"),
-        "should report unavailability"
-    );
+    assert!(line.contains("unavailable"), "should report unavailability");
     assert!(
         line.contains("CUDA driver not found"),
         "should include fallback reason"
@@ -277,7 +276,10 @@ fn test_startup_reporter_builds_complete_report() {
     reporter.set_model_name("qwen3-embed-0.6b");
     reporter.set_quantization_mode("int8");
     reporter.set_warm_load_latency(Duration::from_millis(200));
-    reporter.set_model_path(&std::path::PathBuf::from("/opt/models/model.onnx"), "bundled");
+    reporter.set_model_path(
+        &std::path::PathBuf::from("/opt/models/model.onnx"),
+        "bundled",
+    );
 
     let report = reporter.build();
     assert_eq!(report.execution_provider, "cpu");
@@ -379,7 +381,11 @@ fn test_embed_response_flat_row_major() {
     let rt = WorkerRuntime::new(config);
 
     let request = EmbedRequest {
-        texts: vec!["text1".to_string(), "text2".to_string(), "text3".to_string()],
+        texts: vec![
+            "text1".to_string(),
+            "text2".to_string(),
+            "text3".to_string(),
+        ],
         expected_dim: 4,
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
@@ -461,7 +467,10 @@ fn test_oversized_batch_split_and_stitch() {
 
     match split {
         SplitResult::Split(sub_batches) => {
-            assert!(sub_batches.len() > 1, "should be split into multiple sub-batches");
+            assert!(
+                sub_batches.len() > 1,
+                "should be split into multiple sub-batches"
+            );
 
             // All sub-batches have the same batch ID
             for sb in &sub_batches {
