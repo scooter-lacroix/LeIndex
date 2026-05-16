@@ -14,6 +14,9 @@ use tracing::info;
 #[cfg(feature = "onnx")]
 use crate::search::onnx::{EmbedResult, EmbeddingClient};
 
+#[cfg(feature = "onnx")]
+use tokio::task;
+
 #[cfg(feature = "remote-embeddings")]
 use crate::search::onnx::remote::RemoteEmbeddingProvider;
 #[cfg(feature = "remote-embeddings")]
@@ -420,6 +423,13 @@ impl TfIdfEmbedder {
 // HYBRID EMBEDDING BACKEND (Unified TF-IDF + Neural/Remote)
 // ============================================================================
 
+/// Neural embedding dimension for the Qwen3-Embedding-0.6B ONNX model.
+///
+/// This dimension is used for local ONNX-backed neural embeddings.
+/// The value must match the output dimension of the deployed model.
+#[cfg(feature = "onnx")]
+pub(crate) const NEURAL_EMBEDDING_DIMENSION: usize = 1024;
+
 /// Hybrid embedding backend that always uses TF-IDF as base signal
 /// with optional neural/remote embeddings as enhancement layers
 #[derive(Debug, Clone)]
@@ -563,7 +573,7 @@ impl HybridEmbedder {
         match self {
             Self::TfIdfOnly(_) => None,
             #[cfg(feature = "onnx")]
-            Self::HybridLocal { .. } => Some(1024), // Qwen3-Embedding-0.6B dimension
+            Self::HybridLocal { .. } => Some(NEURAL_EMBEDDING_DIMENSION),
             #[cfg(feature = "remote-embeddings")]
             Self::HybridRemote { remote, .. } => Some(remote.dimension()),
         }
@@ -619,10 +629,16 @@ impl HybridEmbedder {
             Self::TfIdfOnly(_) => None,
             #[cfg(feature = "onnx")]
             Self::HybridLocal { neural, .. } => {
-                // Delegate to the worker process via the embedding client
-                // with retry-once fallback semantics
+                // Clone the client since EmbeddingClient::Clone creates a new empty client
+                // (does not share the worker handle), and spawn_blocking requires ownership.
+                let neural = neural.clone();
                 let texts = vec![text.to_string()];
-                let result = neural.embed_with_fallback(&texts, 1024);
+                let result = task::spawn_blocking(move || {
+                    neural.embed_with_fallback(&texts, NEURAL_EMBEDDING_DIMENSION)
+                })
+                .await
+                .ok()?
+                ;
                 match result {
                     EmbedResult::Success(response) => {
                         if response.count > 0 {
@@ -668,7 +684,7 @@ impl HybridEmbedder {
             #[cfg(feature = "onnx")]
             Self::HybridLocal { neural, .. } => {
                 let texts = vec![text.to_string()];
-                let result = neural.embed_with_fallback(&texts, 1024);
+                let result = neural.embed_with_fallback(&texts, NEURAL_EMBEDDING_DIMENSION);
                 match result {
                     EmbedResult::Success(response) => {
                         if response.count > 0 {
