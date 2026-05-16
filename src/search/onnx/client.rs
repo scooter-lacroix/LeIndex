@@ -42,6 +42,14 @@ const MAX_RESPONSE_FRAME_SIZE: u32 = 64 * 1024 * 1024; // 64 MiB
 /// fails with a timeout error rather than blocking indefinitely.
 const IPC_TIMEOUT_SECS: u64 = 30;
 
+fn platform_binary_name(binary_name: &str) -> String {
+    if cfg!(windows) {
+        format!("{}.exe", binary_name)
+    } else {
+        binary_name.to_string()
+    }
+}
+
 /// Resolve the path to the worker binary.
 ///
 /// First tries to find `leindex-embed` in the same directory as the running
@@ -49,19 +57,20 @@ const IPC_TIMEOUT_SECS: u64 = 30;
 /// is invoked via absolute path. Falls back to PATH lookup if the sibling
 /// doesn't exist.
 fn resolve_worker_binary() -> Result<std::path::PathBuf, std::io::Error> {
+    let binary_name = platform_binary_name("leindex-embed");
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
-            let sibling = exe_dir.join("leindex-embed");
+            let sibling = exe_dir.join(&binary_name);
             if sibling.exists() {
                 return Ok(sibling);
             }
         }
     }
     // Fall back to PATH lookup
-    which::which("leindex-embed").map_err(|e| {
+    which::which(&binary_name).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            format!("worker binary 'leindex-embed' not found in PATH: {}", e),
+            format!("worker binary '{}' not found in PATH: {}", binary_name, e),
         )
     })
 }
