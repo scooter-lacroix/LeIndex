@@ -18,12 +18,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "onnx")]
+use std::sync::Mutex;
+
 use crate::model_path::ModelResolver;
 use crate::protocol::{
     self, BatchId, EmbedResponse, ErrorKind, Frame, MsgType, Request, RerankResponse, WorkerError,
 };
 use crate::provider::ExecutionProviderSelector;
 use crate::startup::{StartupReport, StartupReporter};
+
+// ONNX Runtime imports - only available with "onnx" feature
+#[cfg(feature = "onnx")]
+use ort::session::Session;
 
 /// Default idle timeout in seconds before the worker tears itself down.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes
@@ -108,20 +115,152 @@ impl RuntimeConfig {
 /// Worker runtime state.
 ///
 /// Tracks the idle timer and provides the main request-processing loop.
+/// 
+/// When built with the `onnx` feature, also holds the ONNX session and tokenizer
+/// for neural embedding inference.
 pub struct WorkerRuntime {
     config: RuntimeConfig,
     last_activity: Instant,
     shutdown_flag: Arc<AtomicBool>,
+
+    /// ONNX session for neural embedding inference. Only available with `onnx` feature.
+    #[cfg(feature = "onnx")]
+    session: Option<Arc<Mutex<Session>>>,
+
+    /// Tokenizer for text preprocessing. Only available with `onnx` feature.
+    #[cfg(feature = "onnx")]
+    tokenizer: Option<Arc<tokenizers::Tokenizer>>,
+
+    /// Model load time for startup reporting.
+    #[cfg(feature = "onnx")]
+    model_load_time: Duration,
 }
 
 impl WorkerRuntime {
     /// Create a new worker runtime with the given configuration.
+    /// 
+    /// When built with the `onnx` feature, also initializes the ONNX session and tokenizer
+    /// for neural embedding inference.
     pub fn new(config: RuntimeConfig) -> Self {
+        #[cfg(feature = "onnx")]
+        let (session, tokenizer, model_load_time) = Self::init_onnx(&config);
+
         Self {
             config,
             last_activity: Instant::now(),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
+            #[cfg(feature = "onnx")]
+            session,
+            #[cfg(feature = "onnx")]
+            tokenizer,
+            #[cfg(feature = "onnx")]
+            model_load_time,
         }
+    }
+
+    #[cfg(feature = "onnx")]
+    fn init_onnx(config: &RuntimeConfig) -> (Option<Arc<Mutex<Session>>>, Option<Arc<tokenizers::Tokenizer>>, Duration) {
+        use std::time::Instant;
+
+        let load_start = Instant::now();
+
+        // Resolve model path
+        let model_path = match ModelResolver::resolve(&config.model_name) {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::warn!("failed to resolve ONNX model path: {}", e);
+                return (None, None, Duration::ZERO);
+            }
+        };
+
+        // Resolve tokenizer path
+        let tokenizer_path = match ModelResolver::resolve_tokenizer(&config.model_name) {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::warn!("failed to resolve tokenizer path: {}", e);
+                return (None, None, load_start.elapsed());
+            }
+        };
+
+        // Load tokenizer
+        let tokenizer = match tokenizers::Tokenizer::from_file(&tokenizer_path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("failed to load tokenizer from {}: {}", tokenizer_path.display(), e);
+                return (None, None, load_start.elapsed());
+            }
+        };
+
+        // Create ONNX session
+        let provider_selection = ExecutionProviderSelector::select(&config.execution_provider);
+        let session_result = match provider_selection {
+            Ok(selection) => {
+                tracing::info!("using {} execution provider", selection.name());
+                Self::build_session(&model_path, &selection.name())
+            }
+            Err(fallback) => {
+                tracing::warn!("requested provider unavailable, using {}: {}", fallback.fallback_name(), fallback.reason());
+                Self::build_session(&model_path, &fallback.fallback_name())
+            }
+        };
+
+        let model_load_time = load_start.elapsed();
+
+        match &session_result {
+            Ok(_) => tracing::info!("ONNX model loaded in {:?}", model_load_time),
+            Err(e) => tracing::warn!("failed to build ONNX session: {}", e),
+        }
+
+        match session_result {
+            Ok(session) => (Some(Arc::new(Mutex::new(session))), Some(Arc::new(tokenizer)), model_load_time),
+            Err(_) => (None, Some(Arc::new(tokenizer)), model_load_time),
+        }
+    }
+
+    #[cfg(feature = "onnx")]
+    fn build_session(model_path: &std::path::Path, provider_name: &str) -> Result<Session, ort::Error> {
+        
+        let mut session_builder = Session::builder()?;
+        
+        // Configure execution providers based on selection
+        match provider_name {
+            "cuda" => {
+                // Try CUDA first, fall back to CPU if unavailable
+                session_builder = match session_builder.with_execution_providers([ort::ep::CUDA::default().build()]) {
+                    Ok(sb) => sb,
+                    Err(e) => {
+                        tracing::warn!("CUDA EP not available: {}, falling back to CPU", e);
+                        Session::builder()?.with_execution_providers([ort::ep::CPU::default().build()])?
+                    }
+                };
+            }
+            "rocm" => {
+                // Try ROCm first, fall back to CPU if unavailable
+                session_builder = match session_builder.with_execution_providers([ort::ep::ROCm::default().build()]) {
+                    Ok(sb) => sb,
+                    Err(e) => {
+                        tracing::warn!("ROCm EP not available: {}, falling back to CPU", e);
+                        Session::builder()?.with_execution_providers([ort::ep::CPU::default().build()])?
+                    }
+                };
+            }
+            "coreml" => {
+                // CoreML for macOS
+                session_builder = match session_builder.with_execution_providers([ort::ep::CoreML::default().build()]) {
+                    Ok(sb) => sb,
+                    Err(e) => {
+                        tracing::warn!("CoreML EP not available: {}, falling back to CPU", e);
+                        Session::builder()?.with_execution_providers([ort::ep::CPU::default().build()])?
+                    }
+                };
+            }
+            _ => {
+                // CPU is the default
+                session_builder = session_builder.with_execution_providers([ort::ep::CPU::default().build()])?;
+            }
+        }
+
+        session_builder.commit_from_file(model_path)
     }
 
     /// Get a handle to the shutdown flag for external signaling.
@@ -210,6 +349,9 @@ impl WorkerRuntime {
 
         reporter.set_model_name(&self.config.model_name);
         reporter.set_quantization_mode("none"); // Will be updated when quantization is wired
+        #[cfg(feature = "onnx")]
+        reporter.set_warm_load_latency(self.model_load_time);
+        #[cfg(not(feature = "onnx"))]
         reporter.set_warm_load_latency(Duration::from_millis(0)); // Placeholder until real ONNX load
         reporter.build()
     }
@@ -343,17 +485,211 @@ impl WorkerRuntime {
             .map(|t| self.truncate_text(t))
             .collect();
 
-        // TODO(onnx-worker): This is a STUB that returns zero vectors.
-        // ONNX inference is not yet wired — neural embeddings are non-functional.
-        // When the model bundle pipeline is complete, replace this with real inference:
-        // let embeddings = self.session.run(&inputs)?;
-        // Return the actual embedding vectors from the model output.
-        tracing::warn!("handle_embed: returning zero vectors (ONNX inference not yet wired)");
+        #[cfg(feature = "onnx")]
+        {
+            // Real ONNX inference path
+            if let (Some(session), Some(tokenizer)) = (&self.session, &self.tokenizer) {
+                return self.run_onnx_embed(session, tokenizer, &texts, embed_req.expected_dim);
+            }
+            // Fall through to zero-vector fallback if session/tokenizer unavailable
+        }
+
+        // Fallback: return zero vectors if ONNX is not available
+        tracing::warn!("ONNX session unavailable, returning zero vectors");
         let count = texts.len();
         let dim = embed_req.expected_dim;
         let vectors = vec![0.0f32; count * dim];
 
         Ok(EmbedResponse::new(vectors, count, dim))
+    }
+
+    #[cfg(feature = "onnx")]
+    fn run_onnx_embed(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        tokenizer: &Arc<tokenizers::Tokenizer>,
+        texts: &[String],
+        expected_dim: usize,
+    ) -> Result<EmbedResponse, WorkerError> {
+
+        // Batch tokenize all texts
+        let encodings = tokenizer.encode_batch(texts.to_vec(), true)
+            .map_err(|e| WorkerError {
+                kind: ErrorKind::Tokenizer,
+                message: format!("tokenization failed: {}", e),
+            })?;
+
+        if encodings.is_empty() {
+            return Ok(EmbedResponse::new(vec![], 0, expected_dim));
+        }
+
+        // Determine max sequence length in this batch
+        let max_len = encodings.iter()
+            .map(|e| e.len())
+            .max()
+            .unwrap_or(0)
+            .min(512); // Cap at 512 tokens for memory safety
+
+        if max_len == 0 {
+            return Ok(EmbedResponse::new(vec![], texts.len(), expected_dim));
+        }
+
+        let batch_size = encodings.len();
+
+        // Create input tensors: [batch_size, seq_len]
+        let mut input_ids: Vec<i64> = Vec::with_capacity(batch_size * max_len);
+        let mut attention_mask: Vec<i64> = Vec::with_capacity(batch_size * max_len);
+
+        for encoding in &encodings {
+            let ids = encoding.get_ids();
+            let mask = encoding.get_attention_mask();
+            
+            // Pad to max_len
+            for i in 0..max_len {
+                if i < ids.len() {
+                    input_ids.push(ids[i] as i64);
+                    attention_mask.push(mask[i] as i64);
+                } else {
+                    input_ids.push(0i64);
+                    attention_mask.push(0i64);
+                }
+            }
+        }
+
+        // Run inference with properly shaped tensors
+        // Shape: [batch_size, seq_len]
+        let input_ids_tensor = ort::value::Tensor::from_array(
+            ndarray::Array2::from_shape_vec((batch_size, max_len), input_ids)
+                .map_err(|e| WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: format!("failed to create input_ids array: {}", e),
+                })?,
+        )
+        .map_err(|e| WorkerError {
+            kind: ErrorKind::Inference,
+            message: format!("failed to create input_ids tensor: {}", e),
+        })?;
+
+        let attention_mask_tensor = ort::value::Tensor::from_array(
+            ndarray::Array2::from_shape_vec((batch_size, max_len), attention_mask.clone())
+                .map_err(|e| WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: format!("failed to create attention_mask array: {}", e),
+                })?,
+        )
+        .map_err(|e| WorkerError {
+            kind: ErrorKind::Inference,
+            message: format!("failed to create attention_mask tensor: {}", e),
+        })?;
+
+        let mut session_guard = session.lock().map_err(|e| WorkerError {
+            kind: ErrorKind::OnnxRuntime,
+            message: format!("failed to lock ONNX session: {}", e),
+        })?;
+
+        let outputs = session_guard
+            .run(ort::inputs! {
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+            })
+            .map_err(|e| WorkerError {
+                kind: ErrorKind::Inference,
+                message: format!("ONNX inference failed: {}", e),
+            })?;
+
+        // Note: session_guard will be dropped when outputs is no longer used
+
+        // Extract embeddings from output
+        // Use try_extract_array to get f32 values directly
+        let embeddings_f32: Vec<f32> = outputs[0]
+            .try_extract_array::<f32>()
+            .map_err(|e| WorkerError {
+                kind: ErrorKind::Inference,
+                message: format!("failed to extract output tensor: {:?}", e),
+            })?
+            .iter()
+            .copied()
+            .collect();
+
+        // Output shape should be [batch_size, seq_len, hidden_dim]
+        // But ONNX Runtime may give us a flat array, so we need to reshape
+        let hidden_dim = expected_dim; // Use expected dimension
+        let output_seq_len = embeddings_f32.len() / (batch_size * hidden_dim);
+
+        if embeddings_f32.len() != batch_size * output_seq_len * hidden_dim {
+            // Try to interpret as [batch_size, hidden_dim] (already pooled)
+            if embeddings_f32.len() == batch_size * hidden_dim {
+                // Apply mean pooling manually
+                return self.pool_and_normalize(embeddings_f32, batch_size, hidden_dim, attention_mask, expected_dim);
+            }
+            return Err(WorkerError {
+                kind: ErrorKind::Inference,
+                message: format!("unexpected output size: expected {}*{}*{}, got {}",
+                    batch_size, output_seq_len, hidden_dim, embeddings_f32.len()),
+            });
+        }
+
+        // Apply mean pooling using attention mask
+        self.pool_and_normalize(embeddings_f32, batch_size, hidden_dim, attention_mask, expected_dim)
+    }
+
+    #[cfg(feature = "onnx")]
+    fn pool_and_normalize(
+        &self,
+        embeddings: Vec<f32>,
+        batch_size: usize,
+        seq_len: usize,
+        attention_mask: Vec<i64>,
+        expected_dim: usize,
+    ) -> Result<EmbedResponse, WorkerError> {
+        // Reshape: [batch_size, seq_len, hidden_dim]
+        // Apply mean pooling with attention mask weighting
+        // Then L2 normalize each embedding
+
+        let hidden_dim = expected_dim;
+        let mut pooled: Vec<f32> = Vec::with_capacity(batch_size * hidden_dim);
+
+        for b in 0..batch_size {
+            let mut sum: Vec<f32> = vec![0.0f32; hidden_dim];
+            let mut weight_sum: f32 = 0.0f32;
+
+            for s in 0..seq_len {
+                let mask_val = attention_mask.get(b * seq_len + s).copied().unwrap_or(0);
+                if mask_val > 0 {
+                    for h in 0..hidden_dim {
+                        let idx = b * seq_len * hidden_dim + s * hidden_dim + h;
+                        if let Some(&val) = embeddings.get(idx) {
+                            sum[h] += val;
+                        }
+                    }
+                    weight_sum += 1.0f32;
+                }
+            }
+
+            // Mean pooling
+            if weight_sum > 0.0f32 {
+                for h in 0..hidden_dim {
+                    sum[h] /= weight_sum;
+                }
+            }
+
+            // L2 normalize
+            let mut norm: f32 = 0.0f32;
+            for h in 0..hidden_dim {
+                norm += sum[h] * sum[h];
+            }
+            norm = norm.sqrt();
+
+            if norm > 1e-10f32 {
+                for h in 0..hidden_dim {
+                    sum[h] /= norm;
+                }
+            }
+
+            pooled.extend_from_slice(&sum);
+        }
+
+        Ok(EmbedResponse::new(pooled, batch_size, expected_dim))
     }
 
     /// Handle a rerank request.
@@ -373,7 +709,17 @@ impl WorkerRuntime {
             }
         };
 
-        // Stub: return documents with their initial scores as combined scores.
+        #[cfg(feature = "onnx")]
+        {
+            // Real ONNX reranking path
+            if let (Some(session), Some(tokenizer)) = (&self.session, &self.tokenizer) {
+                return self.run_onnx_rerank(session, tokenizer, &rerank_req);
+            }
+            // Fall through to passthrough fallback if session/tokenizer unavailable
+        }
+
+        // Fallback: return documents with their initial scores as combined scores.
+        tracing::warn!("ONNX session unavailable for rerank, using passthrough scores");
         let results: Vec<_> = rerank_req
             .documents
             .into_iter()
@@ -384,6 +730,170 @@ impl WorkerRuntime {
                 combined_score: doc.initial_score,
             })
             .collect();
+
+        Ok(RerankResponse { results })
+    }
+
+    #[cfg(feature = "onnx")]
+    fn run_onnx_rerank(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        tokenizer: &Arc<tokenizers::Tokenizer>,
+        rerank_req: &protocol::RerankRequest,
+    ) -> Result<RerankResponse, WorkerError> {
+        // Encode query-document pairs as "Query: {q} Document: {d}"
+        let pair_texts: Vec<String> = rerank_req
+            .documents
+            .iter()
+            .map(|doc| format!("Query: {} Document: {}", rerank_req.query, doc.content))
+            .collect();
+
+        // Batch tokenize all pairs
+        let encodings = tokenizer.encode_batch(pair_texts, true)
+            .map_err(|e| WorkerError {
+                kind: ErrorKind::Tokenizer,
+                message: format!("rerank tokenization failed: {}", e),
+            })?;
+
+        if encodings.is_empty() {
+            return Ok(RerankResponse { results: vec![] });
+        }
+
+        let batch_size = encodings.len();
+        let max_len = encodings.iter()
+            .map(|e| e.len())
+            .max()
+            .unwrap_or(0)
+            .min(512);
+
+        if max_len == 0 {
+            // Return passthrough scores if tokenization failed
+            let results: Vec<_> = rerank_req
+                .documents
+                .iter()
+                .map(|doc| protocol::RerankResult {
+                    id: doc.id.clone(),
+                    original_score: doc.initial_score,
+                    rerank_score: doc.initial_score,
+                    combined_score: doc.initial_score,
+                })
+                .collect();
+            return Ok(RerankResponse { results });
+        }
+
+        // Build input_ids and attention_mask vectors from encodings
+        let mut input_ids: Vec<i64> = Vec::with_capacity(batch_size * max_len);
+        let mut attention_mask: Vec<i64> = Vec::with_capacity(batch_size * max_len);
+
+        for encoding in &encodings {
+            let ids = encoding.get_ids();
+            let mask = encoding.get_attention_mask();
+            
+            for i in 0..max_len {
+                if i < ids.len() {
+                    input_ids.push(ids[i] as i64);
+                    attention_mask.push(mask[i] as i64);
+                } else {
+                    input_ids.push(0i64);
+                    attention_mask.push(0i64);
+                }
+            }
+        }
+
+        // Create input tensors with proper ndarrays
+        let input_ids_tensor = ort::value::Tensor::from_array(
+            ndarray::Array2::from_shape_vec((batch_size, max_len), input_ids.clone())
+                .map_err(|e| WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: format!("failed to create rerank input_ids array: {}", e),
+                })?,
+        )
+        .map_err(|e| WorkerError {
+            kind: ErrorKind::Inference,
+            message: format!("failed to create rerank input_ids tensor: {}", e),
+        })?;
+
+        let attention_mask_tensor = ort::value::Tensor::from_array(
+            ndarray::Array2::from_shape_vec((batch_size, max_len), attention_mask.clone())
+                .map_err(|e| WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: format!("failed to create rerank attention_mask array: {}", e),
+                })?,
+        )
+        .map_err(|e| WorkerError {
+            kind: ErrorKind::Inference,
+            message: format!("failed to create rerank attention_mask tensor: {}", e),
+        })?;
+
+        let mut session_guard = session.lock().map_err(|e| WorkerError {
+            kind: ErrorKind::OnnxRuntime,
+            message: format!("failed to lock ONNX session for rerank: {}", e),
+        })?;
+
+        let outputs = session_guard
+            .run(ort::inputs! {
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+            })
+            .map_err(|e| WorkerError {
+                kind: ErrorKind::Inference,
+                message: format!("ONNX rerank inference failed: {}", e),
+            })?;
+
+        // Note: session_guard will be dropped when outputs is no longer used
+
+        // Extract relevance scores from output using try_extract_array
+        let scores: Vec<f32> = outputs[0]
+            .try_extract_array::<f32>()
+            .map_err(|e| WorkerError {
+                kind: ErrorKind::Inference,
+                message: format!("failed to extract rerank output tensor: {:?}", e),
+            })?
+            .iter()
+            .copied()
+            .collect();
+
+        // Extract scores for each query-document pair
+        // The output is [batch_size, seq_len, hidden_dim], we take the [CLS] token (first token)
+        let hidden_dim = self.config.embedding_dim;
+        let seq_len = scores.len() / (batch_size * hidden_dim);
+
+        let mut rerank_scores: Vec<f32> = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            // Take the first token's embedding as the query-document score
+            let first_token_idx = b * seq_len * hidden_dim;
+            let first_token_emb = &scores[first_token_idx..first_token_idx + hidden_dim];
+            
+            // Compute cosine similarity with a reference direction (use mean of first token)
+            // Or simply use the L2 norm of the first token as a relevance proxy
+            let mut norm: f32 = 0.0f32;
+            for &v in first_token_emb {
+                norm += v * v;
+            }
+            norm = norm.sqrt();
+            
+            // Normalized magnitude serves as relevance score
+            rerank_scores.push(norm);
+        }
+
+        // Build results with combined scores: 70% rerank + 30% initial
+        let mut results: Vec<_> = rerank_req
+            .documents
+            .iter()
+            .zip(rerank_scores.into_iter())
+            .map(|(doc, rerank_score)| {
+                let combined_score = 0.7 * rerank_score + 0.3 * doc.initial_score;
+                protocol::RerankResult {
+                    id: doc.id.clone(),
+                    original_score: doc.initial_score,
+                    rerank_score,
+                    combined_score,
+                }
+            })
+            .collect();
+
+        // Sort by combined score descending
+        results.sort_by(|a, b| b.combined_score.partial_cmp(&a.combined_score).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(RerankResponse { results })
     }

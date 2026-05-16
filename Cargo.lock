@@ -1984,6 +1984,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "dirs",
+ "ndarray",
  "ort",
  "serde",
  "serde_json",

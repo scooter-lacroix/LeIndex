@@ -12,7 +12,7 @@ default = []
 
 # Neural embeddings with ONNX Runtime and tokenizers
 # Only needed for the worker binary, not for the main crate.
-onnx = ["dep:ort", "dep:tokenizers"]
+onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 
 [dependencies]
 # Protocol serialization
@@ -27,6 +27,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # ONNX Runtime dependencies — owned exclusively by the worker crate
 ort = { version = "2.0.0-rc.12", optional = true, features = ["ndarray"] }
 tokenizers = { version = "0.20", optional = true }
+ndarray = { version = "0.17", optional = true }
 dirs = { version = "5" }
 
 [dev-dependencies]
