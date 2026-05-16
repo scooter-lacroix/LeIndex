@@ -475,10 +475,10 @@ impl EmbeddingClient {
     /// Pipes do not support `set_read_timeout()`, so we spawn a thread to do
     /// the blocking read and use `recv_timeout()` to enforce the deadline.
     ///
-    /// NOTE: After this method is called, the worker handle's stdout is consumed
-    /// (set to None). The caller must call `kill_worker()` on any error
-    /// to respawn a fresh worker. This is acceptable because the retry/fallback
-    /// logic already kills and respawns the worker on failure.
+    /// After a successful read, stdout is restored to the handle so the client
+    /// remains usable for subsequent requests. On timeout, the worker is left
+    /// in an undefined state but no stdout is consumed (the thread may still
+    /// be blocked on read — the process will be killed via kill_worker if needed).
     fn send_and_receive(&self, frame: Frame) -> Result<Frame, ClientError> {
         let mut guard = self
             .worker
@@ -503,17 +503,19 @@ impl EmbeddingClient {
             .map_err(|e| ClientError::Ipc(format!("failed to flush worker stdin: {}", e)))?;
 
         // Take stdout out of the handle for the read thread.
-        // Set to None - on error, the caller kills the worker anyway.
-        // This is acceptable because the fallback/retry logic respawns the worker on failure.
-        let stdout = handle.stdout.take().ok_or_else(|| {
-            ClientError::Ipc("worker stdout was unexpectedly None".to_string())
-        })?;
+        // After the thread completes (success or timeout), we return stdout
+        // so the caller can restore it to the handle on success.
+        let stdout = handle
+            .stdout
+            .take()
+            .ok_or_else(|| ClientError::Ipc("worker stdout was unexpectedly None".to_string()))?;
 
-        // Helper to perform the IPC read with timeout
+        // Helper to perform the IPC read with timeout.
+        // Returns (frame_buf, stdout) so the caller can restore stdout on success.
         fn read_response(
             stdout: std::process::ChildStdout,
-        ) -> Result<Vec<u8>, ClientError> {
-            let (tx, rx) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>();
+        ) -> Result<(Vec<u8>, std::process::ChildStdout), ClientError> {
+            let (tx, rx) = mpsc::channel::<Result<(Vec<u8>, std::process::ChildStdout), std::io::Error>>();
             let timeout = Duration::from_secs(IPC_TIMEOUT_SECS);
 
             std::thread::spawn(move || {
@@ -546,7 +548,7 @@ impl EmbeddingClient {
                 let mut frame_buf = vec![0u8; payload_len];
                 match stdout.read_exact(&mut frame_buf) {
                     Ok(()) => {
-                        let _ = tx.send(Ok(frame_buf));
+                        let _ = tx.send(Ok((frame_buf, stdout)));
                     }
                     Err(e) => {
                         let _ = tx.send(Err(e));
@@ -556,22 +558,29 @@ impl EmbeddingClient {
 
             // Wait for the read with timeout
             match rx.recv_timeout(timeout) {
-                Ok(Ok(frame_buf)) => Ok(frame_buf),
+                Ok(Ok(result)) => Ok(result),
                 Ok(Err(e)) => {
                     if e.kind() == std::io::ErrorKind::TimedOut {
                         Err(ClientError::Timeout)
                     } else {
-                        Err(ClientError::Ipc(format!("failed to read from worker: {}", e)))
+                        Err(ClientError::Ipc(format!(
+                            "failed to read from worker: {}",
+                            e
+                        )))
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => Err(ClientError::Timeout),
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    Err(ClientError::Ipc("worker disconnected unexpectedly".to_string()))
-                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(ClientError::Ipc(
+                    "worker disconnected unexpectedly".to_string(),
+                )),
             }
         }
 
-        let frame_buf = read_response(stdout)?;
+        let (frame_buf, returned_stdout) = read_response(stdout)?;
+
+        // Restore stdout to the handle so the client remains usable.
+        handle.stdout = Some(returned_stdout);
+
         Frame::from_wire_bytes(&frame_buf).map_err(|e| ClientError::Ipc(e.to_string()))
     }
 }
