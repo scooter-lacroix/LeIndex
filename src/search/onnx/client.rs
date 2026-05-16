@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use leindex_embed::protocol::{
     self, BatchId, EmbedRequest, EmbedResponse, Frame, MsgType, RerankDocument, RerankRequest,
@@ -26,6 +27,38 @@ use leindex_embed::protocol::{
 
 /// Monotonic batch ID counter for correlating requests.
 static BATCH_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Maximum response frame size in bytes.
+///
+/// This mirrors the worker-side guard (`max_frame_size * 2` = 32 MiB) to
+/// prevent a compromised or buggy worker from causing excessive allocations.
+/// A response larger than this is rejected with a clear protocol error.
+const MAX_RESPONSE_FRAME_SIZE: u32 = 64 * 1024 * 1024; // 64 MiB
+
+/// Timeout for IPC read/write operations.
+///
+/// If the worker does not respond within this window, the IPC operation
+/// fails with a timeout error rather than blocking indefinitely.
+const IPC_TIMEOUT_SECS: u64 = 30;
+
+/// Resolve the path to the worker binary.
+///
+/// First tries to find `leindex-embed` in the same directory as the running
+/// binary (sibling path), so the worker is found even when the main binary
+/// is invoked via absolute path. Falls back to PATH lookup if the sibling
+/// doesn't exist.
+fn resolve_worker_binary() -> Result<std::path::PathBuf, std::io::Error> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            let sibling = exe_dir.join("leindex-embed");
+            if sibling.exists() {
+                return Ok(sibling);
+            }
+        }
+    }
+    // Fall back to PATH lookup
+    which::which("leindex-embed")
+}
 
 /// Errors that can occur when communicating with the embedding worker.
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +78,13 @@ pub enum ClientError {
     /// Protocol-level error (unexpected message type, etc.).
     #[error("protocol error: {0}")]
     Protocol(String),
+
+    /// IPC operation timed out.
+    #[error(
+        "IPC timeout: worker did not respond within {} seconds",
+        IPC_TIMEOUT_SECS
+    )]
+    Timeout,
 }
 
 /// Result of an embed request with fallback semantics.
@@ -164,7 +204,16 @@ impl EmbeddingClient {
         &self,
         guard: &mut std::sync::MutexGuard<'_, Option<WorkerHandle>>,
     ) -> Result<(), ClientError> {
-        let mut child = Command::new("leindex-embed")
+        // Resolve the worker binary path.
+        //
+        // First, try to find `leindex-embed` relative to the running binary
+        // so the worker is found even when the main binary is invoked via
+        // absolute path. Fall back to PATH lookup if the sibling is absent.
+        let worker_path = resolve_worker_binary().map_err(|e| {
+            ClientError::SpawnFailed(format!("failed to resolve worker binary: {}", e))
+        })?;
+
+        let mut child = Command::new(&worker_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -424,6 +473,13 @@ impl EmbeddingClient {
             .as_mut()
             .ok_or_else(|| ClientError::Ipc("worker not running".to_string()))?;
 
+        // Set a timeout on stdout so we don't block indefinitely on a hung worker.
+        let timeout = Duration::from_secs(IPC_TIMEOUT_SECS);
+        handle
+            .stdout
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| ClientError::Ipc(format!("failed to set read timeout: {}", e)))?;
+
         // Send the frame
         let wire = frame
             .encode_wire()
@@ -437,19 +493,36 @@ impl EmbeddingClient {
             .flush()
             .map_err(|e| ClientError::Ipc(format!("failed to flush worker stdin: {}", e)))?;
 
-        // Read the response
+        // Read the response length (4 bytes, little-endian)
         let mut len_buf = [0u8; 4];
-        handle
-            .stdout
-            .read_exact(&mut len_buf)
-            .map_err(|e| ClientError::Ipc(format!("failed to read response length: {}", e)))?;
+        handle.stdout.read_exact(&mut len_buf).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                ClientError::Timeout
+            } else {
+                ClientError::Ipc(format!("failed to read response length: {}", e))
+            }
+        })?;
 
-        let payload_len = u32::from_le_bytes(len_buf) as usize;
+        let payload_len = u32::from_le_bytes(len_buf);
+
+        // Guard against oversized responses to prevent excessive allocations.
+        // A compromised or buggy worker could send u32::MAX (~4 GiB) otherwise.
+        if payload_len > MAX_RESPONSE_FRAME_SIZE {
+            return Err(ClientError::Protocol(format!(
+                "response frame too large: {} bytes (max: {} bytes)",
+                payload_len, MAX_RESPONSE_FRAME_SIZE
+            )));
+        }
+
+        let payload_len = payload_len as usize;
         let mut frame_buf = vec![0u8; payload_len];
-        handle
-            .stdout
-            .read_exact(&mut frame_buf)
-            .map_err(|e| ClientError::Ipc(format!("failed to read response payload: {}", e)))?;
+        handle.stdout.read_exact(&mut frame_buf).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                ClientError::Timeout
+            } else {
+                ClientError::Ipc(format!("failed to read response payload: {}", e))
+            }
+        })?;
 
         Frame::from_wire_bytes(&frame_buf).map_err(|e| ClientError::Ipc(e.to_string()))
     }

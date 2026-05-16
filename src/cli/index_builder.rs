@@ -1255,6 +1255,7 @@ pub(crate) fn index_nodes_with_embedder(
 
     for batch in node_indices.chunks(batch_size) {
         nodes.clear();
+        admission_gate.reset();
         for &node_idx in batch {
             if let Some(node) = pdg.get_node(node_idx) {
                 // A+ VAL-APLUS-038: Selective pruning — skip generated/low-info nodes.

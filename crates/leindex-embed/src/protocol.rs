@@ -99,7 +99,12 @@ impl Frame {
     /// Wire format: `[4-byte LE length][bincode Frame]`
     pub fn encode_wire(&self) -> anyhow::Result<Vec<u8>> {
         let frame_bytes = bincode::serialize(self)?;
-        let len = frame_bytes.len() as u32;
+        let len = u32::try_from(frame_bytes.len()).map_err(|_| {
+            anyhow::anyhow!(
+                "frame payload too large: {} bytes exceeds u32::MAX",
+                frame_bytes.len()
+            )
+        })?;
         let mut wire = Vec::with_capacity(4 + frame_bytes.len());
         wire.extend_from_slice(&len.to_le_bytes());
         wire.extend_from_slice(&frame_bytes);

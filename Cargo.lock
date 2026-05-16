@@ -383,7 +383,7 @@ dependencies = [
  "rustc-hash 1.1.0",
  "shlex",
  "syn",
- "which",
+ "which 4.4.2",
 ]
 
 [[package]]
@@ -1907,7 +1907,7 @@ checksum = "830d08ce1d1d941e6b30645f1a0eb5643013d835ce3779a5fc208261dbe10f55"
 
 [[package]]
 name = "leindex"
-version = "1.6.6"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1973,12 +1973,13 @@ dependencies = [
  "tree-sitter-typescript",
  "unicode-normalization",
  "walkdir",
+ "which 5.0.0",
  "wide",
 ]
 
 [[package]]
 name = "leindex-embed"
-version = "1.6.6"
+version = "1.7.0"
 dependencies = [
  "anyhow",
  "bincode",
@@ -4883,6 +4884,19 @@ dependencies = [
  "home",
  "once_cell",
  "rustix 0.38.44",
+]
+
+[[package]]
+name = "which"
+version = "5.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9bf3ea8596f3a0dd5980b46430f2058dfe2c36a27ccfbb1845d6fbfcd9ba6e14"
+dependencies = [
+ "either",
+ "home",
+ "once_cell",
+ "rustix 0.38.44",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

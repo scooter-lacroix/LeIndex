@@ -208,7 +208,7 @@ turso = ["dep:libsql", "dep:rusqlite_migration"]
 #
 # VAL-CPHASE-002: The main crate no longer owns ONNX runtime deps directly.
 # ONNX inference is delegated to the leindex-embed worker process.
-onnx = ["search", "dep:leindex-embed"]
+onnx = ["search", "dep:leindex-embed", "dep:which"]
 
 # Remote embedding API support (OpenAI, etc.)
 # Opt-in feature: Use cloud-based embedding services instead of local models
@@ -291,6 +291,9 @@ leindex-embed = { path = "crates/leindex-embed", optional = true, default-featur
 # Remote embedding API dependencies (for cloud-based embeddings)
 reqwest = { version = "0.12", features = ["json", "rustls-tls-webpki-roots", "gzip", "deflate"], optional = true, default-features = false }
 async-trait = { version = "0.1", optional = true }
+
+# PATH resolution for worker binary lookup (onnx feature)
+which = { version = "5.0", optional = true }
 
 # Phase/CLI/Global/Server/Edit feature dependencies
 walkdir = { version = "2.5", optional = true }
