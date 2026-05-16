@@ -618,13 +618,16 @@ impl EmbeddingClient {
                 if e.to_string().contains("too large") {
                     Err(ClientError::Ipc(e.to_string()))
                 } else {
-                    Err(ClientError::Ipc(format!("failed to read from worker: {}", e)))
+                    Err(ClientError::Ipc(format!(
+                        "failed to read from worker: {}",
+                        e
+                    )))
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => Err(ClientError::Timeout),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(ClientError::Ipc("reader thread disconnected unexpectedly".to_string()))
-            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ClientError::Ipc(
+                "reader thread disconnected unexpectedly".to_string(),
+            )),
         }
     }
 }

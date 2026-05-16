@@ -201,21 +201,14 @@ impl McpServer {
         // Uses 60-second interval and 5-minute idle threshold.
         let cleanup_server = self.clone();
         let _cleanup_handle = tokio::spawn(async move {
-            const CLEANUP_INTERVAL: std::time::Duration =
-                std::time::Duration::from_secs(60);
-            const SESSION_MAX_IDLE: std::time::Duration =
-                std::time::Duration::from_secs(300); // 5 minutes
-            let mut interval =
-                tokio::time::interval(CLEANUP_INTERVAL);
+            const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+            const SESSION_MAX_IDLE: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
+            let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
             loop {
                 interval.tick().await;
-                let removed =
-                    cleanup_server.cleanup_stale_sessions(SESSION_MAX_IDLE);
+                let removed = cleanup_server.cleanup_stale_sessions(SESSION_MAX_IDLE);
                 if removed > 0 {
-                    debug!(
-                        "Cleaned up {} stale session(s)",
-                        removed
-                    );
+                    debug!("Cleaned up {} stale session(s)", removed);
                 }
             }
         });

@@ -115,7 +115,7 @@ impl RuntimeConfig {
 /// Worker runtime state.
 ///
 /// Tracks the idle timer and provides the main request-processing loop.
-/// 
+///
 /// When built with the `onnx` feature, also holds the ONNX session and tokenizer
 /// for neural embedding inference.
 pub struct WorkerRuntime {
@@ -138,7 +138,7 @@ pub struct WorkerRuntime {
 
 impl WorkerRuntime {
     /// Create a new worker runtime with the given configuration.
-    /// 
+    ///
     /// When built with the `onnx` feature, also initializes the ONNX session and tokenizer
     /// for neural embedding inference.
     pub fn new(config: RuntimeConfig) -> Self {
@@ -159,7 +159,13 @@ impl WorkerRuntime {
     }
 
     #[cfg(feature = "onnx")]
-    fn init_onnx(config: &RuntimeConfig) -> (Option<Arc<Mutex<Session>>>, Option<Arc<tokenizers::Tokenizer>>, Duration) {
+    fn init_onnx(
+        config: &RuntimeConfig,
+    ) -> (
+        Option<Arc<Mutex<Session>>>,
+        Option<Arc<tokenizers::Tokenizer>>,
+        Duration,
+    ) {
         use std::time::Instant;
 
         let load_start = Instant::now();
@@ -186,7 +192,11 @@ impl WorkerRuntime {
         let tokenizer = match tokenizers::Tokenizer::from_file(&tokenizer_path) {
             Ok(t) => t,
             Err(e) => {
-                tracing::warn!("failed to load tokenizer from {}: {}", tokenizer_path.display(), e);
+                tracing::warn!(
+                    "failed to load tokenizer from {}: {}",
+                    tokenizer_path.display(),
+                    e
+                );
                 return (None, None, load_start.elapsed());
             }
         };
@@ -199,7 +209,11 @@ impl WorkerRuntime {
                 Self::build_session(&model_path, &selection.name())
             }
             Err(fallback) => {
-                tracing::warn!("requested provider unavailable, using {}: {}", fallback.fallback_name(), fallback.reason());
+                tracing::warn!(
+                    "requested provider unavailable, using {}: {}",
+                    fallback.fallback_name(),
+                    fallback.reason()
+                );
                 Self::build_session(&model_path, &fallback.fallback_name())
             }
         };
@@ -212,51 +226,67 @@ impl WorkerRuntime {
         }
 
         match session_result {
-            Ok(session) => (Some(Arc::new(Mutex::new(session))), Some(Arc::new(tokenizer)), model_load_time),
+            Ok(session) => (
+                Some(Arc::new(Mutex::new(session))),
+                Some(Arc::new(tokenizer)),
+                model_load_time,
+            ),
             Err(_) => (None, Some(Arc::new(tokenizer)), model_load_time),
         }
     }
 
     #[cfg(feature = "onnx")]
-    fn build_session(model_path: &std::path::Path, provider_name: &str) -> Result<Session, ort::Error> {
-        
+    fn build_session(
+        model_path: &std::path::Path,
+        provider_name: &str,
+    ) -> Result<Session, ort::Error> {
         let mut session_builder = Session::builder()?;
-        
+
         // Configure execution providers based on selection
         match provider_name {
             "cuda" => {
                 // Try CUDA first, fall back to CPU if unavailable
-                session_builder = match session_builder.with_execution_providers([ort::ep::CUDA::default().build()]) {
+                session_builder = match session_builder
+                    .with_execution_providers([ort::ep::CUDA::default().build()])
+                {
                     Ok(sb) => sb,
                     Err(e) => {
                         tracing::warn!("CUDA EP not available: {}, falling back to CPU", e);
-                        Session::builder()?.with_execution_providers([ort::ep::CPU::default().build()])?
+                        Session::builder()?
+                            .with_execution_providers([ort::ep::CPU::default().build()])?
                     }
                 };
             }
             "rocm" => {
                 // Try ROCm first, fall back to CPU if unavailable
-                session_builder = match session_builder.with_execution_providers([ort::ep::ROCm::default().build()]) {
+                session_builder = match session_builder
+                    .with_execution_providers([ort::ep::ROCm::default().build()])
+                {
                     Ok(sb) => sb,
                     Err(e) => {
                         tracing::warn!("ROCm EP not available: {}, falling back to CPU", e);
-                        Session::builder()?.with_execution_providers([ort::ep::CPU::default().build()])?
+                        Session::builder()?
+                            .with_execution_providers([ort::ep::CPU::default().build()])?
                     }
                 };
             }
             "coreml" => {
                 // CoreML for macOS
-                session_builder = match session_builder.with_execution_providers([ort::ep::CoreML::default().build()]) {
+                session_builder = match session_builder
+                    .with_execution_providers([ort::ep::CoreML::default().build()])
+                {
                     Ok(sb) => sb,
                     Err(e) => {
                         tracing::warn!("CoreML EP not available: {}, falling back to CPU", e);
-                        Session::builder()?.with_execution_providers([ort::ep::CPU::default().build()])?
+                        Session::builder()?
+                            .with_execution_providers([ort::ep::CPU::default().build()])?
                     }
                 };
             }
             _ => {
                 // CPU is the default
-                session_builder = session_builder.with_execution_providers([ort::ep::CPU::default().build()])?;
+                session_builder =
+                    session_builder.with_execution_providers([ort::ep::CPU::default().build()])?;
             }
         }
 
@@ -511,9 +541,9 @@ impl WorkerRuntime {
         texts: &[String],
         expected_dim: usize,
     ) -> Result<EmbedResponse, WorkerError> {
-
         // Batch tokenize all texts
-        let encodings = tokenizer.encode_batch(texts.to_vec(), true)
+        let encodings = tokenizer
+            .encode_batch(texts.to_vec(), true)
             .map_err(|e| WorkerError {
                 kind: ErrorKind::Tokenizer,
                 message: format!("tokenization failed: {}", e),
@@ -524,7 +554,8 @@ impl WorkerRuntime {
         }
 
         // Determine max sequence length in this batch
-        let max_len = encodings.iter()
+        let max_len = encodings
+            .iter()
             .map(|e| e.len())
             .max()
             .unwrap_or(0)
@@ -543,7 +574,7 @@ impl WorkerRuntime {
         for encoding in &encodings {
             let ids = encoding.get_ids();
             let mask = encoding.get_attention_mask();
-            
+
             // Pad to max_len
             for i in 0..max_len {
                 if i < ids.len() {
@@ -559,11 +590,12 @@ impl WorkerRuntime {
         // Run inference with properly shaped tensors
         // Shape: [batch_size, seq_len]
         let input_ids_tensor = ort::value::Tensor::from_array(
-            ndarray::Array2::from_shape_vec((batch_size, max_len), input_ids)
-                .map_err(|e| WorkerError {
+            ndarray::Array2::from_shape_vec((batch_size, max_len), input_ids).map_err(|e| {
+                WorkerError {
                     kind: ErrorKind::Inference,
                     message: format!("failed to create input_ids array: {}", e),
-                })?,
+                }
+            })?,
         )
         .map_err(|e| WorkerError {
             kind: ErrorKind::Inference,
@@ -620,17 +652,34 @@ impl WorkerRuntime {
             // Try to interpret as [batch_size, hidden_dim] (already pooled)
             if embeddings_f32.len() == batch_size * hidden_dim {
                 // Apply mean pooling manually
-                return self.pool_and_normalize(embeddings_f32, batch_size, hidden_dim, attention_mask, expected_dim);
+                return self.pool_and_normalize(
+                    embeddings_f32,
+                    batch_size,
+                    hidden_dim,
+                    attention_mask,
+                    expected_dim,
+                );
             }
             return Err(WorkerError {
                 kind: ErrorKind::Inference,
-                message: format!("unexpected output size: expected {}*{}*{}, got {}",
-                    batch_size, output_seq_len, hidden_dim, embeddings_f32.len()),
+                message: format!(
+                    "unexpected output size: expected {}*{}*{}, got {}",
+                    batch_size,
+                    output_seq_len,
+                    hidden_dim,
+                    embeddings_f32.len()
+                ),
             });
         }
 
         // Apply mean pooling using attention mask
-        self.pool_and_normalize(embeddings_f32, batch_size, hidden_dim, attention_mask, expected_dim)
+        self.pool_and_normalize(
+            embeddings_f32,
+            batch_size,
+            hidden_dim,
+            attention_mask,
+            expected_dim,
+        )
     }
 
     #[cfg(feature = "onnx")]
@@ -749,7 +798,8 @@ impl WorkerRuntime {
             .collect();
 
         // Batch tokenize all pairs
-        let encodings = tokenizer.encode_batch(pair_texts, true)
+        let encodings = tokenizer
+            .encode_batch(pair_texts, true)
             .map_err(|e| WorkerError {
                 kind: ErrorKind::Tokenizer,
                 message: format!("rerank tokenization failed: {}", e),
@@ -760,7 +810,8 @@ impl WorkerRuntime {
         }
 
         let batch_size = encodings.len();
-        let max_len = encodings.iter()
+        let max_len = encodings
+            .iter()
             .map(|e| e.len())
             .max()
             .unwrap_or(0)
@@ -788,7 +839,7 @@ impl WorkerRuntime {
         for encoding in &encodings {
             let ids = encoding.get_ids();
             let mask = encoding.get_attention_mask();
-            
+
             for i in 0..max_len {
                 if i < ids.len() {
                     input_ids.push(ids[i] as i64);
@@ -802,11 +853,12 @@ impl WorkerRuntime {
 
         // Create input tensors with proper ndarrays
         let input_ids_tensor = ort::value::Tensor::from_array(
-            ndarray::Array2::from_shape_vec((batch_size, max_len), input_ids.clone())
-                .map_err(|e| WorkerError {
+            ndarray::Array2::from_shape_vec((batch_size, max_len), input_ids.clone()).map_err(
+                |e| WorkerError {
                     kind: ErrorKind::Inference,
                     message: format!("failed to create rerank input_ids array: {}", e),
-                })?,
+                },
+            )?,
         )
         .map_err(|e| WorkerError {
             kind: ErrorKind::Inference,
@@ -863,7 +915,7 @@ impl WorkerRuntime {
             // Take the first token's embedding as the query-document score
             let first_token_idx = b * seq_len * hidden_dim;
             let first_token_emb = &scores[first_token_idx..first_token_idx + hidden_dim];
-            
+
             // Compute cosine similarity with a reference direction (use mean of first token)
             // Or simply use the L2 norm of the first token as a relevance proxy
             let mut norm: f32 = 0.0f32;
@@ -871,7 +923,7 @@ impl WorkerRuntime {
                 norm += v * v;
             }
             norm = norm.sqrt();
-            
+
             // Normalized magnitude serves as relevance score
             rerank_scores.push(norm);
         }
@@ -893,7 +945,11 @@ impl WorkerRuntime {
             .collect();
 
         // Sort by combined score descending
-        results.sort_by(|a, b| b.combined_score.partial_cmp(&a.combined_score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.combined_score
+                .partial_cmp(&a.combined_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Ok(RerankResponse { results })
     }
