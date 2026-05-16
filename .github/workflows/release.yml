@@ -147,6 +147,7 @@ jobs:
           $STRIP target/${{ matrix.target }}/release/leindex-embed
 
       - name: Download model assets
+        shell: bash
         run: |
           set -e
           MODELS_DIR="models"
@@ -185,6 +186,18 @@ jobs:
               echo "Downloading config from HuggingFace..."
               curl --fail --location --progress-bar -o "$MODELS_DIR/config.json" \
                 "https://huggingface.co/${HF_REPO}/resolve/main/config.json"
+            fi
+            if [[ ! -f "$MODELS_DIR/checksums.sha256" ]]; then
+              echo "Downloading checksums from HuggingFace..."
+              curl --fail --location --progress-bar -o "$MODELS_DIR/checksums.sha256" \
+                "https://huggingface.co/${HF_REPO}/resolve/main/checksums.sha256" \
+                || true
+            fi
+            if [[ ! -f "$MODELS_DIR/LICENSE" ]]; then
+              echo "Downloading LICENSE from HuggingFace..."
+              curl --fail --location --progress-bar -o "$MODELS_DIR/LICENSE" \
+                "https://huggingface.co/${HF_REPO}/resolve/main/LICENSE" \
+                || true
             fi
             echo "Model assets ready at $MODELS_DIR"
           fi
