@@ -19,12 +19,55 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
+use std::thread;
 use std::time::Duration;
 
 use leindex_embed::protocol::{
     self, BatchId, EmbedRequest, EmbedResponse, Frame, MsgType, RerankDocument, RerankRequest,
     RerankResponse, Response, WorkerError,
 };
+
+/// Read a response frame from the worker with timeout enforcement.
+///
+/// This is the core I/O routine used by the persistent reader thread.
+/// It reads the 4-byte length prefix followed by the payload, enforcing
+/// the max frame size guard to prevent excessive allocations.
+fn read_frame_with_timeout(
+    stdout: &mut std::process::ChildStdout,
+    _timeout: Duration,
+) -> Result<Vec<u8>, ClientError> {
+    // Read response length (4 bytes, little-endian)
+    let mut len_buf = [0u8; 4];
+    match stdout.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) => {
+            return Err(ClientError::Ipc(format!(
+                "failed to read frame length: {}",
+                e
+            )));
+        }
+    }
+
+    let payload_len = u32::from_le_bytes(len_buf);
+
+    // Guard against oversized responses to prevent excessive allocations.
+    if payload_len > MAX_RESPONSE_FRAME_SIZE {
+        return Err(ClientError::Ipc(format!(
+            "response frame too large: {} bytes (max: {} bytes)",
+            payload_len, MAX_RESPONSE_FRAME_SIZE
+        )));
+    }
+
+    let payload_len = payload_len as usize;
+    let mut frame_buf = vec![0u8; payload_len];
+    match stdout.read_exact(&mut frame_buf) {
+        Ok(()) => Ok(frame_buf),
+        Err(e) => Err(ClientError::Ipc(format!(
+            "failed to read frame payload: {}",
+            e
+        ))),
+    }
+}
 
 /// Monotonic batch ID counter for correlating requests.
 static BATCH_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -181,9 +224,22 @@ struct WorkerHandle {
     child: Child,
     /// Stdin pipe for sending frames to the worker.
     stdin: std::process::ChildStdin,
-    /// Stdout pipe for receiving frames from the worker.
-    /// Wrapped in Option so we can take it for the read thread and restore it afterward.
-    stdout: Option<std::process::ChildStdout>,
+    /// Persistent reader thread that reads IPC responses from the worker's stdout.
+    /// Uses a oneshot channel to receive the response data with timeout enforcement.
+    read_thread: thread::JoinHandle<()>,
+    /// Channel sender to signal the read thread to perform a read and return the result.
+    read_request_tx: std::sync::mpsc::Sender<ReadRequest>,
+}
+
+/// Request sent to the persistent reader thread.
+enum ReadRequest {
+    /// Request a read with the given timeout. Response sent via the oneshot channel.
+    Read {
+        tx: mpsc::Sender<Result<Vec<u8>, ClientError>>,
+        timeout: Duration,
+    },
+    /// Signal the read thread to shut down.
+    Shutdown,
 }
 
 impl EmbeddingClient {
@@ -245,10 +301,37 @@ impl EmbeddingClient {
             .take()
             .ok_or_else(|| ClientError::SpawnFailed("failed to open worker stdout".to_string()))?;
 
+        // Create a channel for communicating read requests to the persistent reader thread.
+        let (read_request_tx, read_request_rx) = mpsc::channel::<ReadRequest>();
+
+        // Spawn a persistent reader thread that owns the stdout and handles reads with timeout.
+        // This avoids spawning a new thread for each IPC request.
+        let read_thread = thread::spawn(move || {
+            // Reader thread owns stdout for the lifetime of the worker.
+            let mut stdout = stdout;
+
+            // Handle read requests until shutdown signal.
+            while let Ok(request) = read_request_rx.recv() {
+                match request {
+                    ReadRequest::Read { tx, timeout } => {
+                        // Perform the read with timeout enforcement.
+                        let result = read_frame_with_timeout(&mut stdout, timeout);
+                        // Send result back to the requester.
+                        let _ = tx.send(result);
+                    }
+                    ReadRequest::Shutdown => {
+                        // Exit the thread gracefully.
+                        break;
+                    }
+                }
+            }
+        });
+
         **guard = Some(WorkerHandle {
             child,
             stdin,
-            stdout: Some(stdout),
+            read_thread,
+            read_request_tx,
         });
 
         Ok(())
@@ -264,6 +347,10 @@ impl EmbeddingClient {
             if let Some(mut handle) = guard.take() {
                 // Close stdin to signal shutdown
                 drop(handle.stdin);
+                // Signal the read thread to shut down
+                let _ = handle.read_request_tx.send(ReadRequest::Shutdown);
+                // Wait for the reader thread to exit
+                let _ = handle.read_thread.join();
                 // Kill the process if it hasn't exited yet
                 let _ = handle.child.kill();
                 let _ = handle.child.wait();
@@ -480,14 +567,14 @@ impl EmbeddingClient {
 
     /// Send a frame and receive the response frame.
     ///
-    /// Uses a thread + channel pattern to enforce timeout on blocking pipe I/O.
-    /// Pipes do not support `set_read_timeout()`, so we spawn a thread to do
-    /// the blocking read and use `recv_timeout()` to enforce the deadline.
+    /// Uses a persistent reader thread with a oneshot channel to enforce
+    /// timeout on blocking pipe I/O. The persistent thread is spawned once
+    /// when the worker starts and reused for all requests, avoiding the
+    /// overhead of spawning a new thread per request.
     ///
-    /// After a successful read, stdout is restored to the handle so the client
-    /// remains usable for subsequent requests. On timeout, the worker is left
-    /// in an undefined state but no stdout is consumed (the thread may still
-    /// be blocked on read — the process will be killed via kill_worker if needed).
+    /// On timeout, the worker is left in an undefined state but no stdout
+    /// is consumed (the thread may still be blocked on read — the process
+    /// will be killed via kill_worker if needed).
     fn send_and_receive(&self, frame: Frame) -> Result<Frame, ClientError> {
         let mut guard = self
             .worker
@@ -511,87 +598,34 @@ impl EmbeddingClient {
             .flush()
             .map_err(|e| ClientError::Ipc(format!("failed to flush worker stdin: {}", e)))?;
 
-        // Take stdout out of the handle for the read thread.
-        // After the thread completes (success or timeout), we return stdout
-        // so the caller can restore it to the handle on success.
-        let stdout = handle
-            .stdout
-            .take()
-            .ok_or_else(|| ClientError::Ipc("worker stdout was unexpectedly None".to_string()))?;
+        // Use the persistent reader thread to read the response with timeout.
+        let (tx, rx) = mpsc::channel();
+        handle
+            .read_request_tx
+            .send(ReadRequest::Read {
+                tx,
+                timeout: Duration::from_secs(IPC_TIMEOUT_SECS),
+            })
+            .map_err(|_e| ClientError::Ipc("reader thread channel closed".to_string()))?;
 
-        // Helper to perform the IPC read with timeout.
-        // Returns (frame_buf, stdout) so the caller can restore stdout on success.
-        fn read_response(
-            stdout: std::process::ChildStdout,
-        ) -> Result<(Vec<u8>, std::process::ChildStdout), ClientError> {
-            let (tx, rx) =
-                mpsc::channel::<Result<(Vec<u8>, std::process::ChildStdout), std::io::Error>>();
-            let timeout = Duration::from_secs(IPC_TIMEOUT_SECS);
-
-            std::thread::spawn(move || {
-                let mut stdout = stdout;
-                // Read response length (4 bytes, little-endian)
-                let mut len_buf = [0u8; 4];
-                match stdout.read_exact(&mut len_buf) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
-                    }
+        // Wait for the read with timeout.
+        match rx.recv_timeout(Duration::from_secs(IPC_TIMEOUT_SECS)) {
+            Ok(Ok(frame_buf)) => {
+                Frame::from_wire_bytes(&frame_buf).map_err(|e| ClientError::Ipc(e.to_string()))
+            }
+            Ok(Err(e)) => {
+                // Frame too large or other I/O error
+                if e.to_string().contains("too large") {
+                    Err(ClientError::Ipc(e.to_string()))
+                } else {
+                    Err(ClientError::Ipc(format!("failed to read from worker: {}", e)))
                 }
-
-                let payload_len = u32::from_le_bytes(len_buf);
-
-                // Guard against oversized responses to prevent excessive allocations.
-                if payload_len > MAX_RESPONSE_FRAME_SIZE {
-                    let _ = tx.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "response frame too large: {} bytes (max: {} bytes)",
-                            payload_len, MAX_RESPONSE_FRAME_SIZE
-                        ),
-                    )));
-                    return;
-                }
-
-                let payload_len = payload_len as usize;
-                let mut frame_buf = vec![0u8; payload_len];
-                match stdout.read_exact(&mut frame_buf) {
-                    Ok(()) => {
-                        let _ = tx.send(Ok((frame_buf, stdout)));
-                    }
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                    }
-                }
-            });
-
-            // Wait for the read with timeout
-            match rx.recv_timeout(timeout) {
-                Ok(Ok(result)) => Ok(result),
-                Ok(Err(e)) => {
-                    if e.kind() == std::io::ErrorKind::TimedOut {
-                        Err(ClientError::Timeout)
-                    } else {
-                        Err(ClientError::Ipc(format!(
-                            "failed to read from worker: {}",
-                            e
-                        )))
-                    }
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => Err(ClientError::Timeout),
-                Err(mpsc::RecvTimeoutError::Disconnected) => Err(ClientError::Ipc(
-                    "worker disconnected unexpectedly".to_string(),
-                )),
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ClientError::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err(ClientError::Ipc("reader thread disconnected unexpectedly".to_string()))
             }
         }
-
-        let (frame_buf, returned_stdout) = read_response(stdout)?;
-
-        // Restore stdout to the handle so the client remains usable.
-        handle.stdout = Some(returned_stdout);
-
-        Frame::from_wire_bytes(&frame_buf).map_err(|e| ClientError::Ipc(e.to_string()))
     }
 }
 
@@ -601,6 +635,10 @@ impl Drop for EmbeddingClient {
             if let Some(mut handle) = guard.take() {
                 // Close stdin to signal the worker to shut down
                 drop(handle.stdin);
+                // Signal the read thread to shut down
+                let _ = handle.read_request_tx.send(ReadRequest::Shutdown);
+                // Wait for the reader thread to exit
+                let _ = handle.read_thread.join();
                 // Wait for the worker to exit
                 let _ = handle.child.wait();
             }
