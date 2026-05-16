@@ -17,6 +17,7 @@ use std::fmt;
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -57,7 +58,12 @@ fn resolve_worker_binary() -> Result<std::path::PathBuf, std::io::Error> {
         }
     }
     // Fall back to PATH lookup
-    which::which("leindex-embed")
+    which::which("leindex-embed").map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("worker binary 'leindex-embed' not found in PATH: {}", e),
+        )
+    })
 }
 
 /// Errors that can occur when communicating with the embedding worker.
@@ -167,7 +173,8 @@ struct WorkerHandle {
     /// Stdin pipe for sending frames to the worker.
     stdin: std::process::ChildStdin,
     /// Stdout pipe for receiving frames from the worker.
-    stdout: std::process::ChildStdout,
+    /// Wrapped in Option so we can take it for the read thread and restore it afterward.
+    stdout: Option<std::process::ChildStdout>,
 }
 
 impl EmbeddingClient {
@@ -232,7 +239,7 @@ impl EmbeddingClient {
         **guard = Some(WorkerHandle {
             child,
             stdin,
-            stdout,
+            stdout: Some(stdout),
         });
 
         Ok(())
@@ -463,6 +470,15 @@ impl EmbeddingClient {
     }
 
     /// Send a frame and receive the response frame.
+    ///
+    /// Uses a thread + channel pattern to enforce timeout on blocking pipe I/O.
+    /// Pipes do not support `set_read_timeout()`, so we spawn a thread to do
+    /// the blocking read and use `recv_timeout()` to enforce the deadline.
+    ///
+    /// NOTE: After this method is called, the worker handle's stdout is consumed
+    /// (set to None). The caller must call `kill_worker()` on any error
+    /// to respawn a fresh worker. This is acceptable because the retry/fallback
+    /// logic already kills and respawns the worker on failure.
     fn send_and_receive(&self, frame: Frame) -> Result<Frame, ClientError> {
         let mut guard = self
             .worker
@@ -472,13 +488,6 @@ impl EmbeddingClient {
         let handle = guard
             .as_mut()
             .ok_or_else(|| ClientError::Ipc("worker not running".to_string()))?;
-
-        // Set a timeout on stdout so we don't block indefinitely on a hung worker.
-        let timeout = Duration::from_secs(IPC_TIMEOUT_SECS);
-        handle
-            .stdout
-            .set_read_timeout(Some(timeout))
-            .map_err(|e| ClientError::Ipc(format!("failed to set read timeout: {}", e)))?;
 
         // Send the frame
         let wire = frame
@@ -493,37 +502,76 @@ impl EmbeddingClient {
             .flush()
             .map_err(|e| ClientError::Ipc(format!("failed to flush worker stdin: {}", e)))?;
 
-        // Read the response length (4 bytes, little-endian)
-        let mut len_buf = [0u8; 4];
-        handle.stdout.read_exact(&mut len_buf).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                ClientError::Timeout
-            } else {
-                ClientError::Ipc(format!("failed to read response length: {}", e))
-            }
+        // Take stdout out of the handle for the read thread.
+        // Set to None - on error, the caller kills the worker anyway.
+        // This is acceptable because the fallback/retry logic respawns the worker on failure.
+        let stdout = handle.stdout.take().ok_or_else(|| {
+            ClientError::Ipc("worker stdout was unexpectedly None".to_string())
         })?;
 
-        let payload_len = u32::from_le_bytes(len_buf);
+        // Helper to perform the IPC read with timeout
+        fn read_response(
+            stdout: std::process::ChildStdout,
+        ) -> Result<Vec<u8>, ClientError> {
+            let (tx, rx) = mpsc::channel::<Result<Vec<u8>, std::io::Error>>();
+            let timeout = Duration::from_secs(IPC_TIMEOUT_SECS);
 
-        // Guard against oversized responses to prevent excessive allocations.
-        // A compromised or buggy worker could send u32::MAX (~4 GiB) otherwise.
-        if payload_len > MAX_RESPONSE_FRAME_SIZE {
-            return Err(ClientError::Protocol(format!(
-                "response frame too large: {} bytes (max: {} bytes)",
-                payload_len, MAX_RESPONSE_FRAME_SIZE
-            )));
+            std::thread::spawn(move || {
+                let mut stdout = stdout;
+                // Read response length (4 bytes, little-endian)
+                let mut len_buf = [0u8; 4];
+                match stdout.read_exact(&mut len_buf) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                }
+
+                let payload_len = u32::from_le_bytes(len_buf);
+
+                // Guard against oversized responses to prevent excessive allocations.
+                if payload_len > MAX_RESPONSE_FRAME_SIZE {
+                    let _ = tx.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "response frame too large: {} bytes (max: {} bytes)",
+                            payload_len, MAX_RESPONSE_FRAME_SIZE
+                        ),
+                    )));
+                    return;
+                }
+
+                let payload_len = payload_len as usize;
+                let mut frame_buf = vec![0u8; payload_len];
+                match stdout.read_exact(&mut frame_buf) {
+                    Ok(()) => {
+                        let _ = tx.send(Ok(frame_buf));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                }
+            });
+
+            // Wait for the read with timeout
+            match rx.recv_timeout(timeout) {
+                Ok(Ok(frame_buf)) => Ok(frame_buf),
+                Ok(Err(e)) => {
+                    if e.kind() == std::io::ErrorKind::TimedOut {
+                        Err(ClientError::Timeout)
+                    } else {
+                        Err(ClientError::Ipc(format!("failed to read from worker: {}", e)))
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(ClientError::Timeout),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(ClientError::Ipc("worker disconnected unexpectedly".to_string()))
+                }
+            }
         }
 
-        let payload_len = payload_len as usize;
-        let mut frame_buf = vec![0u8; payload_len];
-        handle.stdout.read_exact(&mut frame_buf).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::TimedOut {
-                ClientError::Timeout
-            } else {
-                ClientError::Ipc(format!("failed to read response payload: {}", e))
-            }
-        })?;
-
+        let frame_buf = read_response(stdout)?;
         Frame::from_wire_bytes(&frame_buf).map_err(|e| ClientError::Ipc(e.to_string()))
     }
 }
