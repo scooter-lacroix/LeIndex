@@ -348,9 +348,7 @@ impl WorkerRuntime {
         // When the model bundle pipeline is complete, replace this with real inference:
         // let embeddings = self.session.run(&inputs)?;
         // Return the actual embedding vectors from the model output.
-        tracing::warn!(
-            "handle_embed: returning zero vectors (ONNX inference not yet wired)"
-        );
+        tracing::warn!("handle_embed: returning zero vectors (ONNX inference not yet wired)");
         let count = texts.len();
         let dim = embed_req.expected_dim;
         let vectors = vec![0.0f32; count * dim];

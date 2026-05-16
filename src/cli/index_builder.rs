@@ -637,8 +637,7 @@ impl HybridEmbedder {
                     neural.embed_with_fallback(&texts, NEURAL_EMBEDDING_DIMENSION)
                 })
                 .await
-                .ok()?
-                ;
+                .ok()?;
                 match result {
                     EmbedResult::Success(response) => {
                         if response.count > 0 {
