@@ -515,7 +515,8 @@ impl EmbeddingClient {
         fn read_response(
             stdout: std::process::ChildStdout,
         ) -> Result<(Vec<u8>, std::process::ChildStdout), ClientError> {
-            let (tx, rx) = mpsc::channel::<Result<(Vec<u8>, std::process::ChildStdout), std::io::Error>>();
+            let (tx, rx) =
+                mpsc::channel::<Result<(Vec<u8>, std::process::ChildStdout), std::io::Error>>();
             let timeout = Duration::from_secs(IPC_TIMEOUT_SECS);
 
             std::thread::spawn(move || {
