@@ -343,8 +343,14 @@ impl WorkerRuntime {
             .map(|t| self.truncate_text(t))
             .collect();
 
-        // Stub: return zero vectors for protocol validation.
-        // Full ONNX inference will be wired when the model bundle pipeline is complete.
+        // TODO(onnx-worker): This is a STUB that returns zero vectors.
+        // ONNX inference is not yet wired — neural embeddings are non-functional.
+        // When the model bundle pipeline is complete, replace this with real inference:
+        // let embeddings = self.session.run(&inputs)?;
+        // Return the actual embedding vectors from the model output.
+        tracing::warn!(
+            "handle_embed: returning zero vectors (ONNX inference not yet wired)"
+        );
         let count = texts.len();
         let dim = embed_req.expected_dim;
         let vectors = vec![0.0f32; count * dim];

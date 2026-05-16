@@ -163,6 +163,12 @@ impl McpServer {
     ///
     /// A+ hotspot cleanup: prevents session-tracking state from growing
     /// monotonically across long-lived server sessions (VAL-APLUS-025).
+    ///
+    /// TODO(mcp-server): This method is currently only called from tests.
+    /// Wire it to a periodic background task (e.g., via tokio::time::Interval)
+    /// or call it at an appropriate point in the server lifecycle during
+    /// session creation or on a timer. Until wired, stale sessions may
+    /// accumulate in memory over long-lived server processes.
     pub fn cleanup_stale_sessions(&self, max_idle: std::time::Duration) -> usize {
         let mut sessions = self.session_handshakes.lock().unwrap();
         let before = sessions.len();
