@@ -294,7 +294,9 @@ install_model_assets() {
     # Validate checksums if checksums.sha256 exists
     if [[ -f "$model_dir/checksums.sha256" ]]; then
         log_info "Validating model checksums..."
-        if ! shasum -a 256 -c "$model_dir/checksums.sha256" >> "$INSTALL_LOG" 2>&1; then
+        # Run checksum validation from within $model_dir so relative paths in
+        # checksums.sha256 (e.g. "tokenizer.json  abc123...") resolve correctly.
+        if ! (cd "$model_dir" && shasum -a 256 -c checksums.sha256) >> "$INSTALL_LOG" 2>&1; then
             log_warn "Checksum validation failed; removing corrupted model files"
             rm -rf "$model_dir"
             return 1
