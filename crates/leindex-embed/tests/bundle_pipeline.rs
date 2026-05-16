@@ -8,8 +8,14 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use leindex_embed::ModelResolver;
+
+/// Global lock serialising env-var mutation across all bundle_pipeline tests.
+/// The `LEINDEX_MODEL_PATH` env var is shared process state; without this lock
+/// parallel test threads race and intermittently fail.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 // ── VAL-CPHASE-022: Bundle pipeline produces worker-ready model layout ──
 
@@ -97,6 +103,7 @@ fn test_bundled_tokenizer_is_valid_json() {
 
 #[test]
 fn test_model_resolver_fails_on_missing_model() {
+    let _guard = ENV_LOCK.lock().unwrap();
     // When no model exists in any standard location, resolution should fail
     // with a clear error message.
     std::env::remove_var("LEINDEX_MODEL_PATH");
@@ -118,6 +125,7 @@ fn test_model_resolver_fails_on_missing_model() {
 
 #[test]
 fn test_model_resolver_fails_on_missing_tokenizer() {
+    let _guard = ENV_LOCK.lock().unwrap();
     std::env::remove_var("LEINDEX_MODEL_PATH");
 
     let result = ModelResolver::resolve_tokenizer("nonexistent");
@@ -132,6 +140,7 @@ fn test_model_resolver_fails_on_missing_tokenizer() {
 
 #[test]
 fn test_missing_env_override_falls_through() {
+    let _guard = ENV_LOCK.lock().unwrap();
     // When LEINDEX_MODEL_PATH points to a non-existent directory,
     // resolution should fall through to the next precedence level.
     let temp_dir = tempfile::tempdir().unwrap();
@@ -263,6 +272,7 @@ fn test_checksum_file_covers_required_artifacts() {
 
 #[test]
 fn test_bundled_model_resolution_without_user_cache() {
+    let _guard = ENV_LOCK.lock().unwrap();
     // When the model is placed next to a simulated binary location,
     // the resolver should find it without needing user cache.
     let temp_dir = tempfile::tempdir().unwrap();
@@ -309,6 +319,7 @@ fn test_bundled_model_resolution_without_user_cache() {
 
 #[test]
 fn test_clean_install_resolves_bundled_models() {
+    let _guard = ENV_LOCK.lock().unwrap();
     // Simulates a clean install where only bundled models exist.
     // No user cache, no env override — just the bundled directory.
     let temp_dir = tempfile::tempdir().unwrap();
@@ -361,6 +372,7 @@ fn test_clean_install_resolves_bundled_models() {
 
 #[test]
 fn test_model_resolution_precedence_env_over_bundled() {
+    let _guard = ENV_LOCK.lock().unwrap();
     // When both env override and a bundled model exist, env override wins.
     let temp_dir1 = tempfile::tempdir().unwrap();
     let temp_dir2 = tempfile::tempdir().unwrap();

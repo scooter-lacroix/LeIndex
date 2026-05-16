@@ -1,0 +1,52 @@
+# Clippy lint configuration — plan0 → plan3 final state
+# Mirrors in-source #[allow(clippy::...)] directives so `cargo clippy -- -D warnings`
+# runs clean across the full workspace (see plan3-audit: "cargo clippy 0 warnings").
+
+# ── Globally allowed (codebase intentional, already annotated in source) ──
+allow = [
+    "clippy::too_many_arguments",   # CLI handlers carry rich context; counted
+    "clippy::module_inception",     # Multiple crate roots intentionally mirror
+    "clippy::result_unit_err",      # Registry operations surface cover Err(())
+    "clippy::arc_with_non_send_sync",  # Tokio Mutex<Arc<...>> pattern
+    "clippy::type_complexity",      # Rich filter builder types in handlers
+    "clippy::new_without_default",  # Index query builders (no default meaningful)
+    "clippy::incompatible_msrv",    # MSRVs differ across target platforms
+    "clippy::should_implement_trait",  # Newtype around rusqlite types
+    "clippy::manual_find",          # C# parser — tree-sitter query idiom
+    "clippy::only_used_in_recursion",# C# parser inherently recursive
+]
+
+# ── Denied — downward pressure on new regressions ──
+# These are not currently suppressed in source; a `-D warnings` build should
+# remain clean when they are absent.
+deny = [
+    "clippy::dbg_macro",
+    "clippy::unwrap_used",
+    "clippy::expect_used",
+    "clippy::panic",
+    "clippy::todo",
+    "clippy::unimplemented",
+    "clippy::print_stdout",
+    "clippy::commented_code",
+    "clippy::bool_assert_comparison",
+    "clippy::clone_on_copy",
+    "clippy::needless_pass_by_value",
+    "clippy::drop_ref",
+    "clippy::equatable_if_let",
+    "clippy::float_cmp",
+    "clippy::match_like_matches_macro",
+    "clippy::single_match",
+    "clippy::suspicious_else_formatting",
+]
+
+# ── Warned — allowed to exist but actively tracked ──
+warn = [
+    "clippy::pedantic",
+    "clippy::nursery",
+    "clippy::cargo",
+    "clippy::restriction",
+    "clippy::style",
+    "clippy::perf",
+    "clippy::complexity",
+    "clippy::correctness",
+]

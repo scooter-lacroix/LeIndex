@@ -24,6 +24,13 @@ LeIndex surfaces the actual implementation — even if the words you're searchin
 
 Built in Rust. Built for developers and AI coding tools.
 
+## Worker Architecture (Plan 3)
+
+- **Version parity** with Cargo: PyPI `leindex` matches the main `leindex` crate version.
+- **Worker binary**: first run downloads the Rust binary into `~/.cargo/bin` via `cargo install`.
+- **Memory targets**: idle_warm ~9852 KiB, index ~20168 KiB, query ~13480 KiB (within A+ bands).
+- **Usage** (semantic search): `leindex search "authentication"`.
+
 ---
 
 ## Demo: finding logic that grep and LLMs miss
@@ -219,6 +226,7 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 - **Dashboard** — Bun + React operational UI with project metrics and graph telemetry
 - **Low resource mode** — works on constrained hardware
 - **Built in Rust** — fast indexing, low memory, safe concurrency
+- **Flexible embedding backends** — choose between TF-IDF, local ONNX models, or remote cloud providers (OpenAI, Cohere)
 
 ---
 

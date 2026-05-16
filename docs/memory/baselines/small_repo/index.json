@@ -1,7 +1,7 @@
 {
   "phase": "index",
   "rss_min_kib": 24,
-  "rss_max_kib": 19432,
+  "rss_max_kib": 21228,
   "rss_p95_kib": 19432,
   "mapped_file_kib": 11940,
   "anon_kib": 7552,

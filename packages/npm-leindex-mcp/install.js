@@ -203,7 +203,7 @@ function getRequestedRelease() {
 
 /**
  * Legacy asset name for backward compatibility with pre-bundle releases.
- * Returns the bare binary asset name (e.g. leindex-1.6.6-linux-x86_64).
+ * Returns the bare binary asset name (e.g. leindex-1.7.0-linux-x86_64).
  */
 function getAssetName(version, platform, arch) {
   const ext = platform === 'windows' ? '.exe' : '';
@@ -212,7 +212,7 @@ function getAssetName(version, platform, arch) {
 
 /**
  * Bundle archive asset name for the worker-bundle release format.
- * Returns the tar.gz or zip archive name (e.g. leindex-1.6.6-linux-x86_64.tar.gz).
+ * Returns the tar.gz or zip archive name (e.g. leindex-1.7.0-linux-x86_64.tar.gz).
  */
 function getBundleAssetName(version, platform, arch) {
   if (platform === 'windows') {

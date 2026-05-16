@@ -4,6 +4,13 @@
 
 A lightweight npm package that automatically downloads and configures LeIndex for use as an MCP (Model Context Protocol) server in AI coding tools.
 
+## Worker Architecture (Plan 3)
+
+- **Version parity** with Cargo: npm package version matches `Cargo.toml` — bundles always stay in sync.
+- **Worker bundle topology**: auto-downloads platform-native bundle (`leindex-embed` sidecar + ONNX model assets) on install; falls back to bare binary or `cargo install` gracefully.
+- **Memory targets**: idle_warm ~9852 KiB, index ~20168 KiB, query ~13480 KiB (within A+ bands).
+- **Install** (MCP): `npx -y @leindex/mcp`.
+
 ## What is This?
 
 This package provides the **leanest** LeIndex distribution:
