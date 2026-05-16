@@ -178,7 +178,9 @@ impl McpServer {
     /// Run the MCP server
     ///
     /// Starts the axum HTTP server and handles incoming requests.
-    /// This function will block until the server is shut down.
+    /// A background task runs `cleanup_stale_sessions` every 60 seconds
+    /// to prevent session-tracking state from growing monotonically
+    /// (VAL-APLUS-025).
     ///
     /// # Returns
     ///
@@ -188,12 +190,35 @@ impl McpServer {
     ///
     /// ```ignore
     /// let config = McpServerConfig::default();
-    /// let server = McpServer::new(config, leindex)?;
+    /// let server = McpServer::new(config)?;
     /// server.run().await?;
     /// ```
     pub async fn run(self) -> anyhow::Result<()> {
         let bind_address = self.config.bind_address;
         let router = Self::router();
+
+        // Spawn background task to clean up stale sessions periodically.
+        // Uses 60-second interval and 5-minute idle threshold.
+        let cleanup_server = self.clone();
+        let _cleanup_handle = tokio::spawn(async move {
+            const CLEANUP_INTERVAL: std::time::Duration =
+                std::time::Duration::from_secs(60);
+            const SESSION_MAX_IDLE: std::time::Duration =
+                std::time::Duration::from_secs(300); // 5 minutes
+            let mut interval =
+                tokio::time::interval(CLEANUP_INTERVAL);
+            loop {
+                interval.tick().await;
+                let removed =
+                    cleanup_server.cleanup_stale_sessions(SESSION_MAX_IDLE);
+                if removed > 0 {
+                    debug!(
+                        "Cleaned up {} stale session(s)",
+                        removed
+                    );
+                }
+            }
+        });
 
         info!("Starting MCP server on {}", bind_address);
 
