@@ -1,0 +1,6 @@
+/target
+.leindex
+*.swp
+*.swo
+*~
+.DS_Store

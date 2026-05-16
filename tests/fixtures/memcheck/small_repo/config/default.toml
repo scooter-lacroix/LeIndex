@@ -1,0 +1,20 @@
+[database]
+url = "sqlite:data/app.db"
+max_connections = 10
+connection_timeout_secs = 30
+idle_timeout_secs = 600
+
+[server]
+host = "127.0.0.1"
+port = 8080
+workers = 4
+request_timeout_secs = 60
+
+[cache]
+enabled = true
+ttl_secs = 300
+max_entries = 1000
+
+[logging]
+level = "info"
+format = "json"

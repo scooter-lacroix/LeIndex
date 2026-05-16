@@ -488,11 +488,6 @@ impl EmbeddingClient {
     /// remains usable for subsequent requests. On timeout, the worker is left
     /// in an undefined state but no stdout is consumed (the thread may still
     /// be blocked on read — the process will be killed via kill_worker if needed).
-    ///
-    /// TODO(onnx-worker): Currently spawns a new OS thread for every IPC read
-    /// (see `std::thread::spawn` below). During bulk indexing this is inefficient.
-    /// Consider using a reusable reader thread or a small thread pool (e.g.,
-    /// rayon or a dedicated tokio blocking task) to amortize thread creation cost.
     fn send_and_receive(&self, frame: Frame) -> Result<Frame, ClientError> {
         let mut guard = self
             .worker

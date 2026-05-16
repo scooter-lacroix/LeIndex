@@ -475,7 +475,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish draft release
-        if: needs.github-release.result == 'success'
+        if: needs.github-release.result == 'success' && (needs.crates-io.result == 'success' || needs.crates-io.result == 'skipped') && (needs.pypi.result == 'success' || needs.pypi.result == 'skipped') && (needs.npm.result == 'success' || needs.npm.result == 'skipped')
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           gh release edit "v${VERSION}" --draft=false
