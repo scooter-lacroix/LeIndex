@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -323,7 +324,7 @@ jobs:
           if npm view "${PKG_NAME}@${PKG_VER}" version 2>/dev/null | grep -q "${PKG_VER}"; then
             echo "Version ${PKG_VER} already published to npm — skipping"
           else
-            npm publish --access public
+            npm publish --access public --provenance
           fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -403,10 +404,7 @@ jobs:
           fetch-depth: 0
 
       - name: Verify HEAD matches release commit
-        if: >
-          needs.crates-io.result == 'success' &&
-          needs.pypi.result == 'success' &&
-          (needs.npm.result == 'success' || needs.npm.result == 'skipped')
+        if: needs.github-release.result == 'success'
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           RELEASE_SHA=$(gh release view "v${VERSION}" --json targetCommitish --jq '.targetCommitish')
@@ -421,10 +419,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish draft release
-        if: >
-          needs.crates-io.result == 'success' &&
-          needs.pypi.result == 'success' &&
-          (needs.npm.result == 'success' || needs.npm.result == 'skipped')
+        if: needs.github-release.result == 'success'
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           gh release edit "v${VERSION}" --draft=false
