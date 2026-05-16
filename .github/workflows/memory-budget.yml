@@ -57,8 +57,8 @@ jobs:
           restore-keys: |
             memcheck-${{ runner.os }}-
 
-      - name: Build release binaries
-        run: cargo build --release --bin leindex -p memcheck
+      - name: Build release binary
+        run: cargo build --release --bin leindex
 
       - name: Run memcheck against canonical fixture
         run: cargo xtask memcheck

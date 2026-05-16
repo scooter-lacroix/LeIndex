@@ -146,6 +146,49 @@ jobs:
           $STRIP target/${{ matrix.target }}/release/leindex
           $STRIP target/${{ matrix.target }}/release/leindex-embed
 
+      - name: Download model assets
+        run: |
+          set -e
+          MODELS_DIR="models"
+          mkdir -p "$MODELS_DIR"
+          # Model assets are gitignored so checkout won't include them.
+          # Try to fetch from a prior GitHub Release first, then HuggingFace.
+          HF_REPO="Qwen/Qwen3-Embedding-0.6B"
+          if [[ -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
+            echo "Model assets already present in repository"
+          else
+            echo "Model assets not in repo — attempting to fetch from prior release..."
+            # Fetch latest non-draft release tag
+            TAG=$(gh release list --limit 10 --json tagName --jq '.[] | select(.draft == false) | .tagName' | head -1)
+            if [[ -n "$TAG" ]]; then
+              echo "Downloading model assets from release $TAG..."
+              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "*.onnx" 2>/dev/null || true
+              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "tokenizer.json" 2>/dev/null || true
+              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "config.json" 2>/dev/null || true
+              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "checksums.sha256" 2>/dev/null || true
+              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "LICENSE" 2>/dev/null || true
+            fi
+            # Fall back to HuggingFace download if still missing
+            if [[ ! -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
+              echo "Downloading ONNX model from HuggingFace (${HF_REPO})..."
+              curl --fail --location --progress-bar -o "$MODELS_DIR/qwen3-embed-0.6b.onnx" \
+                "https://huggingface.co/${HF_REPO}/resolve/main/qwen3-embed-0.6b-onnx/model.onnx" \
+                || curl --fail --location --progress-bar -o "$MODELS_DIR/qwen3-embed-0.6b.onnx" \
+                "https://huggingface.co/${HF_REPO}/resolve/main/model.onnx"
+            fi
+            if [[ ! -f "$MODELS_DIR/tokenizer.json" ]]; then
+              echo "Downloading tokenizer from HuggingFace..."
+              curl --fail --location --progress-bar -o "$MODELS_DIR/tokenizer.json" \
+                "https://huggingface.co/${HF_REPO}/resolve/main/tokenizer.json"
+            fi
+            if [[ ! -f "$MODELS_DIR/config.json" ]]; then
+              echo "Downloading config from HuggingFace..."
+              curl --fail --location --progress-bar -o "$MODELS_DIR/config.json" \
+                "https://huggingface.co/${HF_REPO}/resolve/main/config.json"
+            fi
+            echo "Model assets ready at $MODELS_DIR"
+          fi
+
       - name: Package release bundle
         shell: bash
         run: |
