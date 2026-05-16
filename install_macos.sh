@@ -290,6 +290,18 @@ install_model_assets() {
 
     rm -rf "$model_dir"
     mv "$temp_model_dir" "$model_dir"
+
+    # Validate checksums if checksums.sha256 exists
+    if [[ -f "$model_dir/checksums.sha256" ]]; then
+        log_info "Validating model checksums..."
+        if ! shasum -a 256 -c "$model_dir/checksums.sha256" >> "$INSTALL_LOG" 2>&1; then
+            log_warn "Checksum validation failed; removing corrupted model files"
+            rm -rf "$model_dir"
+            return 1
+        fi
+        log_info "Checksum validation passed"
+    fi
+
     log_success "Model assets installed to $model_dir"
 }
 
