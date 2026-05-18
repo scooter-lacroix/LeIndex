@@ -28,6 +28,19 @@ impl std::error::Error for ModelResolutionError {}
 pub struct ModelResolver;
 
 impl ModelResolver {
+    fn bundled_model_dirs() -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(parent) = exe_path.parent() {
+                dirs.push(parent.join("models"));
+                if let Some(grandparent) = parent.parent() {
+                    dirs.push(grandparent.join("models"));
+                }
+            }
+        }
+        dirs
+    }
+
     /// Resolve the ONNX model file path for the given model name.
     ///
     /// VAL-CPHASE-010: Uses the precedence chain:
@@ -47,14 +60,11 @@ impl ModelResolver {
         }
 
         // 2. Bundled models (relative to the running binary)
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(parent) = exe_path.parent() {
-                let bundled_dir = parent.join("models");
-                let model_path = bundled_dir.join(&model_filename);
-                if model_path.exists() {
-                    tracing::debug!("model resolved via bundled path: {}", model_path.display());
-                    return Ok(model_path);
-                }
+        for bundled_dir in Self::bundled_model_dirs() {
+            let model_path = bundled_dir.join(&model_filename);
+            if model_path.exists() {
+                tracing::debug!("model resolved via bundled path: {}", model_path.display());
+                return Ok(model_path);
             }
         }
 
@@ -92,13 +102,10 @@ impl ModelResolver {
         }
 
         // 2. Bundled models
-        if let Ok(exe_path) = std::env::current_exe() {
-            if let Some(parent) = exe_path.parent() {
-                let bundled_dir = parent.join("models");
-                let tokenizer_path = bundled_dir.join("tokenizer.json");
-                if tokenizer_path.exists() {
-                    return Ok(tokenizer_path);
-                }
+        for bundled_dir in Self::bundled_model_dirs() {
+            let tokenizer_path = bundled_dir.join("tokenizer.json");
+            if tokenizer_path.exists() {
+                return Ok(tokenizer_path);
             }
         }
 

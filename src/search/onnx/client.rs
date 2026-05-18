@@ -344,15 +344,18 @@ impl EmbeddingClient {
     /// transparently spawn a new worker process.
     fn kill_worker(&self) {
         if let Ok(mut guard) = self.worker.lock() {
-            if let Some(mut handle) = guard.take() {
-                // Close stdin to signal shutdown
-                drop(handle.stdin);
-                // Signal the read thread to shut down
+            if let Some(handle) = guard.as_mut() {
+                // Signal the read thread to shut down.
                 let _ = handle.read_request_tx.send(ReadRequest::Shutdown);
-                // Wait for the reader thread to exit
-                let _ = handle.read_thread.join();
-                // Kill the process if it hasn't exited yet
+                // Kill the child first so any blocked stdout read unblocks.
                 let _ = handle.child.kill();
+            }
+            if let Some(mut handle) = guard.take() {
+                // Close stdin after termination has begun.
+                drop(handle.stdin);
+                // Join the reader thread after the pipe closure from child exit.
+                let _ = handle.read_thread.join();
+                // Reap the child process.
                 let _ = handle.child.wait();
             }
         }
@@ -671,14 +674,18 @@ impl EmbeddingClient {
 impl Drop for EmbeddingClient {
     fn drop(&mut self) {
         if let Ok(mut guard) = self.worker.lock() {
-            if let Some(mut handle) = guard.take() {
-                // Close stdin to signal the worker to shut down
-                drop(handle.stdin);
-                // Signal the read thread to shut down
+            if let Some(handle) = guard.as_mut() {
+                // Signal the read thread to shut down.
                 let _ = handle.read_request_tx.send(ReadRequest::Shutdown);
-                // Wait for the reader thread to exit
+                // Kill the child first so any blocked stdout read unblocks.
+                let _ = handle.child.kill();
+            }
+            if let Some(mut handle) = guard.take() {
+                // Close stdin after termination has begun.
+                drop(handle.stdin);
+                // Join the reader thread after the pipe closure from child exit.
                 let _ = handle.read_thread.join();
-                // Wait for the worker to exit
+                // Reap the child process.
                 let _ = handle.child.wait();
             }
         }
