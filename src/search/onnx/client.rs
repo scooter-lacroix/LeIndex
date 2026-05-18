@@ -591,14 +591,22 @@ impl EmbeddingClient {
             .map_err(|e| ClientError::Ipc(e.to_string()))?;
         let request_batch_id = frame.header.batch_id;
 
-        handle.stdin.write_all(&wire).map_err(|e| {
+        if let Err(e) = handle.stdin.write_all(&wire) {
+            drop(guard);
             self.kill_worker();
-            ClientError::Ipc(format!("failed to write to worker: {}", e))
-        })?;
-        handle.stdin.flush().map_err(|e| {
+            return Err(ClientError::Ipc(format!(
+                "failed to write to worker: {}",
+                e
+            )));
+        }
+        if let Err(e) = handle.stdin.flush() {
+            drop(guard);
             self.kill_worker();
-            ClientError::Ipc(format!("failed to flush worker stdin: {}", e))
-        })?;
+            return Err(ClientError::Ipc(format!(
+                "failed to flush worker stdin: {}",
+                e
+            )));
+        }
 
         // Use the persistent reader thread to read the response with timeout.
         let (tx, rx) = mpsc::channel();
@@ -613,11 +621,16 @@ impl EmbeddingClient {
         // Wait for the read with timeout.
         match rx.recv_timeout(Duration::from_secs(IPC_TIMEOUT_SECS)) {
             Ok(Ok(frame_buf)) => {
-                let response = Frame::from_wire_bytes(&frame_buf).map_err(|e| {
-                    self.kill_worker();
-                    ClientError::Ipc(e.to_string())
-                })?;
+                let response = match Frame::from_wire_bytes(&frame_buf) {
+                    Ok(response) => response,
+                    Err(e) => {
+                        drop(guard);
+                        self.kill_worker();
+                        return Err(ClientError::Ipc(e.to_string()));
+                    }
+                };
                 if response.header.batch_id != request_batch_id {
+                    drop(guard);
                     self.kill_worker();
                     return Err(ClientError::Ipc(format!(
                         "response batch_id mismatch: expected {}, got {}",
@@ -627,6 +640,7 @@ impl EmbeddingClient {
                 Ok(response)
             }
             Ok(Err(e)) => {
+                drop(guard);
                 self.kill_worker();
                 // Frame too large or other I/O error
                 if e.to_string().contains("too large") {
@@ -639,10 +653,12 @@ impl EmbeddingClient {
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                drop(guard);
                 self.kill_worker();
                 Err(ClientError::Timeout)
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                drop(guard);
                 self.kill_worker();
                 Err(ClientError::Ipc(
                     "reader thread disconnected unexpectedly".to_string(),
