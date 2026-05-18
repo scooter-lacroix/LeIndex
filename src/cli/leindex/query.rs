@@ -441,6 +441,26 @@ fn generate_deterministic_embedding(symbol_name: &str) -> Vec<f32> {
 /// 1. Nodes whose name contains the query as a substring
 /// 2. Nodes whose ID contains the query as a substring
 /// 3. Higher-complexity nodes (event loops tend to be complex)
+/// Case-insensitive substring check. `needle_lower` must already be
+/// lowercase. Uses byte-level sliding-window comparison with
+/// `to_ascii_lowercase()` to avoid per-call heap allocations, which is
+/// correct for code-symbol identifiers (ASCII-only in practice).
+fn ci_contains(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    let n = needle_lower.len();
+    if n > haystack.len() {
+        return false;
+    }
+    haystack.as_bytes().windows(n).any(|window| {
+        window
+            .iter()
+            .zip(needle_lower.as_bytes())
+            .all(|(&h, &n)| h.to_ascii_lowercase() == n)
+    })
+}
+
 fn fuzzy_find_node(
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
     query: &str,
@@ -455,14 +475,12 @@ fn fuzzy_find_node(
 
     for node_id in pdg.node_indices() {
         if let Some(node) = pdg.get_node(node_id) {
-            let name_lower = node.name.to_lowercase();
-            let id_lower = node.id.to_lowercase();
-
             // Check if the query is a substring of the name or ID
-            let score = if name_lower.contains(&query_lower) {
+            // (case-insensitive, using zero-allocation ci_contains)
+            let score = if ci_contains(&node.name, &query_lower) {
                 // Prefer name matches with higher complexity
                 100 + node.complexity.min(50) as usize
-            } else if id_lower.contains(&query_lower) {
+            } else if ci_contains(&node.id, &query_lower) {
                 50 + node.complexity.min(50) as usize
             } else {
                 // Check if any event-loop alias matches and the node looks
@@ -472,7 +490,7 @@ fn fuzzy_find_node(
                     .any(|alias| query_lower.contains(alias));
                 let name_matches_alias = event_loop_aliases
                     .iter()
-                    .any(|alias| name_lower.contains(alias));
+                    .any(|alias| ci_contains(&node.name, alias));
 
                 if is_event_loop_candidate && name_matches_alias {
                     25 + node.complexity.min(50) as usize
