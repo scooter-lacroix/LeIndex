@@ -222,6 +222,12 @@ impl EditCache {
                 let entry_size = entry.estimated_size();
                 if entry_size <= EDIT_CACHE_MAX_ENTRY_BYTES {
                     let mut entries = self.entries.lock().await;
+                    if let Some(existing) = entries.remove(&abs_path) {
+                        self.total_bytes.fetch_sub(
+                            existing.estimated_size(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                    }
                     // Evict if needed
                     while self.total_bytes.load(std::sync::atomic::Ordering::Relaxed) + entry_size
                         > EDIT_CACHE_TOTAL_CAP_BYTES
@@ -348,6 +354,40 @@ mod tests {
             "hot cache bytes ({}) should not exceed cap ({})",
             cache.hot_cache_bytes(),
             EDIT_CACHE_TOTAL_CAP_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn test_edit_cache_backfill_replaces_existing_hot_entry_bytes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let cache = EditCache::new();
+
+        let mut initial = make_entry(32, 32);
+        initial.file_path = PathBuf::from("/test/backfill.rs");
+        cache.set(temp_dir.path(), initial.clone()).await.unwrap().unwrap();
+        {
+            let mut entries = cache.entries.lock().await;
+            let mut disk_entry = make_entry(160, 160);
+            disk_entry.file_path = initial.file_path.clone();
+            let disk_entry_size = disk_entry.estimated_size();
+            entries.insert(initial.file_path.clone(), disk_entry.clone());
+            cache.total_bytes.fetch_add(
+                disk_entry_size - initial.estimated_size(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+
+        let backed_fill = cache
+            .get(temp_dir.path(), &initial.file_path)
+            .await
+            .expect("entry should be recovered from cold storage");
+
+        assert_eq!(backed_fill.file_path, initial.file_path);
+        let expected = backed_fill.estimated_size();
+        assert_eq!(
+            cache.hot_cache_bytes(),
+            expected,
+            "backfill should replace the existing hot entry bytes exactly"
         );
     }
 
