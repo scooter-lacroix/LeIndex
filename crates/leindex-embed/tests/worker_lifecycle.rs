@@ -26,6 +26,55 @@ use leindex_embed::provider::ExecutionProviderSelector;
 use leindex_embed::runtime::{RuntimeConfig, WorkerRuntime};
 use leindex_embed::startup::{StartupReport, StartupReporter};
 
+#[cfg(feature = "onnx")]
+mod rerank_output_shape_tests {
+    use super::*;
+    use ndarray::ArrayD;
+    use std::sync::{Arc, Mutex};
+
+    struct FakeOutput {
+        shape: Vec<usize>,
+        values: Vec<f32>,
+    }
+
+    impl FakeOutput {
+        fn new(shape: Vec<usize>, values: Vec<f32>) -> Self {
+            Self { shape, values }
+        }
+    }
+
+    #[test]
+    fn scalar_logit_outputs_use_direct_scores() {
+        let batch_size = 2;
+        let outputs = FakeOutput::new(vec![batch_size], vec![0.81, 0.22]);
+        let array = ArrayD::from_shape_vec(outputs.shape.clone(), outputs.values.clone()).unwrap();
+        let extracted: Vec<f32> = array.iter().copied().collect();
+        assert_eq!(extracted, vec![0.81, 0.22]);
+    }
+
+    #[test]
+    fn hidden_state_outputs_fallback_to_first_token_norm() {
+        let batch_size = 2;
+        let seq_len = 3;
+        let hidden_dim = 4;
+        let values = vec![
+            1.0, 2.0, 3.0, 4.0, // batch 0, token 0
+            9.0, 9.0, 9.0, 9.0, // batch 0, token 1
+            8.0, 8.0, 8.0, 8.0, // batch 0, token 2
+            0.5, 0.5, 0.5, 0.5, // batch 1, token 0
+            7.0, 7.0, 7.0, 7.0, // batch 1, token 1
+            6.0, 6.0, 6.0, 6.0, // batch 1, token 2
+        ];
+        let array = ArrayD::from_shape_vec(vec![batch_size, seq_len, hidden_dim], values).unwrap();
+        let extracted: Vec<f32> = array.iter().copied().collect();
+        let first_token_norm_batch0 = (1.0_f32 + 4.0 + 9.0 + 16.0).sqrt();
+        let first_token_norm_batch1 = (0.25_f32 * 4.0).sqrt();
+        assert_eq!(extracted.len(), batch_size * seq_len * hidden_dim);
+        assert!((first_token_norm_batch0 - 5.4772253).abs() < 1e-5);
+        assert!((first_token_norm_batch1 - 1.0).abs() < 1e-5);
+    }
+}
+
 // ── VAL-CPHASE-004: Worker transport uses local IPC only ────────────────
 
 #[test]

@@ -894,39 +894,86 @@ impl WorkerRuntime {
 
         // Note: session_guard will be dropped when outputs is no longer used
 
-        // Extract relevance scores from output using try_extract_array
-        let scores: Vec<f32> = outputs[0]
-            .try_extract_array::<f32>()
-            .map_err(|e| WorkerError {
-                kind: ErrorKind::Inference,
-                message: format!("failed to extract rerank output tensor: {:?}", e),
-            })?
-            .iter()
-            .copied()
-            .collect();
+        let output = &outputs[0];
+        let shape: Vec<usize> = output.shape().iter().copied().collect();
 
-        // Extract scores for each query-document pair
-        // The output is [batch_size, seq_len, hidden_dim], we take the [CLS] token (first token)
-        let hidden_dim = self.config.embedding_dim;
-        let seq_len = scores.len() / (batch_size * hidden_dim);
-
-        let mut rerank_scores: Vec<f32> = Vec::with_capacity(batch_size);
-        for b in 0..batch_size {
-            // Take the first token's embedding as the query-document score
-            let first_token_idx = b * seq_len * hidden_dim;
-            let first_token_emb = &scores[first_token_idx..first_token_idx + hidden_dim];
-
-            // Compute cosine similarity with a reference direction (use mean of first token)
-            // Or simply use the L2 norm of the first token as a relevance proxy
-            let mut norm: f32 = 0.0f32;
-            for &v in first_token_emb {
-                norm += v * v;
+        let rerank_scores: Vec<f32> = match shape.as_slice() {
+            [n] if *n == batch_size => output
+                .try_extract_array::<f32>()
+                .map_err(|e| WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: format!("failed to extract scalar rerank output tensor: {:?}", e),
+                })?
+                .iter()
+                .copied()
+                .collect(),
+            [n, 1] if *n == batch_size => output
+                .try_extract_array::<f32>()
+                .map_err(|e| WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: format!("failed to extract scalar rerank output tensor: {:?}", e),
+                })?
+                .iter()
+                .copied()
+                .collect(),
+            [n, seq_len, hidden_dim] if *n == batch_size => {
+                let scores: Vec<f32> = output
+                    .try_extract_array::<f32>()
+                    .map_err(|e| WorkerError {
+                        kind: ErrorKind::Inference,
+                        message: format!("failed to extract rerank output tensor: {:?}", e),
+                    })?
+                    .iter()
+                    .copied()
+                    .collect();
+                let seq_len = *seq_len;
+                let hidden_dim = *hidden_dim;
+                if seq_len == 0 || hidden_dim == 0 {
+                    return Err(WorkerError {
+                        kind: ErrorKind::Inference,
+                        message: format!(
+                            "invalid rerank output shape {:?}: seq_len and hidden_dim must be non-zero",
+                            shape
+                        ),
+                    });
+                }
+                if scores.len() != batch_size * seq_len * hidden_dim {
+                    return Err(WorkerError {
+                        kind: ErrorKind::Inference,
+                        message: format!(
+                            "unexpected rerank output size: expected {}*{}*{}, got {}",
+                            batch_size,
+                            seq_len,
+                            hidden_dim,
+                            scores.len()
+                        ),
+                    });
+                }
+                let mut rerank_scores: Vec<f32> = Vec::with_capacity(batch_size);
+                for b in 0..batch_size {
+                    let first_token_idx = b * seq_len * hidden_dim;
+                    let first_token_emb = &scores[first_token_idx..first_token_idx + hidden_dim];
+                    let mut norm: f32 = 0.0f32;
+                    for &v in first_token_emb {
+                        norm += v * v;
+                    }
+                    rerank_scores.push(norm.sqrt());
+                }
+                rerank_scores
             }
-            norm = norm.sqrt();
-
-            // Normalized magnitude serves as relevance score
-            rerank_scores.push(norm);
-        }
+            _ => {
+                return Err(WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: format!(
+                        "unsupported rerank output shape {:?}; expected [{}, 1], [{}], or [{}, seq_len, hidden_dim]",
+                        shape,
+                        batch_size,
+                        batch_size,
+                        batch_size
+                    ),
+                });
+            }
+        };
 
         // Build results with combined scores: 70% rerank + 30% initial
         let mut results: Vec<_> = rerank_req

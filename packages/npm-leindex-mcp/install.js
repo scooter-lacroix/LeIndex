@@ -511,10 +511,11 @@ async function install() {
       console.log(`   ✓ LeIndex already installed: ${version}`);
       if (hasWorker) {
         console.log('   ✓ Worker binary present');
+        console.log('\n📦 Installation complete!');
+        console.log('   Add this package to your MCP configuration to use LeIndex.');
+        return;
       }
-      console.log('\n📦 Installation complete!');
-      console.log('   Add this package to your MCP configuration to use LeIndex.');
-      return;
+      console.log('   ⚠ Worker binary missing; downloading bundled worker...');
     } catch (e) {
       // Version check failed, continue with download
       try { fs.unlinkSync(binaryPath); } catch (_) {}
