@@ -676,7 +676,7 @@ impl WorkerRuntime {
         self.pool_and_normalize(
             embeddings_f32,
             batch_size,
-            hidden_dim,
+            output_seq_len,
             attention_mask,
             expected_dim,
         )

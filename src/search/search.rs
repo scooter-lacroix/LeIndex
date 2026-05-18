@@ -328,13 +328,13 @@ impl WorkHoister {
     pub fn store(&mut self, content: &str, embedding: Vec<f32>) {
         let key = Self::content_key(content);
         let byte_size = key.len() + embedding.len() * std::mem::size_of::<f32>();
+        let entry = HoistedWork {
+            embedding,
+            byte_size,
+        };
 
-        // If already present, update and adjust bytes.
-        if let Some(existing) = self.cache.get(&key) {
+        if let Some(existing) = self.cache.put(key, entry) {
             self.tracked_bytes = self.tracked_bytes.saturating_sub(existing.byte_size);
-            self.tracked_bytes += byte_size;
-            // LruCache::put would be ideal but we need to work with get_mut
-            return;
         }
 
         // Evict until there is room.
@@ -345,13 +345,6 @@ impl WorkHoister {
         }
 
         self.tracked_bytes += byte_size;
-        self.cache.put(
-            key,
-            HoistedWork {
-                embedding,
-                byte_size,
-            },
-        );
     }
 
     /// Number of entries currently in the hoister.
@@ -4311,6 +4304,27 @@ mod tests {
 
         // Verify the hoister has exactly 1 entry (no duplicate)
         assert_eq!(hoister.len(), 1);
+    }
+
+    #[test]
+    fn test_work_hoister_updates_existing_embedding() {
+        let mut hoister = WorkHoister::with_bounds(100, 1_000_000);
+        let content = "fn update_me() {}";
+        let first_embedding = vec![1.0, 2.0, 3.0];
+        let second_embedding = vec![4.0, 5.0];
+
+        hoister.store(content, first_embedding.clone());
+        let initial_bytes = hoister.bytes_used();
+
+        hoister.store(content, second_embedding.clone());
+
+        assert_eq!(hoister.lookup(content).unwrap(), second_embedding);
+        assert_eq!(hoister.len(), 1);
+        assert_eq!(
+            hoister.bytes_used(),
+            initial_bytes - first_embedding.len() * std::mem::size_of::<f32>()
+                + second_embedding.len() * std::mem::size_of::<f32>()
+        );
     }
 
     // ========================================================================
