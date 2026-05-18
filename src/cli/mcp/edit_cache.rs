@@ -364,7 +364,11 @@ mod tests {
 
         let mut initial = make_entry(32, 32);
         initial.file_path = PathBuf::from("/test/backfill.rs");
-        cache.set(temp_dir.path(), initial.clone()).await.unwrap().unwrap();
+        cache
+            .set(temp_dir.path(), initial.clone())
+            .await
+            .unwrap()
+            .unwrap();
         {
             let mut entries = cache.entries.lock().await;
             let mut disk_entry = make_entry(160, 160);
