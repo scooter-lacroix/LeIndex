@@ -18,7 +18,7 @@ use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -199,7 +199,8 @@ impl EmbedResult {
 /// so the next request spawns a fresh worker.
 pub struct EmbeddingClient {
     /// Worker process handle, if currently running.
-    worker: Mutex<Option<WorkerHandle>>,
+    /// Shared via Arc so that Clone shares the same worker handle.
+    worker: Arc<Mutex<Option<WorkerHandle>>>,
 }
 
 /// Manual Debug impl — Child doesn't implement Debug.
@@ -211,10 +212,12 @@ impl fmt::Debug for EmbeddingClient {
     }
 }
 
-/// Manual Clone impl — creates a new empty client (does not clone the worker).
+/// Manual Clone impl — shares the worker handle via Arc.
 impl Clone for EmbeddingClient {
     fn clone(&self) -> Self {
-        Self::new()
+        Self {
+            worker: Arc::clone(&self.worker),
+        }
     }
 }
 
@@ -248,7 +251,7 @@ impl EmbeddingClient {
     /// The worker is not spawned until the first request is made (cold start).
     pub fn new() -> Self {
         Self {
-            worker: Mutex::new(None),
+            worker: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -673,7 +676,9 @@ impl EmbeddingClient {
 
 impl Drop for EmbeddingClient {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.worker.lock() {
+        // Only the last owner should kill the worker.
+        // If try_unwrap returns Some, we are the unique owner.
+        if let Ok(mut guard) = self.worker.try_lock() {
             if let Some(handle) = guard.as_mut() {
                 // Signal the read thread to shut down.
                 let _ = handle.read_request_tx.send(ReadRequest::Shutdown);
@@ -710,10 +715,10 @@ mod tests {
     }
 
     #[test]
-    fn test_client_clone_creates_new() {
+    fn test_client_clone_shares_worker() {
         let client = EmbeddingClient::new();
         let cloned = client.clone();
-        // Clone creates a new empty client, not sharing the worker
+        // Clone shares the worker handle via Arc, not a new empty client
         let _ = format!("{:?}", cloned);
     }
 
