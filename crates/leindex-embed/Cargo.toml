@@ -5,7 +5,6 @@ edition = "2021"
 rust-version = "1.75"
 authors = ["LeIndex Contributors"]
 description = "ONNX embedding worker for LeIndex — runs neural embedding and reranking inference in a separate process"
-publish = false
 
 [features]
 default = []

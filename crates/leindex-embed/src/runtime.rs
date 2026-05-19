@@ -895,7 +895,7 @@ impl WorkerRuntime {
         // Note: session_guard will be dropped when outputs is no longer used
 
         let output = &outputs[0];
-        let shape: Vec<usize> = output.shape().iter().copied().collect();
+        let shape: Vec<usize> = output.shape().iter().map(|&d| d as usize).collect();
 
         let rerank_scores: Vec<f32> = match shape.as_slice() {
             [n] if *n == batch_size => output

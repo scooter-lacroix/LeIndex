@@ -7,6 +7,9 @@
 // reports the result. If the requested provider is not available, it
 // falls back to CPU and reports the reason.
 
+#[cfg(feature = "onnx")]
+use ort::ep::ExecutionProvider as _;
+
 /// Result of execution provider selection.
 #[derive(Debug, Clone)]
 pub struct ProviderSelection {
@@ -163,21 +166,31 @@ impl ExecutionProviderSelector {
 
     /// Check if CUDA is available on this system.
     fn is_cuda_available() -> bool {
-        // Check for CUDA runtime via environment or library presence
-        if std::env::var("CUDA_PATH").is_ok() {
-            return true;
+        #[cfg(feature = "onnx")]
+        {
+            ort::ep::CUDA::default().is_available().unwrap_or(false)
         }
-        // Check for nvidia-smi as a proxy for CUDA driver
-        std::path::Path::new("/usr/bin/nvidia-smi").exists()
-            || std::path::Path::new("/usr/local/cuda/bin/nvidia-smi").exists()
+        #[cfg(not(feature = "onnx"))]
+        {
+            // Conservative fallback: check environment and driver presence
+            std::env::var("CUDA_PATH").is_ok()
+                || std::path::Path::new("/usr/bin/nvidia-smi").exists()
+                || std::path::Path::new("/usr/local/cuda/bin/nvidia-smi").exists()
+        }
     }
 
     /// Check if ROCm is available on this system.
     fn is_rocm_available() -> bool {
-        if std::env::var("ROCM_PATH").is_ok() {
-            return true;
+        #[cfg(feature = "onnx")]
+        {
+            ort::ep::ROCm::default().is_available().unwrap_or(false)
         }
-        std::path::Path::new("/opt/rocm/bin/rocm-smi").exists()
+        #[cfg(not(feature = "onnx"))]
+        {
+            // Conservative fallback: check environment and driver presence
+            std::env::var("ROCM_PATH").is_ok()
+                || std::path::Path::new("/opt/rocm/bin/rocm-smi").exists()
+        }
     }
 
     /// Check if CoreML is available (macOS only).
