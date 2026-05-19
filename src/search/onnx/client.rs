@@ -676,9 +676,13 @@ impl EmbeddingClient {
 
 impl Drop for EmbeddingClient {
     fn drop(&mut self) {
-        // Only the last owner should kill the worker.
-        // If try_unwrap returns Some, we are the unique owner.
-        if let Ok(mut guard) = self.worker.try_lock() {
+        // Only the last Arc owner should kill the worker.
+        let worker = match Arc::try_unwrap(std::mem::take(&mut self.worker)) {
+            Ok(worker) => worker,
+            Err(_) => return,
+        };
+
+        if let Ok(mut guard) = worker.into_inner() {
             if let Some(handle) = guard.as_mut() {
                 // Signal the read thread to shut down.
                 let _ = handle.read_request_tx.send(ReadRequest::Shutdown);
