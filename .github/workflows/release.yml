@@ -318,10 +318,20 @@ jobs:
             ~/.cargo/git
           key: publish-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Publish to crates.io
+      - name: Publish leindex-embed to crates.io
+        run: |
+          VERSION=$(grep '^version =' crates/leindex-embed/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if cargo search leindex-embed 2>/dev/null | grep -q "^leindex-embed = \"${VERSION}\""; then
+            echo "Version ${VERSION} of leindex-embed already published to crates.io — skipping"
+          else
+            cargo publish --allow-dirty -p leindex-embed
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish leindex to crates.io
         run: |
           VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          # Skip if this version already exists on crates.io (idempotent for retries)
           if cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\""; then
             echo "Version ${VERSION} already published to crates.io — skipping"
           else

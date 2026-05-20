@@ -233,10 +233,9 @@ struct WorkerHandle {
 
 /// Request sent to the persistent reader thread.
 enum ReadRequest {
-    /// Request a read with the given timeout. Response sent via the oneshot channel.
+    /// Request a read. Response sent via the channel.
     Read {
         tx: mpsc::Sender<Result<Vec<u8>, ClientError>>,
-        timeout: Duration,
     },
     /// Signal the read thread to shut down.
     Shutdown,
@@ -313,7 +312,7 @@ impl EmbeddingClient {
             // Handle read requests until shutdown signal.
             while let Ok(request) = read_request_rx.recv() {
                 match request {
-                    ReadRequest::Read { tx, timeout: _ } => {
+                    ReadRequest::Read { tx } => {
                         // Perform the read with timeout enforcement.
                         let result = read_frame_with_timeout(&mut stdout);
                         // Send result back to the requester.
@@ -615,10 +614,7 @@ impl EmbeddingClient {
         let (tx, rx) = mpsc::channel();
         handle
             .read_request_tx
-            .send(ReadRequest::Read {
-                tx,
-                timeout: Duration::from_secs(IPC_TIMEOUT_SECS),
-            })
+            .send(ReadRequest::Read { tx })
             .map_err(|_e| ClientError::Ipc("reader thread channel closed".to_string()))?;
 
         // Wait for the read with timeout.
