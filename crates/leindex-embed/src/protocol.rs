@@ -70,8 +70,7 @@ pub enum MsgType {
 /// On the wire this is encoded as:
 /// ```text
 /// [4 bytes: payload length, little-endian u32]
-/// [header bytes: bincode-encoded FrameHeader]
-/// [payload bytes: bincode-encoded request or response body]
+/// [bincode-encoded Frame (header + payload)]
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {

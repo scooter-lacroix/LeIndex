@@ -32,10 +32,7 @@ use leindex_embed::protocol::{
 /// This is the core I/O routine used by the persistent reader thread.
 /// It reads the 4-byte length prefix followed by the payload, enforcing
 /// the max frame size guard to prevent excessive allocations.
-fn read_frame_with_timeout(
-    stdout: &mut std::process::ChildStdout,
-    _timeout: Duration,
-) -> Result<Vec<u8>, ClientError> {
+fn read_frame_with_timeout(stdout: &mut std::process::ChildStdout) -> Result<Vec<u8>, ClientError> {
     // Read response length (4 bytes, little-endian)
     let mut len_buf = [0u8; 4];
     match stdout.read_exact(&mut len_buf) {
@@ -291,7 +288,7 @@ impl EmbeddingClient {
         let mut child = Command::new(&worker_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::null())
             .spawn()
             .map_err(|e| ClientError::SpawnFailed(e.to_string()))?;
 
@@ -316,9 +313,9 @@ impl EmbeddingClient {
             // Handle read requests until shutdown signal.
             while let Ok(request) = read_request_rx.recv() {
                 match request {
-                    ReadRequest::Read { tx, timeout } => {
+                    ReadRequest::Read { tx, timeout: _ } => {
                         // Perform the read with timeout enforcement.
-                        let result = read_frame_with_timeout(&mut stdout, timeout);
+                        let result = read_frame_with_timeout(&mut stdout);
                         // Send result back to the requester.
                         let _ = tx.send(result);
                     }

@@ -646,6 +646,14 @@ impl WorkerRuntime {
         // Output shape should be [batch_size, seq_len, hidden_dim]
         // But ONNX Runtime may give us a flat array, so we need to reshape
         let hidden_dim = expected_dim; // Use expected dimension
+
+        if hidden_dim == 0 {
+            return Err(WorkerError {
+                kind: ErrorKind::InvalidRequest,
+                message: "expected_dim must be non-zero".to_string(),
+            });
+        }
+
         let output_seq_len = embeddings_f32.len() / (batch_size * hidden_dim);
 
         if embeddings_f32.len() != batch_size * output_seq_len * hidden_dim {
@@ -665,7 +673,7 @@ impl WorkerRuntime {
                 message: format!(
                     "unexpected output size: expected {}*{}*{}, got {}",
                     batch_size,
-                    output_seq_len,
+                    max_len,
                     hidden_dim,
                     embeddings_f32.len()
                 ),
@@ -917,6 +925,11 @@ impl WorkerRuntime {
                 .copied()
                 .collect(),
             [n, seq_len, hidden_dim] if *n == batch_size => {
+                // Heuristic fallback for models that output hidden states instead of
+                // scalar logits: use L2 norm of the first token's embedding as a
+                // relevance proxy. This is NOT a proper cross-encoder score — models
+                // should ideally output scalar logits via a classification head.
+                // TODO: Support proper classification-head reranker models.
                 let scores: Vec<f32> = output
                     .try_extract_array::<f32>()
                     .map_err(|e| WorkerError {
