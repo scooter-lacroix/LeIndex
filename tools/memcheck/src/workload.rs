@@ -420,8 +420,12 @@ fn run_command_phase(
 
     let duration = start.elapsed();
 
-    if !status.success() && config.verbose {
-        eprintln!("  warning: {} command exited with {:?}", phase_name, status);
+    if !status.success() {
+        anyhow::bail!(
+            "{} command exited with {:?} — aborting memcheck",
+            phase_name,
+            status
+        );
     }
 
     let report = build_phase_report(phase_name, &mut samples, duration);

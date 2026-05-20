@@ -4,7 +4,6 @@ use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 // ============================================================================
@@ -77,16 +76,15 @@ impl std::error::Error for EntryTooLargeError {}
 /// The hot cache is bounded by both per-entry and total-byte caps.
 pub struct EditCache {
     /// Hot cache in memory for fast access during a session.
-    entries: Mutex<HashMap<PathBuf, EditCacheEntry>>,
-    /// Tracked total bytes in the hot cache.
-    total_bytes: AtomicUsize,
+    /// `total_bytes` lives inside the Mutex alongside the map so all mutations
+    /// are naturally synchronized without needing AtomicUsize.
+    entries: Mutex<(HashMap<PathBuf, EditCacheEntry>, usize)>,
 }
 
 impl Default for EditCache {
     fn default() -> Self {
         Self {
-            entries: Mutex::new(HashMap::new()),
-            total_bytes: AtomicUsize::new(0),
+            entries: Mutex::new((HashMap::new(), 0)),
         }
     }
 }
@@ -164,16 +162,16 @@ impl EditCache {
         // Update hot cache only AFTER successful disk persistence.
         // Enforce total-byte cap via synchronous eviction (VAL-APLUS-013).
         {
-            let mut entries = self.entries.lock().await;
-            let mut total_bytes = self.total_bytes.load(Ordering::Relaxed);
+            let mut guard = self.entries.lock().await;
+            let (ref mut entries, ref mut total_bytes) = *guard;
 
             // Account for replacing an existing entry
             if let Some(existing) = entries.get(&abs_path) {
-                total_bytes = total_bytes.saturating_sub(existing.estimated_size());
+                *total_bytes = total_bytes.saturating_sub(existing.estimated_size());
             }
 
             // Evict until there is room
-            while total_bytes + entry_size > EDIT_CACHE_TOTAL_CAP_BYTES && !entries.is_empty() {
+            while *total_bytes + entry_size > EDIT_CACHE_TOTAL_CAP_BYTES && !entries.is_empty() {
                 // Find the oldest entry to evict (simplest LRU approximation)
                 if let Some(oldest_key) = entries
                     .iter()
@@ -181,14 +179,13 @@ impl EditCache {
                     .map(|(k, _)| k.clone())
                 {
                     if let Some(removed) = entries.remove(&oldest_key) {
-                        total_bytes = total_bytes.saturating_sub(removed.estimated_size());
+                        *total_bytes = total_bytes.saturating_sub(removed.estimated_size());
                     }
                 }
             }
 
             entries.insert(abs_path, entry);
-            total_bytes = total_bytes.saturating_add(entry_size);
-            self.total_bytes.store(total_bytes, Ordering::Relaxed);
+            *total_bytes = total_bytes.saturating_add(entry_size);
         }
 
         Ok(Ok(()))
@@ -202,8 +199,8 @@ impl EditCache {
 
         // Try hot cache first
         {
-            let entries = self.entries.lock().await;
-            if let Some(entry) = entries.get(&abs_path) {
+            let guard = self.entries.lock().await;
+            if let Some(entry) = guard.0.get(&abs_path) {
                 return Some(entry.clone());
             }
         }
@@ -214,13 +211,13 @@ impl EditCache {
                 // Backfill hot cache only if within budget
                 let entry_size = entry.estimated_size();
                 if entry_size <= EDIT_CACHE_MAX_ENTRY_BYTES {
-                    let mut entries = self.entries.lock().await;
-                    let mut total_bytes = self.total_bytes.load(Ordering::Relaxed);
+                    let mut guard = self.entries.lock().await;
+                    let (ref mut entries, ref mut total_bytes) = *guard;
                     if let Some(existing) = entries.remove(&abs_path) {
-                        total_bytes = total_bytes.saturating_sub(existing.estimated_size());
+                        *total_bytes = total_bytes.saturating_sub(existing.estimated_size());
                     }
                     // Evict if needed
-                    while total_bytes + entry_size > EDIT_CACHE_TOTAL_CAP_BYTES && !entries.is_empty()
+                    while *total_bytes + entry_size > EDIT_CACHE_TOTAL_CAP_BYTES && !entries.is_empty()
                     {
                         if let Some(oldest_key) = entries
                             .iter()
@@ -228,12 +225,11 @@ impl EditCache {
                             .map(|(k, _)| k.clone())
                         {
                             if let Some(removed) = entries.remove(&oldest_key) {
-                                total_bytes = total_bytes.saturating_sub(removed.estimated_size());
+                                *total_bytes = total_bytes.saturating_sub(removed.estimated_size());
                             }
                         }
                     }
-                    total_bytes = total_bytes.saturating_add(entry_size);
-                    self.total_bytes.store(total_bytes, Ordering::Relaxed);
+                    *total_bytes = total_bytes.saturating_add(entry_size);
                     entries.insert(abs_path, entry.clone());
                 }
                 return Some(entry);
@@ -250,13 +246,9 @@ impl EditCache {
             .await;
 
         {
-            let mut entries = self.entries.lock().await;
-            if let Some(removed) = entries.remove(&abs_path) {
-                let total_bytes = self
-                    .total_bytes
-                    .load(Ordering::Relaxed)
-                    .saturating_sub(removed.estimated_size());
-                self.total_bytes.store(total_bytes, Ordering::Relaxed);
+            let mut guard = self.entries.lock().await;
+            if let Some(removed) = guard.0.remove(&abs_path) {
+                guard.1 = guard.1.saturating_sub(removed.estimated_size());
             }
         }
 
@@ -265,7 +257,7 @@ impl EditCache {
 
     /// Current total bytes in the hot cache (for testing/telemetry).
     pub async fn hot_cache_bytes(&self) -> usize {
-        self.total_bytes.load(Ordering::Relaxed)
+        self.entries.lock().await.1
     }
 }
 
@@ -357,13 +349,13 @@ mod tests {
             .unwrap()
             .unwrap();
         {
-            let mut entries = cache.entries.lock().await;
+            let mut guard = cache.entries.lock().await;
             let mut disk_entry = make_entry(160, 160);
             disk_entry.file_path = initial.file_path.clone();
             let disk_entry_size = disk_entry.estimated_size();
-            cache.total_bytes -= initial.estimated_size();
-            entries.insert(initial.file_path.clone(), disk_entry.clone());
-            cache.total_bytes += disk_entry_size;
+            guard.1 -= initial.estimated_size();
+            guard.0.insert(initial.file_path.clone(), disk_entry.clone());
+            guard.1 += disk_entry_size;
         }
 
         let backed_fill = cache
