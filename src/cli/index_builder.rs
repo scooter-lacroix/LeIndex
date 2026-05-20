@@ -735,9 +735,9 @@ impl HybridEmbedder {
         match self {
             Self::TfIdfOnly(_) => {}
             #[cfg(feature = "onnx")]
-            Self::HybridLocal { .. } => {
-                // Worker lifecycle management will be handled in the runtime
-                // lifecycle feature. For now, the client drops the worker on Drop.
+            Self::HybridLocal { neural, .. } => {
+                // Kill the worker process; the client can spawn a fresh one later.
+                neural.kill_worker();
             }
             #[cfg(feature = "remote-embeddings")]
             Self::HybridRemote { .. } => {}

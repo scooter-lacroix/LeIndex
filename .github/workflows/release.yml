@@ -160,7 +160,7 @@ jobs:
           else
             echo "Model assets not in repo — attempting to fetch from prior release..."
             # Fetch latest non-draft release tag
-            TAG=$(gh release list --limit 10 --json tagName --jq '.[] | select(.draft == false) | .tagName' | head -1)
+            TAG=$(gh release list --limit 10 --json tagName,isDraft --jq '.[] | select(.isDraft == false) | .tagName' | head -1)
             if [[ -n "$TAG" ]]; then
               echo "Downloading model assets from release $TAG..."
               gh release download "$TAG" --dir "$MODELS_DIR" --pattern "*.onnx" 2>/dev/null || true

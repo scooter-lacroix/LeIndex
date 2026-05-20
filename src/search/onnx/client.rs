@@ -341,7 +341,7 @@ impl EmbeddingClient {
     ///
     /// VAL-CPHASE-021: After calling this, the next embed request will
     /// transparently spawn a new worker process.
-    fn kill_worker(&self) {
+    pub fn kill_worker(&self) {
         if let Ok(mut guard) = self.worker.lock() {
             if let Some(handle) = guard.as_mut() {
                 // Signal the read thread to shut down.
