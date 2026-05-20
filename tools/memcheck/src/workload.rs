@@ -12,6 +12,7 @@
 use crate::report::PhaseReport;
 use crate::sampler;
 use anyhow::{Context, Result};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -157,19 +158,31 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
                     .unwrap_or_else(|| "worker binary path not set".to_string())
             );
         }
-        // Still add placeholder phases so the report has the right phase count
+        // Still add placeholder phases so the report has the right phase count.
+        // Use u64::MAX sentinel values so the budget gate fails these phases
+        // (they were not actually measured). A zero-valued report would pass
+        // trivially since 0 < any threshold.
+        eprintln!(
+            "memcheck: WARNING: worker-active phases skipped ({} not found) — \
+             placeholder reports will fail the budget gate",
+            config
+                .worker_binary
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "worker binary path not set".to_string())
+        );
         for phase_name in &["embed_idle", "embed_active", "embed_teardown"] {
             reports.push(PhaseReport {
                 phase: phase_name.to_string(),
                 rss_min_kib: 0,
-                rss_max_kib: 0,
+                rss_max_kib: u64::MAX,
                 rss_p95_kib: 0,
                 mapped_file_kib: 0,
                 anon_kib: 0,
                 sample_count: 0,
                 duration_ms: 0,
                 worker_rss_max_kib: 0,
-                combined_rss_max_kib: 0,
+                combined_rss_max_kib: u64::MAX,
             });
         }
     }
@@ -223,31 +236,89 @@ fn run_idle_phase(
 /// VAL-CPHASE-036: The canonical workload includes a worker-active embed phase.
 /// VAL-CPHASE-034: The memcheck harness detects the worker process once
 /// embedding begins and records it separately from the main daemon.
+///
+/// The search is triggered by sending a JSON-RPC `tools/call` message directly
+/// to the MCP process's stdin, rather than launching a separate CLI command.
+/// This ensures the MCP process (which we are sampling) actually receives the
+/// search request and spawns the embedding worker as a child process.
 fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport)> {
     if config.verbose {
         eprintln!("memcheck: phase 'embed_active' starting (worker-active)");
     }
 
-    let child = launch_mcp_process(config)?;
+    let mut child = launch_mcp_process(config)?;
     let pid = child.id();
+
+    // Take stdin/stdout pipes for MCP JSON-RPC communication.
+    let mut stdin_pipe = child
+        .stdin
+        .take()
+        .context("failed to take MCP stdin pipe")?;
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .context("failed to take MCP stdout pipe")?;
+    let mut stdout_reader = std::io::BufReader::new(stdout_pipe);
 
     // Give the process time to initialise
     std::thread::sleep(STARTUP_GRACE);
 
-    // Trigger a search that would use ONNX embeddings, spawning the worker.
-    // We run a search command against the same fixture in a separate process
-    // to trigger the MCP server's embed path. The MCP server (our sampled
-    // process) will spawn the worker as a child.
-    let search_handle = std::thread::spawn({
-        let binary = config.binary.clone();
-        let fixture = config.fixture.clone();
-        move || {
-            let _ = Command::new(&binary)
-                .arg("search")
-                .arg("function")
-                .arg("--project")
-                .arg(&fixture)
-                .output();
+    // MCP handshake: send initialize request, read response.
+    let init_request = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#;
+    stdin_pipe
+        .write_all(format!("{}\n", init_request).as_bytes())
+        .context("failed to write initialize request to MCP stdin")?;
+    stdin_pipe
+        .flush()
+        .context("failed to flush MCP stdin")?;
+
+    // Read the initialize response (line-delimited JSON).
+    let mut init_response = String::new();
+    stdout_reader
+        .read_line(&mut init_response)
+        .context("failed to read initialize response from MCP stdout")?;
+
+    if config.verbose {
+        eprintln!(
+            "memcheck: MCP initialize response: {}",
+            init_response.trim()
+        );
+    }
+
+    // Send initialized notification (no response expected).
+    let initialized_notification =
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    stdin_pipe
+        .write_all(format!("{}\n", initialized_notification).as_bytes())
+        .context("failed to write initialized notification to MCP stdin")?;
+    stdin_pipe
+        .flush()
+        .context("failed to flush MCP stdin")?;
+
+    // Trigger a search via tools/call in a background thread.
+    // This sends the request to the MCP process we are sampling, which will
+    // activate the embedding path and spawn the worker as a child.
+    let fixture_path = config.fixture.display().to_string();
+    let search_handle = std::thread::spawn(move || {
+        let search_request = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search","arguments":{{"query":"function","project_path":"{}"}}}}}}"#,
+            fixture_path.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        if let Err(e) = stdin_pipe.write_all(format!("{}\n", search_request).as_bytes()) {
+            eprintln!("memcheck: failed to write search request to MCP stdin: {}", e);
+            return;
+        }
+        if let Err(e) = stdin_pipe.flush() {
+            eprintln!("memcheck: failed to flush MCP stdin after search: {}", e);
+            return;
+        }
+        // Read the search response so the MCP process can complete.
+        let mut search_response = String::new();
+        if let Err(e) = stdout_reader.read_line(&mut search_response) {
+            eprintln!(
+                "memcheck: failed to read search response from MCP stdout: {}",
+                e
+            );
         }
     });
 

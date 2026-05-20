@@ -58,7 +58,7 @@ jobs:
             memcheck-${{ runner.os }}-
 
       - name: Build release binary
-        run: cargo build --release --bin leindex
+        run: cargo build --release --bin leindex --bin leindex-embed
 
       - name: Run memcheck against canonical fixture
         run: cargo xtask memcheck

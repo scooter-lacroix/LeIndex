@@ -675,7 +675,8 @@ impl Drop for EmbeddingClient {
             Err(_) => return,
         };
 
-        if let Ok(mut guard) = worker.into_inner() {
+        let mut guard = worker.into_inner().unwrap_or_else(|e| e.into_inner());
+        {
             if let Some(handle) = guard.as_mut() {
                 // Signal the read thread to shut down.
                 let _ = handle.read_request_tx.send(ReadRequest::Shutdown);
