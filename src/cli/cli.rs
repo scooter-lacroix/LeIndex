@@ -1077,46 +1077,22 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
 
 /// MCP stdio command implementation - Run MCP server in stdio mode
 /// This mode allows AI tools to start LeIndex as a subprocess for automatic integration
-async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
+///
+/// Initialization is deferred: the server enters the stdin read loop immediately
+/// (no SQLite open, no PDG load, no TF-IDF rebuild, no file watcher at startup).
+/// Projects are loaded lazily on first tool call via `ProjectRegistry::get_or_load()`.
+async fn cmd_mcp_stdio_impl(_project: Option<PathBuf>) -> AnyhowResult<()> {
     use crate::cli::mcp::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse};
     use std::io::{self, BufRead, Read, Write};
 
-    let project_path = get_project_path(project);
-    let canonical_path = project_path
-        .canonicalize()
-        .context("Failed to canonicalize project path")?;
+    info!("Starting LeIndex MCP stdio server (lazy project loading)");
 
-    info!(
-        "Starting LeIndex MCP stdio server for project: {}",
-        canonical_path.display()
-    );
-
-    // Create LeIndex instance
-    let mut leindex = LeIndex::new(&canonical_path).context("Failed to create LeIndex instance")?;
-
-    // Try to load from storage, but don't fail if not indexed yet
-    let _ = leindex.load_from_storage();
-
-    // Initialize global state for handlers
-    let registry = Arc::new(ProjectRegistry::with_initial_project(
-        DEFAULT_MAX_PROJECTS,
-        leindex,
-    ));
-    let _ = crate::cli::mcp::server::SERVER_STATE.set(registry.clone());
-
-    // Initialize handlers
-    let _ = crate::cli::mcp::server::HANDLERS.set(all_tool_handlers());
-
-    // Initialize SERVER_INSTANCE for stdio mode
-    let server = crate::cli::mcp::server::McpServer {
-        config: crate::cli::mcp::server::McpServerConfig::default(),
-        _registry: registry.clone(),
-        handshake_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        session_handshakes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-    };
-    crate::cli::mcp::server::SERVER_INSTANCE
-        .set(Arc::new(server))
-        .map_err(|_| anyhow::anyhow!("Server instance already initialized"))?;
+    // Fast initialization: create empty registry + set all globals, no I/O.
+    // Projects are loaded lazily when tool calls provide a `project_path`.
+    let _server = crate::cli::mcp::server::McpServer::new(
+        crate::cli::mcp::server::McpServerConfig::default(),
+    )
+    .context("Failed to create MCP server")?;
 
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
@@ -1211,7 +1187,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
             JsonRpcMessage::Request(request) => {
                 let request_id = request.id.clone().unwrap_or(serde_json::Value::Null);
 
-                let response = match handle_mcp_request(request, project_path.clone()).await {
+                let response = match handle_mcp_request(request, PathBuf::new()).await {
                     Ok(r) => r,
                     Err(e) => Some(JsonRpcResponse::error(
                         request_id,
