@@ -298,7 +298,14 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
     // Trigger a search via tools/call in a background thread.
     // This sends the request to the MCP process we are sampling, which will
     // activate the embedding path and spawn the worker as a child.
+    //
+    // A channel-based timeout guards against hangs: if the MCP server never
+    // responds, read_line blocks forever in the search thread. The timed recv
+    // prevents the sampling thread from blocking indefinitely, allowing
+    // kill_child to terminate the process (which closes pipes and unblocks
+    // the read).
     let fixture_path = config.fixture.display().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
     let search_handle = std::thread::spawn(move || {
         let search_request = format!(
             r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search","arguments":{{"query":"function","project_path":"{}"}}}}}}"#,
@@ -306,10 +313,12 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
         );
         if let Err(e) = stdin_pipe.write_all(format!("{}\n", search_request).as_bytes()) {
             eprintln!("memcheck: failed to write search request to MCP stdin: {}", e);
+            let _ = tx.send(());
             return;
         }
         if let Err(e) = stdin_pipe.flush() {
             eprintln!("memcheck: failed to flush MCP stdin after search: {}", e);
+            let _ = tx.send(());
             return;
         }
         // Read the search response so the MCP process can complete.
@@ -320,6 +329,7 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
                 e
             );
         }
+        let _ = tx.send(());
     });
 
     // Sample the MCP process (and its worker child) for the dwell period.
@@ -332,8 +342,14 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
         Some(WORKER_BINARY_NAME),
     )?;
 
-    // Wait for the search to finish (ignore result)
-    let _ = search_handle.join();
+    // Wait for the search to finish with a timeout.
+    match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(()) => {}
+        Err(_) => {
+            eprintln!("memcheck: WARNING: embed_active search thread timed out, detaching");
+        }
+    }
+    drop(search_handle);
 
     if config.verbose {
         eprintln!(

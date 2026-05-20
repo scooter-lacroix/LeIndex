@@ -144,8 +144,9 @@ elif curl --fail --head --silent "${MODEL_BASE_URL}/pytorch_model.bin" &>/dev/nu
 else
     # Try indexed safetensors
     for i in 1 2 3 4 5; do
-        if curl --fail --head --silent "${MODEL_BASE_URL}/model-${i:0:5}-of-00005.safetensors" &>/dev/null; then
-            MODEL_FILES+=("model-${i:0:5}-of-00005.safetensors")
+        shard_idx=$(printf '%05d' "$i")
+        if curl --fail --head --silent "${MODEL_BASE_URL}/model-${shard_idx}-of-00005.safetensors" &>/dev/null; then
+            MODEL_FILES+=("model-${shard_idx}-of-00005.safetensors")
         fi
     done
     if [[ ${#MODEL_FILES[@]} -eq 0 ]]; then
