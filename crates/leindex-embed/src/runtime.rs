@@ -240,55 +240,50 @@ impl WorkerRuntime {
         model_path: &std::path::Path,
         provider_name: &str,
     ) -> Result<Session, ort::Error> {
-        let mut session_builder = Session::builder()?;
+        /// Try to attach the given execution provider; on failure, create a fresh
+        /// session builder and fall back to CPU.
+        macro_rules! try_provider_or_cpu {
+            ($builder:expr, $provider:expr, $name:literal) => {
+                match $builder.with_execution_providers([$provider]) {
+                    Ok(sb) => sb,
+                    Err(e) => {
+                        tracing::warn!("{} EP not available: {}, falling back to CPU", $name, e);
+                        Session::builder()?
+                            .with_execution_providers([ort::ep::CPU::default().build()])?
+                    }
+                }
+            };
+        }
+
+        let session_builder = Session::builder()?;
 
         // Configure execution providers based on selection
-        match provider_name {
+        let mut session_builder = match provider_name {
             "cuda" => {
-                // Try CUDA first, fall back to CPU if unavailable
-                session_builder = match session_builder
-                    .with_execution_providers([ort::ep::CUDA::default().build()])
-                {
-                    Ok(sb) => sb,
-                    Err(e) => {
-                        tracing::warn!("CUDA EP not available: {}, falling back to CPU", e);
-                        Session::builder()?
-                            .with_execution_providers([ort::ep::CPU::default().build()])?
-                    }
-                };
+                try_provider_or_cpu!(
+                    session_builder,
+                    ort::ep::CUDA::default().build(),
+                    "CUDA"
+                )
             }
             "rocm" => {
-                // Try ROCm first, fall back to CPU if unavailable
-                session_builder = match session_builder
-                    .with_execution_providers([ort::ep::ROCm::default().build()])
-                {
-                    Ok(sb) => sb,
-                    Err(e) => {
-                        tracing::warn!("ROCm EP not available: {}, falling back to CPU", e);
-                        Session::builder()?
-                            .with_execution_providers([ort::ep::CPU::default().build()])?
-                    }
-                };
+                try_provider_or_cpu!(
+                    session_builder,
+                    ort::ep::ROCm::default().build(),
+                    "ROCm"
+                )
             }
             "coreml" => {
-                // CoreML for macOS
-                session_builder = match session_builder
-                    .with_execution_providers([ort::ep::CoreML::default().build()])
-                {
-                    Ok(sb) => sb,
-                    Err(e) => {
-                        tracing::warn!("CoreML EP not available: {}, falling back to CPU", e);
-                        Session::builder()?
-                            .with_execution_providers([ort::ep::CPU::default().build()])?
-                    }
-                };
+                try_provider_or_cpu!(
+                    session_builder,
+                    ort::ep::CoreML::default().build(),
+                    "CoreML"
+                )
             }
             _ => {
-                // CPU is the default
-                session_builder =
-                    session_builder.with_execution_providers([ort::ep::CPU::default().build()])?;
+                session_builder.with_execution_providers([ort::ep::CPU::default().build()])?
             }
-        }
+        };
 
         session_builder.commit_from_file(model_path)
     }
@@ -924,63 +919,12 @@ impl WorkerRuntime {
                 .iter()
                 .copied()
                 .collect(),
-            [n, seq_len, hidden_dim] if *n == batch_size => {
-                // Heuristic fallback for models that output hidden states instead of
-                // scalar logits: use L2 norm of the first token's embedding as a
-                // relevance proxy. This is NOT a proper cross-encoder score — models
-                // should ideally output scalar logits via a classification head.
-                // TODO: Support proper classification-head reranker models.
-                let scores: Vec<f32> = output
-                    .try_extract_array::<f32>()
-                    .map_err(|e| WorkerError {
-                        kind: ErrorKind::Inference,
-                        message: format!("failed to extract rerank output tensor: {:?}", e),
-                    })?
-                    .iter()
-                    .copied()
-                    .collect();
-                let seq_len = *seq_len;
-                let hidden_dim = *hidden_dim;
-                if seq_len == 0 || hidden_dim == 0 {
-                    return Err(WorkerError {
-                        kind: ErrorKind::Inference,
-                        message: format!(
-                            "invalid rerank output shape {:?}: seq_len and hidden_dim must be non-zero",
-                            shape
-                        ),
-                    });
-                }
-                if scores.len() != batch_size * seq_len * hidden_dim {
-                    return Err(WorkerError {
-                        kind: ErrorKind::Inference,
-                        message: format!(
-                            "unexpected rerank output size: expected {}*{}*{}, got {}",
-                            batch_size,
-                            seq_len,
-                            hidden_dim,
-                            scores.len()
-                        ),
-                    });
-                }
-                let mut rerank_scores: Vec<f32> = Vec::with_capacity(batch_size);
-                for b in 0..batch_size {
-                    let first_token_idx = b * seq_len * hidden_dim;
-                    let first_token_emb = &scores[first_token_idx..first_token_idx + hidden_dim];
-                    let mut norm: f32 = 0.0f32;
-                    for &v in first_token_emb {
-                        norm += v * v;
-                    }
-                    rerank_scores.push(norm.sqrt());
-                }
-                rerank_scores
-            }
             _ => {
                 return Err(WorkerError {
                     kind: ErrorKind::Inference,
                     message: format!(
-                        "unsupported rerank output shape {:?}; expected [{}, 1], [{}], or [{}, seq_len, hidden_dim]",
+                        "unsupported rerank output shape {:?}; expected [{}] or [{}, 1]",
                         shape,
-                        batch_size,
                         batch_size,
                         batch_size
                     ),

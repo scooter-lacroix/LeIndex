@@ -8,6 +8,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
+use crate::storage::schema::{PROJECT_STORE_MMAP_SIZE, PROJECT_WRITER_CACHE_SIZE_KIB};
+
 /// Default configuration file name
 pub const DEFAULT_CONFIG_FILE: &str = ".leindex/config.toml";
 
@@ -461,8 +463,8 @@ impl Default for StorageConfig {
             backend: StorageBackend::SQLite,
             db_path: None, // Use default
             wal_enabled: true,
-            cache_size_kib: Some(-16000), // 16 MiB writer budget
-            mmap_size: Some(67_108_864),  // 64 MiB mmap cap
+            cache_size_kib: Some(PROJECT_WRITER_CACHE_SIZE_KIB),
+            mmap_size: Some(PROJECT_STORE_MMAP_SIZE),
             connection_timeout_secs: Some(30),
         }
     }

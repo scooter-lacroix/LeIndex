@@ -547,9 +547,9 @@ async fn test_edit_cache_total_cap_enforced() {
 
     // Total hot cache bytes should not significantly exceed the cap
     assert!(
-        cache.hot_cache_bytes() <= EDIT_CACHE_TOTAL_CAP_BYTES + 10_000,
+        cache.hot_cache_bytes().await <= EDIT_CACHE_TOTAL_CAP_BYTES + 10_000,
         "hot cache bytes ({}) should not exceed cap ({})",
-        cache.hot_cache_bytes(),
+        cache.hot_cache_bytes().await,
         EDIT_CACHE_TOTAL_CAP_BYTES
     );
 }

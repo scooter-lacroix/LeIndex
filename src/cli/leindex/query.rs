@@ -465,6 +465,11 @@ fn fuzzy_find_node(
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
     query: &str,
 ) -> Option<crate::graph::pdg::NodeId> {
+    const NAME_MATCH_SCORE: usize = 100;
+    const ID_MATCH_SCORE: usize = 50;
+    const ALIAS_MATCH_SCORE: usize = 25;
+    const COMPLEXITY_SCORE_CAP: u32 = 50;
+
     let query_lower = query.to_lowercase();
 
     // Keywords that suggest event-loop or entry-point patterns.
@@ -479,9 +484,9 @@ fn fuzzy_find_node(
             // (case-insensitive, using zero-allocation ci_contains)
             let score = if ci_contains(&node.name, &query_lower) {
                 // Prefer name matches with higher complexity
-                100 + node.complexity.min(50) as usize
+                NAME_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
             } else if ci_contains(&node.id, &query_lower) {
-                50 + node.complexity.min(50) as usize
+                ID_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
             } else {
                 // Check if any event-loop alias matches and the node looks
                 // like an entry point (high complexity, function type)
@@ -493,7 +498,7 @@ fn fuzzy_find_node(
                     .any(|alias| ci_contains(&node.name, alias));
 
                 if is_event_loop_candidate && name_matches_alias {
-                    25 + node.complexity.min(50) as usize
+                    ALIAS_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
                 } else {
                     continue;
                 }

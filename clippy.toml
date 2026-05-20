@@ -10,7 +10,6 @@ allow = [
     "clippy::arc_with_non_send_sync",  # Tokio Mutex<Arc<...>> pattern
     "clippy::type_complexity",      # Rich filter builder types in handlers
     "clippy::new_without_default",  # Index query builders (no default meaningful)
-    "clippy::incompatible_msrv",    # MSRVs differ across target platforms
     "clippy::should_implement_trait",  # Newtype around rusqlite types
     "clippy::manual_find",          # C# parser — tree-sitter query idiom
     "clippy::only_used_in_recursion",# C# parser inherently recursive
