@@ -1308,45 +1308,56 @@ pub(crate) fn index_nodes_with_embedder(
 
                 // A+ VAL-APLUS-039: Repeated-work hoisting — reuse cached embedding
                 // if we've already computed one for identical content.
-                let tfidf_embedding = if let Some(cached) = work_hoister.lookup(&node_content) {
+                // Both TF-IDF and neural embeddings are cached to avoid redundant
+                // ONNX inference on cache hits.
+                let (tfidf_embedding, cached_neural) = if let Some((tfidf, neural)) = work_hoister.lookup(&node_content) {
                     hoisted_count += 1;
-                    cached
+                    (tfidf, neural)
                 } else {
                     let embedding = embedder.embed_tfidf(&tokens);
-                    work_hoister.store(&node_content, embedding.clone());
-                    embedding
+                    // Don't store yet — we'll store after computing neural embedding
+                    // so both are cached together.
+                    (embedding, None)
                 };
 
                 // Generate neural embedding (if available)
                 // Note: Remote embeddings are not supported in synchronous indexing context
                 // Only local ONNX embeddings are used here to avoid async runtime issues
-                let neural_embedding = match &embedder {
-                    HybridEmbedder::TfIdfOnly(_) => None,
-                    #[cfg(feature = "onnx")]
-                    HybridEmbedder::HybridLocal { .. } => {
-                        match embedder.embed_neural_blocking(&node_content) {
-                            Some(Ok(v)) => Some(v),
-                            Some(Err(e)) => {
-                                tracing::warn!(
-                                    "Neural embedding failed for node {}: {}",
-                                    node.id,
-                                    e
-                                );
-                                None
+                let neural_embedding = if cached_neural.is_some() {
+                    // Cache hit — reuse the cached neural embedding
+                    cached_neural
+                } else {
+                    let neural = match &embedder {
+                        HybridEmbedder::TfIdfOnly(_) => None,
+                        #[cfg(feature = "onnx")]
+                        HybridEmbedder::HybridLocal { .. } => {
+                            match embedder.embed_neural_blocking(&node_content) {
+                                Some(Ok(v)) => Some(v),
+                                Some(Err(e)) => {
+                                    tracing::warn!(
+                                        "Neural embedding failed for node {}: {}",
+                                        node.id,
+                                        e
+                                    );
+                                    None
+                                }
+                                None => None,
                             }
-                            None => None,
                         }
-                    }
-                    #[cfg(feature = "remote-embeddings")]
-                    HybridEmbedder::HybridRemote { .. } => {
-                        if !warned_remote_blocking {
-                            tracing::warn!(
-                                "Remote embeddings require async runtime; falling back to TF-IDF-only for this indexing run"
-                            );
-                            warned_remote_blocking = true;
+                        #[cfg(feature = "remote-embeddings")]
+                        HybridEmbedder::HybridRemote { .. } => {
+                            if !warned_remote_blocking {
+                                tracing::warn!(
+                                    "Remote embeddings require async runtime; falling back to TF-IDF-only for this indexing run"
+                                );
+                                warned_remote_blocking = true;
+                            }
+                            None
                         }
-                        None
-                    }
+                    };
+                    // Store both embeddings together now that we have the neural result
+                    work_hoister.store(&node_content, tfidf_embedding.clone(), neural.clone());
+                    neural
                 };
 
                 let signature = crate::search::search::SearchEngine::extract_signature_from_content(

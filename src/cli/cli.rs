@@ -1128,8 +1128,14 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         let bytes = match reader.read_line(&mut line) {
             Ok(b) => b,
             Err(e) => {
-                tracing::debug!("MCP stdio: failed to read stdin: {}", e);
-                continue;
+                if e.kind() == std::io::ErrorKind::WouldBlock {
+                    // Transient — retry.
+                    tracing::debug!("MCP stdio: transient read error: {}", e);
+                    continue;
+                }
+                // Persistent / fatal error — break to allow graceful shutdown.
+                tracing::debug!("MCP stdio: fatal read error, breaking loop: {}", e);
+                break;
             }
         };
         if bytes == 0 {

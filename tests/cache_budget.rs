@@ -570,7 +570,7 @@ fn test_work_hoister_is_bounded() {
     for i in 0..(WORK_HOISTER_MAX_ENTRIES + 100) {
         let content = format!("content_{}", i);
         let embedding = vec![0.5f32; 768];
-        hoister.store(&content, embedding);
+        hoister.store(&content, embedding, None);
     }
 
     // Should not exceed entry limit
@@ -598,11 +598,11 @@ fn test_work_hoister_lookup_returns_correct_results() {
 
     let content = "fn compute() { return 42; }";
     let embedding = vec![1.0, 0.0, 0.0];
-    hoister.store(content, embedding.clone());
+    hoister.store(content, embedding.clone(), None);
 
     let result = hoister.lookup(content);
     assert!(result.is_some(), "stored content should be found");
-    assert_eq!(result.unwrap(), embedding);
+    assert_eq!(result.unwrap().0, embedding);
 }
 
 #[test]
@@ -613,8 +613,8 @@ fn test_work_hoister_scoped_to_owner() {
     let mut hoister_a = WorkHoister::with_bounds(100, 1024 * 1024);
     let mut hoister_b = WorkHoister::with_bounds(100, 1024 * 1024);
 
-    hoister_a.store("content_a", vec![1.0]);
-    hoister_b.store("content_b", vec![2.0]);
+    hoister_a.store("content_a", vec![1.0], None);
+    hoister_b.store("content_b", vec![2.0], None);
 
     assert!(hoister_a.lookup("content_a").is_some());
     assert!(hoister_a.lookup("content_b").is_none());
@@ -698,7 +698,7 @@ fn test_work_hoister_exposes_byte_accounting() {
     let mut hoister = WorkHoister::with_bounds(100, 1024 * 1024);
     assert_eq!(hoister.bytes_used(), 0);
 
-    hoister.store("test content", vec![1.0f32; 128]);
+    hoister.store("test content", vec![1.0f32; 128], None);
     assert!(
         hoister.bytes_used() > 0,
         "hoister should track bytes after store"

@@ -164,7 +164,7 @@ impl McpServer {
     /// A+ hotspot cleanup: prevents session-tracking state from growing
     /// monotonically across long-lived server sessions (VAL-APLUS-025).
     pub fn cleanup_stale_sessions(&self, max_idle: std::time::Duration) -> usize {
-        let mut sessions = self.session_handshakes.lock().unwrap();
+        let mut sessions = self.session_handshakes.lock().unwrap_or_else(|e| e.into_inner());
         let before = sessions.len();
         sessions.retain(|_, (_, last_access)| last_access.elapsed() < max_idle);
         before - sessions.len()
@@ -172,7 +172,7 @@ impl McpServer {
 
     /// Get the number of active sessions (for diagnostics and testing).
     pub fn active_session_count(&self) -> usize {
-        self.session_handshakes.lock().unwrap().len()
+        self.session_handshakes.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Run the MCP server
@@ -199,6 +199,8 @@ impl McpServer {
 
         // Spawn background task to clean up stale sessions periodically.
         // Uses 60-second interval and 5-minute idle threshold.
+        // The task body is wrapped to catch panics so the cleanup loop
+        // doesn't die silently (Fix 6).
         let cleanup_server = self.clone();
         let _cleanup_handle = tokio::spawn(async move {
             const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -210,6 +212,13 @@ impl McpServer {
                 if removed > 0 {
                     debug!("Cleaned up {} stale session(s)", removed);
                 }
+            }
+        });
+        // Detach with error logging: if the cleanup task panics or errors,
+        // log it rather than dying silently.
+        tokio::spawn(async move {
+            if let Err(e) = _cleanup_handle.await {
+                eprintln!("cleanup task died: {e}");
             }
         });
 

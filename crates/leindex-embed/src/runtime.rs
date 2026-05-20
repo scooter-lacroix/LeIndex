@@ -557,7 +557,7 @@ impl WorkerRuntime {
             .min(512); // Cap at 512 tokens for memory safety
 
         if max_len == 0 {
-            return Ok(EmbedResponse::new(vec![], texts.len(), expected_dim));
+            return Ok(EmbedResponse::new(vec![], 0, expected_dim));
         }
 
         let batch_size = encodings.len();

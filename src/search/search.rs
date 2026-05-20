@@ -265,14 +265,17 @@ impl Default for IndexingAdmissionGate {
 struct HoistedWork {
     /// The TF-IDF embedding computed for this content.
     embedding: Vec<f32>,
+    /// The neural embedding computed for this content (if available).
+    /// Cached alongside TF-IDF to avoid redundant ONNX inference on cache hits.
+    neural_embedding: Option<Vec<f32>>,
     /// Approximate byte size of this cache entry.
     byte_size: usize,
 }
 
 /// Bounded repeated-work hoister.
 ///
-/// Caches intermediate TF-IDF embedding results keyed by a content hash
-/// within a bounded window. When the same content is encountered again
+/// Caches intermediate TF-IDF and neural embedding results keyed by a content
+/// hash within a bounded window. When the same content is encountered again
 /// (e.g., during incremental reindexing of unchanged files), the hoisted
 /// result is reused instead of recomputing the embedding.
 ///
@@ -317,19 +320,23 @@ impl WorkHoister {
     }
 
     /// Look up a previously hoisted embedding for the given content.
-    /// Returns `Some(embedding)` if found, `None` otherwise.
-    pub fn lookup(&mut self, content: &str) -> Option<Vec<f32>> {
+    /// Returns `Some((tfidf_embedding, neural_embedding))` if found, `None` otherwise.
+    pub fn lookup(&mut self, content: &str) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
         let key = Self::content_key(content);
-        self.cache.get(&key).map(|entry| entry.embedding.clone())
+        self.cache.get(&key).map(|entry| {
+            (entry.embedding.clone(), entry.neural_embedding.clone())
+        })
     }
 
     /// Store a computed embedding for the given content.
     /// If the cache is full, evicts the least-recently-used entry first.
-    pub fn store(&mut self, content: &str, embedding: Vec<f32>) {
+    pub fn store(&mut self, content: &str, embedding: Vec<f32>, neural_embedding: Option<Vec<f32>>) {
         let key = Self::content_key(content);
-        let byte_size = key.len() + embedding.len() * std::mem::size_of::<f32>();
+        let neural_byte_size = neural_embedding.as_ref().map_or(0, |v| v.len() * std::mem::size_of::<f32>());
+        let byte_size = key.len() + embedding.len() * std::mem::size_of::<f32>() + neural_byte_size;
         let entry = HoistedWork {
             embedding,
+            neural_embedding,
             byte_size,
         };
 
@@ -4140,11 +4147,11 @@ mod tests {
         let content = "fn compute(x: i32) -> i32 { x + 1 }";
         let embedding = vec![0.1, 0.2, 0.3];
 
-        hoister.store(content, embedding.clone());
+        hoister.store(content, embedding.clone(), None);
         let retrieved = hoister.lookup(content);
 
         assert!(retrieved.is_some());
-        assert_eq!(retrieved.unwrap(), embedding);
+        assert_eq!(retrieved.unwrap().0, embedding);
     }
 
     #[test]
@@ -4159,11 +4166,11 @@ mod tests {
         let content = "fn identical() {}";
         let embedding = vec![0.5, 0.5, 0.5];
 
-        hoister.store(content, embedding.clone());
+        hoister.store(content, embedding.clone(), None);
 
         // Second lookup for identical content should return the same embedding
         let retrieved = hoister.lookup(content);
-        assert_eq!(retrieved.unwrap(), embedding);
+        assert_eq!(retrieved.unwrap().0, embedding);
     }
 
     #[test]
@@ -4174,24 +4181,24 @@ mod tests {
         let embedding_a = vec![1.0, 0.0, 0.0];
         let embedding_b = vec![0.0, 1.0, 0.0];
 
-        hoister.store(content_a, embedding_a.clone());
-        hoister.store(content_b, embedding_b.clone());
+        hoister.store(content_a, embedding_a.clone(), None);
+        hoister.store(content_b, embedding_b.clone(), None);
 
-        assert_eq!(hoister.lookup(content_a).unwrap(), embedding_a);
-        assert_eq!(hoister.lookup(content_b).unwrap(), embedding_b);
+        assert_eq!(hoister.lookup(content_a).unwrap().0, embedding_a);
+        assert_eq!(hoister.lookup(content_b).unwrap().0, embedding_b);
     }
 
     #[test]
     fn test_work_hoister_evicts_on_entry_cap() {
         let mut hoister = WorkHoister::with_bounds(3, 1_000_000);
 
-        hoister.store("content_1", vec![1.0]);
-        hoister.store("content_2", vec![2.0]);
-        hoister.store("content_3", vec![3.0]);
+        hoister.store("content_1", vec![1.0], None);
+        hoister.store("content_2", vec![2.0], None);
+        hoister.store("content_3", vec![3.0], None);
         assert_eq!(hoister.len(), 3);
 
         // Adding a 4th should evict the LRU entry
-        hoister.store("content_4", vec![4.0]);
+        hoister.store("content_4", vec![4.0], None);
         assert_eq!(hoister.len(), 3);
 
         // content_1 should have been evicted (LRU)
@@ -4206,11 +4213,11 @@ mod tests {
         // Each entry: 16-byte key + 3 * 4 bytes = 28 bytes
         let mut hoister = WorkHoister::with_bounds(100, 30);
 
-        hoister.store("short", vec![1.0, 2.0, 3.0]);
+        hoister.store("short", vec![1.0, 2.0, 3.0], None);
         assert_eq!(hoister.len(), 1);
 
         // Adding another should evict the first (28 + 28 = 56 > 30)
-        hoister.store("another", vec![4.0, 5.0, 6.0]);
+        hoister.store("another", vec![4.0, 5.0, 6.0], None);
         assert!(hoister.lookup("short").is_none());
         assert!(hoister.lookup("another").is_some());
     }
@@ -4218,7 +4225,7 @@ mod tests {
     #[test]
     fn test_work_hoister_clear() {
         let mut hoister = WorkHoister::with_bounds(100, 1_000_000);
-        hoister.store("content", vec![1.0]);
+        hoister.store("content", vec![1.0], None);
         assert!(!hoister.is_empty());
 
         hoister.clear();
@@ -4234,10 +4241,10 @@ mod tests {
         let embedding = vec![0.1, 0.2, 0.3, 0.4, 0.5];
 
         // Store the embedding
-        hoister.store(content, embedding.clone());
+        hoister.store(content, embedding.clone(), None);
 
         // Retrieve and verify it matches
-        let retrieved = hoister.lookup(content).unwrap();
+        let retrieved = hoister.lookup(content).unwrap().0;
         assert_eq!(retrieved, embedding);
 
         // Using the retrieved embedding in a search engine should produce
@@ -4295,12 +4302,12 @@ mod tests {
         let embedding = vec![0.42; 768];
 
         // First time: store
-        hoister.store(content, embedding.clone());
+        hoister.store(content, embedding.clone(), None);
 
         // Second time: lookup should return the same result without recomputation
         let lookup_result = hoister.lookup(content);
         assert!(lookup_result.is_some());
-        assert_eq!(lookup_result.unwrap(), embedding);
+        assert_eq!(lookup_result.unwrap().0, embedding);
 
         // Verify the hoister has exactly 1 entry (no duplicate)
         assert_eq!(hoister.len(), 1);
@@ -4313,12 +4320,12 @@ mod tests {
         let first_embedding = vec![1.0, 2.0, 3.0];
         let second_embedding = vec![4.0, 5.0];
 
-        hoister.store(content, first_embedding.clone());
+        hoister.store(content, first_embedding.clone(), None);
         let initial_bytes = hoister.bytes_used();
 
-        hoister.store(content, second_embedding.clone());
+        hoister.store(content, second_embedding.clone(), None);
 
-        assert_eq!(hoister.lookup(content).unwrap(), second_embedding);
+        assert_eq!(hoister.lookup(content).unwrap().0, second_embedding);
         assert_eq!(hoister.len(), 1);
         assert_eq!(
             hoister.bytes_used(),

@@ -7,6 +7,31 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use tracing::{info, warn};
 
+/// Write a progress line to stderr if stderr is a terminal.
+/// Uses `\r` to overwrite the current line (no newline).
+/// This is a no-op when stderr is not a terminal (e.g., MCP/stdio mode).
+fn progress_stderr(msg: &str) {
+    use std::io::{IsTerminal, Write};
+    let stderr = std::io::stderr();
+    if stderr.is_terminal() {
+        let mut handle = stderr.lock();
+        // Clear the line first, then write the new content
+        let _ = write!(handle, "\r\x1b[K{}", msg);
+        let _ = handle.flush();
+    }
+}
+
+/// Clear the progress line on stderr (when terminal).
+fn progress_clear() {
+    use std::io::{IsTerminal, Write};
+    let stderr = std::io::stderr();
+    if stderr.is_terminal() {
+        let mut handle = stderr.lock();
+        let _ = write!(handle, "\r\x1b[K");
+        let _ = handle.flush();
+    }
+}
+
 impl LeIndex {
     pub(crate) fn incremental_reindex_from_watcher(&mut self) -> Result<super::IndexStats> {
         let start_time = std::time::Instant::now();
@@ -327,6 +352,7 @@ impl LeIndex {
         );
 
         // Step 1: Get currently indexed files from storage
+        progress_stderr("Indexing: scanning files...");
         let indexed_files =
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .context("Failed to load indexed files from storage")?;
@@ -431,6 +457,7 @@ impl LeIndex {
         }
 
         // Step 4: Parse changed files
+        progress_stderr(&format!("Indexing: parsing {} files...", files_to_parse.len()));
         let parsing_results = if !files_to_parse.is_empty() {
             let parser = crate::parse::parallel::ParallelParser::new();
             parser.parse_files(files_to_parse)
@@ -444,6 +471,7 @@ impl LeIndex {
         }
 
         // Step 5: Update PDG
+        progress_stderr("Indexing: building PDG...");
         if !unchanged_files.is_empty() && self.pdg.is_none() {
             self.load_pdg_from_storage()
                 .context("Failed to load existing PDG for incremental reindex. Please reindex with --force if corruption persists.")?;
@@ -545,6 +573,7 @@ impl LeIndex {
         }
 
         // Step 6: Re-index nodes for search
+        progress_stderr(&format!("Indexing: embedding {} nodes...", pdg_node_count));
         let batch_size = self.indexing_batch_size();
         let persisted_embedder =
             index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
@@ -595,6 +624,7 @@ impl LeIndex {
         info!("Indexed {} nodes for search", indexed_count);
 
         // Step 7: Persist to storage
+        progress_stderr("Indexing: saving to storage...");
         index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
 
         // Update statistics
@@ -642,6 +672,9 @@ impl LeIndex {
         }
 
         info!("Indexing completed in {}ms", self.stats.indexing_time_ms);
+
+        // Clear the progress line so the final output is clean.
+        progress_clear();
 
         Ok(self.stats.clone())
     }

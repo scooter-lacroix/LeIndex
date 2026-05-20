@@ -341,17 +341,80 @@ impl EmbeddingClient {
     ///
     /// VAL-CPHASE-021: After calling this, the next embed request will
     /// transparently spawn a new worker process.
+    ///
+    /// On Unix, sends SIGTERM first and waits up to 2 seconds before
+    /// falling back to SIGKILL. On other platforms, drops stdin (EOF)
+    /// then waits with a timeout before killing.
     pub fn kill_worker(&self) {
         if let Ok(mut guard) = self.worker.lock() {
             if let Some(handle) = guard.as_mut() {
                 // Signal the read thread to shut down.
                 let _ = handle.read_request_tx.send(ReadRequest::Shutdown);
-                // Kill the child first so any blocked stdout read unblocks.
-                let _ = handle.child.kill();
+
+                // Graceful shutdown: try SIGTERM first (Unix) or stdin drop (portable).
+                #[cfg(unix)]
+                {
+                    let pid = handle.child.id() as libc::pid_t;
+                    if pid > 0 {
+                        unsafe {
+                            libc::kill(pid, libc::SIGTERM);
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    // Portable: drop stdin to signal EOF to the child.
+                    drop(std::mem::take(&mut handle.stdin));
+                }
             }
             if let Some(mut handle) = guard.take() {
-                // Close stdin after termination has begun.
-                drop(handle.stdin);
+                #[cfg(unix)]
+                {
+                    // Close stdin after signalling termination.
+                    drop(handle.stdin);
+
+                    // Wait up to 2 seconds for graceful exit.
+                    match handle.child.try_wait() {
+                        Ok(Some(_status)) => {
+                            // Already exited — just join the reader thread.
+                            let _ = handle.read_thread.join();
+                            let _ = handle.child.wait();
+                            return;
+                        }
+                        Ok(None) => {
+                            // Still running — wait with timeout.
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(2);
+                            loop {
+                                match handle.child.try_wait() {
+                                    Ok(Some(_)) => break,
+                                    Ok(None) if std::time::Instant::now() < deadline => {
+                                        std::thread::sleep(std::time::Duration::from_millis(50));
+                                    }
+                                    _ => break,
+                                }
+                            }
+                        }
+                        Err(_) => {}
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    // Wait up to 2 seconds for graceful exit after stdin drop.
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    loop {
+                        match handle.child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) if std::time::Instant::now() < deadline => {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                // Fallback: SIGKILL if still alive.
+                let _ = handle.child.kill();
                 // Join the reader thread after the pipe closure from child exit.
                 let _ = handle.read_thread.join();
                 // Reap the child process.
@@ -680,12 +743,58 @@ impl Drop for EmbeddingClient {
             if let Some(handle) = guard.as_mut() {
                 // Signal the read thread to shut down.
                 let _ = handle.read_request_tx.send(ReadRequest::Shutdown);
-                // Kill the child first so any blocked stdout read unblocks.
-                let _ = handle.child.kill();
+
+                // Graceful shutdown: SIGTERM on Unix, stdin drop on other platforms.
+                #[cfg(unix)]
+                {
+                    let pid = handle.child.id() as libc::pid_t;
+                    if pid > 0 {
+                        unsafe {
+                            libc::kill(pid, libc::SIGTERM);
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    drop(std::mem::take(&mut handle.stdin));
+                }
             }
             if let Some(mut handle) = guard.take() {
-                // Close stdin after termination has begun.
+                // Close stdin after signalling termination.
                 drop(handle.stdin);
+
+                // Wait briefly for graceful exit before SIGKILL.
+                #[cfg(unix)]
+                {
+                    let deadline = std::time::Duration::from_secs(2);
+                    let start = std::time::Instant::now();
+                    loop {
+                        match handle.child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) if start.elapsed() < deadline => {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    let deadline = std::time::Duration::from_secs(2);
+                    let start = std::time::Instant::now();
+                    loop {
+                        match handle.child.try_wait() {
+                            Ok(Some(_)) => break,
+                            Ok(None) if start.elapsed() < deadline => {
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+
+                // Fallback: SIGKILL if still alive.
+                let _ = handle.child.kill();
                 // Join the reader thread after the pipe closure from child exit.
                 let _ = handle.read_thread.join();
                 // Reap the child process.
