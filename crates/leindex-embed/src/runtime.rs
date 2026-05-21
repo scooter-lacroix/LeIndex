@@ -688,15 +688,15 @@ impl WorkerRuntime {
             .map(|&d| d as usize)
             .collect();
 
+        // try_extract_array returns an owned ndarray::ArrayD<f32>. Using
+        // into_raw_vec() reclaims the underlying Vec<f32> without copying.
         let embeddings_f32: Vec<f32> = outputs[0]
             .try_extract_array::<f32>()
             .map_err(|e| WorkerError {
                 kind: ErrorKind::Inference,
                 message: format!("failed to extract output tensor: {:?}", e),
             })?
-            .iter()
-            .copied()
-            .collect();
+            .into_raw_vec();
 
         if expected_dim == 0 {
             return Err(WorkerError {
@@ -773,9 +773,10 @@ impl WorkerRuntime {
 
         let hidden_dim = expected_dim;
         let mut pooled: Vec<f32> = Vec::with_capacity(batch_size * hidden_dim);
+        let mut sum: Vec<f32> = vec![0.0f32; hidden_dim];
 
         for b in 0..batch_size {
-            let mut sum: Vec<f32> = vec![0.0f32; hidden_dim];
+            sum.fill(0.0);
             let mut weight_sum: f32 = 0.0f32;
 
             for s in 0..seq_len {

@@ -227,8 +227,8 @@ jobs:
           cp models/qwen3-embed-0.6b.onnx "$BUNDLE_DIR/models/"
           cp models/tokenizer.json "$BUNDLE_DIR/models/"
           cp models/config.json "$BUNDLE_DIR/models/"
-          cp models/checksums.sha256 "$BUNDLE_DIR/models/"
-          cp models/LICENSE "$BUNDLE_DIR/models/"
+          cp models/checksums.sha256 "$BUNDLE_DIR/models/" 2>/dev/null || true
+          cp models/LICENSE "$BUNDLE_DIR/models/" 2>/dev/null || true
 
           # Create archive
           if [ "${{ matrix.asset_name }}" = "windows-x86_64" ]; then

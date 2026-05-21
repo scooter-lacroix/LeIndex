@@ -1181,6 +1181,12 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
                 }
             };
 
+            const MAX_STDIN_PAYLOAD: usize = 10 * 1024 * 1024; // 10 MiB
+            if length > MAX_STDIN_PAYLOAD {
+                eprintln!("[ERROR] Payload too large: {} bytes (max: {} bytes)", length, MAX_STDIN_PAYLOAD);
+                continue;
+            }
+
             // Consume remaining header lines until blank line
             loop {
                 let mut header = String::new();
