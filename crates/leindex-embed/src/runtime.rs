@@ -419,7 +419,7 @@ impl WorkerRuntime {
                         frame_buf.resize(payload_len, 0);
                         match buf_reader.read_exact(&mut frame_buf) {
                             Ok(()) => {
-                                if tx.send(Ok(frame_buf.clone())).is_err() {
+                                if tx.send(Ok(std::mem::take(&mut frame_buf))).is_err() {
                                     break; // Receiver dropped
                                 }
                             }

@@ -1318,21 +1318,10 @@ pub(crate) fn index_nodes_with_embedder(
     for batch in node_indices.chunks(batch_size) {
         nodes.clear();
         admission_gate.reset();
-        // Collect (index-in-nodes, text) for nodes that need a neural embedding.
-        let mut neural_pending: Vec<(usize, String)> = Vec::new();
+        // Collect index-into-nodes for nodes that need a neural embedding.
+        let mut neural_pending: Vec<usize> = Vec::new();
         for &node_idx in batch {
             if let Some(node) = pdg.get_node(node_idx) {
-                // A+ VAL-APLUS-038: Selective pruning — skip generated/low-info nodes.
-                let pruning_decision = pruner.evaluate(
-                    &node.file_path,
-                    "", // content not yet extracted; use path-only check
-                    &node.name,
-                );
-                if pruning_decision != crate::search::search::PruningDecision::Keep {
-                    pruned_count += 1;
-                    continue;
-                }
-
                 // Re-read and re-tokenize node content for Pass 2
                 let file_bytes = file_cache
                     .get_or_read(Path::new(&*node.file_path))
@@ -1401,7 +1390,7 @@ pub(crate) fn index_nodes_with_embedder(
 
                 let node_vec_idx = nodes.len();
                 if needs_batch_neural {
-                    neural_pending.push((node_vec_idx, node_content.clone()));
+                    neural_pending.push(node_vec_idx);
                 }
 
                 nodes.push(NodeInfo {
@@ -1424,21 +1413,21 @@ pub(crate) fn index_nodes_with_embedder(
         if !neural_pending.is_empty() {
             #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
             let batch_results = {
-                let texts: Vec<String> = neural_pending.iter().map(|(_, t)| t.clone()).collect();
+                let texts: Vec<String> = neural_pending.iter().map(|&idx| nodes[idx].content.clone()).collect();
                 embedder.embed_neural_batch_blocking(&texts)
             };
             #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
             let batch_results: Vec<Option<Vec<f32>>> = vec![None; neural_pending.len()];
 
-            for (i, (node_vec_idx, content)) in neural_pending.iter().enumerate() {
+            for (i, &node_vec_idx) in neural_pending.iter().enumerate() {
                 let neural = batch_results.get(i).and_then(|r| r.clone());
                 // Store in work hoister so future cache hits avoid re-computation
                 work_hoister.store(
-                    content,
-                    nodes[*node_vec_idx].tfidf_embedding.clone(),
+                    &nodes[node_vec_idx].content,
+                    nodes[node_vec_idx].tfidf_embedding.clone(),
                     neural.clone(),
                 );
-                nodes[*node_vec_idx].neural_embedding = neural;
+                nodes[node_vec_idx].neural_embedding = neural;
             }
         }
 

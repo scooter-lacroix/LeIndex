@@ -175,7 +175,7 @@ impl LeIndex {
 
         // Two-pass approach: first collect node data, then batch neural embeddings.
         let mut updated_nodes: Vec<crate::search::search::NodeInfo> = Vec::new();
-        let mut neural_pending: Vec<(usize, String)> = Vec::new();
+        let mut neural_pending: Vec<usize> = Vec::new();
 
         for node_idx in pdg.node_indices() {
             let node = match pdg.get_node(node_idx) {
@@ -240,7 +240,7 @@ impl LeIndex {
             // Defer neural embedding to batch call below
             let node_vec_idx = updated_nodes.len();
             if embedder.has_neural() {
-                neural_pending.push((node_vec_idx, node_content.clone()));
+                neural_pending.push(node_vec_idx);
             }
 
             updated_nodes.push(crate::search::search::NodeInfo {
@@ -262,15 +262,15 @@ impl LeIndex {
         if !neural_pending.is_empty() {
             #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
             let batch_results = {
-                let texts: Vec<String> = neural_pending.iter().map(|(_, t)| t.clone()).collect();
+                let texts: Vec<String> = neural_pending.iter().map(|&idx| updated_nodes[idx].content.clone()).collect();
                 embedder.embed_neural_batch_blocking(&texts)
             };
             #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
             let batch_results: Vec<Option<Vec<f32>>> = vec![None; neural_pending.len()];
 
-            for (i, (node_vec_idx, _content)) in neural_pending.iter().enumerate() {
+            for (i, &node_vec_idx) in neural_pending.iter().enumerate() {
                 if let Some(neural) = batch_results.get(i).and_then(|r| r.clone()) {
-                    updated_nodes[*node_vec_idx].neural_embedding = Some(neural);
+                    updated_nodes[node_vec_idx].neural_embedding = Some(neural);
                 }
             }
         }

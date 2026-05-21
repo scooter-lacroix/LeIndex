@@ -2053,24 +2053,27 @@ impl SearchEngine {
         // Cache results with byte-budget enforcement (A+ Section 8.1)
         {
             let results_bytes = Self::estimate_search_results_bytes(&final_results);
-            // If replacing an existing entry, subtract its bytes first
-            if let Some(existing) = self.search_cache.get(&cache_key) {
-                self.search_cache_bytes = self
-                    .search_cache_bytes
-                    .saturating_sub(Self::estimate_search_results_bytes(existing));
-            }
-            // Evict until there is room
-            while self.search_cache_bytes + results_bytes > SEARCH_CACHE_MAX_BYTES
-                && !self.search_cache.is_empty()
-            {
-                if let Some((_, evicted)) = self.search_cache.pop_lru() {
+            // Guard: skip insertion if a single entry exceeds the cache budget.
+            if results_bytes < SEARCH_CACHE_MAX_BYTES {
+                // If replacing an existing entry, subtract its bytes first
+                if let Some(existing) = self.search_cache.get(&cache_key) {
                     self.search_cache_bytes = self
                         .search_cache_bytes
-                        .saturating_sub(Self::estimate_search_results_bytes(&evicted));
+                        .saturating_sub(Self::estimate_search_results_bytes(existing));
                 }
+                // Evict until there is room
+                while self.search_cache_bytes + results_bytes > SEARCH_CACHE_MAX_BYTES
+                    && !self.search_cache.is_empty()
+                {
+                    if let Some((_, evicted)) = self.search_cache.pop_lru() {
+                        self.search_cache_bytes = self
+                            .search_cache_bytes
+                            .saturating_sub(Self::estimate_search_results_bytes(&evicted));
+                    }
+                }
+                self.search_cache_bytes += results_bytes;
+                self.search_cache.put(cache_key, final_results.clone());
             }
-            self.search_cache_bytes += results_bytes;
-            self.search_cache.put(cache_key, final_results.clone());
         }
 
         Ok(final_results)
@@ -2305,22 +2308,25 @@ impl SearchEngine {
         // Cache results with byte-budget enforcement
         {
             let results_bytes = Self::estimate_search_results_bytes(&final_results);
-            if let Some(existing) = self.search_cache.get(&cache_key) {
-                self.search_cache_bytes = self
-                    .search_cache_bytes
-                    .saturating_sub(Self::estimate_search_results_bytes(existing));
-            }
-            while self.search_cache_bytes + results_bytes > SEARCH_CACHE_MAX_BYTES
-                && !self.search_cache.is_empty()
-            {
-                if let Some((_, evicted)) = self.search_cache.pop_lru() {
+            // Guard: skip insertion if a single entry exceeds the cache budget.
+            if results_bytes < SEARCH_CACHE_MAX_BYTES {
+                if let Some(existing) = self.search_cache.get(&cache_key) {
                     self.search_cache_bytes = self
                         .search_cache_bytes
-                        .saturating_sub(Self::estimate_search_results_bytes(&evicted));
+                        .saturating_sub(Self::estimate_search_results_bytes(existing));
                 }
+                while self.search_cache_bytes + results_bytes > SEARCH_CACHE_MAX_BYTES
+                    && !self.search_cache.is_empty()
+                {
+                    if let Some((_, evicted)) = self.search_cache.pop_lru() {
+                        self.search_cache_bytes = self
+                            .search_cache_bytes
+                            .saturating_sub(Self::estimate_search_results_bytes(&evicted));
+                    }
+                }
+                self.search_cache_bytes += results_bytes;
+                self.search_cache.put(cache_key, final_results.clone());
             }
-            self.search_cache_bytes += results_bytes;
-            self.search_cache.put(cache_key, final_results.clone());
         }
 
         Ok((final_results, metrics))
