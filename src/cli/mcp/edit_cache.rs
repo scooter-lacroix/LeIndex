@@ -165,8 +165,10 @@ impl EditCache {
             let mut guard = self.entries.lock().await;
             let (ref mut entries, ref mut total_bytes) = *guard;
 
-            // Account for replacing an existing entry
-            if let Some(existing) = entries.get(&abs_path) {
+            // Remove existing entry first to prevent double-subtraction during eviction.
+            // If we only subtract its size but leave it in the map, the eviction loop
+            // could remove it again and subtract its size a second time (underflow).
+            if let Some(existing) = entries.remove(&abs_path) {
                 *total_bytes = total_bytes.saturating_sub(existing.estimated_size());
             }
 

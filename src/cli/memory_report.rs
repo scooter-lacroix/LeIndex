@@ -13,11 +13,13 @@ use std::sync::{Mutex, OnceLock};
 use tracing::{debug, info, warn};
 
 /// Global tracker instance, set once at startup.
-static GLOBAL_TRACKER: OnceLock<Mutex<MemoryReportTracker>> = OnceLock::new();
+/// Wrapped in `Option` so `shutdown()` can take the tracker out and
+/// explicitly write the report — Rust does NOT run `Drop` for statics.
+static GLOBAL_TRACKER: OnceLock<Mutex<Option<MemoryReportTracker>>> = OnceLock::new();
 
 /// Store the tracker in the global slot. Call once during startup.
 pub fn init_tracker(tracker: MemoryReportTracker) {
-    let _ = GLOBAL_TRACKER.set(Mutex::new(tracker));
+    let _ = GLOBAL_TRACKER.set(Mutex::new(Some(tracker)));
 }
 
 /// Record an RSS observation against the global tracker (if initialized).
@@ -25,8 +27,9 @@ pub fn init_tracker(tracker: MemoryReportTracker) {
 pub fn observe_rss(phase: &str) {
     if let Some(tracker) = GLOBAL_TRACKER.get() {
         let rss = current_rss_bytes();
-        if let Ok(mut guard) = tracker.lock() {
-            guard.observe_rss(rss);
+        let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = guard.as_mut() {
+            t.observe_rss(rss);
         }
         debug!("Memory observation: phase={}, rss={} bytes", phase, rss);
     }
@@ -35,8 +38,26 @@ pub fn observe_rss(phase: &str) {
 /// Record a completed phase against the global tracker (if initialized).
 pub fn record_phase(name: &str, peak_rss_bytes: u64, sample_count: u64) {
     if let Some(tracker) = GLOBAL_TRACKER.get() {
-        if let Ok(mut guard) = tracker.lock() {
-            guard.record_phase(name, peak_rss_bytes, sample_count);
+        let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = guard.as_mut() {
+            t.record_phase(name, peak_rss_bytes, sample_count);
+        }
+    }
+}
+
+/// Take the tracker out of the global slot and write the report.
+///
+/// Must be called explicitly at shutdown because Rust does **not** run
+/// destructors for static variables. After this call the global slot
+/// contains `None` and subsequent `observe_rss` / `record_phase` calls
+/// are no-ops.
+pub fn shutdown() {
+    if let Some(tracker) = GLOBAL_TRACKER.get() {
+        let mut guard = tracker.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(mut t) = guard.take() {
+            if let Err(e) = t.write_report() {
+                warn!("Failed to write memory report on shutdown: {}", e);
+            }
         }
     }
 }
@@ -204,10 +225,11 @@ fn read_rss_procfs_bytes() -> Option<u64> {
 
 #[cfg(not(target_os = "linux"))]
 fn read_rss_sysinfo_bytes() -> Option<u64> {
-    use sysinfo::{ProcessesToUpdate, System};
+    use sysinfo::System;
     let mut sys = System::new();
-    sys.refresh_processes(ProcessesToUpdate::All, true);
     let pid = sysinfo::Pid::from(std::process::id() as usize);
+    let pid_list = [pid];
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&pid_list), true);
     sys.process(pid).map(|p| p.memory())
 }
 

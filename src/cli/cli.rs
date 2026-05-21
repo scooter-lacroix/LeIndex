@@ -304,7 +304,7 @@ impl Cli {
 
         maybe_complete_post_install_actions(&command);
 
-        match command {
+        let result = match command {
             Commands::Index {
                 path,
                 force,
@@ -366,7 +366,13 @@ impl Cli {
                 max_age_days,
                 dry_run,
             } => cmd_cleanup_impl(max_age_days, dry_run).await,
-        }
+        };
+
+        // Write the memory report (if tracking was enabled) before returning.
+        // Rust does not run Drop for statics, so this must be explicit.
+        crate::cli::memory_report::shutdown();
+
+        result
     }
 }
 

@@ -679,8 +679,14 @@ impl WorkerRuntime {
             });
         }
 
-        // Extract embeddings from output
-        // Use try_extract_array to get f32 values directly
+        // Extract the actual output shape from the ONNX tensor.
+        // Expected: [batch_size, seq_len, hidden_dim] or [batch_size, hidden_dim].
+        let output_shape: Vec<usize> = outputs[0]
+            .shape()
+            .iter()
+            .map(|&d| d as usize)
+            .collect();
+
         let embeddings_f32: Vec<f32> = outputs[0]
             .try_extract_array::<f32>()
             .map_err(|e| WorkerError {
@@ -691,38 +697,44 @@ impl WorkerRuntime {
             .copied()
             .collect();
 
-        // Output shape should be [batch_size, seq_len, hidden_dim]
-        // But ONNX Runtime may give us a flat array, so we need to reshape
-        let hidden_dim = expected_dim; // Use expected dimension
-
-        if hidden_dim == 0 {
+        if expected_dim == 0 {
             return Err(WorkerError {
                 kind: ErrorKind::InvalidRequest,
                 message: "expected_dim must be non-zero".to_string(),
             });
         }
 
-        let output_seq_len = embeddings_f32.len() / (batch_size * hidden_dim);
-
-        if embeddings_f32.len() != batch_size * output_seq_len * hidden_dim {
-            // Try to interpret as [batch_size, hidden_dim] (already pooled)
-            if embeddings_f32.len() == batch_size * hidden_dim {
-                // Apply mean pooling manually
+        // Derive seq_len and hidden_dim from the actual tensor shape.
+        let (actual_seq_len, hidden_dim) = match output_shape.as_slice() {
+            [bs, sl, hd] if *bs == batch_size => (*sl, *hd),
+            [bs, hd] if *bs == batch_size => {
+                // Already pooled: [batch_size, hidden_dim]
                 return self.pool_and_normalize(
                     embeddings_f32,
                     batch_size,
                     1,
                     attention_mask,
-                    expected_dim,
+                    *hd,
                 );
             }
+            _ => {
+                return Err(WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: format!(
+                        "unexpected output shape {:?}; expected [{}, seq_len, hidden_dim] or [{}, hidden_dim]",
+                        output_shape, batch_size, batch_size
+                    ),
+                });
+            }
+        };
+
+        if embeddings_f32.len() != batch_size * actual_seq_len * hidden_dim {
             return Err(WorkerError {
                 kind: ErrorKind::Inference,
                 message: format!(
-                    "unexpected output size: expected {}*{}*{}, got {}",
-                    batch_size,
-                    max_len,
-                    hidden_dim,
+                    "output size mismatch: shape {:?} implies {} elements, got {}",
+                    output_shape,
+                    batch_size * actual_seq_len * hidden_dim,
                     embeddings_f32.len()
                 ),
             });
@@ -732,9 +744,9 @@ impl WorkerRuntime {
         self.pool_and_normalize(
             embeddings_f32,
             batch_size,
-            output_seq_len,
+            actual_seq_len,
             attention_mask,
-            expected_dim,
+            hidden_dim,
         )
     }
 

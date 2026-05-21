@@ -471,7 +471,7 @@ jobs:
   summary:
     name: Release Summary
     needs: [detect, github-release, crates-io, npm, pypi]
-    if: always() && needs.detect.outputs.changed == 'true'
+    if: ${{ needs.detect.outputs.changed == 'true' && needs.crates-io.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
