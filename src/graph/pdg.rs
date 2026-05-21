@@ -579,8 +579,13 @@ impl SerializablePDG {
             }
         }
 
-        // Rebuild trigram index from nodes (not serialized separately)
-        pdg.rebuild_trigram_index();
+        // Rebuild trigram index from nodes only if not already populated.
+        // When loading from SQLite storage, load_trigram_index() + set_trigram_index()
+        // is preferred (faster for large PDGs). This rebuild serves as fallback for
+        // bincode deserialization or when the persisted index is missing/corrupted.
+        if pdg.trigram_index.is_empty() {
+            pdg.rebuild_trigram_index();
+        }
 
         Ok(pdg)
     }

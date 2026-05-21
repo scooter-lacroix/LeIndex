@@ -2146,7 +2146,7 @@ impl SearchEngine {
             ));
         }
 
-        // Check cache first (same cache key logic as search())
+        // Check staged-search cache (key includes query, top_k, threshold, semantic, coarse_multiplier, query_type)
         let cache_key = format!(
             "staged:{}:{}:{:?}:{}:{:?}:{:?}",
             query.query, query.top_k, query.threshold, query.semantic, config.coarse_multiplier, query.query_type

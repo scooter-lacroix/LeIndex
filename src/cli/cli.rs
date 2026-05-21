@@ -1123,17 +1123,22 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         });
     }
 
-    // If --project was provided, register it as the default project path.
+    // Register a default project path for tool calls that omit project_path.
+    // If --project was provided, canonicalize it; otherwise, use CWD.
     // The actual LeIndex creation happens lazily on first tool call.
-    if let Some(ref project_path) = project {
-        let canonical = project_path
-            .canonicalize()
-            .with_context(|| format!("Cannot resolve project path '{}'", project_path.display()))?;
+    {
         let registry = crate::cli::mcp::server::SERVER_STATE
             .get()
             .context("Server state not initialized")?;
-        registry.set_default_path(canonical).await;
-        info!("Default project path set to: {}", project_path.display());
+        let resolved_path = match project {
+            Some(ref p) => p
+                .canonicalize()
+                .with_context(|| format!("Cannot resolve project path '{}'", p.display()))?,
+            None => std::env::current_dir()
+                .context("Cannot determine current working directory")?,
+        };
+        registry.set_default_path(resolved_path.clone()).await;
+        info!("Default project path set to: {}", resolved_path.display());
     }
 
     let stdin = io::stdin();
