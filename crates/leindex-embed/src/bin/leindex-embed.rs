@@ -79,7 +79,18 @@ mod tests {
         let response_frame = rt.dispatch(frame);
 
         assert_eq!(response_frame.header.batch_id, BatchId::new(42));
-        assert_eq!(response_frame.header.msg_type, MsgType::EmbedResponse);
+
+        // Without a real ONNX session, dispatch returns an error frame
+        #[cfg(feature = "onnx")]
+        {
+            assert_eq!(response_frame.header.msg_type, MsgType::Error);
+        }
+
+        // Without ONNX feature, dispatch returns a success response
+        #[cfg(not(feature = "onnx"))]
+        {
+            assert_eq!(response_frame.header.msg_type, MsgType::EmbedResponse);
+        }
     }
 
     #[test]

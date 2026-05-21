@@ -17,6 +17,8 @@ pub mod extraction;
 pub mod pdg;
 /// Gravity-based graph traversal algorithms.
 pub mod traversal;
+/// Trigram index for accelerated fuzzy node lookup.
+pub mod trigram;
 
 pub use cross_project::{CrossProjectPDG, ExternalNodeRef, MergeError};
 pub use embedding::NodeEmbedding;

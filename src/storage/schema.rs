@@ -366,6 +366,19 @@ CREATE TABLE IF NOT EXISTS project_metadata (
             [],
         )?;
 
+        // Create trigram_index table for accelerated fuzzy node lookup.
+        // Stores the serialized trigram index as a single blob per project.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS trigram_index (
+                project_id TEXT PRIMARY KEY,
+                index_data BLOB NOT NULL,
+                node_count INTEGER NOT NULL DEFAULT 0,
+                trigram_count INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )?;
+
         Ok(())
     }
 

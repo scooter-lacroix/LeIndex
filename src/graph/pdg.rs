@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use crate::graph::trigram::TrigramIndex;
+
 /// A unique identifier for a node in the Program Dependence Graph.
 ///
 /// This is a type alias for `petgraph::stable_graph::NodeIndex`, which provides
@@ -577,6 +579,9 @@ impl SerializablePDG {
             }
         }
 
+        // Rebuild trigram index from nodes (not serialized separately)
+        pdg.rebuild_trigram_index();
+
         Ok(pdg)
     }
 }
@@ -652,6 +657,14 @@ pub struct ProgramDependenceGraph {
     /// Wrapped in `Mutex` because the PDG is shared across threads
     /// (e.g., via `Arc<ProgramDependenceGraph>` in validation handlers).
     bfs_scratch: Mutex<Vec<NodeId>>,
+
+    /// Trigram index for accelerating fuzzy node lookups.
+    ///
+    /// Maps 3-character substrings to sets of node indices, enabling
+    /// `fuzzy_find_node` to skip nodes that share no trigrams with the query.
+    /// Built lazily on first fuzzy search, or eagerly during indexing.
+    /// Persisted alongside the PDG in SQLite.
+    trigram_index: TrigramIndex,
 }
 
 impl Clone for ProgramDependenceGraph {
@@ -665,6 +678,7 @@ impl Clone for ProgramDependenceGraph {
             embedding_store: self.embedding_store.clone(),
             name_file_index: self.name_file_index.clone(),
             bfs_scratch: Mutex::new(Vec::new()),
+            trigram_index: self.trigram_index.clone(),
         }
     }
 }
@@ -681,6 +695,7 @@ impl ProgramDependenceGraph {
             embedding_store: EmbeddingStore::new(),
             name_file_index: HashMap::new(),
             bfs_scratch: Mutex::new(Vec::new()),
+            trigram_index: TrigramIndex::new(),
         }
     }
 
@@ -718,6 +733,11 @@ impl ProgramDependenceGraph {
             .push(id);
         self.name_file_index
             .insert((node.name.clone(), node.file_path.to_string()), id);
+
+        // Update trigram index incrementally
+        self.trigram_index
+            .add_node(id, &node.name, &node.id, &node.file_path);
+
         id
     }
 
@@ -761,6 +781,10 @@ impl ProgramDependenceGraph {
             }
             self.name_file_index
                 .remove(&(node.name.clone(), node.file_path.to_string()));
+
+            // Update trigram index
+            self.trigram_index.remove_node(node_id);
+
             Some(node)
         } else {
             None
@@ -1077,6 +1101,31 @@ impl ProgramDependenceGraph {
         }
 
         None
+    }
+
+    // -----------------------------------------------------------------------
+    // Trigram index access
+    // -----------------------------------------------------------------------
+
+    /// Get a reference to the trigram index.
+    ///
+    /// The trigram index is maintained incrementally as nodes are added/removed.
+    /// It can also be rebuilt from scratch with `rebuild_trigram_index()`.
+    pub fn trigram_index(&self) -> &TrigramIndex {
+        &self.trigram_index
+    }
+
+    /// Rebuild the trigram index from scratch from all current nodes.
+    ///
+    /// This is useful after bulk operations that bypass `add_node`/`remove_node`,
+    /// such as deserialization or loading from storage.
+    pub fn rebuild_trigram_index(&mut self) {
+        self.trigram_index = TrigramIndex::build_from_pdg(self);
+    }
+
+    /// Set the trigram index (used when loading from storage).
+    pub fn set_trigram_index(&mut self, index: TrigramIndex) {
+        self.trigram_index = index;
     }
 
     // -----------------------------------------------------------------------

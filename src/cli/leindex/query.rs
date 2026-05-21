@@ -478,38 +478,57 @@ fn fuzzy_find_node(
 
     let mut best_match: Option<(crate::graph::pdg::NodeId, usize)> = None;
 
-    for node_id in pdg.node_indices() {
-        if let Some(node) = pdg.get_node(node_id) {
-            // Check if the query is a substring of the name or ID
-            // (case-insensitive, using zero-allocation ci_contains)
-            let score = if ci_contains(&node.name, &query_lower) {
-                // Prefer name matches with higher complexity
-                NAME_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
-            } else if ci_contains(&node.id, &query_lower) {
-                ID_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
+    // Use trigram index to filter candidates when the query is long enough.
+    // The trigram index returns node indices (u32) that contain ALL trigrams
+    // from the query. This dramatically reduces the search space for large PDGs.
+    let candidate_indices: Option<Vec<u32>> = pdg.trigram_index().query(&query_lower);
+
+    // Score a single node and update best_match if it's better.
+    let mut score_node = |node_id: crate::graph::pdg::NodeId, node: &crate::graph::pdg::Node| {
+        let score = if ci_contains(&node.name, &query_lower) {
+            NAME_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
+        } else if ci_contains(&node.id, &query_lower) {
+            ID_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
+        } else {
+            let is_event_loop_candidate = event_loop_aliases
+                .iter()
+                .any(|alias| query_lower.contains(alias));
+            let name_matches_alias = event_loop_aliases
+                .iter()
+                .any(|alias| ci_contains(&node.name, alias));
+
+            if is_event_loop_candidate && name_matches_alias {
+                ALIAS_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
             } else {
-                // Check if any event-loop alias matches and the node looks
-                // like an entry point (high complexity, function type)
-                let is_event_loop_candidate = event_loop_aliases
-                    .iter()
-                    .any(|alias| query_lower.contains(alias));
-                let name_matches_alias = event_loop_aliases
-                    .iter()
-                    .any(|alias| ci_contains(&node.name, alias));
+                return;
+            }
+        };
 
-                if is_event_loop_candidate && name_matches_alias {
-                    ALIAS_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
-                } else {
-                    continue;
-                }
-            };
+        match &best_match {
+            None => best_match = Some((node_id, score)),
+            Some((_, best_score)) if score > *best_score => {
+                best_match = Some((node_id, score));
+            }
+            _ => {}
+        }
+    };
 
-            match &best_match {
-                None => best_match = Some((node_id, score)),
-                Some((_, best_score)) if score > *best_score => {
-                    best_match = Some((node_id, score));
+    match candidate_indices {
+        Some(indices) => {
+            // Trigram-filtered path: only score nodes in the candidate set
+            for node_idx in indices {
+                let node_id = crate::graph::pdg::NodeId::new(node_idx as usize);
+                if let Some(node) = pdg.get_node(node_id) {
+                    score_node(node_id, node);
                 }
-                _ => {}
+            }
+        }
+        None => {
+            // Fallback: query too short (< 3 chars), do full linear scan
+            for node_id in pdg.node_indices() {
+                if let Some(node) = pdg.get_node(node_id) {
+                    score_node(node_id, node);
+                }
             }
         }
     }

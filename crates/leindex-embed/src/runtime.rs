@@ -512,20 +512,25 @@ impl WorkerRuntime {
 
         #[cfg(feature = "onnx")]
         {
-            // Real ONNX inference path
             if let (Some(session), Some(tokenizer)) = (&self.session, &self.tokenizer) {
                 return self.run_onnx_embed(session, tokenizer, &texts, embed_req.expected_dim);
+            } else {
+                return Err(WorkerError {
+                    kind: ErrorKind::ModelNotFound,
+                    message: "ONNX session or tokenizer not initialized".to_string(),
+                });
             }
-            // Fall through to zero-vector fallback if session/tokenizer unavailable
         }
 
-        // Fallback: return zero vectors if ONNX is not available
-        tracing::warn!("ONNX session unavailable, returning zero vectors");
-        let count = texts.len();
-        let dim = embed_req.expected_dim;
-        let vectors = vec![0.0f32; count * dim];
-
-        Ok(EmbedResponse::new(vectors, count, dim))
+        #[cfg(not(feature = "onnx"))]
+        {
+            // No ONNX feature: return zero vectors
+            tracing::warn!("ONNX feature not enabled, returning zero vectors");
+            let count = texts.len();
+            let dim = embed_req.expected_dim;
+            let vectors = vec![0.0f32; count * dim];
+            Ok(EmbedResponse::new(vectors, count, dim))
+        }
     }
 
     #[cfg(feature = "onnx")]
@@ -763,27 +768,32 @@ impl WorkerRuntime {
 
         #[cfg(feature = "onnx")]
         {
-            // Real ONNX reranking path
             if let (Some(session), Some(tokenizer)) = (&self.session, &self.tokenizer) {
                 return self.run_onnx_rerank(session, tokenizer, &rerank_req);
+            } else {
+                return Err(WorkerError {
+                    kind: ErrorKind::ModelNotFound,
+                    message: "ONNX session or tokenizer not initialized for rerank".to_string(),
+                });
             }
-            // Fall through to passthrough fallback if session/tokenizer unavailable
         }
 
-        // Fallback: return documents with their initial scores as combined scores.
-        tracing::warn!("ONNX session unavailable for rerank, using passthrough scores");
-        let results: Vec<_> = rerank_req
-            .documents
-            .into_iter()
-            .map(|doc| protocol::RerankResult {
-                id: doc.id,
-                original_score: doc.initial_score,
-                rerank_score: doc.initial_score,
-                combined_score: doc.initial_score,
-            })
-            .collect();
-
-        Ok(RerankResponse { results })
+        #[cfg(not(feature = "onnx"))]
+        {
+            // No ONNX feature: return passthrough scores
+            tracing::warn!("ONNX feature not enabled for rerank, using passthrough scores");
+            let results: Vec<_> = rerank_req
+                .documents
+                .into_iter()
+                .map(|doc| protocol::RerankResult {
+                    id: doc.id,
+                    original_score: doc.initial_score,
+                    rerank_score: doc.initial_score,
+                    combined_score: doc.initial_score,
+                })
+                .collect();
+            Ok(RerankResponse { results })
+        }
     }
 
     #[cfg(feature = "onnx")]
@@ -1114,16 +1124,25 @@ mod tests {
             expected_dim: 8,
         };
         let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-        let response = rt.handle_embed(frame).unwrap();
+        let result = rt.handle_embed(frame);
 
-        // VAL-CPHASE-012: flat row-major output with dimension and count
-        assert_eq!(response.count, 2);
-        assert_eq!(response.dimension, 8);
-        assert_eq!(response.vectors.len(), 16); // 2 * 8
+        // Without a real ONNX session, should return ModelNotFound error
+        #[cfg(feature = "onnx")]
+        {
+            let err = result.unwrap_err();
+            assert_eq!(err.kind, ErrorKind::ModelNotFound);
+        }
 
-        // Verify individual embeddings are accessible
-        assert_eq!(response.get_embedding(0).unwrap().len(), 8);
-        assert_eq!(response.get_embedding(1).unwrap().len(), 8);
+        // Without ONNX feature, returns zero vectors
+        #[cfg(not(feature = "onnx"))]
+        {
+            let response = result.unwrap();
+            assert_eq!(response.count, 2);
+            assert_eq!(response.dimension, 8);
+            assert_eq!(response.vectors.len(), 16);
+            assert_eq!(response.get_embedding(0).unwrap().len(), 8);
+            assert_eq!(response.get_embedding(1).unwrap().len(), 8);
+        }
     }
 
     #[test]
@@ -1137,13 +1156,23 @@ mod tests {
             expected_dim: 4,
         };
         let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-        let response = rt.handle_embed(frame).unwrap();
+        let result = rt.handle_embed(frame);
 
-        // VAL-CPHASE-013: batch ordering preserved
-        assert_eq!(response.count, 5);
-        // Each embedding should be distinct (even though stub zeros, the count is correct)
-        for i in 0..5 {
-            assert!(response.get_embedding(i).is_some());
+        // Without a real ONNX session, should return ModelNotFound error
+        #[cfg(feature = "onnx")]
+        {
+            let err = result.unwrap_err();
+            assert_eq!(err.kind, ErrorKind::ModelNotFound);
+        }
+
+        // Without ONNX feature, returns zero vectors with correct count
+        #[cfg(not(feature = "onnx"))]
+        {
+            let response = result.unwrap();
+            assert_eq!(response.count, 5);
+            for i in 0..5 {
+                assert!(response.get_embedding(i).is_some());
+            }
         }
     }
 
@@ -1160,7 +1189,18 @@ mod tests {
         let response_frame = rt.dispatch(frame);
 
         assert_eq!(response_frame.header.batch_id, BatchId::new(42));
-        assert_eq!(response_frame.header.msg_type, MsgType::EmbedResponse);
+
+        // Without a real ONNX session, dispatch returns an error frame
+        #[cfg(feature = "onnx")]
+        {
+            assert_eq!(response_frame.header.msg_type, MsgType::Error);
+        }
+
+        // Without ONNX feature, dispatch returns a success response
+        #[cfg(not(feature = "onnx"))]
+        {
+            assert_eq!(response_frame.header.msg_type, MsgType::EmbedResponse);
+        }
     }
 
     #[test]
@@ -1180,7 +1220,18 @@ mod tests {
         let response_frame = rt.dispatch(frame);
 
         assert_eq!(response_frame.header.batch_id, BatchId::new(7));
-        assert_eq!(response_frame.header.msg_type, MsgType::RerankResponse);
+
+        // Without a real ONNX session, dispatch returns an error frame
+        #[cfg(feature = "onnx")]
+        {
+            assert_eq!(response_frame.header.msg_type, MsgType::Error);
+        }
+
+        // Without ONNX feature, dispatch returns a success response
+        #[cfg(not(feature = "onnx"))]
+        {
+            assert_eq!(response_frame.header.msg_type, MsgType::RerankResponse);
+        }
     }
 
     #[test]
