@@ -110,7 +110,7 @@ fn run_memcheck(update_baseline: bool) -> Result<()> {
 
     // Build the memcheck command
     let mut cmd = Command::new(&memcheck_bin);
-    cmd.arg(&fixture).arg("--verbose");
+    cmd.arg(&fixture).arg("--verbose").arg("--output").arg("target/memcheck-report.json");
 
     if update_baseline {
         cmd.arg("--update-baseline");
