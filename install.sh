@@ -735,16 +735,17 @@ install_model_assets() {
                 rm -rf "$model_dir"
                 return 1
             fi
+            log_info "Checksum validation passed"
         elif command -v shasum &>/dev/null; then
             if ! (cd "$model_dir" && shasum -a 256 -c checksums.sha256) >> "$INSTALL_LOG" 2>&1; then
                 log_warn "Checksum validation failed; removing corrupted model files"
                 rm -rf "$model_dir"
                 return 1
             fi
+            log_info "Checksum validation passed"
         else
             log_warn "No checksum tool found (sha256sum or shasum), skipping validation"
         fi
-        log_info "Checksum validation passed"
     fi
 
     log_success "Model assets installed to $model_dir"

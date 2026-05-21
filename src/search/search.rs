@@ -2148,8 +2148,8 @@ impl SearchEngine {
 
         // Check cache first (same cache key logic as search())
         let cache_key = format!(
-            "staged:{}:{}:{:?}:{}:{}",
-            query.query, query.top_k, query.threshold, query.semantic, config.coarse_multiplier
+            "staged:{}:{}:{:?}:{}:{:?}:{:?}",
+            query.query, query.top_k, query.threshold, query.semantic, config.coarse_multiplier, query.query_type
         );
         if let Some(cached) = self.search_cache.get(&cache_key) {
             let count = cached.len();

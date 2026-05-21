@@ -380,7 +380,7 @@ impl WorkerRuntime {
         let read_timeout = Duration::from_secs(5);
 
         // Derive incoming frame size limit from config (with 2× headroom).
-        let max_incoming_frame = self.config.max_frame_size * 2;
+        let max_incoming_frame = self.config.max_frame_size.saturating_mul(2);
 
         // Reader helper thread: reads frames from the IPC channel and sends them
         // to the main loop via the `tx` channel.
