@@ -672,6 +672,13 @@ impl WorkerRuntime {
 
         // Note: session_guard will be dropped when outputs is no longer used
 
+        if outputs.len() == 0 {
+            return Err(WorkerError {
+                kind: ErrorKind::Inference,
+                message: "ONNX model returned no outputs".to_string(),
+            });
+        }
+
         // Extract embeddings from output
         // Use try_extract_array to get f32 values directly
         let embeddings_f32: Vec<f32> = outputs[0]
@@ -947,6 +954,13 @@ impl WorkerRuntime {
             })?;
 
         // Note: session_guard will be dropped when outputs is no longer used
+
+        if outputs.len() == 0 {
+            return Err(WorkerError {
+                kind: ErrorKind::Inference,
+                message: "ONNX rerank model returned no outputs".to_string(),
+            });
+        }
 
         let output = &outputs[0];
         let shape: Vec<usize> = output.shape().iter().map(|&d| d as usize).collect();
