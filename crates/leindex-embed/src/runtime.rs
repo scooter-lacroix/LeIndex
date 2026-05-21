@@ -406,6 +406,15 @@ impl WorkerRuntime {
                 match buf_reader.read_exact(&mut len_buf) {
                     Ok(()) => {
                         let payload_len = u32::from_le_bytes(len_buf) as usize;
+                        // Guard against unreasonably large frames BEFORE allocation
+                        // to prevent OOM from a malicious or malfunctioning main process.
+                        if payload_len > 32 * 1024 * 1024 {
+                            let _ = tx.send(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("incoming frame too large: {payload_len} bytes (max: 32 MiB)"),
+                            )));
+                            break;
+                        }
                         let mut frame_buf = vec![0u8; payload_len];
                         match buf_reader.read_exact(&mut frame_buf) {
                             Ok(()) => {
@@ -462,15 +471,6 @@ impl WorkerRuntime {
                     return Ok(());
                 }
             };
-
-            // Guard against unreasonably large frames
-            if frame_buf.len() > self.config.max_frame_size * 2 {
-                return Err(anyhow::anyhow!(
-                    "incoming frame too large: {} bytes (max: {})",
-                    frame_buf.len(),
-                    self.config.max_frame_size * 2
-                ));
-            }
 
             let frame = Frame::from_wire_bytes(&frame_buf)?;
             let _batch_id = frame.header.batch_id;

@@ -170,16 +170,34 @@ impl TrigramIndex {
     /// Remove a node from the index.
     ///
     /// Call this when a node is removed from the PDG.
-    pub fn remove_node(&mut self, node_id: NodeId) {
+    /// Uses targeted removal: extracts trigrams from the node's text fields
+    /// and only cleans those specific posting lists, avoiding O(T) scan.
+    pub fn remove_node(
+        &mut self,
+        node_id: NodeId,
+        name: &str,
+        node_id_str: &str,
+        file_path: &str,
+    ) {
         let node_idx = node_id.index() as u32;
         if self.node_count > 0 {
             self.node_count -= 1;
         }
 
-        // Remove from all posting lists that contain this node index
-        for posting_list in self.postings.values_mut() {
-            if let Ok(pos) = posting_list.binary_search(&node_idx) {
-                posting_list.remove(pos);
+        // Collect unique trigrams from the same text fields used during add_node
+        let mut trigrams_to_clean: Vec<Trigram> = Vec::new();
+        trigrams_to_clean.extend(extract_trigrams(&name.to_lowercase()));
+        trigrams_to_clean.extend(extract_trigrams(&node_id_str.to_lowercase()));
+        trigrams_to_clean.extend(extract_trigrams(&file_path.to_lowercase()));
+        trigrams_to_clean.sort_unstable();
+        trigrams_to_clean.dedup();
+
+        // Remove the node_idx only from posting lists that could contain it
+        for trigram in &trigrams_to_clean {
+            if let Some(posting_list) = self.postings.get_mut(trigram) {
+                if let Ok(pos) = posting_list.binary_search(&node_idx) {
+                    posting_list.remove(pos);
+                }
             }
         }
 
@@ -299,20 +317,28 @@ impl TrigramIndex {
 /// multi-byte UTF-8 characters. Each trigram is a u32 hash of 3 consecutive
 /// characters. The string should already be lowercased for case-insensitive matching.
 pub fn extract_trigrams(s: &str) -> Vec<Trigram> {
-    let chars: Vec<char> = s.chars().collect();
-    chars.windows(3)
-        .map(|w| {
-            // Hash the 3-char window into a u32 using FNV-1a-like mixing.
-            // This avoids needing to change the Trigram type from u32.
-            let mut h: u32 = 2166136261; // FNV offset basis
-            for &c in w {
-                let b = c as u32;
-                h ^= b;
-                h = h.wrapping_mul(16777619); // FNV prime
-            }
-            h
-        })
-        .collect()
+    let mut trigrams = Vec::new();
+    let mut chars = s.chars();
+    let mut c1 = match chars.next() {
+        Some(c) => c,
+        None => return trigrams,
+    };
+    let mut c2 = match chars.next() {
+        Some(c) => c,
+        None => return trigrams,
+    };
+
+    for c3 in chars {
+        let mut h: u32 = 2166136261; // FNV offset basis
+        for &c in &[c1, c2, c3] {
+            h ^= c as u32;
+            h = h.wrapping_mul(16777619); // FNV prime
+        }
+        trigrams.push(h);
+        c1 = c2;
+        c2 = c3;
+    }
+    trigrams
 }
 
 /// Intersect two sorted vecs of u32, returning a new sorted vec.

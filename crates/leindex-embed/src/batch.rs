@@ -178,10 +178,14 @@ pub fn stitch_responses(responses: Vec<EmbedResponse>) -> StitchedResponse {
     let mut total_count = 0;
 
     for response in responses {
-        debug_assert_eq!(
-            response.dimension, dimension,
-            "all sub-batch responses must have the same dimension"
-        );
+        if response.dimension != dimension {
+            tracing::error!(
+                expected = dimension,
+                actual = response.dimension,
+                "dimension mismatch during response stitching"
+            );
+            continue;
+        }
         all_vectors.extend_from_slice(&response.vectors);
         total_count += response.count;
     }

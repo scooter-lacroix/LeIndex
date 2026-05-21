@@ -340,18 +340,25 @@ impl WorkHoister {
             byte_size,
         };
 
-        if let Some(existing) = self.cache.put(key, entry) {
+        if let Some(existing) = self.cache.put(key.clone(), entry) {
             self.tracked_bytes = self.tracked_bytes.saturating_sub(existing.byte_size);
         }
 
         // Evict until there is room.
         while self.tracked_bytes + byte_size > self.max_bytes && !self.cache.is_empty() {
-            if let Some((_, evicted)) = self.cache.pop_lru() {
+            if let Some((evicted_key, evicted)) = self.cache.pop_lru() {
                 self.tracked_bytes = self.tracked_bytes.saturating_sub(evicted.byte_size);
+                // If the just-inserted entry was evicted, stop — don't count it.
+                if evicted_key == key {
+                    return;
+                }
             }
         }
 
-        self.tracked_bytes += byte_size;
+        // Only increment tracked_bytes if the entry is still in the cache after eviction.
+        if self.cache.contains(&key) {
+            self.tracked_bytes += byte_size;
+        }
     }
 
     /// Number of entries currently in the hoister.
