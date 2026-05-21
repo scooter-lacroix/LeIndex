@@ -57,6 +57,17 @@ jobs:
           restore-keys: |
             memcheck-${{ runner.os }}-
 
+      - name: Download model assets
+        run: |
+          mkdir -p models
+          HF_REPO="Qwen/Qwen3-Embedding-0.6B"
+          curl --fail --location --progress-bar -o models/qwen3-embed-0.6b.onnx \
+            "https://huggingface.co/${HF_REPO}/resolve/main/qwen3-embed-0.6b-onnx/model.onnx" \
+            || curl --fail --location --progress-bar -o models/qwen3-embed-0.6b.onnx \
+            "https://huggingface.co/${HF_REPO}/resolve/main/model.onnx"
+          curl --fail --location --progress-bar -o models/tokenizer.json \
+            "https://huggingface.co/${HF_REPO}/resolve/main/tokenizer.json"
+
       - name: Build release binary
         run: cargo build --release -p leindex --features onnx -p leindex-embed --features onnx
 
