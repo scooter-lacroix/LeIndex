@@ -629,8 +629,8 @@ impl HybridEmbedder {
             Self::TfIdfOnly(_) => None,
             #[cfg(feature = "onnx")]
             Self::HybridLocal { neural, .. } => {
-                // Clone the client since EmbeddingClient::Clone creates a new empty client
-                // (does not share the worker handle), and spawn_blocking requires ownership.
+                // Clone shares the worker handle via Arc (EmbeddingClient::clone is cheap).
+                // Required because spawn_blocking requires ownership.
                 let neural = neural.clone();
                 let texts = vec![text.to_string()];
                 let result = task::spawn_blocking(move || {

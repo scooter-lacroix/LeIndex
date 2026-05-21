@@ -150,6 +150,7 @@ jobs:
         shell: bash
         run: |
           set -e
+          export GH_TOKEN="${{ github.token }}"
           MODELS_DIR="models"
           mkdir -p "$MODELS_DIR"
           # Model assets are gitignored so checkout won't include them.

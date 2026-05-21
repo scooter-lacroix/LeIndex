@@ -457,7 +457,7 @@ fn fuzzy_find_node(
         return None;
     }
 
-    let event_loop_aliases: &[&str] = &["run", "main", "start", "event_loop", "event loop", "loop"];
+    let event_loop_aliases: &[&str] = &["event_loop", "event loop", "winit", "app_runner"];
 
     let is_event_loop_query = event_loop_aliases
         .iter()
