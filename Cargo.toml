@@ -240,6 +240,7 @@ tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "net"
 blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 libc = "0.2"
+dashmap = "5.5"
 
 # Serialization
 bincode = "1.3"

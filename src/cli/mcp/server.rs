@@ -20,12 +20,12 @@ use axum::{
 use futures_util::stream::{Stream, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -92,7 +92,7 @@ pub struct McpServer {
     pub(crate) handshake_complete: Arc<AtomicBool>,
     /// Per-session handshake state for HTTP and stdio transports (session ID → (handshaked, last_access_time)).
     /// Keyed by the `Mcp-Session-Id` header value for HTTP, and generated session ID for stdio.
-    pub(crate) session_handshakes: Arc<Mutex<HashMap<String, (bool, Instant)>>>,
+    pub(crate) session_handshakes: Arc<DashMap<String, (bool, Instant)>>,
 }
 
 impl McpServer {
@@ -132,7 +132,7 @@ impl McpServer {
             config,
             _registry: registry,
             handshake_complete: Arc::new(AtomicBool::new(false)),
-            session_handshakes: Arc::new(Mutex::new(HashMap::new())),
+            session_handshakes: Arc::new(DashMap::new()),
         };
 
         SERVER_INSTANCE
@@ -164,15 +164,14 @@ impl McpServer {
     /// A+ hotspot cleanup: prevents session-tracking state from growing
     /// monotonically across long-lived server sessions (VAL-APLUS-025).
     pub fn cleanup_stale_sessions(&self, max_idle: std::time::Duration) -> usize {
-        let mut sessions = self.session_handshakes.lock().unwrap_or_else(|e| e.into_inner());
-        let before = sessions.len();
-        sessions.retain(|_, (_, last_access)| last_access.elapsed() < max_idle);
-        before - sessions.len()
+        let before = self.session_handshakes.len();
+        self.session_handshakes.retain(|_, (_, last_access)| last_access.elapsed() < max_idle);
+        before - self.session_handshakes.len()
     }
 
     /// Get the number of active sessions (for diagnostics and testing).
     pub fn active_session_count(&self) -> usize {
-        self.session_handshakes.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.session_handshakes.len()
     }
 
     /// Run the MCP server
@@ -415,17 +414,16 @@ fn handle_initialize(server: &McpServer) -> (Value, Option<String>) {
 
     // Store in per-session map with eviction logic
     {
-        let mut sessions = server.session_handshakes.lock().unwrap();
         // Evict oldest sessions if we exceed a reasonable limit (1000 sessions)
         const MAX_HTTP_SESSIONS: usize = 1000;
-        if sessions.len() >= MAX_HTTP_SESSIONS {
+        if server.session_handshakes.len() >= MAX_HTTP_SESSIONS {
             // Find and remove the oldest session (by last_access_time)
-            if let Some((oldest_id, _)) = sessions.iter().min_by_key(|&(_, (_, time))| time) {
-                let oldest_id = oldest_id.to_string();
-                sessions.remove(&oldest_id);
+            if let Some(oldest) = server.session_handshakes.iter().min_by_key(|r| r.value().1) {
+                let oldest_id = oldest.key().to_string();
+                server.session_handshakes.remove(&oldest_id);
             }
         }
-        sessions.insert(session_id.clone(), (true, Instant::now()));
+        server.session_handshakes.insert(session_id.clone(), (true, Instant::now()));
     }
 
     let result = serde_json::json!({
@@ -548,11 +546,10 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
         // Non-initialize: validate session ID exists and is handshaked
         let session_ok = match &incoming_session_id {
             Some(sid) => {
-                let mut sessions = server_instance.session_handshakes.lock().unwrap();
-                if let Some((handshaked, last_access)) = sessions.get_mut(sid) {
+                if let Some(mut entry) = server_instance.session_handshakes.get_mut(sid) {
                     // Update last access time
-                    *last_access = Instant::now();
-                    *handshaked
+                    entry.1 = Instant::now();
+                    entry.0
                 } else {
                     false
                 }
@@ -733,11 +730,10 @@ async fn list_tools_handler(headers: HeaderMap) -> Json<Value> {
     // Validate session ID if present, but don't require one
     if let Some(sid) = headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok()) {
         if let Some(server) = SERVER_INSTANCE.get() {
-            let mut sessions = server.session_handshakes.lock().unwrap();
-            if let Some((handshaked, last_access)) = sessions.get_mut(sid) {
+            if let Some(mut entry) = server.session_handshakes.get_mut(sid) {
                 // Update last access time
-                *last_access = Instant::now();
-                if !*handshaked {
+                entry.1 = Instant::now();
+                if !entry.0 {
                     return Json(serde_json::json!({
                         "error": "Invalid session. Call 'initialize' first."
                     }));
@@ -839,10 +835,7 @@ impl McpServer {
                 .context("Failed to accept connection")?;
 
             let session_id = generate_session_id();
-            {
-                let mut sessions = self.session_handshakes.lock().unwrap();
-                sessions.insert(session_id.clone(), (false, Instant::now()));
-            }
+            self.session_handshakes.insert(session_id.clone(), (false, Instant::now()));
 
             let session_id_clone = session_id.clone();
             let session_handshakes = self.session_handshakes.clone();
@@ -976,10 +969,7 @@ impl McpServer {
                 }
 
                 // Clean up session on disconnect
-                {
-                    let mut sessions = session_handshakes.lock().unwrap();
-                    sessions.remove(&session_id_clone);
-                }
+                session_handshakes.remove(&session_id_clone);
 
                 debug!("Socket connection closed (session: {})", session_id_clone);
             });
@@ -999,7 +989,7 @@ impl McpServer {
 async fn handle_socket_message(
     json_payload: &str,
     session_id: &str,
-    session_handshakes: &Arc<Mutex<HashMap<String, (bool, Instant)>>>,
+    session_handshakes: &Arc<DashMap<String, (bool, Instant)>>,
     handshake_complete: &Arc<AtomicBool>,
 ) -> Option<String> {
     use super::protocol::{JsonRpcMessage, JsonRpcResponse};
@@ -1052,12 +1042,11 @@ async fn handle_socket_message(
 
             // Check handshake state for this session (allow initialize and ping before handshake)
             if method_name != "initialize" && method_name != "ping" {
-                let mut sessions = session_handshakes.lock().unwrap();
                 let handshaked =
-                    if let Some((handshaked, last_access)) = sessions.get_mut(session_id) {
+                    if let Some(mut entry) = session_handshakes.get_mut(session_id) {
                         // Update last access time to prevent eviction
-                        *last_access = Instant::now();
-                        *handshaked
+                        entry.1 = Instant::now();
+                        entry.0
                     } else {
                         false
                     };
@@ -1077,10 +1066,7 @@ async fn handle_socket_message(
                 "initialize" => {
                     // Mark session as handshaked
                     handshake_complete.store(true, Ordering::SeqCst);
-                    {
-                        let mut sessions = session_handshakes.lock().unwrap();
-                        sessions.insert(session_id.to_string(), (true, Instant::now()));
-                    }
+                    session_handshakes.insert(session_id.to_string(), (true, Instant::now()));
 
                     let result = serde_json::json!({
                         "protocolVersion": "2024-11-05",
@@ -1176,7 +1162,7 @@ mod tests {
             config: McpServerConfig::default(),
             _registry: registry,
             handshake_complete: Arc::new(AtomicBool::new(false)),
-            session_handshakes: Arc::new(Mutex::new(HashMap::new())),
+            session_handshakes: Arc::new(DashMap::new()),
         };
 
         // Simulate multiple concurrent session handshakes
@@ -1199,10 +1185,9 @@ mod tests {
 
         // All sessions should be marked as handshaked
         {
-            let sessions = server.session_handshakes.lock().unwrap();
-            assert!(sessions.get(&sid1).unwrap().0);
-            assert!(sessions.get(&sid2).unwrap().0);
-            assert!(sessions.get(&sid3).unwrap().0);
+            assert!(server.session_handshakes.get(&sid1).unwrap().0);
+            assert!(server.session_handshakes.get(&sid2).unwrap().0);
+            assert!(server.session_handshakes.get(&sid3).unwrap().0);
         }
     }
 
@@ -1215,24 +1200,18 @@ mod tests {
             config: McpServerConfig::default(),
             _registry: registry,
             handshake_complete: Arc::new(AtomicBool::new(false)),
-            session_handshakes: Arc::new(Mutex::new(HashMap::new())),
+            session_handshakes: Arc::new(DashMap::new()),
         };
 
         let (_, sid1) = handle_initialize_for_test(&server);
         let (_, sid2) = handle_initialize_for_test(&server);
 
         // Remove session 1
-        {
-            let mut sessions = server.session_handshakes.lock().unwrap();
-            sessions.remove(&sid1);
-        }
+        server.session_handshakes.remove(&sid1);
 
         // Session 2 should still be valid
-        {
-            let sessions = server.session_handshakes.lock().unwrap();
-            assert!(sessions.get(&sid2).is_some());
-            assert!(sessions.get(&sid2).unwrap().0);
-        }
+        assert!(server.session_handshakes.get(&sid2).is_some());
+        assert!(server.session_handshakes.get(&sid2).unwrap().0);
 
         assert_eq!(server.active_session_count(), 1);
     }
@@ -1245,7 +1224,7 @@ mod tests {
             config: McpServerConfig::default(),
             _registry: registry,
             handshake_complete: Arc::new(AtomicBool::new(false)),
-            session_handshakes: Arc::new(Mutex::new(HashMap::new())),
+            session_handshakes: Arc::new(DashMap::new()),
         };
 
         // Create a session
@@ -1253,11 +1232,8 @@ mod tests {
         assert_eq!(server.active_session_count(), 1);
 
         // Manually age the session's last_access time to simulate staleness
-        {
-            let mut sessions = server.session_handshakes.lock().unwrap();
-            if let Some((_, last_access)) = sessions.get_mut(&sid) {
-                *last_access = Instant::now() - std::time::Duration::from_secs(600);
-            }
+        if let Some(mut entry) = server.session_handshakes.get_mut(&sid) {
+            entry.1 = Instant::now() - std::time::Duration::from_secs(600);
         }
 
         // Cleanup with a 60-second idle timeout should remove the stale session

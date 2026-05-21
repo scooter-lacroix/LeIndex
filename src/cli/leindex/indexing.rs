@@ -173,114 +173,112 @@ impl LeIndex {
             min_edge_confidence: 0.0,
         };
 
-        let updated_nodes: Vec<crate::search::search::NodeInfo> = pdg
-            .node_indices()
-            .filter_map(|node_idx| {
-                let node = pdg.get_node(node_idx)?;
-                let file_path_str = node.file_path.as_ref();
-                // Only include nodes belonging to changed files
-                if !changed_file_set.contains(file_path_str) {
-                    return None;
+        // Two-pass approach: first collect node data, then batch neural embeddings.
+        let mut updated_nodes: Vec<crate::search::search::NodeInfo> = Vec::new();
+        let mut neural_pending: Vec<(usize, String)> = Vec::new();
+
+        for node_idx in pdg.node_indices() {
+            let node = match pdg.get_node(node_idx) {
+                Some(n) => n,
+                None => continue,
+            };
+            let file_path_str = node.file_path.as_ref();
+            // Only include nodes belonging to changed files
+            if !changed_file_set.contains(file_path_str) {
+                continue;
+            }
+            // Read actual file content and extract the node's source
+            let file_bytes = file_cache
+                .get_or_read(std::path::Path::new(file_path_str))
+                .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
+            let file_content = String::from_utf8_lossy(&file_bytes);
+            let content_bytes = file_content.as_bytes();
+            let start = node.byte_range.0.min(content_bytes.len());
+            let end = node.byte_range.1.min(content_bytes.len());
+
+            let mut enrichment = format!(
+                "// type:{} lang:{}",
+                match node.node_type {
+                    crate::graph::pdg::NodeType::Function => "function",
+                    crate::graph::pdg::NodeType::Class => "class",
+                    crate::graph::pdg::NodeType::Method => "method",
+                    crate::graph::pdg::NodeType::Variable => "variable",
+                    crate::graph::pdg::NodeType::Module => "module",
+                    crate::graph::pdg::NodeType::External => "external",
+                },
+                node.language,
+            );
+            let callers = pdg.backward_impact(node_idx, &connectivity_config);
+            let callees = pdg.forward_impact(node_idx, &connectivity_config);
+            enrichment.push_str(&format!(
+                " callers:{} callees:{} complexity:{}",
+                callers.len().min(50),
+                callees.len().min(50),
+                node.complexity,
+            ));
+
+            let node_content = if start < end {
+                let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
+                format!(
+                    "{}\n// {} in {}\n{}",
+                    enrichment, node.name, node.file_path, snippet
+                )
+            } else {
+                format!(
+                    "{}\n// {} in {}\n{}",
+                    enrichment, node.name, node.file_path, "// [No source code available]"
+                )
+            };
+
+            let tokens: Vec<String> = node_content
+                .split(|c: char| !c.is_alphanumeric())
+                .map(|s| s.to_ascii_lowercase())
+                .filter(|s| s.len() >= 2)
+                .collect();
+
+            let signature = crate::search::search::SearchEngine::extract_signature_from_content(
+                &node_content,
+            );
+            let tfidf_embedding =
+                embedder.embed_tfidf(&index_builder::tokenize_code(&node_content));
+
+            // Defer neural embedding to batch call below
+            let node_vec_idx = updated_nodes.len();
+            if embedder.has_neural() {
+                neural_pending.push((node_vec_idx, node_content.clone()));
+            }
+
+            updated_nodes.push(crate::search::search::NodeInfo {
+                node_id: node.id.clone(),
+                file_path: node.file_path.to_string(),
+                symbol_name: node.name.clone(),
+                language: node.language.clone(),
+                content: node_content,
+                byte_range: node.byte_range,
+                tfidf_embedding,
+                neural_embedding: None,
+                complexity: node.complexity,
+                signature,
+                pre_tokenized: Some(tokens),
+            });
+        }
+
+        // Batch neural embedding: one IPC call for all pending nodes.
+        if !neural_pending.is_empty() {
+            #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+            let batch_results = {
+                let texts: Vec<String> = neural_pending.iter().map(|(_, t)| t.clone()).collect();
+                embedder.embed_neural_batch_blocking(&texts)
+            };
+            #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+            let batch_results: Vec<Option<Vec<f32>>> = vec![None; neural_pending.len()];
+
+            for (i, (node_vec_idx, _content)) in neural_pending.iter().enumerate() {
+                if let Some(neural) = batch_results.get(i).and_then(|r| r.clone()) {
+                    updated_nodes[*node_vec_idx].neural_embedding = Some(neural);
                 }
-                // Read actual file content and extract the node's source
-                let file_bytes = file_cache
-                    .get_or_read(std::path::Path::new(file_path_str))
-                    .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
-                let file_content = String::from_utf8_lossy(&file_bytes);
-                let content_bytes = file_content.as_bytes();
-                let start = node.byte_range.0.min(content_bytes.len());
-                let end = node.byte_range.1.min(content_bytes.len());
-
-                let mut enrichment = format!(
-                    "// type:{} lang:{}",
-                    match node.node_type {
-                        crate::graph::pdg::NodeType::Function => "function",
-                        crate::graph::pdg::NodeType::Class => "class",
-                        crate::graph::pdg::NodeType::Method => "method",
-                        crate::graph::pdg::NodeType::Variable => "variable",
-                        crate::graph::pdg::NodeType::Module => "module",
-                        crate::graph::pdg::NodeType::External => "external",
-                    },
-                    node.language,
-                );
-                let callers = pdg.backward_impact(node_idx, &connectivity_config);
-                let callees = pdg.forward_impact(node_idx, &connectivity_config);
-                enrichment.push_str(&format!(
-                    " callers:{} callees:{} complexity:{}",
-                    callers.len().min(50),
-                    callees.len().min(50),
-                    node.complexity,
-                ));
-
-                let node_content = if start < end {
-                    let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
-                    format!(
-                        "{}\n// {} in {}\n{}",
-                        enrichment, node.name, node.file_path, snippet
-                    )
-                } else {
-                    format!(
-                        "{}\n// {} in {}\n{}",
-                        enrichment, node.name, node.file_path, "// [No source code available]"
-                    )
-                };
-
-                let tokens: Vec<String> = node_content
-                    .split(|c: char| !c.is_alphanumeric())
-                    .map(|s| s.to_ascii_lowercase())
-                    .filter(|s| s.len() >= 2)
-                    .collect();
-
-                let signature = crate::search::search::SearchEngine::extract_signature_from_content(
-                    &node_content,
-                );
-                let tfidf_embedding =
-                    embedder.embed_tfidf(&index_builder::tokenize_code(&node_content));
-
-                // Compute neural embedding if the embedder supports it
-                let neural_embedding = {
-                    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-                    {
-                        match &embedder {
-                            index_builder::HybridEmbedder::TfIdfOnly(_) => None,
-                            #[cfg(feature = "onnx")]
-                            index_builder::HybridEmbedder::HybridLocal { .. } => {
-                                match embedder.embed_neural_blocking(&node_content) {
-                                    Some(Ok(v)) => Some(v),
-                                    Some(Err(e)) => {
-                                        tracing::warn!(
-                                            "Neural embedding failed for node {}: {}",
-                                            node.id,
-                                            e
-                                        );
-                                        None
-                                    }
-                                    None => None,
-                                }
-                            }
-                            #[cfg(feature = "remote-embeddings")]
-                            index_builder::HybridEmbedder::HybridRemote { .. } => None,
-                        }
-                    }
-                    #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
-                    { None }
-                };
-
-                Some(crate::search::search::NodeInfo {
-                    node_id: node.id.clone(),
-                    file_path: node.file_path.to_string(),
-                    symbol_name: node.name.clone(),
-                    language: node.language.clone(),
-                    content: node_content,
-                    byte_range: node.byte_range,
-                    tfidf_embedding,
-                    neural_embedding,
-                    complexity: node.complexity,
-                    signature,
-                    pre_tokenized: Some(tokens),
-                })
-            })
-            .collect();
+            }
+        }
 
         self.search_engine
             .incremental_reindex(crate::search::search::TextIndexDelta {
