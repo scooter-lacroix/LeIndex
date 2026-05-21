@@ -35,6 +35,10 @@ use ort::session::Session;
 /// Default idle timeout in seconds before the worker tears itself down.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes
 
+/// Default maximum sequence length for tokenization.
+// TODO: make this configurable from model config / RuntimeConfig.
+pub const DEFAULT_MAX_SEQ_LEN: usize = 512;
+
 /// Default maximum outgoing frame size in bytes (16 MiB).
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
@@ -597,7 +601,7 @@ impl WorkerRuntime {
             .map(|e| e.len())
             .max()
             .unwrap_or(0)
-            .min(512); // Cap at 512 tokens for memory safety
+            .min(DEFAULT_MAX_SEQ_LEN); // Cap at max sequence length for memory safety
 
         if max_len == 0 {
             return Ok(EmbedResponse::new(vec![], 0, expected_dim));
@@ -705,14 +709,21 @@ impl WorkerRuntime {
         let (actual_seq_len, hidden_dim) = match output_shape.as_slice() {
             [bs, sl, hd] if *bs == batch_size => (*sl, *hd),
             [bs, hd] if *bs == batch_size => {
-                // Already pooled: [batch_size, hidden_dim]
-                return self.pool_and_normalize(
-                    embeddings_f32,
-                    batch_size,
-                    1,
-                    attention_mask,
-                    *hd,
-                );
+                // Already pooled: [batch_size, hidden_dim] — just L2-normalize per row
+                let dim = *hd;
+                let mut embeddings_f32 = embeddings_f32;
+                for b in 0..batch_size {
+                    let start = b * dim;
+                    let end = start + dim;
+                    let row = &mut embeddings_f32[start..end];
+                    let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+                    if norm > 0.0 {
+                        for v in row.iter_mut() {
+                            *v /= norm;
+                        }
+                    }
+                }
+                return Ok(EmbedResponse { count: batch_size, dimension: dim, vectors: embeddings_f32 });
             }
             _ => {
                 return Err(WorkerError {

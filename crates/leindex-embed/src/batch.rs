@@ -125,7 +125,7 @@ pub fn split_request(
         // Recalculate text_size to match the actual (possibly truncated) text
         let text_size = text.len() + 16;
 
-        current_texts.push(text.clone());
+        current_texts.push(text);
         current_size += text_size;
     }
 

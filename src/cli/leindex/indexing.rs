@@ -694,6 +694,9 @@ impl LeIndex {
 
         info!("Indexing completed in {}ms", self.stats.indexing_time_ms);
 
+        // Record RSS observation after indexing for memory report.
+        crate::cli::memory_report::observe_rss("post_index");
+
         // Clear the progress line so the final output is clean.
         progress_clear();
 

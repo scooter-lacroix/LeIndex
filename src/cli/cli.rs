@@ -1093,9 +1093,12 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
 /// Projects are loaded lazily on first tool call via `ProjectRegistry::get_or_load()`.
 async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     use crate::cli::mcp::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse};
-    use std::io::{self, BufRead, Read, Write};
+    use std::io::{self, BufRead, Write};
 
     info!("Starting LeIndex MCP stdio server (lazy project loading)");
+
+    // Record RSS observation at startup for memory report.
+    crate::cli::memory_report::observe_rss("mcp_stdio_startup");
 
     // Fast initialization: create empty registry + set all globals, no I/O.
     // Projects are loaded lazily when tool calls provide a `project_path`.
@@ -1142,8 +1145,8 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     }
 
     let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
     let mut reader = io::BufReader::new(stdin.lock());
+    let mut stdout = io::stdout().lock();
     let mut use_content_length = false;
 
     loop {
@@ -1151,11 +1154,6 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         let bytes = match reader.read_line(&mut line) {
             Ok(b) => b,
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::WouldBlock {
-                    // Transient — retry.
-                    tracing::debug!("MCP stdio: transient read error: {}", e);
-                    continue;
-                }
                 // Persistent / fatal error — break to allow graceful shutdown.
                 tracing::debug!("MCP stdio: fatal read error, breaking loop: {}", e);
                 break;
@@ -1195,7 +1193,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
             }
 
             let mut buf = vec![0u8; length];
-            if let Err(e) = reader.read_exact(&mut buf) {
+            if let Err(e) = io::Read::read_exact(&mut reader, &mut buf) {
                 tracing::debug!("MCP stdio: failed to read JSON payload: {}", e);
                 break;
             }
