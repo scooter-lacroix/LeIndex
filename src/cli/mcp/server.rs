@@ -418,9 +418,9 @@ fn handle_initialize(server: &McpServer) -> (Value, Option<String>) {
         const MAX_HTTP_SESSIONS: usize = 1000;
         if server.session_handshakes.len() >= MAX_HTTP_SESSIONS {
             // Find and remove the oldest session (by last_access_time)
-            if let Some(oldest) = server.session_handshakes.iter().min_by_key(|r| r.value().1) {
-                let oldest_id = oldest.key().to_string();
-                server.session_handshakes.remove(&oldest_id);
+            let oldest_id = server.session_handshakes.iter().min_by_key(|r| r.value().1).map(|r| r.key().to_string());
+            if let Some(id) = oldest_id {
+                server.session_handshakes.remove(&id);
             }
         }
         server.session_handshakes.insert(session_id.clone(), (true, Instant::now()));

@@ -492,20 +492,40 @@ fn fuzzy_find_node(
 
     let candidate_indices = pdg.trigram_index().query(&query_lower);
 
-    match candidate_indices {
-        Some(indices) if !is_event_loop_query => {
-            for node_idx in indices {
+    if is_event_loop_query {
+        // Query trigram index for each alias, collect union of candidates
+        let mut alias_candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for alias in event_loop_aliases {
+            if let Some(indices) = pdg.trigram_index().query(alias) {
+                alias_candidates.extend(indices.iter());
+            }
+        }
+        if alias_candidates.is_empty() {
+            // No trigram hits for any alias — fall back to full scan
+            for node_id in pdg.node_indices() {
+                if let Some(node) = pdg.get_node(node_id) {
+                    score_node(node_id, node);
+                }
+            }
+        } else {
+            for &node_idx in &alias_candidates {
                 let node_id = crate::graph::pdg::NodeId::new(node_idx as usize);
                 if let Some(node) = pdg.get_node(node_id) {
                     score_node(node_id, node);
                 }
             }
         }
-        _ => {
-            for node_id in pdg.node_indices() {
-                if let Some(node) = pdg.get_node(node_id) {
-                    score_node(node_id, node);
-                }
+    } else if let Some(indices) = candidate_indices {
+        for node_idx in indices {
+            let node_id = crate::graph::pdg::NodeId::new(node_idx as usize);
+            if let Some(node) = pdg.get_node(node_id) {
+                score_node(node_id, node);
+            }
+        }
+    } else {
+        for node_id in pdg.node_indices() {
+            if let Some(node) = pdg.get_node(node_id) {
+                score_node(node_id, node);
             }
         }
     }
