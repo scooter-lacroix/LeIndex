@@ -328,26 +328,7 @@ impl WorkerRuntime {
         let model_resolution = ModelResolver::resolve(&self.config.model_name);
         let (_model_path, _model_source) = match model_resolution {
             Ok(path) => {
-                let source = if std::env::var("LEINDEX_MODEL_PATH").is_ok() {
-                    "env_override"
-                } else if path.to_str().map(|s| s.contains("models")).unwrap_or(false) {
-                    // Check if it's near the binary
-                    if let Ok(exe) = std::env::current_exe() {
-                        if let Some(parent) = exe.parent() {
-                            if path.starts_with(parent) {
-                                "bundled"
-                            } else {
-                                "user_cache"
-                            }
-                        } else {
-                            "user_cache"
-                        }
-                    } else {
-                        "user_cache"
-                    }
-                } else {
-                    "user_cache"
-                };
+                let source = ModelResolver::source_for_path(&path);
                 reporter.set_model_path(&path, source);
                 (Some(path), source.to_string())
             }
@@ -398,6 +379,9 @@ impl WorkerRuntime {
         let (tx, rx) = std::sync::mpsc::channel();
         let read_timeout = Duration::from_secs(5);
 
+        // Derive incoming frame size limit from config (with 2× headroom).
+        let max_incoming_frame = self.config.max_frame_size * 2;
+
         // Reader helper thread: reads frames from the IPC channel and sends them
         // to the main loop via the `tx` channel.
         //
@@ -419,10 +403,10 @@ impl WorkerRuntime {
                         let payload_len = u32::from_le_bytes(len_buf) as usize;
                         // Guard against unreasonably large frames BEFORE allocation
                         // to prevent OOM from a malicious or malfunctioning main process.
-                        if payload_len > 32 * 1024 * 1024 {
+                        if payload_len > max_incoming_frame {
                             let _ = tx.send(Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
-                                format!("incoming frame too large: {payload_len} bytes (max: 32 MiB)"),
+                                format!("incoming frame too large: {payload_len} bytes (max: {max_incoming_frame} bytes)"),
                             )));
                             break;
                         }

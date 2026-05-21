@@ -1,8 +1,9 @@
 use crate::cli::mcp::protocol::JsonRpcError;
 use crate::edit::EditChange;
+use lru::LruCache;
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 
@@ -78,13 +79,17 @@ pub struct EditCache {
     /// Hot cache in memory for fast access during a session.
     /// `total_bytes` lives inside the Mutex alongside the map so all mutations
     /// are naturally synchronized without needing AtomicUsize.
-    entries: Mutex<(HashMap<PathBuf, EditCacheEntry>, usize)>,
+    /// Uses LruCache for O(1) eviction instead of O(N) min_by_key scan.
+    entries: Mutex<(LruCache<PathBuf, EditCacheEntry>, usize)>,
 }
 
 impl Default for EditCache {
     fn default() -> Self {
         Self {
-            entries: Mutex::new((HashMap::new(), 0)),
+            entries: Mutex::new((
+                LruCache::new(NonZeroUsize::new(10_000).unwrap()),
+                0,
+            )),
         }
     }
 }
@@ -168,25 +173,20 @@ impl EditCache {
             // Remove existing entry first to prevent double-subtraction during eviction.
             // If we only subtract its size but leave it in the map, the eviction loop
             // could remove it again and subtract its size a second time (underflow).
-            if let Some(existing) = entries.remove(&abs_path) {
+            if let Some(existing) = entries.pop(&abs_path) {
                 *total_bytes = total_bytes.saturating_sub(existing.estimated_size());
             }
 
-            // Evict until there is room
-            while *total_bytes + entry_size > EDIT_CACHE_TOTAL_CAP_BYTES && !entries.is_empty() {
-                // Find the oldest entry to evict (simplest LRU approximation)
-                if let Some(oldest_key) = entries
-                    .iter()
-                    .min_by_key(|(_, e)| e.timestamp)
-                    .map(|(k, _)| k.clone())
-                {
-                    if let Some(removed) = entries.remove(&oldest_key) {
-                        *total_bytes = total_bytes.saturating_sub(removed.estimated_size());
-                    }
+            // Evict until there is room using O(1) LRU eviction
+            while *total_bytes + entry_size > EDIT_CACHE_TOTAL_CAP_BYTES {
+                if let Some((_, removed)) = entries.pop_lru() {
+                    *total_bytes = total_bytes.saturating_sub(removed.estimated_size());
+                } else {
+                    break;
                 }
             }
 
-            entries.insert(abs_path, entry);
+            entries.put(abs_path, entry);
             *total_bytes = total_bytes.saturating_add(entry_size);
         }
 
@@ -201,7 +201,7 @@ impl EditCache {
 
         // Try hot cache first
         {
-            let guard = self.entries.lock().await;
+            let mut guard = self.entries.lock().await;
             if let Some(entry) = guard.0.get(&abs_path) {
                 return Some(entry.clone());
             }
@@ -215,24 +215,19 @@ impl EditCache {
                 if entry_size <= EDIT_CACHE_MAX_ENTRY_BYTES {
                     let mut guard = self.entries.lock().await;
                     let (ref mut entries, ref mut total_bytes) = *guard;
-                    if let Some(existing) = entries.remove(&abs_path) {
+                    if let Some(existing) = entries.pop(&abs_path) {
                         *total_bytes = total_bytes.saturating_sub(existing.estimated_size());
                     }
-                    // Evict if needed
-                    while *total_bytes + entry_size > EDIT_CACHE_TOTAL_CAP_BYTES && !entries.is_empty()
-                    {
-                        if let Some(oldest_key) = entries
-                            .iter()
-                            .min_by_key(|(_, e)| e.timestamp)
-                            .map(|(k, _)| k.clone())
-                        {
-                            if let Some(removed) = entries.remove(&oldest_key) {
-                                *total_bytes = total_bytes.saturating_sub(removed.estimated_size());
-                            }
+                    // Evict if needed using O(1) LRU eviction
+                    while *total_bytes + entry_size > EDIT_CACHE_TOTAL_CAP_BYTES {
+                        if let Some((_, removed)) = entries.pop_lru() {
+                            *total_bytes = total_bytes.saturating_sub(removed.estimated_size());
+                        } else {
+                            break;
                         }
                     }
                     *total_bytes = total_bytes.saturating_add(entry_size);
-                    entries.insert(abs_path, entry.clone());
+                    entries.put(abs_path, entry.clone());
                 }
                 return Some(entry);
             }
@@ -249,7 +244,7 @@ impl EditCache {
 
         {
             let mut guard = self.entries.lock().await;
-            if let Some(removed) = guard.0.remove(&abs_path) {
+            if let Some(removed) = guard.0.pop(&abs_path) {
                 guard.1 = guard.1.saturating_sub(removed.estimated_size());
             }
         }
@@ -356,7 +351,7 @@ mod tests {
             disk_entry.file_path = initial.file_path.clone();
             let disk_entry_size = disk_entry.estimated_size();
             guard.1 -= initial.estimated_size();
-            guard.0.insert(initial.file_path.clone(), disk_entry.clone());
+            guard.0.put(initial.file_path.clone(), disk_entry.clone());
             guard.1 += disk_entry_size;
         }
 

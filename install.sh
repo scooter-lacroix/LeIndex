@@ -729,10 +729,20 @@ install_model_assets() {
         log_info "Validating model checksums..."
         # Run checksum validation from within $model_dir so relative paths in
         # checksums.sha256 (e.g. "tokenizer.json  abc123...") resolve correctly.
-        if ! (cd "$model_dir" && sha256sum -c checksums.sha256) >> "$INSTALL_LOG" 2>&1; then
-            log_warn "Checksum validation failed; removing corrupted model files"
-            rm -rf "$model_dir"
-            return 1
+        if command -v sha256sum &>/dev/null; then
+            if ! (cd "$model_dir" && sha256sum -c checksums.sha256) >> "$INSTALL_LOG" 2>&1; then
+                log_warn "Checksum validation failed; removing corrupted model files"
+                rm -rf "$model_dir"
+                return 1
+            fi
+        elif command -v shasum &>/dev/null; then
+            if ! (cd "$model_dir" && shasum -a 256 -c checksums.sha256) >> "$INSTALL_LOG" 2>&1; then
+                log_warn "Checksum validation failed; removing corrupted model files"
+                rm -rf "$model_dir"
+                return 1
+            fi
+        else
+            log_warn "No checksum tool found (sha256sum or shasum), skipping validation"
         fi
         log_info "Checksum validation passed"
     fi

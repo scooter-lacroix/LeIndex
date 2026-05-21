@@ -628,6 +628,11 @@ impl ProjectRegistry {
             let mut slots = self.index_slots.lock().await;
             slots.remove(&path);
 
+            // Remove watcher so the evicted LeIndex is not kept alive by
+            // the watcher's captured ProjectHandle.
+            let mut watchers = self.watchers.lock().await;
+            watchers.remove(&path);
+
             // A+ hotspot cleanup: also evict stale-cache entry
             self.stale_cache.write().await.remove(&path);
 
