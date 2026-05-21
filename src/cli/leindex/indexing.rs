@@ -230,17 +230,12 @@ impl LeIndex {
                 )
             };
 
-            let tokens: Vec<String> = node_content
-                .split(|c: char| !c.is_alphanumeric())
-                .map(|s| s.to_ascii_lowercase())
-                .filter(|s| s.len() >= 2)
-                .collect();
+            let tokens = index_builder::tokenize_code(&node_content);
 
             let signature = crate::search::search::SearchEngine::extract_signature_from_content(
                 &node_content,
             );
-            let tfidf_embedding =
-                embedder.embed_tfidf(&index_builder::tokenize_code(&node_content));
+            let tfidf_embedding = embedder.embed_tfidf(&tokens);
 
             // Defer neural embedding to batch call below
             let node_vec_idx = updated_nodes.len();

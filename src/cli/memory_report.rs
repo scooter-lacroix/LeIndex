@@ -9,7 +9,37 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use tracing::{debug, info, warn};
+
+/// Global tracker instance, set once at startup.
+static GLOBAL_TRACKER: OnceLock<Mutex<MemoryReportTracker>> = OnceLock::new();
+
+/// Store the tracker in the global slot. Call once during startup.
+pub fn init_tracker(tracker: MemoryReportTracker) {
+    let _ = GLOBAL_TRACKER.set(Mutex::new(tracker));
+}
+
+/// Record an RSS observation against the global tracker (if initialized).
+/// Reads current RSS automatically.
+pub fn observe_rss(phase: &str) {
+    if let Some(tracker) = GLOBAL_TRACKER.get() {
+        let rss = current_rss_bytes();
+        if let Ok(mut guard) = tracker.lock() {
+            guard.observe_rss(rss);
+        }
+        debug!("Memory observation: phase={}, rss={} bytes", phase, rss);
+    }
+}
+
+/// Record a completed phase against the global tracker (if initialized).
+pub fn record_phase(name: &str, peak_rss_bytes: u64, sample_count: u64) {
+    if let Some(tracker) = GLOBAL_TRACKER.get() {
+        if let Ok(mut guard) = tracker.lock() {
+            guard.record_phase(name, peak_rss_bytes, sample_count);
+        }
+    }
+}
 
 /// Environment variable that enables memory report writing (same as --memory-report).
 pub const MEMORY_REPORT_ENV: &str = "LEINDEX_MEMORY_REPORT";

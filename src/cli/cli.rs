@@ -277,9 +277,13 @@ impl Cli {
         // The tracker observes RSS during execution and writes a compact JSON
         // summary on drop (graceful shutdown). Also enabled via
         // LEINDEX_MEMORY_REPORT env var; CLI flag takes precedence.
-        let _memory_report_guard =
+        if let Some(path) =
             crate::cli::memory_report::resolve_report_path(self.memory_report.as_deref())
-                .map(crate::cli::memory_report::MemoryReportTracker::new);
+        {
+            crate::cli::memory_report::init_tracker(
+                crate::cli::memory_report::MemoryReportTracker::new(path),
+            );
+        }
 
         // Get global project path
         let global_project = self.project_path;
