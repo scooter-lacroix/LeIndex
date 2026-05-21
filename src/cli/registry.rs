@@ -590,6 +590,17 @@ impl ProjectRegistry {
         *default = Some(path.to_path_buf());
     }
 
+    /// Set the default project path without loading the project.
+    ///
+    /// Used by MCP stdio to register the `--project` CLI argument as the
+    /// default so that subsequent tool calls that omit `project_path` resolve
+    /// to it. The actual `LeIndex` creation happens lazily on first tool call
+    /// via `get_or_load()`.
+    pub async fn set_default_path(&self, path: PathBuf) {
+        let mut default = self.default_project.write().await;
+        *default = Some(path);
+    }
+
     /// Evict the least-recently-used project if we're at or over capacity.
     async fn evict_lru_if_needed(&self) {
         let current_count = self.projects.read().await.len();

@@ -154,7 +154,7 @@ jobs:
           mkdir -p "$MODELS_DIR"
           # Model assets are gitignored so checkout won't include them.
           # Try to fetch from a prior GitHub Release first, then HuggingFace.
-          HF_REPO="Qwen/Qwen3-Embedding-0.6B"
+          HF_REPO="onnx-community/Qwen3-Embedding-0.6B-ONNX"
           if [[ -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
             echo "Model assets already present in repository"
           else
@@ -173,9 +173,7 @@ jobs:
             if [[ ! -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
               echo "Downloading ONNX model from HuggingFace (${HF_REPO})..."
               curl --fail --location --progress-bar -o "$MODELS_DIR/qwen3-embed-0.6b.onnx" \
-                "https://huggingface.co/${HF_REPO}/resolve/main/qwen3-embed-0.6b-onnx/model.onnx" \
-                || curl --fail --location --progress-bar -o "$MODELS_DIR/qwen3-embed-0.6b.onnx" \
-                "https://huggingface.co/${HF_REPO}/resolve/main/model.onnx"
+                "https://huggingface.co/${HF_REPO}/resolve/main/onnx/model.onnx"
             fi
             if [[ ! -f "$MODELS_DIR/tokenizer.json" ]]; then
               echo "Downloading tokenizer from HuggingFace..."

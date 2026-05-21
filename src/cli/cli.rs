@@ -1081,7 +1081,7 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
 /// Initialization is deferred: the server enters the stdin read loop immediately
 /// (no SQLite open, no PDG load, no TF-IDF rebuild, no file watcher at startup).
 /// Projects are loaded lazily on first tool call via `ProjectRegistry::get_or_load()`.
-async fn cmd_mcp_stdio_impl(_project: Option<PathBuf>) -> AnyhowResult<()> {
+async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     use crate::cli::mcp::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse};
     use std::io::{self, BufRead, Read, Write};
 
@@ -1093,6 +1093,19 @@ async fn cmd_mcp_stdio_impl(_project: Option<PathBuf>) -> AnyhowResult<()> {
         crate::cli::mcp::server::McpServerConfig::default(),
     )
     .context("Failed to create MCP server")?;
+
+    // If --project was provided, register it as the default project path.
+    // The actual LeIndex creation happens lazily on first tool call.
+    if let Some(ref project_path) = project {
+        let canonical = project_path
+            .canonicalize()
+            .with_context(|| format!("Cannot resolve project path '{}'", project_path.display()))?;
+        let registry = crate::cli::mcp::server::SERVER_STATE
+            .get()
+            .context("Server state not initialized")?;
+        registry.set_default_path(canonical).await;
+        info!("Default project path set to: {}", project_path.display());
+    }
 
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();

@@ -276,7 +276,7 @@ pub fn save_pdg(
     if let Err(e) = save_trigram_index_tx(&tx, project_id, &pdg.trigram_index()) {
         // Log but don't fail — the trigram index is a performance optimization,
         // not a correctness requirement. It will be rebuilt on load if missing.
-        tracing::debug!("Failed to save trigram index: {e}");
+        tracing::warn!("Failed to save trigram index: {e}");
     }
 
     tx.commit()?;
@@ -501,7 +501,9 @@ pub fn delete_pdg(storage: &mut Storage, project_id: &str) -> SqliteResult<()> {
     )?;
 
     // Delete trigram index
-    let _ = delete_trigram_index(storage, project_id);
+    if let Err(e) = delete_trigram_index(storage, project_id) {
+        tracing::warn!("Failed to delete trigram index for project {}: {e}", project_id);
+    }
 
     Ok(())
 }

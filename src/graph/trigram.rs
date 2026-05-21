@@ -87,7 +87,7 @@ impl TrigramIndex {
     /// If the query has fewer than 3 characters (no trigrams), returns None
     /// to signal that the caller should fall back to a full linear scan.
     pub fn query(&self, query_lower: &str) -> Option<Vec<u32>> {
-        let trigrams: Vec<Trigram> = extract_trigrams(query_lower).collect();
+        let trigrams = extract_trigrams(query_lower);
         if trigrams.is_empty() {
             return None; // Query too short, fall back to full scan
         }
@@ -207,7 +207,10 @@ impl TrigramIndex {
     ///     [u32 * posting_list_length: node indices]
     pub fn serialize(&self) -> Vec<u8> {
         let entry_count = self.postings.len() as u32;
-        let mut buf = Vec::with_capacity(4 + entry_count as usize * 12);
+        // Pre-pass: compute exact size to avoid over-allocation.
+        // Header: 4 bytes. Per entry: 4 (key) + 4 (len) + 4 * posting_list.len().
+        let total_size: usize = 4 + self.postings.iter().map(|(_, list)| 8 + list.len() * 4).sum::<usize>();
+        let mut buf = Vec::with_capacity(total_size);
 
         buf.extend_from_slice(&entry_count.to_le_bytes());
 
@@ -279,13 +282,24 @@ impl TrigramIndex {
 
 /// Extract all trigrams from a string, returning them as packed u32 values.
 ///
-/// Each trigram is 3 consecutive bytes packed into the low 24 bits of a u32.
-/// The string should already be lowercased for case-insensitive matching.
-pub fn extract_trigrams(s: &str) -> impl Iterator<Item = Trigram> + '_ {
-    let bytes = s.as_bytes();
-    bytes.windows(3).map(|w| {
-        (w[0] as u32) | ((w[1] as u32) << 8) | ((w[2] as u32) << 16)
-    })
+/// Uses character-level trigrams (not byte-level) to correctly handle
+/// multi-byte UTF-8 characters. Each trigram is a u32 hash of 3 consecutive
+/// characters. The string should already be lowercased for case-insensitive matching.
+pub fn extract_trigrams(s: &str) -> Vec<Trigram> {
+    let chars: Vec<char> = s.chars().collect();
+    chars.windows(3)
+        .map(|w| {
+            // Hash the 3-char window into a u32 using FNV-1a-like mixing.
+            // This avoids needing to change the Trigram type from u32.
+            let mut h: u32 = 2166136261; // FNV offset basis
+            for &c in w {
+                let b = c as u32;
+                h ^= b;
+                h = h.wrapping_mul(16777619); // FNV prime
+            }
+            h
+        })
+        .collect()
 }
 
 /// Intersect two sorted vecs of u32, returning a new sorted vec.
@@ -315,13 +329,13 @@ mod tests {
 
     #[test]
     fn test_extract_trigrams() {
-        let trigrams: Vec<_> = extract_trigrams("hello").collect();
+        let trigrams = extract_trigrams("hello");
         assert_eq!(trigrams.len(), 3); // "hel", "ell", "llo"
     }
 
     #[test]
     fn test_extract_trigrams_short() {
-        let trigrams: Vec<_> = extract_trigrams("ab").collect();
+        let trigrams = extract_trigrams("ab");
         assert!(trigrams.is_empty());
     }
 
