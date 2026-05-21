@@ -60,11 +60,9 @@ jobs:
       - name: Download model assets
         run: |
           mkdir -p models
-          HF_REPO="Qwen/Qwen3-Embedding-0.6B"
+          HF_REPO="onnx-community/Qwen3-Embedding-0.6B-ONNX"
           curl --fail --location --progress-bar -o models/qwen3-embed-0.6b.onnx \
-            "https://huggingface.co/${HF_REPO}/resolve/main/qwen3-embed-0.6b-onnx/model.onnx" \
-            || curl --fail --location --progress-bar -o models/qwen3-embed-0.6b.onnx \
-            "https://huggingface.co/${HF_REPO}/resolve/main/model.onnx"
+            "https://huggingface.co/${HF_REPO}/resolve/main/onnx/model.onnx"
           curl --fail --location --progress-bar -o models/tokenizer.json \
             "https://huggingface.co/${HF_REPO}/resolve/main/tokenizer.json"
 
