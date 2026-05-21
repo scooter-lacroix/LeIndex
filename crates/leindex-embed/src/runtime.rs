@@ -312,7 +312,7 @@ impl WorkerRuntime {
     /// 4. Check idle timeout and exit if expired
     ///
     /// VAL-CPHASE-004: Uses local IPC only (stdin/stdout pipes or Unix socket).
-    pub fn run<R: Read, W: Write>(&mut self, reader: R, writer: W) -> anyhow::Result<()> {
+    pub fn run<R: Read + Send + 'static, W: Write>(&mut self, reader: R, writer: W) -> anyhow::Result<()> {
         // Emit startup report
         let startup = self.build_startup_report();
         startup.log();
@@ -382,11 +382,51 @@ impl WorkerRuntime {
     }
 
     /// Inner loop: read frames, process, respond, check idle.
-    pub fn run_loop<R: Read, W: Write>(
+    ///
+    /// Uses a read timeout on the reader so that the idle timeout check
+    /// at the top of the loop is reached even when no data is arriving.
+    /// Without this, a blocking `read_exact` would block forever and the
+    /// worker would never tear down its ONNX session on idle.
+    pub fn run_loop<R: Read + Send + 'static, W: Write>(
         &mut self,
-        mut reader: R,
+        reader: R,
         mut writer: W,
     ) -> anyhow::Result<()> {
+        // Wrap the reader in a BufReader so we can call `set_read_timeout`
+        // via the underlying handle. We use a cross-platform approach:
+        // spawn a helper thread that reads and sends results via a channel.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let read_timeout = Duration::from_secs(5);
+
+        std::thread::spawn(move || {
+            let mut buf_reader = io::BufReader::new(reader);
+            loop {
+                // Read 4-byte length prefix
+                let mut len_buf = [0u8; 4];
+                match buf_reader.read_exact(&mut len_buf) {
+                    Ok(()) => {
+                        let payload_len = u32::from_le_bytes(len_buf) as usize;
+                        let mut frame_buf = vec![0u8; payload_len];
+                        match buf_reader.read_exact(&mut frame_buf) {
+                            Ok(()) => {
+                                if tx.send(Ok(frame_buf)).is_err() {
+                                    break; // Receiver dropped
+                                }
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(e));
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        break;
+                    }
+                }
+            }
+        });
+
         loop {
             // Check external shutdown signal
             if self.shutdown_flag.load(Ordering::Relaxed) {
@@ -403,33 +443,34 @@ impl WorkerRuntime {
                 return Ok(());
             }
 
-            // Read 4-byte length prefix
-            let mut len_buf = [0u8; 4];
-            match reader.read_exact(&mut len_buf) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            // Read frame with timeout so idle check fires periodically
+            let frame_buf = match rx.recv_timeout(read_timeout) {
+                Ok(Ok(buf)) => buf,
+                Ok(Err(e)) => {
+                    if e.kind() == io::ErrorKind::UnexpectedEof {
+                        tracing::debug!("IPC channel closed, worker shutting down");
+                        return Ok(());
+                    }
+                    return Err(anyhow::anyhow!("failed to read frame: {}", e));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Read timed out — loop back to check idle expiry.
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     tracing::debug!("IPC channel closed, worker shutting down");
                     return Ok(());
                 }
-                Err(e) => {
-                    return Err(anyhow::anyhow!("failed to read frame length: {}", e));
-                }
-            }
-
-            let payload_len = u32::from_le_bytes(len_buf) as usize;
+            };
 
             // Guard against unreasonably large frames
-            if payload_len > self.config.max_frame_size * 2 {
+            if frame_buf.len() > self.config.max_frame_size * 2 {
                 return Err(anyhow::anyhow!(
                     "incoming frame too large: {} bytes (max: {})",
-                    payload_len,
+                    frame_buf.len(),
                     self.config.max_frame_size * 2
                 ));
             }
-
-            // Read the frame payload
-            let mut frame_buf = vec![0u8; payload_len];
-            reader.read_exact(&mut frame_buf)?;
 
             let frame = Frame::from_wire_bytes(&frame_buf)?;
             let _batch_id = frame.header.batch_id;

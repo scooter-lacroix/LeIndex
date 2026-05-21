@@ -67,7 +67,7 @@ fn run_memcheck(update_baseline: bool) -> Result<()> {
     if !leindex_bin.exists() {
         eprintln!("xtask: building release binary...");
         let status = Command::new("cargo")
-            .args(["build", "--release", "--bin", "leindex"])
+            .args(["build", "--release", "-p", "leindex", "--features", "onnx"])
             .current_dir(&root)
             .status()
             .context("failed to run cargo build")?;
@@ -80,7 +80,7 @@ fn run_memcheck(update_baseline: bool) -> Result<()> {
     if !leindex_embed_bin.exists() {
         eprintln!("xtask: building leindex-embed worker binary...");
         let status = Command::new("cargo")
-            .args(["build", "--release", "-p", "leindex-embed"])
+            .args(["build", "--release", "-p", "leindex-embed", "--features", "onnx"])
             .current_dir(&root)
             .status()
             .context("failed to build leindex-embed")?;

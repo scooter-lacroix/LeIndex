@@ -16,6 +16,11 @@ use std::collections::HashMap;
 /// This avoids heap-allocating a String for every trigram.
 pub type Trigram = u32;
 
+/// Version header for the serialized trigram index format.
+/// Increment this when the on-disk layout changes to prevent
+/// deserializing incompatible data.
+const TRIGRAM_INDEX_VERSION: u32 = 1;
+
 /// Inverted index: trigram → set of node indices (as u32).
 ///
 /// Uses `Vec<u32>` for posting lists (compact, cache-friendly) and
@@ -200,6 +205,7 @@ impl TrigramIndex {
     /// Serialize the trigram index to bytes for persistence.
     ///
     /// Format:
+    ///   [u32: version header (TRIGRAM_INDEX_VERSION)]
     ///   [u32: number of posting entries]
     ///   For each entry:
     ///     [u32: trigram key]
@@ -208,10 +214,11 @@ impl TrigramIndex {
     pub fn serialize(&self) -> Vec<u8> {
         let entry_count = self.postings.len() as u32;
         // Pre-pass: compute exact size to avoid over-allocation.
-        // Header: 4 bytes. Per entry: 4 (key) + 4 (len) + 4 * posting_list.len().
-        let total_size: usize = 4 + self.postings.iter().map(|(_, list)| 8 + list.len() * 4).sum::<usize>();
+        // Header: 4 (version) + 4 (entry count). Per entry: 4 (key) + 4 (len) + 4 * posting_list.len().
+        let total_size: usize = 4 + 4 + self.postings.iter().map(|(_, list)| 8 + list.len() * 4).sum::<usize>();
         let mut buf = Vec::with_capacity(total_size);
 
+        buf.extend_from_slice(&TRIGRAM_INDEX_VERSION.to_le_bytes());
         buf.extend_from_slice(&entry_count.to_le_bytes());
 
         for (&trigram, posting_list) in &self.postings {
@@ -228,12 +235,18 @@ impl TrigramIndex {
 
     /// Deserialize a trigram index from bytes.
     pub fn deserialize(data: &[u8]) -> Option<Self> {
-        if data.len() < 4 {
+        if data.len() < 8 {
             return None;
         }
 
-        let entry_count = u32::from_le_bytes(data[0..4].try_into().ok()?) as usize;
-        let mut offset = 4;
+        // Validate version header
+        let version = u32::from_le_bytes(data[0..4].try_into().ok()?);
+        if version != TRIGRAM_INDEX_VERSION {
+            return None;
+        }
+
+        let entry_count = u32::from_le_bytes(data[4..8].try_into().ok()?) as usize;
+        let mut offset = 8;
         let mut postings = HashMap::with_capacity_and_hasher(
             entry_count,
             std::collections::hash_map::RandomState::default(),

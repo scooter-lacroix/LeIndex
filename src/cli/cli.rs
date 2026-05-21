@@ -1089,10 +1089,29 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 
     // Fast initialization: create empty registry + set all globals, no I/O.
     // Projects are loaded lazily when tool calls provide a `project_path`.
-    let _server = crate::cli::mcp::server::McpServer::new(
+    let server = crate::cli::mcp::server::McpServer::new(
         crate::cli::mcp::server::McpServerConfig::default(),
     )
     .context("Failed to create MCP server")?;
+
+    // Spawn background task to clean up stale sessions periodically.
+    // In HTTP mode, `McpServer::run()` starts this internally, but stdio
+    // mode uses its own read loop so we need to start it explicitly.
+    {
+        let cleanup_server = server.clone();
+        tokio::spawn(async move {
+            const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+            const SESSION_MAX_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+            let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+            loop {
+                interval.tick().await;
+                let removed = cleanup_server.cleanup_stale_sessions(SESSION_MAX_IDLE);
+                if removed > 0 {
+                    tracing::debug!("Cleaned up {} stale session(s)", removed);
+                }
+            }
+        });
+    }
 
     // If --project was provided, register it as the default project path.
     // The actual LeIndex creation happens lazily on first tool call.

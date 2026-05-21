@@ -35,7 +35,9 @@ fn main() {
 
     // Run the main IPC loop over stdin/stdout
     // VAL-CPHASE-004: Local IPC only (stdin/stdout pipes)
-    if let Err(e) = runtime.run(io::stdin().lock(), io::stdout().lock()) {
+    // Note: we pass io::stdin() directly (not .lock()) because the run_loop
+    // spawns a helper thread that needs the reader to be Send.
+    if let Err(e) = runtime.run(io::stdin(), io::stdout()) {
         tracing::error!("worker loop failed: {}", e);
         process::exit(1);
     }

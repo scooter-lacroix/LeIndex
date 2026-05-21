@@ -552,7 +552,15 @@ async function install() {
     try {
       // Use --force to overwrite any old workspace crate installations
       execSync('cargo install leindex --force', { stdio: 'inherit' });
-      console.log('\n   ✓ Installed via cargo');
+      console.log('\n   ✓ Installed leindex via cargo');
+      
+      // Also install the ONNX worker binary
+      try {
+        execSync('cargo install leindex-embed --features onnx --force', { stdio: 'inherit' });
+        console.log('   ✓ Installed leindex-embed worker via cargo');
+      } catch (embedErr) {
+        console.log('   ⚠ leindex-embed install failed; ONNX will use in-process fallback');
+      }
       
       // Link cargo-installed binary to our bin directory
       try {

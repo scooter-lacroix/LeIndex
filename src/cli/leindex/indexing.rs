@@ -237,6 +237,35 @@ impl LeIndex {
                 let tfidf_embedding =
                     embedder.embed_tfidf(&index_builder::tokenize_code(&node_content));
 
+                // Compute neural embedding if the embedder supports it
+                let neural_embedding = {
+                    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+                    {
+                        match &embedder {
+                            index_builder::HybridEmbedder::TfIdfOnly(_) => None,
+                            #[cfg(feature = "onnx")]
+                            index_builder::HybridEmbedder::HybridLocal { .. } => {
+                                match embedder.embed_neural_blocking(&node_content) {
+                                    Some(Ok(v)) => Some(v),
+                                    Some(Err(e)) => {
+                                        tracing::warn!(
+                                            "Neural embedding failed for node {}: {}",
+                                            node.id,
+                                            e
+                                        );
+                                        None
+                                    }
+                                    None => None,
+                                }
+                            }
+                            #[cfg(feature = "remote-embeddings")]
+                            index_builder::HybridEmbedder::HybridRemote { .. } => None,
+                        }
+                    }
+                    #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+                    { None }
+                };
+
                 Some(crate::search::search::NodeInfo {
                     node_id: node.id.clone(),
                     file_path: node.file_path.to_string(),
@@ -245,7 +274,7 @@ impl LeIndex {
                     content: node_content,
                     byte_range: node.byte_range,
                     tfidf_embedding,
-                    neural_embedding: None, // Will be enhanced if embedder supports it
+                    neural_embedding,
                     complexity: node.complexity,
                     signature,
                     pre_tokenized: Some(tokens),
@@ -664,12 +693,11 @@ impl LeIndex {
             warn!("Failed to update last_indexed timestamp: {err:#}");
         }
 
-        // A+ idle-unload: drop the ONNX session after indexing batch so it
-        // does not remain resident indefinitely (VAL-APLUS-024). The session
-        // will be lazily recreated on the next embed/rerank demand.
-        if let Some(embedder) = &self.embedder {
-            embedder.unload_onnx();
-        }
+        // Note: ONNX worker idle-unload is handled by the worker's own idle
+        // timeout (see leindex-embed runtime.rs). We do NOT call
+        // unload_onnx() here because this path runs on every incremental
+        // reindex (file save with 500ms debounce), and killing the worker
+        // process on each save causes high latency for subsequent requests.
 
         info!("Indexing completed in {}ms", self.stats.indexing_time_ms);
 
