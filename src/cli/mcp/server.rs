@@ -30,7 +30,7 @@ use std::sync::{
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Global server state — multi-project registry.
 ///
@@ -218,7 +218,7 @@ impl McpServer {
         // log it rather than dying silently.
         tokio::spawn(async move {
             if let Err(e) = _cleanup_handle.await {
-                eprintln!("cleanup task died: {e}");
+                error!("cleanup task died: {e}");
             }
         });
 

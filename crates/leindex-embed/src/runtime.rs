@@ -1110,24 +1110,12 @@ mod tests {
         let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
         let result = rt.handle_embed(frame);
 
-        // With onnx feature but no model loaded, empty batch still returns Ok
-        // (early return before model check), but guard for safety.
-        #[cfg(feature = "onnx")]
-        {
-            // Empty batch returns Ok early (before ONNX session check)
-            let response = result.unwrap();
-            assert_eq!(response.count, 0);
-            assert_eq!(response.dimension, 1024);
-            assert!(response.vectors.is_empty());
-        }
-
-        #[cfg(not(feature = "onnx"))]
-        {
-            let response = result.unwrap();
-            assert_eq!(response.count, 0);
-            assert_eq!(response.dimension, 1024);
-            assert!(response.vectors.is_empty());
-        }
+        // Empty batch returns Ok early (before any ONNX session check),
+        // so .unwrap() is safe regardless of feature flag.
+        let response = result.unwrap();
+        assert_eq!(response.count, 0);
+        assert_eq!(response.dimension, 1024);
+        assert!(response.vectors.is_empty());
     }
 
     #[test]

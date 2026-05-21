@@ -441,24 +441,11 @@ fn generate_deterministic_embedding(symbol_name: &str) -> Vec<f32> {
 /// 1. Nodes whose name contains the query as a substring
 /// 2. Nodes whose ID contains the query as a substring
 /// 3. Higher-complexity nodes (event loops tend to be complex)
-/// Case-insensitive substring check. `needle_lower` must already be
-/// lowercase. Uses byte-level sliding-window comparison with
-/// `to_ascii_lowercase()` to avoid per-call heap allocations, which is
-/// correct for code-symbol identifiers (ASCII-only in practice).
+/// Case-insensitive substring check using proper UTF-8 handling.
+/// This is on the on-demand fallback path (not the hot path), so the
+/// performance cost of `to_lowercase()` is negligible.
 fn ci_contains(haystack: &str, needle_lower: &str) -> bool {
-    if needle_lower.is_empty() {
-        return true;
-    }
-    let n = needle_lower.len();
-    if n > haystack.len() {
-        return false;
-    }
-    haystack.as_bytes().windows(n).any(|window| {
-        window
-            .iter()
-            .zip(needle_lower.as_bytes())
-            .all(|(&h, &n)| h.to_ascii_lowercase() == n)
-    })
+    haystack.to_lowercase().contains(needle_lower)
 }
 
 fn fuzzy_find_node(

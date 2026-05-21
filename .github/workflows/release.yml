@@ -168,6 +168,16 @@ jobs:
               gh release download "$TAG" --dir "$MODELS_DIR" --pattern "config.json" 2>/dev/null || true
               gh release download "$TAG" --dir "$MODELS_DIR" --pattern "checksums.sha256" 2>/dev/null || true
               gh release download "$TAG" --dir "$MODELS_DIR" --pattern "LICENSE" 2>/dev/null || true
+              # Try to extract from prior release bundle if direct download failed
+              if [[ ! -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
+                echo "Direct download failed — trying to extract from release bundle..."
+                BUNDLE=$(gh release download "$TAG" --dir /tmp --pattern "leindex-linux-x86_64.tar.gz" 2>/dev/null && echo "/tmp/leindex-linux-x86_64.tar.gz" || true)
+                if [[ -n "$BUNDLE" && -f "$BUNDLE" ]]; then
+                  tar xzf "$BUNDLE" -C /tmp --strip-components=1 "leindex/models/qwen3-embed-0.6b.onnx" "leindex/models/tokenizer.json" 2>/dev/null || true
+                  cp /tmp/leindex/models/qwen3-embed-0.6b.onnx "$MODELS_DIR/" 2>/dev/null || true
+                  cp /tmp/leindex/models/tokenizer.json "$MODELS_DIR/" 2>/dev/null || true
+                fi
+              fi
             fi
             # Fall back to HuggingFace download if still missing
             if [[ ! -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then

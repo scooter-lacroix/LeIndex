@@ -107,8 +107,23 @@ pub fn split_request(
             current_size = 0;
         }
 
-        current_texts.push(text);
-        current_size += text_size;
+        // Guard: if a single text (after truncation to max_text_size) still
+        // exceeds max_frame_size, truncate it further to fit. This can happen
+        // when max_text_size + overhead > max_frame_size due to misconfiguration.
+        let text = if current_texts.is_empty() && text_size > config.max_frame_size {
+            let max_content = config.max_frame_size.saturating_sub(16); // subtract overhead
+            tracing::warn!(
+                original_len = text.len(),
+                truncated_to = max_content,
+                "single text exceeds max_frame_size, truncating further"
+            );
+            truncate_text(text, max_content)
+        } else {
+            text
+        };
+
+        current_texts.push(text.clone());
+        current_size += text.len() + 16;
     }
 
     // Flush remaining
