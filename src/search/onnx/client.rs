@@ -656,7 +656,12 @@ impl EmbeddingClient {
             .map_err(|e| ClientError::Ipc(e.to_string()))?;
         let request_batch_id = frame.header.batch_id;
 
-        if let Err(e) = handle.stdin.as_mut().unwrap().write_all(&wire) {
+        if let Err(e) = handle
+            .stdin
+            .as_mut()
+            .ok_or_else(|| ClientError::Ipc("worker stdin not available".into()))?
+            .write_all(&wire)
+        {
             drop(guard);
             self.kill_worker();
             return Err(ClientError::Ipc(format!(
@@ -664,7 +669,12 @@ impl EmbeddingClient {
                 e
             )));
         }
-        if let Err(e) = handle.stdin.as_mut().unwrap().flush() {
+        if let Err(e) = handle
+            .stdin
+            .as_mut()
+            .ok_or_else(|| ClientError::Ipc("worker stdin not available".into()))?
+            .flush()
+        {
             drop(guard);
             self.kill_worker();
             return Err(ClientError::Ipc(format!(

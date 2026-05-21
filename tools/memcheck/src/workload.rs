@@ -144,7 +144,7 @@ pub fn run_workload(config: &WorkloadConfig) -> Result<Vec<PhaseReport>> {
         // ── Phase 9: embed_teardown ─────────────────────────────────────
         // Launch MCP process after the worker has been torn down. This verifies
         // that the worker process is cleaned up and doesn't leak RSS.
-        let (child, report) = run_idle_phase(config, "embed_teardown", IDLE_DWELL, false)?;
+        let (child, report) = run_idle_phase(config, "embed_teardown", IDLE_DWELL, true)?;
         reports.push(report);
         kill_child(child);
     } else {

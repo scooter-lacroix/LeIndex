@@ -258,7 +258,7 @@ fn read_mapped_anon_smaps(pid: u32) -> (u64, u64) {
             // Format: address perms offset dev inode [pathname]
             // Fields:    0       1      2     3    4       5+
             let fields: Vec<&str> = trimmed.split_whitespace().collect();
-            is_file_mapped = fields.len() > 5;
+            is_file_mapped = fields.len() > 5 && !fields[5].starts_with('[');
             continue;
         }
 

@@ -398,6 +398,17 @@ impl WorkerRuntime {
         let (tx, rx) = std::sync::mpsc::channel();
         let read_timeout = Duration::from_secs(5);
 
+        // Reader helper thread: reads frames from the IPC channel and sends them
+        // to the main loop via the `tx` channel.
+        //
+        // Lifecycle: the thread blocks on `read_exact`, which will return EOF when
+        // the parent process closes the pipe (e.g., on shutdown or process exit).
+        // When the main loop exits (idle timeout or shutdown), the `tx` sender is
+        // dropped, causing the reader thread's `tx.send()` to fail and the thread
+        // to break out of its loop. The thread is not joinable from this scope, but
+        // it will exit naturally when either:
+        //   1. The pipe closes (EOF on read_exact), or
+        //   2. The `tx` channel is disconnected (main loop exited).
         std::thread::spawn(move || {
             let mut buf_reader = io::BufReader::new(reader);
             loop {
