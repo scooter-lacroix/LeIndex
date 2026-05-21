@@ -274,15 +274,15 @@ struct HoistedWork {
 
 /// Bounded repeated-work hoister.
 ///
-/// Caches intermediate TF-IDF and neural embedding results keyed by a content
-/// hash within a bounded window. When the same content is encountered again
+/// Caches intermediate TF-IDF and neural embedding results keyed by a BLAKE3
+/// content hash within a bounded window. When the same content is encountered again
 /// (e.g., during incremental reindexing of unchanged files), the hoisted
 /// result is reused instead of recomputing the embedding.
 ///
 /// The cache is bounded by both entry count and total bytes. When either
 /// limit is exceeded, the least-recently-used entry is evicted.
 pub struct WorkHoister {
-    cache: LruCache<String, HoistedWork>,
+    cache: LruCache<blake3::Hash, HoistedWork>,
     tracked_bytes: usize,
     max_bytes: usize,
 }
@@ -306,24 +306,11 @@ impl WorkHoister {
         }
     }
 
-    /// Compute a lightweight content hash key for hoisting.
-    /// Uses a simple hash of the content bytes rather than the full content.
-    fn content_key(content: &str) -> String {
-        // Use a fast hash — we don't need cryptographic strength here,
-        // just collision resistance within a single indexing session.
-        let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
-        for byte in content.as_bytes() {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3); // FNV prime
-        }
-        format!("{:016x}", hash)
-    }
-
     /// Look up a previously hoisted embedding for the given content.
     /// Returns `Some((tfidf_embedding, neural_embedding))` if found, `None` otherwise.
     pub fn lookup(&mut self, content: &str) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
-        let key = Self::content_key(content);
-        self.cache.get(&key).map(|entry| {
+        let hash = blake3::hash(content.as_bytes());
+        self.cache.get(&hash).map(|entry| {
             (entry.embedding.clone(), entry.neural_embedding.clone())
         })
     }
@@ -331,32 +318,32 @@ impl WorkHoister {
     /// Store a computed embedding for the given content.
     /// If the cache is full, evicts the least-recently-used entry first.
     pub fn store(&mut self, content: &str, embedding: Vec<f32>, neural_embedding: Option<Vec<f32>>) {
-        let key = Self::content_key(content);
+        let hash = blake3::hash(content.as_bytes());
         let neural_byte_size = neural_embedding.as_ref().map_or(0, |v| v.len() * std::mem::size_of::<f32>());
-        let byte_size = key.len() + embedding.len() * std::mem::size_of::<f32>() + neural_byte_size;
+        let byte_size = 32 + embedding.len() * std::mem::size_of::<f32>() + neural_byte_size;
         let entry = HoistedWork {
             embedding,
             neural_embedding,
             byte_size,
         };
 
-        if let Some(existing) = self.cache.put(key.clone(), entry) {
+        if let Some(existing) = self.cache.put(hash, entry) {
             self.tracked_bytes = self.tracked_bytes.saturating_sub(existing.byte_size);
         }
 
         // Evict until there is room.
         while self.tracked_bytes + byte_size > self.max_bytes && !self.cache.is_empty() {
-            if let Some((evicted_key, evicted)) = self.cache.pop_lru() {
+            if let Some((evicted_hash, evicted)) = self.cache.pop_lru() {
                 self.tracked_bytes = self.tracked_bytes.saturating_sub(evicted.byte_size);
                 // If the just-inserted entry was evicted, stop — don't count it.
-                if evicted_key == key {
+                if evicted_hash == hash {
                     return;
                 }
             }
         }
 
         // Only increment tracked_bytes if the entry is still in the cache after eviction.
-        if self.cache.contains(&key) {
+        if self.cache.contains(&hash) {
             self.tracked_bytes += byte_size;
         }
     }
@@ -4217,13 +4204,13 @@ mod tests {
     #[test]
     fn test_work_hoister_evicts_on_byte_cap() {
         // Very small byte cap: only room for ~1 embedding
-        // Each entry: 16-byte key + 3 * 4 bytes = 28 bytes
-        let mut hoister = WorkHoister::with_bounds(100, 30);
+        // Each entry: 32-byte BLAKE3 hash key + 3 * 4 bytes = 44 bytes
+        let mut hoister = WorkHoister::with_bounds(100, 50);
 
         hoister.store("short", vec![1.0, 2.0, 3.0], None);
         assert_eq!(hoister.len(), 1);
 
-        // Adding another should evict the first (28 + 28 = 56 > 30)
+        // Adding another should evict the first (44 + 44 = 88 > 50)
         hoister.store("another", vec![4.0, 5.0, 6.0], None);
         assert!(hoister.lookup("short").is_none());
         assert!(hoister.lookup("another").is_some());

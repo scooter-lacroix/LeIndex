@@ -395,6 +395,7 @@ impl WorkerRuntime {
         //   2. The `tx` channel is disconnected (main loop exited).
         std::thread::spawn(move || {
             let mut buf_reader = io::BufReader::new(reader);
+            let mut frame_buf: Vec<u8> = Vec::new();
             loop {
                 // Read 4-byte length prefix
                 let mut len_buf = [0u8; 4];
@@ -410,10 +411,11 @@ impl WorkerRuntime {
                             )));
                             break;
                         }
-                        let mut frame_buf = vec![0u8; payload_len];
+                        frame_buf.clear();
+                        frame_buf.resize(payload_len, 0);
                         match buf_reader.read_exact(&mut frame_buf) {
                             Ok(()) => {
-                                if tx.send(Ok(frame_buf)).is_err() {
+                                if tx.send(Ok(frame_buf.clone())).is_err() {
                                     break; // Receiver dropped
                                 }
                             }

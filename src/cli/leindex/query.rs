@@ -449,6 +449,7 @@ fn fuzzy_find_node(
     const ID_MATCH_SCORE: usize = 50;
     const ALIAS_MATCH_SCORE: usize = 25;
     const COMPLEXITY_SCORE_CAP: u32 = 50;
+    const MAX_FALLBACK_SCAN: usize = 10_000;
 
     let query_lower = query.to_lowercase();
 
@@ -501,11 +502,16 @@ fn fuzzy_find_node(
             }
         }
         if alias_candidates.is_empty() {
-            // No trigram hits for any alias — fall back to full scan
+            // No trigram hits for any alias — fall back to full scan (bounded)
+            let mut scanned = 0;
             for node_id in pdg.node_indices() {
+                if scanned >= MAX_FALLBACK_SCAN {
+                    break;
+                }
                 if let Some(node) = pdg.get_node(node_id) {
                     score_node(node_id, node);
                 }
+                scanned += 1;
             }
         } else {
             for &node_idx in &alias_candidates {
@@ -523,10 +529,16 @@ fn fuzzy_find_node(
             }
         }
     } else {
+        // No trigram index — fall back to full scan (bounded)
+        let mut scanned = 0;
         for node_id in pdg.node_indices() {
+            if scanned >= MAX_FALLBACK_SCAN {
+                break;
+            }
             if let Some(node) = pdg.get_node(node_id) {
                 score_node(node_id, node);
             }
+            scanned += 1;
         }
     }
 
