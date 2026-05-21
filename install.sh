@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 1.6.6 - Rust Edition + Dashboard Assets
+# Version: 1.7.0 - Rust Edition + Dashboard Assets
 # Platform: Linux/Unix
 #
 # Installer:

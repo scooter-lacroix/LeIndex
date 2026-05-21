@@ -176,6 +176,7 @@ impl LeIndex {
         // Two-pass approach: first collect node data, then batch neural embeddings.
         let mut updated_nodes: Vec<crate::search::search::NodeInfo> = Vec::new();
         let mut neural_pending: Vec<usize> = Vec::new();
+        let pruner = crate::search::search::ContentPruner::new();
 
         for node_idx in pdg.node_indices() {
             let node = match pdg.get_node(node_idx) {
@@ -229,6 +230,12 @@ impl LeIndex {
                     enrichment, node.name, node.file_path, "// [No source code available]"
                 )
             };
+
+            // Pruning gate: skip low-information / generated nodes (same as index_builder).
+            let pruning_decision = pruner.evaluate(&node.file_path, &node_content, &node.name);
+            if pruning_decision != crate::search::search::PruningDecision::Keep {
+                continue;
+            }
 
             let tokens = index_builder::tokenize_code(&node_content);
 

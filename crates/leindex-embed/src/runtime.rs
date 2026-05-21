@@ -717,7 +717,7 @@ impl WorkerRuntime {
                     let end = start + dim;
                     let row = &mut embeddings_f32[start..end];
                     let norm: f32 = row.iter().map(|v| v * v).sum::<f32>().sqrt();
-                    if norm > 0.0 {
+                    if norm > 1e-10f32 {
                         for v in row.iter_mut() {
                             *v /= norm;
                         }
