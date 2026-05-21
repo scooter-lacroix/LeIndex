@@ -223,7 +223,7 @@ struct WorkerHandle {
     /// The child process.
     child: Child,
     /// Stdin pipe for sending frames to the worker.
-    stdin: std::process::ChildStdin,
+    stdin: Option<std::process::ChildStdin>,
     /// Persistent reader thread that reads IPC responses from the worker's stdout.
     /// Uses a oneshot channel to receive the response data with timeout enforcement.
     read_thread: thread::JoinHandle<()>,
@@ -328,7 +328,7 @@ impl EmbeddingClient {
 
         **guard = Some(WorkerHandle {
             child,
-            stdin,
+            stdin: Some(stdin),
             read_thread,
             read_request_tx,
         });
@@ -364,14 +364,14 @@ impl EmbeddingClient {
                 #[cfg(not(unix))]
                 {
                     // Portable: drop stdin to signal EOF to the child.
-                    drop(std::mem::take(&mut handle.stdin));
+                    drop(handle.stdin.take());
                 }
             }
             if let Some(mut handle) = guard.take() {
                 #[cfg(unix)]
                 {
                     // Close stdin after signalling termination.
-                    drop(handle.stdin);
+                    drop(handle.stdin.take());
 
                     // Wait up to 2 seconds for graceful exit.
                     match handle.child.try_wait() {
@@ -656,7 +656,7 @@ impl EmbeddingClient {
             .map_err(|e| ClientError::Ipc(e.to_string()))?;
         let request_batch_id = frame.header.batch_id;
 
-        if let Err(e) = handle.stdin.write_all(&wire) {
+        if let Err(e) = handle.stdin.as_mut().unwrap().write_all(&wire) {
             drop(guard);
             self.kill_worker();
             return Err(ClientError::Ipc(format!(
@@ -664,7 +664,7 @@ impl EmbeddingClient {
                 e
             )));
         }
-        if let Err(e) = handle.stdin.flush() {
+        if let Err(e) = handle.stdin.as_mut().unwrap().flush() {
             drop(guard);
             self.kill_worker();
             return Err(ClientError::Ipc(format!(
@@ -756,12 +756,12 @@ impl Drop for EmbeddingClient {
                 }
                 #[cfg(not(unix))]
                 {
-                    drop(std::mem::take(&mut handle.stdin));
+                    drop(handle.stdin.take());
                 }
             }
             if let Some(mut handle) = guard.take() {
                 // Close stdin after signalling termination.
-                drop(handle.stdin);
+                drop(handle.stdin.take());
 
                 // Wait briefly for graceful exit before SIGKILL.
                 #[cfg(unix)]
