@@ -1093,7 +1093,7 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
 /// Projects are loaded lazily on first tool call via `ProjectRegistry::get_or_load()`.
 async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     use crate::cli::mcp::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse};
-    use std::io::{self, BufRead, Write};
+    use std::io::{self, BufRead, Read, Write};
 
     info!("Starting LeIndex MCP stdio server (lazy project loading)");
 
@@ -1185,8 +1185,9 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
             if length > MAX_STDIN_PAYLOAD {
                 eprintln!("[ERROR] Payload too large: {} bytes (max: {} bytes)", length, MAX_STDIN_PAYLOAD);
                 // Drain the oversized body to keep stdin framing aligned
-                let mut discard = vec![0u8; length];
-                let _ = io::Read::read_exact(&mut reader, &mut discard);
+                if io::copy(&mut reader.by_ref().take(length as u64), &mut io::sink()).is_err() {
+                    break;
+                }
                 continue;
             }
 

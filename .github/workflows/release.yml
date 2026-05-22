@@ -134,7 +134,7 @@ jobs:
       - name: Build release binaries
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} -p leindex -p leindex-embed --features leindex-embed/onnx
+        run: cargo build --release --target ${{ matrix.target }} -p leindex -p leindex-embed --features leindex/onnx,leindex-embed/onnx
 
       - name: Strip binaries (Linux/macOS)
         if: runner.os != 'Windows'
@@ -172,7 +172,7 @@ jobs:
               # Try to extract from prior release bundle if direct download failed
               if [[ ! -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
                 echo "Direct download failed — trying to extract from release bundle..."
-                BUNDLE=$(gh release download "$TAG" --dir /tmp --pattern "leindex-linux-x86_64.tar.gz" 2>/dev/null && echo "/tmp/leindex-linux-x86_64.tar.gz" || true)
+                BUNDLE=$(gh release download "$TAG" --dir /tmp --pattern "leindex-*-linux-x86_64.tar.gz" 2>/dev/null && ls /tmp/leindex-*-linux-x86_64.tar.gz 2>/dev/null | head -1 || true)
                 if [[ -n "$BUNDLE" && -f "$BUNDLE" ]]; then
                   tar xzf "$BUNDLE" -C /tmp --strip-components=1 --wildcards "leindex-*/models/qwen3-embed-0.6b.onnx" "leindex-*/models/tokenizer.json" 2>/dev/null || true
                   cp /tmp/models/qwen3-embed-0.6b.onnx "$MODELS_DIR/" 2>/dev/null || true
