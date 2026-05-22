@@ -22,9 +22,12 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
         "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Systems languages
         "cs",  // C#
         "rb", "php", "lua", "scala", "sc", // Scripting languages
-        "sh", "bash", // Shell
-        "json", // Data
+        "sh", "bash",  // Shell
+        "json",  // Data
     ];
+
+    // File suffixes that extension() can't match (e.g., ".rs.in" returns "in").
+    let code_suffixes = [".rs.in"];
 
     // Optional focused-file mode (used by MCP when path points to a single file).
     if !options.focus_files.is_empty() {
@@ -46,6 +49,11 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
                 } else if options.include_docs && include_docs_extension(&ext, options.docs_mode) {
                     collected.docs_files.push(candidate.clone());
                 }
+            }
+
+            // Check for multi-dot suffixes that extension() can't match (e.g., .rs.in)
+            if code_suffixes.iter().any(|s| candidate.to_string_lossy().ends_with(s)) {
+                collected.code_files.push(candidate.clone());
             }
 
             if collected.code_files.len() >= options.max_files {
@@ -97,6 +105,14 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
 
             if options.include_docs && include_docs_extension(&ext, options.docs_mode) {
                 collected.docs_files.push(path.to_path_buf());
+            }
+        }
+
+        // Check for multi-dot suffixes that extension() can't match (e.g., .rs.in)
+        if code_suffixes.iter().any(|s| path.to_string_lossy().ends_with(s)) {
+            collected.code_files.push(path.to_path_buf());
+            if collected.code_files.len() >= options.max_files {
+                break;
             }
         }
 

@@ -97,6 +97,8 @@ pub mod leindex;
 pub mod memory;
 /// Memory cap enforcement (RSS monitoring and hard limits).
 pub mod memory_cap;
+/// Lightweight memory report for graceful shutdown.
+pub mod memory_report;
 /// Multi-project registry with per-project concurrency.
 #[cfg(feature = "mcp-server")]
 pub mod registry;

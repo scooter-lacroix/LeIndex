@@ -1,29 +1,26 @@
 // ONNX Runtime-based neural embeddings
 //
-// This module provides true neural embeddings using ONNX Runtime with
-// Qwen3 models for cross-language semantic understanding.
+// This module provides the main-daemon side of the ONNX embedding architecture.
+// Actual ONNX inference is delegated to the leindex-embed worker process.
+// VAL-CPHASE-002: The main crate no longer owns ONNX runtime deps directly.
 
 /// Cross-language semantic chunking for code
 ///
 /// Provides intelligent code chunking that handles language markers,
 /// cross-language references, and semantic boundaries for better
 /// neural embedding generation.
+///
+/// This module does not depend on ONNX Runtime directly — it prepares
+/// text for embedding but does not run inference.
 #[cfg(feature = "onnx")]
 pub mod chunking;
 
-/// Qwen3 embedding provider using ONNX Runtime
+/// Worker client for delegating ONNX inference to the leindex-embed process.
 ///
-/// Implements neural embeddings using the Qwen3-Embedding-0.6B model
-/// for cross-language code understanding and semantic search.
+/// The client manages the worker lifecycle (spawn, reuse, idle teardown)
+/// and communicates using the protocol types from the leindex-embed crate.
 #[cfg(feature = "onnx")]
-pub mod qwen;
-
-/// Qwen3 reranker for quality-aware result refinement
-///
-/// Provides optional reranking of search results using the Qwen3-Reranker-0.6B
-/// model for improved relevance scoring and result ordering.
-#[cfg(feature = "onnx")]
-pub mod reranker;
+pub mod client;
 
 /// Remote embedding providers (OpenAI, Cohere, etc.)
 ///
@@ -34,13 +31,12 @@ pub mod remote;
 
 #[cfg(feature = "onnx")]
 pub use chunking::{ChunkConfig, CrossLanguageChunker, SemanticChunk};
+
 #[cfg(feature = "onnx")]
-pub use qwen::{QwenEmbeddingProvider, QwenEmbeddingProviderError};
-#[cfg(feature = "onnx")]
-pub use reranker::{QwenReranker, QwenRerankerError};
+pub use client::{ClientError, EmbedResult, EmbeddingClient};
 
 #[cfg(feature = "remote-embeddings")]
 pub use remote::{
-    CohereEmbeddingProvider, GenericRemoteProvider, OpenAIEmbeddingProvider,
-    RemoteEmbeddingConfig, RemoteEmbeddingError, RemoteProvider,
+    CohereEmbeddingProvider, GenericRemoteProvider, OpenAIEmbeddingProvider, RemoteEmbeddingConfig,
+    RemoteEmbeddingError, RemoteProvider,
 };

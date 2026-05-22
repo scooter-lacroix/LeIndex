@@ -4,7 +4,7 @@
  * LeIndex MCP - Main Entry Point
  * 
  * This package provides LeIndex MCP server functionality through npm.
- * The binary is automatically downloaded during installation.
+ * The binary bundle (main + worker + models) is automatically downloaded during installation.
  */
 
 const { execFileSync, spawn } = require('child_process');
@@ -12,8 +12,11 @@ const path = require('path');
 const fs = require('fs');
 
 const BIN_DIR = path.join(__dirname, 'bin');
+const MODELS_DIR = path.join(__dirname, 'models');
 const binaryName = process.platform === 'win32' ? 'leindex.exe' : 'leindex';
+const workerBinaryName = process.platform === 'win32' ? 'leindex-embed.exe' : 'leindex-embed';
 const binaryPath = path.join(BIN_DIR, binaryName);
+const workerBinaryPath = path.join(BIN_DIR, workerBinaryName);
 
 /**
  * Get the path to the LeIndex binary
@@ -24,6 +27,28 @@ function getBinaryPath() {
     throw new Error('LeIndex binary not found. Run: npm install');
   }
   return binaryPath;
+}
+
+/**
+ * Get the path to the LeIndex ONNX worker binary
+ * @returns {string|null} Path to the worker binary, or null if not installed
+ */
+function getWorkerBinaryPath() {
+  if (fs.existsSync(workerBinaryPath)) {
+    return workerBinaryPath;
+  }
+  return null;
+}
+
+/**
+ * Get the path to bundled model assets
+ * @returns {string|null} Path to the models directory, or null if not present
+ */
+function getModelsPath() {
+  if (fs.existsSync(MODELS_DIR)) {
+    return MODELS_DIR;
+  }
+  return null;
 }
 
 /**
@@ -43,8 +68,15 @@ function exec(args = []) {
 function startMcpServer() {
   const bin = getBinaryPath();
   
+  const env = Object.assign({}, process.env);
+  const modelsPath = getModelsPath();
+  if (modelsPath && !env.LEINDEX_MODEL_PATH) {
+    env.LEINDEX_MODEL_PATH = modelsPath;
+  }
+  
   return spawn(bin, ['mcp', '--stdio'], {
-    stdio: ['pipe', 'pipe', 'pipe']
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: env
   });
 }
 
@@ -58,6 +90,8 @@ function getVersion() {
 
 module.exports = {
   getBinaryPath,
+  getWorkerBinaryPath,
+  getModelsPath,
   exec,
   startMcpServer,
   getVersion
@@ -68,5 +102,13 @@ if (require.main === module) {
   console.log('LeIndex MCP Package');
   console.log('Version:', getVersion());
   console.log('Binary:', getBinaryPath());
+  const workerPath = getWorkerBinaryPath();
+  if (workerPath) {
+    console.log('Worker:', workerPath);
+  }
+  const models = getModelsPath();
+  if (models) {
+    console.log('Models:', models);
+  }
   console.log('\nUse "npx @leindex/mcp" in your MCP configuration.');
 }

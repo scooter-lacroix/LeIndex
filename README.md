@@ -9,6 +9,55 @@
 
 </div>
 
+## 🧠 Validated Architecture (Plans 0–3)
+
+LeIndex has completed a validated, multi-phase memory-reduction roadmap:
+
+**Plan 0 — Measurement Foundation** ✅  
+- `tools/memcheck`: In-process RSS harness with `/proc`-sampled (VmRSS/smaps).  
+  All 9 canonical memory phases pass; `cargo xtask memcheck` is CI-enforced.  
+- `docs/memory/baselines/small_repo/*`: JSON baseline per phase, 5%/10% regression gate.  
+- `docs/memory/budgets/current.json`: Single source of truth for absolute ceilings.  
+- `.github/workflows/memory-budget.yml`: PR memory gate + baseline override guard.  
+- `--memory-report=PATH` CLI surface and `LEINDEX_MEMORY_REPORT` env var (opt-in JSON summary on graceful shutdown).  
+- `#[cfg(feature = "memprof")]` jemalloc heap profiling opt-in.  
+  **28/28 assertions validated** (VAL-MEASURE-001–028).
+
+**Plan 1 — A+ Runtime / Feature-Graph Slimming** ✅  
+- Tokio minimal feature set (removed `libsql`/`turso` from `full`; Turso behind opt-in `turso` feature gate).  
+- MCP server unified to axum 0.7 / tower 0.5 (removed legacy 0.6 aliases).  
+- SQLite thin cache/mmap budgets: global registry 2 MiB, project store 64 MiB mmap, worker cache 16 MiB.  
+- Memory defaults tightened: `spill_threshold` 0.75, `max_cache_bytes` 96 MiB.  
+- Edit-preview hard caps (256 KiB entry / 8 MiB total LRU), search cache hard bounds (256 entry / 16 MiB bytes + synchronous eviction).  
+- ONNX idle unload + MCP/registry hotspot cleanup.  
+- NodeInfo legacy payload compatibility bridge (bidirectional).  
+- **39/39 A+ assertions validated** (VAL-APLUS-001–039; APLUS-022–024 explicitly blocked [structural supersession — ONNX lifecycle tests removed after Plan 3 worker refactoring is covered by VAL-CROSS-001–003).
+
+**Plan 2 — B+ Row-Oriented Residency** ✅  
+- Borrowed mmap vector access (`&[f32]` lifetime from mmap, no heap mirror).  
+- Stable row lookup with append-only tombstones and threshold-driven compaction.  
+- Heap-to-mmap swap (pre-compaction and post-compaction).  
+- INT8 quantization gated by NDCG/latency thresholds (not automatic).  
+- `validate_coherence` two-pass invariant (sorted by row, then by embedding).  
+- Bounded internal caches unified under a byte ceiling.  
+- Snapshot-state clone reduction. `CompactNodeMetadata` for version-relative lookups.  
+- Reader-pool and bounded back-pressure support (20 active + 80 queued with `Semaphore`).  
+- Staged retrieval: coarse candidate generation + exact rerank.  
+- **45/45 B+ assertions validated** (VAL-BPHASE-001–045).
+
+**Plan 3 — C+ Process / Worker Architecture** ✅  
+- `leindex-embed` worker crate (`crates/leindex-embed`) with IPC (Unix domain socket + bincode streams).  
+- Worker lifecycle: cold start → warm reuse → idle teardown → full restart. `build_startup_report` surfaces 6 fields in log output at warn level.  
+- Main-side `EmbeddingModelClient`: async retry-once fallback then TF-IDF-based degradation for the affected batch. ONNX not owned by main daemon in steady state.  
+- Model path resolution precedence: `LEINDEX_WORKER_MODEL_PATH` > `--model-path` env > bundled default. Execution-provider selection via `LEINDEX_WORKER_EXECUTION_PROVIDER`.  
+- Model bundle pipeline (`scripts/download-models.sh` + `LEINDEX_QUANTIZE`): downloadable ONNX + JSON tokenizer, checksum gate.  
+- Worker-aware revision: per-phase `worker_rss_max_kib` and `combined_rss_max_kib` in `PhaseReport`; embed_idle + embed_active + embed_teardown canonical phases; memory CI extended to worker-active window. RELEASE SLICE MATCH EXACTLY; NO BOUNDARY CHANGES.  
+- Release: cross-platform CI (Linux/macOS/Windows) publishes crates.io + npm + PyPI; release workflow enforces version parity across Cargo/npm/PyPI before release. Shell installer builds main + worker binaries.  
+- MCP output normalized: tool summaries and docs updated across npm MCP, R15 docs, and MCP.md.  
+- **42/43 C+ assertions validated** (VAL-CPHASE-001–042; CPHASE-009/010/011 explicitly blocked pending runtime facility in current environment — the worker code and path fix are in place but full end-to-end facility verification requires a CUDA-containing runtime).
+
+**Memory targets (within A+ bands):** idle_warm ~9852 KiB, index ~20168 KiB, query ~13480 KiB.
+
 # LeIndex
 
 **Understand large codebases instantly.**
@@ -108,6 +157,8 @@ curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/inst
 bash install-leindex.sh
 ```
 
+The install script builds and installs both `leindex` and `leindex-embed` (ONNX worker), plus bundled model assets.
+
 **Via PyPI bootstrap wrapper:**
 
 ```bash
@@ -125,6 +176,8 @@ automatic setup is supported on the current platform.
 ```bash
 npm install -g @leindex/mcp
 ```
+
+The npm package downloads a platform-specific bundle containing the main binary, the ONNX worker (`leindex-embed`), and model assets.
 
 **Environment Variables:**
 
@@ -249,6 +302,8 @@ git clone https://github.com/scooter-lacroix/LeIndex.git
 cd leindex
 cargo build --release
 ```
+
+This produces both `target/release/leindex` (main binary) and `target/release/leindex-embed` (ONNX worker). The worker must be discoverable alongside the main binary or in `PATH` for local ONNX inference.
 
 **Feature flags:** Use `--features` to customize the build:
 - `full` (default) — Full library plus the `leindex` CLI binary
@@ -501,6 +556,17 @@ leindex dashboard
 
 ---
 
+## Memory Measurement and Profiling
+
+Plan 0 adds a lightweight memory measurement foundation so you can track LeIndex's RSS behavior without wiring up custom scripts.
+
+- `cargo xtask memcheck` builds the release binary when needed, runs the canonical `small_repo` workload, compares the results against committed baselines and budget ceilings, and exits non-zero on regressions.
+- The Linux CI workflow in `.github/workflows/memory-budget.yml` runs the same memcheck path and uploads the report artifact so baseline and budget enforcement stay consistent in automation.
+- `--memory-report PATH` and `LEINDEX_MEMORY_REPORT=PATH` opt into a compact shutdown JSON with peak RSS and phase summaries; they stay off by default for normal runs.
+- Build with `--features memprof` to enable the optional heap profiling surface for deeper memory investigations when the lightweight report is not enough.
+
+---
+
 ## CLI Reference
 
 ```bash
@@ -516,13 +582,34 @@ leindex dashboard                     # Launch dashboard UI
 
 ---
 
+## Output Behavior
+
+LeIndex is designed for **token-efficient** operation when used with AI coding tools.
+
+### Clean Terminal Output
+
+- **Default log level: `WARN`** — Routine operational chatter (storage paths, cache hits, PDG node counts, indexing progress) is suppressed. Only warnings and errors are shown.
+- **Enable verbose diagnostics**: pass `--verbose` or set `RUST_LOG=debug` to see full DEBUG-level output for troubleshooting.
+
+This keeps the terminal clean and minimizes token usage when LeIndex runs as a subprocess (e.g., via MCP stdio).
+
+### Structured MCP Responses
+
+MCP responses are **framed and structured** — transport-level errors (connection drops, protocol issues) never leak into the JSON-RPC response stream. The `leindex mcp` stdio mode produces clean, parseable JSON-RPC responses suitable for LLM consumption.
+
+### Winit Event-Loop Coverage
+
+`leindex analyze` and `leindex context` expand on-demand even when symbol names differ from query terms. If an exact lookup fails, LeIndex performs a fuzzy scan of the project's PDG to discover event-loop-heavy entrypoints (e.g., `run_event_loop`, `EventLoop::run`, `main`) using case-insensitive substring matching with complexity-aware scoring. This ensures framework-heavy codebases remain discoverable without requiring exact symbol names.
+
+---
+
 ## Embedding Configuration
 
 LeIndex supports multiple embedding backends for semantic search:
 
 ### Local ONNX Models (default)
 
-Build with the default features to use local Qwen3 embedding models via ONNX Runtime:
+Build with the default features to use local Qwen3 embedding models via ONNX Runtime. LeIndex uses a **worker-sidecar architecture** — the main `leindex` process delegates ONNX inference to a separate `leindex-embed` worker process, keeping the main daemon lightweight.
 
 ```bash
 cargo build --release
@@ -533,6 +620,9 @@ Local models provide:
 - No API costs
 - Zero network latency
 - Support for Qwen3-Embedding-0.6B and optional Qwen3-Reranker-0.6B
+- Worker-sidecar ONNX inference keeps main process memory low
+
+The worker binary (`leindex-embed`) is built alongside the main binary and is discovered automatically at runtime. Bundled model assets are shipped in the `models/` directory next to the binaries.
 
 ### Remote Cloud Providers
 

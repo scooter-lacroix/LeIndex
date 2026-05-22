@@ -458,6 +458,20 @@ impl LeIndex {
         Ok(())
     }
 
+    /// Ensure the searchable context is ready for deep analysis / context tools.
+    ///
+    /// This loads the PDG if needed and performs a focused refresh when the
+    /// in-memory search index is empty but indexed files already exist.
+    pub fn ensure_analysis_context_loaded(&mut self) -> Result<()> {
+        self.ensure_pdg_loaded()?;
+        if self.search_engine.is_empty()
+            && crate::storage::pdg_store::has_indexed_files(&self.storage, &self.project_id)
+        {
+            self.load_from_storage()?;
+        }
+        Ok(())
+    }
+
     /// Get the current indexing statistics.
     #[inline]
     pub fn get_stats(&self) -> &IndexStats {

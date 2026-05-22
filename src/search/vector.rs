@@ -437,13 +437,17 @@ impl MmapEmbeddingIndex {
 
         // Verify offset and length tables fit in file before accessing
         // Use checked arithmetic to prevent overflow on malicious node_count
-        let offsets_table_size = n.checked_mul(8)
+        let offsets_table_size = n
+            .checked_mul(8)
             .ok_or_else(|| MmapError::Corrupt("offset table size overflow".to_string()))?;
-        let lengths_table_size = n.checked_mul(4)
+        let lengths_table_size = n
+            .checked_mul(4)
             .ok_or_else(|| MmapError::Corrupt("length table size overflow".to_string()))?;
-        let offsets_end_checked = offsets_start.checked_add(offsets_table_size)
+        let offsets_end_checked = offsets_start
+            .checked_add(offsets_table_size)
             .ok_or_else(|| MmapError::Corrupt("offset table end overflow".to_string()))?;
-        let lengths_end_checked = lengths_start.checked_add(lengths_table_size)
+        let lengths_end_checked = lengths_start
+            .checked_add(lengths_table_size)
             .ok_or_else(|| MmapError::Corrupt("length table end overflow".to_string()))?;
 
         if offsets_end_checked > mmap.len() {
@@ -460,45 +464,55 @@ impl MmapEmbeddingIndex {
                 mmap.len()
             )));
         }
-        
+
         let ids_section_end = {
             let mut max_end: usize = ids_section_offset;
             for i in 0..n {
                 // Use checked arithmetic for slice indices to prevent overflow
-                let offset_idx_start = offsets_start.checked_add(i.checked_mul(8).ok_or_else(|| MmapError::Corrupt("offset index overflow".to_string()))?)
-                    .ok_or_else(|| MmapError::Corrupt("offset start overflow".to_string()))?;
-                let offset_idx_end = offset_idx_start.checked_add(8)
+                let offset_idx_start =
+                    offsets_start
+                        .checked_add(i.checked_mul(8).ok_or_else(|| {
+                            MmapError::Corrupt("offset index overflow".to_string())
+                        })?)
+                        .ok_or_else(|| MmapError::Corrupt("offset start overflow".to_string()))?;
+                let offset_idx_end = offset_idx_start
+                    .checked_add(8)
                     .ok_or_else(|| MmapError::Corrupt("offset end overflow".to_string()))?;
-                let len_idx_start = lengths_start.checked_add(i.checked_mul(4).ok_or_else(|| MmapError::Corrupt("length index overflow".to_string()))?)
-                    .ok_or_else(|| MmapError::Corrupt("length start overflow".to_string()))?;
-                let len_idx_end = len_idx_start.checked_add(4)
+                let len_idx_start =
+                    lengths_start
+                        .checked_add(i.checked_mul(4).ok_or_else(|| {
+                            MmapError::Corrupt("length index overflow".to_string())
+                        })?)
+                        .ok_or_else(|| MmapError::Corrupt("length start overflow".to_string()))?;
+                let len_idx_end = len_idx_start
+                    .checked_add(4)
                     .ok_or_else(|| MmapError::Corrupt("length end overflow".to_string()))?;
 
                 if offset_idx_end > mmap.len() {
                     return Err(MmapError::Corrupt(format!(
                         "offset slice exceeds file size: [{}, {}], file size {}",
-                        offset_idx_start, offset_idx_end, mmap.len()
+                        offset_idx_start,
+                        offset_idx_end,
+                        mmap.len()
                     )));
                 }
                 if len_idx_end > mmap.len() {
                     return Err(MmapError::Corrupt(format!(
                         "length slice exceeds file size: [{}, {}], file size {}",
-                        len_idx_start, len_idx_end, mmap.len()
+                        len_idx_start,
+                        len_idx_end,
+                        mmap.len()
                     )));
                 }
 
-                let off = u64::from_le_bytes(
-                    mmap[offset_idx_start..offset_idx_end]
-                        .try_into()
-                        .unwrap(),
-                ) as usize;
-                let len = u32::from_le_bytes(
-                    mmap[len_idx_start..len_idx_end]
-                        .try_into()
-                        .unwrap(),
-                ) as usize;
+                let off =
+                    u64::from_le_bytes(mmap[offset_idx_start..offset_idx_end].try_into().unwrap())
+                        as usize;
+                let len = u32::from_le_bytes(mmap[len_idx_start..len_idx_end].try_into().unwrap())
+                    as usize;
                 // Use checked addition for ID section end calculation to prevent overflow
-                let section_end = ids_section_offset.checked_add(off)
+                let section_end = ids_section_offset
+                    .checked_add(off)
                     .and_then(|v| v.checked_add(len))
                     .ok_or_else(|| MmapError::Corrupt("ID section end overflow".to_string()))?;
                 max_end = max_end.max(section_end);
@@ -509,7 +523,8 @@ impl MmapEmbeddingIndex {
         // Pad to 4-byte alignment for the embedding matrix
         let embedding_matrix_offset = ids_section_end
             .checked_add(3)
-            .ok_or_else(|| MmapError::Corrupt("embedding matrix offset overflow".to_string()))? & !3;
+            .ok_or_else(|| MmapError::Corrupt("embedding matrix offset overflow".to_string()))?
+            & !3;
 
         // Validate total file size
         let embedding_matrix_size = (dimension as usize)
@@ -545,13 +560,82 @@ impl MmapEmbeddingIndex {
         Some(self.read_embedding(idx))
     }
 
+    // ----------------------------------------------------------------
+    // B-phase row-oriented access (Plan 2)
+    // ----------------------------------------------------------------
+
+    /// Return a borrowed slice of the embedding at the given row index.
+    ///
+    /// This is the primary read path for mmap-backed vector access. It returns
+    /// a zero-copy `&[f32]` into the memory-mapped file, avoiding heap
+    /// allocation entirely.
+    ///
+    /// Returns `None` if the row index is out of range.
+    ///
+    /// # Stability
+    ///
+    /// The returned slice remains valid for the lifetime of this
+    /// `MmapEmbeddingIndex`. Row indexes are stable for the lifetime of the
+    /// mmap file unless explicit compaction occurs.
+    pub fn embedding_slice_by_index(&self, idx: u32) -> Option<&[f32]> {
+        let idx = idx as usize;
+        if idx >= self.node_count as usize {
+            return None;
+        }
+        let dim = self.dimension as usize;
+        let byte_offset = self.embedding_matrix_offset + idx * dim * 4;
+        let end = byte_offset + dim * 4;
+        if end > self.mmap.len() {
+            return None;
+        }
+        // Safety: the mmap bytes are aligned and we validated bounds above.
+        // f32 is 4 bytes and the embedding matrix is 4-byte aligned, so
+        // we can safely reinterpret the byte slice as &[f32].
+        let ptr = self.mmap[byte_offset..end].as_ptr() as *const f32;
+        // Verify alignment (embedding_matrix_offset is 4-byte aligned by construction)
+        assert!(
+            (ptr as usize) % std::mem::align_of::<f32>() == 0,
+            "embedding matrix not aligned for f32 access"
+        );
+        Some(unsafe { std::slice::from_raw_parts(ptr, dim) })
+    }
+
+    /// Look up the row index for a given node ID.
+    ///
+    /// Returns `Some(row_index)` if the node exists, `None` otherwise.
+    /// The returned row index is stable for the lifetime of the mmap file
+    /// unless explicit compaction occurs.
+    ///
+    /// This performs a linear scan over the ID table (O(n)). For hot paths,
+    /// callers should cache the result rather than looking up repeatedly.
+    pub fn find_node_row(&self, node_id: &str) -> Option<u32> {
+        // Delegate to the internal helper and convert to u32 row index.
+        self.find_node_index(node_id).map(|idx| idx as u32)
+    }
+
+    /// Return an owned copy of the embedding at the given row index.
+    ///
+    /// This is a compatibility shim that allocates a `Vec<f32>`. Prefer
+    /// [`Self::embedding_slice_by_index`] for the hot path to avoid
+    /// allocation.
+    ///
+    /// Returns `None` if the row index is out of range.
+    pub fn get_embedding_by_row(&self, idx: u32) -> Option<Vec<f32>> {
+        let idx = idx as usize;
+        if idx >= self.node_count as usize {
+            return None;
+        }
+        Some(self.read_embedding(idx))
+    }
+
     /// Search for the top-K most similar vectors by cosine similarity.
+    ///
+    /// Uses borrowed mmap slices for scoring, avoiding per-row heap allocation.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
         if self.node_count == 0 || query.len() != self.dimension as usize {
             return Vec::new();
         }
 
-        let _dim = self.dimension as usize;
         let query_norm: f32 = query.iter().map(|v| v * v).sum::<f32>().sqrt();
         if query_norm < 1e-9 {
             return Vec::new();
@@ -560,7 +644,8 @@ impl MmapEmbeddingIndex {
         let mut results: Vec<(String, f32)> = (0..self.node_count as usize)
             .filter_map(|i| {
                 let id = self.read_node_id(i)?;
-                let embedding = self.read_embedding(i);
+                // Use borrowed slice path — no heap allocation per row.
+                let embedding = self.embedding_slice_by_index(i as u32)?;
                 let dot: f32 = query.iter().zip(embedding.iter()).map(|(a, b)| a * b).sum();
                 let emb_norm: f32 = embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
                 if emb_norm < 1e-9 {

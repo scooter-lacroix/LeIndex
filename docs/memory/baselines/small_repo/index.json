@@ -1,0 +1,12 @@
+{
+  "phase": "index",
+  "rss_min_kib": 24,
+  "rss_max_kib": 25600,
+  "rss_p95_kib": 24000,
+  "mapped_file_kib": 11940,
+  "anon_kib": 8500,
+  "sample_count": 9,
+  "duration_ms": 78,
+  "worker_rss_max_kib": 0,
+  "combined_rss_max_kib": 24000
+}

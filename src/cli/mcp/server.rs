@@ -7,29 +7,30 @@ use super::handlers::{all_tool_handlers, ToolHandler};
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use crate::cli::registry::ProjectRegistry;
 use anyhow::Context;
-use axum_06::{
-    http::StatusCode,
+use axum::{
+    extract::Json,
+    http::{HeaderMap, HeaderValue, StatusCode},
     response::{
-        sse::{Event, Sse},
-        IntoResponse, Json, Response,
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
     },
     routing::{get, post},
-    Router, Server,
+    Router,
 };
 use futures_util::stream::{Stream, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Global server state — multi-project registry.
 ///
@@ -91,7 +92,7 @@ pub struct McpServer {
     pub(crate) handshake_complete: Arc<AtomicBool>,
     /// Per-session handshake state for HTTP and stdio transports (session ID → (handshaked, last_access_time)).
     /// Keyed by the `Mcp-Session-Id` header value for HTTP, and generated session ID for stdio.
-    pub(crate) session_handshakes: Arc<Mutex<HashMap<String, (bool, Instant)>>>,
+    pub(crate) session_handshakes: Arc<DashMap<String, (bool, Instant)>>,
 }
 
 impl McpServer {
@@ -131,7 +132,7 @@ impl McpServer {
             config,
             _registry: registry,
             handshake_complete: Arc::new(AtomicBool::new(false)),
-            session_handshakes: Arc::new(Mutex::new(HashMap::new())),
+            session_handshakes: Arc::new(DashMap::new()),
         };
 
         SERVER_INSTANCE
@@ -158,10 +159,27 @@ impl McpServer {
         Self::new(config)
     }
 
+    /// Clean up stale sessions that have not been accessed within the timeout.
+    ///
+    /// A+ hotspot cleanup: prevents session-tracking state from growing
+    /// monotonically across long-lived server sessions (VAL-APLUS-025).
+    pub fn cleanup_stale_sessions(&self, max_idle: std::time::Duration) -> usize {
+        let before = self.session_handshakes.len();
+        self.session_handshakes.retain(|_, (_, last_access)| last_access.elapsed() < max_idle);
+        before - self.session_handshakes.len()
+    }
+
+    /// Get the number of active sessions (for diagnostics and testing).
+    pub fn active_session_count(&self) -> usize {
+        self.session_handshakes.len()
+    }
+
     /// Run the MCP server
     ///
     /// Starts the axum HTTP server and handles incoming requests.
-    /// This function will block until the server is shut down.
+    /// A background task runs `cleanup_stale_sessions` every 60 seconds
+    /// to prevent session-tracking state from growing monotonically
+    /// (VAL-APLUS-025).
     ///
     /// # Returns
     ///
@@ -171,17 +189,44 @@ impl McpServer {
     ///
     /// ```ignore
     /// let config = McpServerConfig::default();
-    /// let server = McpServer::new(config, leindex)?;
+    /// let server = McpServer::new(config)?;
     /// server.run().await?;
     /// ```
     pub async fn run(self) -> anyhow::Result<()> {
         let bind_address = self.config.bind_address;
         let router = Self::router();
 
+        // Spawn background task to clean up stale sessions periodically.
+        // Uses 60-second interval and 5-minute idle threshold.
+        // The task body is wrapped to catch panics so the cleanup loop
+        // doesn't die silently (Fix 6).
+        let cleanup_server = self.clone();
+        let _cleanup_handle = tokio::spawn(async move {
+            const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+            const SESSION_MAX_IDLE: std::time::Duration = std::time::Duration::from_secs(300); // 5 minutes
+            let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+            loop {
+                interval.tick().await;
+                let removed = cleanup_server.cleanup_stale_sessions(SESSION_MAX_IDLE);
+                if removed > 0 {
+                    debug!("Cleaned up {} stale session(s)", removed);
+                }
+            }
+        });
+        // Detach with error logging: if the cleanup task panics or errors,
+        // log it rather than dying silently.
+        tokio::spawn(async move {
+            if let Err(e) = _cleanup_handle.await {
+                error!("cleanup task died: {e}");
+            }
+        });
+
         info!("Starting MCP server on {}", bind_address);
 
-        Server::bind(&bind_address)
-            .serve(router.into_make_service())
+        let listener = tokio::net::TcpListener::bind(bind_address)
+            .await
+            .context("Failed to bind TCP listener")?;
+        axum::serve(listener, router.into_make_service())
             .await
             .context("Server error")?;
 
@@ -286,7 +331,7 @@ pub async fn index_stream_handler(
     });
 
     Sse::new(stream).keep_alive(
-        axum_06::response::sse::KeepAlive::new()
+        KeepAlive::new()
             .interval(std::time::Duration::from_secs(15))
             .text("keep-alive"),
     )
@@ -369,17 +414,16 @@ fn handle_initialize(server: &McpServer) -> (Value, Option<String>) {
 
     // Store in per-session map with eviction logic
     {
-        let mut sessions = server.session_handshakes.lock().unwrap();
         // Evict oldest sessions if we exceed a reasonable limit (1000 sessions)
         const MAX_HTTP_SESSIONS: usize = 1000;
-        if sessions.len() >= MAX_HTTP_SESSIONS {
+        if server.session_handshakes.len() >= MAX_HTTP_SESSIONS {
             // Find and remove the oldest session (by last_access_time)
-            if let Some((oldest_id, _)) = sessions.iter().min_by_key(|&(_, (_, time))| time) {
-                let oldest_id = oldest_id.to_string();
-                sessions.remove(&oldest_id);
+            let oldest_id = server.session_handshakes.iter().min_by_key(|r| r.value().1).map(|r| r.key().to_string());
+            if let Some(id) = oldest_id {
+                server.session_handshakes.remove(&id);
             }
         }
-        sessions.insert(session_id.clone(), (true, Instant::now()));
+        server.session_handshakes.insert(session_id.clone(), (true, Instant::now()));
     }
 
     let result = serde_json::json!({
@@ -420,7 +464,7 @@ fn handle_ping() -> Value {
 }
 
 /// JSON-RPC request handler
-async fn json_rpc_handler(headers: axum_06::http::HeaderMap, Json(body): Json<Value>) -> Response {
+async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Response {
     // Extract Mcp-Session-Id header (if present)
     let incoming_session_id = headers
         .get("Mcp-Session-Id")
@@ -502,11 +546,10 @@ async fn json_rpc_handler(headers: axum_06::http::HeaderMap, Json(body): Json<Va
         // Non-initialize: validate session ID exists and is handshaked
         let session_ok = match &incoming_session_id {
             Some(sid) => {
-                let mut sessions = server_instance.session_handshakes.lock().unwrap();
-                if let Some((handshaked, last_access)) = sessions.get_mut(sid) {
+                if let Some(mut entry) = server_instance.session_handshakes.get_mut(sid) {
                     // Update last access time
-                    *last_access = Instant::now();
-                    *handshaked
+                    entry.1 = Instant::now();
+                    entry.0
                 } else {
                     false
                 }
@@ -535,8 +578,8 @@ async fn json_rpc_handler(headers: axum_06::http::HeaderMap, Json(body): Json<Va
             // Attach Mcp-Session-Id response header
             if let Some(sid) = session_id {
                 let mut response = body;
-                let sid_header = axum_06::http::HeaderValue::from_str(&sid)
-                    .unwrap_or_else(|_| axum_06::http::HeaderValue::from_static("unknown"));
+                let sid_header = HeaderValue::from_str(&sid)
+                    .unwrap_or_else(|_| HeaderValue::from_static("unknown"));
                 response.headers_mut().insert("Mcp-Session-Id", sid_header);
                 return response;
             }
@@ -683,15 +726,14 @@ pub fn handle_resource_read(req: &JsonRpcRequest) -> Result<Value, JsonRpcError>
 /// Public discovery endpoint — no handshake required.
 /// If a `Mcp-Session-Id` header is present, it is validated but
 /// the endpoint still functions without one.
-async fn list_tools_handler(headers: axum_06::http::HeaderMap) -> Json<Value> {
+async fn list_tools_handler(headers: HeaderMap) -> Json<Value> {
     // Validate session ID if present, but don't require one
     if let Some(sid) = headers.get("Mcp-Session-Id").and_then(|v| v.to_str().ok()) {
         if let Some(server) = SERVER_INSTANCE.get() {
-            let mut sessions = server.session_handshakes.lock().unwrap();
-            if let Some((handshaked, last_access)) = sessions.get_mut(sid) {
+            if let Some(mut entry) = server.session_handshakes.get_mut(sid) {
                 // Update last access time
-                *last_access = Instant::now();
-                if !*handshaked {
+                entry.1 = Instant::now();
+                if !entry.0 {
                     return Json(serde_json::json!({
                         "error": "Invalid session. Call 'initialize' first."
                     }));
@@ -793,10 +835,7 @@ impl McpServer {
                 .context("Failed to accept connection")?;
 
             let session_id = generate_session_id();
-            {
-                let mut sessions = self.session_handshakes.lock().unwrap();
-                sessions.insert(session_id.clone(), (false, Instant::now()));
-            }
+            self.session_handshakes.insert(session_id.clone(), (false, Instant::now()));
 
             let session_id_clone = session_id.clone();
             let session_handshakes = self.session_handshakes.clone();
@@ -822,7 +861,11 @@ impl McpServer {
                         Ok(0) => break, // EOF
                         Ok(_) => {
                             if line.len() > MAX_LINE_LENGTH {
-                                debug!("Line too long (session {}): {} bytes", session_id_clone, line.len());
+                                debug!(
+                                    "Line too long (session {}): {} bytes",
+                                    session_id_clone,
+                                    line.len()
+                                );
                                 break;
                             }
                         }
@@ -852,7 +895,10 @@ impl McpServer {
 
                         // Reject excessively large payloads to prevent OOM
                         if length > MAX_PAYLOAD_SIZE {
-                            debug!("Payload too large (session {}): {} bytes", session_id_clone, length);
+                            debug!(
+                                "Payload too large (session {}): {} bytes",
+                                session_id_clone, length
+                            );
                             break;
                         }
 
@@ -863,7 +909,11 @@ impl McpServer {
                                 Ok(0) => break,
                                 Ok(_) => {
                                     if header.len() > MAX_LINE_LENGTH {
-                                        debug!("Header line too long (session {}): {} bytes", session_id_clone, header.len());
+                                        debug!(
+                                            "Header line too long (session {}): {} bytes",
+                                            session_id_clone,
+                                            header.len()
+                                        );
                                         break;
                                     }
                                     if header.trim().is_empty() {
@@ -919,10 +969,7 @@ impl McpServer {
                 }
 
                 // Clean up session on disconnect
-                {
-                    let mut sessions = session_handshakes.lock().unwrap();
-                    sessions.remove(&session_id_clone);
-                }
+                session_handshakes.remove(&session_id_clone);
 
                 debug!("Socket connection closed (session: {})", session_id_clone);
             });
@@ -942,7 +989,7 @@ impl McpServer {
 async fn handle_socket_message(
     json_payload: &str,
     session_id: &str,
-    session_handshakes: &Arc<Mutex<HashMap<String, (bool, Instant)>>>,
+    session_handshakes: &Arc<DashMap<String, (bool, Instant)>>,
     handshake_complete: &Arc<AtomicBool>,
 ) -> Option<String> {
     use super::protocol::{JsonRpcMessage, JsonRpcResponse};
@@ -995,18 +1042,21 @@ async fn handle_socket_message(
 
             // Check handshake state for this session (allow initialize and ping before handshake)
             if method_name != "initialize" && method_name != "ping" {
-                let mut sessions = session_handshakes.lock().unwrap();
-                let handshaked = if let Some((handshaked, last_access)) = sessions.get_mut(session_id) {
-                    // Update last access time to prevent eviction
-                    *last_access = Instant::now();
-                    *handshaked
-                } else {
-                    false
-                };
+                let handshaked =
+                    if let Some(mut entry) = session_handshakes.get_mut(session_id) {
+                        // Update last access time to prevent eviction
+                        entry.1 = Instant::now();
+                        entry.0
+                    } else {
+                        false
+                    };
                 if !handshaked {
                     let resp = JsonRpcResponse::error(
                         request_id,
-                        super::protocol::JsonRpcError::new(-32600, "Server not initialized. Call 'initialize' first."),
+                        super::protocol::JsonRpcError::new(
+                            -32600,
+                            "Server not initialized. Call 'initialize' first.",
+                        ),
                     );
                     return serde_json::to_string(&resp).ok();
                 }
@@ -1016,10 +1066,7 @@ async fn handle_socket_message(
                 "initialize" => {
                     // Mark session as handshaked
                     handshake_complete.store(true, Ordering::SeqCst);
-                    {
-                        let mut sessions = session_handshakes.lock().unwrap();
-                        sessions.insert(session_id.to_string(), (true, Instant::now()));
-                    }
+                    session_handshakes.insert(session_id.to_string(), (true, Instant::now()));
 
                     let result = serde_json::json!({
                         "protocolVersion": "2024-11-05",
@@ -1101,6 +1148,104 @@ mod tests {
         assert!(!socket_path.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- A+ MCP session cleanup tests (VAL-APLUS-025, VAL-APLUS-026) ----
+
+    /// VAL-APLUS-025: MCP session handshake handling preserves behavior under
+    /// concurrent sessions. Multiple sessions can be initialized and tracked
+    /// independently without corrupting each other.
+    #[test]
+    fn test_concurrent_session_handshake_isolation() {
+        let registry = Arc::new(ProjectRegistry::new(5));
+        let server = McpServer {
+            config: McpServerConfig::default(),
+            _registry: registry,
+            handshake_complete: Arc::new(AtomicBool::new(false)),
+            session_handshakes: Arc::new(DashMap::new()),
+        };
+
+        // Simulate multiple concurrent session handshakes
+        let (result1, sid1) = handle_initialize_for_test(&server);
+        let (result2, sid2) = handle_initialize_for_test(&server);
+        let (result3, sid3) = handle_initialize_for_test(&server);
+
+        // All should succeed with unique session IDs
+        assert!(result1.get("protocolVersion").is_some());
+        assert!(result2.get("protocolVersion").is_some());
+        assert!(result3.get("protocolVersion").is_some());
+
+        // Session IDs must be unique
+        assert_ne!(sid1, sid2);
+        assert_ne!(sid2, sid3);
+        assert_ne!(sid1, sid3);
+
+        // All sessions should be tracked
+        assert_eq!(server.active_session_count(), 3);
+
+        // All sessions should be marked as handshaked
+        {
+            assert!(server.session_handshakes.get(&sid1).unwrap().0);
+            assert!(server.session_handshakes.get(&sid2).unwrap().0);
+            assert!(server.session_handshakes.get(&sid3).unwrap().0);
+        }
+    }
+
+    /// VAL-APLUS-026: MCP session tracking remains isolated per session.
+    /// Operations on one session do not corrupt or block unrelated session state.
+    #[test]
+    fn test_session_isolation_per_session() {
+        let registry = Arc::new(ProjectRegistry::new(5));
+        let server = McpServer {
+            config: McpServerConfig::default(),
+            _registry: registry,
+            handshake_complete: Arc::new(AtomicBool::new(false)),
+            session_handshakes: Arc::new(DashMap::new()),
+        };
+
+        let (_, sid1) = handle_initialize_for_test(&server);
+        let (_, sid2) = handle_initialize_for_test(&server);
+
+        // Remove session 1
+        server.session_handshakes.remove(&sid1);
+
+        // Session 2 should still be valid
+        assert!(server.session_handshakes.get(&sid2).is_some());
+        assert!(server.session_handshakes.get(&sid2).unwrap().0);
+
+        assert_eq!(server.active_session_count(), 1);
+    }
+
+    /// VAL-APLUS-025 variant: stale session cleanup removes only expired sessions.
+    #[test]
+    fn test_stale_session_cleanup() {
+        let registry = Arc::new(ProjectRegistry::new(5));
+        let server = McpServer {
+            config: McpServerConfig::default(),
+            _registry: registry,
+            handshake_complete: Arc::new(AtomicBool::new(false)),
+            session_handshakes: Arc::new(DashMap::new()),
+        };
+
+        // Create a session
+        let (_, sid) = handle_initialize_for_test(&server);
+        assert_eq!(server.active_session_count(), 1);
+
+        // Manually age the session's last_access time to simulate staleness
+        if let Some(mut entry) = server.session_handshakes.get_mut(&sid) {
+            entry.1 = Instant::now() - std::time::Duration::from_secs(600);
+        }
+
+        // Cleanup with a 60-second idle timeout should remove the stale session
+        let removed = server.cleanup_stale_sessions(std::time::Duration::from_secs(60));
+        assert_eq!(removed, 1);
+        assert_eq!(server.active_session_count(), 0);
+    }
+
+    /// Helper: simulate an initialize call and return (result, session_id).
+    fn handle_initialize_for_test(server: &McpServer) -> (Value, String) {
+        let (result, sid) = handle_initialize(server);
+        (result, sid.unwrap())
     }
 }
 

@@ -7,14 +7,34 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashSet;
 use tracing::{info, warn};
 
+/// Write a progress line to stderr if stderr is a terminal.
+/// Uses `\r` to overwrite the current line (no newline).
+/// This is a no-op when stderr is not a terminal (e.g., MCP/stdio mode).
+fn progress_stderr(msg: &str) {
+    use std::io::{IsTerminal, Write};
+    let stderr = std::io::stderr();
+    if stderr.is_terminal() {
+        let mut handle = stderr.lock();
+        // Clear the line first, then write the new content
+        let _ = write!(handle, "\r\x1b[K{}", msg);
+        let _ = handle.flush();
+    }
+}
+
+/// Clear the progress line on stderr (when terminal).
+fn progress_clear() {
+    use std::io::{IsTerminal, Write};
+    let stderr = std::io::stderr();
+    if stderr.is_terminal() {
+        let mut handle = stderr.lock();
+        let _ = write!(handle, "\r\x1b[K");
+        let _ = handle.flush();
+    }
+}
+
 impl LeIndex {
     pub(crate) fn incremental_reindex_from_watcher(&mut self) -> Result<super::IndexStats> {
         let start_time = std::time::Instant::now();
-        info!(
-            "Starting watcher incremental reindex for: {}",
-            self.project_id
-        );
-
         let indexed_files =
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .context("Failed to load indexed files from storage")?;
@@ -51,14 +71,7 @@ impl LeIndex {
             .cloned()
             .collect();
 
-        info!(
-            "Watcher delta: {} changed, {} deleted",
-            changed_files.len(),
-            deleted_files.len()
-        );
-
         if changed_files.is_empty() && deleted_files.is_empty() {
-            info!("Watcher found no delta, skipping incremental reindex");
             return Ok(self.stats.clone());
         }
 
@@ -160,85 +173,114 @@ impl LeIndex {
             min_edge_confidence: 0.0,
         };
 
-        let updated_nodes: Vec<crate::search::search::NodeInfo> = pdg
-            .node_indices()
-            .filter_map(|node_idx| {
-                let node = pdg.get_node(node_idx)?;
-                let file_path_str = node.file_path.as_ref();
-                // Only include nodes belonging to changed files
-                if !changed_file_set.contains(file_path_str) {
-                    return None;
+        // Two-pass approach: first collect node data, then batch neural embeddings.
+        let mut updated_nodes: Vec<crate::search::search::NodeInfo> = Vec::new();
+        let mut neural_pending: Vec<usize> = Vec::new();
+        let pruner = crate::search::search::ContentPruner::new();
+
+        for node_idx in pdg.node_indices() {
+            let node = match pdg.get_node(node_idx) {
+                Some(n) => n,
+                None => continue,
+            };
+            let file_path_str = node.file_path.as_ref();
+            // Only include nodes belonging to changed files
+            if !changed_file_set.contains(file_path_str) {
+                continue;
+            }
+            // Read actual file content and extract the node's source
+            let file_bytes = file_cache
+                .get_or_read(std::path::Path::new(file_path_str))
+                .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
+            let file_content = String::from_utf8_lossy(&file_bytes);
+            let content_bytes = file_content.as_bytes();
+            let start = node.byte_range.0.min(content_bytes.len());
+            let end = node.byte_range.1.min(content_bytes.len());
+
+            let mut enrichment = format!(
+                "// type:{} lang:{}",
+                match node.node_type {
+                    crate::graph::pdg::NodeType::Function => "function",
+                    crate::graph::pdg::NodeType::Class => "class",
+                    crate::graph::pdg::NodeType::Method => "method",
+                    crate::graph::pdg::NodeType::Variable => "variable",
+                    crate::graph::pdg::NodeType::Module => "module",
+                    crate::graph::pdg::NodeType::External => "external",
+                },
+                node.language,
+            );
+            let callers = pdg.backward_impact(node_idx, &connectivity_config);
+            let callees = pdg.forward_impact(node_idx, &connectivity_config);
+            enrichment.push_str(&format!(
+                " callers:{} callees:{} complexity:{}",
+                callers.len().min(50),
+                callees.len().min(50),
+                node.complexity,
+            ));
+
+            let node_content = if start < end {
+                let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
+                format!(
+                    "{}\n// {} in {}\n{}",
+                    enrichment, node.name, node.file_path, snippet
+                )
+            } else {
+                format!(
+                    "{}\n// {} in {}\n{}",
+                    enrichment, node.name, node.file_path, "// [No source code available]"
+                )
+            };
+
+            // Pruning gate: skip low-information / generated nodes (same as index_builder).
+            let pruning_decision = pruner.evaluate(&node.file_path, &node_content, &node.name);
+            if pruning_decision != crate::search::search::PruningDecision::Keep {
+                continue;
+            }
+
+            let tokens = index_builder::tokenize_code(&node_content);
+
+            let signature = crate::search::search::SearchEngine::extract_signature_from_content(
+                &node_content,
+            );
+            let tfidf_embedding = embedder.embed_tfidf(&tokens);
+
+            // Defer neural embedding to batch call below
+            let node_vec_idx = updated_nodes.len();
+            if embedder.has_neural() {
+                neural_pending.push(node_vec_idx);
+            }
+
+            updated_nodes.push(crate::search::search::NodeInfo {
+                node_id: node.id.clone(),
+                file_path: node.file_path.to_string(),
+                symbol_name: node.name.clone(),
+                language: node.language.clone(),
+                content: node_content,
+                byte_range: node.byte_range,
+                tfidf_embedding,
+                neural_embedding: None,
+                complexity: node.complexity,
+                signature,
+                pre_tokenized: Some(tokens),
+            });
+        }
+
+        // Batch neural embedding: one IPC call for all pending nodes.
+        if !neural_pending.is_empty() {
+            #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+            let batch_results = {
+                let texts: Vec<String> = neural_pending.iter().map(|&idx| updated_nodes[idx].content.clone()).collect();
+                embedder.embed_neural_batch_blocking(&texts)
+            };
+            #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+            let batch_results: Vec<Option<Vec<f32>>> = vec![None; neural_pending.len()];
+
+            for (i, &node_vec_idx) in neural_pending.iter().enumerate() {
+                if let Some(neural) = batch_results.get(i).and_then(|r| r.clone()) {
+                    updated_nodes[node_vec_idx].neural_embedding = Some(neural);
                 }
-                // Read actual file content and extract the node's source
-                let file_bytes = file_cache
-                    .get_or_read(std::path::Path::new(file_path_str))
-                    .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
-                let file_content = String::from_utf8_lossy(&file_bytes);
-                let content_bytes = file_content.as_bytes();
-                let start = node.byte_range.0.min(content_bytes.len());
-                let end = node.byte_range.1.min(content_bytes.len());
-
-                let mut enrichment = format!(
-                    "// type:{} lang:{}",
-                    match node.node_type {
-                        crate::graph::pdg::NodeType::Function => "function",
-                        crate::graph::pdg::NodeType::Class => "class",
-                        crate::graph::pdg::NodeType::Method => "method",
-                        crate::graph::pdg::NodeType::Variable => "variable",
-                        crate::graph::pdg::NodeType::Module => "module",
-                        crate::graph::pdg::NodeType::External => "external",
-                    },
-                    node.language,
-                );
-                let callers = pdg.backward_impact(node_idx, &connectivity_config);
-                let callees = pdg.forward_impact(node_idx, &connectivity_config);
-                enrichment.push_str(&format!(
-                    " callers:{} callees:{} complexity:{}",
-                    callers.len().min(50),
-                    callees.len().min(50),
-                    node.complexity,
-                ));
-
-                let node_content = if start < end {
-                    let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
-                    format!(
-                        "{}\n// {} in {}\n{}",
-                        enrichment, node.name, node.file_path, snippet
-                    )
-                } else {
-                    format!(
-                        "{}\n// {} in {}\n{}",
-                        enrichment, node.name, node.file_path, "// [No source code available]"
-                    )
-                };
-
-                let tokens: Vec<String> = node_content
-                    .split(|c: char| !c.is_alphanumeric())
-                    .map(|s| s.to_ascii_lowercase())
-                    .filter(|s| s.len() >= 2)
-                    .collect();
-
-                let signature = crate::search::search::SearchEngine::extract_signature_from_content(
-                    &node_content,
-                );
-                let tfidf_embedding = embedder.embed_tfidf(&index_builder::tokenize_code(&node_content));
-
-                Some(crate::search::search::NodeInfo {
-                    node_id: node.id.clone(),
-                    file_path: node.file_path.to_string(),
-                    symbol_name: node.name.clone(),
-                    language: node.language.clone(),
-                    content: node_content,
-                    byte_range: node.byte_range,
-                    tfidf_embedding: tfidf_embedding.clone(),
-                    neural_embedding: None, // Will be enhanced if embedder supports it
-                    embedding: Some(tfidf_embedding.clone()), // Backward compatibility
-                    complexity: node.complexity,
-                    signature,
-                    pre_tokenized: Some(tokens),
-                })
-            })
-            .collect();
+            }
+        }
 
         self.search_engine
             .incremental_reindex(crate::search::search::TextIndexDelta {
@@ -339,6 +381,7 @@ impl LeIndex {
         );
 
         // Step 1: Get currently indexed files from storage
+        progress_stderr("Indexing: scanning files...");
         let indexed_files =
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
                 .context("Failed to load indexed files from storage")?;
@@ -443,6 +486,7 @@ impl LeIndex {
         }
 
         // Step 4: Parse changed files
+        progress_stderr(&format!("Indexing: parsing {} files...", files_to_parse.len()));
         let parsing_results = if !files_to_parse.is_empty() {
             let parser = crate::parse::parallel::ParallelParser::new();
             parser.parse_files(files_to_parse)
@@ -456,6 +500,7 @@ impl LeIndex {
         }
 
         // Step 5: Update PDG
+        progress_stderr("Indexing: building PDG...");
         if !unchanged_files.is_empty() && self.pdg.is_none() {
             self.load_pdg_from_storage()
                 .context("Failed to load existing PDG for incremental reindex. Please reindex with --force if corruption persists.")?;
@@ -557,6 +602,7 @@ impl LeIndex {
         }
 
         // Step 6: Re-index nodes for search
+        progress_stderr(&format!("Indexing: embedding {} nodes...", pdg_node_count));
         let batch_size = self.indexing_batch_size();
         let persisted_embedder =
             index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
@@ -607,6 +653,7 @@ impl LeIndex {
         info!("Indexed {} nodes for search", indexed_count);
 
         // Step 7: Persist to storage
+        progress_stderr("Indexing: saving to storage...");
         index_builder::save_to_storage(&mut self.storage, &self.project_id, &pdg)?;
 
         // Update statistics
@@ -646,7 +693,19 @@ impl LeIndex {
             warn!("Failed to update last_indexed timestamp: {err:#}");
         }
 
+        // Note: ONNX worker idle-unload is handled by the worker's own idle
+        // timeout (see leindex-embed runtime.rs). We do NOT call
+        // unload_onnx() here because this path runs on every incremental
+        // reindex (file save with 500ms debounce), and killing the worker
+        // process on each save causes high latency for subsequent requests.
+
         info!("Indexing completed in {}ms", self.stats.indexing_time_ms);
+
+        // Record RSS observation after indexing for memory report.
+        crate::cli::memory_report::observe_rss("post_index");
+
+        // Clear the progress line so the final output is clean.
+        progress_clear();
 
         Ok(self.stats.clone())
     }

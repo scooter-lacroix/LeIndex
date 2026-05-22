@@ -3,8 +3,9 @@
 /**
  * LeIndex MCP - Post-install script
  * 
- * Automatically downloads the appropriate LeIndex binary for the current platform.
- * This provides the leanest LeIndex distribution - MCP server only, no dashboard.
+ * Automatically downloads the appropriate LeIndex bundle for the current platform.
+ * The bundle includes the main binary, the ONNX worker binary (leindex-embed),
+ * and model assets required for local semantic search.
  */
 
 const fs = require('fs');
@@ -12,9 +13,11 @@ const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
 const { execFileSync, execSync } = require('child_process');
+const zlib = require('zlib');
 const pkg = require('./package.json');
 
 const BIN_DIR = path.join(__dirname, 'bin');
+const MODELS_DIR = path.join(__dirname, 'models');
 const GITHUB_API_BASE = 'https://api.github.com/repos/scooter-lacroix/LeIndex';
 const DEFAULT_RELEASE_SELECTOR = 'latest';
 const MAX_REDIRECTS = 5;
@@ -56,6 +59,10 @@ function getPlatform() {
 
 function getBinaryName() {
   return process.platform === 'win32' ? 'leindex.exe' : 'leindex';
+}
+
+function getWorkerBinaryName() {
+  return process.platform === 'win32' ? 'leindex-embed.exe' : 'leindex-embed';
 }
 
 function requestResponse(url, options = {}, redirectCount = 0) {
@@ -194,9 +201,24 @@ function getRequestedRelease() {
   return process.env.LEINDEX_BINARY_VERSION || process.env.LEINDEX_BINARY_CHANNEL || DEFAULT_RELEASE_SELECTOR;
 }
 
+/**
+ * Legacy asset name for backward compatibility with pre-bundle releases.
+ * Returns the bare binary asset name (e.g. leindex-1.7.0-linux-x86_64).
+ */
 function getAssetName(version, platform, arch) {
   const ext = platform === 'windows' ? '.exe' : '';
   return `leindex-${version}-${platform}-${arch}${ext}`;
+}
+
+/**
+ * Bundle archive asset name for the worker-bundle release format.
+ * Returns the tar.gz or zip archive name (e.g. leindex-1.7.0-linux-x86_64.tar.gz).
+ */
+function getBundleAssetName(version, platform, arch) {
+  if (platform === 'windows') {
+    return `leindex-${version}-${platform}-${arch}.zip`;
+  }
+  return `leindex-${version}-${platform}-${arch}.tar.gz`;
 }
 
 function parseReleaseVersion(tagName) {
@@ -226,15 +248,7 @@ async function resolveReleaseConfig(platform, arch, requestedRelease = getReques
   }
 
   const version = parseReleaseVersion(release.tag_name);
-  const assetName = getAssetName(version, platform, arch);
-  const binaryAsset = release.assets.find((asset) => asset.name === assetName);
   const checksumAsset = release.assets.find((asset) => asset.name === 'SHA256SUMS');
-
-  if (!binaryAsset) {
-    const error = new Error(`Release asset not found: ${assetName}`);
-    error.code = 'RELEASE_ASSET';
-    throw error;
-  }
 
   if (!checksumAsset) {
     const error = new Error('Release checksum asset SHA256SUMS not found');
@@ -242,13 +256,40 @@ async function resolveReleaseConfig(platform, arch, requestedRelease = getReques
     throw error;
   }
 
+  // Try the bundle archive first (worker-bundle format)
+  const bundleAssetName = getBundleAssetName(version, platform, arch);
+  const bundleAsset = release.assets.find((asset) => asset.name === bundleAssetName);
+
+  if (bundleAsset) {
+    return {
+      selector: requestedRelease,
+      source: requestedRelease === 'latest' ? 'github-latest' : 'github-versioned',
+      version,
+      assetName: bundleAssetName,
+      bundleUrl: bundleAsset.browser_download_url,
+      checksumUrl: checksumAsset.browser_download_url,
+      isBundle: true
+    };
+  }
+
+  // Fall back to legacy bare binary format
+  const legacyAssetName = getAssetName(version, platform, arch);
+  const legacyAsset = release.assets.find((asset) => asset.name === legacyAssetName);
+
+  if (!legacyAsset) {
+    const error = new Error(`Release asset not found: ${bundleAssetName} (tried legacy ${legacyAssetName} too)`);
+    error.code = 'RELEASE_ASSET';
+    throw error;
+  }
+
   return {
     selector: requestedRelease,
     source: requestedRelease === 'latest' ? 'github-latest' : 'github-versioned',
     version,
-    assetName,
-    binaryUrl: binaryAsset.browser_download_url,
-    checksumUrl: checksumAsset.browser_download_url
+    assetName: legacyAssetName,
+    binaryUrl: legacyAsset.browser_download_url,
+    checksumUrl: checksumAsset.browser_download_url,
+    isBundle: false
   };
 }
 
@@ -289,6 +330,161 @@ function verifyChecksum(filePath, expectedChecksum) {
   }
 }
 
+/**
+ * Extract a tar.gz bundle using Node's built-in zlib + tar parsing.
+ * Places bin/ contents into BIN_DIR and models/ contents into MODELS_DIR.
+ */
+function extractTarGz(archivePath, destDir) {
+  const tar = require('child_process');
+  // Use system tar for reliable extraction
+  tar.execSync(`tar xzf "${archivePath}" -C "${destDir}"`, { stdio: 'pipe' });
+}
+
+/**
+ * Extract a zip bundle using PowerShell (Windows) or unzip.
+ */
+function extractZip(archivePath, destDir) {
+  const tar = require('child_process');
+  if (process.platform === 'win32') {
+    tar.execSync(`powershell -Command "Expand-Archive -Path '${archivePath}' -DestinationPath '${destDir}' -Force"`, { stdio: 'pipe' });
+  } else {
+    tar.execSync(`unzip -o "${archivePath}" -d "${destDir}"`, { stdio: 'pipe' });
+  }
+}
+
+/**
+ * Install from a bundle archive: extract and place binaries + models.
+ */
+async function installFromBundle(release) {
+  const tempDir = path.join(BIN_DIR, '.bundle-tmp');
+  const archiveExt = release.assetName.endsWith('.zip') ? '.zip' : '.tar.gz';
+  const archivePath = path.join(tempDir, release.assetName);
+
+  // Clean up any previous attempt
+  if (fs.existsSync(tempDir)) {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+  fs.mkdirSync(tempDir, { recursive: true });
+
+  try {
+    console.log(`   Downloading bundle from: ${release.bundleUrl}\n`);
+    await downloadFile(release.bundleUrl, archivePath);
+
+    // Verify archive checksum
+    const checksumText = await downloadText(release.checksumUrl);
+    const expectedChecksum = parseExpectedChecksum(checksumText, release.assetName);
+    verifyChecksum(archivePath, expectedChecksum);
+    console.log('   ✓ Bundle checksum verified');
+
+    // Extract
+    if (archiveExt === '.zip') {
+      extractZip(archivePath, tempDir);
+    } else {
+      extractTarGz(archivePath, tempDir);
+    }
+
+    // Find the extracted bundle directory (leindex-VERSION-PLATFORM)
+    const extractedDirs = fs.readdirSync(tempDir).filter(name => 
+      name.startsWith('leindex-') && fs.statSync(path.join(tempDir, name)).isDirectory()
+    );
+
+    if (extractedDirs.length === 0) {
+      throw new Error('Bundle archive did not contain expected directory');
+    }
+
+    const bundleDir = path.join(tempDir, extractedDirs[0]);
+
+    // Install binaries
+    if (!fs.existsSync(BIN_DIR)) {
+      fs.mkdirSync(BIN_DIR, { recursive: true });
+    }
+
+    const binaryName = getBinaryName();
+    const workerName = getWorkerBinaryName();
+    const srcBinary = path.join(bundleDir, 'bin', binaryName);
+    const srcWorker = path.join(bundleDir, 'bin', workerName);
+
+    if (fs.existsSync(srcBinary)) {
+      fs.copyFileSync(srcBinary, path.join(BIN_DIR, binaryName));
+      if (process.platform !== 'win32') {
+        fs.chmodSync(path.join(BIN_DIR, binaryName), 0o755);
+      }
+      console.log('   ✓ Main binary installed');
+    } else {
+      throw new Error(`Main binary not found in bundle: bin/${binaryName}`);
+    }
+
+    if (fs.existsSync(srcWorker)) {
+      fs.copyFileSync(srcWorker, path.join(BIN_DIR, workerName));
+      if (process.platform !== 'win32') {
+        fs.chmodSync(path.join(BIN_DIR, workerName), 0o755);
+      }
+      console.log('   ✓ Worker binary installed');
+    } else {
+      console.log('   ⚠ Worker binary not found in bundle; ONNX will use in-process fallback');
+    }
+
+    // Install model assets
+    const srcModels = path.join(bundleDir, 'models');
+    if (fs.existsSync(srcModels)) {
+      if (!fs.existsSync(MODELS_DIR)) {
+        fs.mkdirSync(MODELS_DIR, { recursive: true });
+      }
+      const modelFiles = fs.readdirSync(srcModels);
+      for (const file of modelFiles) {
+        fs.copyFileSync(path.join(srcModels, file), path.join(MODELS_DIR, file));
+      }
+      console.log(`   ✓ Model assets installed (${modelFiles.length} files)`);
+    } else {
+      console.log('   ⚠ Model assets not found in bundle');
+    }
+
+    // Verify main binary works
+    const binaryPath = path.join(BIN_DIR, binaryName);
+    const version = execFileSync(binaryPath, ['--version'], { encoding: 'utf8' }).trim();
+    console.log(`   ✓ LeIndex installed from ${release.source}: ${version}`);
+    console.log('\n📦 Installation complete!');
+    console.log('   Bundle includes: main binary, ONNX worker, and model assets.');
+    console.log('   Add this package to your MCP configuration to use LeIndex.');
+
+  } finally {
+    // Clean up temp directory
+    if (fs.existsSync(tempDir)) {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    }
+  }
+}
+
+/**
+ * Legacy install from bare binary (pre-bundle releases).
+ */
+async function installFromBinary(release) {
+  const binaryName = getBinaryName();
+  const binaryPath = path.join(BIN_DIR, binaryName);
+  const tempBinaryPath = path.join(BIN_DIR, `${binaryName}.download`);
+
+  if (fs.existsSync(tempBinaryPath)) {
+    fs.unlinkSync(tempBinaryPath);
+  }
+
+  console.log(`   Downloading from: ${release.binaryUrl}\n`);
+  await downloadFile(release.binaryUrl, tempBinaryPath);
+  const checksumText = await downloadText(release.checksumUrl);
+  const expectedChecksum = parseExpectedChecksum(checksumText, release.assetName);
+  verifyChecksum(tempBinaryPath, expectedChecksum);
+
+  if (process.platform !== 'win32') {
+    fs.chmodSync(tempBinaryPath, 0o755);
+  }
+
+  fs.renameSync(tempBinaryPath, binaryPath);
+
+  const version = execFileSync(binaryPath, ['--version'], { encoding: 'utf8' }).trim();
+  console.log(`   ✓ LeIndex installed from ${release.source}: ${version}`);
+  console.log('\n📦 Installation complete (legacy binary format).');
+  console.log('   Add this package to your MCP configuration to use LeIndex.');
+}
+
 async function install() {
   console.log('🔧 LeIndex MCP Installer');
   console.log(`   Wrapper version: ${pkg.version}`);
@@ -304,50 +500,41 @@ async function install() {
   
   const binaryName = getBinaryName();
   const binaryPath = path.join(BIN_DIR, binaryName);
-  const tempBinaryPath = path.join(BIN_DIR, `${binaryName}.download`);
+  const workerName = getWorkerBinaryName();
+  const workerPath = path.join(BIN_DIR, workerName);
   
-  // Check if already installed
+  // Check if already installed (both main and worker)
   if (fs.existsSync(binaryPath)) {
     try {
       const version = execFileSync(binaryPath, ['--version'], { encoding: 'utf8' }).trim();
+      const hasWorker = fs.existsSync(workerPath);
       console.log(`   ✓ LeIndex already installed: ${version}`);
-      console.log('\n📦 Installation complete!');
-      console.log('   Add this package to your MCP configuration to use LeIndex.');
-      return;
+      if (hasWorker) {
+        console.log('   ✓ Worker binary present');
+        console.log('\n📦 Installation complete!');
+        console.log('   Add this package to your MCP configuration to use LeIndex.');
+        return;
+      }
+      console.log('   ⚠ Worker binary missing; downloading bundled worker...');
     } catch (e) {
       // Version check failed, continue with download
-      fs.unlinkSync(binaryPath);
+      try { fs.unlinkSync(binaryPath); } catch (_) {}
     }
   }
   
   try {
     const release = await resolveReleaseConfig(platform, arch);
-    console.log(`   Resolved binary version: ${release.version}`);
-    console.log(`   Downloading from: ${release.binaryUrl}\n`);
+    console.log(`   Resolved version: ${release.version} (${release.isBundle ? 'bundle' : 'legacy binary'})`);
 
-    if (fs.existsSync(tempBinaryPath)) {
-      fs.unlinkSync(tempBinaryPath);
+    if (release.isBundle) {
+      await installFromBundle(release);
+    } else {
+      await installFromBinary(release);
     }
-
-    await downloadFile(release.binaryUrl, tempBinaryPath);
-    const checksumText = await downloadText(release.checksumUrl);
-    const expectedChecksum = parseExpectedChecksum(checksumText, release.assetName);
-    verifyChecksum(tempBinaryPath, expectedChecksum);
-    
-    // Make executable on Unix
-    if (process.platform !== 'win32') {
-      fs.chmodSync(tempBinaryPath, 0o755);
-    }
-
-    fs.renameSync(tempBinaryPath, binaryPath);
-    
-    // Verify installation
-    const version = execFileSync(binaryPath, ['--version'], { encoding: 'utf8' }).trim();
-    console.log(`   ✓ LeIndex installed from ${release.source}: ${version}`);
-    console.log('\n📦 Installation complete!');
-    console.log('   Add this package to your MCP configuration to use LeIndex.');
     
   } catch (error) {
+    // Clean up partial downloads
+    const tempBinaryPath = path.join(BIN_DIR, `${binaryName}.download`);
     if (fs.existsSync(tempBinaryPath)) {
       fs.unlinkSync(tempBinaryPath);
     }
@@ -364,8 +551,16 @@ async function install() {
     
     try {
       // Use --force to overwrite any old workspace crate installations
-      execSync('cargo install leindex --force', { stdio: 'inherit' });
-      console.log('\n   ✓ Installed via cargo');
+      execSync('cargo install leindex --force --features onnx', { stdio: 'inherit' });
+      console.log('\n   ✓ Installed leindex via cargo');
+      
+      // Also install the ONNX worker binary
+      try {
+        execSync('cargo install leindex-embed --features onnx --force', { stdio: 'inherit' });
+        console.log('   ✓ Installed leindex-embed worker via cargo');
+      } catch (embedErr) {
+        console.log('   ⚠ leindex-embed install failed; ONNX will use in-process fallback');
+      }
       
       // Link cargo-installed binary to our bin directory
       try {
@@ -376,6 +571,13 @@ async function install() {
           fs.chmodSync(binaryPath, 0o755);
           console.log('   ✓ Binary linked to package directory');
         }
+        // Also link worker binary if available
+        const cargoWorker = path.join(cargoHome, 'bin', workerName);
+        if (fs.existsSync(cargoWorker)) {
+          fs.copyFileSync(cargoWorker, workerPath);
+          fs.chmodSync(workerPath, 0o755);
+          console.log('   ✓ Worker binary linked to package directory');
+        }
       } catch (linkErr) {
         console.log('   ⚠ Could not link binary, but cargo install succeeded');
       }
@@ -385,8 +587,6 @@ async function install() {
       console.error('   1. cargo install leindex --force');
       console.error('   2. Or build from source: git clone + cargo build --release');
       console.error('   3. Or wait for GitHub release and reinstall this package');
-      console.error('\n   Note: If you have old workspace crates installed (lepasserelle, etc.),');
-      console.error('         run: cargo uninstall lepasserelle leserve leedit leparse legraphe lestockage lerecherche lephase leglobal levalidation');
       process.exit(1);
     }
   }
@@ -395,6 +595,7 @@ async function install() {
 module.exports = {
   computeFileSha256,
   getAssetName,
+  getBundleAssetName,
   getRequestedRelease,
   parseExpectedChecksum,
   parseReleaseVersion,

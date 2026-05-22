@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 concurrency:
   group: release-${{ github.ref }}
@@ -75,7 +76,7 @@ jobs:
             echo "New version or draft-only: v${VERSION}"
           fi
 
-  # ── Build native binaries ────────────────────────────────────────────
+  # ── Build native binaries (main + worker) ────────────────────────────
   build:
     name: Build ${{ matrix.target }}
     needs: detect
@@ -86,27 +87,22 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            binary: leindex
             asset_name: linux-x86_64
 
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            binary: leindex
             asset_name: linux-aarch64
 
           - target: x86_64-apple-darwin
             os: macos-latest
-            binary: leindex
             asset_name: macos-x86_64
 
           - target: aarch64-apple-darwin
             os: macos-latest
-            binary: leindex
             asset_name: macos-aarch64
 
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            binary: leindex.exe
             asset_name: windows-x86_64
 
     runs-on: ${{ matrix.os }}
@@ -135,34 +131,123 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - name: Build release binary
+      - name: Build release binaries
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} -p leindex -p leindex-embed --features leindex/onnx,leindex-embed/onnx
 
-      - name: Strip binary (Linux/macOS)
+      - name: Strip binaries (Linux/macOS)
         if: runner.os != 'Windows'
         run: |
           STRIP="strip"
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
             STRIP="aarch64-linux-gnu-strip"
           fi
-          $STRIP target/${{ matrix.target }}/release/${{ matrix.binary }}
+          $STRIP target/${{ matrix.target }}/release/leindex
+          $STRIP target/${{ matrix.target }}/release/leindex-embed
 
-      - name: Rename binary for upload
+      - name: Download model assets
+        shell: bash
+        run: |
+          set -e
+          export GH_TOKEN="${{ secrets.GITHUB_TOKEN }}"
+          MODELS_DIR="models"
+          mkdir -p "$MODELS_DIR"
+          # Model assets are gitignored so checkout won't include them.
+          # Try to fetch from a prior GitHub Release first, then HuggingFace.
+          HF_REPO="onnx-community/Qwen3-Embedding-0.6B-ONNX"
+          if [[ -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
+            echo "Model assets already present in repository"
+          else
+            echo "Model assets not in repo — attempting to fetch from prior release..."
+            # Fetch latest non-draft release tag
+            TAG=$(gh release list --limit 10 --json tagName,isDraft --jq '.[] | select(.isDraft == false) | .tagName' | head -1)
+            if [[ -n "$TAG" ]]; then
+              echo "Downloading model assets from release $TAG..."
+              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "*.onnx" 2>/dev/null || true
+              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "tokenizer.json" 2>/dev/null || true
+              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "config.json" 2>/dev/null || true
+              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "checksums.sha256" 2>/dev/null || true
+              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "LICENSE" 2>/dev/null || true
+              # Try to extract from prior release bundle if direct download failed
+              if [[ ! -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
+                echo "Direct download failed — trying to extract from release bundle..."
+                BUNDLE=$(gh release download "$TAG" --dir /tmp --pattern "leindex-*-linux-x86_64.tar.gz" 2>/dev/null && ls /tmp/leindex-*-linux-x86_64.tar.gz 2>/dev/null | head -1 || true)
+                if [[ -z "$BUNDLE" || ! -f "$BUNDLE" ]]; then
+                  echo "::warning::Prior release bundle not found — cannot extract models from previous release"
+                fi
+                if [[ -n "$BUNDLE" && -f "$BUNDLE" ]]; then
+                  tar xzf "$BUNDLE" -C /tmp --strip-components=1 --wildcards "leindex-*/models/qwen3-embed-0.6b.onnx" "leindex-*/models/tokenizer.json" 2>/dev/null || true
+                  cp /tmp/models/qwen3-embed-0.6b.onnx "$MODELS_DIR/" 2>/dev/null || true
+                  cp /tmp/models/tokenizer.json "$MODELS_DIR/" 2>/dev/null || true
+                fi
+              fi
+            fi
+            # Fall back to HuggingFace download if still missing
+            if [[ ! -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
+              echo "Downloading ONNX model from HuggingFace (${HF_REPO})..."
+              curl --fail --location --progress-bar -o "$MODELS_DIR/qwen3-embed-0.6b.onnx" \
+                "https://huggingface.co/${HF_REPO}/resolve/main/onnx/model.onnx"
+            fi
+            if [[ ! -f "$MODELS_DIR/tokenizer.json" ]]; then
+              echo "Downloading tokenizer from HuggingFace..."
+              curl --fail --location --progress-bar -o "$MODELS_DIR/tokenizer.json" \
+                "https://huggingface.co/${HF_REPO}/resolve/main/tokenizer.json"
+            fi
+            if [[ ! -f "$MODELS_DIR/config.json" ]]; then
+              echo "Downloading config from HuggingFace..."
+              curl --fail --location --progress-bar -o "$MODELS_DIR/config.json" \
+                "https://huggingface.co/${HF_REPO}/resolve/main/config.json"
+            fi
+            if [[ ! -f "$MODELS_DIR/checksums.sha256" ]]; then
+              echo "Downloading checksums from HuggingFace..."
+              curl --fail --location --progress-bar -o "$MODELS_DIR/checksums.sha256" \
+                "https://huggingface.co/${HF_REPO}/resolve/main/checksums.sha256" \
+                || true
+            fi
+            if [[ ! -f "$MODELS_DIR/LICENSE" ]]; then
+              echo "Downloading LICENSE from HuggingFace..."
+              curl --fail --location --progress-bar -o "$MODELS_DIR/LICENSE" \
+                "https://huggingface.co/${HF_REPO}/resolve/main/LICENSE" \
+                || true
+            fi
+            echo "Model assets ready at $MODELS_DIR"
+          fi
+
+      - name: Package release bundle
         shell: bash
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           EXT="${{ matrix.asset_name == 'windows-x86_64' && '.exe' || '' }}"
-          ASSET="leindex-${VERSION}-${{ matrix.asset_name }}${EXT}"
-          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "$ASSET"
-          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+          BUNDLE_DIR="leindex-${VERSION}-${{ matrix.asset_name }}"
+          mkdir -p "$BUNDLE_DIR/bin" "$BUNDLE_DIR/models"
+
+          # Copy both binaries
+          cp "target/${{ matrix.target }}/release/leindex${EXT}" "$BUNDLE_DIR/bin/leindex${EXT}"
+          cp "target/${{ matrix.target }}/release/leindex-embed${EXT}" "$BUNDLE_DIR/bin/leindex-embed${EXT}"
+
+          # Copy model assets
+          cp models/qwen3-embed-0.6b.onnx "$BUNDLE_DIR/models/"
+          cp models/tokenizer.json "$BUNDLE_DIR/models/"
+          cp models/config.json "$BUNDLE_DIR/models/"
+          cp models/checksums.sha256 "$BUNDLE_DIR/models/" 2>/dev/null || echo "::warning::models/checksums.sha256 not found — bundle will lack integrity checksums"
+          cp models/LICENSE "$BUNDLE_DIR/models/" 2>/dev/null || echo "::warning::models/LICENSE not found — bundle will lack model license"
+
+          # Create archive
+          if [ "${{ matrix.asset_name }}" = "windows-x86_64" ]; then
+            7z a -tzip "${BUNDLE_DIR}.zip" "$BUNDLE_DIR"
+          else
+            tar czf "${BUNDLE_DIR}.tar.gz" "$BUNDLE_DIR"
+          fi
+          echo "BUNDLE_DIR=$BUNDLE_DIR" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: binary-${{ matrix.asset_name }}
-          path: ${{ env.ASSET }}
+          name: bundle-${{ matrix.asset_name }}
+          path: |
+            leindex-*.tar.gz
+            leindex-*.zip
           if-no-files-found: error
 
   # ── Create GitHub Release (draft) ────────────────────────────────────
@@ -180,14 +265,14 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
-          pattern: binary-*
+          pattern: bundle-*
           merge-multiple: true
 
       - name: Generate SHA256 checksums
         working-directory: release-artifacts
         run: |
           shopt -s nullglob
-          sha256sum leindex-* > ../SHA256SUMS
+          sha256sum leindex-*.tar.gz leindex-*.zip > ../SHA256SUMS
           cat ../SHA256SUMS
 
       - name: Generate changelog
@@ -219,7 +304,8 @@ jobs:
           draft: true
           prerelease: false
           files: |
-            release-artifacts/leindex-*
+            release-artifacts/leindex-*.tar.gz
+            release-artifacts/leindex-*.zip
             SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -244,10 +330,20 @@ jobs:
             ~/.cargo/git
           key: publish-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Publish to crates.io
+      - name: Publish leindex-embed to crates.io
+        run: |
+          VERSION=$(grep '^version =' crates/leindex-embed/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if cargo search leindex-embed 2>/dev/null | grep -q "^leindex-embed = \"${VERSION}\""; then
+            echo "Version ${VERSION} of leindex-embed already published to crates.io — skipping"
+          else
+            cargo publish --allow-dirty -p leindex-embed
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish leindex to crates.io
         run: |
           VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
-          # Skip if this version already exists on crates.io (idempotent for retries)
           if cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\""; then
             echo "Version ${VERSION} already published to crates.io — skipping"
           else
@@ -306,7 +402,7 @@ jobs:
           if npm view "${PKG_NAME}@${PKG_VER}" version 2>/dev/null | grep -q "${PKG_VER}"; then
             echo "Version ${PKG_VER} already published to npm — skipping"
           else
-            npm publish --access public
+            npm publish --access public --provenance
           fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -378,7 +474,7 @@ jobs:
   summary:
     name: Release Summary
     needs: [detect, github-release, crates-io, npm, pypi]
-    if: always() && needs.detect.outputs.changed == 'true'
+    if: ${{ needs.detect.outputs.changed == 'true' && needs.crates-io.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -386,10 +482,7 @@ jobs:
           fetch-depth: 0
 
       - name: Verify HEAD matches release commit
-        if: >
-          needs.crates-io.result == 'success' &&
-          needs.pypi.result == 'success' &&
-          (needs.npm.result == 'success' || needs.npm.result == 'skipped')
+        if: needs.github-release.result == 'success'
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           RELEASE_SHA=$(gh release view "v${VERSION}" --json targetCommitish --jq '.targetCommitish')
@@ -404,10 +497,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish draft release
-        if: >
-          needs.crates-io.result == 'success' &&
-          needs.pypi.result == 'success' &&
-          (needs.npm.result == 'success' || needs.npm.result == 'skipped')
+        if: needs.github-release.result == 'success' && (needs.crates-io.result == 'success' || needs.crates-io.result == 'skipped') && (needs.pypi.result == 'success' || needs.pypi.result == 'skipped') && (needs.npm.result == 'success' || needs.npm.result == 'skipped')
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           gh release edit "v${VERSION}" --draft=false
@@ -430,3 +520,6 @@ jobs:
           echo "- **crates.io**: Publishes the Rust crate (required)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **PyPI**: Thin Python wrapper that bootstraps cargo install (optional — needs PYPI_TOKEN)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **npm**: Binary wrapper with GH Release download (optional — needs NPM_TOKEN)" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Bundle topology" >> "$GITHUB_STEP_SUMMARY"
+          echo "Each platform archive includes \`leindex\`, \`leindex-embed\` (ONNX worker), and model assets." >> "$GITHUB_STEP_SUMMARY"

@@ -9,17 +9,18 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg(feature = "onnx")]
-use crate::search::onnx::QwenEmbeddingProvider;
+use crate::search::onnx::{EmbedResult, EmbeddingClient};
+
+#[cfg(feature = "onnx")]
+use tokio::task;
 
 #[cfg(feature = "remote-embeddings")]
-use crate::search::onnx::{
-    GenericRemoteProvider, RemoteEmbeddingConfig, RemoteEmbeddingError,
-};
-#[cfg(feature = "remote-embeddings")]
 use crate::search::onnx::remote::RemoteEmbeddingProvider;
+#[cfg(feature = "remote-embeddings")]
+use crate::search::onnx::{GenericRemoteProvider, RemoteEmbeddingConfig, RemoteEmbeddingError};
 
 use super::leindex::{
     FileStats, IndexStats, ProjectFileScan, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS,
@@ -422,6 +423,13 @@ impl TfIdfEmbedder {
 // HYBRID EMBEDDING BACKEND (Unified TF-IDF + Neural/Remote)
 // ============================================================================
 
+/// Neural embedding dimension for the Qwen3-Embedding-0.6B ONNX model.
+///
+/// This dimension is used for local ONNX-backed neural embeddings.
+/// The value must match the output dimension of the deployed model.
+#[cfg(feature = "onnx")]
+pub(crate) const NEURAL_EMBEDDING_DIMENSION: usize = 1024;
+
 /// Hybrid embedding backend that always uses TF-IDF as base signal
 /// with optional neural/remote embeddings as enhancement layers
 #[derive(Debug, Clone)]
@@ -429,13 +437,13 @@ pub enum HybridEmbedder {
     /// TF-IDF only (base signal always available)
     TfIdfOnly(TfIdfEmbedder),
 
-    /// TF-IDF + Local ONNX neural embeddings
+    /// TF-IDF + Local ONNX neural embeddings (via worker process)
     #[cfg(feature = "onnx")]
     HybridLocal {
         /// TF-IDF embedder for keyword-based search
         tfidf: TfIdfEmbedder,
-        /// Local ONNX neural embedder for semantic search
-        neural: QwenEmbeddingProvider,
+        /// Worker client for neural embedding via leindex-embed process
+        neural: EmbeddingClient,
         /// Weight for neural embeddings in hybrid scoring (0.0-1.0)
         neural_weight: f32,
     },
@@ -508,15 +516,12 @@ impl HybridEmbedder {
         Self::TfIdfOnly(embedder)
     }
 
-    /// Create a hybrid embedder with local ONNX neural embeddings
+    /// Create a hybrid embedder with local ONNX neural embeddings via worker
     #[cfg(feature = "onnx")]
-    pub fn hybrid_local(
-        tfidf: TfIdfEmbedder,
-        neural_weight: Option<f32>,
-    ) -> Result<Self, crate::search::onnx::QwenEmbeddingProviderError> {
+    pub fn hybrid_local(tfidf: TfIdfEmbedder, neural_weight: Option<f32>) -> Result<Self, String> {
         Ok(Self::HybridLocal {
             tfidf,
-            neural: QwenEmbeddingProvider::new()?,
+            neural: EmbeddingClient::new(),
             neural_weight: neural_weight.unwrap_or(0.40),
         })
     }
@@ -568,7 +573,7 @@ impl HybridEmbedder {
         match self {
             Self::TfIdfOnly(_) => None,
             #[cfg(feature = "onnx")]
-            Self::HybridLocal { neural, .. } => Some(neural.dimension()),
+            Self::HybridLocal { .. } => Some(NEURAL_EMBEDDING_DIMENSION),
             #[cfg(feature = "remote-embeddings")]
             Self::HybridRemote { remote, .. } => Some(remote.dimension()),
         }
@@ -612,46 +617,94 @@ impl HybridEmbedder {
 
     /// Generate neural/remote embedding for text (if available)
     ///
-    /// Returns None if neural enhancement is not available
+    /// Uses `embed_with_fallback` for retry-once semantics:
+    /// - VAL-CPHASE-017: Retries once on worker failure
+    /// - VAL-CPHASE-018: Falls back to TF-IDF for the affected batch after second failure
+    /// - VAL-CPHASE-019: Emits actionable warning on fallback
+    /// - VAL-CPHASE-020: Worker failure does not crash the main daemon
+    /// - VAL-CPHASE-021: Fresh worker can be spawned after fallback
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     pub async fn embed_neural_async(&self, text: &str) -> Option<Result<Vec<f32>, String>> {
         match self {
             Self::TfIdfOnly(_) => None,
             #[cfg(feature = "onnx")]
             Self::HybridLocal { neural, .. } => {
-                // ONNX is synchronous, wrap in async
-                Some(
-                    neural
-                        .embed(text)
-                        .map_err(|e| format!("ONNX embedding failed: {}", e)),
-                )
+                // Clone shares the worker handle via Arc (EmbeddingClient::clone is cheap).
+                // Required because spawn_blocking requires ownership.
+                let neural = neural.clone();
+                let texts = vec![text.to_string()];
+                let result = task::spawn_blocking(move || {
+                    neural.embed_with_fallback(&texts, NEURAL_EMBEDDING_DIMENSION)
+                })
+                .await
+                .ok()?;
+                match result {
+                    EmbedResult::Success(response) => {
+                        if response.count > 0 {
+                            // VAL-CPHASE-016: Write from flat buffer directly
+                            Some(Ok(response.into_vectors().into_iter().next().unwrap()))
+                        } else {
+                            Some(Err("worker returned empty response".to_string()))
+                        }
+                    }
+                    EmbedResult::Fallback { batch_id, error } => {
+                        // VAL-CPHASE-018/019: Fallback already logged actionable warning.
+                        tracing::warn!(
+                            batch_id = %batch_id,
+                            error = %error,
+                            "Neural embedding degraded to TF-IDF for node (async path)"
+                        );
+                        None
+                    }
+                }
             }
             #[cfg(feature = "remote-embeddings")]
-            Self::HybridRemote { remote, .. } => {
-                Some(
-                    remote
-                        .embed(text)
-                        .await
-                        .map_err(|e| format!("Remote embedding failed: {}", e)),
-                )
-            }
+            Self::HybridRemote { remote, .. } => Some(
+                remote
+                    .embed(text)
+                    .await
+                    .map_err(|e| format!("Remote embedding failed: {}", e)),
+            ),
         }
     }
 
     /// Generate neural/remote embedding for text (blocking wrapper for sync contexts)
     ///
-    /// Returns None if neural enhancement is not available
+    /// Uses `embed_with_fallback` for retry-once semantics:
+    /// - VAL-CPHASE-017: Retries once on worker failure
+    /// - VAL-CPHASE-018: Falls back to TF-IDF for the affected batch after second failure
+    /// - VAL-CPHASE-019: Emits actionable warning on fallback
+    /// - VAL-CPHASE-020: Worker failure does not crash the main daemon
+    /// - VAL-CPHASE-021: Fresh worker can be spawned after fallback
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     pub fn embed_neural_blocking(&self, text: &str) -> Option<Result<Vec<f32>, String>> {
         match self {
             Self::TfIdfOnly(_) => None,
             #[cfg(feature = "onnx")]
             Self::HybridLocal { neural, .. } => {
-                Some(
-                    neural
-                        .embed(text)
-                        .map_err(|e| format!("ONNX embedding failed: {}", e)),
-                )
+                let texts = vec![text.to_string()];
+                let result = neural.embed_with_fallback(&texts, NEURAL_EMBEDDING_DIMENSION);
+                match result {
+                    EmbedResult::Success(response) => {
+                        if response.count > 0 {
+                            // VAL-CPHASE-016: Write from flat buffer directly,
+                            // avoiding nested Vec<Vec<f32>> heap mirror
+                            Some(Ok(response.into_vectors().into_iter().next().unwrap()))
+                        } else {
+                            Some(Err("worker returned empty response".to_string()))
+                        }
+                    }
+                    EmbedResult::Fallback { batch_id, error } => {
+                        // VAL-CPHASE-018/019: Fallback already logged actionable warning.
+                        // Return None so the caller falls back to TF-IDF for this batch.
+                        tracing::warn!(
+                            batch_id = %batch_id,
+                            error = %error,
+                            "Neural embedding degraded to TF-IDF for node"
+                        );
+                        None
+                    }
+                }
             }
             #[cfg(feature = "remote-embeddings")]
             Self::HybridRemote { .. } => {
@@ -662,11 +715,99 @@ impl HybridEmbedder {
         }
     }
 
+    /// Generate neural/remote embeddings for a batch of texts (blocking wrapper).
+    ///
+    /// Returns `Vec<Option<Vec<f32>>>` — one entry per input text.
+    /// `Some(vec)` on success, `None` when neural is unavailable or on fallback.
+    ///
+    /// This batches all texts into a single IPC call to the ONNX worker,
+    /// reducing N round-trips to 1 per chunk.
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    pub fn embed_neural_batch_blocking(&self, texts: &[String]) -> Vec<Option<Vec<f32>>> {
+        match self {
+            Self::TfIdfOnly(_) => vec![None; texts.len()],
+            #[cfg(feature = "onnx")]
+            Self::HybridLocal { neural, .. } => {
+                if texts.is_empty() {
+                    return Vec::new();
+                }
+                let result = neural.embed_with_fallback(texts, NEURAL_EMBEDDING_DIMENSION);
+                match result {
+                    EmbedResult::Success(response) => {
+                        if response.count == texts.len() {
+                            response.into_vectors().into_iter().map(Some).collect()
+                        } else {
+                            tracing::warn!(
+                                expected = texts.len(),
+                                got = response.count,
+                                "Neural batch returned wrong count, falling back to None for all"
+                            );
+                            vec![None; texts.len()]
+                        }
+                    }
+                    EmbedResult::Fallback { batch_id, error } => {
+                        tracing::warn!(
+                            batch_id = %batch_id,
+                            error = %error,
+                            "Neural batch embedding degraded to TF-IDF for {} texts",
+                            texts.len()
+                        );
+                        vec![None; texts.len()]
+                    }
+                }
+            }
+            #[cfg(feature = "remote-embeddings")]
+            Self::HybridRemote { .. } => {
+                // Remote requires async runtime; not supported in blocking context
+                vec![None; texts.len()]
+            }
+        }
+    }
+
     /// Persist the TF-IDF embedder to storage
     ///
     /// Delegates to the inner TfIdfEmbedder's persist_to_storage method
-    pub fn persist_to_storage(&self, project_path: &Path, pdg: &ProgramDependenceGraph) -> Result<()> {
+    pub fn persist_to_storage(
+        &self,
+        project_path: &Path,
+        pdg: &ProgramDependenceGraph,
+    ) -> Result<()> {
         self.tfidf().persist_to_storage(project_path, pdg)
+    }
+
+    /// Unload the ONNX session if the hybrid backend uses one (A+ idle-unload).
+    ///
+    /// After an indexing batch completes, calling this drops the live ONNX
+    /// session so it does not remain resident indefinitely (VAL-APLUS-024).
+    /// With the worker architecture, this signals the worker to shut down.
+    pub fn unload_onnx(&self) {
+        match self {
+            Self::TfIdfOnly(_) => {}
+            #[cfg(feature = "onnx")]
+            Self::HybridLocal { neural, .. } => {
+                // Kill the worker process; the client can spawn a fresh one later.
+                neural.kill_worker();
+            }
+            #[cfg(feature = "remote-embeddings")]
+            Self::HybridRemote { .. } => {}
+        }
+    }
+
+    /// Check whether the ONNX session is currently loaded.
+    #[must_use]
+    pub fn is_onnx_loaded(&self) -> bool {
+        match self {
+            Self::TfIdfOnly(_) => false,
+            #[cfg(feature = "onnx")]
+            Self::HybridLocal { .. } => {
+                // With the worker architecture, "loaded" means the worker process
+                // is running. This will be properly tracked in the runtime lifecycle
+                // feature. For now, return false as the worker is spawned on demand.
+                false
+            }
+            #[cfg(feature = "remote-embeddings")]
+            Self::HybridRemote { .. } => false,
+        }
     }
 }
 
@@ -1164,12 +1305,21 @@ pub(crate) fn index_nodes_with_embedder(
         HybridEmbedder::tfidf_only(tfidf_embedder)
     };
 
+    // A+ bound-gated admission, selective pruning, and work hoisting.
+    let pruner = crate::search::search::ContentPruner::new();
+    let mut admission_gate = crate::search::search::IndexingAdmissionGate::new();
+    let mut work_hoister = crate::search::search::WorkHoister::new();
+    let mut pruned_count: usize = 0;
+    let mut shed_count: usize = 0;
+    let mut hoisted_count: usize = 0;
+
     let mut nodes: Vec<NodeInfo> = Vec::with_capacity(batch_size);
-    #[cfg(feature = "remote-embeddings")]
-    let mut warned_remote_blocking = false;
 
     for batch in node_indices.chunks(batch_size) {
         nodes.clear();
+        admission_gate.reset();
+        // Collect index-into-nodes for nodes that need a neural embedding.
+        let mut neural_pending: Vec<usize> = Vec::new();
         for &node_idx in batch {
             if let Some(node) = pdg.get_node(node_idx) {
                 // Re-read and re-tokenize node content for Pass 2
@@ -1178,38 +1328,52 @@ pub(crate) fn index_nodes_with_embedder(
                     .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
 
                 let node_content = extract_node_content(node, node_idx, &file_bytes);
+
+                // A+ VAL-APLUS-038: Full content pruning check (now that we have content).
+                let pruning_decision = pruner.evaluate(&node.file_path, &node_content, &node.name);
+                if pruning_decision != crate::search::search::PruningDecision::Keep {
+                    pruned_count += 1;
+                    continue;
+                }
+
+                // A+ VAL-APLUS-037: Bound-gated admission — shed oversized/bursty work.
+                if !admission_gate.try_admit(node_content.len()) {
+                    shed_count += 1;
+                    continue;
+                }
+
                 let tokens = tokenize_code(&node_content);
 
-                // Generate TF-IDF embedding (always available)
-                let tfidf_embedding = embedder.embed_tfidf(&tokens);
-
-                // Generate neural embedding (if available)
-                // Note: Remote embeddings are not supported in synchronous indexing context
-                // Only local ONNX embeddings are used here to avoid async runtime issues
-                let neural_embedding = match &embedder {
-                    HybridEmbedder::TfIdfOnly(_) => None,
-                    #[cfg(feature = "onnx")]
-                    HybridEmbedder::HybridLocal { .. } => {
-                        match embedder.embed_neural_blocking(&node_content) {
-                            Some(Ok(v)) => Some(v),
-                            Some(Err(e)) => {
-                                tracing::warn!("Neural embedding failed for node {}: {}", node.id, e);
-                                None
-                            }
-                            None => None,
-                        }
-                    }
-                    #[cfg(feature = "remote-embeddings")]
-                    HybridEmbedder::HybridRemote { .. } => {
-                        if !warned_remote_blocking {
-                            tracing::warn!(
-                                "Remote embeddings require async runtime; falling back to TF-IDF-only for this indexing run"
-                            );
-                            warned_remote_blocking = true;
-                        }
-                        None
-                    }
+                // A+ VAL-APLUS-039: Repeated-work hoisting — reuse cached embedding
+                // if we've already computed one for identical content.
+                // Both TF-IDF and neural embeddings are cached to avoid redundant
+                // ONNX inference on cache hits.
+                let (tfidf_embedding, cached_neural) = if let Some((tfidf, neural)) = work_hoister.lookup(&node_content) {
+                    hoisted_count += 1;
+                    (tfidf, neural)
+                } else {
+                    let embedding = embedder.embed_tfidf(&tokens);
+                    // Don't store yet — we'll store after computing neural embedding
+                    // so both are cached together.
+                    (embedding, None)
                 };
+
+                // Determine neural embedding: use cache hit, or defer to batch call.
+                let neural_embedding;
+                let needs_batch_neural;
+                if cached_neural.is_some() {
+                    neural_embedding = cached_neural;
+                    needs_batch_neural = false;
+                } else if embedder.has_neural() {
+                    // Defer neural embedding to batch call below
+                    neural_embedding = None;
+                    needs_batch_neural = true;
+                } else {
+                    // No neural backend available
+                    work_hoister.store(&node_content, tfidf_embedding.clone(), None);
+                    neural_embedding = None;
+                    needs_batch_neural = false;
+                }
 
                 let signature = crate::search::search::SearchEngine::extract_signature_from_content(
                     &node_content,
@@ -1224,23 +1388,71 @@ pub(crate) fn index_nodes_with_embedder(
                     .filter(|s| s.len() >= 2)
                     .collect();
 
+                let node_vec_idx = nodes.len();
+                if needs_batch_neural {
+                    neural_pending.push(node_vec_idx);
+                }
+
                 nodes.push(NodeInfo {
                     node_id: node.id.clone(),
                     file_path: node.file_path.to_string(),
                     symbol_name: node.name.clone(),
                     language: node.language.clone(),
-                    content: node_content.clone(),
+                    content: node_content,
                     byte_range: node.byte_range,
                     tfidf_embedding,
                     neural_embedding,
-                    embedding: None, // Will be set backward-compat after indexing
                     complexity: node.complexity,
                     signature,
                     pre_tokenized: Some(search_tokens),
                 });
             }
         }
-        search_engine.index_nodes(std::mem::take(&mut nodes));
+
+        // Batch neural embedding: one IPC call for all pending nodes in this chunk.
+        if !neural_pending.is_empty() {
+            #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+            let batch_results = {
+                let texts: Vec<String> = neural_pending.iter().map(|&idx| nodes[idx].content.clone()).collect();
+                embedder.embed_neural_batch_blocking(&texts)
+            };
+            #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+            let batch_results: Vec<Option<Vec<f32>>> = vec![None; neural_pending.len()];
+
+            for (i, &node_vec_idx) in neural_pending.iter().enumerate() {
+                let neural = batch_results.get(i).and_then(|r| r.clone());
+                // Store in work hoister so future cache hits avoid re-computation
+                work_hoister.store(
+                    &nodes[node_vec_idx].content,
+                    nodes[node_vec_idx].tfidf_embedding.clone(),
+                    neural.clone(),
+                );
+                nodes[node_vec_idx].neural_embedding = neural;
+            }
+        }
+
+        search_engine.index_nodes(std::mem::replace(&mut nodes, Vec::with_capacity(batch_size)));
+    }
+
+    // A+ logging: per-batch stats at info! level (invisible under default WARN).
+    if pruned_count > 0 || shed_count > 0 || hoisted_count > 0 {
+        info!(
+            pruned = pruned_count,
+            shed = shed_count,
+            hoisted = hoisted_count,
+            admitted = admission_gate.nodes_admitted(),
+            "A+ bound-gated indexing stats"
+        );
+    }
+
+    // Single summary warn! so users see one warning if any work was shed/pruned.
+    if pruned_count > 0 || shed_count > 0 {
+        warn!(
+            total_pruned = pruned_count,
+            total_shed = shed_count,
+            total_hoisted = hoisted_count,
+            "indexing completed with pruning/shedding — some nodes were filtered"
+        );
     }
 
     Ok(embedder)
@@ -2093,9 +2305,17 @@ mod tests {
         // Extract TfIdfEmbedder from HybridEmbedder to access internal fields
         let tfidf_small = match embedder_small {
             HybridEmbedder::TfIdfOnly(emb) => emb,
+            #[cfg(feature = "onnx")]
+            HybridEmbedder::HybridLocal { tfidf, .. } => tfidf,
+            #[cfg(feature = "remote-embeddings")]
+            HybridEmbedder::HybridRemote { tfidf, .. } => tfidf,
         };
         let tfidf_large = match embedder_large {
             HybridEmbedder::TfIdfOnly(emb) => emb,
+            #[cfg(feature = "onnx")]
+            HybridEmbedder::HybridLocal { tfidf, .. } => tfidf,
+            #[cfg(feature = "remote-embeddings")]
+            HybridEmbedder::HybridRemote { tfidf, .. } => tfidf,
         };
 
         assert_eq!(tfidf_small.vocab, tfidf_large.vocab);
@@ -2130,6 +2350,10 @@ mod tests {
         // Extract TfIdfEmbedder from HybridEmbedder to access dimension
         let tfidf_embedder = match embedder {
             HybridEmbedder::TfIdfOnly(emb) => emb,
+            #[cfg(feature = "onnx")]
+            HybridEmbedder::HybridLocal { tfidf, .. } => tfidf,
+            #[cfg(feature = "remote-embeddings")]
+            HybridEmbedder::HybridRemote { tfidf, .. } => tfidf,
         };
 
         assert_eq!(
@@ -2255,9 +2479,8 @@ mod tests {
     #[test]
     #[cfg(feature = "onnx")]
     fn test_hybrid_embedder_local_creation() {
-        let docs: Vec<(String, String)> = vec![
-            ("test".to_string(), "fn test_function() -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> =
+            vec![("test".to_string(), "fn test_function() -> bool".to_string())];
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         let result = HybridEmbedder::hybrid_local(tfidf_embedder, None);
         // May fail if model not found, but tests the API
@@ -2267,9 +2490,8 @@ mod tests {
     #[test]
     #[cfg(not(feature = "onnx"))]
     fn test_hybrid_embedder_local_feature_not_enabled() {
-        let docs: Vec<(String, String)> = vec![
-            ("test".to_string(), "fn test_function() -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> =
+            vec![("test".to_string(), "fn test_function() -> bool".to_string())];
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         // When ONNX feature is not enabled, only TfIdfOnly is available
         let _ = HybridEmbedder::tfidf_only(tfidf_embedder);
@@ -2279,16 +2501,27 @@ mod tests {
     #[test]
     fn test_hybrid_embedder_tfidf_only_default() {
         let embedder = HybridEmbedder::default();
-        assert!(!embedder.has_neural(), "default embedder should be TF-IDF only");
-        assert_eq!(embedder.tfidf_dimension(), 768, "TF-IDF dimension should be 768");
-        assert!(embedder.neural_dimension().is_none(), "neural dimension should be None");
+        assert!(
+            !embedder.has_neural(),
+            "default embedder should be TF-IDF only"
+        );
+        assert_eq!(
+            embedder.tfidf_dimension(),
+            768,
+            "TF-IDF dimension should be 768"
+        );
+        assert!(
+            embedder.neural_dimension().is_none(),
+            "neural dimension should be None"
+        );
     }
 
     #[test]
     fn test_hybrid_embedder_tfidf_only() {
-        let docs: Vec<(String, String)> = vec![
-            ("auth".to_string(), "fn authenticate_user(token: &str) -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> = vec![(
+            "auth".to_string(),
+            "fn authenticate_user(token: &str) -> bool".to_string(),
+        )];
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         let embedder = HybridEmbedder::tfidf_only(tfidf_embedder);
 
@@ -2297,60 +2530,104 @@ mod tests {
         assert_eq!(embedder.neural_weight(), 0.0);
 
         let weights = embedder.scoring_weights();
-        assert_eq!(weights.tfidf, 0.60, "TF-IDF weight should be 0.60 without neural");
-        assert_eq!(weights.neural, 0.00, "neural weight should be 0.00 without neural");
+        assert_eq!(
+            weights.tfidf, 0.60,
+            "TF-IDF weight should be 0.60 without neural"
+        );
+        assert_eq!(
+            weights.neural, 0.00,
+            "neural weight should be 0.00 without neural"
+        );
     }
 
     #[test]
     #[cfg(feature = "onnx")]
     fn test_hybrid_embedder_local_dimension() {
-        let docs: Vec<(String, String)> = vec![
-            ("test".to_string(), "fn test_function() -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> =
+            vec![("test".to_string(), "fn test_function() -> bool".to_string())];
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         if let Ok(embedder) = HybridEmbedder::hybrid_local(tfidf_embedder, None) {
-            assert!(embedder.has_neural(), "hybrid local embedder should have neural");
-            assert_eq!(embedder.tfidf_dimension(), 768, "TF-IDF dimension should be 768");
-            assert!(embedder.neural_dimension().is_some(), "neural dimension should be Some");
-            assert_eq!(embedder.neural_weight(), 0.40, "neural weight should be 0.40");
+            assert!(
+                embedder.has_neural(),
+                "hybrid local embedder should have neural"
+            );
+            assert_eq!(
+                embedder.tfidf_dimension(),
+                768,
+                "TF-IDF dimension should be 768"
+            );
+            assert!(
+                embedder.neural_dimension().is_some(),
+                "neural dimension should be Some"
+            );
+            assert_eq!(
+                embedder.neural_weight(),
+                0.40,
+                "neural weight should be 0.40"
+            );
 
             let weights = embedder.scoring_weights();
-            assert_eq!(weights.tfidf, 0.30, "TF-IDF weight should be 0.30 with neural");
-            assert_eq!(weights.neural, 0.40, "neural weight should be 0.40 with neural");
+            assert_eq!(
+                weights.tfidf, 0.30,
+                "TF-IDF weight should be 0.30 with neural"
+            );
+            assert_eq!(
+                weights.neural, 0.40,
+                "neural weight should be 0.40 with neural"
+            );
         }
     }
 
     #[test]
     fn test_hybrid_embedder_embed_tfidf() {
-        let docs: Vec<(String, String)> = vec![
-            ("auth".to_string(), "fn authenticate_user(token: &str) -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> = vec![(
+            "auth".to_string(),
+            "fn authenticate_user(token: &str) -> bool".to_string(),
+        )];
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         let embedder = HybridEmbedder::tfidf_only(tfidf_embedder);
 
-        let tokens = vec!["authenticate".to_string(), "user".to_string(), "token".to_string()];
+        let tokens = vec![
+            "authenticate".to_string(),
+            "user".to_string(),
+            "token".to_string(),
+        ];
         let embedding = embedder.embed_tfidf(&tokens);
 
-        assert_eq!(embedding.len(), 768, "TF-IDF embedding dimension should be 768");
+        assert_eq!(
+            embedding.len(),
+            768,
+            "TF-IDF embedding dimension should be 768"
+        );
     }
 
     #[test]
     #[cfg(feature = "onnx")]
     fn test_hybrid_embedder_embed_neural_local() {
-        let docs: Vec<(String, String)> = vec![
-            ("test".to_string(), "fn test_function() -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> =
+            vec![("test".to_string(), "fn test_function() -> bool".to_string())];
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         if let Ok(embedder) = HybridEmbedder::hybrid_local(tfidf_embedder, None) {
-            let tokens = vec!["test".to_string(), "code".to_string(), "embedding".to_string()];
+            let tokens = vec![
+                "test".to_string(),
+                "code".to_string(),
+                "embedding".to_string(),
+            ];
             let tfidf_embedding = embedder.embed_tfidf(&tokens);
 
-            assert_eq!(tfidf_embedding.len(), 768, "TF-IDF embedding dimension should be 768");
+            assert_eq!(
+                tfidf_embedding.len(),
+                768,
+                "TF-IDF embedding dimension should be 768"
+            );
 
             // Test neural embedding generation (blocking version for sync test)
             let text = "test code embedding";
             if let Some(Ok(neural_embedding)) = embedder.embed_neural_blocking(text) {
-                assert!(neural_embedding.len() > 0, "neural embedding should have non-zero dimension");
+                assert!(
+                    neural_embedding.len() > 0,
+                    "neural embedding should have non-zero dimension"
+                );
                 // Real embeddings should have non-zero values
                 let has_nonzero = neural_embedding.iter().any(|&v| v != 0.0);
                 assert!(has_nonzero, "neural embeddings should have non-zero values");
@@ -2365,14 +2642,30 @@ mod tests {
         assert_eq!(weights_with_neural.neural, 0.40);
         assert_eq!(weights_with_neural.structural, 0.15);
         assert_eq!(weights_with_neural.text_match, 0.15);
-        assert!((weights_with_neural.tfidf + weights_with_neural.neural + weights_with_neural.structural + weights_with_neural.text_match - 1.0).abs() < 0.001);
+        assert!(
+            (weights_with_neural.tfidf
+                + weights_with_neural.neural
+                + weights_with_neural.structural
+                + weights_with_neural.text_match
+                - 1.0)
+                .abs()
+                < 0.001
+        );
 
         let weights_without_neural = HybridScoringWeights::without_neural();
         assert_eq!(weights_without_neural.tfidf, 0.60);
         assert_eq!(weights_without_neural.neural, 0.00);
         assert_eq!(weights_without_neural.structural, 0.20);
         assert_eq!(weights_without_neural.text_match, 0.20);
-        assert!((weights_without_neural.tfidf + weights_without_neural.neural + weights_without_neural.structural + weights_without_neural.text_match - 1.0).abs() < 0.001);
+        assert!(
+            (weights_without_neural.tfidf
+                + weights_without_neural.neural
+                + weights_without_neural.structural
+                + weights_without_neural.text_match
+                - 1.0)
+                .abs()
+                < 0.001
+        );
     }
 
     #[test]
@@ -2384,14 +2677,21 @@ mod tests {
             text_match: 0.1,
         };
         custom_weights = custom_weights.normalize();
-        assert!((custom_weights.tfidf + custom_weights.neural + custom_weights.structural + custom_weights.text_match - 1.0).abs() < 0.001);
+        assert!(
+            (custom_weights.tfidf
+                + custom_weights.neural
+                + custom_weights.structural
+                + custom_weights.text_match
+                - 1.0)
+                .abs()
+                < 0.001
+        );
     }
 
     #[test]
     fn test_hybrid_embedder_compare_backends() {
-        let docs: Vec<(String, String)> = vec![
-            ("test".to_string(), "fn test_function() -> bool".to_string()),
-        ];
+        let docs: Vec<(String, String)> =
+            vec![("test".to_string(), "fn test_function() -> bool".to_string())];
 
         let tfidf_embedder = TfIdfEmbedder::build(&docs);
         let tfidf_only = HybridEmbedder::tfidf_only(tfidf_embedder.clone());

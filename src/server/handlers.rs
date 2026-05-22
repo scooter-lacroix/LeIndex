@@ -131,7 +131,7 @@ pub async fn list_codebases(
         .query_map([], |row| {
             let last_indexed: Option<String> = row.get(11).ok();
             let last_indexed_str = last_indexed.unwrap_or_else(|| "Unknown".to_string());
-            
+
             Ok(CodebaseResponse {
                 id: row.get::<_, String>(0)?,
                 unique_project_id: row.get::<_, String>(0)?,
@@ -658,13 +658,13 @@ pub async fn get_file_tree(
     let files = stmt
         .query_map([&id], |row| {
             let file_path: String = row.get(0)?;
-            
+
             // Get actual file size
             let full_path = std::path::PathBuf::from(&project_path).join(&file_path);
             let size = std::fs::metadata(&full_path)
                 .map(|m| Some(m.len()))
                 .unwrap_or(None);
-            
+
             Ok(FileNode {
                 name: file_path
                     .rsplit('/')

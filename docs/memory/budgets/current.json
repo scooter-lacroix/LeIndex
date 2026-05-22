@@ -1,0 +1,55 @@
+{
+  "description": "Absolute memory budget ceilings for memcheck regression gating. Single source of truth consumed by cargo xtask memcheck and CI. Tightened to C-phase band after Plan 3 worker-aware memory accounting. Combined ceilings apply to main+worker RSS during worker-active phases.",
+  "fixture": "small_repo",
+  "regression_rules": {
+    "baseline_tolerance_pct": 5,
+    "ceiling_tolerance_pct": 10
+  },
+  "phases": {
+    "idle_warm": {
+      "rss_max_kib": 102400,
+      "description": "After C: 102400 KiB (100 MiB). Main daemon idle.",
+      "combined_rss_max_kib": null
+    },
+    "index": {
+      "rss_max_kib": 307200,
+      "description": "After C: 307200 KiB (300 MiB). Main daemon indexing.",
+      "combined_rss_max_kib": null
+    },
+    "idle_post": {
+      "rss_max_kib": 102400,
+      "description": "After C: 102400 KiB (100 MiB). Main daemon idle post-index.",
+      "combined_rss_max_kib": null
+    },
+    "query": {
+      "rss_max_kib": 184320,
+      "description": "After C: 184320 KiB (180 MiB). Main daemon query.",
+      "combined_rss_max_kib": null
+    },
+    "reindex": {
+      "rss_max_kib": 307200,
+      "description": "After C: 307200 KiB (300 MiB). Main daemon reindexing.",
+      "combined_rss_max_kib": null
+    },
+    "idle_final": {
+      "rss_max_kib": 102400,
+      "description": "After C: 102400 KiB (100 MiB). Main daemon idle final.",
+      "combined_rss_max_kib": null
+    },
+    "embed_idle": {
+      "rss_max_kib": 102400,
+      "description": "After C: 102400 KiB (100 MiB). Main daemon idle before embed demand. No worker spawned yet.",
+      "combined_rss_max_kib": null
+    },
+    "embed_active": {
+      "rss_max_kib": 102400,
+      "description": "After C: 102400 KiB (100 MiB). Main daemon during worker-active embedding. Worker carries the model residency.",
+      "combined_rss_max_kib": 307200
+    },
+    "embed_teardown": {
+      "rss_max_kib": 102400,
+      "description": "After C: 102400 KiB (100 MiB). Main daemon idle after worker teardown. Worker process should be gone.",
+      "combined_rss_max_kib": null
+    }
+  }
+}

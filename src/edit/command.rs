@@ -47,6 +47,18 @@ pub enum EditChange {
     },
 }
 
+impl EditChange {
+    /// Estimated byte size of this change for cache accounting.
+    pub fn estimated_size(&self) -> usize {
+        match self {
+            Self::ReplaceText { new_text, .. } => new_text.len() + 32,
+            Self::RenameSymbol { old_name, new_name } => old_name.len() + new_name.len() + 32,
+            Self::ExtractFunction { function_name, .. } => function_name.len() + 32,
+            Self::InlineVariable { variable_name } => variable_name.len() + 32,
+        }
+    }
+}
+
 /// Edit request
 #[derive(Debug, Clone)]
 pub struct EditRequest {

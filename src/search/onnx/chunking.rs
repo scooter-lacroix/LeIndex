@@ -89,16 +89,11 @@ impl CrossLanguageChunker {
         };
 
         // Add cross-language references if enabled
-        let cross_ref_marker = if self.config.include_cross_file_refs && !cross_lang_refs.is_empty() {
+        let cross_ref_marker = if self.config.include_cross_file_refs && !cross_lang_refs.is_empty()
+        {
             let refs: Vec<String> = cross_lang_refs
                 .iter()
-                .map(|(lang, symbols)| {
-                    format!(
-                        "// REFERENCES[{}]: {}",
-                        lang,
-                        symbols.join(", ")
-                    )
-                })
+                .map(|(lang, symbols)| format!("// REFERENCES[{}]: {}", lang, symbols.join(", ")))
                 .collect();
             format!("{}\n", refs.join("\n"))
         } else {
@@ -128,7 +123,11 @@ impl CrossLanguageChunker {
                 chunks.push(SemanticChunk {
                     content: format!(
                         "{}{}// CHUNK {}/{}\n{}",
-                        language_marker, cross_ref_marker, i + 1, total_chunks, chunk_content
+                        language_marker,
+                        cross_ref_marker,
+                        i + 1,
+                        total_chunks,
+                        chunk_content
                     ),
                     language: language.to_string(),
                     file_path: file_path.to_string(),
@@ -158,7 +157,10 @@ impl CrossLanguageChunker {
         match language {
             "python" => {
                 // Look for SQL queries
-                if content.contains("SELECT") || content.contains("INSERT") || content.contains("UPDATE") {
+                if content.contains("SELECT")
+                    || content.contains("INSERT")
+                    || content.contains("UPDATE")
+                {
                     refs.entry("sql".to_string())
                         .or_insert_with(Vec::new)
                         .push("database_query".to_string());

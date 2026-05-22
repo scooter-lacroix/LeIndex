@@ -1,0 +1,81 @@
+# Memory-budget CI gate
+#
+# Runs on pull requests to enforce the memory regression contract.
+# Builds in release mode, runs memcheck against the canonical small fixture,
+# and uploads the report as a CI artifact for inspection.
+#
+# VAL-MEASURE-014: Memory-budget workflow runs on pull requests.
+# VAL-MEASURE-015: Builds release and runs memcheck against small_repo.
+# VAL-MEASURE-016: Uploads the memcheck report as an artifact.
+# VAL-MEASURE-027: Does not require memprof.
+# VAL-MEASURE-028: Linux-first scope.
+
+name: Memory Budget
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'src/**'
+      - 'crates/**'
+      - 'tools/memcheck/**'
+      - 'tools/xtask/**'
+      - 'docs/memory/**'
+      - 'tests/fixtures/memcheck/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: memory-budget-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  memcheck:
+    name: Memory budget gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: memcheck-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            memcheck-${{ runner.os }}-
+
+      - name: Download model assets
+        run: |
+          mkdir -p models
+          HF_REPO="onnx-community/Qwen3-Embedding-0.6B-ONNX"
+          curl --fail --location --progress-bar -o models/qwen3-embed-0.6b.onnx \
+            "https://huggingface.co/${HF_REPO}/resolve/main/onnx/model.onnx"
+          curl --fail --location --progress-bar -o models/tokenizer.json \
+            "https://huggingface.co/${HF_REPO}/resolve/main/tokenizer.json"
+
+      - name: Build release binary
+        run: cargo build --release -p leindex -p leindex-embed --features leindex/onnx,leindex-embed/onnx
+
+      - name: Run memcheck against canonical fixture
+        run: cargo xtask memcheck
+
+      - name: Upload memcheck report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memcheck-report
+          path: target/memcheck-report.json
+          retention-days: 14

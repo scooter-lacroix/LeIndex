@@ -49,6 +49,14 @@ pub struct Cli {
     #[arg(long = "stdio")]
     pub stdio: bool,
 
+    /// Write a lightweight memory summary to PATH on graceful shutdown.
+    ///
+    /// The report is a compact JSON file containing peak RSS and phase-level
+    /// max/sample information. Also enabled by the `LEINDEX_MEMORY_REPORT`
+    /// environment variable (the CLI flag takes precedence).
+    #[arg(global = true, long = "memory-report", value_name = "PATH")]
+    pub memory_report: Option<PathBuf>,
+
     /// Subcommand to execute
     #[command(subcommand)]
     pub command: Option<Commands>,
@@ -265,6 +273,18 @@ impl Cli {
         // Initialize logging
         init_logging_impl(self.verbose);
 
+        // Set up optional memory report tracker.
+        // The tracker observes RSS during execution and writes a compact JSON
+        // summary on drop (graceful shutdown). Also enabled via
+        // LEINDEX_MEMORY_REPORT env var; CLI flag takes precedence.
+        if let Some(path) =
+            crate::cli::memory_report::resolve_report_path(self.memory_report.as_deref())
+        {
+            crate::cli::memory_report::init_tracker(
+                crate::cli::memory_report::MemoryReportTracker::new(path),
+            );
+        }
+
         // Get global project path
         let global_project = self.project_path;
 
@@ -284,7 +304,7 @@ impl Cli {
 
         maybe_complete_post_install_actions(&command);
 
-        match command {
+        let result = match command {
             Commands::Index {
                 path,
                 force,
@@ -346,16 +366,30 @@ impl Cli {
                 max_age_days,
                 dry_run,
             } => cmd_cleanup_impl(max_age_days, dry_run).await,
-        }
+        };
+
+        // Write the memory report (if tracking was enabled) before returning.
+        // Rust does not run Drop for statics, so this must be explicit.
+        crate::cli::memory_report::shutdown();
+
+        result
     }
 }
 
-/// Initialize logging implementation
+/// Initialize logging implementation.
+///
+/// In non-verbose mode the default level is WARN so that routine `info!()`
+/// chatter (storage paths, cache hits, PDG node counts, etc.) stays off the
+/// terminal.  Only warnings and errors reach stderr unless `--verbose` is
+/// passed, in which case DEBUG-level output is enabled.
+///
+/// This keeps CLI output clean and token-efficient for LLM consumers while
+/// preserving full diagnostics behind the `--verbose` flag.
 fn init_logging_impl(verbose: bool) {
     let level = if verbose {
         tracing::Level::DEBUG
     } else {
-        tracing::Level::INFO
+        tracing::Level::WARN
     };
 
     let subscriber = tracing_subscriber::fmt()
@@ -1053,55 +1087,71 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
 
 /// MCP stdio command implementation - Run MCP server in stdio mode
 /// This mode allows AI tools to start LeIndex as a subprocess for automatic integration
+///
+/// Initialization is deferred: the server enters the stdin read loop immediately
+/// (no SQLite open, no PDG load, no TF-IDF rebuild, no file watcher at startup).
+/// Projects are loaded lazily on first tool call via `ProjectRegistry::get_or_load()`.
 async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     use crate::cli::mcp::protocol::{JsonRpcError, JsonRpcMessage, JsonRpcResponse};
     use std::io::{self, BufRead, Read, Write};
 
-    let project_path = get_project_path(project);
-    let canonical_path = project_path
-        .canonicalize()
-        .context("Failed to canonicalize project path")?;
+    info!("Starting LeIndex MCP stdio server (lazy project loading)");
 
-    info!(
-        "Starting LeIndex MCP stdio server for project: {}",
-        canonical_path.display()
-    );
+    // Record RSS observation at startup for memory report.
+    crate::cli::memory_report::observe_rss("mcp_stdio_startup");
 
-    // Create LeIndex instance
-    let mut leindex = LeIndex::new(&canonical_path).context("Failed to create LeIndex instance")?;
+    // Fast initialization: create empty registry + set all globals, no I/O.
+    // Projects are loaded lazily when tool calls provide a `project_path`.
+    let server = crate::cli::mcp::server::McpServer::new(
+        crate::cli::mcp::server::McpServerConfig::default(),
+    )
+    .context("Failed to create MCP server")?;
 
-    // Try to load from storage, but don't fail if not indexed yet
-    let _ = leindex.load_from_storage();
+    // Spawn background task to clean up stale sessions periodically.
+    // In HTTP mode, `McpServer::run()` starts this internally, but stdio
+    // mode uses its own read loop so we need to start it explicitly.
+    {
+        let cleanup_server = server.clone();
+        let cleanup_handle = tokio::spawn(async move {
+            const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+            const SESSION_MAX_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
+            let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+            loop {
+                interval.tick().await;
+                let removed = cleanup_server.cleanup_stale_sessions(SESSION_MAX_IDLE);
+                if removed > 0 {
+                    tracing::debug!("Cleaned up {} stale session(s)", removed);
+                }
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(e) = cleanup_handle.await {
+                tracing::error!("MCP stdio cleanup task died: {e}");
+            }
+        });
+    }
 
-    // Initialize global state for handlers
-    let registry = Arc::new(ProjectRegistry::with_initial_project(
-        DEFAULT_MAX_PROJECTS,
-        leindex,
-    ));
-    let _ = crate::cli::mcp::server::SERVER_STATE.set(registry.clone());
-
-    // Initialize handlers
-    let _ = crate::cli::mcp::server::HANDLERS.set(all_tool_handlers());
-
-    // Initialize SERVER_INSTANCE for stdio mode
-    let server = crate::cli::mcp::server::McpServer {
-        config: crate::cli::mcp::server::McpServerConfig::default(),
-        _registry: registry.clone(),
-        handshake_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        session_handshakes: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-    };
-    crate::cli::mcp::server::SERVER_INSTANCE
-        .set(Arc::new(server))
-        .map_err(|_| anyhow::anyhow!("Server instance already initialized"))?;
-
-    eprintln!("[INFO] LeIndex MCP stdio server starting");
-    eprintln!("[INFO] Project: {}", canonical_path.display());
-    eprintln!("[INFO] Reading JSON-RPC from stdin, writing to stdout");
-    eprintln!("[INFO] Press Ctrl+C to stop\n");
+    // Register a default project path for tool calls that omit project_path.
+    // If --project was provided, canonicalize it; otherwise, use CWD.
+    // The actual LeIndex creation happens lazily on first tool call.
+    {
+        let registry = crate::cli::mcp::server::SERVER_STATE
+            .get()
+            .context("Server state not initialized")?;
+        let resolved_path = match project {
+            Some(ref p) => p
+                .canonicalize()
+                .with_context(|| format!("Cannot resolve project path '{}'", p.display()))?,
+            None => std::env::current_dir()
+                .context("Cannot determine current working directory")?,
+        };
+        registry.set_default_path(resolved_path.clone()).await;
+        info!("Default project path set to: {}", resolved_path.display());
+    }
 
     let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
     let mut reader = io::BufReader::new(stdin.lock());
+    let mut stdout = io::stdout().lock();
     let mut use_content_length = false;
 
     loop {
@@ -1109,8 +1159,9 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         let bytes = match reader.read_line(&mut line) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("[ERROR] Failed to read stdin: {}", e);
-                continue;
+                // Persistent / fatal error — break to allow graceful shutdown.
+                tracing::debug!("MCP stdio: fatal read error, breaking loop: {}", e);
+                break;
             }
         };
         if bytes == 0 {
@@ -1130,10 +1181,30 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
             let length: usize = match len_str.parse() {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("[ERROR] Invalid Content-Length header: {}", e);
+                    tracing::debug!("MCP stdio: invalid Content-Length header: {}", e);
                     continue;
                 }
             };
+
+            const MAX_STDIN_PAYLOAD: usize = 10 * 1024 * 1024; // 10 MiB
+            if length > MAX_STDIN_PAYLOAD {
+                eprintln!("[ERROR] Payload too large: {} bytes (max: {} bytes)", length, MAX_STDIN_PAYLOAD);
+                // Consume remaining headers first to align the stream
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                }
+                // Now drain the oversized body to keep stdin framing aligned
+                if io::copy(&mut reader.by_ref().take(length as u64), &mut io::sink()).is_err() {
+                    break;
+                }
+                continue;
+            }
 
             // Consume remaining header lines until blank line
             loop {
@@ -1147,8 +1218,8 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
             }
 
             let mut buf = vec![0u8; length];
-            if let Err(e) = reader.read_exact(&mut buf) {
-                eprintln!("[ERROR] Failed to read JSON payload: {}", e);
+            if let Err(e) = io::Read::read_exact(&mut reader, &mut buf) {
+                tracing::debug!("MCP stdio: failed to read JSON payload: {}", e);
                 break;
             }
 
@@ -1182,18 +1253,11 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 
         // Handle based on message type
         match message {
-            JsonRpcMessage::Notification(notification) => {
-                eprintln!(
-                    "[INFO] Received notification: {} (type: {})",
-                    notification.method,
-                    notification.notification_type()
-                );
-                continue;
-            }
+            JsonRpcMessage::Notification(_notification) => continue,
             JsonRpcMessage::Request(request) => {
                 let request_id = request.id.clone().unwrap_or(serde_json::Value::Null);
 
-                let response = match handle_mcp_request(request, project_path.clone()).await {
+                let response = match handle_mcp_request(request, PathBuf::new()).await {
                     Ok(r) => r,
                     Err(e) => Some(JsonRpcResponse::error(
                         request_id,
@@ -1223,11 +1287,11 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
                     )
                     .is_err()
                     {
-                        eprintln!("[ERROR] Failed to write to stdout");
+                        tracing::debug!("MCP stdio: failed to write to stdout");
                         break;
                     }
                 } else if writeln!(stdout, "{}", response_json).is_err() {
-                    eprintln!("[ERROR] Failed to write to stdout");
+                    tracing::debug!("MCP stdio: failed to write to stdout");
                     break;
                 }
                 let _ = stdout.flush();
@@ -1351,7 +1415,7 @@ fn print_tool_help(handler: &ToolHandler) {
     let kebab_short = short_name.replace('_', "-");
     let kebab_full = normalized.replace('_', "-");
 
-    println!("{}", handler.name());
+    println!("{}", format_tool_title(handler.title()));
     println!("{}", handler.description());
     println!();
     println!("Aliases:");
@@ -1435,6 +1499,17 @@ fn print_tool_help(handler: &ToolHandler) {
 
 fn normalize_tool_name(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn format_tool_title(title: &str) -> String {
+    if let Some(rest) = title
+        .strip_prefix("LeIndex [")
+        .and_then(|s| s.strip_suffix(']'))
+    {
+        format!("LEINDEX [{}]", rest)
+    } else {
+        title.to_string()
+    }
 }
 
 fn find_tool_handler(name: &str) -> Option<ToolHandler> {
@@ -2023,5 +2098,29 @@ mod tests {
             }
             _ => panic!("Expected Cleanup command"),
         }
+    }
+
+    #[test]
+    fn test_memory_report_flag_parsing() {
+        // VAL-MEASURE-020: --memory-report is an opt-in CLI surface
+        let cli = Cli::try_parse_from([
+            "leindex",
+            "--memory-report",
+            "/tmp/mem-report.json",
+            "index",
+            "/tmp/project",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.memory_report,
+            Some(PathBuf::from("/tmp/mem-report.json"))
+        );
+        assert!(matches!(cli.command, Some(Commands::Index { .. })));
+    }
+
+    #[test]
+    fn test_memory_report_flag_absent_by_default() {
+        let cli = Cli::try_parse_from(["leindex", "index", "/tmp/project"]).unwrap();
+        assert!(cli.memory_report.is_none());
     }
 }

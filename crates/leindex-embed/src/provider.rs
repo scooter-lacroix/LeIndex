@@ -1,0 +1,319 @@
+// Execution provider selection for the worker process
+//
+// VAL-CPHASE-011: Runtime honors configured execution-provider selection
+// and reports fallback when the requested provider is unavailable.
+//
+// The selector checks whether the requested provider is available and
+// reports the result. If the requested provider is not available, it
+// falls back to CPU and reports the reason.
+
+#[cfg(feature = "onnx")]
+use ort::ep::ExecutionProvider as _;
+
+/// Result of execution provider selection.
+#[derive(Debug, Clone)]
+pub struct ProviderSelection {
+    /// The selected provider.
+    provider: Provider,
+    /// Whether this was the originally requested provider.
+    is_requested: bool,
+    /// Reason for fallback if the requested provider was unavailable.
+    fallback_reason: Option<String>,
+}
+
+impl ProviderSelection {
+    /// Get the name of the selected provider.
+    pub fn name(&self) -> String {
+        self.provider.name()
+    }
+
+    /// Get the fallback provider name (the actually selected provider when fallback occurred).
+    pub fn fallback_name(&self) -> String {
+        self.provider.name()
+    }
+
+    /// Get the reason for fallback.
+    pub fn reason(&self) -> String {
+        self.fallback_reason
+            .clone()
+            .unwrap_or_else(|| "no fallback".to_string())
+    }
+
+    /// Whether the requested provider was available.
+    pub fn is_requested_provider(&self) -> bool {
+        self.is_requested
+    }
+}
+
+/// Supported execution providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    /// CPU execution provider (always available).
+    Cpu,
+    /// CUDA GPU execution provider.
+    Cuda,
+    /// ROCm GPU execution provider.
+    Rocm,
+    /// CoreML execution provider (macOS).
+    CoreMl,
+}
+
+impl Provider {
+    /// Get the name of this provider.
+    pub fn name(&self) -> String {
+        match self {
+            Provider::Cpu => "cpu".to_string(),
+            Provider::Cuda => "cuda".to_string(),
+            Provider::Rocm => "rocm".to_string(),
+            Provider::CoreMl => "coreml".to_string(),
+        }
+    }
+
+    /// Parse a provider from a string name.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_lowercase().as_str() {
+            "cpu" => Some(Provider::Cpu),
+            "cuda" | "gpu" => Some(Provider::Cuda),
+            "rocm" => Some(Provider::Rocm),
+            "coreml" => Some(Provider::CoreMl),
+            _ => None,
+        }
+    }
+}
+
+/// Selector for execution providers.
+///
+/// Checks availability of the requested provider and falls back to CPU
+/// if the requested provider is not available.
+pub struct ExecutionProviderSelector;
+
+impl ExecutionProviderSelector {
+    /// Select an execution provider based on the requested name.
+    ///
+    /// VAL-CPHASE-011: Honors configured selection and reports fallback.
+    ///
+    /// Returns `Ok(ProviderSelection)` if the requested provider is available,
+    /// or `Err(ProviderSelection)` with a fallback to CPU if not.
+    pub fn select(requested: &str) -> Result<ProviderSelection, ProviderSelection> {
+        let requested_provider = Provider::from_name(requested);
+
+        match requested_provider {
+            Some(Provider::Cpu) => Ok(ProviderSelection {
+                provider: Provider::Cpu,
+                is_requested: true,
+                fallback_reason: None,
+            }),
+            Some(provider @ Provider::Cuda) => {
+                if Self::is_cuda_available() {
+                    Ok(ProviderSelection {
+                        provider,
+                        is_requested: true,
+                        fallback_reason: None,
+                    })
+                } else {
+                    Err(ProviderSelection {
+                        provider: Provider::Cpu,
+                        is_requested: false,
+                        fallback_reason: Some(
+                            "CUDA runtime or driver not found on this system".to_string(),
+                        ),
+                    })
+                }
+            }
+            Some(provider @ Provider::Rocm) => {
+                if Self::is_rocm_available() {
+                    Ok(ProviderSelection {
+                        provider,
+                        is_requested: true,
+                        fallback_reason: None,
+                    })
+                } else {
+                    Err(ProviderSelection {
+                        provider: Provider::Cpu,
+                        is_requested: false,
+                        fallback_reason: Some("ROCm runtime not found on this system".to_string()),
+                    })
+                }
+            }
+            Some(provider @ Provider::CoreMl) => {
+                if Self::is_coreml_available() {
+                    Ok(ProviderSelection {
+                        provider,
+                        is_requested: true,
+                        fallback_reason: None,
+                    })
+                } else {
+                    Err(ProviderSelection {
+                        provider: Provider::Cpu,
+                        is_requested: false,
+                        fallback_reason: Some("CoreML is only available on macOS".to_string()),
+                    })
+                }
+            }
+            None => {
+                // Unknown provider name — fall back to CPU
+                Err(ProviderSelection {
+                    provider: Provider::Cpu,
+                    is_requested: false,
+                    fallback_reason: Some(format!(
+                        "unknown execution provider '{}', falling back to CPU",
+                        requested
+                    )),
+                })
+            }
+        }
+    }
+
+    /// Check if CUDA is available on this system.
+    fn is_cuda_available() -> bool {
+        #[cfg(feature = "onnx")]
+        {
+            ort::ep::CUDA::default().is_available().unwrap_or(false)
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            // Conservative fallback: check environment and driver presence
+            std::env::var("CUDA_PATH").is_ok()
+                || std::path::Path::new("/usr/bin/nvidia-smi").exists()
+                || std::path::Path::new("/usr/local/cuda/bin/nvidia-smi").exists()
+        }
+    }
+
+    /// Check if ROCm is available on this system.
+    fn is_rocm_available() -> bool {
+        #[cfg(feature = "onnx")]
+        {
+            ort::ep::ROCm::default().is_available().unwrap_or(false)
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            // Conservative fallback: check environment and driver presence
+            std::env::var("ROCM_PATH").is_ok()
+                || std::path::Path::new("/opt/rocm/bin/rocm-smi").exists()
+        }
+    }
+
+    /// Check if CoreML is available (macOS only).
+    fn is_coreml_available() -> bool {
+        cfg!(target_os = "macos")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cpu_provider_always_available() {
+        let result = ExecutionProviderSelector::select("cpu");
+        assert!(result.is_ok());
+        let selection = result.unwrap();
+        assert_eq!(selection.name(), "cpu");
+        assert!(selection.is_requested_provider());
+    }
+
+    #[test]
+    fn test_cpu_provider_case_insensitive() {
+        let result = ExecutionProviderSelector::select("CPU");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().name(), "cpu");
+    }
+
+    #[test]
+    fn test_unknown_provider_falls_back_to_cpu() {
+        let result = ExecutionProviderSelector::select("tpu");
+        assert!(result.is_err());
+        let fallback = result.unwrap_err();
+        assert_eq!(fallback.fallback_name(), "cpu");
+        assert!(!fallback.is_requested_provider());
+        assert!(fallback.reason().contains("unknown"));
+    }
+
+    #[test]
+    fn test_cuda_provider_selection() {
+        let result = ExecutionProviderSelector::select("cuda");
+        // Result depends on whether CUDA is actually installed
+        match result {
+            Ok(selection) => {
+                assert_eq!(selection.name(), "cuda");
+                assert!(selection.is_requested_provider());
+            }
+            Err(fallback) => {
+                assert_eq!(fallback.fallback_name(), "cpu");
+                assert!(!fallback.is_requested_provider());
+                assert!(fallback.reason().contains("CUDA"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_gpu_alias_for_cuda() {
+        let result = ExecutionProviderSelector::select("gpu");
+        // "gpu" is an alias for "cuda"
+        match result {
+            Ok(selection) => {
+                assert_eq!(selection.name(), "cuda");
+            }
+            Err(fallback) => {
+                assert_eq!(fallback.fallback_name(), "cpu");
+            }
+        }
+    }
+
+    #[test]
+    fn test_rocm_provider_selection() {
+        let result = ExecutionProviderSelector::select("rocm");
+        match result {
+            Ok(selection) => {
+                assert_eq!(selection.name(), "rocm");
+            }
+            Err(fallback) => {
+                assert_eq!(fallback.fallback_name(), "cpu");
+                assert!(fallback.reason().contains("ROCm"));
+            }
+        }
+    }
+
+    #[test]
+    fn test_coreml_provider_selection() {
+        let result = ExecutionProviderSelector::select("coreml");
+        if cfg!(target_os = "macos") {
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap().name(), "coreml");
+        } else {
+            assert!(result.is_err());
+            let fallback = result.unwrap_err();
+            assert_eq!(fallback.fallback_name(), "cpu");
+            assert!(fallback.reason().contains("macOS"));
+        }
+    }
+
+    #[test]
+    fn test_provider_from_name() {
+        assert_eq!(Provider::from_name("cpu"), Some(Provider::Cpu));
+        assert_eq!(Provider::from_name("CUDA"), Some(Provider::Cuda));
+        assert_eq!(Provider::from_name("rocm"), Some(Provider::Rocm));
+        assert_eq!(Provider::from_name("CoreML"), Some(Provider::CoreMl));
+        assert_eq!(Provider::from_name("unknown"), None);
+    }
+
+    #[test]
+    fn test_provider_name() {
+        assert_eq!(Provider::Cpu.name(), "cpu");
+        assert_eq!(Provider::Cuda.name(), "cuda");
+        assert_eq!(Provider::Rocm.name(), "rocm");
+        assert_eq!(Provider::CoreMl.name(), "coreml");
+    }
+
+    #[test]
+    fn test_provider_selection_fields() {
+        let sel = ProviderSelection {
+            provider: Provider::Cpu,
+            is_requested: true,
+            fallback_reason: None,
+        };
+        assert_eq!(sel.name(), "cpu");
+        assert!(sel.is_requested_provider());
+        assert_eq!(sel.reason(), "no fallback");
+    }
+}

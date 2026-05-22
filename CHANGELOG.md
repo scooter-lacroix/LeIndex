@@ -2,6 +2,76 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [1.7.0] - 2026-05-15
+
+### Added
+
+- **Memory measurement framework**: New `cargo xtask memcheck` command for measuring memory usage across canonical workload phases (idle, indexing, querying). Includes baseline and budget system that tracks memory targets and detects regressions automatically.
+- **Baseline management**: `--update-baseline` flag for rebaselining when intentional changes affect memory. Baseline metadata gate requires explicit justification for baseline changes.
+- **Memory reporting**: `--memory-report` CLI flag and `LEINDEX_MEMORY_REPORT` environment variable for lightweight shutdown memory summaries. Optional `memprof` feature flag for deep heap profiling.
+- **CI memory gates**: Memory-budget CI workflow that runs on pull requests and enforces regression gates. PR template includes memory-impact guidance.
+- **Borrowed mmap vector access**: Replaces heap-allocated embedding storage with memory-mapped vectors, significantly reducing resident memory during search operations.
+- **Row-oriented vector lookup**: Stable row indices allow direct lookup by node ID without maintaining parallel heap structures.
+- **Heap-to-mmap swap with delta overlays**: Live updates apply through delta-overlay layers with tombstones for deleted entries, avoiding full rebuilds.
+- **Threshold-driven compaction**: Rebuilds the row map automatically when fragmentation exceeds configurable limits.
+- **Compact integer-backed metadata**: Search structures use compact integer addressing instead of string-based keys.
+- **Staged retrieval pipeline**: Coarse candidate generation phase followed by exact rerank, reducing compute without replacing the INT8/default quality-gated path.
+- **INT8 quantization quality gate**: Promotion to INT8 is blocked unless NDCG and latency thresholds are met. FP32 comparison path is preserved as a fallback.
+- **Worker process architecture**: New `leindex-embed` worker binary for ONNX inference, fully separate from the main process. Local IPC protocol with stable frame round-trips for main-to-worker communication.
+- **Worker lifecycle management**: Cold-start on first demand, reuse before idle timeout, teardown on idle, restart on later demand. Startup reporting and model-path/provider selection.
+- **Worker-aware memcheck accounting**: Reports main, worker, and combined RSS separately for clear attribution.
+- **Model bundle pipeline**: Deterministic worker-ready model asset generation with fail-fast on missing inputs, bundle guardrails, and checksums for shipped artifacts.
+- **On-demand fuzzy node discovery**: Deep analysis and context tools now cover event-loop-heavy files through fuzzy node matching.
+- **Bound-gated indexing controls**: Suppresses oversized or bursty work to prevent memory spikes during indexing.
+- **Bounded repeated-work hoisting**: Prevents redundant re-indexing within configurable time windows.
+
+### Changed
+
+- **Runtime and dependency graph slimming**: Turso/libsql moved behind an opt-in feature flag. MCP dependency stack unified. Tokio usage narrowed to reduce baseline memory.
+- **SQLite cache budget cuts**: Hard cache ceilings for global registry, project writer/reader roles, and memory defaults lowered across the board.
+- **Edit-preview and search caches**: Now have synchronous byte bounds to prevent unbounded growth.
+- **NodeInfo compatibility bridge**: One-minior-version legacy payload support window for smooth upgrades.
+- **ONNX provider lifecycle**: Providers unload after inactivity and lazily reload on demand, reducing idle memory.
+- **MCP session-state and registry-slot cleanup**: Hotspot elimination in session management paths.
+- **Snapshot path redesigned**: Avoids full embedding clone amplification during index snapshots.
+- **Fixed SQLite reader topology**: One writer plus a bounded reader pool replaces the previous unbounded connection model.
+- **Bounded parse/index backpressure**: Prevents memory accumulation during large indexing runs.
+- **Selective pruning**: Low-information and generated-code files are pruned during indexing to reduce index size and memory.
+- **CLI output normalization**: Suppresses irrelevant INFO chatter, returns concise structured progress and result data.
+- **MCP output normalization**: Token-efficient framing without leaking transport logs.
+- **Release workflow**: Updated to bundle both executables (main and worker) and models in a single archive.
+- **Shell installers**: Install both binaries and model assets.
+- **npm installer**: Downloads, verifies, and packages the worker bundle.
+- **Memory target progression**: Monotonically tightening unless explicitly rebaselined, enforced across all milestones.
+
+### Fixed
+
+- HybridRemote warning throttled to log once per indexing run.
+- Improved error logging, HTTP compression support, and overflow regression tests.
+- mmap size computation guarded against integer overflow.
+- Cross-compilation: reqwest switched to rustls, missing documentation fixed.
+- First-run metadata migration tolerance for clean startup on new installations.
+- Remote-embeddings feature now correctly requires the ONNX feature.
+- Pre-existing test failures addressed across the test suite.
+- Session access time tracking and overflow checks for ID section calculation.
+- Version parity enforced across all published surfaces (Cargo.toml, npm, PyPI).
+- Type errors, panic safety, and JSON-RPC compliance fixes from reviewer feedback.
+- Remote embeddings, cross-device file ops, and protocol compliance fixes.
+- Critical reviewer findings on crashes, memory issues, and vulnerabilities addressed.
+- Auto-refresh index after edit-apply to eliminate stale warnings.
+- SSE index streaming staleness check added.
+- Duplicate TF-IDF ownership removed in search serialization.
+
+### Removed
+
+- Dead ONNX lifecycle code in `src/search/onnx/qwen.rs` and `src/search/onnx/reranker.rs`, superseded by the worker architecture.
+
+### Infrastructure
+
+- **Memory band verification**: A+ phase verified at idle_warm ~9852 KiB, index ~20168 KiB, query ~13480 KiB. B-phase verified and tightened further.
+- **Cross-roadmap governance**: Baseline and budget governance remains authoritative across all milestones. Compatibility windows preserved through minor-release boundaries.
+- **Release and documentation alignment**: All guidance stays aligned with the actual landed state of the codebase.
+
 ## [1.9.0] - 2026-05-12
 
 ### ✨ New Features

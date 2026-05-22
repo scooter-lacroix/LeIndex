@@ -238,6 +238,13 @@ impl LeIndex {
     /// - Short symbol name (`"health_check"`)
     /// - Qualified name (`"ClassName.method_name"`)
     /// - `"file_path:symbol_name"` partial IDs
+    /// - Fuzzy/partial name match (e.g., `"event_loop"` matches `run_event_loop`)
+    ///
+    /// When the initial lookup fails, performs an on-demand expansion scan
+    /// of the PDG to discover nodes whose names contain the query as a
+    /// substring. This ensures event-loop-heavy files (e.g., winit
+    /// entrypoints) are discoverable even when the exact symbol name
+    /// differs from the query.
     ///
     /// Populates the SearchResult with real metadata from the PDG node.
     pub fn expand_node_context(
@@ -255,10 +262,12 @@ impl LeIndex {
         // 1. Exact ID match (full "file_path:qualified_name")
         // 2. By name (short display name like "health_check")
         // 3. Case-insensitive substring match on name or id
+        // 4. On-demand fuzzy scan: find nodes whose name contains the query
         let resolved_nid = pdg
             .find_by_symbol(node_id)
             .or_else(|| pdg.find_by_name(node_id))
-            .or_else(|| pdg.find_by_name_in_file(node_id, None));
+            .or_else(|| pdg.find_by_name_in_file(node_id, None))
+            .or_else(|| fuzzy_find_node(pdg, node_id));
 
         let (result_node_id, file_path, symbol_name, language, byte_range, complexity) =
             if let Some(nid) = resolved_nid {
@@ -348,13 +357,15 @@ impl LeIndex {
         let traversal = GravityTraversal::with_config(config);
 
         // Map SearchResult entries to PDG node IDs for the traversal call.
-        // Try exact ID match first, then fall back to name-based lookup.
+        // Try exact ID match first, then fall back to name-based lookup,
+        // then fuzzy substring match for event-loop-heavy files.
         let entry_points: Vec<_> = results
             .iter()
             .filter_map(|r| {
                 pdg.find_by_symbol(&r.node_id)
                     .or_else(|| pdg.find_by_name(&r.node_id))
                     .or_else(|| pdg.find_by_name(&r.symbol_name))
+                    .or_else(|| fuzzy_find_node(pdg, &r.symbol_name))
             })
             .collect();
 
@@ -416,4 +427,120 @@ fn generate_deterministic_embedding(symbol_name: &str) -> Vec<f32> {
     }
 
     embedding
+}
+
+/// On-demand fuzzy node discovery for event-loop-heavy files.
+///
+/// When exact lookup fails, this function scans the PDG for nodes whose
+/// name or ID contains the query as a case-insensitive substring. This
+/// ensures that winit event-loop entrypoints (e.g., `run_event_loop`,
+/// `EventLoop::run`, `main`) are discoverable even when the user's query
+/// doesn't exactly match the symbol name.
+///
+/// Returns the best-matching NodeId, preferring:
+/// 1. Nodes whose name contains the query as a substring
+/// 2. Nodes whose ID contains the query as a substring
+/// 3. Higher-complexity nodes (event loops tend to be complex)
+fn fuzzy_find_node(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    query: &str,
+) -> Option<crate::graph::pdg::NodeId> {
+    const NAME_MATCH_SCORE: usize = 100;
+    const ID_MATCH_SCORE: usize = 50;
+    const ALIAS_MATCH_SCORE: usize = 25;
+    const COMPLEXITY_SCORE_CAP: u32 = 50;
+    const MAX_FALLBACK_SCAN: usize = 10_000;
+
+    let query_lower = query.to_lowercase();
+
+    // Empty query matches nothing — not a wildcard.
+    if query_lower.is_empty() {
+        return None;
+    }
+
+    let event_loop_aliases: &[&str] = &["run", "main", "event_loop", "event loop", "winit", "app_runner"];
+
+    let is_event_loop_query = event_loop_aliases
+        .iter()
+        .any(|alias| query_lower.contains(alias));
+
+    let mut best_match: Option<(crate::graph::pdg::NodeId, usize)> = None;
+
+    let mut score_node = |node_id: crate::graph::pdg::NodeId, node: &crate::graph::pdg::Node| {
+        let name_lower = node.name.to_lowercase();
+
+        let score = if name_lower.contains(&query_lower) {
+            NAME_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
+        } else {
+            let id_lower = node.id.to_lowercase();
+            if id_lower.contains(&query_lower) {
+                ID_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
+            } else if is_event_loop_query && event_loop_aliases.iter().any(|alias| name_lower.contains(alias)) {
+                ALIAS_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
+            } else {
+                return;
+            }
+        };
+
+        match &best_match {
+            None => best_match = Some((node_id, score)),
+            Some((_, best_score)) if score > *best_score => {
+                best_match = Some((node_id, score));
+            }
+            _ => {}
+        }
+    };
+
+    let candidate_indices = pdg.trigram_index().query(&query_lower);
+
+    if is_event_loop_query {
+        // Query trigram index for each alias, collect union of candidates
+        let mut alias_candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for alias in event_loop_aliases {
+            if let Some(indices) = pdg.trigram_index().query(alias) {
+                alias_candidates.extend(indices.iter());
+            }
+        }
+        if alias_candidates.is_empty() {
+            // No trigram hits for any alias — fall back to full scan (bounded)
+            let mut scanned = 0;
+            for node_id in pdg.node_indices() {
+                if scanned >= MAX_FALLBACK_SCAN {
+                    break;
+                }
+                if let Some(node) = pdg.get_node(node_id) {
+                    score_node(node_id, node);
+                }
+                scanned += 1;
+            }
+        } else {
+            for &node_idx in &alias_candidates {
+                let node_id = crate::graph::pdg::NodeId::new(node_idx as usize);
+                if let Some(node) = pdg.get_node(node_id) {
+                    score_node(node_id, node);
+                }
+            }
+        }
+    } else if let Some(indices) = candidate_indices {
+        for node_idx in indices {
+            let node_id = crate::graph::pdg::NodeId::new(node_idx as usize);
+            if let Some(node) = pdg.get_node(node_id) {
+                score_node(node_id, node);
+            }
+        }
+    } else {
+        // No trigram index — fall back to full scan (bounded)
+        let mut scanned = 0;
+        for node_id in pdg.node_indices() {
+            if scanned >= MAX_FALLBACK_SCAN {
+                break;
+            }
+            if let Some(node) = pdg.get_node(node_id) {
+                score_node(node_id, node);
+            }
+            scanned += 1;
+        }
+    }
+
+    best_match.map(|(nid, _)| nid)
 }

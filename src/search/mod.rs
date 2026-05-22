@@ -28,12 +28,17 @@ pub mod onnx;
 pub use hnsw::{HNSWIndex, HNSWParams, IndexError};
 pub use query::{ParsedQuery, QueryIntent, QueryParser};
 pub use ranking::{HybridScorer, Score};
-pub use search::{NodeInfo, SearchEngine, SearchQuery, SearchResult, SemanticEntry};
+pub use search::{
+    CompactNodeMetadata, CompactTokenIndex, ContentPruner, IndexingAdmissionGate,
+    Int8PromotionDecision, Int8QualityGate, Int8QualityReport, Int8QualityThresholds, NodeInfo,
+    PruningDecision, SearchEngine, SearchQuery, SearchResult, SemanticEntry, StagedRetrievalConfig,
+    StagedRetrievalMetrics, WorkHoister,
+};
 pub use semantic::SemanticProcessor;
 pub use vector::VectorIndex;
 
 #[cfg(feature = "onnx")]
-pub use onnx::{QwenEmbeddingProvider, QwenReranker};
+pub use onnx::{ClientError, EmbedResult, EmbeddingClient};
 
 #[cfg(all(feature = "remote-embeddings", feature = "onnx"))]
 pub use onnx::{

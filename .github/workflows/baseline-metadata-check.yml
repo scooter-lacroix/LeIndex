@@ -1,0 +1,56 @@
+# Baseline metadata gate
+#
+# Detects edits under docs/memory/baselines/ and gates them on required
+# PR description metadata. Prevents silent baseline churn by requiring
+# authors to include a justification note in the PR body.
+#
+# VAL-MEASURE-017: Detects baseline edits and gates on metadata.
+# VAL-MEASURE-018: Fails if baselines change without PR description justification.
+
+name: Baseline Metadata Check
+
+on:
+  pull_request:
+    branches: [master]
+    paths:
+      - 'docs/memory/baselines/**'
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  check-baseline-metadata:
+    name: Verify baseline edit justification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for baseline justification in PR description
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -e
+
+          PR_BODY="${PR_BODY:-}"
+
+          # Check for any of the accepted justification markers
+          # Accepted: "baseline update", "baseline change", "baseline justification",
+          #           "memory baseline", "rebaseline", or the ## Memory Baseline section
+          if echo "$PR_BODY" | grep -qiE '(baseline\s+(update|change|justification)|memory\s+baseline|rebaseline|\[x\].*baseline)'; then
+            echo "✅ Baseline edit justified in PR description."
+            exit 0
+          fi
+
+          echo "::error::Baseline files changed but no justification found in PR description."
+          echo ""
+          echo "PRs that modify docs/memory/baselines/ must include a justification."
+          echo "Add one of the following to your PR description:"
+          echo "  - 'Baseline update: <reason>'"
+          echo "  - 'Baseline change: <reason>'"
+          echo "  - 'Baseline justification: <reason>'"
+          echo "  - 'Memory baseline: <reason>'"
+          echo "  - 'Rebaseline: <reason>'"
+          echo ""
+          echo "Or check the baseline-related item in the PR template checklist."
+          exit 1

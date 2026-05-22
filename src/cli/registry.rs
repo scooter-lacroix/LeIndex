@@ -345,6 +345,9 @@ impl ProjectRegistry {
     }
 
     /// Explicitly evict a project from memory. Its data remains on disk.
+    ///
+    /// Cleans up all associated bookkeeping: LRU order, index slots,
+    /// watchers, and stale-cache entries (VAL-APLUS-027).
     pub async fn evict(&self, path: &Path) {
         let removed = {
             let mut projects = self.projects.write().await;
@@ -366,6 +369,10 @@ impl ProjectRegistry {
 
         let mut watchers = self.watchers.lock().await;
         watchers.remove(path);
+
+        // A+ hotspot cleanup: evict stale-cache entry so residency does not
+        // grow monotonically across long-lived sessions (VAL-APLUS-027).
+        self.stale_cache.write().await.remove(path);
     }
 
     /// Resolve an optional `project_path` string to a canonical `PathBuf`.
@@ -583,6 +590,17 @@ impl ProjectRegistry {
         *default = Some(path.to_path_buf());
     }
 
+    /// Set the default project path without loading the project.
+    ///
+    /// Used by MCP stdio to register the `--project` CLI argument as the
+    /// default so that subsequent tool calls that omit `project_path` resolve
+    /// to it. The actual `LeIndex` creation happens lazily on first tool call
+    /// via `get_or_load()`.
+    pub async fn set_default_path(&self, path: PathBuf) {
+        let mut default = self.default_project.write().await;
+        *default = Some(path);
+    }
+
     /// Evict the least-recently-used project if we're at or over capacity.
     async fn evict_lru_if_needed(&self) {
         let current_count = self.projects.read().await.len();
@@ -609,6 +627,14 @@ impl ProjectRegistry {
 
             let mut slots = self.index_slots.lock().await;
             slots.remove(&path);
+
+            // Remove watcher so the evicted LeIndex is not kept alive by
+            // the watcher's captured ProjectHandle.
+            let mut watchers = self.watchers.lock().await;
+            watchers.remove(&path);
+
+            // A+ hotspot cleanup: also evict stale-cache entry
+            self.stale_cache.write().await.remove(&path);
 
             info!(
                 "Evicted LRU project: {} (capacity: {})",
@@ -840,5 +866,93 @@ mod tests {
         .unwrap();
 
         assert!(result.exists());
+    }
+
+    // ---- A+ registry slot eviction tests (VAL-APLUS-027, VAL-APLUS-028) ----
+
+    /// VAL-APLUS-027: Registry slot bookkeeping is evicted on project unregister/evict.
+    ///
+    /// When a project leaves the live registry, its slot bookkeeping is removed
+    /// so residency does not grow monotonically across long-lived sessions.
+    #[tokio::test]
+    async fn test_evict_removes_slot_bookkeeping() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        let leindex = LeIndex::new(tmp.path()).unwrap();
+        let registry = ProjectRegistry::with_initial_project(5, leindex);
+
+        let canonical = tmp.path().canonicalize().unwrap();
+        assert_eq!(registry.len().await, 1);
+
+        // Evict the project
+        registry.evict(&canonical).await;
+        assert_eq!(registry.len().await, 0);
+
+        // Verify slot bookkeeping is gone (internal state check via re-load)
+        // Re-loading should work cleanly without stale slot state
+        let path_str = tmp.path().to_string_lossy().to_string();
+        let result = registry.get_or_load(Some(&path_str)).await;
+        assert!(result.is_ok(), "re-loading after eviction should succeed");
+        assert_eq!(registry.len().await, 1);
+    }
+
+    /// VAL-APLUS-028: Registry slot map reflects only live projects.
+    ///
+    /// Slot bookkeeping tracks active projects rather than every project ever
+    /// seen in the process lifetime.
+    #[tokio::test]
+    async fn test_slot_map_reflects_only_live_projects() {
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        std::fs::write(tmp1.path().join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::write(tmp2.path().join("b.rs"), "fn b() {}\n").unwrap();
+
+        let leindex = LeIndex::new(tmp1.path()).unwrap();
+        let registry = ProjectRegistry::with_initial_project(5, leindex);
+
+        // Load second project
+        let p2 = tmp2.path().to_string_lossy().to_string();
+        let _ = registry.get_or_load(Some(&p2)).await.unwrap();
+        assert_eq!(registry.len().await, 2);
+
+        // Evict first project
+        let canonical1 = tmp1.path().canonicalize().unwrap();
+        registry.evict(&canonical1).await;
+        assert_eq!(registry.len().await, 1);
+
+        // Only the second project should remain
+        let loaded = registry.loaded_projects().await;
+        let canonical2 = tmp2.path().canonicalize().unwrap();
+        assert!(loaded.contains(&canonical2));
+        assert!(!loaded.contains(&canonical1));
+    }
+
+    /// VAL-APLUS-027 variant: stale-cache entries are cleaned up on evict.
+    #[tokio::test]
+    async fn test_evict_cleans_stale_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        let leindex = LeIndex::new(tmp.path()).unwrap();
+        let registry = ProjectRegistry::with_initial_project(5, leindex);
+
+        let canonical = tmp.path().canonicalize().unwrap();
+
+        // Populate stale cache
+        registry
+            .stale_cache
+            .write()
+            .await
+            .insert(canonical.clone(), (std::time::Instant::now(), false));
+
+        assert!(registry.stale_cache.read().await.contains_key(&canonical));
+
+        // Evict should clean up stale cache
+        registry.evict(&canonical).await;
+        assert!(
+            !registry.stale_cache.read().await.contains_key(&canonical),
+            "stale cache entry should be removed on evict"
+        );
     }
 }

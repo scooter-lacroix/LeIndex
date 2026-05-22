@@ -26,6 +26,7 @@ pub mod salsa;
 /// Database schema and connection management.
 pub mod schema;
 /// Configuration for Turso and hybrid storage backends.
+#[cfg(feature = "turso")]
 pub mod turso_config;
 
 pub use analytics::Analytics;
@@ -42,7 +43,11 @@ pub use pdg_store::{
 pub use project_id::UniqueProjectId;
 pub use project_metadata::{ProjectMetadata, ProjectMetadataError};
 pub use salsa::{IncrementalCache, NodeHash};
-pub use schema::{Storage, StorageConfig};
+pub use schema::{
+    Storage, StorageConfig, StoragePool, StoragePoolError, StorageRole, DEFAULT_READER_POOL_SIZE,
+};
+
+#[cfg(feature = "turso")]
 pub use turso_config::{HybridStorage, MigrationStats, StorageError, StorageMode, TursoConfig};
 
 /// Storage library initialization

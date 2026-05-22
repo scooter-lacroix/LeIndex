@@ -53,13 +53,10 @@ pub mod php;
 
 /// Swift language implementation (disabled due to tree-sitter version conflicts)
 // pub mod swift;
-
 /// Kotlin language implementation (disabled due to tree-sitter version conflicts)
 // pub mod kotlin;
-
 /// Dart language implementation (disabled due to tree-sitter version conflicts)
 // pub mod dart;
-
 /// Lua language implementation.
 pub mod lua;
 

@@ -5,6 +5,28 @@ use rusqlite::{Connection, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// Default number of reader connections in the fixed reader pool.
+pub const DEFAULT_READER_POOL_SIZE: usize = 2;
+
+// ============================================================================
+// A+ SQLite budget constants (Section 5.2)
+// ============================================================================
+
+/// Global registry connection: thin cache, no mmap.
+/// Single connection, rare access.
+pub const GLOBAL_REGISTRY_CACHE_SIZE_KIB: i64 = -2000; // 2 MiB
+/// Global registry mmap size: disabled (no mmap for global registry).
+pub const GLOBAL_REGISTRY_MMAP_SIZE: i64 = 0;
+
+/// Project writer connection: larger cache for hot write path.
+pub const PROJECT_WRITER_CACHE_SIZE_KIB: i64 = -16000; // 16 MiB
+
+/// Project reader connection: thin cache for point lookups.
+pub const PROJECT_READER_CACHE_SIZE_KIB: i64 = -2000; // 2 MiB
+
+/// Project store mmap cap (shared by writer and readers at OS level).
+pub const PROJECT_STORE_MMAP_SIZE: i64 = 67_108_864; // 64 MiB
+
 /// Storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
@@ -14,8 +36,12 @@ pub struct StorageConfig {
     /// Whether to enable WAL mode
     pub wal_enabled: bool,
 
-    /// Cache size in pages
-    pub cache_size_pages: Option<usize>,
+    /// Cache size in KiB (negative = KiB units per SQLite convention).
+    /// Defaults to the writer budget for backward compatibility.
+    pub cache_size_kib: Option<i64>,
+
+    /// mmap_size cap in bytes. Defaults to PROJECT_STORE_MMAP_SIZE.
+    pub mmap_size: Option<i64>,
 }
 
 impl Default for StorageConfig {
@@ -23,7 +49,8 @@ impl Default for StorageConfig {
         Self {
             db_path: "leindex.db".to_string(),
             wal_enabled: true,
-            cache_size_pages: Some(10000),
+            cache_size_kib: Some(PROJECT_WRITER_CACHE_SIZE_KIB),
+            mmap_size: Some(PROJECT_STORE_MMAP_SIZE),
         }
     }
 }
@@ -55,9 +82,14 @@ impl Storage {
         // (or a ProjectRegistry) access the same project's .leindex/leindex.db.
         conn.pragma_update(None, "busy_timeout", 5000)?;
 
-        // Set cache size if specified
-        if let Some(cache_size) = config.cache_size_pages {
-            conn.pragma_update(None, "cache_size", cache_size)?;
+        // Set cache size if specified (negative = KiB per SQLite convention)
+        if let Some(cache_size_kib) = config.cache_size_kib {
+            conn.pragma_update(None, "cache_size", cache_size_kib)?;
+        }
+
+        // Set mmap_size cap if specified
+        if let Some(mmap_size) = config.mmap_size {
+            conn.pragma_update(None, "mmap_size", mmap_size)?;
         }
 
         let mut storage = Self { conn, config };
@@ -334,6 +366,19 @@ CREATE TABLE IF NOT EXISTS project_metadata (
             [],
         )?;
 
+        // Create trigram_index table for accelerated fuzzy node lookup.
+        // Stores the serialized trigram index as a single blob per project.
+        self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS trigram_index (
+                project_id TEXT PRIMARY KEY,
+                index_data BLOB NOT NULL,
+                node_count INTEGER NOT NULL DEFAULT 0,
+                trigram_count INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+            )",
+            [],
+        )?;
+
         Ok(())
     }
 
@@ -499,4 +544,194 @@ mod tests {
 
         assert_eq!(table_count, 8); // intel_nodes, intel_edges, analysis_cache, cache_telemetry, global_symbols, external_refs, project_deps, project_metadata
     }
+
+    // A+ VAL-APLUS-007: Project writer SQLite connection uses the writer cache cap
+    #[test]
+    fn test_project_writer_cache_budget() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let storage = Storage::open(temp_file.path()).unwrap();
+
+        let cache_size: i64 = storage
+            .conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            cache_size, PROJECT_WRITER_CACHE_SIZE_KIB,
+            "project writer cache_size should be {} (16 MiB), got {}",
+            PROJECT_WRITER_CACHE_SIZE_KIB, cache_size
+        );
+    }
+
+    // A+ VAL-APLUS-009: Project store mmap cap is bounded to 64 MiB
+    #[test]
+    fn test_project_store_mmap_cap() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let storage = Storage::open(temp_file.path()).unwrap();
+
+        let mmap_size: i64 = storage
+            .conn
+            .query_row("PRAGMA mmap_size", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            mmap_size, PROJECT_STORE_MMAP_SIZE,
+            "project store mmap_size should be {} (64 MiB), got {}",
+            PROJECT_STORE_MMAP_SIZE, mmap_size
+        );
+    }
+
+    // A+ VAL-APLUS-008: Project reader SQLite connections use the thin reader cap
+    #[test]
+    fn test_project_reader_cache_budget() {
+        // Verify the reader constant is the thin budget
+        assert_eq!(
+            PROJECT_READER_CACHE_SIZE_KIB, -2000,
+            "reader cache should be -2000 (2 MiB thin budget)"
+        );
+
+        // Verify a connection opened with reader config gets the right pragma
+        let temp_file = NamedTempFile::new().unwrap();
+        let reader_config = StorageConfig {
+            db_path: temp_file.path().to_string_lossy().to_string(),
+            wal_enabled: true,
+            cache_size_kib: Some(PROJECT_READER_CACHE_SIZE_KIB),
+            mmap_size: Some(PROJECT_STORE_MMAP_SIZE),
+        };
+        let storage = Storage::open_with_config(temp_file.path(), reader_config).unwrap();
+
+        let cache_size: i64 = storage
+            .conn
+            .query_row("PRAGMA cache_size", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            cache_size, PROJECT_READER_CACHE_SIZE_KIB,
+            "reader cache_size should be {} (2 MiB), got {}",
+            PROJECT_READER_CACHE_SIZE_KIB, cache_size
+        );
+    }
+}
+
+// ============================================================================
+// B-phase fixed reader topology (VAL-BPHASE-026..028)
+// ============================================================================
+
+/// Role of a storage connection within the pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageRole {
+    /// Writer connection: larger cache, write-capable.
+    Writer,
+    /// Reader connection: thin cache, read-only queries.
+    Reader,
+}
+
+/// Fixed-size storage connection pool: one writer + a bounded reader pool.
+///
+/// This replaces ad-hoc `Storage::open` calls with a topology that keeps
+/// SQLite residency bounded: one writer with a larger cache budget and a
+/// fixed small set of thin-cache reader connections.
+pub struct StoragePool {
+    writer: Storage,
+    readers: Vec<Storage>,
+}
+
+impl StoragePool {
+    /// Open a storage pool at the given path with the specified writer and
+    /// reader configurations.
+    ///
+    /// Creates one writer connection and `DEFAULT_READER_POOL_SIZE` reader
+    /// connections, all pointing at the same database file.
+    pub fn open<P: AsRef<Path>>(
+        db_path: P,
+        writer_config: StorageConfig,
+        reader_config: StorageConfig,
+    ) -> SqliteResult<Self> {
+        let writer = Storage::open_with_config(&db_path, writer_config)?;
+
+        let mut readers = Vec::with_capacity(DEFAULT_READER_POOL_SIZE);
+        for _ in 0..DEFAULT_READER_POOL_SIZE {
+            let reader = Storage::open_with_config(&db_path, reader_config.clone())?;
+            readers.push(reader);
+        }
+
+        Ok(Self { writer, readers })
+    }
+
+    /// Open a storage pool with a custom reader pool size.
+    pub fn open_with_pool_size<P: AsRef<Path>>(
+        db_path: P,
+        writer_config: StorageConfig,
+        reader_config: StorageConfig,
+        pool_size: usize,
+    ) -> SqliteResult<Self> {
+        let writer = Storage::open_with_config(&db_path, writer_config)?;
+
+        let mut readers = Vec::with_capacity(pool_size);
+        for _ in 0..pool_size {
+            let reader = Storage::open_with_config(&db_path, reader_config.clone())?;
+            readers.push(reader);
+        }
+
+        Ok(Self { writer, readers })
+    }
+
+    /// Returns true if the writer connection is present.
+    pub fn has_writer(&self) -> bool {
+        true // writer is always present after open
+    }
+
+    /// Get a reference to the writer connection.
+    pub fn writer(&self) -> &Storage {
+        &self.writer
+    }
+
+    /// Get a mutable reference to the writer connection.
+    pub fn writer_mut(&mut self) -> &mut Storage {
+        &mut self.writer
+    }
+
+    /// Get a reference to a reader connection by index.
+    ///
+    /// Returns an error if the index is out of bounds.
+    pub fn reader(&self, index: usize) -> Result<&Storage, StoragePoolError> {
+        self.readers
+            .get(index)
+            .ok_or(StoragePoolError::ReaderOutOfBounds {
+                index,
+                pool_size: self.readers.len(),
+            })
+    }
+
+    /// Get a mutable reference to a reader connection by index.
+    pub fn reader_mut(&mut self, index: usize) -> Result<&mut Storage, StoragePoolError> {
+        let pool_size = self.readers.len();
+        self.readers
+            .get_mut(index)
+            .ok_or(StoragePoolError::ReaderOutOfBounds { index, pool_size })
+    }
+
+    /// Number of reader connections in the pool.
+    pub fn reader_count(&self) -> usize {
+        self.readers.len()
+    }
+
+    /// Close all connections in the pool.
+    pub fn close_all(&mut self) -> SqliteResult<()> {
+        self.writer.close()?;
+        for reader in &mut self.readers {
+            reader.close()?;
+        }
+        Ok(())
+    }
+}
+
+/// Errors from storage pool operations.
+#[derive(Debug, thiserror::Error)]
+pub enum StoragePoolError {
+    /// Requested reader index exceeds the fixed pool size.
+    #[error("reader index {index} out of bounds (pool size: {pool_size})")]
+    ReaderOutOfBounds {
+        /// Requested index.
+        index: usize,
+        /// Actual pool size.
+        pool_size: usize,
+    },
 }

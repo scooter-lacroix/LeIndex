@@ -66,7 +66,7 @@ data flow, and impact radius. Use for broad codebase understanding queries."
         let mut guard = handle.write().await;
 
         guard
-            .ensure_pdg_loaded()
+            .ensure_analysis_context_loaded()
             .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
 
         if guard.search_engine().is_empty() {

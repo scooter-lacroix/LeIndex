@@ -6,6 +6,7 @@ use crate::graph::pdg::{
     Edge as PDGEdge, EdgeMetadata as PDGEdgeMetadata, EdgeType as PDGEdgeType, Node as PDGNode,
     NodeId, NodeType as PDGNodeType, ProgramDependenceGraph,
 };
+use crate::graph::trigram::TrigramIndex;
 use crate::storage::edges::{EdgeMetadata as StorageEdgeMetadata, EdgeType as StorageEdgeType};
 use crate::storage::nodes::{NodeRecord, NodeType as StorageNodeType};
 use crate::storage::schema::Storage;
@@ -271,7 +272,44 @@ pub fn save_pdg(
         )?;
     }
 
+    // Save trigram index alongside the PDG (within the same transaction)
+    if let Err(e) = save_trigram_index_tx(&tx, project_id, &pdg.trigram_index()) {
+        // Log but don't fail — the trigram index is a performance optimization,
+        // not a correctness requirement. It will be rebuilt on load if missing.
+        tracing::warn!("Failed to save trigram index: {e}");
+    }
+
     tx.commit()?;
+    Ok(())
+}
+
+/// Save trigram index within an existing transaction.
+fn save_trigram_index_tx(
+    tx: &rusqlite::Transaction<'_>,
+    project_id: &str,
+    trigram_index: &TrigramIndex,
+) -> SqliteResult<()> {
+    let serialized = trigram_index.serialize();
+    let node_count = trigram_index.node_count() as i64;
+    let trigram_count = trigram_index.trigram_count() as i64;
+
+    tx.execute(
+        "INSERT INTO trigram_index (project_id, index_data, node_count, trigram_count, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(project_id) DO UPDATE SET
+            index_data = excluded.index_data,
+            node_count = excluded.node_count,
+            trigram_count = excluded.trigram_count,
+            updated_at = excluded.updated_at",
+        params![
+            project_id,
+            serialized,
+            node_count,
+            trigram_count,
+            chrono::Utc::now().timestamp(),
+        ],
+    )?;
+
     Ok(())
 }
 
@@ -412,6 +450,14 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
         pdg.add_edge(caller_node_id, callee_node_id, pdg_edge);
     }
 
+    // Try to load persisted trigram index; fall back to rebuilding from nodes.
+    // The trigram index is maintained incrementally via add_node during load,
+    // but loading the persisted version is faster for large PDGs.
+    if let Ok(Some(trigram_idx)) = load_trigram_index(storage, project_id) {
+        pdg.set_trigram_index(trigram_idx);
+    }
+    // If no persisted index, the one built incrementally via add_node is already correct.
+
     Ok(pdg)
 }
 
@@ -453,6 +499,11 @@ pub fn delete_pdg(storage: &mut Storage, project_id: &str) -> SqliteResult<()> {
         "DELETE FROM indexed_files WHERE project_id = ?1",
         params![project_id],
     )?;
+
+    // Delete trigram index
+    if let Err(e) = delete_trigram_index(storage, project_id) {
+        tracing::warn!("Failed to delete trigram index for project {}: {e}", project_id);
+    }
 
     Ok(())
 }
@@ -533,6 +584,76 @@ pub fn update_indexed_file(
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(file_path) DO UPDATE SET file_hash = ?3, last_indexed = ?4",
         params![file_path, project_id, hash, chrono::Utc::now().timestamp()],
+    )?;
+    Ok(())
+}
+
+/// Save the trigram index for a project to storage.
+///
+/// The trigram index is serialized to a binary blob and stored in the
+/// `trigram_index` table. This avoids rebuilding the index on every load.
+pub fn save_trigram_index(
+    storage: &mut Storage,
+    project_id: &str,
+    trigram_index: &TrigramIndex,
+) -> Result<()> {
+    let serialized = trigram_index.serialize();
+    let node_count = trigram_index.node_count() as i64;
+    let trigram_count = trigram_index.trigram_count() as i64;
+
+    storage.conn().execute(
+        "INSERT INTO trigram_index (project_id, index_data, node_count, trigram_count, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(project_id) DO UPDATE SET
+            index_data = excluded.index_data,
+            node_count = excluded.node_count,
+            trigram_count = excluded.trigram_count,
+            updated_at = excluded.updated_at",
+        params![
+            project_id,
+            serialized,
+            node_count,
+            trigram_count,
+            chrono::Utc::now().timestamp(),
+        ],
+    )?;
+
+    Ok(())
+}
+
+/// Load the trigram index for a project from storage.
+///
+/// Returns `Ok(Some(TrigramIndex))` if a persisted index exists,
+/// `Ok(None)` if no index has been saved yet.
+pub fn load_trigram_index(
+    storage: &Storage,
+    project_id: &str,
+) -> Result<Option<TrigramIndex>> {
+    let result = storage.conn().query_row(
+        "SELECT index_data FROM trigram_index WHERE project_id = ?1",
+        params![project_id],
+        |row| row.get::<_, Vec<u8>>(0),
+    );
+
+    match result {
+        Ok(data) => {
+            let index = TrigramIndex::deserialize(&data).ok_or_else(|| {
+                PdgStoreError::Deserialization(
+                    "Failed to deserialize trigram index".to_string(),
+                )
+            })?;
+            Ok(Some(index))
+        }
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Delete the trigram index for a project.
+pub fn delete_trigram_index(storage: &mut Storage, project_id: &str) -> SqliteResult<()> {
+    storage.conn().execute(
+        "DELETE FROM trigram_index WHERE project_id = ?1",
+        params![project_id],
     )?;
     Ok(())
 }

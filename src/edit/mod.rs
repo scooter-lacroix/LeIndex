@@ -60,7 +60,8 @@ mod tests {
             StorageConfig {
                 db_path: ":memory:".to_string(),
                 wal_enabled: false,
-                cache_size_pages: None,
+                cache_size_kib: None,
+                mmap_size: None,
             },
         )
         .unwrap()

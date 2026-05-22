@@ -1,0 +1,44 @@
+[package]
+name = "leindex-embed"
+version = "1.7.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["LeIndex Contributors"]
+description = "ONNX embedding worker for LeIndex — runs neural embedding and reranking inference in a separate process"
+
+[features]
+default = []
+
+# Neural embeddings with ONNX Runtime and tokenizers
+# Only needed for the worker binary, not for the main crate.
+onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+
+[dependencies]
+# Protocol serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+bincode = "1.3"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ONNX Runtime dependencies — owned exclusively by the worker crate
+ort = { version = "2.0.0-rc.12", optional = true, features = ["ndarray"] }
+tokenizers = { version = "0.20", optional = true }
+ndarray = { version = "0.17", optional = true }
+dirs = { version = "5" }
+
+[dev-dependencies]
+tempfile = "3.13"
+
+[[bin]]
+name = "leindex-embed"
+path = "src/bin/leindex-embed.rs"
+doc = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = true

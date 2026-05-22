@@ -1,6 +1,6 @@
 {
   "name": "@leindex/mcp",
-  "version": "1.6.6",
+  "version": "1.7.0",
   "description": "LeIndex MCP Server - Semantic code search for AI tools (auto-installing binary wrapper)",
   "private": false,
   "main": "index.js",
