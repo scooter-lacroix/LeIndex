@@ -1431,7 +1431,7 @@ pub(crate) fn index_nodes_with_embedder(
             }
         }
 
-        search_engine.index_nodes(std::mem::take(&mut nodes));
+        search_engine.index_nodes(std::mem::replace(&mut nodes, Vec::with_capacity(batch_size)));
     }
 
     // A+ logging: report pruning, shedding, and hoisting stats.

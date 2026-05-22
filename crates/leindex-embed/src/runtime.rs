@@ -688,14 +688,16 @@ impl WorkerRuntime {
             .map(|&d| d as usize)
             .collect();
 
-        // try_extract_array returns an owned ndarray::ArrayD<f32>. Using
-        // into_raw_vec() reclaims the underlying Vec<f32> without copying.
+        // try_extract_array returns an ndarray::ArrayView (borrowed). We call
+        // to_owned() to get an owned ArrayD<f32>, then into_raw_vec() reclaims
+        // the underlying Vec<f32> without an extra copy.
         let embeddings_f32: Vec<f32> = outputs[0]
             .try_extract_array::<f32>()
             .map_err(|e| WorkerError {
                 kind: ErrorKind::Inference,
                 message: format!("failed to extract output tensor: {:?}", e),
             })?
+            .to_owned()
             .into_raw_vec();
 
         if expected_dim == 0 {
@@ -707,7 +709,18 @@ impl WorkerRuntime {
 
         // Derive seq_len and hidden_dim from the actual tensor shape.
         let (actual_seq_len, hidden_dim) = match output_shape.as_slice() {
-            [bs, sl, hd] if *bs == batch_size => (*sl, *hd),
+            [bs, sl, hd] if *bs == batch_size => {
+                if *hd != expected_dim {
+                    return Err(WorkerError {
+                        kind: ErrorKind::Inference,
+                        message: format!(
+                            "output dimension mismatch: model produced {}, expected {}",
+                            hd, expected_dim
+                        ),
+                    });
+                }
+                (*sl, *hd)
+            }
             [bs, hd] if *bs == batch_size => {
                 // Already pooled: [batch_size, hidden_dim] — just L2-normalize per row
                 let dim = *hd;

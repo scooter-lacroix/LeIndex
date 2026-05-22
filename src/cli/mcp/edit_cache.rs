@@ -201,8 +201,8 @@ impl EditCache {
 
         // Try hot cache first
         {
-            let guard = self.entries.lock().await;
-            if let Some(entry) = guard.0.peek(&abs_path) {
+            let mut guard = self.entries.lock().await;
+            if let Some(entry) = guard.0.get_mut(&abs_path) {
                 return Some(entry.clone());
             }
         }
