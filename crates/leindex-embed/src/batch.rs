@@ -164,13 +164,13 @@ pub fn split_request(
 ///
 /// VAL-CPHASE-014: Split responses are re-stitched correctly, preserving
 /// the original batch ordering.
-pub fn stitch_responses(responses: Vec<EmbedResponse>) -> StitchedResponse {
+pub fn stitch_responses(responses: Vec<EmbedResponse>) -> anyhow::Result<StitchedResponse> {
     if responses.is_empty() {
-        return StitchedResponse {
+        return Ok(StitchedResponse {
             vectors: vec![],
             count: 0,
             dimension: 0,
-        };
+        });
     }
 
     let dimension = responses[0].dimension;
@@ -180,22 +180,21 @@ pub fn stitch_responses(responses: Vec<EmbedResponse>) -> StitchedResponse {
 
     for response in responses {
         if response.dimension != dimension {
-            tracing::error!(
-                expected = dimension,
-                actual = response.dimension,
-                "dimension mismatch during response stitching"
+            anyhow::bail!(
+                "dimension mismatch during response stitching: expected {}, got {}",
+                dimension,
+                response.dimension
             );
-            continue;
         }
         all_vectors.extend(response.vectors);
         total_count += response.count;
     }
 
-    StitchedResponse {
+    Ok(StitchedResponse {
         vectors: all_vectors,
         count: total_count,
         dimension,
-    }
+    })
 }
 
 /// Truncate a single text to the maximum allowed size.
@@ -336,7 +335,7 @@ mod tests {
 
     #[test]
     fn test_stitch_responses_empty() {
-        let result = stitch_responses(vec![]);
+        let result = stitch_responses(vec![]).unwrap();
         assert_eq!(result.count, 0);
         assert!(result.vectors.is_empty());
     }
@@ -344,7 +343,7 @@ mod tests {
     #[test]
     fn test_stitch_responses_single() {
         let response = EmbedResponse::new(vec![1.0, 2.0, 3.0, 4.0], 1, 4);
-        let result = stitch_responses(vec![response]);
+        let result = stitch_responses(vec![response]).unwrap();
         assert_eq!(result.count, 1);
         assert_eq!(result.dimension, 4);
         assert_eq!(result.vectors, vec![1.0, 2.0, 3.0, 4.0]);
@@ -356,7 +355,7 @@ mod tests {
         let r2 = EmbedResponse::new(vec![5.0, 6.0, 7.0, 8.0], 1, 4);
         let r3 = EmbedResponse::new(vec![9.0, 10.0, 11.0, 12.0], 1, 4);
 
-        let result = stitch_responses(vec![r1, r2, r3]);
+        let result = stitch_responses(vec![r1, r2, r3]).unwrap();
         assert_eq!(result.count, 3);
         assert_eq!(result.dimension, 4);
         assert_eq!(
@@ -372,7 +371,7 @@ mod tests {
         let r2 = EmbedResponse::new(vec![3.0, 4.0], 1, 2);
         let r3 = EmbedResponse::new(vec![5.0, 6.0], 1, 2);
 
-        let result = stitch_responses(vec![r1, r2, r3]);
+        let result = stitch_responses(vec![r1, r2, r3]).unwrap();
         assert_eq!(result.vectors, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
 
@@ -454,7 +453,7 @@ mod tests {
                     .collect();
 
                 // Stitch them back together
-                let stitched = stitch_responses(responses);
+                let stitched = stitch_responses(responses).unwrap();
 
                 // Verify total count matches original text count
                 assert_eq!(stitched.count, texts.len());

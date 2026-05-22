@@ -580,7 +580,7 @@ fn test_oversized_batch_split_and_stitch() {
                 })
                 .collect();
 
-            let stitched = batch::stitch_responses(responses);
+            let stitched = batch::stitch_responses(responses).unwrap();
             assert_eq!(stitched.count, texts.len());
             assert_eq!(stitched.dimension, dim);
             assert_eq!(stitched.vectors.len(), texts.len() * dim);

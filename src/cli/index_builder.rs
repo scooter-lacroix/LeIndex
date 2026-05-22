@@ -1434,14 +1434,24 @@ pub(crate) fn index_nodes_with_embedder(
         search_engine.index_nodes(std::mem::replace(&mut nodes, Vec::with_capacity(batch_size)));
     }
 
-    // A+ logging: report pruning, shedding, and hoisting stats.
+    // A+ logging: per-batch stats at info! level (invisible under default WARN).
     if pruned_count > 0 || shed_count > 0 || hoisted_count > 0 {
-        warn!(
+        info!(
             pruned = pruned_count,
             shed = shed_count,
             hoisted = hoisted_count,
             admitted = admission_gate.nodes_admitted(),
             "A+ bound-gated indexing stats"
+        );
+    }
+
+    // Single summary warn! so users see one warning if any work was shed/pruned.
+    if pruned_count > 0 || shed_count > 0 {
+        warn!(
+            total_pruned = pruned_count,
+            total_shed = shed_count,
+            total_hoisted = hoisted_count,
+            "indexing completed with pruning/shedding — some nodes were filtered"
         );
     }
 
