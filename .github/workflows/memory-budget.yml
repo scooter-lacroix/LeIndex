@@ -67,7 +67,7 @@ jobs:
             "https://huggingface.co/${HF_REPO}/resolve/main/tokenizer.json"
 
       - name: Build release binary
-        run: cargo build --release -p leindex --features onnx -p leindex-embed --features onnx
+        run: cargo build --release -p leindex -p leindex-embed --features leindex/onnx,leindex-embed/onnx
 
       - name: Run memcheck against canonical fixture
         run: cargo xtask memcheck
