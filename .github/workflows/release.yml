@@ -173,6 +173,9 @@ jobs:
               if [[ ! -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
                 echo "Direct download failed — trying to extract from release bundle..."
                 BUNDLE=$(gh release download "$TAG" --dir /tmp --pattern "leindex-*-linux-x86_64.tar.gz" 2>/dev/null && ls /tmp/leindex-*-linux-x86_64.tar.gz 2>/dev/null | head -1 || true)
+                if [[ -z "$BUNDLE" || ! -f "$BUNDLE" ]]; then
+                  echo "::warning::Prior release bundle not found — cannot extract models from previous release"
+                fi
                 if [[ -n "$BUNDLE" && -f "$BUNDLE" ]]; then
                   tar xzf "$BUNDLE" -C /tmp --strip-components=1 --wildcards "leindex-*/models/qwen3-embed-0.6b.onnx" "leindex-*/models/tokenizer.json" 2>/dev/null || true
                   cp /tmp/models/qwen3-embed-0.6b.onnx "$MODELS_DIR/" 2>/dev/null || true
