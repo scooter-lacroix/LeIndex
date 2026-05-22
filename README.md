@@ -9,55 +9,6 @@
 
 </div>
 
-## 🧠 Validated Architecture (Plans 0–3)
-
-LeIndex has completed a validated, multi-phase memory-reduction roadmap:
-
-**Plan 0 — Measurement Foundation** ✅  
-- `tools/memcheck`: In-process RSS harness with `/proc`-sampled (VmRSS/smaps).  
-  All 9 canonical memory phases pass; `cargo xtask memcheck` is CI-enforced.  
-- `docs/memory/baselines/small_repo/*`: JSON baseline per phase, 5%/10% regression gate.  
-- `docs/memory/budgets/current.json`: Single source of truth for absolute ceilings.  
-- `.github/workflows/memory-budget.yml`: PR memory gate + baseline override guard.  
-- `--memory-report=PATH` CLI surface and `LEINDEX_MEMORY_REPORT` env var (opt-in JSON summary on graceful shutdown).  
-- `#[cfg(feature = "memprof")]` jemalloc heap profiling opt-in.  
-  **28/28 assertions validated** (VAL-MEASURE-001–028).
-
-**Plan 1 — A+ Runtime / Feature-Graph Slimming** ✅  
-- Tokio minimal feature set (removed `libsql`/`turso` from `full`; Turso behind opt-in `turso` feature gate).  
-- MCP server unified to axum 0.7 / tower 0.5 (removed legacy 0.6 aliases).  
-- SQLite thin cache/mmap budgets: global registry 2 MiB, project store 64 MiB mmap, worker cache 16 MiB.  
-- Memory defaults tightened: `spill_threshold` 0.75, `max_cache_bytes` 96 MiB.  
-- Edit-preview hard caps (256 KiB entry / 8 MiB total LRU), search cache hard bounds (256 entry / 16 MiB bytes + synchronous eviction).  
-- ONNX idle unload + MCP/registry hotspot cleanup.  
-- NodeInfo legacy payload compatibility bridge (bidirectional).  
-- **39/39 A+ assertions validated** (VAL-APLUS-001–039; APLUS-022–024 explicitly blocked [structural supersession — ONNX lifecycle tests removed after Plan 3 worker refactoring is covered by VAL-CROSS-001–003).
-
-**Plan 2 — B+ Row-Oriented Residency** ✅  
-- Borrowed mmap vector access (`&[f32]` lifetime from mmap, no heap mirror).  
-- Stable row lookup with append-only tombstones and threshold-driven compaction.  
-- Heap-to-mmap swap (pre-compaction and post-compaction).  
-- INT8 quantization gated by NDCG/latency thresholds (not automatic).  
-- `validate_coherence` two-pass invariant (sorted by row, then by embedding).  
-- Bounded internal caches unified under a byte ceiling.  
-- Snapshot-state clone reduction. `CompactNodeMetadata` for version-relative lookups.  
-- Reader-pool and bounded back-pressure support (20 active + 80 queued with `Semaphore`).  
-- Staged retrieval: coarse candidate generation + exact rerank.  
-- **45/45 B+ assertions validated** (VAL-BPHASE-001–045).
-
-**Plan 3 — C+ Process / Worker Architecture** ✅  
-- `leindex-embed` worker crate (`crates/leindex-embed`) with IPC (Unix domain socket + bincode streams).  
-- Worker lifecycle: cold start → warm reuse → idle teardown → full restart. `build_startup_report` surfaces 6 fields in log output at warn level.  
-- Main-side `EmbeddingModelClient`: async retry-once fallback then TF-IDF-based degradation for the affected batch. ONNX not owned by main daemon in steady state.  
-- Model path resolution precedence: `LEINDEX_WORKER_MODEL_PATH` > `--model-path` env > bundled default. Execution-provider selection via `LEINDEX_WORKER_EXECUTION_PROVIDER`.  
-- Model bundle pipeline (`scripts/download-models.sh` + `LEINDEX_QUANTIZE`): downloadable ONNX + JSON tokenizer, checksum gate.  
-- Worker-aware revision: per-phase `worker_rss_max_kib` and `combined_rss_max_kib` in `PhaseReport`; embed_idle + embed_active + embed_teardown canonical phases; memory CI extended to worker-active window. RELEASE SLICE MATCH EXACTLY; NO BOUNDARY CHANGES.  
-- Release: cross-platform CI (Linux/macOS/Windows) publishes crates.io + npm + PyPI; release workflow enforces version parity across Cargo/npm/PyPI before release. Shell installer builds main + worker binaries.  
-- MCP output normalized: tool summaries and docs updated across npm MCP, R15 docs, and MCP.md.  
-- **42/43 C+ assertions validated** (VAL-CPHASE-001–042; CPHASE-009/010/011 explicitly blocked pending runtime facility in current environment — the worker code and path fix are in place but full end-to-end facility verification requires a CUDA-containing runtime).
-
-**Memory targets (within A+ bands):** idle_warm ~9852 KiB, index ~20168 KiB, query ~13480 KiB.
-
 # LeIndex
 
 **Understand large codebases instantly.**
