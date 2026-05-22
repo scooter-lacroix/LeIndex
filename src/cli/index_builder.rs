@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 
 #[cfg(feature = "onnx")]
 use crate::search::onnx::{EmbedResult, EmbeddingClient};
@@ -1436,7 +1436,7 @@ pub(crate) fn index_nodes_with_embedder(
 
     // A+ logging: report pruning, shedding, and hoisting stats.
     if pruned_count > 0 || shed_count > 0 || hoisted_count > 0 {
-        info!(
+        warn!(
             pruned = pruned_count,
             shed = shed_count,
             hoisted = hoisted_count,
