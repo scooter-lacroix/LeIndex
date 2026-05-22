@@ -94,9 +94,6 @@ jobs:
             os: ubuntu-latest
             asset_name: linux-aarch64
 
-          - target: x86_64-apple-darwin
-            os: macos-13
-            asset_name: macos-x86_64
 
           - target: aarch64-apple-darwin
             os: macos-latest
