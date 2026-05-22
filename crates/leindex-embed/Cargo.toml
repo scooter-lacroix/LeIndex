@@ -5,6 +5,9 @@ edition = "2021"
 rust-version = "1.75"
 authors = ["LeIndex Contributors"]
 description = "ONNX embedding worker for LeIndex — runs neural embedding and reranking inference in a separate process"
+license = "MIT"
+repository = "https://github.com/scooter-lacroix/LeIndex"
+homepage = "https://github.com/scooter-lacroix/LeIndex#readme"
 
 [features]
 default = []

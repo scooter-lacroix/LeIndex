@@ -362,27 +362,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check NPM_TOKEN availability
-        id: check_token
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "$NPM_TOKEN" ]; then
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "⚠️ NPM_TOKEN not set — skipping npm publish"
-          else
-            echo "available=true" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Setup Node.js
-        if: steps.check_token.outputs.available == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Verify version parity
-        if: steps.check_token.outputs.available == 'true'
         run: |
           CARGO_VERSION=$(grep '^version =' ../../Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           NPM_VERSION=$(node -p "require('./package.json').version")
@@ -393,7 +379,6 @@ jobs:
           echo "Versions match: v${CARGO_VERSION}"
 
       - name: Publish to npm
-        if: steps.check_token.outputs.available == 'true'
         run: |
           PKG_NAME=$(node -p "require('./package.json').name")
           PKG_VER=$(node -p "require('./package.json').version")
@@ -402,8 +387,6 @@ jobs:
           else
             npm publish --access public --provenance
           fi
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ── Publish PyPI package (thin wrapper — installs binary via cargo) ──
   pypi:
@@ -472,7 +455,7 @@ jobs:
   summary:
     name: Release Summary
     needs: [detect, github-release, crates-io, npm, pypi]
-    if: ${{ needs.detect.outputs.changed == 'true' && needs.crates-io.result == 'success' }}
+    if: ${{ always() && needs.detect.outputs.changed == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -495,7 +478,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish draft release
-        if: needs.github-release.result == 'success' && (needs.crates-io.result == 'success' || needs.crates-io.result == 'skipped') && (needs.pypi.result == 'success' || needs.pypi.result == 'skipped') && (needs.npm.result == 'success' || needs.npm.result == 'skipped')
+        if: needs.github-release.result == 'success'
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           gh release edit "v${VERSION}" --draft=false
