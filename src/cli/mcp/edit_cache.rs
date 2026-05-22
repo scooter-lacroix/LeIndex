@@ -39,7 +39,11 @@ pub struct EditCacheEntry {
 impl EditCacheEntry {
     /// Estimated byte size of this entry in the hot cache.
     pub fn estimated_size(&self) -> usize {
-        self.file_path.as_os_str().len()
+        let path_bytes = self.file_path.as_os_str().len();
+        // On Windows, OsStr::len() returns u16 code units, not bytes
+        #[cfg(target_os = "windows")]
+        let path_bytes = path_bytes * 2;
+        path_bytes
             + self.preview_token.len()
             + self.original_text.len()
             + self.modified_text.len()

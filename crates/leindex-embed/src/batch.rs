@@ -221,12 +221,17 @@ pub fn truncate_text(text: String, max_size: usize) -> String {
     text[..end].to_string()
 }
 
+/// Per-text serialization overhead (length prefix, type tag, etc.)
+const PER_TEXT_SERIALIZE_OVERHEAD: usize = 16;
+/// Fixed overhead for the frame header and message envelope
+const FRAME_HEADER_OVERHEAD: usize = 128;
+
 /// Estimate the serialized size of an embed request.
 fn estimate_request_size(texts: &[String]) -> usize {
     // Rough estimate: each text contributes its byte length plus some overhead
     // for the serialization format (length prefixes, type tags, etc.)
     let text_bytes: usize = texts.iter().map(|t| t.len()).sum();
-    let overhead = texts.len() * 16 + 128; // per-text overhead + fixed overhead
+    let overhead = texts.len() * PER_TEXT_SERIALIZE_OVERHEAD + FRAME_HEADER_OVERHEAD;
     text_bytes + overhead
 }
 
