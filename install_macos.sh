@@ -358,7 +358,7 @@ install_leindex() {
 
     # Build from source
     log_info "Building LeIndex..."
-    if cargo build --release --bins 2>&1 | tee -a "$INSTALL_LOG"; then
+    if cargo build --release -p leindex -p leindex-embed --features leindex-embed/onnx 2>&1 | tee -a "$INSTALL_LOG"; then
         log_success "Build completed successfully"
     else
         log_error "Build failed"

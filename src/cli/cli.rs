@@ -1189,7 +1189,17 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
             const MAX_STDIN_PAYLOAD: usize = 10 * 1024 * 1024; // 10 MiB
             if length > MAX_STDIN_PAYLOAD {
                 eprintln!("[ERROR] Payload too large: {} bytes (max: {} bytes)", length, MAX_STDIN_PAYLOAD);
-                // Drain the oversized body to keep stdin framing aligned
+                // Consume remaining headers first to align the stream
+                loop {
+                    let mut header = String::new();
+                    if reader.read_line(&mut header).unwrap_or(0) == 0 {
+                        break;
+                    }
+                    if header.trim().is_empty() {
+                        break;
+                    }
+                }
+                // Now drain the oversized body to keep stdin framing aligned
                 if io::copy(&mut reader.by_ref().take(length as u64), &mut io::sink()).is_err() {
                     break;
                 }
