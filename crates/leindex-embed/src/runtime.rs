@@ -722,6 +722,15 @@ impl WorkerRuntime {
                 (*sl, *hd)
             }
             [bs, hd] if *bs == batch_size => {
+                if *hd != expected_dim {
+                    return Err(WorkerError {
+                        kind: ErrorKind::Inference,
+                        message: format!(
+                            "output dimension mismatch: model produced {}, expected {}",
+                            hd, expected_dim
+                        ),
+                    });
+                }
                 // Already pooled: [batch_size, hidden_dim] — just L2-normalize per row
                 let dim = *hd;
                 let mut embeddings_f32 = embeddings_f32;

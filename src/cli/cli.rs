@@ -1112,7 +1112,7 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     // mode uses its own read loop so we need to start it explicitly.
     {
         let cleanup_server = server.clone();
-        tokio::spawn(async move {
+        let cleanup_handle = tokio::spawn(async move {
             const CLEANUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
             const SESSION_MAX_IDLE: std::time::Duration = std::time::Duration::from_secs(300);
             let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
@@ -1122,6 +1122,11 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
                 if removed > 0 {
                     tracing::debug!("Cleaned up {} stale session(s)", removed);
                 }
+            }
+        });
+        tokio::spawn(async move {
+            if let Err(e) = cleanup_handle.await {
+                tracing::error!("MCP stdio cleanup task died: {e}");
             }
         });
     }
