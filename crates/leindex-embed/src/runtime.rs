@@ -656,21 +656,20 @@ impl WorkerRuntime {
             message: format!("failed to create attention_mask tensor: {}", e),
         })?;
 
-        let outputs = {
-            let mut session_guard = session.lock().map_err(|e| WorkerError {
-                kind: ErrorKind::OnnxRuntime,
-                message: format!("failed to lock ONNX session: {}", e),
+        let mut session_guard = session.lock().map_err(|e| WorkerError {
+            kind: ErrorKind::OnnxRuntime,
+            message: format!("failed to lock ONNX session: {}", e),
+        })?;
+
+        let outputs = session_guard
+            .run(ort::inputs! {
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+            })
+            .map_err(|e| WorkerError {
+                kind: ErrorKind::Inference,
+                message: format!("ONNX inference failed: {}", e),
             })?;
-            session_guard
-                .run(ort::inputs! {
-                    "input_ids" => input_ids_tensor,
-                    "attention_mask" => attention_mask_tensor,
-                })
-                .map_err(|e| WorkerError {
-                    kind: ErrorKind::Inference,
-                    message: format!("ONNX inference failed: {}", e),
-                })?
-        };
 
         if outputs.len() == 0 {
             return Err(WorkerError {
@@ -688,8 +687,8 @@ impl WorkerRuntime {
             .collect();
 
         // try_extract_array returns an ndarray::ArrayView (borrowed). We call
-        // to_owned() to get an owned ArrayD<f32>, then into_raw_vec() reclaims
-        // the underlying Vec<f32> without an extra copy.
+        // to_owned() to get an owned ArrayD<f32>, then into_raw_vec_and_offset()
+        // reclaims the underlying Vec<f32> without an extra copy.
         let embeddings_f32: Vec<f32> = outputs[0]
             .try_extract_array::<f32>()
             .map_err(|e| WorkerError {
@@ -697,7 +696,8 @@ impl WorkerRuntime {
                 message: format!("failed to extract output tensor: {:?}", e),
             })?
             .to_owned()
-            .into_raw_vec();
+            .into_raw_vec_and_offset()
+            .0;
 
         if expected_dim == 0 {
             return Err(WorkerError {
@@ -980,21 +980,20 @@ impl WorkerRuntime {
             message: format!("failed to create rerank attention_mask tensor: {}", e),
         })?;
 
-        let outputs = {
-            let mut session_guard = session.lock().map_err(|e| WorkerError {
-                kind: ErrorKind::OnnxRuntime,
-                message: format!("failed to lock ONNX session for rerank: {}", e),
+        let mut session_guard = session.lock().map_err(|e| WorkerError {
+            kind: ErrorKind::OnnxRuntime,
+            message: format!("failed to lock ONNX session for rerank: {}", e),
+        })?;
+
+        let outputs = session_guard
+            .run(ort::inputs! {
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+            })
+            .map_err(|e| WorkerError {
+                kind: ErrorKind::Inference,
+                message: format!("ONNX rerank inference failed: {}", e),
             })?;
-            session_guard
-                .run(ort::inputs! {
-                    "input_ids" => input_ids_tensor,
-                    "attention_mask" => attention_mask_tensor,
-                })
-                .map_err(|e| WorkerError {
-                    kind: ErrorKind::Inference,
-                    message: format!("ONNX rerank inference failed: {}", e),
-                })?
-        };
 
         if outputs.len() == 0 {
             return Err(WorkerError {
