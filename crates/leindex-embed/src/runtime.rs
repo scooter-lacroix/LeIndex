@@ -656,22 +656,21 @@ impl WorkerRuntime {
             message: format!("failed to create attention_mask tensor: {}", e),
         })?;
 
-        let mut session_guard = session.lock().map_err(|e| WorkerError {
-            kind: ErrorKind::OnnxRuntime,
-            message: format!("failed to lock ONNX session: {}", e),
-        })?;
-
-        let outputs = session_guard
-            .run(ort::inputs! {
-                "input_ids" => input_ids_tensor,
-                "attention_mask" => attention_mask_tensor,
-            })
-            .map_err(|e| WorkerError {
-                kind: ErrorKind::Inference,
-                message: format!("ONNX inference failed: {}", e),
+        let outputs = {
+            let mut session_guard = session.lock().map_err(|e| WorkerError {
+                kind: ErrorKind::OnnxRuntime,
+                message: format!("failed to lock ONNX session: {}", e),
             })?;
-
-        // Note: session_guard will be dropped when outputs is no longer used
+            session_guard
+                .run(ort::inputs! {
+                    "input_ids" => input_ids_tensor,
+                    "attention_mask" => attention_mask_tensor,
+                })
+                .map_err(|e| WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: format!("ONNX inference failed: {}", e),
+                })?
+        };
 
         if outputs.len() == 0 {
             return Err(WorkerError {
@@ -981,22 +980,21 @@ impl WorkerRuntime {
             message: format!("failed to create rerank attention_mask tensor: {}", e),
         })?;
 
-        let mut session_guard = session.lock().map_err(|e| WorkerError {
-            kind: ErrorKind::OnnxRuntime,
-            message: format!("failed to lock ONNX session for rerank: {}", e),
-        })?;
-
-        let outputs = session_guard
-            .run(ort::inputs! {
-                "input_ids" => input_ids_tensor,
-                "attention_mask" => attention_mask_tensor,
-            })
-            .map_err(|e| WorkerError {
-                kind: ErrorKind::Inference,
-                message: format!("ONNX rerank inference failed: {}", e),
+        let outputs = {
+            let mut session_guard = session.lock().map_err(|e| WorkerError {
+                kind: ErrorKind::OnnxRuntime,
+                message: format!("failed to lock ONNX session for rerank: {}", e),
             })?;
-
-        // Note: session_guard will be dropped when outputs is no longer used
+            session_guard
+                .run(ort::inputs! {
+                    "input_ids" => input_ids_tensor,
+                    "attention_mask" => attention_mask_tensor,
+                })
+                .map_err(|e| WorkerError {
+                    kind: ErrorKind::Inference,
+                    message: format!("ONNX rerank inference failed: {}", e),
+                })?
+        };
 
         if outputs.len() == 0 {
             return Err(WorkerError {
