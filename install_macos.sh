@@ -358,7 +358,7 @@ install_leindex() {
 
     # Build from source
     log_info "Building LeIndex..."
-    if cargo build --release -p leindex -p leindex-embed --features leindex-embed/onnx 2>&1 | tee -a "$INSTALL_LOG"; then
+    if cargo build --release -p leindex -p leindex-embed --features leindex/onnx,leindex-embed/onnx 2>&1 | tee -a "$INSTALL_LOG"; then
         log_success "Build completed successfully"
     else
         log_error "Build failed"
@@ -390,9 +390,11 @@ install_leindex() {
     # Install ONNX worker binary
     if [[ -f "$worker_binary" ]]; then
         local worker_install_path="${INSTALL_BIN_DIR}/leindex-embed"
-        cp "$worker_binary" "$worker_install_path"
-        chmod +x "$worker_install_path"
-        log_success "Worker binary installed to: $worker_install_path"
+        if cp "$worker_binary" "$worker_install_path" && chmod +x "$worker_install_path"; then
+            log_success "Worker binary installed to: $worker_install_path"
+        else
+            log_warn "Failed to install worker binary to $worker_install_path"
+        fi
     else
         log_warn "Worker binary not found (leindex-embed); ONNX inference will use in-process fallback"
     fi

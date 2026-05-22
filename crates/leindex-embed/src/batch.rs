@@ -174,7 +174,8 @@ pub fn stitch_responses(responses: Vec<EmbedResponse>) -> StitchedResponse {
     }
 
     let dimension = responses[0].dimension;
-    let mut all_vectors = Vec::new();
+    let total_elements: usize = responses.iter().map(|r| r.vectors.len()).sum();
+    let mut all_vectors = Vec::with_capacity(total_elements);
     let mut total_count = 0;
 
     for response in responses {
@@ -186,7 +187,7 @@ pub fn stitch_responses(responses: Vec<EmbedResponse>) -> StitchedResponse {
             );
             continue;
         }
-        all_vectors.extend_from_slice(&response.vectors);
+        all_vectors.extend(response.vectors);
         total_count += response.count;
     }
 
