@@ -5,7 +5,7 @@
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange?style=flat-square&logo=rust)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/License-MIT%20%7C%20Apache--2.0-blue?style=flat-square)](LICENSE)
 [![MCP](https://img.shields.io/badge/MCP-Server-purple?style=flat-square)](https://modelcontextprotocol.io)
-[![Release](https://github.com/scooter-lacroix/LeIndex/actions/workflows/release.yml/badge.svg?event=release)](https://github.com/scooter-lacroix/LeIndex/actions/workflows/release.yml)
+[![Release](https://github.com/scooter-lacroix/LeIndex/actions/workflows/release.yml/badge.svg)](https://github.com/scooter-lacroix/LeIndex/actions/workflows/release.yml)
 
 </div>
 
