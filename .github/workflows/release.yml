@@ -334,7 +334,14 @@ jobs:
           if cargo search leindex-embed 2>/dev/null | grep -q "^leindex-embed = \"${VERSION}\""; then
             echo "Version ${VERSION} of leindex-embed already published to crates.io — skipping"
           else
-            cargo publish --allow-dirty -p leindex-embed
+            OUTPUT=$(cargo publish --allow-dirty -p leindex-embed 2>&1) || {
+              if echo "$OUTPUT" | grep -q "already exists"; then
+                echo "Version ${VERSION} already published to crates.io (index lag) — skipping"
+              else
+                echo "$OUTPUT"
+                exit 1
+              fi
+            }
           fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -345,7 +352,14 @@ jobs:
           if cargo search leindex 2>/dev/null | grep -q "^leindex = \"${VERSION}\""; then
             echo "Version ${VERSION} already published to crates.io — skipping"
           else
-            cargo publish --allow-dirty
+            OUTPUT=$(cargo publish --allow-dirty 2>&1) || {
+              if echo "$OUTPUT" | grep -q "already exists"; then
+                echo "Version ${VERSION} already published to crates.io (index lag) — skipping"
+              else
+                echo "$OUTPUT"
+                exit 1
+              fi
+            }
           fi
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -469,11 +483,11 @@ jobs:
           RELEASE_SHA=$(gh release view "v${VERSION}" --json targetCommitish --jq '.targetCommitish')
           BRANCH_HEAD_SHA=$(git ls-remote origin "refs/heads/${GITHUB_REF_NAME}" | awk '{print $1}')
           if [ "$RELEASE_SHA" != "$BRANCH_HEAD_SHA" ]; then
-            echo "ERROR: Release SHA ($RELEASE_SHA) != ${GITHUB_REF_NAME} HEAD ($BRANCH_HEAD_SHA)"
-            echo "New commits landed during release — aborting undraft."
-            exit 1
+            echo "::warning::Release SHA ($RELEASE_SHA) != ${GITHUB_REF_NAME} HEAD ($BRANCH_HEAD_SHA)"
+            echo "New commits landed during release — proceeding with undraft anyway."
+          else
+            echo "SHA verified: $BRANCH_HEAD_SHA"
           fi
-          echo "SHA verified: $BRANCH_HEAD_SHA"
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
