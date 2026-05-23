@@ -434,8 +434,10 @@ jobs:
           if npm view "${PKG_NAME}@${PKG_VER}" version 2>/dev/null | grep -q "${PKG_VER}"; then
             echo "Version ${PKG_VER} already published to npm — skipping"
           else
-            npm publish --access public --provenance
+            npm publish --access public
           fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ── Publish PyPI package (thin wrapper — installs binary via cargo) ──
   pypi:
@@ -568,7 +570,7 @@ jobs:
           echo "### Registry notes" >> "$GITHUB_STEP_SUMMARY"
           echo "- **crates.io**: Publishes the Rust crate (required)" >> "$GITHUB_STEP_SUMMARY"
           echo "- **PyPI**: Thin Python wrapper that bootstraps cargo install (optional — needs PYPI_TOKEN)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- **npm**: Binary wrapper with GH Release download (optional — uses OIDC)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **npm**: Binary wrapper with GH Release download (optional — needs NPM_TOKEN)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "### Bundle topology" >> "$GITHUB_STEP_SUMMARY"
           echo "Each platform archive includes \`leindex\`, \`leindex-embed\` (ONNX worker), and model assets." >> "$GITHUB_STEP_SUMMARY"
