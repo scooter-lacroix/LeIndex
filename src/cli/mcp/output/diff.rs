@@ -1,0 +1,857 @@
+//! Structured diff types, computation, and rendering.
+//!
+//! `DiffResult` / `DiffHunk` / `DiffLine` are the data shape the LLM
+//! sees (clean JSON, no ANSI). `compute_diff` is the single source of
+//! truth — both MCP (via `to_json()`) and CLI (via `render_split_diff` /
+//! `render_unified_diff`) read from the same `DiffResult` so the two
+//! surfaces can never drift.
+
+use serde_json::Value;
+
+use super::{truncate, LIGHT_CYAN, LIGHT_GREEN, LIGHT_GREY, LIGHT_RED, RESET};
+
+// =============================================================================
+// Structured diff types — what the LLM sees
+// =============================================================================
+
+/// Operation kind for a single diff line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffOp {
+    /// Unchanged context line.
+    Context,
+    /// Line present in original, removed in modified.
+    Remove,
+    /// Line added in modified, not in original.
+    Add,
+}
+
+impl DiffOp {
+    /// Stable lowercase string used in serialized JSON.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiffOp::Context => "context",
+            DiffOp::Remove => "remove",
+            DiffOp::Add => "add",
+        }
+    }
+}
+
+/// A single line inside a diff hunk.
+///
+/// `old_line` and `new_line` are 1-based and `None` for the side that
+/// does not have the line (e.g. a removed line has no `new_line`).
+#[derive(Debug, Clone)]
+pub struct DiffLine {
+    /// What happened to this line.
+    pub op: DiffOp,
+    /// 1-based line number in the original file, or `None` if added.
+    pub old_line: Option<usize>,
+    /// 1-based line number in the modified file, or `None` if removed.
+    pub new_line: Option<usize>,
+    /// The text of the line without its trailing newline.
+    pub content: String,
+}
+
+/// A contiguous hunk of changes with 3 lines of surrounding context
+/// (matching `diffy`'s default behaviour).
+#[derive(Debug, Clone)]
+pub struct DiffHunk {
+    /// 1-based line number of the first line of the original file in this hunk.
+    pub old_start: usize,
+    /// 1-based line number of the first line of the modified file in this hunk.
+    pub new_start: usize,
+    /// The lines that make up the hunk, in original file order.
+    pub lines: Vec<DiffLine>,
+}
+
+/// A complete diff between two pieces of text, plus the file the diff
+/// applies to (used for headers in the rendered view).
+#[derive(Debug, Clone)]
+pub struct DiffResult {
+    /// Path of the file the diff was computed against.
+    pub file_path: String,
+    /// Number of added lines across all hunks.
+    pub additions: usize,
+    /// Number of removed lines across all hunks.
+    pub deletions: usize,
+    /// The change hunks, ordered by position in the original file.
+    pub hunks: Vec<DiffHunk>,
+}
+
+impl DiffResult {
+    /// Returns `true` if the diff contains at least one hunk.
+    pub fn has_changes(&self) -> bool {
+        !self.hunks.is_empty()
+    }
+
+    /// Serialize to the JSON shape the LLM sees: structured, no ANSI.
+    pub fn to_json(&self) -> Value {
+        let hunk_json: Vec<Value> = self
+            .hunks
+            .iter()
+            .map(|h| {
+                let line_json: Vec<Value> = h
+                    .lines
+                    .iter()
+                    .map(|l| {
+                        serde_json::json!({
+                            "op": l.op.as_str(),
+                            "old_line": l.old_line,
+                            "new_line": l.new_line,
+                            "content": l.content,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "old_start": h.old_start,
+                    "new_start": h.new_start,
+                    "lines": line_json,
+                })
+            })
+            .collect();
+        serde_json::json!({
+            "file_path": self.file_path,
+            "additions": self.additions,
+            "deletions": self.deletions,
+            "hunks": hunk_json,
+        })
+    }
+}
+
+/// Compute a structured diff between two pieces of text.
+///
+/// This is the source of truth for what the LLM receives and what the
+/// CLI renders — both go through the same `DiffResult`.
+pub fn compute_diff(original: &str, modified: &str, file_path: &str) -> DiffResult {
+    let mut result = DiffResult {
+        file_path: file_path.to_string(),
+        additions: 0,
+        deletions: 0,
+        hunks: Vec::new(),
+    };
+
+    if original == modified {
+        return result;
+    }
+
+    let patch = diffy::create_patch(original, modified);
+    for hunk in patch.hunks() {
+        let mut lines = Vec::with_capacity(hunk.lines().len());
+        let mut old_line = hunk.old_range().start();
+        let mut new_line = hunk.new_range().start();
+        for line in hunk.lines() {
+            // diffy includes the trailing newline in each line; strip it
+            // so the diff renderer can pad each side cleanly without
+            // breaking the row layout.
+            let strip = |s: &str| s.trim_end_matches('\n').trim_end_matches('\r').to_string();
+            match line {
+                diffy::Line::Context(s) => {
+                    lines.push(DiffLine {
+                        op: DiffOp::Context,
+                        old_line: Some(old_line),
+                        new_line: Some(new_line),
+                        content: strip(s),
+                    });
+                    old_line += 1;
+                    new_line += 1;
+                }
+                diffy::Line::Insert(s) => {
+                    lines.push(DiffLine {
+                        op: DiffOp::Add,
+                        old_line: None,
+                        new_line: Some(new_line),
+                        content: strip(s),
+                    });
+                    result.additions += 1;
+                    new_line += 1;
+                }
+                diffy::Line::Delete(s) => {
+                    lines.push(DiffLine {
+                        op: DiffOp::Remove,
+                        old_line: Some(old_line),
+                        new_line: None,
+                        content: strip(s),
+                    });
+                    result.deletions += 1;
+                    old_line += 1;
+                }
+            }
+        }
+        result.hunks.push(DiffHunk {
+            old_start: hunk.old_range().start(),
+            new_start: hunk.new_range().start(),
+            lines,
+        });
+    }
+    result
+}
+
+// =============================================================================
+// Diff rendering
+// =============================================================================
+
+/// Render a `DiffResult` as a unified diff (closest to `git diff`).
+pub fn render_unified_diff(diff: &DiffResult, color: bool) -> String {
+    let mut out = String::new();
+    if !diff.has_changes() {
+        out.push_str(&format!(
+            "{}--- a/{}\n+++ b/{}\n(no changes)\n",
+            if color { LIGHT_GREY } else { "" },
+            diff.file_path,
+            diff.file_path,
+        ));
+        return out;
+    }
+    out.push_str(&format!(
+        "{}--- a/{}\n+++ b/{}\n",
+        if color { LIGHT_GREY } else { "" },
+        diff.file_path,
+        diff.file_path,
+    ));
+    for hunk in &diff.hunks {
+        out.push_str(&format!(
+            "{}@@ -{},{} +{},{} @@\n",
+            if color { LIGHT_CYAN } else { "" },
+            hunk.old_start,
+            hunk.lines.iter().filter(|l| l.op != DiffOp::Add).count(),
+            hunk.new_start,
+            hunk.lines.iter().filter(|l| l.op != DiffOp::Remove).count(),
+        ));
+        for line in &hunk.lines {
+            out.push_str(&unified_line(line, color));
+        }
+    }
+    out
+}
+
+fn unified_line(line: &DiffLine, color: bool) -> String {
+    let content = &line.content;
+    match line.op {
+        DiffOp::Context => format!(
+            " {}{}{}\n",
+            if color { LIGHT_GREY } else { "" },
+            content,
+            if color { RESET } else { "" }
+        ),
+        DiffOp::Add => format!(
+            "+{}{}{}\n",
+            if color { LIGHT_GREEN } else { "" },
+            content,
+            if color { RESET } else { "" }
+        ),
+        DiffOp::Remove => format!(
+            "-{}{}{}\n",
+            if color { LIGHT_RED } else { "" },
+            content,
+            if color { RESET } else { "" }
+        ),
+    }
+}
+
+/// Render a `DiffResult` as a split-view diff with line numbers and
+/// +/- markers (like opencode's Edit). Falls back to unified if the
+/// terminal is too narrow.
+pub fn render_split_diff(diff: &DiffResult, color: bool, width: Option<usize>) -> String {
+    let mut out = String::new();
+    if !diff.has_changes() {
+        out.push_str(&format!(
+            "{}── {} (no changes) ──{}\n",
+            if color { LIGHT_CYAN } else { "" },
+            diff.file_path,
+            if color { RESET } else { "" },
+        ));
+        return out;
+    }
+
+    // Summary header
+    let summary = format!(
+        "{}  +{}  -{}",
+        diff.file_path, diff.additions, diff.deletions
+    );
+    out.push_str(&format!(
+        "{}── {} ──{}\n",
+        if color { LIGHT_CYAN } else { "" },
+        summary,
+        if color { RESET } else { "" },
+    ));
+
+    let gutter = 4usize; // 4-digit line number
+    let half = match width {
+        Some(w) => w.saturating_sub(gutter * 2 + 5) / 2,
+        None => 60,
+    };
+
+    for (hi, hunk) in diff.hunks.iter().enumerate() {
+        if hi > 0 {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "{}@@ -{},{} +{},{} @@{}\n",
+            if color { LIGHT_CYAN } else { "" },
+            hunk.old_start,
+            hunk.lines.iter().filter(|l| l.op != DiffOp::Add).count(),
+            hunk.new_start,
+            hunk.lines.iter().filter(|l| l.op != DiffOp::Remove).count(),
+            if color { RESET } else { "" },
+        ));
+        out.push_str(&render_hunk_split(hunk, &RowLayout { gutter, half, color }));
+    }
+    out
+}
+
+fn render_hunk_split(hunk: &DiffHunk, layout: &RowLayout) -> String {
+    let mut out = String::new();
+    // Walk the hunk in runs. A run of `Remove` is always followed by
+    // (optional) `Add` lines; pair them row-by-row so a true side-by-side
+    // layout is produced (otherwise we'd show a remove on the left and
+    // a blank on the right for a single replacement).
+    let mut old_line = hunk.old_start;
+    let mut new_line = hunk.new_start;
+    let mut i = 0;
+    while i < hunk.lines.len() {
+        let line = &hunk.lines[i];
+        match line.op {
+            DiffOp::Context => {
+                out.push_str(&split_row(
+                    &SplitRow {
+                        old_line: Some(old_line),
+                        old_content: &line.content,
+                        new_line: Some(new_line),
+                        new_content: &line.content,
+                        marker: " ",
+                    },
+                    layout,
+                ));
+                old_line += 1;
+                new_line += 1;
+                i += 1;
+            }
+            DiffOp::Remove => {
+                // Collect this run of removes.
+                let mut removes: Vec<&DiffLine> = vec![line];
+                let mut j = i + 1;
+                while j < hunk.lines.len() && hunk.lines[j].op == DiffOp::Remove {
+                    removes.push(&hunk.lines[j]);
+                    j += 1;
+                }
+                // Collect the immediately-following run of adds.
+                let mut adds: Vec<&DiffLine> = Vec::new();
+                while j < hunk.lines.len() && hunk.lines[j].op == DiffOp::Add {
+                    adds.push(&hunk.lines[j]);
+                    j += 1;
+                }
+                let consumed = removes.len() + adds.len();
+                let max = removes.len().max(adds.len());
+                for k in 0..max {
+                    let rem = removes.get(k);
+                    let add = adds.get(k);
+                    let row = match (rem, add) {
+                        (Some(r), Some(a)) => SplitRow {
+                            old_line: Some(old_line + k),
+                            old_content: r.content.as_str(),
+                            new_line: Some(new_line + k),
+                            new_content: a.content.as_str(),
+                            marker: " ",
+                        },
+                        (Some(r), None) => SplitRow {
+                            old_line: Some(old_line + k),
+                            old_content: r.content.as_str(),
+                            new_line: None,
+                            new_content: "",
+                            marker: " ",
+                        },
+                        (None, Some(a)) => SplitRow {
+                            old_line: None,
+                            old_content: "",
+                            new_line: Some(new_line + k),
+                            new_content: a.content.as_str(),
+                            marker: " ",
+                        },
+                        (None, None) => unreachable!(),
+                    };
+                    out.push_str(&split_row(&row, layout));
+                }
+                old_line += removes.len();
+                new_line += adds.len();
+                i += consumed;
+            }
+            DiffOp::Add => {
+                // Standalone add with no preceding remove — happens when
+                // new lines are inserted (e.g. a brand-new function body).
+                out.push_str(&split_row(
+                    &SplitRow {
+                        old_line: None,
+                        old_content: "",
+                        new_line: Some(new_line),
+                        new_content: &line.content,
+                        marker: " ",
+                    },
+                    layout,
+                ));
+                new_line += 1;
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Layout parameters shared by every row of a split-view diff render.
+#[derive(Clone, Copy)]
+struct RowLayout {
+    /// Width of the line-number gutter on each side (e.g. 4 for "0001").
+    gutter: usize,
+    /// Maximum number of content characters displayed per side.
+    half: usize,
+    /// Whether to emit ANSI color escapes.
+    color: bool,
+}
+
+/// One row of a split-view diff: a (left_line, left_text) + (right_line,
+/// right_text) pair, plus an optional `marker` override used for the
+/// default "context" rows. When only one side is populated the
+/// `marker` argument is ignored and `+` / `-` is used on the populated
+/// side.
+struct SplitRow<'a> {
+    old_line: Option<usize>,
+    old_content: &'a str,
+    new_line: Option<usize>,
+    new_content: &'a str,
+    marker: &'a str,
+}
+
+fn split_row(row: &SplitRow<'_>, layout: &RowLayout) -> String {
+    let RowLayout { gutter, half, color } = *layout;
+    let SplitRow {
+        old_line,
+        old_content,
+        new_line,
+        new_content,
+        marker,
+    } = row;
+
+    let ol_str = old_line
+        .map(|n| format!("{:>width$}", n, width = gutter))
+        .unwrap_or_else(|| " ".repeat(gutter));
+    let nl_str = new_line
+        .map(|n| format!("{:>width$}", n, width = gutter))
+        .unwrap_or_else(|| " ".repeat(gutter));
+
+    let (left_marker, right_marker) = match (old_line, new_line) {
+        (Some(_), Some(_)) => (*marker, *marker),
+        (Some(_), None) => ("-", " "),
+        (None, Some(_)) => (" ", "+"),
+        (None, None) => (*marker, *marker),
+    };
+
+    let left_paint = if color && left_marker == "-" {
+        LIGHT_RED
+    } else if color && left_marker == "+" {
+        LIGHT_GREEN
+    } else if color {
+        LIGHT_GREY
+    } else {
+        ""
+    };
+    let right_paint = if color && right_marker == "+" {
+        LIGHT_GREEN
+    } else if color && right_marker == "-" {
+        LIGHT_RED
+    } else if color {
+        LIGHT_GREY
+    } else {
+        ""
+    };
+    let reset = if color { RESET } else { "" };
+
+    let left = truncate(old_content, half);
+    let right = truncate(new_content, half);
+
+    format!(
+        " {ol_str} {left_marker} {left_paint}{left:half$}{reset} │ {nl_str} {right_marker} {right_paint}{right:half$}{reset}\n",
+        ol_str = ol_str,
+        left_marker = left_marker,
+        left_paint = left_paint,
+        left = left,
+        reset = reset,
+        nl_str = nl_str,
+        right_marker = right_marker,
+        right_paint = right_paint,
+        right = right,
+        half = half,
+    )
+}
+
+// =============================================================================
+// Diff payload classification + dispatch
+// =============================================================================
+//
+// Handlers may ship a diff in any of five shapes. The dispatcher in
+// `render_diff_value` matches on a flat `DiffPayload` enum so each
+// shape is a single match arm — a previous version accidentally
+// nested case (c) inside case (b), making it unreachable for
+// `rename_symbol`-shaped data. See `test_render_diff_value_handles_*`.
+
+/// Shape of a diff payload that a tool handler may return. The dispatch
+/// in `render_diff_value` matches on this so the control flow is flat and
+/// the four supported payload shapes are easy to read.
+#[derive(Debug)]
+enum DiffPayload<'a> {
+    /// (a) Diff fields are at the top level (`{file_path, hunks, …}`).
+    Embedded {
+        file: &'a str,
+        src: &'a Value,
+        hunks: &'a [Value],
+    },
+    /// (b) Diff is wrapped in a `diff: {…}` object (e.g. `edit_preview`).
+    Wrapped {
+        file: &'a str,
+        src: &'a Value,
+        hunks: &'a [Value],
+    },
+    /// (c) A list of per-file diffs in `diffs: [{file, diff}, …]`
+    ///     (e.g. `rename_symbol`).
+    List { entries: &'a [Value] },
+    /// (d) `diff: "…"` is already a pre-rendered string.
+    PreRendered(String),
+    /// (e) `diff_text: "…"` is already a pre-rendered string.
+    EchoText(String),
+}
+
+fn classify_diff_payload(data: &Value) -> Option<DiffPayload<'_>> {
+    // (a) top-level embedded diff
+    if let (Some(file), Some(hunks)) = (
+        data.get("file_path").and_then(|v| v.as_str()),
+        data.get("hunks").and_then(|v| v.as_array()),
+    ) {
+        return Some(DiffPayload::Embedded { file, src: data, hunks });
+    }
+    // (b) wrapped in `diff: {…}` with structured content
+    if let Some(inner) = data.get("diff") {
+        if let (Some(file), Some(hunks)) = (
+            inner.get("file_path").and_then(|v| v.as_str()),
+            inner.get("hunks").and_then(|v| v.as_array()),
+        ) {
+            return Some(DiffPayload::Wrapped { file, src: inner, hunks });
+        }
+        // (d) `diff` is a pre-rendered string
+        if let Some(s) = inner.as_str() {
+            return Some(DiffPayload::PreRendered(s.to_string()));
+        }
+    }
+    // (c) top-level list of per-file diffs
+    if let Some(arr) = data.get("diffs").and_then(|v| v.as_array()) {
+        if !arr.is_empty() {
+            return Some(DiffPayload::List { entries: arr });
+        }
+    }
+    // (e) `diff_text` echo
+    if let Some(s) = data.get("diff_text").and_then(|v| v.as_str()) {
+        return Some(DiffPayload::EchoText(s.to_string()));
+    }
+    None
+}
+
+/// Render a tool's diff payload in CLI form. Used by
+/// `render_tool_output` for the `edit_preview` / `edit_apply` / `write`
+/// / `rename_symbol` tools. Module-internal — the dispatcher in
+/// `render.rs` calls this; the public surface is `render_tool_output`.
+pub(super) fn render_diff_value(data: &Value, color: bool) -> String {
+    // Handlers may ship the diff in any of five shapes. We dispatch via
+    // `classify_diff_payload` so each shape is a single match arm rather
+    // than a nest of `if let` guards (a previous version accidentally
+    // nested case (c) inside case (b), making it unreachable for
+    // `rename_symbol`-shaped data — see test below).
+    match classify_diff_payload(data) {
+        Some(DiffPayload::Embedded { file, src, hunks }) => {
+            render_one_diff(file, src, hunks, color)
+        }
+        Some(DiffPayload::Wrapped { file, src, hunks }) => {
+            render_one_diff(file, src, hunks, color)
+        }
+        Some(DiffPayload::List { entries }) => {
+            let mut out = String::new();
+            for (i, d) in entries.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                if let (Some(file), Some(inner)) = (
+                    d.get("file").and_then(|v| v.as_str()),
+                    d.get("diff"),
+                ) {
+                    if let Some(hunks) = inner.get("hunks").and_then(|v| v.as_array()) {
+                        out.push_str(&render_one_diff(file, inner, hunks, color));
+                    } else {
+                        out.push_str(&format!(
+                            "{}── {} ──{}\n",
+                            if color { LIGHT_CYAN } else { "" },
+                            file,
+                            if color { RESET } else { "" },
+                        ));
+                    }
+                }
+            }
+            out
+        }
+        Some(DiffPayload::PreRendered(s)) | Some(DiffPayload::EchoText(s)) => s,
+        None => String::new(),
+    }
+}
+
+fn render_one_diff(file: &str, src: &Value, hunks: &[Value], color: bool) -> String {
+    let additions = src.get("additions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let deletions = src.get("deletions").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let mut diff = DiffResult {
+        file_path: file.to_string(),
+        additions,
+        deletions,
+        hunks: Vec::new(),
+    };
+    for h in hunks {
+        let old_start = h.get("old_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let new_start = h.get("new_start").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let mut lines = Vec::new();
+        if let Some(ls) = h.get("lines").and_then(|v| v.as_array()) {
+            for l in ls {
+                let op = match l.get("op").and_then(|v| v.as_str()).unwrap_or("context") {
+                    "add" => DiffOp::Add,
+                    "remove" => DiffOp::Remove,
+                    _ => DiffOp::Context,
+                };
+                lines.push(DiffLine {
+                    op,
+                    old_line: l.get("old_line").and_then(|v| v.as_u64()).map(|n| n as usize),
+                    new_line: l.get("new_line").and_then(|v| v.as_u64()).map(|n| n as usize),
+                    content: l
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
+        }
+        diff.hunks.push(DiffHunk {
+            old_start,
+            new_start,
+            lines,
+        });
+    }
+    render_split_diff(&diff, color, None)
+}
+
+/// Pretty-JSON fallback used by the render dispatcher when no
+/// per-tool renderer matches the tool name. `pub(super)` because the
+/// dispatcher lives in `output::render` and needs to reach across.
+/// ANSI color is intentionally ignored — raw escapes would corrupt
+/// the JSON and break downstream parsers (logs, jq, etc).
+pub(super) fn render_default(data: &Value, _color: bool) -> String {
+    serde_json::to_string_pretty(data).unwrap_or_else(|_| "<unprintable>".to_string())
+}
+
+// =============================================================================
+// DiffFormatter — backward-compat struct for callers outside this module
+// that build a formatter explicitly. New code should call
+// `render_tool_output` instead.
+// =============================================================================
+
+/// Formatter for diff output with color-coded additions/removals
+pub struct DiffFormatter {
+    color: bool,
+}
+
+impl DiffFormatter {
+    /// Create a new DiffFormatter with default settings
+    pub fn new() -> Self {
+        Self { color: true }
+    }
+
+    /// Enable or disable color output
+    pub fn with_color(mut self, color: bool) -> Self {
+        self.color = color;
+        self
+    }
+
+    /// Format a diff between original and modified content
+    pub fn format(&self, original: &str, modified: &str, file_path: &str) -> String {
+        let diff = compute_diff(original, modified, file_path);
+        render_split_diff(&diff, self.color, None)
+    }
+}
+
+impl Default for DiffFormatter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_diff() -> DiffResult {
+        DiffResult {
+            file_path: "src/foo.rs".to_string(),
+            additions: 1,
+            deletions: 1,
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    DiffLine {
+                        op: DiffOp::Context,
+                        old_line: Some(1),
+                        new_line: Some(1),
+                        content: "fn main() {".to_string(),
+                    },
+                    DiffLine {
+                        op: DiffOp::Remove,
+                        old_line: Some(2),
+                        new_line: None,
+                        content: "  let x = 1;".to_string(),
+                    },
+                    DiffLine {
+                        op: DiffOp::Add,
+                        old_line: None,
+                        new_line: Some(2),
+                        content: "  let x = 2;".to_string(),
+                    },
+                ],
+            }],
+        }
+    }
+
+    #[test]
+    fn test_compute_diff_basic() {
+        let d = compute_diff("a\nb\nc\n", "a\nB\nc\n", "test.rs");
+        assert_eq!(d.file_path, "test.rs");
+        assert_eq!(d.additions, 1);
+        assert_eq!(d.deletions, 1);
+        assert!(d.has_changes());
+    }
+
+    #[test]
+    fn test_compute_diff_no_changes() {
+        let d = compute_diff("a\nb\n", "a\nb\n", "test.rs");
+        assert!(!d.has_changes());
+        assert_eq!(d.additions, 0);
+        assert_eq!(d.deletions, 0);
+    }
+
+    #[test]
+    fn test_render_split_diff_has_line_numbers() {
+        let d = compute_diff("a\nb\nc\n", "a\nB\nc\n", "test.rs");
+        let s = render_split_diff(&d, false, None);
+        // Split view should have the hunk header, line numbers, and the
+        // separator between left and right.
+        assert!(s.contains("@@ -1,3 +1,3 @@"), "got: {}", s);
+        assert!(s.contains("│"), "expected split separator");
+        assert!(s.contains("  1 "), "expected old line 1");
+        assert!(s.contains("  2 "), "expected old line 2");
+    }
+
+    #[test]
+    fn test_render_split_diff_strips_trailing_newlines() {
+        // diffy includes the trailing newline in the line content;
+        // verify the renderer strips it so the row layout doesn't break.
+        let d = compute_diff("a\nb\n", "a\nB\n", "test.rs");
+        let s = render_split_diff(&d, false, None);
+        // No raw \n should appear in the middle of a row's content.
+        for line in s.lines() {
+            assert!(
+                !line.contains("│\n"),
+                "row contained a mid-line newline: {:?}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn test_diff_result_to_json() {
+        let d = sample_diff();
+        let j = d.to_json();
+        assert_eq!(j["file_path"], "src/foo.rs");
+        assert_eq!(j["additions"], 1);
+        assert_eq!(j["deletions"], 1);
+        assert_eq!(j["hunks"].as_array().unwrap().len(), 1);
+        let first_line = &j["hunks"][0]["lines"][0];
+        assert_eq!(first_line["op"], "context");
+        assert_eq!(first_line["old_line"], 1);
+        assert_eq!(first_line["new_line"], 1);
+        assert_eq!(first_line["content"], "fn main() {");
+    }
+
+    /// Regression test for the bug where the `diffs[]` branch in
+    /// `render_diff_value` was unreachable for `rename_symbol`-shaped
+    /// data. The rename handler returns a top-level `diffs` array with
+    /// NO top-level `diff` field; the previous nested-`if-let`
+    /// implementation short-circuited and rendered an empty string.
+    #[test]
+    fn test_render_diff_value_handles_rename_symbol_diffs_list() {
+        let data = serde_json::json!({
+            "diffs": [
+                {
+                    "file": "src/foo.rs",
+                    "diff": {
+                        "file_path": "src/foo.rs",
+                        "additions": 1,
+                        "deletions": 1,
+                        "hunks": [{
+                            "old_start": 1,
+                            "new_start": 1,
+                            "lines": [
+                                {"op": "context", "old_line": 1, "new_line": 1, "content": "fn main() {"},
+                                {"op": "remove",   "old_line": 2, "new_line": null, "content": "  let x = 1;"},
+                                {"op": "add",      "old_line": null, "new_line": 2, "content": "  let x = 2;"},
+                                {"op": "context",  "old_line": 3, "new_line": 3, "content": "}"}
+                            ]
+                        }]
+                    }
+                }
+            ],
+            "old_name": "x",
+            "new_name": "y"
+        });
+        let s = render_diff_value(&data, false);
+        // Must produce a non-empty diff header for the listed file.
+        assert!(s.contains("src/foo.rs"), "expected file path in render, got: {:?}", s);
+        assert!(s.contains("@@"), "expected hunk header, got: {:?}", s);
+        // Removed line content from the inner diff must appear in the
+        // rendered output (split-view places it on the left side).
+        assert!(s.contains("let x = 1;"), "expected removed line, got: {:?}", s);
+        assert!(s.contains("let x = 2;"), "expected added line, got: {:?}", s);
+    }
+
+    /// Empty `diffs[]` array should fall through to the next shape
+    /// (not panic) — it means the rename produced no file changes,
+    /// which the renderer should represent as empty output rather
+    /// than the default-renderer fallback.
+    #[test]
+    fn test_render_diff_value_handles_empty_diffs_list() {
+        let data = serde_json::json!({"diffs": [], "old_name": "x", "new_name": "x"});
+        let s = render_diff_value(&data, false);
+        // An empty diffs list is valid — the renderer should produce
+        // an empty string (not the wrapped/diff_text branches).
+        assert!(s.is_empty(), "got: {:?}", s);
+    }
+
+    /// `diff` field as a plain pre-rendered string (case d) must pass
+    /// through unchanged.
+    #[test]
+    fn test_render_diff_value_passthrough_for_string_diff() {
+        let data = serde_json::json!({"diff": "--- a\n+++ b\n"});
+        let s = render_diff_value(&data, false);
+        assert_eq!(s, "--- a\n+++ b\n");
+    }
+
+    /// `diff_text` echo field (case e) must pass through unchanged.
+    #[test]
+    fn test_render_diff_value_passthrough_for_diff_text() {
+        let data = serde_json::json!({"diff_text": "@@ -1 +1 @@\n-old\n+new\n"});
+        let s = render_diff_value(&data, false);
+        assert_eq!(s, "@@ -1 +1 @@\n-old\n+new\n");
+    }
+}
