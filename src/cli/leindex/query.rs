@@ -503,15 +503,13 @@ fn fuzzy_find_node(
         }
         if alias_candidates.is_empty() {
             // No trigram hits for any alias — fall back to full scan (bounded)
-            let mut scanned = 0;
-            for node_id in pdg.node_indices() {
+            for (scanned, node_id) in pdg.node_indices().enumerate() {
                 if scanned >= MAX_FALLBACK_SCAN {
                     break;
                 }
                 if let Some(node) = pdg.get_node(node_id) {
                     score_node(node_id, node);
                 }
-                scanned += 1;
             }
         } else {
             for &node_idx in &alias_candidates {
@@ -530,15 +528,13 @@ fn fuzzy_find_node(
         }
     } else {
         // No trigram index — fall back to full scan (bounded)
-        let mut scanned = 0;
-        for node_id in pdg.node_indices() {
+        for (scanned, node_id) in pdg.node_indices().enumerate() {
             if scanned >= MAX_FALLBACK_SCAN {
                 break;
             }
             if let Some(node) = pdg.get_node(node_id) {
                 score_node(node_id, node);
             }
-            scanned += 1;
         }
     }
 

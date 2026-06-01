@@ -273,7 +273,7 @@ pub fn save_pdg(
     }
 
     // Save trigram index alongside the PDG (within the same transaction)
-    if let Err(e) = save_trigram_index_tx(&tx, project_id, &pdg.trigram_index()) {
+    if let Err(e) = save_trigram_index_tx(&tx, project_id, pdg.trigram_index()) {
         // Log but don't fail — the trigram index is a performance optimization,
         // not a correctness requirement. It will be rebuilt on load if missing.
         tracing::warn!("Failed to save trigram index: {e}");

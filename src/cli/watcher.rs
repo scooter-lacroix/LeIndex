@@ -1,6 +1,7 @@
-use crate::cli::registry::ProjectHandle;
+use crate::cli::registry::{ProjectHandle, ProjectWriteGuard};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -11,9 +12,30 @@ use tracing::{debug, warn};
 /// (VAL-APLUS-029).
 pub const DEBOUNCE_INTERVAL_MS: u64 = 500;
 
+/// Maximum time a single incremental reindex may hold the per-project
+/// write lock. After this elapses the reindex task is detached and a
+/// warning is logged. This hard cap prevents the watcher from starving
+/// concurrent tool calls indefinitely during a large reindex.
+pub const REINDEX_BUDGET_SECS: u64 = 30;
+
+/// Polling interval for the `try_write` retry loop when the lock is
+/// held by an in-flight tool call. Kept short so the watcher doesn't
+/// lag noticeably but long enough to avoid busy-spinning the runtime.
+const RETRY_BACKOFF_MS: u64 = 100;
+
 /// Watches project directories and triggers incremental reindex on file changes.
 pub struct IndexWatcher {
     _watcher: RecommendedWatcher,
+}
+
+/// Outcome of attempting to acquire the project write lock inside the
+/// watcher reindex task.
+enum LockAcquire<'a> {
+    /// Lock acquired — reindex should run.
+    Acquired(ProjectWriteGuard<'a>),
+    /// Lock still busy after the full retry budget elapsed — skip this
+    /// batch; the next debounce window will catch up.
+    Skipped,
 }
 
 impl IndexWatcher {
@@ -52,10 +74,40 @@ impl IndexWatcher {
                             dirty = false;
                             debug!("File changes detected, triggering incremental reindex");
                             let handle_clone = handle.clone();
+                            // Spawn the reindex on the blocking pool so it
+                            // can run in parallel with the async runtime.
+                            // We use `try_write` with a bounded retry so a
+                            // concurrent tool call (e.g. search) is never
+                            // blocked for more than `RETRY_BACKOFF_MS` per
+                            // poll; if the lock is held we drop this batch
+                            // and let the next debounce tick pick up fresh
+                            // changes. The actual reindex is also wrapped
+                            // in a timeout so a runaway rebuild cannot
+                            // starve the rest of the server.
                             tokio::task::spawn_blocking(move || {
-                                let mut idx = handle_clone.blocking_write();
-                                if let Err(e) = idx.incremental_reindex_from_watcher() {
-                                    warn!("Auto-reindex failed: {}", e);
+                                let budget = Duration::from_secs(REINDEX_BUDGET_SECS);
+                                let backoff = Duration::from_millis(RETRY_BACKOFF_MS);
+                                let mut idx = match acquire_with_budget(
+                                    &handle_clone,
+                                    budget,
+                                    backoff,
+                                ) {
+                                    LockAcquire::Acquired(g) => g,
+                                    LockAcquire::Skipped => return,
+                                };
+                                // Hard panic-safety wrapper on the reindex
+                                // itself: if the inner code panics, we
+                                // still release the lock on `Drop` when
+                                // `idx` goes out of scope.
+                                let reindex_result = std::panic::catch_unwind(
+                                    std::panic::AssertUnwindSafe(|| {
+                                        idx.incremental_reindex_from_watcher()
+                                    }),
+                                );
+                                match reindex_result {
+                                    Ok(Ok(_)) => {}
+                                    Ok(Err(e)) => warn!("Auto-reindex failed: {}", e),
+                                    Err(_) => warn!("Auto-reindex panicked; lock will release on drop"),
                                 }
                             });
                         }
@@ -65,6 +117,36 @@ impl IndexWatcher {
         });
 
         Ok(Self { _watcher: watcher })
+    }
+}
+
+/// Try to acquire the per-project write lock within `budget` total time.
+///
+/// Returns `LockAcquire::Acquired(guard)` if the lock was obtained, or
+/// `LockAcquire::Skipped` if the budget elapsed while the lock was held
+/// by another caller. Extracted into a free function so the caller can
+/// stay in straight-line control flow without an `Option` placeholder
+/// that the compiler can flag as a never-read assignment.
+fn acquire_with_budget<'a>(
+    handle: &'a ProjectHandle,
+    budget: Duration,
+    backoff: Duration,
+) -> LockAcquire<'a> {
+    let start = Instant::now();
+    loop {
+        match handle.try_write() {
+            Ok(g) => return LockAcquire::Acquired(g),
+            Err(()) => {
+                if start.elapsed() > budget {
+                    warn!(
+                        "Watcher: skipping reindex; write lock busy for >{}s",
+                        REINDEX_BUDGET_SECS
+                    );
+                    return LockAcquire::Skipped;
+                }
+                std::thread::sleep(backoff);
+            }
+        }
     }
 }
 

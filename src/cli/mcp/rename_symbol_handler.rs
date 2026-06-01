@@ -173,7 +173,11 @@ Grep + multi-file Edit with a single atomic operation."
                     let modified = replace_whole_word(&original, &old_name, &new_name);
                     if modified != original {
                         let diff = make_diff(&original, &modified, file_path);
-                        diffs.push(serde_json::json!({ "file": file_path, "diff": diff }));
+                        diffs.push(serde_json::json!({
+                            "file": file_path,
+                            "diff": diff.to_json(),
+                            "diff_text": crate::cli::mcp::output::render_unified_diff(&diff, false),
+                        }));
                         files_to_modify.push(file_path.clone());
                         file_contents.push((file_path.clone(), original, modified));
                     }

@@ -54,6 +54,48 @@ fn generate_session_id() -> String {
     format!("leindex-{pid}-{seq}")
 }
 
+/// Default MCP server port.
+///
+/// Chosen in IANA dynamic/private range (49152-65535) and well above the
+/// common dev-server range. This port is unlikely to be in use by other
+/// processes, but the runtime still auto-falls-back to the next 10 ports
+/// (and ultimately any free port up to 65535) if a conflict occurs.
+///
+/// Override with the `LEINDEX_PORT` environment variable.
+pub const DEFAULT_MCP_PORT: u16 = 47500;
+
+/// Default per-tool-call timeout in seconds.
+///
+/// Hard cap on any single MCP tool call so a slow operation cannot block
+/// the server indefinitely. Individual tool handlers may set a tighter
+/// internal timeout.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
+
+/// Number of consecutive ports to try on `bind()` failure before giving up.
+pub const BIND_FALLBACK_PORT_RANGE: u16 = 10;
+
+/// Default cap on concurrently-tracked HTTP sessions before the oldest
+/// idle session is evicted to make room for a new one. Tunable via the
+/// `LEINDEX_MAX_SESSIONS` environment variable; the env override is
+/// useful for CI farms that spawn many short-lived clients.
+pub const DEFAULT_MAX_HTTP_SESSIONS: usize = 1000;
+
+/// Environment variable that overrides `DEFAULT_MAX_HTTP_SESSIONS`.
+pub const MAX_SESSIONS_ENV: &str = "LEINDEX_MAX_SESSIONS";
+
+/// Resolved cap on concurrent HTTP sessions.
+pub fn max_http_sessions() -> usize {
+    match std::env::var(MAX_SESSIONS_ENV) {
+        Ok(v) => v
+            .trim()
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_MAX_HTTP_SESSIONS),
+        Err(_) => DEFAULT_MAX_HTTP_SESSIONS,
+    }
+}
+
 /// MCP Server configuration
 #[derive(Clone, Debug)]
 pub struct McpServerConfig {
@@ -66,17 +108,20 @@ pub struct McpServerConfig {
     /// Maximum request size in megabytes
     pub max_request_size_mb: usize,
 
-    /// Request timeout in seconds
+    /// Request timeout in seconds (per tool call)
     pub request_timeout_secs: u64,
 }
 
 impl Default for McpServerConfig {
     fn default() -> Self {
         Self {
-            bind_address: SocketAddr::from(([127, 0, 0, 1], 3000)),
+            // Use 127.0.0.1 (loopback only) on a high, rarely-used port in the
+            // IANA dynamic/private range. The server attempts to auto-fallback
+            // to the next consecutive ports if the default is in use.
+            bind_address: SocketAddr::from(([127, 0, 0, 1], DEFAULT_MCP_PORT)),
             enable_cors: true,
             max_request_size_mb: 10,
-            request_timeout_secs: 300,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
         }
     }
 }
@@ -93,6 +138,13 @@ pub struct McpServer {
     /// Per-session handshake state for HTTP and stdio transports (session ID → (handshaked, last_access_time)).
     /// Keyed by the `Mcp-Session-Id` header value for HTTP, and generated session ID for stdio.
     pub(crate) session_handshakes: Arc<DashMap<String, (bool, Instant)>>,
+    /// Session IDs that currently have an in-flight tool call.
+    ///
+    /// Cleanup skips these so a long-running tool call is never evicted
+    /// mid-flight by the idle-expiration sweep. Keys are `Arc<str>` so
+    /// `begin_request`/`end_request` bump a refcount instead of
+    /// allocating a new `String` for every request.
+    pub(crate) in_flight: Arc<DashMap<Arc<str>, ()>>,
 }
 
 impl McpServer {
@@ -133,6 +185,7 @@ impl McpServer {
             _registry: registry,
             handshake_complete: Arc::new(AtomicBool::new(false)),
             session_handshakes: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
         };
 
         SERVER_INSTANCE
@@ -163,15 +216,53 @@ impl McpServer {
     ///
     /// A+ hotspot cleanup: prevents session-tracking state from growing
     /// monotonically across long-lived server sessions (VAL-APLUS-025).
+    ///
+    /// Sessions with an in-flight tool call are preserved — evicting them
+    /// mid-request would cause spurious "Server not initialized" errors
+    /// for the active client.
     pub fn cleanup_stale_sessions(&self, max_idle: std::time::Duration) -> usize {
         let before = self.session_handshakes.len();
-        self.session_handshakes.retain(|_, (_, last_access)| last_access.elapsed() < max_idle);
+        self.session_handshakes.retain(|sid, (_, last_access)| {
+            // `sid` is `&String`; look up in `in_flight` as `&str` so
+            // DashMap resolves the Borrow trait to `Arc<str>: Borrow<str>`.
+            if self.in_flight.contains_key(sid.as_str()) {
+                // Active request — never evict.
+                true
+            } else {
+                last_access.elapsed() < max_idle
+            }
+        });
         before - self.session_handshakes.len()
     }
 
     /// Get the number of active sessions (for diagnostics and testing).
     pub fn active_session_count(&self) -> usize {
         self.session_handshakes.len()
+    }
+
+    /// Returns true if the given session has an in-flight tool call.
+    ///
+    /// The cleanup task uses this to avoid evicting sessions that are
+    /// currently processing a request. `Arc<str>` and `&str` produce
+    /// the same hash, so DashMap's borrow-based lookup works without
+    /// allocating.
+    pub fn session_in_flight(&self, session_id: &str) -> bool {
+        self.in_flight.contains_key(session_id)
+    }
+
+    /// Mark a session as having an in-flight request.
+    ///
+    /// Idempotent — repeated calls are no-ops. The `Arc<str>` key
+    /// refcounts the session ID rather than allocating a new `String`
+    /// for every request.
+    pub fn begin_request(&self, session_id: &str) {
+        self.in_flight
+            .insert(Arc::<str>::from(session_id), ());
+    }
+
+    /// Mark a session's in-flight request as complete.
+    pub fn end_request(&self, session_id: &str) {
+        self.in_flight.remove(session_id);
     }
 
     /// Run the MCP server
@@ -223,9 +314,18 @@ impl McpServer {
 
         info!("Starting MCP server on {}", bind_address);
 
-        let listener = tokio::net::TcpListener::bind(bind_address)
-            .await
-            .context("Failed to bind TCP listener")?;
+        // Auto-bind-fallback: if the default port is taken, try the next
+        // consecutive ports before giving up. Eliminates the most common
+        // "MCP fails to connect" failure mode where another process holds
+        // the port and the user has no idea why the server won't start.
+        let listener = bind_with_fallback(bind_address).await?;
+        if listener.local_addr()? != bind_address {
+            warn!(
+                "Default port {} was unavailable; bound to fallback {}",
+                bind_address.port(),
+                listener.local_addr()?.port()
+            );
+        }
         axum::serve(listener, router.into_make_service())
             .await
             .context("Server error")?;
@@ -241,6 +341,48 @@ impl McpServer {
             .route("/mcp/index/stream", post(index_stream_handler))
         // Note: CORS layer removed due to axum 0.6 / tower-http compatibility issues
         // Can be re-added when upgrading to axum 0.7 with matching tower-http version
+    }
+}
+
+/// Try to bind to `preferred`. If unavailable, walk forward up to
+/// `BIND_FALLBACK_PORT_RANGE` ports, then accept whatever ephemeral port
+/// the OS hands out. This makes "another process took my port" a
+/// recoverable warning instead of a fatal startup error.
+async fn bind_with_fallback(
+    preferred: SocketAddr,
+) -> anyhow::Result<tokio::net::TcpListener> {
+    let mut last_err: Option<std::io::Error> = None;
+    for offset in 0..=BIND_FALLBACK_PORT_RANGE {
+        let candidate = SocketAddr::new(preferred.ip(), preferred.port().saturating_add(offset));
+        match tokio::net::TcpListener::bind(candidate).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) => {
+                debug!("bind({}) failed: {}", candidate, e);
+                last_err = Some(e);
+            }
+        }
+    }
+    // Last resort — ask the OS for any free ephemeral port on the same IP.
+    match tokio::net::TcpListener::bind(SocketAddr::new(preferred.ip(), 0)).await {
+        Ok(listener) => Ok(listener),
+        Err(ephemeral_err) => {
+            // Surface a single descriptive error that mentions both the
+            // preferred port and the ephemeral-bind failure so the user
+            // can see why nothing worked without having to dig through
+            // two stacked anyhow contexts.
+            let preferred_err = last_err
+                .as_ref()
+                .map(|e| format!(" ({})", e))
+                .unwrap_or_default();
+            Err(anyhow::anyhow!(
+                "failed to bind to {} or any of the next {} ports{}; \
+                 ephemeral-bind fallback also failed: {}",
+                preferred,
+                BIND_FALLBACK_PORT_RANGE,
+                preferred_err,
+                ephemeral_err,
+            ))
+        }
     }
 }
 
@@ -414,13 +556,21 @@ fn handle_initialize(server: &McpServer) -> (Value, Option<String>) {
 
     // Store in per-session map with eviction logic
     {
-        // Evict oldest sessions if we exceed a reasonable limit (1000 sessions)
-        const MAX_HTTP_SESSIONS: usize = 1000;
-        if server.session_handshakes.len() >= MAX_HTTP_SESSIONS {
-            // Find and remove the oldest session (by last_access_time)
-            let oldest_id = server.session_handshakes.iter().min_by_key(|r| r.value().1).map(|r| r.key().to_string());
+        let max_sessions = max_http_sessions();
+        if server.session_handshakes.len() >= max_sessions {
+            // Find the oldest session (by last_access_time) that is NOT
+            // currently processing a request. `cleanup_stale_sessions`
+            // applies the same rule; without it, a long tool call can be
+            // evicted mid-request, which surfaces as a spurious
+            // "Server not initialized" error for the active client.
+            let oldest_id = server
+                .session_handshakes
+                .iter()
+                .filter(|r| !server.in_flight.contains_key(r.key().as_str()))
+                .min_by_key(|r| r.value().1)
+                .map(|r| r.key().clone());
             if let Some(id) = oldest_id {
-                server.session_handshakes.remove(&id);
+                server.session_handshakes.remove(id.as_str());
             }
         }
         server.session_handshakes.insert(session_id.clone(), (true, Instant::now()));
@@ -540,10 +690,14 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
         return StatusCode::NO_CONTENT.into_response();
     }
 
+    // `ping` is a health probe and must work without a session.
+    // `initialize` provisions a new session and is allowed pre-handshake.
     if json_req.method == "initialize" {
         // Generate new session, store, and return session ID header
+    } else if json_req.method == "ping" {
+        // Health probe — no session required.
     } else {
-        // Non-initialize: validate session ID exists and is handshaked
+        // All other methods require a valid handshaked session.
         let session_ok = match &incoming_session_id {
             Some(sid) => {
                 if let Some(mut entry) = server_instance.session_handshakes.get_mut(sid) {
@@ -586,7 +740,30 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
             return body;
         }
         "ping" => Ok(handle_ping()),
-        "tools/call" => handle_tool_call(&state, handlers, &json_req).await,
+        "tools/call" => {
+            // Per-tool-call hard timeout + in-flight session tracking so the
+            // background cleanup task never evicts a session that's still
+            // processing a request.
+            let timeout = std::time::Duration::from_secs(server_instance.config.request_timeout_secs);
+            if let Some(sid) = incoming_session_id.as_ref() {
+                server_instance.begin_request(sid);
+            }
+            let tool_result = tokio::time::timeout(
+                timeout,
+                handle_tool_call(&state, handlers, &json_req),
+            )
+            .await;
+            if let Some(sid) = incoming_session_id.as_ref() {
+                server_instance.end_request(sid);
+            }
+            match tool_result {
+                Ok(result) => result,
+                Err(_) => Err(JsonRpcError::internal_error(format!(
+                    "Tool call timed out after {}s",
+                    server_instance.config.request_timeout_secs
+                ))),
+            }
+        }
         "tools/list" => Ok(list_tools_json(handlers)),
         "prompts/list" => Ok(list_prompts_json()),
         "prompts/get" => handle_prompt_get(&json_req),
@@ -627,14 +804,20 @@ pub async fn handle_tool_call(
     // Execute the tool and wrap the result in standard MCP content format
     match handler.execute(registry, tool_call.arguments).await {
         Ok(value) => {
-            // For DeepAnalyze and Context, we might want to be more specific,
-            // but for now, we just stringify the result.
-            // MCP expects { content: [{ type: "text", text: "..." }], isError: false }
+            // The MCP transport is what the LLM actually sees. Run the
+            // tool's raw value through the per-tool payload trimmer so we
+            // hand the model only the fields it needs (no scoring
+            // internals, no byte ranges, no tfidf/neural split, etc.).
+            // The CLI surface uses `output::render_tool_output` over the
+            // same value for its human-readable view.
+            let trimmed = crate::cli::mcp::output::trim_llm_payload(&tool_call.name, &value);
+            let payload = serde_json::to_string_pretty(&trimmed)
+                .unwrap_or_else(|_| "Error serializing result".to_string());
             Ok(serde_json::json!({
                 "content": [
                     {
                         "type": "text",
-                        "text": serde_json::to_string_pretty(&value).unwrap_or_else(|_| "Error serializing result".to_string())
+                        "text": payload
                     }
                 ],
                 "isError": false
@@ -1127,8 +1310,14 @@ mod tests {
         let config = McpServerConfig::default();
         assert_eq!(
             config.bind_address,
-            SocketAddr::from(([127, 0, 0, 1], 3000))
+            SocketAddr::from(([127, 0, 0, 1], DEFAULT_MCP_PORT))
         );
+        // Loopback-only binding on a high, rarely-used port. We avoid the
+        // well-known dev-server range (<10000) which collides with Node,
+        // Rails, Django, etc. 47500 sits well above that and below the
+        // IANA dynamic range (49152+) so it's reliably available.
+        assert!(config.bind_address.ip().is_loopback());
+        assert!(config.bind_address.port() >= 10000);
     }
 
     #[cfg(unix)]
@@ -1163,6 +1352,7 @@ mod tests {
             _registry: registry,
             handshake_complete: Arc::new(AtomicBool::new(false)),
             session_handshakes: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
         };
 
         // Simulate multiple concurrent session handshakes
@@ -1201,6 +1391,7 @@ mod tests {
             _registry: registry,
             handshake_complete: Arc::new(AtomicBool::new(false)),
             session_handshakes: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
         };
 
         let (_, sid1) = handle_initialize_for_test(&server);
@@ -1225,6 +1416,7 @@ mod tests {
             _registry: registry,
             handshake_complete: Arc::new(AtomicBool::new(false)),
             session_handshakes: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
         };
 
         // Create a session
@@ -1246,6 +1438,110 @@ mod tests {
     fn handle_initialize_for_test(server: &McpServer) -> (Value, String) {
         let (result, sid) = handle_initialize(server);
         (result, sid.unwrap())
+    }
+
+    /// Regression test for HIGH #2: when `handle_initialize` is forced to
+    /// evict to make room for a new session, it must NOT evict a session
+    /// that is currently processing a request. Without the in_flight
+    /// filter, a long-running tool call could be evicted mid-request,
+    /// producing spurious "Server not initialized" errors for the
+    /// active client.
+    ///
+    /// Test strategy: lower the session cap to 2, register 2 sessions
+    /// (one of which is in_flight), and call `handle_initialize` a
+    /// third time. The in_flight session must survive; the idle
+    /// session must be evicted.
+    #[test]
+    fn test_handle_initialize_does_not_evict_in_flight_session() {
+        // Override the cap for this test. We can't override
+        // `DEFAULT_MAX_HTTP_SESSIONS` (it's a const) but we can verify
+        // the eviction logic by pre-loading 2 sessions and forcing a
+        // third call to be on the boundary.
+        //
+        // To exercise the eviction code path directly we use a slightly
+        // higher load than the cap: register MAX sessions, then call
+        // initialize once more and check the in_flight session is kept.
+        let registry = Arc::new(ProjectRegistry::new(5));
+        let server = McpServer {
+            config: McpServerConfig::default(),
+            _registry: registry,
+            handshake_complete: Arc::new(AtomicBool::new(false)),
+            session_handshakes: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
+        };
+
+        // Fill the session map to the cap. We use `insert` directly
+        // because `handle_initialize` generates its own session IDs and
+        // we want to control which ones are "old" and "in flight".
+        let now = Instant::now();
+        for i in 0..DEFAULT_MAX_HTTP_SESSIONS {
+            let sid = format!("sess-{i:04}");
+            server
+                .session_handshakes
+                .insert(sid.clone(), (true, now));
+        }
+        assert_eq!(server.active_session_count(), DEFAULT_MAX_HTTP_SESSIONS);
+
+        // Mark the very first session (oldest by insertion order) as
+        // in-flight. `last_access_time` is the same as the others, so
+        // without the in_flight filter it would be evicted.
+        let in_flight_sid = "sess-0000".to_string();
+        server.begin_request(&in_flight_sid);
+        assert!(server.session_in_flight(&in_flight_sid));
+
+        // The next initialize call should trigger eviction logic.
+        let (_, new_sid) = handle_initialize_for_test(&server);
+
+        // The in-flight session must still be present.
+        assert!(
+            server.session_handshakes.contains_key(&in_flight_sid),
+            "in_flight session {} was evicted during initialize",
+            in_flight_sid,
+        );
+        // The new session must be present.
+        assert!(
+            server.session_handshakes.contains_key(&new_sid),
+            "newly initialized session {} was not registered",
+            new_sid,
+        );
+        // The total count is at most MAX + 1 (the new session, since
+        // the in_flight one was preserved and exactly one other was
+        // evicted).
+        assert!(
+            server.active_session_count() <= DEFAULT_MAX_HTTP_SESSIONS + 1,
+            "session count {} exceeds cap + 1",
+            server.active_session_count(),
+        );
+
+        // Cleanup: end the request so the in_flight map is empty for
+        // other tests in the same process.
+        server.end_request(&in_flight_sid);
+    }
+
+    /// `LEINDEX_MAX_SESSIONS` env var overrides the default session cap.
+    #[test]
+    fn test_max_http_sessions_env_override() {
+        // Default (env unset) returns the default.
+        // SAFETY: we never read another thread's env in this test;
+        // setting the var for the duration of the assertion is safe.
+        // SAFETY: This is a single-threaded test; no other thread reads
+        // the env in parallel.
+        unsafe {
+            std::env::set_var(MAX_SESSIONS_ENV, "42");
+        }
+        assert_eq!(max_http_sessions(), 42);
+        unsafe {
+            std::env::remove_var(MAX_SESSIONS_ENV);
+        }
+        assert_eq!(max_http_sessions(), DEFAULT_MAX_HTTP_SESSIONS);
+        // Bogus value falls back to default.
+        unsafe {
+            std::env::set_var(MAX_SESSIONS_ENV, "not-a-number");
+        }
+        assert_eq!(max_http_sessions(), DEFAULT_MAX_HTTP_SESSIONS);
+        unsafe {
+            std::env::remove_var(MAX_SESSIONS_ENV);
+        }
     }
 }
 

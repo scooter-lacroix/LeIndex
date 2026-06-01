@@ -4,10 +4,7 @@
 
 use crate::cli::leindex::LeIndex;
 use crate::cli::mcp::handlers::{all_tool_handlers, ToolHandler};
-use crate::cli::mcp::output::{
-    DiagnosticsFormatter, FileSummaryFormatter, ImpactFormatter, PhaseFormatter,
-    ProjectMapFormatter, SearchFormatter,
-};
+use crate::cli::mcp::output::render_tool_output;
 use crate::cli::mcp::protocol::{JsonRpcRequest, JsonRpcResponse};
 use crate::cli::mcp::McpServer;
 use crate::cli::registry::{ProjectRegistry, DEFAULT_MAX_PROJECTS};
@@ -734,11 +731,15 @@ async fn cmd_search_impl(
         })
         .collect();
 
-    // Use beautiful formatter
-    let formatter = SearchFormatter::new();
+    // Use the unified CLI renderer so the search output matches the
+    // shape of `leindex tools run leindex.search`.
     println!(
         "{}",
-        formatter.format(&serde_json::json!(results_json), &query)
+        render_tool_output(
+            "leindex.search",
+            &serde_json::json!(results_json),
+            &serde_json::json!({ "query": &query }),
+        )
     );
 
     Ok(())
@@ -829,12 +830,10 @@ async fn cmd_context_impl(
 
     let value = execute_tool_handler("leindex_context", args, project).await?;
 
-    let formatter = SearchFormatter::new();
-    let display_value = value
-        .get("results")
-        .cloned()
-        .unwrap_or_else(|| value.clone());
-    println!("{}", formatter.format(&display_value, &node_id));
+    println!(
+        "{}",
+        render_tool_output("leindex.context", &value, &serde_json::json!({ "node_id": &node_id }))
+    );
 
     Ok(())
 }
@@ -951,9 +950,12 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         "issues": []
     });
 
-    // Use beautiful formatter
-    let formatter = DiagnosticsFormatter::new();
-    println!("{}", formatter.format(&diag_json));
+    // Use the unified CLI renderer so `leindex diagnostics` and
+    // `leindex tools run leindex.diagnostics` produce identical output.
+    println!(
+        "{}",
+        render_tool_output("leindex.diagnostics", &diag_json, &serde_json::json!({}))
+    );
 
     Ok(())
 }
@@ -961,8 +963,13 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> AnyhowResult<()> {
     match command {
         ToolCommands::List => {
-            for handler in all_tool_handlers() {
-                println!("{}\t{}", handler.name(), handler.description());
+            // Display as `LeIndex [Tool Name]  description` so the user sees the
+            // human-readable title first (what they'll write in prompts), with
+            // the canonical dotted name available via `leindex tools help`.
+            let mut handlers = all_tool_handlers();
+            handlers.sort_by(|a, b| a.title().cmp(b.title()));
+            for handler in handlers {
+                println!("{}\t{}", handler.title(), handler.description());
             }
             Ok(())
         }
@@ -987,63 +994,13 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
             let args = merge_tool_args(parsed_args.clone(), &set, project.as_ref())?;
             let value = execute_tool_handler(&name, args, project).await?;
 
-            // Use appropriate formatter based on tool name
-            let normalized_name = name.to_lowercase().replace(['-', '.'], "_");
-            let formatted = match normalized_name.as_str() {
-                "leindex_search" | "search" => {
-                    let formatter = SearchFormatter::new();
-                    formatter.format(
-                        &value,
-                        parsed_args
-                            .get("query")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(""),
-                    )
-                }
-                "leindex_context" | "context" => {
-                    let formatter = SearchFormatter::new();
-                    let display_value = value
-                        .get("results")
-                        .cloned()
-                        .unwrap_or_else(|| value.clone());
-                    formatter.format(
-                        &display_value,
-                        parsed_args
-                            .get("node_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(""),
-                    )
-                }
-                "leindex_diagnostics" | "diagnostics" => {
-                    let formatter = DiagnosticsFormatter::new();
-                    formatter.format(&value)
-                }
-                "leindex_project_map" | "project_map" => {
-                    let formatter = ProjectMapFormatter::new();
-                    formatter.format(&value)
-                }
-                "leindex_impact_analysis" | "impact_analysis" => {
-                    let formatter = ImpactFormatter::new();
-                    formatter.format(&value)
-                }
-                "leindex_file_summary" | "file_summary" => {
-                    let formatter = FileSummaryFormatter::new();
-                    formatter.format(&value)
-                }
-                "leindex_phase_analysis" | "phase_analysis" => {
-                    let formatter = PhaseFormatter::new();
-                    formatter.format(&value)
-                }
-                "leindex_git_status" | "git_status" => {
-                    use crate::cli::mcp::output::GitStatusFormatter;
-                    let formatter = GitStatusFormatter::new();
-                    formatter.format(&value)
-                }
-                _ => {
-                    // Default to JSON output
-                    serde_json::to_string_pretty(&value).unwrap_or_default()
-                }
-            };
+            // Use the unified renderer — same path used by the MCP transport
+            // so CLI and LLM-visible payloads stay in lock-step.
+            let formatted = crate::cli::mcp::output::render_tool_output(
+                &name,
+                &value,
+                &parsed_args,
+            );
 
             println!("{}", formatted);
             Ok(())
@@ -1053,7 +1010,8 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
 
 /// Serve command implementation - Start MCP server
 async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
-    // Check for environment variable override (for customization via LEINDEX_PORT)
+    // Check for environment variable override (for customization via LEINDEX_PORT).
+    // `LEINDEX_PORT` always wins — useful for power users and CI overrides.
     let port = if let Ok(env_port) = std::env::var("LEINDEX_PORT") {
         env_port.parse::<u16>().unwrap_or(port)
     } else {
@@ -1077,7 +1035,7 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
     println!("  GET  /mcp/tools/list - List available tools");
     println!("  GET  /health         - Health check");
     println!("\nConfiguration:");
-    println!("  Port: {} (override with LEINDEX_PORT env var)", port);
+    println!("  Port: {} (override with LEINDEX_PORT env var; auto-falls back to next port if taken)", port);
     println!("\nPress Ctrl+C to stop the server\n");
 
     server.run().await.context("Server error")?;

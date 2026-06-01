@@ -2,7 +2,6 @@
 
 use super::leindex::{ProjectFileScan, DEPENDENCY_MANIFEST_NAMES};
 use crate::cli::memory::CacheEntry;
-use crate::cli::skip_dirs::SKIP_DIRS;
 use crate::storage::schema::Storage;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -247,43 +246,13 @@ pub(crate) fn is_stale_fast(
         Vec::new()
     };
 
-    // Walk project tree for ALL manifests
-    {
-        for entry in walkdir::WalkDir::new(ctx.project_path)
-            .max_depth(8)
-            .into_iter()
-            .filter_entry(|e| {
-                if let Some(name) = e.file_name().to_str() {
-                    if SKIP_DIRS.contains(&name) && e.file_type().is_dir() {
-                        return false;
-                    }
-                    // Skip non-root hidden directories (mirrors external_deps.rs)
-                    if e.path() != ctx.project_path
-                        && name.starts_with('.')
-                        && e.file_type().is_dir()
-                    {
-                        return false;
-                    }
-                }
-                true
-            })
-            .filter_map(|e| e.ok())
-        {
-            let Some(name) = entry.file_name().to_str() else {
-                continue;
-            };
-            if !DEPENDENCY_MANIFEST_NAMES.contains(&name) {
-                continue;
-            }
-            if let Ok(metadata) = entry.metadata() {
-                if let Ok(modified) = metadata.modified() {
-                    if modified > db_time {
-                        return true;
-                    }
-                }
-            }
-        }
-    }
+    // The list-based check below covers every manifest already discovered
+    // by the project scan (Cargo.toml, package.json, pyproject.toml, etc.).
+    // The historical walkdir block that re-walked the project tree here
+    // was both redundant with this check AND responsible for adding
+    // hundreds of stat() calls on every tool call when the stale cache
+    // TTL expired. Removed.
+
     for manifest_path in &manifest_paths {
         match std::fs::metadata(manifest_path) {
             Ok(metadata) => {
