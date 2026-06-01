@@ -265,6 +265,22 @@ impl McpServer {
         self.in_flight.remove(session_id);
     }
 
+    /// Acquire a panic-safe in-flight guard for the given session.
+    ///
+    /// The returned `InFlightGuard` removes the session from the
+    /// `in_flight` set on drop, so the cleanup task never sees a
+    /// session as in-flight if the tool call panics, the timeout
+    /// future is dropped, or any other path bypasses the explicit
+    /// `end_request` call. This is a small RAII wrapper that
+    /// eliminates an entire class of session-leak bugs.
+    pub fn in_flight_guard(server: &Arc<Self>, session_id: &str) -> InFlightGuard {
+        server.begin_request(session_id);
+        InFlightGuard {
+            server: Arc::clone(server),
+            session_id: Arc::<str>::from(session_id),
+        }
+    }
+
     /// Run the MCP server
     ///
     /// Starts the axum HTTP server and handles incoming requests.
@@ -743,19 +759,19 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
         "tools/call" => {
             // Per-tool-call hard timeout + in-flight session tracking so the
             // background cleanup task never evicts a session that's still
-            // processing a request.
+            // processing a request. The in-flight guard is RAII — its Drop
+            // always calls `end_request`, so a panic inside `handle_tool_call`
+            // or a dropped timeout future cannot leak the session in the
+            // in-flight map forever.
             let timeout = std::time::Duration::from_secs(server_instance.config.request_timeout_secs);
-            if let Some(sid) = incoming_session_id.as_ref() {
-                server_instance.begin_request(sid);
-            }
+            let _guard = incoming_session_id
+                .as_ref()
+                .map(|sid| McpServer::in_flight_guard(server_instance, sid));
             let tool_result = tokio::time::timeout(
                 timeout,
                 handle_tool_call(&state, handlers, &json_req),
             )
             .await;
-            if let Some(sid) = incoming_session_id.as_ref() {
-                server_instance.end_request(sid);
-            }
             match tool_result {
                 Ok(result) => result,
                 Err(_) => Err(JsonRpcError::internal_error(format!(
@@ -952,6 +968,37 @@ async fn health_check_handler() -> Json<Value> {
         "service": "leindex-mcp-server",
         "version": env!("CARGO_PKG_VERSION")
     }))
+}
+
+// ============================================================================
+// In-Flight Guard (RAII panic safety for tool-call tracking)
+// ============================================================================
+
+/// RAII guard returned by [`McpServer::in_flight_guard`].
+///
+/// Removes the session from the server's `in_flight` set on `Drop`, so
+/// the cleanup task never sees a session as in-flight if the tool call
+/// panics, the timeout future is dropped, or any other code path
+/// bypasses the explicit `end_request` call. Without this guard, a
+/// panic inside a tool handler would leak the session in the in-flight
+/// map forever, defeating the cleanup task's ability to evict the
+/// session.
+///
+/// # Note
+///
+/// `Arc::<str>::from(&str)` *does* allocate a new heap block on
+/// insert — the optimization vs. `String` is that subsequent
+/// `DashMap::contains_key(&str)` lookups don't allocate because the
+/// `Borrow` trait makes `&str` and `Arc<str>` use the same hash.
+pub struct InFlightGuard {
+    server: Arc<McpServer>,
+    session_id: Arc<str>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.server.end_request(&self.session_id);
+    }
 }
 
 // ============================================================================
@@ -1305,6 +1352,17 @@ async fn handle_socket_message(
 mod tests {
     use super::*;
 
+    /// Serialize any test that mutates process-global environment
+    /// variables. `std::env::set_var` is not thread-safe and `cargo
+    /// test` runs tests in parallel by default — the
+    /// `test_max_http_sessions_env_override` test below reads/writes
+    /// `LEINDEX_MAX_SESSIONS` while other tests concurrently call
+    /// `max_http_sessions()` (which reads the same variable), which
+    /// is an active data race under POSIX. Holding this mutex for the
+    /// entire test body guarantees only one test at a time touches
+    /// the env.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_server_config_default() {
         let config = McpServerConfig::default();
@@ -1521,11 +1579,15 @@ mod tests {
     /// `LEINDEX_MAX_SESSIONS` env var overrides the default session cap.
     #[test]
     fn test_max_http_sessions_env_override() {
+        // Hold the env-mutation lock for the entire body. Other tests in
+        // this module (e.g. the eviction test) call `handle_initialize`,
+        // which reads `LEINDEX_MAX_SESSIONS` via `max_http_sessions()`;
+        // racing `std::env::set_var` against a concurrent
+        // `std::env::var` is undefined behaviour. Serialising on
+        // `ENV_LOCK` keeps every env read/write in this test entirely
+        // single-threaded.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Default (env unset) returns the default.
-        // SAFETY: we never read another thread's env in this test;
-        // setting the var for the duration of the assertion is safe.
-        // SAFETY: This is a single-threaded test; no other thread reads
-        // the env in parallel.
         unsafe {
             std::env::set_var(MAX_SESSIONS_ENV, "42");
         }

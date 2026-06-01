@@ -280,6 +280,14 @@ pub fn render_split_diff(diff: &DiffResult, color: bool, width: Option<usize>) -
         Some(w) => w.saturating_sub(gutter * 2 + 5) / 2,
         None => 60,
     };
+    // If the caller told us the width and the resulting per-side
+    // column is too small to be readable, fall back to the unified
+    // layout — that's the behaviour the doc comment promises. Without
+    // this guard `half` can collapse to 0 on a narrow terminal and
+    // the row layout prints nothing useful.
+    if width.is_some() && half < 8 {
+        return render_unified_diff(diff, color);
+    }
 
     for (hi, hunk) in diff.hunks.iter().enumerate() {
         if hi > 0 {

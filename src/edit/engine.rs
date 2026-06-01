@@ -24,11 +24,16 @@ use crate::storage::{Storage, UniqueProjectId};
 /// `libc` crate so they are never out of sync with the host kernel.
 fn is_cross_device_error(error: &std::io::Error) -> bool {
     // EXDEV: <asm-generic/errno-base.h> on Linux and <sys/errno.h> on
-    // macOS/BSDs. ERROR_NOT_SAME_DEVICE: <winerror.h> on Windows.
+    // macOS/BSDs. ERROR_NOT_SAME_DEVICE: <winerror.h> on Windows, but the
+    // `libc` crate does not bind Win32 API error codes (only POSIX + the
+    // C standard library), so we hardcode the numeric value 17 on
+    // Windows. On non-unix, non-windows targets the check is a no-op.
     #[cfg(unix)]
     let code = libc::EXDEV;
     #[cfg(windows)]
-    let code = libc::ERROR_NOT_SAME_DEVICE;
+    let code = 17; // Win32 ERROR_NOT_SAME_DEVICE
+    #[cfg(not(any(unix, windows)))]
+    let code = 0;
     error.raw_os_error() == Some(code)
 }
 

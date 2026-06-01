@@ -195,6 +195,11 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
             .or_else(|| r.get("score").and_then(|v| v.as_f64()));
         let signature = r.get("signature").and_then(|v| v.as_str());
         let context = r.get("context").and_then(|v| v.as_str());
+        // `trim_search` emits `snippet` (a one-line preview built from
+        // `context` / `content` / `signature`). When the LLM is
+        // looking at a trimmed payload we may not have `signature`
+        // or `context` to fall back on, so read `snippet` directly.
+        let snippet = r.get("snippet").and_then(|v| v.as_str());
         let byte_range = r.get("byte_range").and_then(|v| v.as_array());
 
         out.push_str(&format!(
@@ -253,10 +258,21 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
                     if color { RESET } else { "" },
                 ));
             }
+        } else if let Some(snip) = snippet {
+            // `snippet` is already a single short line; trim() once more
+            // to be defensive against leading/trailing whitespace.
+            let trimmed = snip.trim();
+            if !trimmed.is_empty() {
+                out.push_str(&format!("      {}{}{}\n",
+                    if color { DIM } else { "" },
+                    truncate_chars(trimmed, 160),
+                    if color { RESET } else { "" },
+                ));
+            }
         }
-        // Surface byte ranges when no signature/context is available —
-        // helps the user locate the hit in a very large file.
-        if signature.is_none() && context.is_none() {
+        // Surface byte ranges when no signature/context/snippet is
+        // available — helps the user locate the hit in a very large file.
+        if signature.is_none() && context.is_none() && snippet.is_none() {
             if let Some(br) = byte_range {
                 if br.len() == 2 {
                     let start = br[0].as_u64().unwrap_or(0);
@@ -487,12 +503,15 @@ fn build_tree_from_files(files: &[Value]) -> Vec<Value> {
             }
         }
         /// Convert a directory node to a `{name, type, children}` JSON
-        /// value. File nodes pass through their entry.
+        /// value. File nodes pass through their entry. Each child is
+        /// converted using its own key as the name so nested directory
+        /// labels stay distinct instead of inheriting the parent's
+        /// segment.
         fn into_value(self, name: &str) -> Value {
             let children: Vec<Value> = self
                 .children
-                .into_values()
-                .map(|child| child.into_value(name))
+                .into_iter()
+                .map(|(child_name, child)| child.into_value(&child_name))
                 .collect();
             if let Some(mut entry) = self.entry {
                 if let Some(obj) = entry.as_object_mut() {
@@ -1196,6 +1215,45 @@ mod tests {
     }
 
     #[test]
+    fn test_build_tree_preserves_child_names() {
+        // Regression: each nested directory's `name` field must equal
+        // its own path segment, not the parent's. Otherwise the tree
+        // renderer shows duplicated labels like "src → src → main.rs"
+        // for any multi-level path.
+        let files = v(r#"[
+            {"relative_path": "src/cli/main.rs"},
+            {"relative_path": "src/cli/sub/lib.rs"},
+            {"relative_path": "tests/integration.rs"}
+        ]"#);
+        let tree = build_tree_from_files(files.as_array().unwrap());
+        // The top-level must be src + tests.
+        let names: Vec<String> = tree
+            .iter()
+            .map(|n| n.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .collect();
+        assert_eq!(names, vec!["src", "tests"]);
+        // Inside `src`, the child directory must be `cli` (not `src`).
+        let src = tree.iter().find(|n| n["name"] == "src").unwrap();
+        let src_children = src.get("children").and_then(|v| v.as_array()).unwrap();
+        let src_child_names: Vec<String> = src_children
+            .iter()
+            .map(|n| n.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .collect();
+        assert_eq!(src_child_names, vec!["cli"]);
+        // Inside `cli`, the grandchild directory must be `sub`.
+        let cli = src_children
+            .iter()
+            .find(|n| n["name"] == "cli")
+            .unwrap();
+        let cli_children = cli.get("children").and_then(|v| v.as_array()).unwrap();
+        let cli_child_names: Vec<String> = cli_children
+            .iter()
+            .map(|n| n.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .collect();
+        assert_eq!(cli_child_names, vec!["main.rs", "sub"]);
+    }
+
+    #[test]
     fn test_render_tree_indents_children() {
         let tree = v(r#"[
             {"name": "src", "type": "directory", "children": [
@@ -1231,6 +1289,27 @@ mod tests {
         let s = render_tool_output("leindex.search", &search_data, &args);
         assert!(s.contains("Search: \"foo\""), "got: {}", s);
         assert!(s.contains("/p.rs"), "got: {}", s);
+    }
+
+    #[test]
+    fn test_render_search_uses_snippet_field() {
+        // Regression: when the trimmed payload only has `snippet` (no
+        // `signature` or `context`), the search renderer should still
+        // surface a preview line.
+        let args = v(r#"{"query": "foo", "top_k": 1}"#);
+        let payload = v(r#"{
+            "count": 1,
+            "results": [{
+                "file_path": "/p.rs",
+                "symbol": "main",
+                "symbol_type": "function",
+                "score": 0.9,
+                "snippet": "fn main() { return 0; }"
+            }]
+        }"#);
+        let s = render_tool_output("leindex.search", &payload, &args);
+        assert!(s.contains("/p.rs"), "got: {}", s);
+        assert!(s.contains("fn main()"), "snippet preview missing: {}", s);
     }
 
     #[test]

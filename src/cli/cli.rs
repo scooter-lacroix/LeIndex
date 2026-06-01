@@ -189,8 +189,8 @@ pub enum Commands {
         #[arg(long = "host", default_value = "127.0.0.1")]
         host: String,
 
-        /// Port to listen on (default: 47268, override with LEINDEX_PORT env var)
-        #[arg(long = "port", default_value = "47268")]
+        /// Port to listen on (default: 47500, override with LEINDEX_PORT env var)
+        #[arg(long = "port", default_value = "47500")]
         port: u16,
     },
 
@@ -1035,7 +1035,7 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
     println!("  GET  /mcp/tools/list - List available tools");
     println!("  GET  /health         - Health check");
     println!("\nConfiguration:");
-    println!("  Port: {} (override with LEINDEX_PORT env var; auto-falls back to next port if taken)", port);
+    println!("  Port: {} (override with LEINDEX_PORT env var; auto-falls back to next consecutive ports if taken)", port);
     println!("\nPress Ctrl+C to stop the server\n");
 
     server.run().await.context("Server error")?;

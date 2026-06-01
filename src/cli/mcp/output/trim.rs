@@ -21,7 +21,7 @@ use super::{normalize_tool_name, truncate_chars};
 /// the value through this function before returning it to the model.
 pub fn trim_llm_payload(name: &str, data: &Value) -> Value {
     let normalized = normalize_tool_name(name);
-    match normalized.as_str() {
+    let trimmed = match normalized.as_str() {
         "leindex_search" | "search" => trim_search(data),
         "leindex_context" | "context" => trim_context(data),
         "leindex_diagnostics" | "diagnostics" => trim_diagnostics(data),
@@ -41,7 +41,33 @@ pub fn trim_llm_payload(name: &str, data: &Value) -> Value {
         "leindex_edit_apply" | "edit_apply" => trim_edit(data),
         "leindex_rename_symbol" | "rename_symbol" => trim_rename_symbol(data),
         _ => data.clone(),
+    };
+    // Preserve any `_warning` (or other top-level meta field prefixed
+    // with `_`) added by `wrap_with_meta` when the project is stale.
+    // Most `trim_*` functions build a fresh object, so the warning
+    // would otherwise be silently dropped — leaving the LLM to use
+    // stale results without knowing it should reindex.
+    merge_meta(data, &trimmed)
+}
+
+/// Copy top-level fields whose name starts with `_` from `original`
+/// into `trimmed` when they are not already present. This keeps
+/// out-of-band metadata (currently `_warning` from stale-index
+/// detection) visible to the model after the LLM-payload trim step.
+fn merge_meta(original: &Value, trimmed: &Value) -> Value {
+    let Some(orig_obj) = original.as_object() else {
+        return trimmed.clone();
+    };
+    let mut out = trimmed.clone();
+    let Some(out_obj) = out.as_object_mut() else {
+        return trimmed.clone();
+    };
+    for (k, v) in orig_obj {
+        if k.starts_with('_') && !out_obj.contains_key(k) {
+            out_obj.insert(k.clone(), v.clone());
+        }
     }
+    out
 }
 
 // =============================================================================
@@ -261,10 +287,13 @@ fn trim_read_symbol(data: &Value) -> Value {
     }
     // The source body is the dominant token cost. Truncate to 2k chars
     // and expose a flag so the LLM knows to call again with a wider
-    // budget if it really needs the full body.
+    // budget if it really needs the full body. Truncate on character
+    // boundaries directly from the source `&str` — slicing at a fixed
+    // byte offset can panic when the offset lands inside a multi-byte
+    // UTF-8 sequence (e.g. emoji, identifiers in non-ASCII source).
     if let Some(src) = data.get("source").and_then(|v| v.as_str()) {
-        let (head, truncated) = if src.len() > 2000 {
-            (truncate_chars(&src[..2000], 2000), true)
+        let (head, truncated) = if src.chars().count() > 2000 {
+            (truncate_chars(src, 2000), true)
         } else {
             (src.to_string(), false)
         };
@@ -442,19 +471,42 @@ fn trim_index(data: &Value) -> Value {
 }
 
 fn trim_edit(data: &Value) -> Value {
-    // Keep the structured diff (file_path, additions, deletions, hunks)
-    // — the LLM uses this to reason about the change. Drop the
-    // `diff_text` echo (the LLM doesn't need a second copy as a string)
-    // and the validation subtree (it's an internal report).
-    serde_json::json!({
-        "preview_token": data.get("preview_token"),
-        "diff": data.get("diff"),
-        "affected_symbols": data.get("affected_symbols"),
-        "affected_files": data.get("affected_files"),
-        "breaking_changes": data.get("breaking_changes"),
-        "risk_level": data.get("risk_level"),
-        "change_count": data.get("change_count"),
-    })
+    // The edit handlers return different shapes for `preview` vs
+    // `apply`:
+    //   * `edit_preview` → `preview_token`, `diff`, `affected_*`,
+    //     `risk_level`, `change_count`, `validation`
+    //   * `edit_apply`   → `success`, `changes_applied`, `file_path`,
+    //     `edit_region`, `message` (a no-op confirmation), plus the
+    //     same diff/affected_* fields
+    //
+    // We want to keep the union of both shapes so an MCP `edit_apply`
+    // call still surfaces the success confirmation and verification
+    // context, and an `edit_preview` call still gets the diff. The
+    // `diff_text` echo and the internal `validation` subtree are
+    // dropped (the model doesn't need a second copy of the diff or
+    // the full validator report).
+    let mut out = serde_json::Map::new();
+    for k in [
+        // shared / preview-shaped
+        "preview_token",
+        "diff",
+        "affected_symbols",
+        "affected_files",
+        "breaking_changes",
+        "risk_level",
+        "change_count",
+        // apply-shaped
+        "success",
+        "changes_applied",
+        "file_path",
+        "edit_region",
+        "message",
+    ] {
+        if let Some(v) = data.get(k) {
+            out.insert(k.to_string(), v.clone());
+        }
+    }
+    Value::Object(out)
 }
 
 fn trim_rename_symbol(data: &Value) -> Value {
@@ -582,6 +634,28 @@ mod tests {
     }
 
     #[test]
+    fn test_trim_edit_keeps_apply_result_fields() {
+        // Regression: `edit_apply` returns `success`, `changes_applied`,
+        // `file_path`, `edit_region`, and a no-op `message`. The trim
+        // must preserve these so the LLM gets confirmation context
+        // for a successful or no-op apply.
+        let input = v(r#"{
+            "success": true,
+            "changes_applied": 3,
+            "file_path": "src/foo.rs",
+            "edit_region": {"start": 10, "end": 25},
+            "message": "Applied 3 changes",
+            "diff": {"file_path": "src/foo.rs", "additions": 3, "deletions": 0, "hunks": []}
+        }"#);
+        let t = trim_edit(&input);
+        assert_eq!(t["success"], true);
+        assert_eq!(t["changes_applied"], 3);
+        assert_eq!(t["file_path"], "src/foo.rs");
+        assert!(t["edit_region"].is_object());
+        assert_eq!(t["message"], "Applied 3 changes");
+    }
+
+    #[test]
     fn test_trim_read_symbol_caps_callers() {
         let callers: Vec<Value> = (0..20).map(|i| serde_json::json!({"name": format!("c{}", i), "file": "a.rs", "line": i})).collect();
         let input = v(&format!(r#"{{
@@ -598,9 +672,12 @@ mod tests {
             "callees": []
         }}"#, "x".repeat(3000), serde_json::to_string(&callers).unwrap()));
         let t = trim_read_symbol(&input);
-        // Source truncated to 2000 chars
+        // Source is truncated to 2000 chars + 3-char "..." ellipsis.
+        // The previous byte-slice version could panic on multi-byte
+        // UTF-8 sequences; the new char-boundary truncation cannot.
         let src = t["source"].as_str().unwrap();
-        assert!(src.len() <= 2000, "got {}", src.len());
+        assert!(src.chars().count() <= 2003, "got {}", src.chars().count());
+        assert!(src.ends_with("..."), "missing ellipsis: {:?}", &src[src.len() - 10..]);
         assert_eq!(t["source_truncated"], true);
         // Callers capped at 5
         assert_eq!(t["callers"].as_array().unwrap().len(), 5);
@@ -762,5 +839,44 @@ mod tests {
         let raw = v(r#"{"any": "value", "x": 1}"#);
         let out = trim_llm_payload("leindex.something_new", &raw);
         assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn test_trim_llm_payload_preserves_meta_warning() {
+        // Regression: a stale index attaches `_warning` via
+        // `wrap_with_meta` so the LLM knows to reindex. The trim
+        // pipeline must not silently drop that field — otherwise the
+        // model serves stale results thinking they are fresh.
+        let stale_search = v(r#"{
+            "count": 1,
+            "results": [{"file_path": "src/foo.rs", "symbol": "main"}],
+            "_warning": "index is stale (last update: 60s ago) — call leindex.index to refresh"
+        }"#);
+        let out = trim_llm_payload("leindex.search", &stale_search);
+        assert_eq!(out["count"], 1);
+        assert!(out.get("results").is_some());
+        assert_eq!(
+            out["_warning"],
+            "index is stale (last update: 60s ago) — call leindex.index to refresh"
+        );
+
+        // _warning also preserved for tools that build a fresh object
+        // (trim_diagnostics, trim_edit, etc.)
+        let stale_edit = v(r#"{
+            "preview_token": "tok",
+            "diff": {"file_path": "a.rs", "hunks": []},
+            "_warning": "stale"
+        }"#);
+        let out = trim_llm_payload("leindex.edit_apply", &stale_edit);
+        assert_eq!(out["_warning"], "stale");
+
+        // Non-`_`-prefixed fields are NOT merged (trim is still the
+        // primary filter — `_` is the explicit out-of-band prefix).
+        let extra = v(r#"{
+            "results": [{"file_path": "src/foo.rs"}],
+            "ignored_warning": "should not appear"
+        }"#);
+        let out = trim_llm_payload("leindex.search", &extra);
+        assert!(out.get("ignored_warning").is_none());
     }
 }

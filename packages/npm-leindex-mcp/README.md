@@ -255,22 +255,40 @@ cargo install leindex
 
 ## Available MCP Tools
 
-Once configured, your AI tool can use these LeIndex tools:
+Once configured, your AI tool can use these LeIndex tools (full list of
+20 — see [root README](https://github.com/scooter-lacroix/LeIndex#mcp-tools-20)
+for the complete table):
 
-| Tool | Purpose |
-|------|---------|
-| `leindex_index` | Index a project |
-| `leindex_search` | Semantic code search |
-| `leindex_deep_analyze` | Deep analysis with PDG |
-| `leindex_context` | Expand context around symbol |
-| `leindex_file_summary` | Structural file analysis |
-| `leindex_symbol_lookup` | Symbol definition lookup |
-| `leindex_grep_symbols` | Symbol search |
-| `leindex_edit_preview` | Preview edits |
-| `leindex_edit_apply` | Apply code edits |
-| `leindex_rename_symbol` | Rename symbols |
-| `leindex_impact_analysis` | Blast radius analysis |
-| `leindex_diagnostics` | Health check |
+| Display name | Internal name | Purpose |
+|---|---|---|
+| `LeIndex [Context]` | `leindex-context` | Expand context around a code node via PDG |
+| `LeIndex [Deep Analyze]` | `leindex-deep-analyze` | Deep analysis: semantic + PDG traversal |
+| `LeIndex [Diagnostics]` | `leindex-diagnostics` | Index health and stats |
+| `LeIndex [Edit Apply]` | `leindex-edit-apply` | PRIMARY file editor (use instead of `edit_file`) |
+| `LeIndex [Edit Preview]` | `leindex-edit-preview` | Preview a code edit with impact report |
+| `LeIndex [File Summary]` | `leindex-file-summary` | Structural file analysis |
+| `LeIndex [Git Status]` | `leindex-git-status` | Git status with PDG structural analysis |
+| `LeIndex [Grep Symbols]` | `leindex-grep-symbols` | Structural symbol search |
+| `LeIndex [Impact Analysis]` | `leindex-impact-analysis` | Blast radius analysis |
+| `LeIndex [Index]` | `leindex-index` | Index a project |
+| `LeIndex [Phase Analysis]` | `leindex-phase-analysis` | 5-phase additive analysis |
+| `LeIndex [Project Map]` | `leindex-project-map` | Annotated project structure |
+| `LeIndex [Read File]` | `leindex-read-file` | PRIMARY file reader (replaces `Read`) |
+| `LeIndex [Read Symbol]` | `leindex-read-symbol` | PRIMARY symbol reader (replaces `Read` for symbols) |
+| `LeIndex [Rename Symbol]` | `leindex-rename-symbol` | Rename across all references |
+| `LeIndex [Search]` | `leindex-search` | Semantic code search |
+| `LeIndex [Symbol Lookup]` | `leindex-symbol-lookup` | Symbol definition + callers/callees |
+| `LeIndex [Text Search]` | `leindex-text-search` | PRIMARY text search (replaces `Grep`/`rg`) |
+| `LeIndex [Write]` | `leindex-write` | Create or overwrite a file |
+
+### Output formatting
+
+- **MCP payloads** are trimmed to the minimum needed for an LLM: short
+  snippets, capped counts, dropped internal byte ranges and verbose
+  fields. No ANSI color, no UI chrome.
+- **CLI output** (when invoked via `cargo install leindex`) is rendered
+  for human reading: split-view color diffs, tree-style maps, structured
+  tables.
 
 ---
 
