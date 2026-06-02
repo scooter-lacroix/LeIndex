@@ -1509,8 +1509,15 @@ mod tests {
     /// (one of which is in_flight), and call `handle_initialize` a
     /// third time. The in_flight session must survive; the idle
     /// session must be evicted.
+    ///
+    /// `handle_initialize` reads `LEINDEX_MAX_SESSIONS` via
+    /// `max_http_sessions()`. `cargo test` runs tests in parallel by
+    /// default and `test_max_http_sessions_env_override` mutates that
+    /// env var on a sibling thread, so we hold `ENV_LOCK` for the
+    /// entire test body to serialise env access.
     #[test]
     fn test_handle_initialize_does_not_evict_in_flight_session() {
+        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Override the cap for this test. We can't override
         // `DEFAULT_MAX_HTTP_SESSIONS` (it's a const) but we can verify
         // the eviction logic by pre-loading 2 sessions and forcing a

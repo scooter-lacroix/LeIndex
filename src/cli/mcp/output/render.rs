@@ -58,7 +58,23 @@ fn suffix(symbol_count: u64, color: &str, reset: &str) -> String {
 }
 
 fn line_for(data: &Value) -> u64 {
-    data.get("line").and_then(|v| v.as_u64()).unwrap_or(0)
+    // Top-level `line` is the legacy flat shape; the canonical
+    // `AnalysisResult` stores the anchor node in `results[0]` with
+    // its byte range in `byte_range[0]`. Walk both so callers can
+    // pass either payload.
+    if let Some(n) = data.get("line").and_then(|v| v.as_u64()) {
+        return n;
+    }
+    if let Some(arr) = data.get("results").and_then(|v| v.as_array()) {
+        if let Some(first) = arr.first() {
+            if let Some(br) = first.get("byte_range").and_then(|v| v.as_array()) {
+                if let Some(start) = br.first().and_then(|v| v.as_u64()) {
+                    return start;
+                }
+            }
+        }
+    }
+    0
 }
 
 fn extract_array(data: &Value, keys: &[&str]) -> Vec<Value> {
@@ -239,7 +255,14 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
         out.push('\n');
 
         // Show the signature or first context line, whichever the handler
-        // populated. Trim to keep the CLI output compact.
+        // populated. Trim to keep the CLI output compact. The fallback
+        // chain is signature → context → snippet, but a populated-but-
+        // empty (whitespace-only) `signature` must not block the
+        // fallback to `context` or `snippet`. We track a `printed`
+        // flag so an empty signature falls through, and so the byte-
+        // range hint only appears when none of the three text sources
+        // produced output.
+        let mut printed = false;
         if let Some(sig) = signature {
             let trimmed = sig.trim();
             if !trimmed.is_empty() {
@@ -248,31 +271,45 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
                     truncate_chars(trimmed, 160),
                     if color { RESET } else { "" },
                 ));
+                printed = true;
             }
-        } else if let Some(ctx) = context {
-            let first = ctx.lines().next().unwrap_or("").trim();
-            if !first.is_empty() {
-                out.push_str(&format!("      {}{}{}\n",
-                    if color { DIM } else { "" },
-                    truncate_chars(first, 160),
-                    if color { RESET } else { "" },
-                ));
+        }
+        if !printed {
+            if let Some(ctx) = context {
+                let first = ctx.lines().next().unwrap_or("").trim();
+                if !first.is_empty() {
+                    out.push_str(&format!("      {}{}{}\n",
+                        if color { DIM } else { "" },
+                        truncate_chars(first, 160),
+                        if color { RESET } else { "" },
+                    ));
+                    printed = true;
+                }
             }
-        } else if let Some(snip) = snippet {
-            // `snippet` is already a single short line; trim() once more
-            // to be defensive against leading/trailing whitespace.
-            let trimmed = snip.trim();
-            if !trimmed.is_empty() {
-                out.push_str(&format!("      {}{}{}\n",
-                    if color { DIM } else { "" },
-                    truncate_chars(trimmed, 160),
-                    if color { RESET } else { "" },
-                ));
+        }
+        if !printed {
+            if let Some(snip) = snippet {
+                // `snippet` is already a single short line; trim()
+                // once more to be defensive against leading/trailing
+                // whitespace.
+                let trimmed = snip.trim();
+                if !trimmed.is_empty() {
+                    out.push_str(&format!("      {}{}{}\n",
+                        if color { DIM } else { "" },
+                        truncate_chars(trimmed, 160),
+                        if color { RESET } else { "" },
+                    ));
+                    printed = true;
+                }
             }
         }
         // Surface byte ranges when no signature/context/snippet is
-        // available — helps the user locate the hit in a very large file.
-        if signature.is_none() && context.is_none() && snippet.is_none() {
+        // available — helps the user locate the hit in a very large
+        // file. The check is "did we print anything?" rather than
+        // "are all three fields None?" so an empty `signature` falls
+        // through to a real `context` or `snippet`, and only emits
+        // the byte-range hint when there is genuinely no text.
+        if !printed {
             if let Some(br) = byte_range {
                 if br.len() == 2 {
                     let start = br[0].as_u64().unwrap_or(0);
@@ -292,23 +329,65 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
 }
 
 fn render_context(data: &Value, node_id: &str, color: bool) -> String {
-    // Context output is structurally similar to a search hit: show the
-    // node and the surrounding code with line numbers.
+    // `ContextHandler` returns a `AnalysisResult` (see
+    // `src/cli/leindex/types.rs::AnalysisResult`) with shape:
+    //   { query, results: [SearchResult, ...], context: Option<String>,
+    //     tokens_used, processing_time_ms }
+    // The expanded PDG text lives in `context`, not `content`. Node
+    // metadata (symbol, file, type, line) is not on the top level —
+    // it lives in `results[0]` (a `SearchResult`). Old callers
+    // sometimes still emit a flat `content` / `file_path` /
+    // `symbol_type` / `line` / `symbol` shape (e.g. the dispatcher
+    // pre-trim payloads), so we fall back to that path before
+    // showing the `results` summary.
     let mut out = header(&format!("Context: {}", node_id), color);
     out.push('\n');
-    if let Some(symbol) = data.get("symbol").and_then(|v| v.as_str()) {
-        out.push_str(&field("Symbol", symbol, color));
+    // Pull node metadata from `results[0]` (the canonical anchor
+    // node) when present. Fall back to top-level fields for the
+    // legacy flat shape.
+    let anchor = data
+        .get("results")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first());
+    if let Some(sym) = anchor
+        .and_then(|r| r.get("symbol_name"))
+        .and_then(|v| v.as_str())
+        .or_else(|| data.get("symbol").and_then(|v| v.as_str()))
+    {
+        out.push_str(&field("Symbol", sym, color));
     }
-    if let Some(file) = data.get("file_path").and_then(|v| v.as_str()) {
+    if let Some(file) = anchor
+        .and_then(|r| r.get("file_path"))
+        .and_then(|v| v.as_str())
+        .or_else(|| data.get("file_path").and_then(|v| v.as_str()))
+    {
         out.push_str(&field("File", file, color));
     }
-    if let Some(typ) = data.get("symbol_type").and_then(|v| v.as_str()) {
+    if let Some(typ) = anchor
+        .and_then(|r| r.get("symbol_type"))
+        .and_then(|v| v.as_str())
+        .or_else(|| data.get("symbol_type").and_then(|v| v.as_str()))
+    {
         out.push_str(&field("Type", typ, color));
     }
-    if let Some(line) = data.get("line").and_then(|v| v.as_u64()) {
+    if let Some(line) = anchor
+        .and_then(|r| r.get("byte_range"))
+        .and_then(|v| v.as_array())
+        .and_then(|br| br.first())
+        .and_then(|v| v.as_u64())
+        .or_else(|| data.get("line").and_then(|v| v.as_u64()))
+    {
         out.push_str(&field("Line", &line.to_string(), color));
     }
-    if let Some(snippet) = data.get("content").and_then(|v| v.as_str()) {
+    // The expanded PDG body is in `context` (canonical) or
+    // `content` (legacy flat shape). Either way it is a multi-line
+    // string; we render it with a line-number gutter starting at the
+    // anchor's byte-range start.
+    let body = data
+        .get("context")
+        .and_then(|v| v.as_str())
+        .or_else(|| data.get("content").and_then(|v| v.as_str()));
+    if let Some(snippet) = body {
         out.push('\n');
         for (i, l) in snippet.lines().enumerate() {
             let n = line_for(data).saturating_add(i as u64);
@@ -323,7 +402,7 @@ fn render_context(data: &Value, node_id: &str, color: bool) -> String {
         }
     } else if let Some(results) = data.get("results").and_then(|v| v.as_array()) {
         for r in results {
-            let symbol = r.get("symbol").and_then(|v| v.as_str()).unwrap_or("?");
+            let symbol = r.get("symbol_name").and_then(|v| v.as_str()).unwrap_or("?");
             let file = r.get("file_path").and_then(|v| v.as_str()).unwrap_or("?");
             out.push_str(&format!("  → {}{}{} {}{}{}\n",
                 if color { LIGHT_CYAN } else { "" }, symbol, if color { RESET } else { "" },
@@ -635,22 +714,68 @@ fn render_impact_side(
 }
 
 fn render_symbol_lookup(data: &Value, color: bool) -> String {
+    // `lookup_single_symbol` returns the shape (see
+    // `src/cli/mcp/symbol_lookup_handler.rs::lookup_single_symbol`):
+    //   { symbol, type, file, byte_range, complexity, language,
+    //     callers, callees, impact_radius, [source] }
+    // where each caller/callee entry is { name, file, type } (no
+    // `line` field). Older renderers read `file_path` / `line` /
+    // `symbol_type` / `signature` and end up emitting mostly blanks.
     let mut out = header("Symbol Lookup", color);
     out.push('\n');
     if let Some(sym) = data.get("symbol").and_then(|v| v.as_str()) {
         out.push_str(&field("Symbol", sym, color));
     }
-    if let Some(file) = data.get("file_path").and_then(|v| v.as_str()) {
+    if let Some(file) = data.get("file").and_then(|v| v.as_str()) {
         out.push_str(&field("File", file, color));
     }
-    if let Some(line) = data.get("line").and_then(|v| v.as_u64()) {
-        out.push_str(&field("Line", &line.to_string(), color));
-    }
-    if let Some(typ) = data.get("symbol_type").and_then(|v| v.as_str()) {
+    if let Some(typ) = data.get("type").and_then(|v| v.as_str()) {
         out.push_str(&field("Type", typ, color));
     }
-    if let Some(sig) = data.get("signature").and_then(|v| v.as_str()) {
-        out.push_str(&field("Signature", sig, color));
+    if let Some(lang) = data.get("language").and_then(|v| v.as_str()) {
+        out.push_str(&field("Language", lang, color));
+    }
+    if let Some(br) = data.get("byte_range").and_then(|v| v.as_array()) {
+        if br.len() == 2 {
+            let start = br[0].as_u64().unwrap_or(0);
+            let end = br[1].as_u64().unwrap_or(0);
+            if end > start {
+                out.push_str(&field("Range", &format!("bytes {}-{}", start, end), color));
+            }
+        }
+    }
+    if let Some(cx) = data.get("complexity").and_then(|v| v.as_u64()) {
+        out.push_str(&field("Complexity", &cx.to_string(), color));
+    }
+    if let Some(ir) = data.get("impact_radius").and_then(|v| v.as_object()) {
+        let syms = ir.get("affected_symbols").and_then(|v| v.as_u64()).unwrap_or(0);
+        let files = ir.get("affected_files").and_then(|v| v.as_u64()).unwrap_or(0);
+        out.push_str(&field(
+            "Impact",
+            &format!("{} symbols / {} files", syms, files),
+            color,
+        ));
+    }
+    if let Some(src) = data.get("source").and_then(|v| v.as_str()) {
+        // `lookup_single_symbol` already truncates to `char_budget/2`
+        // chars; render the first 12 non-empty lines as a preview.
+        out.push('\n');
+        let mut shown = 0usize;
+        for l in src.lines() {
+            if l.trim().is_empty() {
+                continue;
+            }
+            out.push_str(&format!(
+                "      {}{}{}\n",
+                if color { DIM } else { "" },
+                truncate_chars(l, 160),
+                if color { RESET } else { "" },
+            ));
+            shown += 1;
+            if shown >= 12 {
+                break;
+            }
+        }
     }
 
     if let Some(arr) = data.get("callers").and_then(|v| v.as_array()) {
@@ -660,16 +785,21 @@ fn render_symbol_lookup(data: &Value, color: bool) -> String {
             for c in arr.iter().take(15) {
                 let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                 let file = c.get("file").and_then(|v| v.as_str()).unwrap_or("");
-                let line = c.get("line").and_then(|v| v.as_u64());
+                let typ = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 out.push_str(&format!(
-                    "    → {}{}{} {}{}{}{}\n",
+                    "    → {}{}{} {}{}{}{}{}\n",
                     if color { LIGHT_CYAN } else { "" },
                     name,
                     if color { RESET } else { "" },
                     if color { DIM } else { "" },
                     file,
-                    line.map(|l| format!(":{}", l)).unwrap_or_default(),
+                    if !typ.is_empty() {
+                        format!(" [{}]", typ)
+                    } else {
+                        String::new()
+                    },
                     if color { RESET } else { "" },
+                    "",
                 ));
             }
         }
@@ -681,16 +811,21 @@ fn render_symbol_lookup(data: &Value, color: bool) -> String {
             for c in arr.iter().take(15) {
                 let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                 let file = c.get("file").and_then(|v| v.as_str()).unwrap_or("");
-                let line = c.get("line").and_then(|v| v.as_u64());
+                let typ = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 out.push_str(&format!(
-                    "    ← {}{}{} {}{}{}{}\n",
+                    "    ← {}{}{} {}{}{}{}{}\n",
                     if color { LIGHT_CYAN } else { "" },
                     name,
                     if color { RESET } else { "" },
                     if color { DIM } else { "" },
                     file,
-                    line.map(|l| format!(":{}", l)).unwrap_or_default(),
+                    if !typ.is_empty() {
+                        format!(" [{}]", typ)
+                    } else {
+                        String::new()
+                    },
                     if color { RESET } else { "" },
+                    "",
                 ));
             }
         }
@@ -909,6 +1044,74 @@ fn render_read_file(data: &Value, color: bool) -> String {
     out
 }
 
+fn render_write(data: &Value, color: bool) -> String {
+    // `WriteHandler` returns a confirmation payload with shape
+    // (see `src/cli/mcp/write_handler.rs::WriteHandler::execute`):
+    //   { success, file_path, language, symbols: [{name, type, range}] }
+    // Routing it through `render_diff_value` produced an empty
+    // string because the handler does not emit `diff` / `diffs` /
+    // `diff_text`. Surface the success status, the file path, the
+    // language, and the parsed symbol table so the CLI user sees
+    // the confirmation and the structural context the handler
+    // actually returned.
+    let mut out = String::new();
+    let success = data.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let (status_label, status_color) = if success {
+        ("Wrote", if color { LIGHT_GREEN } else { "" })
+    } else {
+        ("Write failed", if color { LIGHT_RED } else { "" })
+    };
+    out.push_str(&format!(
+        "{}{}{}\n",
+        status_color,
+        status_label,
+        if color { RESET } else { "" },
+    ));
+    if let Some(path) = data.get("file_path").and_then(|v| v.as_str()) {
+        out.push_str(&field("File", path, color));
+    }
+    if let Some(lang) = data.get("language").and_then(|v| v.as_str()) {
+        out.push_str(&field("Language", lang, color));
+    }
+    if let Some(arr) = data.get("symbols").and_then(|v| v.as_array()) {
+        if !arr.is_empty() {
+            out.push('\n');
+            out.push_str(&format!(
+                "  {}Symbols ({}):{}\n",
+                if color { DIM } else { "" },
+                arr.len(),
+                if color { RESET } else { "" },
+            ));
+            for s in arr.iter().take(20) {
+                let name = s.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let typ = s.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                out.push_str(&format!(
+                    "    {}{}{} {}{}{}\n",
+                    if color { LIGHT_CYAN } else { "" },
+                    name,
+                    if color { RESET } else { "" },
+                    if color { DIM } else { "" },
+                    if typ.is_empty() {
+                        String::new()
+                    } else {
+                        format!("[{}]", typ)
+                    },
+                    if color { RESET } else { "" },
+                ));
+            }
+            if arr.len() > 20 {
+                out.push_str(&format!(
+                    "    {}…and {} more{}\n",
+                    if color { DIM } else { "" },
+                    arr.len() - 20,
+                    if color { RESET } else { "" },
+                ));
+            }
+        }
+    }
+    out
+}
+
 // =============================================================================
 // Central dispatch — single entry point for CLI tool rendering
 // =============================================================================
@@ -941,7 +1144,10 @@ pub fn render_tool_output(name: &str, data: &Value, args: &Value) -> String {
         "leindex_read_file" | "read_file" => render_read_file(data, color),
         "leindex_edit_preview" | "edit_preview" => render_diff_value(data, color),
         "leindex_edit_apply" | "edit_apply" => render_diff_value(data, color),
-        "leindex_write" | "write" => render_diff_value(data, color),
+        // `WriteHandler` returns a confirmation payload
+        // (`{success, file_path, language, symbols}`) not a diff, so
+        // `render_diff_value` would return an empty string here.
+        "leindex_write" | "write" => render_write(data, color),
         "leindex_rename_symbol" | "rename_symbol" => render_diff_value(data, color),
         _ => render_default(data, color),
     }
@@ -1319,5 +1525,125 @@ mod tests {
         // Default renderer emits pretty JSON
         assert!(s.contains("\"custom_field\""));
         assert!(s.contains("42"));
+    }
+
+    #[test]
+    fn test_render_search_signature_empty_falls_through_to_snippet() {
+        // Regression: a populated-but-empty `signature` must not
+        // block the fallback chain — a real `snippet` is still
+        // printed instead of leaving the result blank.
+        let args = v(r#"{"query": "foo", "top_k": 1}"#);
+        let payload = v(r#"{
+            "count": 1,
+            "results": [{
+                "file_path": "/p.rs",
+                "symbol": "main",
+                "symbol_type": "function",
+                "score": 0.9,
+                "signature": "   ",
+                "snippet": "fn main() { return 0; }"
+            }]
+        }"#);
+        let s = render_tool_output("leindex.search", &payload, &args);
+        assert!(s.contains("fn main()"), "snippet must print when signature is empty: {}", s);
+    }
+
+    #[test]
+    fn test_render_context_reads_from_results_anchor() {
+        // Regression: `ContextHandler` returns an `AnalysisResult`
+        // whose expanded PDG text is in `context` and whose anchor
+        // node lives in `results[0]`. The CLI must surface both.
+        let args = v(r#"{"node_id": "main"}"#);
+        let payload = v(r#"{
+            "query": "Context for main",
+            "results": [{
+                "rank": 1,
+                "node_id": "src/main.rs:main",
+                "file_path": "src/main.rs",
+                "symbol_name": "main",
+                "symbol_type": "function",
+                "byte_range": [10, 50]
+            }],
+            "context": "fn main() { return 0; }\nfn helper() {}",
+            "tokens_used": 12,
+            "processing_time_ms": 1
+        }"#);
+        let s = render_tool_output("leindex.context", &payload, &args);
+        assert!(s.contains("Symbol"), "missing Symbol field: {}", s);
+        assert!(s.contains("main"), "missing symbol name: {}", s);
+        assert!(s.contains("src/main.rs"), "missing file path: {}", s);
+        assert!(s.contains("fn main()"), "missing expanded body: {}", s);
+    }
+
+    #[test]
+    fn test_render_symbol_lookup_uses_real_field_names() {
+        // Regression: `lookup_single_symbol` returns `file` / `type` /
+        // `byte_range` / `complexity` / `language` / `impact_radius`
+        // / optional `source` — NOT the legacy `file_path` / `line` /
+        // `symbol_type` / `signature` aliases. Verify every real
+        // field is surfaced and the legacy aliases are not.
+        let args = v(r#"{"symbol": "main", "include_source": true}"#);
+        let payload = v(r#"{
+            "symbol": "main",
+            "type": "function",
+            "file": "src/main.rs",
+            "byte_range": [10, 60],
+            "complexity": 3,
+            "language": "rust",
+            "callers": [{"name": "caller_a", "file": "src/lib.rs", "type": "function"}],
+            "callees": [],
+            "impact_radius": {"affected_symbols": 5, "affected_files": 2},
+            "source": "fn main() { return 0; }"
+        }"#);
+        let s = render_tool_output("leindex.symbol-lookup", &payload, &args);
+        assert!(s.contains("Symbol"));
+        assert!(s.contains("main"));
+        assert!(s.contains("File"), "missing File field: {}", s);
+        assert!(s.contains("src/main.rs"), "missing real file: {}", s);
+        assert!(s.contains("Type"), "missing Type field: {}", s);
+        assert!(s.contains("function"), "missing real type: {}", s);
+        assert!(s.contains("Language"), "missing Language field: {}", s);
+        assert!(s.contains("rust"), "missing language: {}", s);
+        assert!(s.contains("Range"), "missing Range field: {}", s);
+        assert!(s.contains("bytes 10-60"), "missing byte range: {}", s);
+        assert!(s.contains("Complexity"), "missing Complexity field: {}", s);
+        assert!(s.contains("Impact"), "missing Impact field: {}", s);
+        assert!(s.contains("5 symbols / 2 files"), "missing impact counts: {}", s);
+        assert!(s.contains("caller_a"), "missing caller: {}", s);
+        assert!(s.contains("Callers"));
+        // Source preview (first non-empty line).
+        assert!(s.contains("fn main()"), "missing source preview: {}", s);
+        // Legacy aliases must NOT appear in the rendered output.
+        assert!(!s.contains("file_path"), "renderer still emits file_path alias: {}", s);
+        assert!(!s.contains("symbol_type"), "renderer still emits symbol_type alias: {}", s);
+        assert!(!s.contains("Signature"), "renderer still emits Signature (legacy alias): {}", s);
+    }
+
+    #[test]
+    fn test_render_write_shows_confirmation_not_diff() {
+        // Regression: `WriteHandler` returns
+        // `{success, file_path, language, symbols}` and must NOT be
+        // routed through `render_diff_value` (which expects
+        // `diff` / `diffs` / `diff_text` and returns empty for the
+        // write payload).
+        let args = v(r#"{"file_path": "src/lib.rs", "content": "// hello"}"#);
+        let payload = v(r#"{
+            "success": true,
+            "file_path": "src/lib.rs",
+            "language": "rust",
+            "symbols": [
+                {"name": "alpha", "type": "fn() -> ()", "range": [0, 9]},
+                {"name": "beta",  "type": "fn() -> ()", "range": [10, 19]}
+            ]
+        }"#);
+        let s = render_tool_output("leindex.write", &payload, &args);
+        assert!(s.contains("Wrote"), "missing confirmation header: {}", s);
+        assert!(s.contains("src/lib.rs"), "missing file path: {}", s);
+        assert!(s.contains("Language"), "missing language field: {}", s);
+        assert!(s.contains("rust"), "missing language value: {}", s);
+        assert!(s.contains("alpha"), "missing symbol name: {}", s);
+        assert!(s.contains("beta"), "missing symbol name: {}", s);
+        // Diff-style gutters (line numbers) must NOT appear.
+        assert!(!s.contains("│"), "write must not render diff gutter: {}", s);
     }
 }
