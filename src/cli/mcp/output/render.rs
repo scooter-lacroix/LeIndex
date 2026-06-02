@@ -58,23 +58,52 @@ fn suffix(symbol_count: u64, color: &str, reset: &str) -> String {
 }
 
 fn line_for(data: &Value) -> u64 {
-    // Top-level `line` is the legacy flat shape; the canonical
-    // `AnalysisResult` stores the anchor node in `results[0]` with
-    // its byte range in `byte_range[0]`. Walk both so callers can
-    // pass either payload.
+    // Top-level `line` is the legacy flat shape (a real source line
+    // number). The canonical `AnalysisResult` only carries the
+    // anchor node's byte range in `results[0].byte_range` — and
+    // `byte_range[0]` is a *byte offset* in the source file, not a
+    // line number. Showing a byte offset as a line number is
+    // misleading (e.g. an anchor at byte 15342 in a long file would
+    // render as "Line: 15342" for a symbol that is actually on a
+    // much earlier source line). The renderer does not have file
+    // contents available to convert bytes to lines, so for the
+    // canonical shape we return 0 — the caller interprets 0 as
+    // "no real line available, start the gutter at 1" and omits
+    // the `Line` field. See the
+    // `byte_range_to_line_range` helper in `helpers.rs` for the
+    // proper conversion when file contents are available.
     if let Some(n) = data.get("line").and_then(|v| v.as_u64()) {
         return n;
     }
-    if let Some(arr) = data.get("results").and_then(|v| v.as_array()) {
-        if let Some(first) = arr.first() {
-            if let Some(br) = first.get("byte_range").and_then(|v| v.as_array()) {
-                if let Some(start) = br.first().and_then(|v| v.as_u64()) {
-                    return start;
+    0
+}
+
+/// Strip ANSI CSI escape sequences from a string. Used by tests
+/// (and only by tests) to assert on the visible text of the
+/// rendered output. Handles only the SGR (colour) subset that
+/// this module emits: `\x1b[<n>m`.
+#[cfg(test)]
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut iter = s.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c == '\x1b' {
+            // Skip `ESC[`
+            if iter.peek() == Some(&'[') {
+                iter.next();
+                // Skip parameters (digits and semicolons) and the
+                // terminating letter.
+                for c2 in iter.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
                 }
+                continue;
             }
         }
+        out.push(c);
     }
-    0
+    out
 }
 
 fn extract_array(data: &Value, keys: &[&str]) -> Vec<Value> {
@@ -145,16 +174,24 @@ fn render_tree_node(
             name_color, name, reset, suffix(symbol_count, count_color, reset),
         ));
     } else {
+        // `suffix(symbol_count, count_color, reset)` already wraps the
+        // symbol-count line in `count_color` and ends with `reset`.
+        // The earlier code emitted `count_color` immediately before
+        // the suffix (and a trailing `reset` after it), so the final
+        // output was `…reset {color} [N symbols]{reset} reset…` —
+        // printing empty ANSI escapes when `symbol_count == 0` and
+        // leaving a trailing reset that does nothing useful when it
+        // is non-zero. Drop both the leading `count_color` and the
+        // trailing `reset`; the suffix already opens and closes
+        // colour for the symbol-count segment.
         out.push_str(&format!(
-            "{}{}{}{}{}{}{}{}\n",
+            "{}{}{}{}{}{}\n",
             prefix,
             connector,
             name_color,
             name,
             reset,
-            count_color,
             suffix(symbol_count, count_color, reset),
-            reset,
         ));
     }
 
@@ -370,27 +407,50 @@ fn render_context(data: &Value, node_id: &str, color: bool) -> String {
     {
         out.push_str(&field("Type", typ, color));
     }
-    if let Some(line) = anchor
+    // `Line` field: only emit when we have a real source-line
+    // number. The top-level `line` field (legacy flat shape) is
+    // authoritative. The anchor's `byte_range[0]` is a byte offset
+    // (not a line) so we must NOT surface it as a line number here
+    // — see `line_for`. When the canonical shape is in play and no
+    // real line is available, drop the field; the gutter will
+    // number the snippet starting at 1.
+    if let Some(line) = data.get("line").and_then(|v| v.as_u64()) {
+        out.push_str(&field("Line", &line.to_string(), color));
+    } else if let Some(br) = anchor
         .and_then(|r| r.get("byte_range"))
         .and_then(|v| v.as_array())
-        .and_then(|br| br.first())
-        .and_then(|v| v.as_u64())
-        .or_else(|| data.get("line").and_then(|v| v.as_u64()))
     {
-        out.push_str(&field("Line", &line.to_string(), color));
+        // Show the byte range as a "Range: bytes X-Y" hint so the
+        // user still has a concrete pointer to the location, but
+        // don't mislabel a byte offset as a line number.
+        if br.len() == 2 {
+            let start = br[0].as_u64().unwrap_or(0);
+            let end = br[1].as_u64().unwrap_or(0);
+            if end > start {
+                out.push_str(&field(
+                    "Range",
+                    &format!("bytes {}-{}", start, end),
+                    color,
+                ));
+            }
+        }
     }
     // The expanded PDG body is in `context` (canonical) or
     // `content` (legacy flat shape). Either way it is a multi-line
-    // string; we render it with a line-number gutter starting at the
-    // anchor's byte-range start.
+    // string; we render it with a line-number gutter. When a real
+    // source-line number is available the gutter starts at that
+    // line; otherwise it starts at 1 (relative to the snippet) so
+    // the user does not see a byte offset mislabelled as a line.
     let body = data
         .get("context")
         .and_then(|v| v.as_str())
         .or_else(|| data.get("content").and_then(|v| v.as_str()));
     if let Some(snippet) = body {
         out.push('\n');
+        let base = line_for(data);
+        let gutter_base = if base == 0 { 1 } else { base };
         for (i, l) in snippet.lines().enumerate() {
-            let n = line_for(data).saturating_add(i as u64);
+            let n = gutter_base.saturating_add(i as u64);
             let gutter = format!("{:>4}", n);
             out.push_str(&format!(
                 "  {}{}{}│ {}\n",
@@ -519,14 +579,20 @@ fn render_flat_files(files: &[Value], color: bool) -> String {
         let cx = f.get("total_complexity").and_then(|v| v.as_u64()).unwrap_or(0);
         let deps = f.get("incoming_dependencies").and_then(|v| v.as_u64()).unwrap_or(0)
             + f.get("outgoing_dependencies").and_then(|v| v.as_u64()).unwrap_or(0);
-        let cx_label = if color {
+        // The complexity value is shown as a colour-coded integer
+        // (`cx:{N}`); the human-readable label ("low" / "med" /
+        // "high") was previously computed alongside the colour but
+        // never rendered, so simplify the conditional to just the
+        // colour string. When colour is disabled the colour string
+        // is the empty literal.
+        let cx_color = if color {
             match cx {
-                0..=20 => (LIGHT_GREEN, "low"),
-                21..=60 => (LIGHT_YELLOW, "med"),
-                _ => (LIGHT_RED, "high"),
+                0..=20 => LIGHT_GREEN,
+                21..=60 => LIGHT_YELLOW,
+                _ => LIGHT_RED,
             }
         } else {
-            ("", "low")
+            ""
         };
         out.push_str(&format!(
             "  {}{:>3}.{} {}{}{}  {}{} sym  cx:{}{}{}  deps:{}\n",
@@ -538,7 +604,7 @@ fn render_flat_files(files: &[Value], color: bool) -> String {
             if color { RESET } else { "" },
             if color { DIM } else { "" },
             syms,
-            cx_label.0,
+            cx_color,
             cx,
             if color { RESET } else { "" },
             deps,
@@ -786,8 +852,12 @@ fn render_symbol_lookup(data: &Value, color: bool) -> String {
                 let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                 let file = c.get("file").and_then(|v| v.as_str()).unwrap_or("");
                 let typ = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                // 7 placeholders, 7 args. The previous format string
+                // had 8 `{}`s with 8 args, where the trailing empty
+                // string was silently emitted as empty and could
+                // mask a future placeholder/argument mismatch.
                 out.push_str(&format!(
-                    "    → {}{}{} {}{}{}{}{}\n",
+                    "    → {}{}{} {}{}{}{}\n",
                     if color { LIGHT_CYAN } else { "" },
                     name,
                     if color { RESET } else { "" },
@@ -799,7 +869,6 @@ fn render_symbol_lookup(data: &Value, color: bool) -> String {
                         String::new()
                     },
                     if color { RESET } else { "" },
-                    "",
                 ));
             }
         }
@@ -813,7 +882,7 @@ fn render_symbol_lookup(data: &Value, color: bool) -> String {
                 let file = c.get("file").and_then(|v| v.as_str()).unwrap_or("");
                 let typ = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 out.push_str(&format!(
-                    "    ← {}{}{} {}{}{}{}{}\n",
+                    "    ← {}{}{} {}{}{}{}\n",
                     if color { LIGHT_CYAN } else { "" },
                     name,
                     if color { RESET } else { "" },
@@ -825,7 +894,6 @@ fn render_symbol_lookup(data: &Value, color: bool) -> String {
                         String::new()
                     },
                     if color { RESET } else { "" },
-                    "",
                 ));
             }
         }
@@ -1112,6 +1180,88 @@ fn render_write(data: &Value, color: bool) -> String {
     out
 }
 
+fn render_edit_apply(data: &Value, color: bool) -> String {
+    // `EditApplyHandler` returns a confirmation payload with shape
+    // (see `src/cli/mcp/edit_apply_handler.rs::EditApplyHandler::
+    // execute`):
+    //   { success, changes_applied, file_path, edit_region,
+    //     affected_symbols, affected_files, breaking_changes,
+    //     [validation], [message] (no-op only) }
+    // The handler never emits `diff` / `diffs` / `diff_text`, so
+    // `render_diff_value` returns an empty string for the apply
+    // response and the CLI prints nothing for a successful (or
+    // no-op) apply. Surface the success status, the change count,
+    // the file path, the affected-symbol/file summary, breaking
+    // changes, and the surrounding-region excerpt.
+    let mut out = String::new();
+    let success = data.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let changes_applied = data
+        .get("changes_applied")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let (status_label, status_color) = if !success {
+        ("Edit apply failed", if color { LIGHT_RED } else { "" })
+    } else if changes_applied == 0 {
+        ("No-op (content identical)", if color { LIGHT_YELLOW } else { "" })
+    } else {
+        ("Applied", if color { LIGHT_GREEN } else { "" })
+    };
+    out.push_str(&format!(
+        "{}{}{}\n",
+        status_color,
+        status_label,
+        if color { RESET } else { "" },
+    ));
+    if let Some(path) = data.get("file_path").and_then(|v| v.as_str()) {
+        out.push_str(&field("File", path, color));
+    }
+    if let Some(msg) = data.get("message").and_then(|v| v.as_str()) {
+        out.push_str(&field("Message", msg, color));
+    }
+    if let Some(arr) = data.get("affected_symbols").and_then(|v| v.as_array()) {
+        if !arr.is_empty() {
+            out.push_str(&field(
+                "Affected symbols",
+                &arr.len().to_string(),
+                color,
+            ));
+        }
+    }
+    if let Some(arr) = data.get("affected_files").and_then(|v| v.as_array()) {
+        if !arr.is_empty() {
+            out.push_str(&field("Affected files", &arr.len().to_string(), color));
+        }
+    }
+    if let Some(bc) = data.get("breaking_changes").and_then(|v| v.as_array()) {
+        if !bc.is_empty() {
+            out.push_str(&field(
+                "Breaking changes",
+                &bc.len().to_string(),
+                color,
+            ));
+        }
+    }
+    if let Some(region) = data.get("edit_region").and_then(|v| v.as_str()) {
+        if !region.is_empty() {
+            out.push('\n');
+            out.push_str(&format!(
+                "  {}Surrounding region:{} \n",
+                if color { DIM } else { "" },
+                if color { RESET } else { "" },
+            ));
+            for l in region.lines() {
+                out.push_str(&format!(
+                    "      {}{}{}\n",
+                    if color { DIM } else { "" },
+                    truncate_chars(l, 160),
+                    if color { RESET } else { "" },
+                ));
+            }
+        }
+    }
+    out
+}
+
 // =============================================================================
 // Central dispatch — single entry point for CLI tool rendering
 // =============================================================================
@@ -1143,7 +1293,12 @@ pub fn render_tool_output(name: &str, data: &Value, args: &Value) -> String {
         "leindex_file_summary" | "file_summary" => render_file_summary(data, color),
         "leindex_read_file" | "read_file" => render_read_file(data, color),
         "leindex_edit_preview" | "edit_preview" => render_diff_value(data, color),
-        "leindex_edit_apply" | "edit_apply" => render_diff_value(data, color),
+        // `EditApplyHandler` returns a confirmation payload
+        // (`success, changes_applied, file_path, edit_region, …`)
+        // not a diff, so `render_diff_value` returns an empty
+        // string for the apply response. Use the dedicated
+        // confirmation renderer instead.
+        "leindex_edit_apply" | "edit_apply" => render_edit_apply(data, color),
         // `WriteHandler` returns a confirmation payload
         // (`{success, file_path, language, symbols}`) not a diff, so
         // `render_diff_value` would return an empty string here.
@@ -1645,5 +1800,159 @@ mod tests {
         assert!(s.contains("beta"), "missing symbol name: {}", s);
         // Diff-style gutters (line numbers) must NOT appear.
         assert!(!s.contains("│"), "write must not render diff gutter: {}", s);
+    }
+
+    #[test]
+    fn test_render_edit_apply_shows_confirmation_not_diff() {
+        // Regression: `EditApplyHandler` returns
+        // `{success, changes_applied, file_path, edit_region,
+        // affected_symbols, affected_files, breaking_changes}` and
+        // must NOT be routed through `render_diff_value` (which
+        // expects `diff` / `diffs` / `diff_text` and returns empty
+        // for the apply payload).
+        let args = v(r#"{"file_path": "src/lib.rs"}"#);
+        let payload = v(r#"{
+            "success": true,
+            "changes_applied": 2,
+            "file_path": "src/lib.rs",
+            "edit_region": "1: // hello\n2: fn alpha() {}",
+            "affected_symbols": ["alpha", "beta"],
+            "affected_files": ["src/lib.rs"],
+            "breaking_changes": []
+        }"#);
+        let s = render_tool_output("leindex.edit-apply", &payload, &args);
+        assert!(s.contains("Applied"), "missing applied header: {}", s);
+        assert!(s.contains("src/lib.rs"), "missing file path: {}", s);
+        assert!(s.contains("Affected symbols"), "missing affected symbols: {}", s);
+        assert!(s.contains("Affected files"), "missing affected files: {}", s);
+        // The surrounding region must be shown.
+        assert!(s.contains("// hello"), "missing surrounding region: {}", s);
+        // Diff-style gutters must NOT appear.
+        assert!(!s.contains("│"), "edit-apply must not render diff gutter: {}", s);
+    }
+
+    #[test]
+    fn test_render_edit_apply_noop_shows_message() {
+        // No-op path: changes_applied == 0, message describes why.
+        let args = v(r#"{"file_path": "src/lib.rs"}"#);
+        let payload = v(r#"{
+            "success": true,
+            "changes_applied": 0,
+            "message": "No changes to apply (content identical)"
+        }"#);
+        let s = render_tool_output("leindex.edit-apply", &payload, &args);
+        assert!(s.contains("No-op"), "missing no-op header: {}", s);
+        assert!(s.contains("content identical"), "missing no-op message: {}", s);
+    }
+
+    #[test]
+    fn test_render_context_does_not_mislabel_byte_offset_as_line() {
+        // Regression: `results[0].byte_range[0]` is a byte offset,
+        // not a line number. The CLI must NOT show the byte offset
+        // in the `Line` field or as the gutter base. The byte
+        // range is still surfaced as a `Range: bytes X-Y` hint.
+        let args = v(r#"{"node_id": "main"}"#);
+        let payload = v(r#"{
+            "query": "Context for main",
+            "results": [{
+                "rank": 1,
+                "node_id": "src/main.rs:main",
+                "file_path": "src/main.rs",
+                "symbol_name": "main",
+                "symbol_type": "function",
+                "byte_range": [15342, 15400]
+            }],
+            "context": "fn main() {\n    return 0;\n}"
+        }"#);
+        let s = render_tool_output("leindex.context", &payload, &args);
+        // The byte offset (15342) must NOT appear as a line value.
+        assert!(
+            !s.contains("Line: 15342"),
+            "renderer mislabelled byte offset as line number: {}",
+            s
+        );
+        // The byte range is still surfaced as a Range hint.
+        assert!(s.contains("Range"), "missing range hint: {}", s);
+        assert!(s.contains("bytes 15342-15400"), "missing byte range: {}", s);
+        // The snippet gutter must start at 1 (relative to the
+        // snippet), not at the byte offset. The gutter value
+        // (right-padded to 4 chars) is followed by an ANSI reset
+        // and the `│` separator; the gutter text itself sits
+        // between the leading "  " (two-space indent) and the `│`
+        // separator, so we strip ANSI escapes and look for the
+        // gutter lines.
+        let stripped = strip_ansi(&s);
+        // The first gutter line should be "   1│", not "15342│".
+        let first_gutter = stripped
+            .lines()
+            .find(|l| l.contains('│'))
+            .unwrap_or("");
+        assert!(
+            first_gutter.contains("   1│"),
+            "first gutter line must start at 1, got {:?}",
+            first_gutter
+        );
+        // No gutter line should start with "15342" (the byte
+        // offset) — every gutter should be a small relative line
+        // number, since the snippet has at most a handful of
+        // lines.
+        for l in stripped.lines() {
+            if l.contains('│') {
+                assert!(
+                    !l.contains("15342│"),
+                    "gutter line must not use byte offset: {:?}",
+                    l
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_render_context_uses_legacy_line_field() {
+        // Regression: legacy flat-shape payloads carry a real
+        // `line` field; the renderer must use that and the gutter
+        // must start at that line.
+        let args = v(r#"{"node_id": "main"}"#);
+        let payload = v(r#"{
+            "symbol": "main",
+            "file_path": "src/main.rs",
+            "symbol_type": "function",
+            "line": 42,
+            "content": "fn main() { return 0; }"
+        }"#);
+        let s = render_tool_output("leindex.context", &payload, &args);
+        let stripped = strip_ansi(&s);
+        assert!(stripped.contains("Line: 42"), "missing line field: {}", stripped);
+        // The gutter must start at 42 (right-padded to width 4).
+        let first_gutter = stripped
+            .lines()
+            .find(|l| l.contains('│'))
+            .unwrap_or("");
+        assert!(
+            first_gutter.contains("  42│"),
+            "gutter must start at 42, got {:?}",
+            first_gutter
+        );
+    }
+
+    #[test]
+    fn test_render_flat_files_drops_unused_label_string() {
+        // Regression: `cx_label.1` ("low"/"med"/"high") was
+        // computed but never used. Confirm the colour-coded
+        // integer is still rendered and no `low`/`med`/`high`
+        // text leaks into the output.
+        let files = v(r#"[
+            {"path": "src/main.rs", "symbol_count": 3, "total_complexity": 5, "incoming_dependencies": 0, "outgoing_dependencies": 0},
+            {"path": "src/lib.rs",  "symbol_count": 12, "total_complexity": 25, "incoming_dependencies": 1, "outgoing_dependencies": 0}
+        ]"#);
+        let s = render_flat_files(files.as_array().unwrap(), false);
+        assert!(s.contains("src/main.rs"));
+        assert!(s.contains("src/lib.rs"));
+        assert!(s.contains("cx:5"), "missing complexity value: {}", s);
+        assert!(s.contains("cx:25"), "missing complexity value: {}", s);
+        // The unused label strings must NOT appear in the output.
+        assert!(!s.contains("low"), "unused label leaked: {}", s);
+        assert!(!s.contains("med"), "unused label leaked: {}", s);
+        assert!(!s.contains("high"), "unused label leaked: {}", s);
     }
 }
