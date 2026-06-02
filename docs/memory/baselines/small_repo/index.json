@@ -1,12 +1,12 @@
 {
   "phase": "index",
-  "rss_min_kib": 24,
-  "rss_max_kib": 25600,
-  "rss_p95_kib": 24000,
-  "mapped_file_kib": 11940,
-  "anon_kib": 8500,
-  "sample_count": 9,
-  "duration_ms": 78,
+  "rss_min_kib": 352,
+  "rss_max_kib": 29680,
+  "rss_p95_kib": 29680,
+  "mapped_file_kib": 19352,
+  "anon_kib": 10328,
+  "sample_count": 10,
+  "duration_ms": 111,
   "worker_rss_max_kib": 0,
-  "combined_rss_max_kib": 24000
+  "combined_rss_max_kib": 29680
 }

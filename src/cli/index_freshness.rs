@@ -292,11 +292,7 @@ pub(crate) fn is_stale_fast(
     // path on canonicalize failure (path no longer exists on disk,
     // permission denied, etc.) so a transient FS error does not
     // silently turn into a "stale" verdict.
-    let mut already_listed: std::collections::HashSet<std::path::PathBuf> =
-        std::collections::HashSet::with_capacity(manifest_paths.len());
-    for p in &manifest_paths {
-        already_listed.insert(p.canonicalize().unwrap_or_else(|_| p.clone()));
-    }
+    let already_listed = build_already_listed(ctx.project_path, &manifest_paths);
     // Root-level fast path: O(N) stat, no walkdir. Common case
     // for single-package projects.
     //
@@ -394,6 +390,30 @@ pub(crate) fn find_new_root_manifest(
         }
     }
     false
+}
+
+/// Build the `already_listed` set used by `is_stale_fast`'s root
+/// and nested fast paths. Each entry in `manifest_paths` is
+/// joined with `project_path` (so relative scanner outputs are
+/// resolved against the project root, not the CWD) and then
+/// canonicalized. `Path::join` returns the second argument
+/// unchanged when it is already absolute, so this is safe for
+/// both relative and absolute scanner outputs.
+///
+/// Factored out of `is_stale_fast` so it can be unit-tested in
+/// isolation against a tempdir fixture without spinning up the
+/// full `Storage` / `CacheSpiller` context.
+pub(crate) fn build_already_listed(
+    project_path: &Path,
+    manifest_paths: &[PathBuf],
+) -> std::collections::HashSet<PathBuf> {
+    let mut already_listed: std::collections::HashSet<PathBuf> =
+        std::collections::HashSet::with_capacity(manifest_paths.len());
+    for p in manifest_paths {
+        let full_path = project_path.join(p);
+        already_listed.insert(full_path.canonicalize().unwrap_or(full_path));
+    }
+    already_listed
 }
 
 /// Walk `project_path` up to depth 5 looking for dependency
@@ -714,6 +734,77 @@ mod tests {
         assert!(
             !find_new_root_manifest(root, &listed),
             "listed package.json must not be flagged"
+        );
+    }
+
+    // =====================================================================
+    // build_already_listed — round-13 gemini canonicalize-relative-path fix
+    // =====================================================================
+
+    /// Regression for HIGH round 13: when the scanner records a
+    /// relative manifest path (e.g. `Cargo.toml` rather than
+    /// `/abs/path/Cargo.toml`), `is_stale_fast` used to
+    /// canonicalize the relative path directly, which resolves
+    /// against the CWD rather than the project root. When
+    /// CWD ≠ project root, the canonical path is wrong, the
+    /// `already_listed.contains(...)` membership check always
+    /// misses, and the fast path reports stale on every tool
+    /// call (the cycle of "stale → reindex → still stale"
+    /// that the previous review called out as the
+    /// "setup.py / build.gradle" loop).
+    ///
+    /// The fix joins each `manifest_paths` entry with
+    /// `project_path` before canonicalizing. `Path::join`
+    /// returns the second argument unchanged when it is
+    /// already absolute, so absolute paths are unaffected.
+    /// Verify the contract: a relative scanner output, joined
+    /// with a relative `project_path`, is canonicalized
+    /// against the project root and ends up in the
+    /// `already_listed` set under its real absolute form.
+    #[test]
+    fn build_already_listed_resolves_relative_paths_against_project_path() {
+        let (tmp, _) = make_fixture();
+        let root = tmp.path();
+        // Create a manifest file at the project root.
+        let manifest = root.join("Cargo.toml");
+        fs::write(&manifest, "[package]\nname = \"x\"\n").unwrap();
+        // The scanner wrote a *relative* path (e.g. when the
+        // user passed `.` as the project root). Pre-fix,
+        // canonicalize would resolve this against the test
+        // runner's CWD; post-fix, we join with `project_path`
+        // first so the canonical path matches the project
+        // root.
+        let relative = std::path::PathBuf::from("Cargo.toml");
+        let listed = build_already_listed(root, &[relative]);
+        // The set must contain the canonical absolute path of
+        // the manifest at the project root, NOT whatever the
+        // relative-path canonicalize would have produced
+        // (which in this test is the same directory anyway,
+        // but the contract is the canonical absolute form).
+        let canon = manifest.canonicalize().unwrap();
+        assert!(
+            listed.contains(&canon),
+            "already_listed must contain the canonical absolute path of the joined manifest: {:?}",
+            canon
+        );
+    }
+
+    /// An absolute scanner output must round-trip unchanged.
+    /// `Path::join(root, abs_path)` returns `abs_path` when
+    /// `abs_path` is already absolute (Rust's documented
+    /// behaviour), so the canonical form is identical to the
+    /// pre-fix behaviour for absolute inputs.
+    #[test]
+    fn build_already_listed_passes_through_absolute_paths() {
+        let (tmp, _) = make_fixture();
+        let root = tmp.path();
+        let manifest = root.join("package.json");
+        fs::write(&manifest, "{}").unwrap();
+        let abs = manifest.canonicalize().unwrap();
+        let listed = build_already_listed(root, &[abs.clone()]);
+        assert!(
+            listed.contains(&abs),
+            "absolute scanner output must round-trip through join+canonicalize"
         );
     }
 }
