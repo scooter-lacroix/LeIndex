@@ -389,10 +389,50 @@ pub(crate) fn find_new_nested_manifest(
     project_path: &Path,
     already_listed: &std::collections::HashSet<PathBuf>,
 ) -> bool {
+    // Use `filter_entry` to prune `SKIP_DIRS` and dotfile-prefixed
+    // directories at traversal time (returning `false` for a
+    // directory entry tells walkdir to skip its entire subtree).
+    // The previous per-file ancestor-chain check still visited
+    // every directory entry up to depth 5 and only filtered after
+    // the stat, so a project with a large `node_modules` or
+    // `target` would pay O(thousands of stat() calls) on every
+    // expired staleness-cache check. With `filter_entry`, the
+    // entire `node_modules` / `target` / `.git` / `target` /
+    // `.venv` subtrees are pruned at the directory boundary
+    // before any child stat happens, restoring the original
+    // intent ("detect new manifests without paying the cost
+    // of a full project walk"). The manifest-name filter still
+    // runs after the walkdir yield so we only flag files whose
+    // name is in `DEPENDENCY_MANIFEST_NAMES`.
     let walker = WalkDir::new(project_path)
         .min_depth(1)
         .max_depth(5)
-        .into_iter();
+        .into_iter()
+        .filter_entry(|e| {
+            // Always keep the root (depth 0) so descent can begin;
+            // `WalkDir` only invokes `filter_entry` on the root
+            // once at the very start, and returning `false`
+            // there would prune the entire tree.
+            if e.depth() == 0 {
+                return true;
+            }
+            // Only prune directories. Files are accepted here
+            // and filtered by manifest-name after the yield.
+            if !e.file_type().is_dir() {
+                return true;
+            }
+            let name = match e.file_name().to_str() {
+                Some(n) => n,
+                None => return true,
+            };
+            if name.starts_with('.') {
+                return false;
+            }
+            if SKIP_DIRS.contains(&name) {
+                return false;
+            }
+            true
+        });
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
@@ -406,37 +446,6 @@ pub(crate) fn find_new_nested_manifest(
             Some(n) => n,
             None => continue,
         };
-        // Skip dotfile-prefixed entries and the shared skip list
-        // (build outputs, venv, node_modules, .git, etc.). We
-        // re-apply the same rules as the full scan in
-        // `index_builder::scan_project_files` so a new manifest
-        // hidden under, e.g., `node_modules` is not flagged.
-        // Note: the full scan skips SKIP_DIRS at directory
-        // traversal time via `walker.skip_current_dir()`, which
-        // means the file is never visited. In the per-file
-        // helper here we have to walk up the parent chain and
-        // check every ancestor directory against SKIP_DIRS to
-        // get the same coverage.
-        if file_name.starts_with('.') {
-            continue;
-        }
-        let mut ancestor = path.parent();
-        let mut in_skip_dir = false;
-        while let Some(dir) = ancestor {
-            if dir == project_path {
-                break;
-            }
-            if let Some(dname) = dir.file_name().and_then(|n| n.to_str()) {
-                if SKIP_DIRS.contains(&dname) {
-                    in_skip_dir = true;
-                    break;
-                }
-            }
-            ancestor = dir.parent();
-        }
-        if in_skip_dir {
-            continue;
-        }
         if !DEPENDENCY_MANIFEST_NAMES.contains(&file_name) {
             continue;
         }

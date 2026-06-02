@@ -87,10 +87,13 @@ pub const DEFAULT_INDEX_TIMEOUT_SECS: u64 = 600;
 
 /// Tools whose work can legitimately exceed `DEFAULT_REQUEST_TIMEOUT_SECS`.
 ///
-/// `tools/call` uses the per-tool cap from this map for any tool name
-/// present here; everything else gets `DEFAULT_REQUEST_TIMEOUT_SECS`.
-/// The map is the single source of truth so the cap is observable in
-/// the timeout-error message and easy to extend.
+/// This list is the single source of truth for "which tools need
+/// a per-tool cap". The actual cap is resolved at runtime by
+/// `long_running_tool_timeout_secs(name)` so environment-variable
+/// overrides (e.g. `LEINDEX_INDEX_TIMEOUT_SECS` for `leindex.index`)
+/// take effect. Keeping the list as a `const` documents the
+/// extension point and lets future long-running tools opt in
+/// without touching the call site in `tools/call`.
 ///
 /// Rationale for `leindex.index` being on this list: the first call
 /// for a new project runs `ProjectRegistry::get_or_create`, which
@@ -101,7 +104,7 @@ pub const DEFAULT_INDEX_TIMEOUT_SECS: u64 = 600;
 /// already-cancelled-but-still-running build. A 10-minute cap keeps
 /// the server responsive to admin shutdown while letting large
 /// projects complete their first index.
-pub const LONG_RUNNING_TOOL_TIMEOUTS: &[(&str, u64)] = &[("leindex.index", DEFAULT_INDEX_TIMEOUT_SECS)];
+pub const LONG_RUNNING_TOOL_TIMEOUTS: &[&str] = &["leindex.index"];
 
 /// Environment variable that overrides the per-tool timeout for
 /// `leindex.index` (seconds). Useful for CI runners on small
@@ -122,6 +125,24 @@ pub fn index_timeout_secs() -> u64 {
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_INDEX_TIMEOUT_SECS),
         Err(_) => DEFAULT_INDEX_TIMEOUT_SECS,
+    }
+}
+
+/// Runtime-resolved per-tool timeout cap, in seconds.
+///
+/// Returns `Some(cap)` when `tool_name` is in
+/// `LONG_RUNNING_TOOL_TIMEOUTS` and `None` otherwise. The
+/// per-tool cap is read from the environment (e.g.
+/// `LEINDEX_INDEX_TIMEOUT_SECS`) for tools whose default would
+/// otherwise be too tight — keeping the resolution at runtime
+/// is what makes the env override actually take effect. The
+/// previous design baked the cap into a const slice, which
+/// meant the env var was dead code.
+pub fn long_running_tool_timeout_secs(tool_name: &str) -> Option<u64> {
+    if LONG_RUNNING_TOOL_TIMEOUTS.contains(&tool_name) {
+        Some(index_timeout_secs())
+    } else {
+        None
     }
 }
 
@@ -374,7 +395,19 @@ impl McpServer {
     /// `bind_with_fallback` walks past the preferred port) so it
     /// can print the real URL before announcing readiness.
     pub async fn serve(self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
-        let bind_address = self.config.bind_address;
+        // Always log the ACTUAL bound address, not the preferred
+        // one. `bind_with_fallback` may have walked past the
+        // preferred port when it was already in use, in which
+        // case `self.config.bind_address` would still be the
+        // preferred (but unbindable) port. `listener.local_addr()`
+        // reflects what the kernel actually assigned, which is
+        // what external clients need to know. Fall back to the
+        // preferred address only when the kernel query fails
+        // (which would itself be a startup error worth surfacing
+        // via the log).
+        let bind_address = listener
+            .local_addr()
+            .unwrap_or(self.config.bind_address);
         let router = Self::router();
 
         // Spawn background task to clean up stale sessions periodically.
@@ -839,10 +872,12 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
                 .and_then(|p| p.get("name"))
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
-            let cap_secs = LONG_RUNNING_TOOL_TIMEOUTS
-                .iter()
-                .find(|(name, _)| *name == tool_name)
-                .map(|(_, secs)| *secs)
+            // Resolve the per-tool cap at runtime so environment
+            // overrides like `LEINDEX_INDEX_TIMEOUT_SECS` take
+            // effect. The previous const-slice lookup baked the
+            // default into a compile-time constant, which made
+            // the env var dead code.
+            let cap_secs = long_running_tool_timeout_secs(tool_name)
                 .unwrap_or(server_instance.config.request_timeout_secs);
             let timeout = std::time::Duration::from_secs(cap_secs);
             let _guard = incoming_session_id
