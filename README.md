@@ -645,13 +645,21 @@ If no embedding backend is configured, LeIndex falls back to TF-IDF for keyword-
 | `LeIndex [Text Search]` | PRIMARY text search (replaces `Grep`/`rg`) |
 | `LeIndex [Write]` | Create or overwrite a file |
 
-MCP tool names use the same identifiers internally (`leindex-search`,
-`leindex-edit-preview`, etc.) and via HTTP use the hyphenated form
-(`leindex-edit-preview`). Use the display form above as the user-facing
-name; the internal hyphenated name is the same in both forms (e.g.
-`leindex-edit-preview` and `leindex-edit-preview` are identical), and
-the underscore form is only used by the CLI bridge (`leindex tools
-help`, `leindex tools run`).
+MCP tool names returned by `tools/list` are the exact strings emitted
+by each handler (e.g. `leindex.index`, `leindex.search`,
+`leindex.edit-preview`, `leindex.write`). The naming is a **mix** of
+dotted and hyphenated forms — single-word tools use a dot
+(`leindex.context`, `leindex.index`, `leindex.search`, `leindex.write`,
+`leindex.diagnostics`), multi-word tools use hyphens
+(`leindex.edit-preview`, `leindex.edit-apply`, `leindex.read-file`,
+`leindex.symbol-lookup`, `leindex.phase-analysis`, etc.). Use these
+exact names when calling `tools/call` — dispatch in
+`handle_tool_call` is exact-equality on the handler name, so a
+hyphen-vs-dot mismatch (e.g. `leindex-search` vs `leindex.search`)
+returns `method-not-found`. The display form above (`LeIndex [...]`)
+is the human-readable title; it is not accepted on the wire. The
+underscore form (`leindex_edit_preview`) is only used by the CLI
+bridge (`leindex tools help`, `leindex tools run`).
 
 ### Output formatting
 

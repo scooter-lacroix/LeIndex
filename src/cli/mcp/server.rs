@@ -68,11 +68,62 @@ pub const DEFAULT_MCP_PORT: u16 = 47500;
 ///
 /// Hard cap on any single MCP tool call so a slow operation cannot block
 /// the server indefinitely. Individual tool handlers may set a tighter
-/// internal timeout.
+/// internal timeout. Long-running tools listed in
+/// `LONG_RUNNING_TOOL_TIMEOUTS` are exempt from this default and use
+/// a per-tool cap instead — see that map for the rationale.
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 /// Number of consecutive ports to try on `bind()` failure before giving up.
 pub const BIND_FALLBACK_PORT_RANGE: u16 = 10;
+
+/// Default timeout (in seconds) for `leindex.index`, the one tool that
+/// can legitimately take much longer than the per-tool default because
+/// it walks and parses the entire project on first use. 30s is fine
+/// for search, context, read-symbol, etc. — none of which should
+/// approach that — but a first-time index of a large monorepo is
+/// routinely several minutes. 600s (10 min) is the documented
+/// per-tool cap. Override with `LEINDEX_INDEX_TIMEOUT_SECS`.
+pub const DEFAULT_INDEX_TIMEOUT_SECS: u64 = 600;
+
+/// Tools whose work can legitimately exceed `DEFAULT_REQUEST_TIMEOUT_SECS`.
+///
+/// `tools/call` uses the per-tool cap from this map for any tool name
+/// present here; everything else gets `DEFAULT_REQUEST_TIMEOUT_SECS`.
+/// The map is the single source of truth so the cap is observable in
+/// the timeout-error message and easy to extend.
+///
+/// Rationale for `leindex.index` being on this list: the first call
+/// for a new project runs `ProjectRegistry::get_or_create`, which
+/// spawns a blocking `temp.index_project(...)` future. If that future
+/// is dropped by a 30s timeout, the in-memory index is never swapped
+/// in even though the spawned blocking work may keep running in the
+/// background — subsequent retries would then race against an
+/// already-cancelled-but-still-running build. A 10-minute cap keeps
+/// the server responsive to admin shutdown while letting large
+/// projects complete their first index.
+pub const LONG_RUNNING_TOOL_TIMEOUTS: &[(&str, u64)] = &[("leindex.index", DEFAULT_INDEX_TIMEOUT_SECS)];
+
+/// Environment variable that overrides the per-tool timeout for
+/// `leindex.index` (seconds). Useful for CI runners on small
+/// projects (lower it) and very large monorepos (raise it).
+pub const INDEX_TIMEOUT_ENV: &str = "LEINDEX_INDEX_TIMEOUT_SECS";
+
+/// Resolved per-tool timeout for `leindex.index`, in seconds.
+///
+/// Reads `LEINDEX_INDEX_TIMEOUT_SECS` from the environment; falls
+/// back to `DEFAULT_INDEX_TIMEOUT_SECS` when the variable is unset,
+/// empty, not a positive integer, or zero.
+pub fn index_timeout_secs() -> u64 {
+    match std::env::var(INDEX_TIMEOUT_ENV) {
+        Ok(v) => v
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_INDEX_TIMEOUT_SECS),
+        Err(_) => DEFAULT_INDEX_TIMEOUT_SECS,
+    }
+}
 
 /// Default cap on concurrently-tracked HTTP sessions before the oldest
 /// idle session is evicted to make room for a new one. Tunable via the
@@ -774,7 +825,26 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
             // always calls `end_request`, so a panic inside `handle_tool_call`
             // or a dropped timeout future cannot leak the session in the
             // in-flight map forever.
-            let timeout = std::time::Duration::from_secs(server_instance.config.request_timeout_secs);
+            //
+            // The timeout cap is per-tool: long-running tools listed in
+            // `LONG_RUNNING_TOOL_TIMEOUTS` (e.g. `leindex.index`, which can
+            // legitimately take several minutes for a first-time build of
+            // a large monorepo) get a higher cap so the timeout does not
+            // drop the future mid-swap and leak the spawned blocking work
+            // into a state where the in-memory index is never populated.
+            // All other tools use `DEFAULT_REQUEST_TIMEOUT_SECS` (30s).
+            let tool_name = json_req
+                .params
+                .as_ref()
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let cap_secs = LONG_RUNNING_TOOL_TIMEOUTS
+                .iter()
+                .find(|(name, _)| *name == tool_name)
+                .map(|(_, secs)| *secs)
+                .unwrap_or(server_instance.config.request_timeout_secs);
+            let timeout = std::time::Duration::from_secs(cap_secs);
             let _guard = incoming_session_id
                 .as_ref()
                 .map(|sid| McpServer::in_flight_guard(server_instance, sid));
@@ -787,7 +857,7 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
                 Ok(result) => result,
                 Err(_) => Err(JsonRpcError::internal_error(format!(
                     "Tool call timed out after {}s",
-                    server_instance.config.request_timeout_secs
+                    cap_secs
                 ))),
             }
         }

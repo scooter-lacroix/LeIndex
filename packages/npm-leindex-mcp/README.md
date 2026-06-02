@@ -261,26 +261,26 @@ for the complete table):
 
 | Display name | Internal name | Purpose |
 |---|---|---|
-| `LeIndex [Context]` | `leindex-context` | Expand context around a code node via PDG |
-| `LeIndex [Deep Analyze]` | `leindex-deep-analyze` | Deep analysis: semantic + PDG traversal |
-| `LeIndex [Diagnostics]` | `leindex-diagnostics` | Index health and stats |
-| `LeIndex [Edit Apply]` | `leindex-edit-apply` | PRIMARY file editor (use instead of `edit_file`) |
-| `LeIndex [Edit Preview]` | `leindex-edit-preview` | Preview a code edit with impact report |
-| `LeIndex [File Summary]` | `leindex-file-summary` | Structural file analysis |
-| `LeIndex [Git Status]` | `leindex-git-status` | Git status with PDG structural analysis |
-| `LeIndex [Grep Symbols]` | `leindex-grep-symbols` | Structural symbol search |
-| `LeIndex [Impact Analysis]` | `leindex-impact-analysis` | Blast radius analysis |
-| `LeIndex [Index]` | `leindex-index` | Index a project |
-| `LeIndex [Phase Analysis]` | `leindex-phase-analysis` | 5-phase additive analysis |
-| `Phase Analysis` | `phase-analysis` | Compatibility alias for `LeIndex [Phase Analysis]` (same handler, no-bracket title for legacy clients) |
-| `LeIndex [Project Map]` | `leindex-project-map` | Annotated project structure |
-| `LeIndex [Read File]` | `leindex-read-file` | PRIMARY file reader (replaces `Read`) |
-| `LeIndex [Read Symbol]` | `leindex-read-symbol` | PRIMARY symbol reader (replaces `Read` for symbols) |
-| `LeIndex [Rename Symbol]` | `leindex-rename-symbol` | Rename across all references |
-| `LeIndex [Search]` | `leindex-search` | Semantic code search |
-| `LeIndex [Symbol Lookup]` | `leindex-symbol-lookup` | Symbol definition + callers/callees |
-| `LeIndex [Text Search]` | `leindex-text-search` | PRIMARY text search (replaces `Grep`/`rg`) |
-| `LeIndex [Write]` | `leindex-write` | Create or overwrite a file |
+| `LeIndex [Context]` | `leindex.context` | Expand context around a code node via PDG |
+| `LeIndex [Deep Analyze]` | `leindex.deep-analyze` | Deep analysis: semantic + PDG traversal |
+| `LeIndex [Diagnostics]` | `leindex.diagnostics` | Index health and stats |
+| `LeIndex [Edit Apply]` | `leindex.edit-apply` | PRIMARY file editor (use instead of `edit_file`) |
+| `LeIndex [Edit Preview]` | `leindex.edit-preview` | Preview a code edit with impact report |
+| `LeIndex [File Summary]` | `leindex.file-summary` | Structural file analysis |
+| `LeIndex [Git Status]` | `leindex.git-status` | Git status with PDG structural analysis |
+| `LeIndex [Grep Symbols]` | `leindex.grep-symbols` | Structural symbol search |
+| `LeIndex [Impact Analysis]` | `leindex.impact-analysis` | Blast radius analysis |
+| `LeIndex [Index]` | `leindex.index` | Index a project |
+| `LeIndex [Phase Analysis]` | `leindex.phase-analysis` | 5-phase additive analysis |
+| `Phase Analysis` | `leindex.phase-analysis` | Compatibility alias for `LeIndex [Phase Analysis]` (same handler, no-bracket title for legacy clients) |
+| `LeIndex [Project Map]` | `leindex.project-map` | Annotated project structure |
+| `LeIndex [Read File]` | `leindex.read-file` | PRIMARY file reader (replaces `Read`) |
+| `LeIndex [Read Symbol]` | `leindex.read-symbol` | PRIMARY symbol reader (replaces `Read` for symbols) |
+| `LeIndex [Rename Symbol]` | `leindex.rename-symbol` | Rename across all references |
+| `LeIndex [Search]` | `leindex.search` | Semantic code search |
+| `LeIndex [Symbol Lookup]` | `leindex.symbol-lookup` | Symbol definition + callers/callees |
+| `LeIndex [Text Search]` | `leindex.text-search` | PRIMARY text search (replaces `Grep`/`rg`) |
+| `LeIndex [Write]` | `leindex.write` | Create or overwrite a file |
 
 ### Output formatting
 

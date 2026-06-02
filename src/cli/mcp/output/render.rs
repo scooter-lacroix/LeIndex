@@ -1241,21 +1241,52 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
             ));
         }
     }
-    if let Some(region) = data.get("edit_region").and_then(|v| v.as_str()) {
-        if !region.is_empty() {
+    if let Some(region_value) = data.get("edit_region") {
+        // `edit_region` may be a string (surrounding code excerpt)
+        // or an object (e.g. `{"start": 10, "end": 25}`) carrying
+        // byte ranges from `trim_edit`. The string form is the
+        // human-readable preview; the object form is what the
+        // trimmer preserves for apply-shaped payloads where the
+        // surrounding text was not retained. Render the object
+        // form as a compact `{start,end}` so the region context
+        // is never dropped from the CLI output.
+        let region_text: Option<String> = if let Some(s) = region_value.as_str() {
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        } else if let Some(obj) = region_value.as_object() {
+            let start = obj.get("start").and_then(|v| v.as_u64());
+            let end = obj.get("end").and_then(|v| v.as_u64());
+            match (start, end) {
+                (Some(s), Some(e)) => Some(format!("bytes {s}..{e}")),
+                (Some(s), None) => Some(format!("bytes {s}..")),
+                (None, Some(e)) => Some(format!("bytes ..{e}")),
+                (None, None) => Some("bytes ?".to_string()),
+            }
+        } else {
+            None
+        };
+        if let Some(text) = region_text {
             out.push('\n');
             out.push_str(&format!(
-                "  {}Surrounding region:{} \n",
+                "  {}Surrounding region:{} {}\n",
                 if color { DIM } else { "" },
                 if color { RESET } else { "" },
+                text,
             ));
-            for l in region.lines() {
-                out.push_str(&format!(
-                    "      {}{}{}\n",
-                    if color { DIM } else { "" },
-                    truncate_chars(l, 160),
-                    if color { RESET } else { "" },
-                ));
+            // Only expand into per-line output for the string
+            // form — the object form is a single line by design.
+            if region_value.is_string() {
+                for l in text.lines() {
+                    out.push_str(&format!(
+                        "      {}{}{}\n",
+                        if color { DIM } else { "" },
+                        truncate_chars(l, 160),
+                        if color { RESET } else { "" },
+                    ));
+                }
             }
         }
     }
@@ -1843,6 +1874,58 @@ mod tests {
         let s = render_tool_output("leindex.edit-apply", &payload, &args);
         assert!(s.contains("No-op"), "missing no-op header: {}", s);
         assert!(s.contains("content identical"), "missing no-op message: {}", s);
+    }
+
+    #[test]
+    fn test_render_edit_apply_renders_object_edit_region() {
+        // Regression: `trim_edit` preserves `edit_region` as an
+        // object (e.g. `{"start": 10, "end": 25}`) for apply-
+        // shaped payloads. The CLI renderer used to look only for
+        // the string form, which would silently drop the region
+        // context. Now it renders the object form as
+        // `Surrounding region: bytes 10..25` so the LLM-visible
+        // payload is never truncated by a shape mismatch.
+        let args = v(r#"{"file_path": "src/lib.rs"}"#);
+        let payload = v(r#"{
+            "success": true,
+            "changes_applied": 3,
+            "file_path": "src/lib.rs",
+            "edit_region": {"start": 10, "end": 25},
+            "message": "Applied 3 changes"
+        }"#);
+        let s = render_tool_output("leindex.edit-apply", &payload, &args);
+        assert!(
+            s.contains("Surrounding region"),
+            "missing surrounding region label: {}",
+            s
+        );
+        assert!(
+            s.contains("bytes 10..25"),
+            "missing structured edit_region range: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn test_render_edit_apply_renders_partial_object_edit_region() {
+        // When the trimmer preserves a half-shape object (only
+        // `start`, or only `end`, or neither), the renderer must
+        // still surface what is present rather than dropping the
+        // region entirely.
+        let args = v(r#"{"file_path": "src/lib.rs"}"#);
+        let payload = v(r#"{
+            "success": true,
+            "changes_applied": 1,
+            "file_path": "src/lib.rs",
+            "edit_region": {"start": 7},
+            "message": "Applied 1 change"
+        }"#);
+        let s = render_tool_output("leindex.edit-apply", &payload, &args);
+        assert!(
+            s.contains("bytes 7.."),
+            "missing open-ended start range: {}",
+            s
+        );
     }
 
     #[test]

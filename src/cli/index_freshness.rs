@@ -280,13 +280,29 @@ pub(crate) fn is_stale_fast(
         "requirements.txt",
         "Pipfile",
     ];
-    let already_listed: std::collections::HashSet<&std::path::Path> = manifest_paths
-        .iter()
-        .map(|p| p.as_path())
-        .collect();
+    // Canonicalize the cached list on both sides of the membership
+    // check. The cached `manifest_paths` are produced by walkdir
+    // against whatever `project_path` the index builder received
+    // (absolute when the user passed an absolute path, relative
+    // when they passed `.` or similar). The current `ctx.project_path`
+    // may be in a different shape, so a raw `Path::join` + `HashSet`
+    // membership check would always miss when the two forms differ.
+    // We canonicalize both sides, falling back to the original
+    // path on canonicalize failure (path no longer exists on disk,
+    // permission denied, etc.) so a transient FS error does not
+    // silently turn into a "stale" verdict.
+    let mut already_listed: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::with_capacity(manifest_paths.len());
+    for p in &manifest_paths {
+        already_listed.insert(p.canonicalize().unwrap_or_else(|_| p.clone()));
+    }
     for name in ROOT_MANIFEST_NAMES {
         let candidate = ctx.project_path.join(name);
-        if !already_listed.contains(candidate.as_path()) && candidate.exists() {
+        if !candidate.exists() {
+            continue;
+        }
+        let candidate_canon = candidate.canonicalize().unwrap_or(candidate);
+        if !already_listed.contains(&candidate_canon) {
             // Newly added root manifest — not in the cached
             // manifest list, but the dependency / external-
             // resolution data in the index pre-dates it.
