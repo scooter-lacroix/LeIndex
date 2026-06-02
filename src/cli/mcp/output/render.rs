@@ -787,8 +787,52 @@ fn render_symbol_lookup(data: &Value, color: bool) -> String {
     // where each caller/callee entry is { name, file, type } (no
     // `line` field). Older renderers read `file_path` / `line` /
     // `symbol_type` / `signature` and end up emitting mostly blanks.
+    //
+    // Batch mode (`lookup_symbols_batch`) returns the wrapper
+    //   { batch: true, count, results: [ ...singleSymbolEntries ] }
+    // The previous renderer silently dropped the wrapper and
+    // emitted a header followed by nothing when `symbol` /
+    // `file` / `type` were absent at the top level. Branch on
+    // `batch:true` and recurse into each entry.
+    if data.get("batch").and_then(|v| v.as_bool()) == Some(true) {
+        let count = data.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let mut out = header("Symbol Lookup (batch)", color);
+        out.push('\n');
+        out.push_str(&field("Count", &count.to_string(), color));
+        if let Some(arr) = data.get("results").and_then(|v| v.as_array()) {
+            if arr.is_empty() {
+                out.push_str("  (no results)\n");
+                return out;
+            }
+            for (idx, entry) in arr.iter().enumerate() {
+                out.push('\n');
+                out.push_str(&format!(
+                    "  {}{}#{}{} {}\n",
+                    if color { BOLD } else { "" },
+                    if color { DIM } else { "" },
+                    idx + 1,
+                    if color { RESET } else { "" },
+                    entry
+                        .get("symbol")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?"),
+                ));
+                out.push_str(&render_symbol_lookup_single(entry, color));
+            }
+        }
+        return out;
+    }
     let mut out = header("Symbol Lookup", color);
     out.push('\n');
+    out.push_str(&render_symbol_lookup_single(data, color));
+    out
+}
+
+/// Render a single symbol entry (the inner shape returned by
+/// `lookup_single_symbol`). Lifted out of `render_symbol_lookup` so
+/// the batch wrapper can recurse into each entry.
+fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
+    let mut out = String::new();
     if let Some(sym) = data.get("symbol").and_then(|v| v.as_str()) {
         out.push_str(&field("Symbol", sym, color));
     }
@@ -2103,5 +2147,67 @@ mod tests {
         assert!(!s.contains("low"), "unused label leaked: {}", s);
         assert!(!s.contains("med"), "unused label leaked: {}", s);
         assert!(!s.contains("high"), "unused label leaked: {}", s);
+    }
+
+    /// Regression for P2 #3342365976: `lookup_symbols_batch` returns
+    /// a wrapper {batch:true, count, results:[ ... ]}. The previous
+    /// renderer emitted the header plus a Count field but no per-entry
+    /// output, because `symbol` / `file` / `type` were at the entry
+    /// level, not the top level. The fix branches on `batch:true` and
+    /// recurses into each result.
+    #[test]
+    fn test_render_symbol_lookup_batch_renders_each_entry() {
+        let args = v(r#"{"symbols": ["main", "lib_init"]}"#);
+        let payload = v(r#"{
+            "batch": true,
+            "count": 2,
+            "results": [
+                {
+                    "symbol": "main",
+                    "type": "function",
+                    "file": "src/main.rs",
+                    "byte_range": [10, 60],
+                    "complexity": 3,
+                    "language": "rust",
+                    "callers": [],
+                    "callees": [],
+                    "impact_radius": {"affected_symbols": 5, "affected_files": 2}
+                },
+                {
+                    "symbol": "lib_init",
+                    "type": "function",
+                    "file": "src/lib.rs",
+                    "byte_range": [100, 200],
+                    "complexity": 7,
+                    "language": "rust",
+                    "callers": [],
+                    "callees": [],
+                    "impact_radius": {"affected_symbols": 0, "affected_files": 0}
+                }
+            ]
+        }"#);
+        let s = render_tool_output("leindex.symbol-lookup", &payload, &args);
+        // Batch header and count.
+        assert!(s.contains("Symbol Lookup (batch)"), "missing batch header: {}", s);
+        assert!(s.contains("Count"), "missing Count field: {}", s);
+        // Each entry must appear with its own Symbol / File / Type.
+        assert!(s.contains("main"), "missing first entry symbol: {}", s);
+        assert!(s.contains("lib_init"), "missing second entry symbol: {}", s);
+        assert!(s.contains("src/main.rs"), "missing first entry file: {}", s);
+        assert!(s.contains("src/lib.rs"), "missing second entry file: {}", s);
+        // The byte range from each entry must be present.
+        assert!(s.contains("bytes 10-60"), "missing first entry range: {}", s);
+        assert!(s.contains("bytes 100-200"), "missing second entry range: {}", s);
+    }
+
+    /// Empty batch returns the wrapper with a "(no results)" marker
+    /// rather than emitting only a header + Count line.
+    #[test]
+    fn test_render_symbol_lookup_batch_empty() {
+        let args = v(r#"{"symbols": []}"#);
+        let payload = v(r#"{"batch": true, "count": 0, "results": []}"#);
+        let s = render_tool_output("leindex.symbol-lookup", &payload, &args);
+        assert!(s.contains("Symbol Lookup (batch)"), "missing batch header: {}", s);
+        assert!(s.contains("(no results)"), "missing empty marker: {}", s);
     }
 }

@@ -209,7 +209,10 @@ pub struct McpServer {
     pub(crate) handshake_complete: Arc<AtomicBool>,
     /// Per-session handshake state for HTTP and stdio transports (session ID → (handshaked, last_access_time)).
     /// Keyed by the `Mcp-Session-Id` header value for HTTP, and generated session ID for stdio.
-    pub(crate) session_handshakes: Arc<DashMap<String, (bool, Instant)>>,
+    /// Keys are `Arc<str>` so `begin_request` can clone the existing
+    /// refcounted ID into `in_flight` instead of allocating a fresh
+    /// heap block on every request.
+    pub(crate) session_handshakes: Arc<DashMap<Arc<str>, (bool, Instant)>>,
     /// Session IDs that currently have an in-flight tool call.
     ///
     /// Cleanup skips these so a long-running tool call is never evicted
@@ -295,9 +298,9 @@ impl McpServer {
     pub fn cleanup_stale_sessions(&self, max_idle: std::time::Duration) -> usize {
         let before = self.session_handshakes.len();
         self.session_handshakes.retain(|sid, (_, last_access)| {
-            // `sid` is `&String`; look up in `in_flight` as `&str` so
+            // `sid` is `&Arc<str>`; look up in `in_flight` as `&str` so
             // DashMap resolves the Borrow trait to `Arc<str>: Borrow<str>`.
-            if self.in_flight.contains_key(sid.as_str()) {
+            if self.in_flight.contains_key(sid.as_ref()) {
                 // Active request — never evict.
                 true
             } else {
@@ -326,10 +329,19 @@ impl McpServer {
     ///
     /// Idempotent — repeated calls are no-ops. The `Arc<str>` key
     /// refcounts the session ID rather than allocating a new `String`
-    /// for every request.
+    /// for every request. When the session is already in the
+    /// `session_handshakes` table, we clone the existing `Arc<str>`
+    /// (a refcount bump, no allocation); when it is not yet
+    /// registered (a degenerate first-request-before-handshake
+    /// case) we fall back to `Arc::<str>::from(&str)`, which does
+    /// allocate, but only once per session.
     pub fn begin_request(&self, session_id: &str) {
-        self.in_flight
-            .insert(Arc::<str>::from(session_id), ());
+        let key = self
+            .session_handshakes
+            .get(session_id)
+            .map(|entry| entry.key().clone())
+            .unwrap_or_else(|| Arc::<str>::from(session_id));
+        self.in_flight.insert(key, ());
     }
 
     /// Mark a session's in-flight request as complete.
@@ -677,14 +689,16 @@ fn handle_initialize(server: &McpServer) -> (Value, Option<String>) {
             let oldest_id = server
                 .session_handshakes
                 .iter()
-                .filter(|r| !server.in_flight.contains_key(r.key().as_str()))
+                .filter(|r| !server.in_flight.contains_key(r.key().as_ref()))
                 .min_by_key(|r| r.value().1)
                 .map(|r| r.key().clone());
             if let Some(id) = oldest_id {
-                server.session_handshakes.remove(id.as_str());
+                server.session_handshakes.remove(id.as_ref());
             }
         }
-        server.session_handshakes.insert(session_id.clone(), (true, Instant::now()));
+        server
+            .session_handshakes
+            .insert(Arc::<str>::from(session_id.as_str()), (true, Instant::now()));
     }
 
     let result = serde_json::json!({
@@ -811,7 +825,7 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
         // All other methods require a valid handshaked session.
         let session_ok = match &incoming_session_id {
             Some(sid) => {
-                if let Some(mut entry) = server_instance.session_handshakes.get_mut(sid) {
+                if let Some(mut entry) = server_instance.session_handshakes.get_mut(sid.as_str()) {
                     // Update last access time
                     entry.1 = Instant::now();
                     entry.0
@@ -1181,7 +1195,8 @@ impl McpServer {
                 .context("Failed to accept connection")?;
 
             let session_id = generate_session_id();
-            self.session_handshakes.insert(session_id.clone(), (false, Instant::now()));
+            self.session_handshakes
+                .insert(Arc::<str>::from(session_id.as_str()), (false, Instant::now()));
 
             let session_id_clone = session_id.clone();
             let session_handshakes = self.session_handshakes.clone();
@@ -1315,7 +1330,7 @@ impl McpServer {
                 }
 
                 // Clean up session on disconnect
-                session_handshakes.remove(&session_id_clone);
+                session_handshakes.remove(session_id_clone.as_str());
 
                 debug!("Socket connection closed (session: {})", session_id_clone);
             });
@@ -1335,7 +1350,7 @@ impl McpServer {
 async fn handle_socket_message(
     json_payload: &str,
     session_id: &str,
-    session_handshakes: &Arc<DashMap<String, (bool, Instant)>>,
+    session_handshakes: &Arc<DashMap<Arc<str>, (bool, Instant)>>,
     handshake_complete: &Arc<AtomicBool>,
 ) -> Option<String> {
     use super::protocol::{JsonRpcMessage, JsonRpcResponse};
@@ -1412,7 +1427,10 @@ async fn handle_socket_message(
                 "initialize" => {
                     // Mark session as handshaked
                     handshake_complete.store(true, Ordering::SeqCst);
-                    session_handshakes.insert(session_id.to_string(), (true, Instant::now()));
+                    session_handshakes.insert(
+                        Arc::<str>::from(session_id),
+                        (true, Instant::now()),
+                    );
 
                     let result = serde_json::json!({
                         "protocolVersion": "2024-11-05",
@@ -1549,9 +1567,9 @@ mod tests {
 
         // All sessions should be marked as handshaked
         {
-            assert!(server.session_handshakes.get(&sid1).unwrap().0);
-            assert!(server.session_handshakes.get(&sid2).unwrap().0);
-            assert!(server.session_handshakes.get(&sid3).unwrap().0);
+            assert!(server.session_handshakes.get(sid1.as_str()).unwrap().0);
+            assert!(server.session_handshakes.get(sid2.as_str()).unwrap().0);
+            assert!(server.session_handshakes.get(sid3.as_str()).unwrap().0);
         }
     }
 
@@ -1572,11 +1590,11 @@ mod tests {
         let (_, sid2) = handle_initialize_for_test(&server);
 
         // Remove session 1
-        server.session_handshakes.remove(&sid1);
+        server.session_handshakes.remove(sid1.as_str());
 
         // Session 2 should still be valid
-        assert!(server.session_handshakes.get(&sid2).is_some());
-        assert!(server.session_handshakes.get(&sid2).unwrap().0);
+        assert!(server.session_handshakes.get(sid2.as_str()).is_some());
+        assert!(server.session_handshakes.get(sid2.as_str()).unwrap().0);
 
         assert_eq!(server.active_session_count(), 1);
     }
@@ -1598,7 +1616,7 @@ mod tests {
         assert_eq!(server.active_session_count(), 1);
 
         // Manually age the session's last_access time to simulate staleness
-        if let Some(mut entry) = server.session_handshakes.get_mut(&sid) {
+        if let Some(mut entry) = server.session_handshakes.get_mut(sid.as_str()) {
             entry.1 = Instant::now() - std::time::Duration::from_secs(600);
         }
 
@@ -1659,7 +1677,7 @@ mod tests {
             let sid = format!("sess-{i:04}");
             server
                 .session_handshakes
-                .insert(sid.clone(), (true, now));
+                .insert(Arc::<str>::from(sid.as_str()), (true, now));
         }
         assert_eq!(server.active_session_count(), DEFAULT_MAX_HTTP_SESSIONS);
 
@@ -1675,13 +1693,13 @@ mod tests {
 
         // The in-flight session must still be present.
         assert!(
-            server.session_handshakes.contains_key(&in_flight_sid),
+            server.session_handshakes.contains_key(in_flight_sid.as_str()),
             "in_flight session {} was evicted during initialize",
             in_flight_sid,
         );
         // The new session must be present.
         assert!(
-            server.session_handshakes.contains_key(&new_sid),
+            server.session_handshakes.contains_key(new_sid.as_str()),
             "newly initialized session {} was not registered",
             new_sid,
         );
@@ -1727,6 +1745,81 @@ mod tests {
         unsafe {
             std::env::remove_var(MAX_SESSIONS_ENV);
         }
+    }
+
+    /// Regression for MED #3342354737: `session_handshakes` is keyed
+    /// on `Arc<str>`, and `begin_request` clones the cached
+    /// `Arc<str>` from the handshake table (refcount bump, no
+    /// allocation) instead of constructing a fresh
+    /// `Arc::<str>::from(&str)` for every request. Verify the
+    /// in_flight map's key is `Arc`-equal (same allocation) to the
+    /// session_handshakes key.
+    #[test]
+    fn test_begin_request_clones_cached_arc_str_key() {
+        let registry = Arc::new(ProjectRegistry::new(5));
+        let server = McpServer {
+            config: McpServerConfig::default(),
+            _registry: registry,
+            handshake_complete: Arc::new(AtomicBool::new(false)),
+            session_handshakes: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
+        };
+
+        // Register a session directly so the key is an `Arc<str>` we
+        // can compare against.
+        let sid = Arc::<str>::from("sess-arc-key");
+        let cached: Arc<str> = sid.clone();
+        server.session_handshakes.insert(sid, (true, Instant::now()));
+
+        // `begin_request` should clone the cached `Arc<str>` rather
+        // than allocating a new one.
+        server.begin_request("sess-arc-key");
+
+        // The in_flight map should contain a key whose pointer
+        // matches the cached one.
+        let stored = server
+            .in_flight
+            .iter()
+            .next()
+            .expect("expected one in_flight entry");
+        assert_eq!(
+            stored.key().as_ptr(),
+            cached.as_ptr(),
+            "in_flight key should be the same Arc<str> allocation as session_handshakes"
+        );
+        assert_eq!(stored.key().as_ref(), "sess-arc-key");
+    }
+
+    /// `begin_request` falls back to `Arc::<str>::from(&str)` when
+    /// the session is not yet registered. The fallback allocation
+    /// is acceptable; the test exists to lock the contract so a
+    /// future refactor doesn't silently panic or skip the insert.
+    #[test]
+    fn test_begin_request_allocates_when_session_unknown() {
+        let registry = Arc::new(ProjectRegistry::new(5));
+        let server = McpServer {
+            config: McpServerConfig::default(),
+            _registry: registry,
+            handshake_complete: Arc::new(AtomicBool::new(false)),
+            session_handshakes: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
+        };
+
+        // Session not registered yet — should still insert into
+        // in_flight (allocates a fresh `Arc<str>`).
+        server.begin_request("unregistered-session");
+
+        assert!(
+            server.session_in_flight("unregistered-session"),
+            "begin_request must insert even when session is unregistered"
+        );
+
+        // Lookup works via `&str` (DashMap resolves Arc<str>: Borrow<str>).
+        let stored = server
+            .in_flight
+            .get("unregistered-session")
+            .expect("lookup by &str must work");
+        assert_eq!(stored.key().as_ref(), "unregistered-session");
     }
 }
 

@@ -139,10 +139,24 @@ pub(crate) fn trim_search(data: &Value) -> Value {
         .collect();
     // The model already knows the query it sent; we just hand back the
     // count and the per-hit fields it needs to make decisions.
-    serde_json::json!({
-        "count": trimmed.len(),
-        "results": trimmed,
-    })
+    // Pagination metadata must round-trip too — the model's follow-up
+    // `leindex.search` call with `offset: N` depends on seeing
+    // `offset` / `has_more` to know how many more pages are
+    // available, and `suggestion` (only populated on zero-result
+    // queries) is the model's hint for query reformulation.
+    let mut out = serde_json::Map::new();
+    out.insert("count".to_string(), serde_json::json!(trimmed.len()));
+    out.insert("results".to_string(), serde_json::json!(trimmed));
+    if let Some(v) = data.get("offset") {
+        out.insert("offset".to_string(), v.clone());
+    }
+    if let Some(v) = data.get("has_more") {
+        out.insert("has_more".to_string(), v.clone());
+    }
+    if let Some(v) = data.get("suggestion") {
+        out.insert("suggestion".to_string(), v.clone());
+    }
+    Value::Object(out)
 }
 
 fn trim_context(data: &Value) -> Value {
@@ -1265,5 +1279,52 @@ mod tests {
             results[0]["symbol"], "fallback_name",
             "explicit null in symbol_name must fall through to symbol"
         );
+    }
+
+    /// Regression for P2 #3342365969: the search payload is
+    /// paginated. `SearchHandler` returns `{results, count, offset,
+    /// has_more, [suggestion]}` and the renderer/trim path was
+    /// dropping `offset`, `has_more`, and `suggestion`. After the
+    /// fix, all three must round-trip.
+    #[test]
+    fn test_trim_search_preserves_pagination_fields() {
+        let data = v(r#"{
+            "query": "find me",
+            "results": [
+                {"file": "a.rs", "byte_range": [0, 10], "content": "x"}
+            ],
+            "count": 1,
+            "offset": 5,
+            "has_more": true,
+            "suggestion": "try a broader query"
+        }"#);
+        let out = trim_llm_payload("leindex.search", &data);
+        assert_eq!(out["count"], 1, "count must round-trip");
+        assert_eq!(out["offset"], 5, "offset must round-trip");
+        assert_eq!(out["has_more"], true, "has_more must round-trip");
+        assert_eq!(
+            out["suggestion"], "try a broader query",
+            "suggestion must round-trip"
+        );
+        assert_eq!(out["results"].as_array().unwrap().len(), 1);
+    }
+
+    /// `has_more=false` and `suggestion` absent on success is also
+    /// the typical shape, not just the zero-results case. Verify
+    /// both fields are accepted.
+    #[test]
+    fn test_trim_search_preserves_pagination_fields_no_more_no_suggestion() {
+        let data = v(r#"{
+            "query": "find me",
+            "results": [{"file": "a.rs", "byte_range": [0, 10], "content": "x"}],
+            "count": 1,
+            "offset": 0,
+            "has_more": false
+        }"#);
+        let out = trim_llm_payload("leindex.search", &data);
+        assert_eq!(out["count"], 1);
+        assert_eq!(out["offset"], 0);
+        assert_eq!(out["has_more"], false);
+        assert!(out.get("suggestion").is_none(), "no suggestion key when absent");
     }
 }

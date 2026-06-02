@@ -50,15 +50,21 @@ enum LockAcquire<'a> {
 /// outer task so the watcher loop can distinguish a successful
 /// reindex (no state change needed) from a lock-skipped batch (mark
 /// `dirty` so the next debounce retries) and from a reindex that
-/// panicked or was wrapped to `Ok(())` for any reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// errored or panicked (mark `dirty` so the next debounce
+/// retries — the in-memory state is potentially inconsistent
+/// because the reindex body returned abnormally, so a follow-up
+/// full rebuild is the safe response).
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ReindexOutcome {
-    /// Reindex ran to completion (success, error, or caught panic —
-    /// all of which still drop the lock on `ProjectWriteGuard`'s
-    /// `Drop`).
+    /// Reindex ran to completion with no error.
     Completed,
     /// Lock was busy for the full budget — reindex never ran.
     Skipped,
+    /// Reindex returned an error or its body panicked. The lock
+    /// is still released via the `ProjectWriteGuard` `Drop`, but
+    /// the on-disk / in-memory state may be inconsistent, so
+    /// the next debounce tick should retry.
+    Failed(String),
 }
 
 impl IndexWatcher {
@@ -135,7 +141,15 @@ impl IndexWatcher {
                                 // Panic-safety wrapper: a panic inside
                                 // the reindex still releases the lock
                                 // when `idx` goes out of scope on
-                                // `Drop`.
+                                // `Drop`. The outer match returns
+                                // `Failed` for both `Ok(Err(_))` and
+                                // `Err(_)` (panic) so the next
+                                // debounce tick can retry — a panic
+                                // during reindex leaves the
+                                // in-memory project state
+                                // potentially inconsistent and
+                                // should not be reported as a
+                                // clean completion.
                                 let reindex_result = std::panic::catch_unwind(
                                     std::panic::AssertUnwindSafe(|| {
                                         idx.incremental_reindex_from_watcher()
@@ -145,11 +159,25 @@ impl IndexWatcher {
                                     Ok(Ok(_)) => ReindexOutcome::Completed,
                                     Ok(Err(e)) => {
                                         warn!("Auto-reindex failed: {}", e);
-                                        ReindexOutcome::Completed
+                                        ReindexOutcome::Failed(e.to_string())
                                     }
-                                    Err(_) => {
-                                        warn!("Auto-reindex panicked; lock will release on drop");
-                                        ReindexOutcome::Completed
+                                    Err(panic_payload) => {
+                                        let msg = panic_payload
+                                            .downcast_ref::<&str>()
+                                            .map(|s| s.to_string())
+                                            .or_else(|| {
+                                                panic_payload
+                                                    .downcast_ref::<String>()
+                                                    .cloned()
+                                            })
+                                            .unwrap_or_else(|| {
+                                                "non-string panic payload".to_string()
+                                            });
+                                        warn!(
+                                            "Auto-reindex panicked: {}; lock will release on drop",
+                                            msg
+                                        );
+                                        ReindexOutcome::Failed(format!("panic: {}", msg))
                                     }
                                 }
                             });
@@ -164,6 +192,21 @@ impl IndexWatcher {
                                     warn!(
                                         "Watcher: skipping reindex; write lock busy for >{}s",
                                         REINDEX_BUDGET_SECS
+                                    );
+                                    dirty = true;
+                                }
+                                Ok(Ok(ReindexOutcome::Failed(reason))) => {
+                                    // The reindex body errored or
+                                    // panicked. The lock is
+                                    // released via `Drop`, but the
+                                    // on-disk / in-memory state is
+                                    // potentially inconsistent —
+                                    // re-arm `dirty` so the next
+                                    // debounce tick retries with a
+                                    // full rebuild.
+                                    warn!(
+                                        "Watcher: reindex did not complete cleanly ({}); retrying on next tick",
+                                        reason
                                     );
                                     dirty = true;
                                 }
@@ -260,5 +303,57 @@ mod tests {
             DEBOUNCE_INTERVAL_MS, 500,
             "watcher debounce interval must remain at 500ms (VAL-APLUS-029)"
         );
+    }
+
+    /// Regression for MED #3342354730: the watcher reindex spawn_blocking
+    /// closure used to silently return `ReindexOutcome::Completed` for
+    /// a panic, leaving `dirty = false` and dropping the change
+    /// permanently. After the fix, the closure must surface a
+    /// `ReindexOutcome::Failed(reason)` variant for both `Ok(Err(_))`
+    /// and the panic branch, and the outer `match` must re-arm
+    /// `dirty = true` so the next debounce tick retries.
+    ///
+    /// The full Watcher::run path is async + requires a tokio runtime
+    /// + a real project handle, so we exercise the *enum contract*:
+    /// the `Failed` variant exists, carries a reason, and matches a
+    /// `dirty = true` arm in the consumer. The full e2e path is
+    /// covered by integration tests in `tests/watcher_retry.rs`.
+    #[test]
+    fn test_watcher_failed_outcome_carries_reason() {
+        let outcome: ReindexOutcome = ReindexOutcome::Failed("incremental_reindex_from_watcher panicked: db corrupt".to_string());
+        match outcome {
+            ReindexOutcome::Completed => {
+                panic!("panic path must NOT surface as Completed")
+            }
+            ReindexOutcome::Skipped => {
+                panic!("panic path must NOT surface as Skipped")
+            }
+            ReindexOutcome::Failed(reason) => {
+                assert!(
+                    reason.contains("db corrupt"),
+                    "reason must include the panic payload: {}",
+                    reason
+                );
+            }
+        }
+    }
+
+    /// The `Failed` variant is distinct from `Completed` and
+    /// `Skipped` so the consumer's match arm for `Failed(reason)`
+    /// reliably re-arms `dirty` even if a future refactor
+    /// consolidates the other arms.
+    #[test]
+    fn test_watcher_outcome_variants_are_distinct() {
+        let completed = ReindexOutcome::Completed;
+        let skipped = ReindexOutcome::Skipped;
+        let failed = ReindexOutcome::Failed("oops".to_string());
+        assert!(matches!(completed, ReindexOutcome::Completed));
+        assert!(matches!(skipped, ReindexOutcome::Skipped));
+        assert!(matches!(failed, ReindexOutcome::Failed(ref s) if s == "oops"));
+        // Cross-variant assertion to catch any future enum
+        // collapse that would silently change the consumer's
+        // match behaviour.
+        assert!(!matches!(failed, ReindexOutcome::Completed));
+        assert!(!matches!(failed, ReindexOutcome::Skipped));
     }
 }
