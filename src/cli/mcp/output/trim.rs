@@ -89,8 +89,9 @@ pub(crate) fn trim_search(data: &Value) -> Value {
             // the single composite that callers actually use.
             let snippet = r
                 .get("context")
-                .or_else(|| r.get("content"))
-                .or_else(|| r.get("signature"))
+                .filter(|v| !v.is_null())
+                .or_else(|| r.get("content").filter(|v| !v.is_null()))
+                .or_else(|| r.get("signature").filter(|v| !v.is_null()))
                 .cloned()
                 .map(|v| match v {
                     Value::String(s) => {
@@ -103,8 +104,13 @@ pub(crate) fn trim_search(data: &Value) -> Value {
             let score = r
                 .get("score")
                 .and_then(|v| v.get("overall"))
+                .filter(|v| !v.is_null())
                 .cloned()
-                .or_else(|| r.get("score").cloned())
+                .or_else(|| {
+                    r.get("score")
+                        .filter(|v| !v.is_null())
+                        .cloned()
+                })
                 .unwrap_or(Value::Null);
             serde_json::json!({
                 "file_path": r.get("file_path").cloned().unwrap_or(Value::Null),
@@ -114,10 +120,15 @@ pub(crate) fn trim_search(data: &Value) -> Value {
                 // `symbol_name`, so a result that arrived with
                 // `symbol` populated and `symbol_name` absent lost
                 // its name to `Null`. Walk both keys so the LLM-
-                // visible payload always carries the symbol.
+                // visible payload always carries the symbol. The
+                // `.filter(|v| !v.is_null())` guards make sure
+                // that an explicit `null` in `symbol_name` falls
+                // through to `symbol` (and vice-versa) rather
+                // than blocking the chain.
                 "symbol": r
                     .get("symbol_name")
-                    .or_else(|| r.get("symbol"))
+                    .filter(|v| !v.is_null())
+                    .or_else(|| r.get("symbol").filter(|v| !v.is_null()))
                     .cloned()
                     .unwrap_or(Value::Null),
                 "symbol_type": r.get("symbol_type").cloned().unwrap_or(Value::Null),
@@ -195,14 +206,46 @@ fn trim_impact(data: &Value) -> Value {
 }
 
 fn trim_symbol_lookup(data: &Value) -> Value {
-    // `leindex.symbol-lookup` returns the result built by
-    // `SymbolLookupHandler::lookup_single_symbol` with fields:
-    //   symbol, type, file, byte_range, complexity, language,
-    //   callers, callees, impact_radius, and optionally source
-    // (when `include_source` is set). The trim must use the same
-    // field names so the LLM-visible payload actually carries the
-    // file path, node type, source excerpt, and impact radius —
-    // not aliases that resolve to `null` from the raw handler.
+    // Batch shape: when `leindex.symbol-lookup` is called with
+    // `symbols` (plural, array of more than one entry), the
+    // handler returns `{batch: true, count, results: [...]}`.
+    // Each entry in `results` has the same per-symbol shape
+    // as the single-symbol case below. Recurse into each
+    // entry so the trimmed payload preserves the requested
+    // results — without this branch, the top-level field
+    // whitelist below finds nothing and the LLM-visible
+    // payload becomes an empty object.
+    if data.get("batch").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if let Some(arr) = data.get("results").and_then(|v| v.as_array()) {
+            let mut trimmed_results: Vec<Value> = Vec::with_capacity(arr.len());
+            for entry in arr {
+                trimmed_results.push(trim_symbol_lookup_single(entry));
+            }
+            let mut out = serde_json::Map::new();
+            out.insert("batch".to_string(), Value::Bool(true));
+            out.insert(
+                "count".to_string(),
+                data.get("count").cloned().unwrap_or(Value::from(trimmed_results.len())),
+            );
+            out.insert("results".to_string(), Value::Array(trimmed_results));
+            return Value::Object(out);
+        }
+    }
+    trim_symbol_lookup_single(data)
+}
+
+/// Per-symbol trimmer used by both the single-symbol and
+/// batch-result paths of `trim_symbol_lookup`.
+///
+/// `leindex.symbol-lookup` returns the result built by
+/// `SymbolLookupHandler::lookup_single_symbol` with fields:
+///   symbol, type, file, byte_range, complexity, language,
+///   callers, callees, impact_radius, and optionally source
+/// (when `include_source` is set). The trim must use the same
+/// field names so the LLM-visible payload actually carries the
+/// file path, node type, source excerpt, and impact radius —
+/// not aliases that resolve to `null` from the raw handler.
+fn trim_symbol_lookup_single(data: &Value) -> Value {
     let mut out = serde_json::Map::new();
     for k in [
         "symbol",
@@ -320,6 +363,17 @@ fn trim_read_symbol(data: &Value) -> Value {
         "line_start",
         "line_end",
         "doc_comment",
+        // `dependencies` is only present when the caller
+        // explicitly passed `include_dependencies=true`. The
+        // handler builds it from `dep_signatures` (see
+        // `read_symbol_handler.rs` around line 248) and
+        // represents full dependency signatures, not just
+        // the names already exposed via `callers` /
+        // `callees`. Trimming it out silently would lose
+        // the extra context the caller explicitly asked
+        // for, so we pass it through (caller can drop the
+        // argument if they want a smaller payload).
+        "dependencies",
     ] {
         if let Some(v) = data.get(k) {
             out.insert(k.to_string(), v.clone());
@@ -1041,5 +1095,175 @@ mod tests {
         }"#);
         let out = trim_llm_payload("leindex.search", &extra);
         assert!(out.get("ignored_warning").is_none());
+    }
+
+    #[test]
+    fn test_trim_symbol_lookup_preserves_batch_results() {
+        // Regression: when `leindex.symbol-lookup` is called in
+        // batch mode (with the `symbols` array containing more
+        // than one entry), the handler returns
+        // `{batch: true, count, results: [...]}`. The trim
+        // must detect the batch shape, recurse into each entry,
+        // and preserve the requested results — otherwise the
+        // LLM-visible payload becomes an empty object.
+        let data = v(r#"{
+            "batch": true,
+            "count": 2,
+            "results": [
+                {
+                    "symbol": "alpha",
+                    "type": "function",
+                    "file": "src/a.rs",
+                    "byte_range": [10, 50],
+                    "complexity": 3,
+                    "language": "rust",
+                    "callers": [],
+                    "callees": [],
+                    "impact_radius": {"affected_symbols": 0, "affected_files": 0}
+                },
+                {
+                    "symbol": "beta",
+                    "type": "function",
+                    "file": "src/b.rs",
+                    "byte_range": [60, 90],
+                    "complexity": 1,
+                    "language": "rust",
+                    "callers": [],
+                    "callees": [],
+                    "impact_radius": {"affected_symbols": 0, "affected_files": 0}
+                }
+            ]
+        }"#);
+        let out = trim_llm_payload("leindex.symbol-lookup", &data);
+        assert_eq!(out["batch"], true);
+        assert_eq!(out["count"], 2);
+        let results = out["results"].as_array().expect("results must be an array");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["symbol"], "alpha");
+        assert_eq!(results[0]["file"], "src/a.rs");
+        assert_eq!(results[0]["type"], "function");
+        assert_eq!(results[0]["byte_range"][0], 10);
+        assert_eq!(results[1]["symbol"], "beta");
+        assert_eq!(results[1]["file"], "src/b.rs");
+    }
+
+    #[test]
+    fn test_trim_symbol_lookup_batch_with_lookup_error_entry() {
+        // Regression: a batch entry that hit a lookup error
+        // comes back as `{"symbol": "...", "error": "..."}`
+        // without the per-symbol fields. The per-entry
+        // recursion must not crash on the missing fields and
+        // must still copy the error entry through unchanged.
+        let data = v(r#"{
+            "batch": true,
+            "count": 2,
+            "results": [
+                {"symbol": "ok", "type": "function", "file": "src/ok.rs", "byte_range": [0, 1], "complexity": 1, "language": "rust", "callers": [], "callees": [], "impact_radius": {}},
+                {"symbol": "missing", "error": "Symbol not found"}
+            ]
+        }"#);
+        let out = trim_llm_payload("leindex.symbol-lookup", &data);
+        let results = out["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["symbol"], "ok");
+        assert_eq!(results[0]["file"], "src/ok.rs");
+        // The error entry has no `file` / `type` / etc. — those
+        // fields simply don't appear in the trimmed copy. The
+        // `error` field is not on the per-symbol whitelist but
+        // the entry still survives as a result the LLM can
+        // surface to the user.
+        assert_eq!(results[1]["symbol"], "missing");
+    }
+
+    #[test]
+    fn test_trim_read_symbol_includes_dependencies_when_present() {
+        // Regression: when the caller passes
+        // `include_dependencies=true`, the handler adds a
+        // `dependencies` array to the payload. The trim must
+        // preserve it so the caller-requested extra context
+        // is not silently dropped.
+        let data = v(r#"{
+            "symbol": "compute",
+            "type": "function",
+            "file": "src/lib.rs",
+            "language": "rust",
+            "complexity": 4,
+            "line_start": 10,
+            "line_end": 25,
+            "doc_comment": "/// Compute result",
+            "source": "fn compute() {}",
+            "callers": [],
+            "callees": [],
+            "dependencies": ["fn helper_a()", "fn helper_b()"]
+        }"#);
+        let out = trim_llm_payload("leindex.read-symbol", &data);
+        assert_eq!(out["symbol"], "compute");
+        let deps = out["dependencies"].as_array().expect("dependencies must be an array");
+        assert_eq!(deps.len(), 2);
+        assert_eq!(deps[0], "fn helper_a()");
+        assert_eq!(deps[1], "fn helper_b()");
+    }
+
+    #[test]
+    fn test_trim_search_falls_through_explicit_null_context() {
+        // Regression: when a search result row carries an
+        // explicit `context: null` (e.g. the handler skipped
+        // snippet expansion for an unindexed file), the
+        // trim fallback chain must NOT stop at the null —
+        // it has to fall through to `content` and then to
+        // `signature`. The previous `r.get("context").or_else(...)`
+        // chain short-circuited on `Some(&Value::Null)`, so
+        // the snippet was always `null` even when a
+        // non-null `content` was available.
+        let data = v(r#"{
+            "query": "compute",
+            "results": [
+                {
+                    "file_path": "src/lib.rs",
+                    "symbol_name": "compute",
+                    "symbol_type": "function",
+                    "score": 0.9,
+                    "context": null,
+                    "content": "fn compute() -> i32 { 42 }",
+                    "signature": "fn compute() -> i32"
+                }
+            ]
+        }"#);
+        let out = trim_llm_payload("leindex.search", &data);
+        let results = out["results"].as_array().unwrap();
+        let snippet = &results[0]["snippet"];
+        // The `content` field carries the source body — the
+        // trim path's snippet transform takes the first line
+        // and truncates to 240 chars. Assert the body text is
+        // present (not the literal `null`).
+        let s = snippet.as_str().expect("snippet must be a string, not null");
+        assert!(s.contains("fn compute()"), "snippet should contain content body: {}", s);
+    }
+
+    #[test]
+    fn test_trim_search_falls_through_explicit_null_symbol_name() {
+        // Regression: same null-blocking pattern for the
+        // `symbol` / `symbol_name` pair — an explicit
+        // `null` in `symbol_name` must not block the
+        // fallback to `symbol`.
+        let data = v(r#"{
+            "query": "x",
+            "results": [
+                {
+                    "file_path": "src/lib.rs",
+                    "symbol_name": null,
+                    "symbol": "fallback_name",
+                    "symbol_type": "function",
+                    "score": 0.5,
+                    "content": "fn fallback_name() {}"
+                }
+            ]
+        }"#);
+        let out = trim_llm_payload("leindex.search", &data);
+        let results = out["results"].as_array().unwrap();
+        assert_eq!(
+            results[0]["symbol"], "fallback_name",
+            "explicit null in symbol_name must fall through to symbol"
+        );
     }
 }

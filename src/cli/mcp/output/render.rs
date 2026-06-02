@@ -1270,15 +1270,19 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
         };
         if let Some(text) = region_text {
             out.push('\n');
-            out.push_str(&format!(
-                "  {}Surrounding region:{} {}\n",
-                if color { DIM } else { "" },
-                if color { RESET } else { "" },
-                text,
-            ));
-            // Only expand into per-line output for the string
-            // form — the object form is a single line by design.
             if region_value.is_string() {
+                // String form: the surrounding text is a
+                // multi-line excerpt. The header is a
+                // marker line; the lines themselves are
+                // emitted below as a per-line colorized
+                // expansion. Putting the raw multi-line
+                // `text` on the header would duplicate the
+                // expansion and produce messy output.
+                out.push_str(&format!(
+                    "  {}Surrounding region:{}\n",
+                    if color { DIM } else { "" },
+                    if color { RESET } else { "" },
+                ));
                 for l in text.lines() {
                     out.push_str(&format!(
                         "      {}{}{}\n",
@@ -1287,6 +1291,18 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
                         if color { RESET } else { "" },
                     ));
                 }
+            } else {
+                // Object form (`{start, end}` etc.):
+                // the `text` is already a compact single
+                // line like `bytes 10..25`, so we put it
+                // on the same line as the header and do
+                // not expand it per-line.
+                out.push_str(&format!(
+                    "  {}Surrounding region:{} {}\n",
+                    if color { DIM } else { "" },
+                    if color { RESET } else { "" },
+                    text,
+                ));
             }
         }
     }
@@ -1903,6 +1919,56 @@ mod tests {
             s.contains("bytes 10..25"),
             "missing structured edit_region range: {}",
             s
+        );
+    }
+
+    #[test]
+    fn test_render_edit_apply_string_region_no_duplicate_text() {
+        // Regression: when `edit_region` is a string (the
+        // multi-line surrounding excerpt form), the renderer
+        // must NOT print the raw multi-line text on the
+        // `Surrounding region:` header line — that would
+        // duplicate the per-line colorized expansion emitted
+        // below the header. The header is a marker; the lines
+        // themselves go on the indented block.
+        let args = v(r#"{"file_path": "src/lib.rs"}"#);
+        let payload = v(r#"{
+            "success": true,
+            "changes_applied": 1,
+            "file_path": "src/lib.rs",
+            "edit_region": "1: // hello\n2: fn alpha() {}\n3: fn beta() {}\n",
+            "message": "Applied 1 change"
+        }"#);
+        let s = render_tool_output("leindex.edit-apply", &payload, &args);
+        let stripped = strip_ansi(&s);
+        // The string body must appear in the per-line
+        // expansion (the `      // hello` indented line), so
+        // the comment marker IS in the output.
+        assert!(
+            stripped.contains("// hello"),
+            "per-line expansion missing: {}",
+            stripped
+        );
+        assert!(stripped.contains("fn alpha() {}"));
+        assert!(stripped.contains("fn beta() {}"));
+        // The header line itself must be a single marker
+        // line — NOT the raw multi-line text concatenated.
+        // We assert that the `Surrounding region:` line, when
+        // stripped, does not also include the function
+        // bodies (which would be the duplication symptom).
+        let header_line = stripped
+            .lines()
+            .find(|l| l.contains("Surrounding region"))
+            .unwrap_or("");
+        assert!(
+            !header_line.contains("fn alpha()"),
+            "string edit_region body leaked into header line: {:?}",
+            header_line
+        );
+        assert!(
+            !header_line.contains("fn beta()"),
+            "string edit_region body leaked into header line: {:?}",
+            header_line
         );
     }
 
