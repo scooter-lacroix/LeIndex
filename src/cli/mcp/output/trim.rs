@@ -355,23 +355,27 @@ fn trim_read_file(data: &Value) -> Value {
 }
 
 fn thin_symbol_map(sm: &Value) -> Value {
-    let arr = sm.as_array().cloned().unwrap_or_default();
-    let trimmed: Vec<Value> = arr
-        .into_iter()
-        .map(|mut s| {
-            if let Some(obj) = s.as_object_mut() {
-                obj.remove("complexity");
-                if let Some(callers) = obj.get("callers").cloned() {
-                    obj.insert("callers".to_string(), take_n(&callers, 5));
+    if let Some(arr) = sm.as_array() {
+        let trimmed: Vec<Value> = arr
+            .iter()
+            .map(|s| {
+                let mut s = s.clone();
+                if let Some(obj) = s.as_object_mut() {
+                    obj.remove("complexity");
+                    if let Some(callers) = obj.get("callers") {
+                        obj.insert("callers".to_string(), take_n(callers, 5));
+                    }
+                    if let Some(callees) = obj.get("callees") {
+                        obj.insert("callees".to_string(), take_n(callees, 5));
+                    }
                 }
-                if let Some(callees) = obj.get("callees").cloned() {
-                    obj.insert("callees".to_string(), take_n(&callees, 5));
-                }
-            }
-            s
-        })
-        .collect();
-    Value::Array(trimmed)
+                s
+            })
+            .collect();
+        Value::Array(trimmed)
+    } else {
+        Value::Array(Vec::new())
+    }
 }
 
 fn trim_read_symbol(data: &Value) -> Value {
@@ -653,29 +657,32 @@ fn trim_edit(data: &Value) -> Value {
 fn trim_rename_symbol(data: &Value) -> Value {
     // `diffs[]` already carries structured per-file diffs. Drop the
     // `diff_text` echoes and shrink the per-file list to the first 25
-    // (callers rarely need more for an LLM context).
-    let arr = data
-        .get("diffs")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let shown: Vec<Value> = arr
-        .iter()
-        .take(25)
-        .map(|d| {
-            let mut obj = serde_json::Map::new();
-            if let Some(v) = d.get("file") {
-                obj.insert("file".to_string(), v.clone());
-            }
-            if let Some(v) = d.get("diff") {
-                obj.insert("diff".to_string(), v.clone());
-            }
-            Value::Object(obj)
+    // (callers rarely need more for an LLM context). Borrow the
+    // array — only the first 25 elements need a deep clone, so the
+    // clone-on-take pattern keeps peak memory at O(25) rather than
+    // O(N) when N >> 25.
+    let diffs = data.get("diffs").and_then(|v| v.as_array());
+    let total = diffs.map(|a| a.len()).unwrap_or(0);
+    let shown: Vec<Value> = diffs
+        .map(|arr| {
+            arr.iter()
+                .take(25)
+                .map(|d| {
+                    let mut obj = serde_json::Map::new();
+                    if let Some(v) = d.get("file") {
+                        obj.insert("file".to_string(), v.clone());
+                    }
+                    if let Some(v) = d.get("diff") {
+                        obj.insert("diff".to_string(), v.clone());
+                    }
+                    Value::Object(obj)
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     serde_json::json!({
         "diffs": shown,
-        "diffs_more": arr.len().saturating_sub(25),
+        "diffs_more": total.saturating_sub(25),
         "old_name": data.get("old_name"),
         "new_name": data.get("new_name"),
     })
@@ -686,9 +693,13 @@ fn trim_rename_symbol(data: &Value) -> Value {
 // =============================================================================
 
 /// Return the first `n` items of a Value (assumed array), as a Value.
+/// Borrows the input — only the first `n` elements are cloned, so the
+/// peak allocation is O(min(n, source_len)) instead of O(source_len).
 fn take_n(v: &Value, n: usize) -> Value {
-    let arr = v.as_array().cloned().unwrap_or_default();
-    Value::Array(arr.into_iter().take(n).collect())
+    match v.as_array() {
+        Some(arr) => Value::Array(arr.iter().take(n).cloned().collect()),
+        None => Value::Array(Vec::new()),
+    }
 }
 
 /// Look up a key in an object and return the first `n` items of its
@@ -1538,5 +1549,115 @@ mod tests {
         let out = trim_llm_payload("leindex.deep-analyze", &data);
         assert_eq!(out["results"].as_array().unwrap().len(), 5);
         assert_eq!(out["results_more"], 0);
+    }
+
+    /// Regression for MED round 14 (gemini `3344534855`):
+    /// `take_n` used to do `v.as_array().cloned().unwrap_or_default()`,
+    /// which deep-cloned the entire source array before taking `n`.
+    /// The post-fix code borrows the source and only clones the
+    /// first `n` elements. The contract: with N=100 source items
+    /// and n=3, the output is a 3-element array of the first three
+    /// source items, preserving order.
+    #[test]
+    fn test_take_n_borrows_source() {
+        let mut arr = Vec::new();
+        for i in 0..100 {
+            arr.push(serde_json::json!({"rank": i, "payload": "x".repeat(64)}));
+        }
+        let v = Value::Array(arr);
+        let out = take_n(&v, 3);
+        let out = out.as_array().unwrap();
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["rank"], 0);
+        assert_eq!(out[1]["rank"], 1);
+        assert_eq!(out[2]["rank"], 2);
+    }
+
+    /// Regression for MED round 14 (gemini `3344534868`):
+    /// `thin_symbol_map` used to clone the whole source array, then
+    /// clone the first 5 callers and first 5 callees for each entry
+    /// (cloning the unused tail as well). The post-fix code borrows
+    /// the source array and clones only the 5-item windows of
+    /// callers/callees. The contract: with callers/callees arrays
+    /// of length 20 each, the output caps each at 5, drops
+    /// `complexity`, and preserves the entry-level fields.
+    #[test]
+    fn test_thin_symbol_map_caps_callers_callees_at_5() {
+        let mut big_callers = Vec::new();
+        let mut big_callees = Vec::new();
+        for i in 0..20 {
+            big_callers.push(serde_json::json!({"name": format!("c{}", i)}));
+            big_callees.push(serde_json::json!({"name": format!("e{}", i)}));
+        }
+        let sm = serde_json::json!([
+            {
+                "name": "foo",
+                "complexity": 42,
+                "callers": big_callers,
+                "callees": big_callees,
+            },
+            {
+                "name": "bar",
+                "complexity": 7,
+                "callers": [{"name": "only"}],
+                "callees": [],
+            }
+        ]);
+        let out = thin_symbol_map(&sm);
+        let arr = out.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        let foo = &arr[0];
+        assert!(foo.get("complexity").is_none(), "complexity must be dropped");
+        assert_eq!(foo["name"], "foo");
+        assert_eq!(
+            foo["callers"].as_array().unwrap().len(),
+            5,
+            "callers must cap at 5 even when source has 20"
+        );
+        assert_eq!(foo["callers"][0]["name"], "c0");
+        assert_eq!(foo["callers"][4]["name"], "c4");
+        assert_eq!(
+            foo["callees"].as_array().unwrap().len(),
+            5,
+            "callees must cap at 5 even when source has 20"
+        );
+        let bar = &arr[1];
+        assert_eq!(bar["callers"].as_array().unwrap().len(), 1);
+        assert_eq!(bar["callees"].as_array().unwrap().len(), 0);
+    }
+
+    /// Regression for MED round 14 (gemini `3344534871`):
+    /// `trim_rename_symbol` used to clone the whole `diffs` array,
+    /// then `take(25).map(|d| ...)` cloned only the first 25
+    /// entries' file/diff fields. The post-fix code borrows the
+    /// source array, takes 25, and clones only the file/diff
+    /// fields of those 25. The contract: with N=50 source diffs,
+    /// the output has 25 entries, `diffs_more` is 25, and
+    /// `diffs_total` (if present) reflects the source length.
+    #[test]
+    fn test_trim_rename_symbol_caps_diffs_at_25() {
+        let mut diffs = Vec::new();
+        for i in 0..50 {
+            diffs.push(serde_json::json!({
+                "file": format!("src/f{}.rs", i),
+                "diff": format!("--- a/src/f{}.rs\n+++ b/src/f{}.rs\n@@ -1,1 +1,1 @@\n-x\n+y", i, i),
+                "diff_text": format!("long echo of diff {}", i),
+            }));
+        }
+        let data = serde_json::json!({
+            "old_name": "foo",
+            "new_name": "bar",
+            "diffs": diffs,
+        });
+        let out = trim_rename_symbol(&data);
+        let shown = out["diffs"].as_array().unwrap();
+        assert_eq!(shown.len(), 25, "must cap at 25 when source has 50");
+        assert_eq!(out["diffs_more"], 25, "diffs_more = total - 25");
+        assert_eq!(out["old_name"], "foo");
+        assert_eq!(out["new_name"], "bar");
+        // First shown is the first source; the long `diff_text` echo
+        // is dropped (we keep only `file` and `diff`).
+        assert!(shown[0].get("diff_text").is_none());
+        assert_eq!(shown[0]["file"], "src/f0.rs");
     }
 }

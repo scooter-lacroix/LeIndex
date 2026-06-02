@@ -1,7 +1,7 @@
 use crate::cli::registry::{ProjectHandle, ProjectWriteGuard};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -18,18 +18,15 @@ pub const DEBOUNCE_INTERVAL_MS: u64 = 500;
 /// concurrent tool calls indefinitely during a large reindex.
 ///
 /// The budget is enforced on two phases:
-///   1. **Lock acquisition** — if `try_write` keeps failing, the
-///      watcher polls with `RETRY_BACKOFF_MS` for at most this long
-///      before declaring the lock busy and skipping the batch.
+///   1. **Lock acquisition** — `acquire_with_budget` is a fail-fast
+///      `try_write` that returns `Skipped` within microseconds if the
+///      lock is held. The outer async loop's debounce tick
+///      (re-entered on `dirty = true`) handles retries, so the
+///      spawn_blocking thread is never pinned waiting for the lock.
 ///   2. **Reindex execution** — the reindex future is wrapped in
 ///      `tokio::time::timeout` so a runaway rebuild cannot starve the
 ///      rest of the server even if the work itself hangs.
 pub const REINDEX_BUDGET_SECS: u64 = 30;
-
-/// Polling interval for the `try_write` retry loop when the lock is
-/// held by an in-flight tool call. Kept short so the watcher doesn't
-/// lag noticeably but long enough to avoid busy-spinning the runtime.
-const RETRY_BACKOFF_MS: u64 = 100;
 
 /// Watches project directories and triggers incremental reindex on file changes.
 pub struct IndexWatcher {
@@ -116,24 +113,24 @@ impl IndexWatcher {
                             // cross an await point — the entire
                             // acquire + reindex sequence lives inside
                             // the spawn_blocking closure.
-                            let budget = Duration::from_secs(REINDEX_BUDGET_SECS);
-                            let backoff = Duration::from_millis(RETRY_BACKOFF_MS);
-                            let reindex_budget = budget;
+                            let reindex_budget = Duration::from_secs(REINDEX_BUDGET_SECS);
                             let blocking = tokio::task::spawn_blocking(move || -> ReindexOutcome {
-                                let mut idx = match acquire_with_budget(
-                                    &handle_clone,
-                                    budget,
-                                    backoff,
-                                ) {
+                                let mut idx = match acquire_with_budget(&handle_clone) {
                                     LockAcquire::Acquired(g) => g,
-                                    // The lock was busy for the full
-                                    // budget. The caller must mark
-                                    // `dirty` again so the next
+                                    // The lock is currently held by
+                                    // another reindex. Return
+                                    // `Skipped` so the caller marks
+                                    // `dirty = true` and the next
                                     // debounce tick retries — treating
                                     // this as success would silently
                                     // drop the pending changes and
                                     // leave the index permanently
-                                    // stale.
+                                    // stale. Fail-fast (no sleep
+                                    // loop) so this spawn_blocking
+                                    // thread is released within
+                                    // microseconds instead of pinning
+                                    // a threadpool worker for the
+                                    // full 30s budget.
                                     LockAcquire::Skipped => {
                                         return ReindexOutcome::Skipped;
                                     }
@@ -267,25 +264,24 @@ impl IndexWatcher {
 /// inside `spawn_blocking`, so the threadpool impact is bounded to
 /// one thread per project for at most `REINDEX_BUDGET_SECS` (default
 /// 30s). The outer `tokio::time::timeout` on the `spawn_blocking` join
-/// further guarantees the watcher loop is never blocked longer than
-/// the budget even if the reindex body itself ignores the inner
-/// budget check.
-fn acquire_with_budget<'a>(
-    handle: &'a ProjectHandle,
-    budget: Duration,
-    backoff: Duration,
-) -> LockAcquire<'a> {
-    let start = Instant::now();
-    loop {
-        match handle.try_write() {
-            Ok(g) => return LockAcquire::Acquired(g),
-            Err(()) => {
-                if start.elapsed() > budget {
-                    return LockAcquire::Skipped;
-                }
-                std::thread::sleep(backoff);
-            }
-        }
+/// Try to acquire the project write lock once and return. On
+/// `try_write` failure we return `Skipped` immediately; the
+/// outer async watcher loop already has a debounced retry path
+/// (`tokio::time::sleep` when `dirty = true`), so the next
+/// tick will try again. The previous budgeted loop with
+/// `std::thread::sleep(backoff)` blocked a `spawn_blocking`
+/// thread for up to `REINDEX_BUDGET_SECS` (30s) — that pinned
+/// a threadpool worker, starved other blocking work, and
+/// produced the same `Skipped` outcome on a busy lock that
+/// fail-fast returns within microseconds. The outer
+/// `tokio::time::timeout(reindex_budget, ...)` still bounds
+/// the spawn_blocking closure as a safety net for a hang in
+/// the reindex body itself, so the spawn_blocking budget
+/// guarantee is preserved.
+fn acquire_with_budget<'a>(handle: &'a ProjectHandle) -> LockAcquire<'a> {
+    match handle.try_write() {
+        Ok(g) => LockAcquire::Acquired(g),
+        Err(()) => LockAcquire::Skipped,
     }
 }
 
@@ -355,5 +351,59 @@ mod tests {
         // match behaviour.
         assert!(!matches!(failed, ReindexOutcome::Completed));
         assert!(!matches!(failed, ReindexOutcome::Skipped));
+    }
+
+    /// Regression for MED round 14 (gemini `3344534850`):
+    /// `acquire_with_budget` previously busy-looped with
+    /// `std::thread::sleep(backoff)` for up to `REINDEX_BUDGET_SECS`
+    /// (30s) waiting for the lock. The post-fix code is a fail-fast
+    /// `try_write`: it returns `Skipped` within microseconds when
+    /// the lock is held by another holder. This test holds the
+    /// write lock from the current thread, calls
+    /// `acquire_with_budget` from a fresh thread, and asserts
+    /// that the call returns `Skipped` well under 1s — a future
+    /// revert to a budgeted loop would either hang for 30s
+    /// (caught by the test timeout) or take noticeably longer
+    /// than 1s (caught by the explicit `Duration` check).
+    #[test]
+    fn test_acquire_with_budget_is_fail_fast() {
+        use crate::cli::leindex::LeIndex;
+        use crate::cli::registry::{ProjectHandle, ProjectRwLock};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let leindex = LeIndex::new(tmp.path()).unwrap();
+        let handle: ProjectHandle = Arc::new(ProjectRwLock::new(leindex));
+
+        // Hold the write lock so any try_write returns Err.
+        let _held = handle.blocking_write();
+
+        let h2 = handle.clone();
+        let start = Instant::now();
+        let outcome = std::thread::spawn(move || {
+            // Reduce the borrow of `h2` to a plain `Result<(), ()>`
+            // so the return value is `'static` — `LockAcquire`
+            // borrows from the handle, which would otherwise be
+            // moved into the closure and outlive the join.
+            match acquire_with_budget(&h2) {
+                LockAcquire::Acquired(_) => Ok(()),
+                LockAcquire::Skipped => Err(()),
+            }
+        })
+        .join()
+        .unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            outcome.is_err(),
+            "lock is held — must return Skipped, not Acquired"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "acquire_with_budget must be fail-fast; took {:?} (would be ~30s with the old budgeted loop)",
+            elapsed
+        );
     }
 }
