@@ -75,68 +75,76 @@ fn merge_meta(original: &Value, trimmed: &Value) -> Value {
 // =============================================================================
 
 pub(crate) fn trim_search(data: &Value) -> Value {
-    let arr = data
+    // Borrow the source array (do NOT clone the whole `results`
+    // array — each entry's `context` / `content` strings can be
+    // tens of kilobytes, and cloning the whole array upfront only
+    // to throw most of it away during the per-entry mapping
+    // defeats the purpose of payload trimming). The previous
+    // `as_array().cloned().or_else(...).cloned()` form was O(N *
+    // total_payload_size) extra allocations on every search call.
+    let arr: Option<&Vec<Value>> = data
         .as_array()
-        .cloned()
-        .or_else(|| data.get("results").and_then(|v| v.as_array()).cloned())
-        .unwrap_or_default();
-    let trimmed: Vec<Value> = arr
-        .into_iter()
-        .map(|r| {
-            // Use whichever content the handler populated — `context`
-            // (full expansion) or `content` (raw node body) — and
-            // collapse the multi-dimensional `score` struct down to
-            // the single composite that callers actually use.
-            let snippet = r
-                .get("context")
-                .filter(|v| !v.is_null())
-                .or_else(|| r.get("content").filter(|v| !v.is_null()))
-                .or_else(|| r.get("signature").filter(|v| !v.is_null()))
-                .cloned()
-                .map(|v| match v {
-                    Value::String(s) => {
-                        let first = s.lines().next().unwrap_or("").trim();
-                        Value::String(truncate_chars(first, 240))
-                    }
-                    other => other,
-                })
-                .unwrap_or(Value::Null);
-            let score = r
-                .get("score")
-                .and_then(|v| v.get("overall"))
-                .filter(|v| !v.is_null())
-                .cloned()
-                .or_else(|| {
-                    r.get("score")
-                        .filter(|v| !v.is_null())
-                        .cloned()
-                })
-                .unwrap_or(Value::Null);
-            serde_json::json!({
-                "file_path": r.get("file_path").cloned().unwrap_or(Value::Null),
-                // `render_search` in `render.rs` already supports
-                // either `symbol` or `symbol_name` on the source
-                // record; the trim path previously only looked at
-                // `symbol_name`, so a result that arrived with
-                // `symbol` populated and `symbol_name` absent lost
-                // its name to `Null`. Walk both keys so the LLM-
-                // visible payload always carries the symbol. The
-                // `.filter(|v| !v.is_null())` guards make sure
-                // that an explicit `null` in `symbol_name` falls
-                // through to `symbol` (and vice-versa) rather
-                // than blocking the chain.
-                "symbol": r
-                    .get("symbol_name")
+        .or_else(|| data.get("results").and_then(|v| v.as_array()));
+    let trimmed: Vec<Value> = match arr {
+        Some(a) => a
+            .iter()
+            .map(|r| {
+                // Use whichever content the handler populated — `context`
+                // (full expansion) or `content` (raw node body) — and
+                // collapse the multi-dimensional `score` struct down to
+                // the single composite that callers actually use.
+                let snippet = r
+                    .get("context")
                     .filter(|v| !v.is_null())
-                    .or_else(|| r.get("symbol").filter(|v| !v.is_null()))
+                    .or_else(|| r.get("content").filter(|v| !v.is_null()))
+                    .or_else(|| r.get("signature").filter(|v| !v.is_null()))
                     .cloned()
-                    .unwrap_or(Value::Null),
-                "symbol_type": r.get("symbol_type").cloned().unwrap_or(Value::Null),
-                "score": score,
-                "snippet": snippet,
+                    .map(|v| match v {
+                        Value::String(s) => {
+                            let first = s.lines().next().unwrap_or("").trim();
+                            Value::String(truncate_chars(first, 240))
+                        }
+                        other => other,
+                    })
+                    .unwrap_or(Value::Null);
+                let score = r
+                    .get("score")
+                    .and_then(|v| v.get("overall"))
+                    .filter(|v| !v.is_null())
+                    .cloned()
+                    .or_else(|| {
+                        r.get("score")
+                            .filter(|v| !v.is_null())
+                            .cloned()
+                    })
+                    .unwrap_or(Value::Null);
+                serde_json::json!({
+                    "file_path": r.get("file_path").cloned().unwrap_or(Value::Null),
+                    // `render_search` in `render.rs` already supports
+                    // either `symbol` or `symbol_name` on the source
+                    // record; the trim path previously only looked at
+                    // `symbol_name`, so a result that arrived with
+                    // `symbol` populated and `symbol_name` absent lost
+                    // its name to `Null`. Walk both keys so the LLM-
+                    // visible payload always carries the symbol. The
+                    // `.filter(|v| !v.is_null())` guards make sure
+                    // that an explicit `null` in `symbol_name` falls
+                    // through to `symbol` (and vice-versa) rather
+                    // than blocking the chain.
+                    "symbol": r
+                        .get("symbol_name")
+                        .filter(|v| !v.is_null())
+                        .or_else(|| r.get("symbol").filter(|v| !v.is_null()))
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                    "symbol_type": r.get("symbol_type").cloned().unwrap_or(Value::Null),
+                    "score": score,
+                    "snippet": snippet,
+                })
             })
-        })
-        .collect();
+            .collect(),
+        None => Vec::new(),
+    };
     // The model already knows the query it sent; we just hand back the
     // count and the per-hit fields it needs to make decisions.
     // Pagination metadata must round-trip too — the model's follow-up
@@ -416,15 +424,20 @@ fn trim_read_symbol(data: &Value) -> Value {
         out.insert("source_truncated".to_string(), Value::Bool(truncated));
     }
     // callers/callees: keep 5 by default, expose `*_more` flag.
+    // The length check uses `as_array().map(|a| a.len())` rather
+    // than cloning the whole array first — callers/callees graphs
+    // can be hundreds of entries, and cloning the array just to
+    // discard it after `len() > 5` was an O(N) heap allocation per
+    // trim call.
     if let Some(callers) = data.get("callers") {
-        let arr = callers.as_array().cloned().unwrap_or_default();
+        let len = callers.as_array().map(|a| a.len()).unwrap_or(0);
         out.insert("callers".to_string(), take_n(callers, 5));
-        out.insert("callers_more".to_string(), Value::Bool(arr.len() > 5));
+        out.insert("callers_more".to_string(), Value::Bool(len > 5));
     }
     if let Some(callees) = data.get("callees") {
-        let arr = callees.as_array().cloned().unwrap_or_default();
+        let len = callees.as_array().map(|a| a.len()).unwrap_or(0);
         out.insert("callees".to_string(), take_n(callees, 5));
-        out.insert("callees_more".to_string(), Value::Bool(arr.len() > 5));
+        out.insert("callees_more".to_string(), Value::Bool(len > 5));
     }
     Value::Object(out)
 }
@@ -511,31 +524,44 @@ fn trim_deep_analyze(data: &Value) -> Value {
     // Keep the pre-built `context` (already token-budgeted). The
     // results array mirrors a search hit — drop verbose per-result
     // fields and cap to 10.
-    let results = data
+    //
+    // Iterate by reference: the previous form cloned the whole
+    // `results` array, then cloned the first 10 entries into a
+    // second vector, then cloned each whitelisted field on each
+    // entry. The intermediate `Vec<Value>` allocations were
+    // unnecessary — the trim path only needs the projected
+    // values, and the source array can be borrowed for the
+    // lifetime of the call.
+    let results_len = data
         .get("results")
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let shown = results.iter().take(10).cloned().collect::<Vec<_>>();
-    let trimmed: Vec<Value> = shown
-        .into_iter()
-        .map(|r| {
-            let mut obj = serde_json::Map::new();
-            for k in ["rank", "file_path", "symbol_name", "symbol_type", "signature"] {
-                if let Some(v) = r.get(k) {
-                    obj.insert(k.to_string(), v.clone());
-                }
-            }
-            Value::Object(obj)
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let trimmed: Vec<Value> = data
+        .get("results")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .take(10)
+                .map(|r| {
+                    let mut obj = serde_json::Map::new();
+                    for k in ["rank", "file_path", "symbol_name", "symbol_type", "signature"] {
+                        if let Some(v) = r.get(k) {
+                            obj.insert(k.to_string(), v.clone());
+                        }
+                    }
+                    Value::Object(obj)
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     serde_json::json!({
         "query": data.get("query"),
         "tokens_used": data.get("tokens_used"),
         "processing_time_ms": data.get("processing_time_ms"),
         "context": data.get("context"),
         "results": trimmed,
-        "results_more": results.len().saturating_sub(10),
+        "results_more": results_len.saturating_sub(10),
     })
 }
 
@@ -1326,5 +1352,191 @@ mod tests {
         assert_eq!(out["offset"], 0);
         assert_eq!(out["has_more"], false);
         assert!(out.get("suggestion").is_none(), "no suggestion key when absent");
+    }
+
+    /// Regression for HIGH round 12: `trim_search` used to clone the
+    /// entire `results` array (`as_array().cloned()`), then clone
+    /// each entry's `context` / `content` strings during the
+    /// per-entry mapping. The intermediate allocations were
+    /// unnecessary because only a few whitelisted fields are kept
+    /// per entry. After the fix, the function borrows the source
+    /// array and clones only the whitelisted fields.
+    ///
+    /// The contract we test: the output shape is unchanged. Each
+    /// entry's `snippet` is taken from `context` / `content` /
+    /// `signature` (truncated to first line, ≤ 240 chars), `score`
+    /// collapses to `score.overall` or `score`, `symbol` falls
+    /// through `symbol_name` → `symbol`, and `file_path` /
+    /// `symbol_type` round-trip.
+    #[test]
+    fn test_trim_search_borrows_input_array() {
+        // The "context" string is intentionally long to make the
+        // "would have been cloned" cost observable in the
+        // pre-fix code path. The post-fix code only borrows it.
+        let big_context = "x".repeat(50_000);
+        let data = v(&format!(
+            r#"{{
+                "query": "find me",
+                "results": [
+                    {{
+                        "file_path": "src/a.rs",
+                        "symbol_name": "alpha",
+                        "symbol_type": "function",
+                        "context": "{}",
+                        "score": {{"overall": 0.91, "tfidf": 0.5, "neural": 0.95}}
+                    }},
+                    {{
+                        "file_path": "src/b.rs",
+                        "symbol": "beta",
+                        "symbol_type": "struct",
+                        "content": "struct Beta {{ x: u32 }}",
+                        "score": 0.42
+                    }}
+                ],
+                "count": 2,
+                "offset": 0,
+                "has_more": false
+            }}"#,
+            big_context
+        ));
+        let out = trim_llm_payload("leindex.search", &data);
+        let results = out["results"].as_array().unwrap();
+        assert_eq!(results.len(), 2);
+
+        // First entry: context was 50_000 chars, snippet must be
+        // the first line truncated to 240 chars + "..." ellipsis
+        // (243 chars total — `truncate_chars(s, 240)` preserves
+        // 240 input chars and appends "...").
+        let snippet0 = results[0]["snippet"].as_str().unwrap();
+        assert_eq!(snippet0.len(), 243, "snippet must be 240 chars + '...' ellipsis");
+        assert!(snippet0.ends_with("..."));
+        assert!(snippet0[..240].chars().all(|c| c == 'x'));
+        assert_eq!(results[0]["symbol"], "alpha");
+        assert_eq!(results[0]["file_path"], "src/a.rs");
+        assert_eq!(results[0]["symbol_type"], "function");
+        // score collapsed to `overall`.
+        assert!((results[0]["score"].as_f64().unwrap() - 0.91).abs() < 1e-9);
+
+        // Second entry: content used (no context), symbol_name
+        // absent so falls through to `symbol`.
+        let snippet1 = results[1]["snippet"].as_str().unwrap();
+        assert_eq!(snippet1, "struct Beta { x: u32 }");
+        assert_eq!(results[1]["symbol"], "beta");
+        // score is a plain number, not a struct.
+        assert!((results[1]["score"].as_f64().unwrap() - 0.42).abs() < 1e-9);
+    }
+
+    /// Regression for HIGH round 12: `trim_read_symbol` used to
+    /// clone the entire `callers` and `callees` arrays just to
+    /// check `len() > 5`. The post-fix code computes the length
+    /// without cloning via `as_array().map(|a| a.len())`.
+    ///
+    /// The contract: when `callers` / `callees` have more than 5
+    /// entries, `*_more` is true; otherwise false. The first 5
+    /// entries are still passed through via `take_n`.
+    #[test]
+    fn test_trim_read_symbol_callers_more_flag_no_clone() {
+        // 7 callers — `callers_more` must be true, first 5 must
+        // be passed through.
+        let mut callers = Vec::new();
+        for i in 0..7 {
+            callers.push(serde_json::json!({"name": format!("c{}", i), "file": "x.rs", "type": "fn"}));
+        }
+        let data = v(&format!(
+            r#"{{
+                "symbol": "main",
+                "type": "function",
+                "file": "src/main.rs",
+                "byte_range": [0, 100],
+                "language": "rust",
+                "callers": {},
+                "callees": []
+            }}"#,
+            serde_json::to_string(&callers).unwrap()
+        ));
+        let out = trim_llm_payload("leindex.read-symbol", &data);
+        assert_eq!(out["callers"].as_array().unwrap().len(), 5, "first 5 callers passed through");
+        assert_eq!(out["callers_more"], true, "more than 5 callers => callers_more true");
+
+        // 3 callers — `callers_more` must be false, all 3 pass through.
+        let mut small_callers = Vec::new();
+        for i in 0..3 {
+            small_callers.push(serde_json::json!({"name": format!("c{}", i)}));
+        }
+        let data = v(&format!(
+            r#"{{
+                "symbol": "main",
+                "callers": {},
+                "callees": []
+            }}"#,
+            serde_json::to_string(&small_callers).unwrap()
+        ));
+        let out = trim_llm_payload("leindex.read-symbol", &data);
+        assert_eq!(out["callers"].as_array().unwrap().len(), 3);
+        assert_eq!(out["callers_more"], false, "3 callers => callers_more false");
+    }
+
+    /// Regression for HIGH round 12: `trim_deep_analyze` used to
+    /// clone the whole `results` array, then clone the first 10
+    /// entries into a second vector, then clone each whitelisted
+    /// field on each entry. The post-fix code borrows the source
+    /// array, takes 10, and clones only the whitelisted fields.
+    ///
+    /// The contract: with N>10 results, the trimmed output has
+    /// 10 entries, `results_more` is N-10, and the whitelisted
+    /// fields are present.
+    #[test]
+    fn test_trim_deep_analyze_caps_at_10_without_clone() {
+        // 15 results.
+        let mut results = Vec::new();
+        for i in 0..15 {
+            results.push(serde_json::json!({
+                "rank": i,
+                "file_path": format!("src/f{}.rs", i),
+                "symbol_name": format!("sym{}", i),
+                "symbol_type": "function",
+                "signature": format!("fn sym{}()", i),
+                // Verbose fields the trim should drop.
+                "byte_range": [0, 1000],
+                "language": "rust",
+                "complexity": 5,
+            }));
+        }
+        let data = v(&format!(
+            r#"{{
+                "query": "x",
+                "tokens_used": 100,
+                "processing_time_ms": 5,
+                "context": "some context",
+                "results": {}
+            }}"#,
+            serde_json::to_string(&results).unwrap()
+        ));
+        let out = trim_llm_payload("leindex.deep-analyze", &data);
+        assert_eq!(out["results"].as_array().unwrap().len(), 10, "cap at 10 entries");
+        assert_eq!(out["results_more"], 5, "results_more = 15 - 10 = 5");
+        // First entry: whitelisted fields present, dropped fields absent.
+        let first = &out["results"].as_array().unwrap()[0];
+        assert_eq!(first["rank"], 0);
+        assert_eq!(first["file_path"], "src/f0.rs");
+        assert_eq!(first["symbol_name"], "sym0");
+        assert_eq!(first["symbol_type"], "function");
+        assert_eq!(first["signature"], "fn sym0()");
+        assert!(first.get("byte_range").is_none(), "byte_range must be dropped");
+        assert!(first.get("language").is_none(), "language must be dropped");
+        assert!(first.get("complexity").is_none(), "complexity must be dropped");
+
+        // 5 results: no cap, all pass through, results_more = 0.
+        let mut small = Vec::new();
+        for i in 0..5 {
+            small.push(serde_json::json!({"rank": i, "file_path": "a.rs"}));
+        }
+        let data = v(&format!(
+            r#"{{"query": "x", "results": {}}}"#,
+            serde_json::to_string(&small).unwrap()
+        ));
+        let out = trim_llm_payload("leindex.deep-analyze", &data);
+        assert_eq!(out["results"].as_array().unwrap().len(), 5);
+        assert_eq!(out["results_more"], 0);
     }
 }

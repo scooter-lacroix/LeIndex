@@ -297,36 +297,25 @@ pub(crate) fn is_stale_fast(
     for p in &manifest_paths {
         already_listed.insert(p.canonicalize().unwrap_or_else(|_| p.clone()));
     }
-    // Root-level fast path: O(14) stat, no walkdir. Common case
+    // Root-level fast path: O(N) stat, no walkdir. Common case
     // for single-package projects.
-    const ROOT_MANIFEST_NAMES: &[&str] = &[
-        "Cargo.toml",
-        "Cargo.lock",
-        "package.json",
-        "package-lock.json",
-        "pyproject.toml",
-        "setup.py",
-        "setup.cfg",
-        "go.mod",
-        "go.sum",
-        "build.gradle",
-        "build.gradle.kts",
-        "pom.xml",
-        "requirements.txt",
-        "Pipfile",
-    ];
-    let mut new_root_manifest = false;
-    for name in ROOT_MANIFEST_NAMES {
-        let candidate = ctx.project_path.join(name);
-        if !candidate.exists() {
-            continue;
-        }
-        let candidate_canon = candidate.canonicalize().unwrap_or(candidate);
-        if !already_listed.contains(&candidate_canon) {
-            new_root_manifest = true;
-            break;
-        }
-    }
+    //
+    // The list of names must be a subset of
+    // `DEPENDENCY_MANIFEST_NAMES` — every name we check here
+    // must also be a name the scanner records in
+    // `ProjectFileScan::manifest_paths`, otherwise the cached
+    // `already_listed` set will never contain it and the fast
+    // path will mark the index stale on every tool call (the
+    // stale flag is then cleared by the next `leindex.index`,
+    // which records the same manifest, which the *next* tool
+    // call still treats as new — an infinite loop). The
+    // previous literal list included `setup.py`, `setup.cfg`,
+    // `build.gradle`, `build.gradle.kts`, `pom.xml`, and
+    // `Pipfile`, none of which the scanner records, so any
+    // project with one of those files at the root reported
+    // stale forever. Reuse `DEPENDENCY_MANIFEST_NAMES`
+    // directly so the two lists can never drift.
+    let new_root_manifest = find_new_root_manifest(ctx.project_path, &already_listed);
     if new_root_manifest {
         return true;
     }
@@ -367,6 +356,43 @@ pub(crate) fn is_stale_fast(
         }
     }
 
+    false
+}
+
+/// Check whether the project root contains a manifest that is
+/// NOT in `already_listed`. This is the O(N) root-only fast path
+/// in `is_stale_fast` — no walkdir, just a `metadata()` call
+/// per name in `DEPENDENCY_MANIFEST_NAMES`.
+///
+/// The list of names we check is exactly
+/// `DEPENDENCY_MANIFEST_NAMES` (the same set the scanner
+/// records in `ProjectFileScan::manifest_paths`). Factored out
+/// of `is_stale_fast` so it can be unit-tested in isolation
+/// against a tempdir fixture without spinning up the full
+/// `Storage` / `CacheSpiller` context. Returns `true` on the
+/// first new manifest found (short-circuits to keep the common
+/// "no new manifest" case fast).
+///
+/// `already_listed` is expected to contain canonicalized
+/// absolute paths (the caller in `is_stale_fast` canonicalizes
+/// before calling). For a tempdir-based test the path is
+/// already canonical for the duration of the test, so we fall
+/// back to the original path on canonicalize failure to keep
+/// the helper standalone.
+pub(crate) fn find_new_root_manifest(
+    project_path: &Path,
+    already_listed: &std::collections::HashSet<PathBuf>,
+) -> bool {
+    for name in DEPENDENCY_MANIFEST_NAMES {
+        let candidate = project_path.join(name);
+        if !candidate.exists() {
+            continue;
+        }
+        let candidate_canon = candidate.canonicalize().unwrap_or(candidate);
+        if !already_listed.contains(&candidate_canon) {
+            return true;
+        }
+    }
     false
 }
 
@@ -617,6 +643,77 @@ mod tests {
         assert!(
             !find_new_nested_manifest(root, &listed),
             ".cargo/config.toml must not be flagged"
+        );
+    }
+
+    // =====================================================================
+    // find_new_root_manifest — root-level fast path regression tests
+    // =====================================================================
+
+    /// Regression for P2 round 12: the previous `ROOT_MANIFEST_NAMES`
+    /// literal in `is_stale_fast` included `setup.py`, `setup.cfg`,
+    /// `build.gradle`, `build.gradle.kts`, `pom.xml`, and `Pipfile`,
+    /// none of which the scanner records. A project with any of
+    /// these files at the root would report stale on every tool
+    /// call (the cached `already_listed` set never contained them,
+    /// so the fast path kept flagging them as new). After the
+    /// fix, the fast path uses `DEPENDENCY_MANIFEST_NAMES`
+    /// directly. Verify that an `already_listed` set containing
+    /// the scanner-tracked manifests does NOT report stale for a
+    /// project that has `setup.py` at the root (i.e. `setup.py` is
+    /// not in the fast path any more).
+    #[test]
+    fn find_new_root_manifest_ignores_setup_py_when_cached() {
+        let (tmp, _) = make_fixture();
+        let root = tmp.path();
+        // `setup.py` is in the *old* literal but NOT in
+        // `DEPENDENCY_MANIFEST_NAMES`, so the post-fix fast path
+        // must not consider it.
+        fs::write(root.join("setup.py"), "from setuptools import setup\n").unwrap();
+        // Create a scanner-tracked manifest at the root and add
+        // it to `already_listed` to simulate a previously-
+        // indexed state.
+        let manifest = root.join("pyproject.toml");
+        fs::write(&manifest, "[tool.poetry]\nname = \"x\"\n").unwrap();
+        let mut listed: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        listed.insert(manifest.canonicalize().unwrap());
+        assert!(
+            !find_new_root_manifest(root, &listed),
+            "setup.py must not be flagged when pyproject.toml is already listed"
+        );
+    }
+
+    /// A new scanner-tracked manifest (e.g. a fresh `Cargo.toml`)
+    /// at the root MUST be flagged as new when it is not in
+    /// `already_listed`.
+    #[test]
+    fn find_new_root_manifest_detects_new_cargo_toml() {
+        let (tmp, listed) = make_fixture();
+        let root = tmp.path();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        assert!(
+            find_new_root_manifest(root, &listed),
+            "new Cargo.toml at root must be flagged"
+        );
+    }
+
+    /// A scanner-tracked manifest that is already in
+    /// `already_listed` must NOT be flagged. This locks the
+    /// canonicalize-and-compare behaviour so a future refactor
+    /// doesn't accidentally introduce a stale-on-every-call
+    /// regression.
+    #[test]
+    fn find_new_root_manifest_does_not_flag_listed_manifest() {
+        let (tmp, _) = make_fixture();
+        let root = tmp.path();
+        fs::write(root.join("package.json"), "{}").unwrap();
+        let mut listed: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        listed.insert(root.join("package.json").canonicalize().unwrap());
+        assert!(
+            !find_new_root_manifest(root, &listed),
+            "listed package.json must not be flagged"
         );
     }
 }
