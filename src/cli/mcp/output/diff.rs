@@ -194,28 +194,35 @@ pub fn compute_diff(original: &str, modified: &str, file_path: &str) -> DiffResu
 pub fn render_unified_diff(diff: &DiffResult, color: bool) -> String {
     let mut out = String::new();
     if !diff.has_changes() {
+        // Close the file-header color at the end of `+++ b/...` so
+        // the `(no changes)` line is rendered in plain text rather
+        // than inheriting `LIGHT_GREY` from the header.
         out.push_str(&format!(
-            "{}--- a/{}\n+++ b/{}\n(no changes)\n",
+            "{}--- a/{}\n+++ b/{}{}\n",
             if color { LIGHT_GREY } else { "" },
             diff.file_path,
             diff.file_path,
+            if color { RESET } else { "" },
         ));
+        out.push_str("(no changes)\n");
         return out;
     }
     out.push_str(&format!(
-        "{}--- a/{}\n+++ b/{}\n",
+        "{}--- a/{}\n+++ b/{}{}\n",
         if color { LIGHT_GREY } else { "" },
         diff.file_path,
         diff.file_path,
+        if color { RESET } else { "" },
     ));
     for hunk in &diff.hunks {
         out.push_str(&format!(
-            "{}@@ -{},{} +{},{} @@\n",
+            "{}@@ -{},{} +{},{} @@{}\n",
             if color { LIGHT_CYAN } else { "" },
             hunk.old_start,
             hunk.lines.iter().filter(|l| l.op != DiffOp::Add).count(),
             hunk.new_start,
             hunk.lines.iter().filter(|l| l.op != DiffOp::Remove).count(),
+            if color { RESET } else { "" },
         ));
         for line in &hunk.lines {
             out.push_str(&unified_line(line, color));
@@ -929,6 +936,76 @@ mod tests {
                 stripped,
             );
         }
+    }
+
+    /// Regression for MED round 11: `render_unified_diff` used to
+    /// open `LIGHT_GREY` (or `LIGHT_CYAN` for the hunk header) at
+    /// the start of each header line but never close it before the
+    /// `\n` that terminates the line. The next line's prefix
+    /// character (` `, `+`, `-`) is then emitted while the
+    /// previous line's color is still active, so the prefix
+    /// inherits the header color. The fix appends `RESET` to the
+    /// end of every header line.
+    ///
+    /// The contract we test: every `--- a/...` / `+++ b/...` /
+    /// `@@ ... @@` line ends with `RESET` (\x1b[0m) when
+    /// `color = true`, so the prefix of the next line is not
+    /// colored by the previous line.
+    #[test]
+    fn test_render_unified_diff_closes_header_color() {
+        let s = render_unified_diff(&sample_diff(), true);
+        // `+++ b/src/foo.rs` is the last header on its line, and
+        // the line that follows begins with a body line (the
+        // hunk header `@@ -... +... @@` or a diff line). The
+        // byte between them must be the RESET escape, not raw
+        // `LIGHT_GREY` left active.
+        let plus_plus_idx = s.find("+++ b/src/foo.rs").unwrap();
+        let after_plus_plus = &s[plus_plus_idx + "+++ b/src/foo.rs".len()..];
+        assert!(
+            after_plus_plus.starts_with("\x1b[0m"),
+            "+++ b/... must be closed by RESET before '\\n', got: {:?}",
+            &after_plus_plus[..after_plus_plus.len().min(20)],
+        );
+
+        // The hunk header `@@ -1,2 +1,2 @@` must also be closed
+        // by RESET before the next diff line.
+        let hunk_idx = s.find("@@ -1,2 +1,2 @@").unwrap();
+        let after_hunk = &s[hunk_idx + "@@ -1,2 +1,2 @@".len()..];
+        assert!(
+            after_hunk.starts_with("\x1b[0m"),
+            "@@ ... @@ must be closed by RESET before '\\n', got: {:?}",
+            &after_hunk[..after_hunk.len().min(20)],
+        );
+    }
+
+    /// The no-changes case must also close the file header color so
+    /// the `(no changes)` text is not painted in `LIGHT_GREY`.
+    #[test]
+    fn test_render_unified_diff_no_changes_closes_color() {
+        let diff = DiffResult {
+            file_path: "src/empty.rs".to_string(),
+            additions: 0,
+            deletions: 0,
+            hunks: vec![],
+        };
+        let s = render_unified_diff(&diff, true);
+        // The `+++ b/src/empty.rs` must be followed by RESET, not
+        // bleed into `(no changes)`.
+        let idx = s.find("+++ b/src/empty.rs").unwrap();
+        let after = &s[idx + "+++ b/src/empty.rs".len()..];
+        assert!(
+            after.starts_with("\x1b[0m"),
+            "+++ b/src/empty.rs must be followed by RESET, got: {:?}",
+            &after[..after.len().min(20)],
+        );
+        // And `(no changes)` must be plain (not wrapped in an
+        // open color escape).
+        let no_changes_idx = s.find("(no changes)").unwrap();
+        assert!(
+            !s[no_changes_idx..].starts_with("\x1b["),
+            "(no changes) must not be colorised, got: {:?}",
+            &s[no_changes_idx..no_changes_idx + 30],
+        );
     }
 }
 

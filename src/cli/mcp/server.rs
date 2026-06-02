@@ -130,7 +130,7 @@ pub fn index_timeout_secs() -> u64 {
 
 /// Runtime-resolved per-tool timeout cap, in seconds.
 ///
-/// Returns `Some(cap)` when `tool_name` is in
+/// Returns `Some(cap)` when `tool_name` matches an entry in
 /// `LONG_RUNNING_TOOL_TIMEOUTS` and `None` otherwise. The
 /// per-tool cap is read from the environment (e.g.
 /// `LEINDEX_INDEX_TIMEOUT_SECS`) for tools whose default would
@@ -138,12 +138,37 @@ pub fn index_timeout_secs() -> u64 {
 /// is what makes the env override actually take effect. The
 /// previous design baked the cap into a const slice, which
 /// meant the env var was dead code.
+///
+/// Name matching is normalised so that all of `leindex.index`,
+/// `leindex-index`, and `leindex_index` resolve to the same
+/// entry: trim, lower-case ASCII, and replace `-` / `.` / ` `
+/// with `_`. The trim dispatcher (`output::trim::trim_llm_payload`)
+/// already accepts both the canonical dotted form and the
+/// snake-case alias, so the timeout resolver must follow suit or
+/// a client that uses an alternative form would silently fall
+/// back to the 30s default and have its long-running tool call
+/// dropped mid-flight.
 pub fn long_running_tool_timeout_secs(tool_name: &str) -> Option<u64> {
-    if LONG_RUNNING_TOOL_TIMEOUTS.contains(&tool_name) {
+    let normalized = normalize_tool_name(tool_name);
+    if LONG_RUNNING_TOOL_TIMEOUTS
+        .iter()
+        .any(|t| normalize_tool_name(t) == normalized)
+    {
         Some(index_timeout_secs())
     } else {
         None
     }
+}
+
+/// Normalise a tool name to the form used by the long-running
+/// timeout table: trim, ASCII lower-case, and `-` / `.` / ` `
+/// replaced with `_`. This is the same shape that
+/// `output::trim::trim_llm_payload` accepts for its alias
+/// dispatch (`leindex_index | index`).
+fn normalize_tool_name(name: &str) -> String {
+    name.trim()
+        .to_ascii_lowercase()
+        .replace(['-', '.', ' '], "_")
 }
 
 /// Default cap on concurrently-tracked HTTP sessions before the oldest
@@ -1820,6 +1845,55 @@ mod tests {
             .get("unregistered-session")
             .expect("lookup by &str must work");
         assert_eq!(stored.key().as_ref(), "unregistered-session");
+    }
+
+    /// Regression for MED round 11: `long_running_tool_timeout_secs`
+    /// used to do an exact match against `LONG_RUNNING_TOOL_TIMEOUTS`.
+    /// The trim dispatcher (`output::trim::trim_llm_payload`)
+    /// already accepts both the canonical dotted form and the
+    /// snake-case alias (`leindex_index | index`), so the timeout
+    /// resolver must follow suit. A client that uses an
+    /// alternative form would otherwise silently fall back to the
+    /// 30s default and have its long-running tool call dropped
+    /// mid-flight.
+    #[test]
+    fn test_long_running_tool_timeout_secs_normalises_tool_name() {
+        // The canonical dotted form must match.
+        let canonical = long_running_tool_timeout_secs("leindex.index");
+        assert!(
+            canonical.is_some(),
+            "canonical form `leindex.index` must be recognised as long-running"
+        );
+        // The hyphenated alias must also match.
+        let hyphenated = long_running_tool_timeout_secs("leindex-index");
+        assert!(
+            hyphenated.is_some(),
+            "hyphenated alias `leindex-index` must be recognised as long-running"
+        );
+        // The snake_case alias (the form used by `trim_llm_payload`)
+        // must also match.
+        let snake = long_running_tool_timeout_secs("leindex_index");
+        assert!(
+            snake.is_some(),
+            "snake_case alias `leindex_index` must be recognised as long-running"
+        );
+        // Whitespace and case must be tolerated.
+        let padded = long_running_tool_timeout_secs("  LeIndex.Index  ");
+        assert!(
+            padded.is_some(),
+            "padded / mixed-case variant must be recognised as long-running"
+        );
+        // Unrelated tools must not match.
+        let search = long_running_tool_timeout_secs("leindex.search");
+        assert!(
+            search.is_none(),
+            "`leindex.search` must NOT be classified as long-running"
+        );
+        let context = long_running_tool_timeout_secs("leindex.context");
+        assert!(
+            context.is_none(),
+            "`leindex.context` must NOT be classified as long-running"
+        );
     }
 }
 
