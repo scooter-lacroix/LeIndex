@@ -166,6 +166,13 @@ jobs:
 
       - name: Download model assets
         shell: bash
+        env:
+          # Authenticated HuggingFace requests get a higher rate
+          # limit per IP. The token is optional — when the
+          # workflow has no `HF_TOKEN` secret, unauthenticated
+          # requests still work, just with a tighter per-minute
+          # cap that the retry policy below absorbs.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -e
           export GH_TOKEN="${{ secrets.GITHUB_TOKEN }}"
@@ -202,30 +209,67 @@ jobs:
               fi
             fi
             # Fall back to HuggingFace download if still missing
+            # HuggingFace serves from a CDN that returns HTTP 429
+            # (Too Many Requests) under bursty CI load. The default
+            # curl behaviour is to fail on the first 429, which
+            # is what caused the 2026-06-02 memory-budget run to
+            # fail. We:
+            #   - retry up to 5 times on ANY error (the
+            #     --retry-all-errors flag), so transient 429s are
+            #     absorbed without manual re-runs
+            #   - wait 15s between retries (--retry-delay) so we
+            #     back off past the rate-limit window
+            #   - cap each curl call at 5 minutes (--retry-max-time)
+            #     so a wedged connection cannot stall the workflow
+            #   - use --retry-connrefused so a CDN edge node that
+            #     drops the TCP connection also triggers a retry
+            #   - pass the token as a Bearer header when present
+            #     (HF raises the per-IP cap for authenticated
+            #     clients; absent the token, unauthenticated
+            #     requests still work, just with tighter limits)
+            HF_AUTH=()
+            if [[ -n "${HF_TOKEN}" ]]; then
+              HF_AUTH=(-H "Authorization: Bearer ${HF_TOKEN}")
+            fi
+            CURL_COMMON=(
+              --fail
+              --location
+              --progress-bar
+              --retry 5
+              --retry-delay 15
+              --retry-all-errors
+              --retry-connrefused
+              --retry-max-time 300
+            )
             if [[ ! -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
               echo "Downloading ONNX model from HuggingFace (${HF_REPO})..."
-              curl --fail --location --progress-bar -o "$MODELS_DIR/qwen3-embed-0.6b.onnx" \
+              curl "${CURL_COMMON[@]}" "${HF_AUTH[@]}" \
+                -o "$MODELS_DIR/qwen3-embed-0.6b.onnx" \
                 "https://huggingface.co/${HF_REPO}/resolve/main/onnx/model.onnx"
             fi
             if [[ ! -f "$MODELS_DIR/tokenizer.json" ]]; then
               echo "Downloading tokenizer from HuggingFace..."
-              curl --fail --location --progress-bar -o "$MODELS_DIR/tokenizer.json" \
+              curl "${CURL_COMMON[@]}" "${HF_AUTH[@]}" \
+                -o "$MODELS_DIR/tokenizer.json" \
                 "https://huggingface.co/${HF_REPO}/resolve/main/tokenizer.json"
             fi
             if [[ ! -f "$MODELS_DIR/config.json" ]]; then
               echo "Downloading config from HuggingFace..."
-              curl --fail --location --progress-bar -o "$MODELS_DIR/config.json" \
+              curl "${CURL_COMMON[@]}" "${HF_AUTH[@]}" \
+                -o "$MODELS_DIR/config.json" \
                 "https://huggingface.co/${HF_REPO}/resolve/main/config.json"
             fi
             if [[ ! -f "$MODELS_DIR/checksums.sha256" ]]; then
               echo "Downloading checksums from HuggingFace..."
-              curl --fail --location --progress-bar -o "$MODELS_DIR/checksums.sha256" \
+              curl "${CURL_COMMON[@]}" "${HF_AUTH[@]}" \
+                -o "$MODELS_DIR/checksums.sha256" \
                 "https://huggingface.co/${HF_REPO}/resolve/main/checksums.sha256" \
                 || true
             fi
             if [[ ! -f "$MODELS_DIR/LICENSE" ]]; then
               echo "Downloading LICENSE from HuggingFace..."
-              curl --fail --location --progress-bar -o "$MODELS_DIR/LICENSE" \
+              curl "${CURL_COMMON[@]}" "${HF_AUTH[@]}" \
+                -o "$MODELS_DIR/LICENSE" \
                 "https://huggingface.co/${HF_REPO}/resolve/main/LICENSE" \
                 || true
             fi

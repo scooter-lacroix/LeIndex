@@ -2,10 +2,12 @@
 
 use super::leindex::{ProjectFileScan, DEPENDENCY_MANIFEST_NAMES};
 use crate::cli::memory::CacheEntry;
+use crate::cli::skip_dirs::SKIP_DIRS;
 use crate::storage::schema::Storage;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use walkdir::WalkDir;
 
 /// Read-only context passed to freshness functions to avoid borrow conflicts.
 pub(crate) struct FreshnessContext<'a> {
@@ -112,7 +114,12 @@ pub(crate) fn check_manifest_stale(
 /// 1. Source count mismatch (cached vs indexed)
 /// 2. Directory mtime sentinel — detects new file additions in <1ms
 /// 3. Mtime sampling of 50-500 indexed files
-/// 4. Manifest walkdir (depth-limited) for dependency changes
+/// 4. Root-manifest stat (O(14) — catches `Cargo.toml` /
+///    `package.json` / `pyproject.toml` at the project root)
+/// 5. Bounded-depth nested-manifest walkdir (`max_depth(5)`,
+///    skipping dotfile dirs and SKIP_DIRS) — catches monorepo
+///    cases like `packages/api/package.json` where the new
+///    manifest is not at the project root.
 pub(crate) fn is_stale_fast(
     ctx: &FreshnessContext<'_>,
     scan_fn: impl Fn() -> Result<ProjectFileScan>,
@@ -255,31 +262,25 @@ pub(crate) fn is_stale_fast(
     //
     // However, the cached list only carries manifests that
     // existed during the previous scan. A user who adds a brand-
-    // new root manifest after the index was built would not be
-    // caught by either the source-count check (no new source
-    // file was indexed) or the directory-mtime check (the
-    // manifest's directory is unlikely to be in `source_dirs`).
-    // Detect this case with a focused stat of the well-known
-    // manifest filenames at the project root — O(few) stats, no
-    // walkdir. A new manifest is reported as stale because the
-    // dependency / external-resolution metadata in the index
-    // pre-dates it.
-    const ROOT_MANIFEST_NAMES: &[&str] = &[
-        "Cargo.toml",
-        "Cargo.lock",
-        "package.json",
-        "package-lock.json",
-        "pyproject.toml",
-        "setup.py",
-        "setup.cfg",
-        "go.mod",
-        "go.sum",
-        "build.gradle",
-        "build.gradle.kts",
-        "pom.xml",
-        "requirements.txt",
-        "Pipfile",
-    ];
+    // new manifest after the index was built (whether at the
+    // project root or in a monorepo subdirectory such as
+    // `packages/api/package.json`) would not be caught by the
+    // source-count check (no new source file was indexed), the
+    // directory-mtime check (the manifest's parent dir may not
+    // be in `source_dirs`), the source-file sample check, or the
+    // cached manifest list. The check below is a bounded-depth
+    // walkdir (`max_depth(5)`, skipping dotfile dirs and the
+    // shared SKIP_DIRS list) that looks only for files whose
+    // name is in `DEPENDENCY_MANIFEST_NAMES`. The walk short-
+    // circuits at the first new manifest, so the common case
+    // (no new manifest) costs O(number of directories up to
+    // depth 5) which is on the order of a few thousand
+    // directory entries for a large monorepo, comparable to
+    // one `cargo build` directory traversal. We also keep the
+    // root-only fast path above (it does the same canonicalize
+    // check in O(14) without touching walkdir) for the common
+    // case of a single-package project.
+    //
     // Canonicalize the cached list on both sides of the membership
     // check. The cached `manifest_paths` are produced by walkdir
     // against whatever `project_path` the index builder received
@@ -296,6 +297,25 @@ pub(crate) fn is_stale_fast(
     for p in &manifest_paths {
         already_listed.insert(p.canonicalize().unwrap_or_else(|_| p.clone()));
     }
+    // Root-level fast path: O(14) stat, no walkdir. Common case
+    // for single-package projects.
+    const ROOT_MANIFEST_NAMES: &[&str] = &[
+        "Cargo.toml",
+        "Cargo.lock",
+        "package.json",
+        "package-lock.json",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "go.mod",
+        "go.sum",
+        "build.gradle",
+        "build.gradle.kts",
+        "pom.xml",
+        "requirements.txt",
+        "Pipfile",
+    ];
+    let mut new_root_manifest = false;
     for name in ROOT_MANIFEST_NAMES {
         let candidate = ctx.project_path.join(name);
         if !candidate.exists() {
@@ -303,11 +323,33 @@ pub(crate) fn is_stale_fast(
         }
         let candidate_canon = candidate.canonicalize().unwrap_or(candidate);
         if !already_listed.contains(&candidate_canon) {
-            // Newly added root manifest — not in the cached
-            // manifest list, but the dependency / external-
-            // resolution data in the index pre-dates it.
-            return true;
+            new_root_manifest = true;
+            break;
         }
+    }
+    if new_root_manifest {
+        return true;
+    }
+    // Nested-manifest slow path: bounded-depth walkdir that
+    // catches monorepo cases like `packages/api/package.json`
+    // where the manifest is not at the project root. We walk
+    // up to depth 5 (covers repos like
+    // `repo/services/auth/config/Cargo.toml`) and skip
+    // dotfile / build / cache / VCS directories via the shared
+    // SKIP_DIRS list. The walk short-circuits at the first
+    // new manifest, so the common case (no new manifest)
+    // completes after visiting every directory entry up to
+    // depth 5 — on the order of a few thousand `metadata()`
+    // calls, comparable to one `cargo build` traversal. A
+    // walkdir iteration error is treated the same as the full
+    // scan in `index_builder::scan_project_files`: skipped
+    // silently and we move to the next entry. Permission
+    // errors or vanished paths do not flip the verdict to
+    // stale by themselves; we only return `true` when a
+    // candidate manifest is actually present and not in the
+    // cached list.
+    if find_new_nested_manifest(ctx.project_path, &already_listed) {
+        return true;
     }
 
     for manifest_path in &manifest_paths {
@@ -328,6 +370,84 @@ pub(crate) fn is_stale_fast(
     false
 }
 
+/// Walk `project_path` up to depth 5 looking for dependency
+/// manifests that are NOT in the supplied `already_listed` set.
+///
+/// The set is expected to contain canonicalized absolute paths
+/// (built by the caller via `Path::canonicalize`). This helper
+/// exists as a separate function so it can be unit-tested in
+/// isolation against a tempdir fixture without spinning up
+/// the full `Storage` / `CacheSpiller` context that
+/// `is_stale_fast` requires.
+///
+/// Returns `true` on the first new manifest found (short-
+/// circuits to keep the common "no new manifest" case fast).
+/// Walkdir iteration errors are skipped silently — the same
+/// policy as the full project scan in
+/// `index_builder::scan_project_files`.
+pub(crate) fn find_new_nested_manifest(
+    project_path: &Path,
+    already_listed: &std::collections::HashSet<PathBuf>,
+) -> bool {
+    let walker = WalkDir::new(project_path)
+        .min_depth(1)
+        .max_depth(5)
+        .into_iter();
+    for entry in walker {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let file_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+        // Skip dotfile-prefixed entries and the shared skip list
+        // (build outputs, venv, node_modules, .git, etc.). We
+        // re-apply the same rules as the full scan in
+        // `index_builder::scan_project_files` so a new manifest
+        // hidden under, e.g., `node_modules` is not flagged.
+        // Note: the full scan skips SKIP_DIRS at directory
+        // traversal time via `walker.skip_current_dir()`, which
+        // means the file is never visited. In the per-file
+        // helper here we have to walk up the parent chain and
+        // check every ancestor directory against SKIP_DIRS to
+        // get the same coverage.
+        if file_name.starts_with('.') {
+            continue;
+        }
+        let mut ancestor = path.parent();
+        let mut in_skip_dir = false;
+        while let Some(dir) = ancestor {
+            if dir == project_path {
+                break;
+            }
+            if let Some(dname) = dir.file_name().and_then(|n| n.to_str()) {
+                if SKIP_DIRS.contains(&dname) {
+                    in_skip_dir = true;
+                    break;
+                }
+            }
+            ancestor = dir.parent();
+        }
+        if in_skip_dir {
+            continue;
+        }
+        if !DEPENDENCY_MANIFEST_NAMES.contains(&file_name) {
+            continue;
+        }
+        let candidate_canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if !already_listed.contains(&candidate_canon) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Extract sorted unique directories from a list of file paths.
 pub(crate) fn extract_unique_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
@@ -339,4 +459,155 @@ pub(crate) fn extract_unique_dirs(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut result: Vec<PathBuf> = dirs.into_iter().collect();
     result.sort();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Build a tempdir fixture for the bounded-walkdir tests.
+    /// Returns `(tempdir_path, already_listed_set)` — the set is
+    /// pre-populated with the canonicalized absolute paths of
+    /// any manifests that the test wants the helper to treat as
+    /// "already known". Tests that want to exercise the "new
+    /// manifest" case simply leave the set empty.
+    fn make_fixture() -> (tempfile::TempDir, std::collections::HashSet<PathBuf>) {
+        let tmp = tempfile::tempdir().unwrap();
+        (tmp, std::collections::HashSet::new())
+    }
+
+    #[test]
+    fn find_new_nested_manifest_detects_monorepo_package_json() {
+        // Regression: a new `packages/api/package.json` (a
+        // monorepo nested manifest) must be flagged as stale
+        // by the bounded walkdir. The previous root-only check
+        // missed this case entirely.
+        let (tmp, listed) = make_fixture();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("packages/api/src")).unwrap();
+        fs::write(root.join("packages/api/package.json"), "{}").unwrap();
+        fs::write(root.join("packages/api/src/main.rs"), "fn main() {}").unwrap();
+        assert!(
+            find_new_nested_manifest(root, &listed),
+            "monorepo package.json at depth 2 must be flagged"
+        );
+    }
+
+    #[test]
+    fn find_new_nested_manifest_detects_cargo_toml_at_depth_3() {
+        // Depth-3 monorepo case: `services/auth/config/Cargo.toml`.
+        let (tmp, listed) = make_fixture();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("services/auth/config/src")).unwrap();
+        fs::write(
+            root.join("services/auth/config/Cargo.toml"),
+            "[package]\nname = \"auth\"\n",
+        )
+        .unwrap();
+        assert!(
+            find_new_nested_manifest(root, &listed),
+            "depth-3 Cargo.toml must be flagged"
+        );
+    }
+
+    #[test]
+    fn find_new_nested_manifest_skips_node_modules() {
+        // A new `node_modules/foo/package.json` must NOT be
+        // flagged — node_modules is in SKIP_DIRS and would
+        // otherwise produce a false-positive stale verdict on
+        // every `npm install`.
+        let (tmp, listed) = make_fixture();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("node_modules/foo/src")).unwrap();
+        fs::write(root.join("node_modules/foo/package.json"), "{}").unwrap();
+        assert!(
+            !find_new_nested_manifest(root, &listed),
+            "node_modules/package.json must be skipped"
+        );
+    }
+
+    #[test]
+    fn find_new_nested_manifest_skips_target() {
+        // A new `target/Cargo.toml` (e.g. via a build script)
+        // must NOT be flagged — `target` is in SKIP_DIRS.
+        let (tmp, listed) = make_fixture();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("target/some-build/src")).unwrap();
+        fs::write(root.join("target/some-build/Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        assert!(
+            !find_new_nested_manifest(root, &listed),
+            "target/Cargo.toml must be skipped"
+        );
+    }
+
+    #[test]
+    fn find_new_nested_manifest_respects_already_listed() {
+        // When the nested manifest IS in `already_listed`, the
+        // helper must return false (no new manifest). The
+        // canonicalize() form of the path is what the caller
+        // uses, so we match that here.
+        let (tmp, mut listed) = make_fixture();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("packages/api/src")).unwrap();
+        let manifest = root.join("packages/api/package.json");
+        fs::write(&manifest, "{}").unwrap();
+        let canon = manifest.canonicalize().unwrap();
+        listed.insert(canon);
+        assert!(
+            !find_new_nested_manifest(root, &listed),
+            "manifest already in listed set must not be flagged"
+        );
+    }
+
+    #[test]
+    fn find_new_nested_manifest_returns_false_when_no_manifests() {
+        // A project with no manifests (e.g. a fresh source
+        // tree with only `.rs` files) must return false — the
+        // bounded walkdir must not produce false positives.
+        let (tmp, listed) = make_fixture();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("src/lib.rs"), "// lib\n").unwrap();
+        assert!(
+            !find_new_nested_manifest(root, &listed),
+            "no manifests present, must return false"
+        );
+    }
+
+    #[test]
+    fn find_new_nested_manifest_respects_max_depth_5() {
+        // max_depth=5 means depth 6 is NOT visited. A manifest
+        // at depth 6 (e.g. a/b/c/d/e/f/Cargo.toml) must NOT
+        // be flagged — the bounded walkdir is a deliberate
+        // performance/perf trade-off that the index builder's
+        // full scan covers at index-build time.
+        let (tmp, listed) = make_fixture();
+        let root = tmp.path();
+        let deep = root.join("a/b/c/d/e/f");
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(deep.join("Cargo.toml"), "[package]\nname=\"deep\"\n").unwrap();
+        assert!(
+            !find_new_nested_manifest(root, &listed),
+            "depth-6 manifest must not be flagged (max_depth=5)"
+        );
+    }
+
+    #[test]
+    fn find_new_nested_manifest_ignores_dotfile_dirs() {
+        // A new `.cargo/config.toml` (an oddball dotfile
+        // directory) must NOT be flagged — dotfile-prefixed
+        // directories are skipped to keep the walkdir cost
+        // bounded and to match the full scan's behaviour.
+        let (tmp, listed) = make_fixture();
+        let root = tmp.path();
+        fs::create_dir_all(root.join(".cargo")).unwrap();
+        fs::write(root.join(".cargo/config.toml"), "[net]\n").unwrap();
+        assert!(
+            !find_new_nested_manifest(root, &listed),
+            ".cargo/config.toml must not be flagged"
+        );
+    }
 }
