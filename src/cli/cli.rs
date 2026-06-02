@@ -1025,20 +1025,44 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
 
     info!("Starting MCP server on {}", addr);
 
-    // Create and run the MCP server
+    // Create the MCP server and bind the listener BEFORE printing
+    // the startup banner. The previous flow printed
+    // `Server starting on http://{addr}` and then bound inside
+    // `McpServer::run`; if the preferred port was occupied the
+    // bind fell back to a different port, the process kept
+    // running, but the advertised URL still pointed at the
+    // occupied port. External clients / service managers that
+    // parsed the printed URL would then connect to the wrong
+    // process (or to a process that no longer owns the port).
+    // Doing the bind here lets us print the actual bound address.
     let server = McpServer::with_address(addr).context("Failed to create MCP server")?;
+    let listener =
+        crate::cli::mcp::server::bind_with_fallback(addr).await.context("Bind failed")?;
+    let bound_addr = listener
+        .local_addr()
+        .context("Failed to read bound address")?;
+    if bound_addr != addr {
+        eprintln!(
+            "\nWARNING: preferred port {} was unavailable; bound to fallback {}\n",
+            addr.port(),
+            bound_addr.port()
+        );
+    }
 
     println!("\nLeIndex MCP Server\n");
-    println!("Server starting on http://{}\n", addr);
+    println!("Server starting on http://{}\n", bound_addr);
     println!("Available endpoints:");
-    println!("  POST /mcp           - JSON-RPC 2.0 endpoint");
-    println!("  GET  /mcp/tools/list - List available tools");
-    println!("  GET  /health         - Health check");
+    println!("  POST /mcp             - JSON-RPC 2.0 endpoint");
+    println!("  GET  /mcp/tools/list  - List available tools");
+    println!("  GET  /health          - Health check");
     println!("\nConfiguration:");
-    println!("  Port: {} (override with LEINDEX_PORT env var; auto-falls back to next consecutive ports if taken)", port);
+    println!(
+        "  Port: {} (override with LEINDEX_PORT env var; auto-falls back to next consecutive ports if taken)",
+        bound_addr.port()
+    );
     println!("\nPress Ctrl+C to stop the server\n");
 
-    server.run().await.context("Server error")?;
+    server.serve(listener).await.context("Server error")?;
 
     Ok(())
 }

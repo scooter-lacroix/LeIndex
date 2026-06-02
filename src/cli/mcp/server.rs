@@ -301,6 +301,29 @@ impl McpServer {
     /// ```
     pub async fn run(self) -> anyhow::Result<()> {
         let bind_address = self.config.bind_address;
+        // Auto-bind-fallback: if the default port is taken, try the
+        // next consecutive ports before giving up. Eliminates the
+        // most common "MCP fails to connect" failure mode where
+        // another process holds the port and the user has no idea
+        // why the server won't start.
+        let listener = bind_with_fallback(bind_address).await?;
+        if listener.local_addr()? != bind_address {
+            warn!(
+                "Default port {} was unavailable; bound to fallback {}",
+                bind_address.port(),
+                listener.local_addr()?.port()
+            );
+        }
+        self.serve(listener).await
+    }
+
+    /// Serve on a pre-bound listener. Use this from `cmd_serve_impl`
+    /// when the caller needs to know the actual bound address
+    /// (which may differ from the preferred one when
+    /// `bind_with_fallback` walks past the preferred port) so it
+    /// can print the real URL before announcing readiness.
+    pub async fn serve(self, listener: tokio::net::TcpListener) -> anyhow::Result<()> {
+        let bind_address = self.config.bind_address;
         let router = Self::router();
 
         // Spawn background task to clean up stale sessions periodically.
@@ -316,7 +339,7 @@ impl McpServer {
                 interval.tick().await;
                 let removed = cleanup_server.cleanup_stale_sessions(SESSION_MAX_IDLE);
                 if removed > 0 {
-                    debug!("Cleaned up {} stale session(s)", removed);
+                    debug!("Cleaned {} stale session(s)", removed);
                 }
             }
         });
@@ -330,18 +353,6 @@ impl McpServer {
 
         info!("Starting MCP server on {}", bind_address);
 
-        // Auto-bind-fallback: if the default port is taken, try the next
-        // consecutive ports before giving up. Eliminates the most common
-        // "MCP fails to connect" failure mode where another process holds
-        // the port and the user has no idea why the server won't start.
-        let listener = bind_with_fallback(bind_address).await?;
-        if listener.local_addr()? != bind_address {
-            warn!(
-                "Default port {} was unavailable; bound to fallback {}",
-                bind_address.port(),
-                listener.local_addr()?.port()
-            );
-        }
         axum::serve(listener, router.into_make_service())
             .await
             .context("Server error")?;
@@ -364,7 +375,7 @@ impl McpServer {
 /// `BIND_FALLBACK_PORT_RANGE` ports, then accept whatever ephemeral port
 /// the OS hands out. This makes "another process took my port" a
 /// recoverable warning instead of a fatal startup error.
-async fn bind_with_fallback(
+pub(crate) async fn bind_with_fallback(
     preferred: SocketAddr,
 ) -> anyhow::Result<tokio::net::TcpListener> {
     let mut last_err: Option<std::io::Error> = None;

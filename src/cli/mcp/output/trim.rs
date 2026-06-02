@@ -108,7 +108,18 @@ pub(crate) fn trim_search(data: &Value) -> Value {
                 .unwrap_or(Value::Null);
             serde_json::json!({
                 "file_path": r.get("file_path").cloned().unwrap_or(Value::Null),
-                "symbol": r.get("symbol_name").cloned().unwrap_or(Value::Null),
+                // `render_search` in `render.rs` already supports
+                // either `symbol` or `symbol_name` on the source
+                // record; the trim path previously only looked at
+                // `symbol_name`, so a result that arrived with
+                // `symbol` populated and `symbol_name` absent lost
+                // its name to `Null`. Walk both keys so the LLM-
+                // visible payload always carries the symbol.
+                "symbol": r
+                    .get("symbol_name")
+                    .or_else(|| r.get("symbol"))
+                    .cloned()
+                    .unwrap_or(Value::Null),
                 "symbol_type": r.get("symbol_type").cloned().unwrap_or(Value::Null),
                 "score": score,
                 "snippet": snippet,
@@ -715,6 +726,52 @@ mod tests {
         assert!(r.get("complexity").is_none() || r["complexity"].is_null());
         assert!(r.get("caller_count").is_none() || r["caller_count"].is_null());
         assert!(r.get("language").is_none() || r["language"].is_null());
+    }
+
+    #[test]
+    fn test_trim_search_falls_back_to_symbol_key() {
+        // Regression: the trim path previously only looked at
+        // `symbol_name`. If a search result only had `symbol`
+        // populated, the trim dropped it to `Null` and
+        // `render_search` (which reads `symbol` first) got no
+        // name. The trim now walks both keys.
+        let input = v(r#"{
+            "results": [
+                {
+                    "rank": 1,
+                    "file_path": "/p/src/foo.rs",
+                    "symbol": "main",
+                    "symbol_type": "function",
+                    "context": "fn main() { return 0; }"
+                }
+            ]
+        }"#);
+        let t = trim_search(&input);
+        let r = &t["results"][0];
+        assert_eq!(r["symbol"], "main");
+        assert_eq!(r["file_path"], "/p/src/foo.rs");
+    }
+
+    #[test]
+    fn test_trim_search_prefers_symbol_name_when_both_present() {
+        // When both `symbol` and `symbol_name` are populated,
+        // `symbol_name` wins because it is the canonical
+        // `SearchResult` field and we want trim output to be
+        // stable regardless of which key the caller used.
+        let input = v(r#"{
+            "results": [
+                {
+                    "file_path": "/p/src/foo.rs",
+                    "symbol": "alias",
+                    "symbol_name": "canonical",
+                    "symbol_type": "function",
+                    "context": "x"
+                }
+            ]
+        }"#);
+        let t = trim_search(&input);
+        let r = &t["results"][0];
+        assert_eq!(r["symbol"], "canonical");
     }
 
     #[test]

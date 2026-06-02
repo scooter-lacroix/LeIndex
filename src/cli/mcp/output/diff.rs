@@ -276,8 +276,29 @@ pub fn render_split_diff(diff: &DiffResult, color: bool, width: Option<usize>) -
     ));
 
     let gutter = 4usize; // 4-digit line number
+    // The split-view format string in `split_row` emits the
+    // following per row, excluding the gutter and the two
+    // content halves:
+    //   1 leading space
+    //   1 space between the left gutter and the left marker
+    //   1 space between the left marker and the left content
+    //   3 chars for the ` │ ` centre separator
+    //   1 space between the right gutter and the right marker
+    //   1 space between the right marker and the right content
+    //   2 trailing reset escapes when colour is enabled (each
+    //     contributes an ANSI CSI sequence; when colour is off
+    //     these are empty strings and contribute 0 to the
+    //     visible width).
+    // The empirical constant that keeps the rendered row
+    // inside the requested terminal width is 10 (8 separator
+    // chars + 2 to absorb ANSI colour escapes that still
+    // contribute to string length in some callers). Using
+    // `5` here was too small and could push the rendered row
+    // past the terminal width on an 80-column terminal,
+    // causing awkward wrapping. The `gutter * 2 + 10` formula
+    // is what the regression test below asserts against.
     let half = match width {
-        Some(w) => w.saturating_sub(gutter * 2 + 5) / 2,
+        Some(w) => w.saturating_sub(gutter * 2 + 10) / 2,
         None => 60,
     };
     // If the caller told us the width and the resulting per-side
@@ -862,4 +883,73 @@ mod tests {
         let s = render_diff_value(&data, false);
         assert_eq!(s, "@@ -1 +1 @@\n-old\n+new\n");
     }
+
+    /// `render_split_diff` must keep the rendered row width inside
+    /// the terminal width on an 80-column terminal. The split-view
+    /// format string emits constant characters per row that are
+    /// not part of the gutter or the two content halves. A
+    /// previous version subtracted only 5, which let the rendered
+    /// row exceed 80 chars.
+    #[test]
+    fn test_render_split_diff_respects_80_col_width() {
+        let diff = DiffResult {
+            file_path: "src/lib.rs".to_string(),
+            additions: 1,
+            deletions: 1,
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                new_start: 1,
+                lines: vec![
+                    DiffLine {
+                        op: DiffOp::Remove,
+                        old_line: Some(1),
+                        new_line: None,
+                        // 60 chars on the remove side.
+                        content: "x".repeat(60),
+                    },
+                    DiffLine {
+                        op: DiffOp::Add,
+                        old_line: None,
+                        new_line: Some(1),
+                        content: "y".repeat(60),
+                    },
+                ],
+            }],
+        };
+        let s = render_split_diff(&diff, false, Some(80));
+        // Every rendered line must fit in 80 columns.
+        for (i, line) in s.lines().enumerate() {
+            let stripped = strip_ansi_for_test(line);
+            let visible = stripped.chars().count();
+            assert!(
+                visible <= 80,
+                "line {} exceeds 80 cols ({} chars): {:?}",
+                i,
+                visible,
+                stripped,
+            );
+        }
+    }
+}
+
+/// Strip CSI (SGR) escapes for test assertions on visible text.
+#[cfg(test)]
+fn strip_ansi_for_test(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut iter = s.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c == '\x1b' {
+            if iter.peek() == Some(&'[') {
+                iter.next();
+                for c2 in iter.by_ref() {
+                    if c2.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
 }

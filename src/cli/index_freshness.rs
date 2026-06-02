@@ -246,12 +246,53 @@ pub(crate) fn is_stale_fast(
         Vec::new()
     };
 
-    // The list-based check below covers every manifest already discovered
-    // by the project scan (Cargo.toml, package.json, pyproject.toml, etc.).
-    // The historical walkdir block that re-walked the project tree here
-    // was both redundant with this check AND responsible for adding
-    // hundreds of stat() calls on every tool call when the stale cache
-    // TTL expired. Removed.
+    // The list-based check below covers every manifest already
+    // discovered by the project scan (Cargo.toml, package.json,
+    // pyproject.toml, etc.). The historical walkdir block that
+    // re-walked the project tree here was both redundant with this
+    // check AND responsible for adding hundreds of stat() calls
+    // on every tool call when the stale cache TTL expired.
+    //
+    // However, the cached list only carries manifests that
+    // existed during the previous scan. A user who adds a brand-
+    // new root manifest after the index was built would not be
+    // caught by either the source-count check (no new source
+    // file was indexed) or the directory-mtime check (the
+    // manifest's directory is unlikely to be in `source_dirs`).
+    // Detect this case with a focused stat of the well-known
+    // manifest filenames at the project root — O(few) stats, no
+    // walkdir. A new manifest is reported as stale because the
+    // dependency / external-resolution metadata in the index
+    // pre-dates it.
+    const ROOT_MANIFEST_NAMES: &[&str] = &[
+        "Cargo.toml",
+        "Cargo.lock",
+        "package.json",
+        "package-lock.json",
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "go.mod",
+        "go.sum",
+        "build.gradle",
+        "build.gradle.kts",
+        "pom.xml",
+        "requirements.txt",
+        "Pipfile",
+    ];
+    let already_listed: std::collections::HashSet<&std::path::Path> = manifest_paths
+        .iter()
+        .map(|p| p.as_path())
+        .collect();
+    for name in ROOT_MANIFEST_NAMES {
+        let candidate = ctx.project_path.join(name);
+        if !already_listed.contains(candidate.as_path()) && candidate.exists() {
+            // Newly added root manifest — not in the cached
+            // manifest list, but the dependency / external-
+            // resolution data in the index pre-dates it.
+            return true;
+        }
+    }
 
     for manifest_path in &manifest_paths {
         match std::fs::metadata(manifest_path) {
