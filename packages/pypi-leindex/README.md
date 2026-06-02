@@ -537,6 +537,7 @@ leindex dashboard                     # Launch dashboard UI
 | `LeIndex [Impact Analysis]` | Blast radius analysis |
 | `LeIndex [Index]` | Index a project |
 | `LeIndex [Phase Analysis]` | 5-phase additive analysis |
+| `Phase Analysis` | Compatibility alias for `LeIndex [Phase Analysis]` (same handler, no-bracket title for legacy clients) |
 | `LeIndex [Project Map]` | Annotated project structure |
 | `LeIndex [Read File]` | PRIMARY file reader (replaces `Read`) |
 | `LeIndex [Read Symbol]` | PRIMARY symbol reader (replaces `Read` for symbols) |
@@ -549,8 +550,10 @@ leindex dashboard                     # Launch dashboard UI
 MCP tool names use the same identifiers internally (`leindex-search`,
 `leindex-edit-preview`, etc.) and via HTTP use the hyphenated form
 (`leindex-edit-preview`). Use the display form above as the user-facing
-name; use the underscore form for `leindex tools help` and
-`leindex tools run` on the CLI bridge.
+name; the internal hyphenated name is the same in both forms (e.g.
+`leindex-edit-preview` and `leindex-edit-preview` are identical), and
+the underscore form is only used by the CLI bridge (`leindex tools
+help`, `leindex tools run`).
 
 ### Output formatting
 

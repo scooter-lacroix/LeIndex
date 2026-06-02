@@ -122,15 +122,19 @@ fn truncate_with_ellipsis(input: &str, max: usize, ellipsis: &str) -> String {
     // `cut` is then the byte offset of the (max+1)-th character
     // (i.e. the prefix we keep ends right before that boundary).
     let mut cut: Option<usize> = None;
-    for (char_count, (i, _ch)) in input.char_indices().enumerate() {
+    for (char_count, (i, ch)) in input.char_indices().enumerate() {
         if char_count == max {
             cut = Some(i);
             break;
         }
         // Advance `cut` to just past this character so if the loop
         // exits naturally (we ran out of input) we still know the
-        // total byte length.
-        cut = Some(i + input[i..].chars().next().unwrap().len_utf8());
+        // total byte length. `ch` is the character at byte offset
+        // `i` so `ch.len_utf8()` is the exact byte length of that
+        // one character — the previous `input[i..].chars().next()
+        // .unwrap().len_utf8()` recomputed the same value through
+        // a fresh UTF-8 decode.
+        cut = Some(i + ch.len_utf8());
     }
     match cut {
         Some(end) if end < input.len() => {

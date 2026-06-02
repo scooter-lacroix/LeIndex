@@ -124,16 +124,28 @@ pub(crate) fn trim_search(data: &Value) -> Value {
 }
 
 fn trim_context(data: &Value) -> Value {
-    serde_json::json!({
-        "node_id": data.get("node_id"),
-        "symbol": data.get("symbol"),
-        "file_path": data.get("file_path"),
-        "line": data.get("line"),
-        "symbol_type": data.get("symbol_type"),
-        "content": data.get("content"),
-        "callers": data.get("callers"),
-        "callees": data.get("callees"),
-    })
+    // `leindex.context` returns an `AnalysisResult` (see
+    // `src/cli/leindex/types.rs::AnalysisResult`) with the shape:
+    //   { query, results, context, tokens_used, processing_time_ms }
+    // The handler populates these directly from `expand_node_context`;
+    // the LLM-visible payload must keep the same fields so the model
+    // can see the expanded PDG context (`context`), the timing
+    // metadata, and the search-result anchor (`results`). Dropping or
+    // substituting fields here would make the tool return almost
+    // entirely nulls.
+    let mut out = serde_json::Map::new();
+    for k in [
+        "query",
+        "results",
+        "context",
+        "tokens_used",
+        "processing_time_ms",
+    ] {
+        if let Some(v) = data.get(k) {
+            out.insert(k.to_string(), v.clone());
+        }
+    }
+    Value::Object(out)
 }
 
 fn trim_diagnostics(data: &Value) -> Value {
@@ -172,15 +184,32 @@ fn trim_impact(data: &Value) -> Value {
 }
 
 fn trim_symbol_lookup(data: &Value) -> Value {
-    serde_json::json!({
-        "symbol": data.get("symbol"),
-        "file_path": data.get("file_path"),
-        "line": data.get("line"),
-        "symbol_type": data.get("symbol_type"),
-        "signature": data.get("signature"),
-        "callers": data.get("callers"),
-        "callees": data.get("callees"),
-    })
+    // `leindex.symbol-lookup` returns the result built by
+    // `SymbolLookupHandler::lookup_single_symbol` with fields:
+    //   symbol, type, file, byte_range, complexity, language,
+    //   callers, callees, impact_radius, and optionally source
+    // (when `include_source` is set). The trim must use the same
+    // field names so the LLM-visible payload actually carries the
+    // file path, node type, source excerpt, and impact radius —
+    // not aliases that resolve to `null` from the raw handler.
+    let mut out = serde_json::Map::new();
+    for k in [
+        "symbol",
+        "type",
+        "file",
+        "byte_range",
+        "complexity",
+        "language",
+        "callers",
+        "callees",
+        "impact_radius",
+        "source",
+    ] {
+        if let Some(v) = data.get(k) {
+            out.insert(k.to_string(), v.clone());
+        }
+    }
+    Value::Object(out)
 }
 
 fn trim_file_summary(data: &Value) -> Value {
@@ -291,11 +320,18 @@ fn trim_read_symbol(data: &Value) -> Value {
     // boundaries directly from the source `&str` — slicing at a fixed
     // byte offset can panic when the offset lands inside a multi-byte
     // UTF-8 sequence (e.g. emoji, identifiers in non-ASCII source).
+    //
+    // `char_indices().nth(2000)` is a single pass: it walks the UTF-8
+    // string once and stops at the (n+1)-th character, returning the
+    // byte offset of the truncation boundary. We then append the
+    // standard `...` ellipsis so the LLM sees a 2003-char preview.
+    // The previous `chars().count() > 2000` + `truncate_chars(...)`
+    // path scanned the entire string twice on every call, which
+    // dominated trim cost for very large sources.
     if let Some(src) = data.get("source").and_then(|v| v.as_str()) {
-        let (head, truncated) = if src.chars().count() > 2000 {
-            (truncate_chars(src, 2000), true)
-        } else {
-            (src.to_string(), false)
+        let (head, truncated) = match src.char_indices().nth(2000) {
+            Some((idx, _)) => (format!("{}...", &src[..idx]), true),
+            None => (src.to_string(), false),
         };
         out.insert("source".to_string(), Value::String(head));
         out.insert("source_truncated".to_string(), Value::Bool(truncated));
@@ -570,6 +606,76 @@ mod tests {
 
     fn v(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn test_trim_context_keeps_analysis_result() {
+        // Regression: `leindex.context` returns an `AnalysisResult`
+        // with the exact field set { query, results, context,
+        // tokens_used, processing_time_ms }. The trim must keep all
+        // five so the LLM can see the expanded PDG context and the
+        // timing metadata.
+        let input = v(r#"{
+            "query": "Context for node main",
+            "results": [
+                {"rank": 1, "file_path": "src/main.rs", "symbol_name": "main", "language": "rust"}
+            ],
+            "context": "fn main() { ... }",
+            "tokens_used": 120,
+            "processing_time_ms": 5
+        }"#);
+        let t = trim_context(&input);
+        assert_eq!(t["query"], "Context for node main");
+        assert!(t["results"].is_array());
+        assert_eq!(t["context"], "fn main() { ... }");
+        assert_eq!(t["tokens_used"], 120);
+        assert_eq!(t["processing_time_ms"], 5);
+        // The stale-index `_warning` is preserved by `merge_meta`
+        // after the trim, not by the trim function itself.
+        let merged = trim_llm_payload("leindex.context", &v(r#"{
+            "query": "q", "results": [], "context": "c",
+            "tokens_used": 0, "processing_time_ms": 0,
+            "_warning": "stale"
+        }"#));
+        assert_eq!(merged["_warning"], "stale");
+    }
+
+    #[test]
+    fn test_trim_symbol_lookup_keeps_actual_fields() {
+        // Regression: `leindex.symbol-lookup` returns the shape
+        // built by `lookup_single_symbol`: { symbol, type, file,
+        // byte_range, complexity, language, callers, callees,
+        // impact_radius, source }. Keep the same names — the
+        // previous trim used `file_path` / `line` / `symbol_type`
+        // / `signature` which do not exist on the raw output and
+        // resolved to `null`.
+        let input = v(r#"{
+            "symbol": "main",
+            "type": "function",
+            "file": "src/main.rs",
+            "byte_range": [0, 100],
+            "complexity": 3,
+            "language": "rust",
+            "callers": [{"name": "test_main"}],
+            "callees": [],
+            "impact_radius": {"affected_symbols": 5, "affected_files": 2},
+            "source": "fn main() { ... }"
+        }"#);
+        let t = trim_symbol_lookup(&input);
+        assert_eq!(t["symbol"], "main");
+        assert_eq!(t["type"], "function");
+        assert_eq!(t["file"], "src/main.rs");
+        assert_eq!(t["byte_range"][0], 0);
+        assert_eq!(t["complexity"], 3);
+        assert_eq!(t["language"], "rust");
+        assert!(t["callers"].is_array());
+        assert!(t["callees"].is_array());
+        assert_eq!(t["impact_radius"]["affected_symbols"], 5);
+        assert_eq!(t["source"], "fn main() { ... }");
+        // The pre-fix trim used `file_path` / `signature` — those
+        // must NOT appear since the handler does not emit them.
+        assert!(t.get("file_path").is_none());
+        assert!(t.get("signature").is_none());
     }
 
     #[test]

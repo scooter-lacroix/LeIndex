@@ -272,6 +272,7 @@ for the complete table):
 | `LeIndex [Impact Analysis]` | `leindex-impact-analysis` | Blast radius analysis |
 | `LeIndex [Index]` | `leindex-index` | Index a project |
 | `LeIndex [Phase Analysis]` | `leindex-phase-analysis` | 5-phase additive analysis |
+| `Phase Analysis` | `phase-analysis` | Compatibility alias for `LeIndex [Phase Analysis]` (same handler, no-bracket title for legacy clients) |
 | `LeIndex [Project Map]` | `leindex-project-map` | Annotated project structure |
 | `LeIndex [Read File]` | `leindex-read-file` | PRIMARY file reader (replaces `Read`) |
 | `LeIndex [Read Symbol]` | `leindex-read-symbol` | PRIMARY symbol reader (replaces `Read` for symbols) |

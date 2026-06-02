@@ -46,6 +46,21 @@ enum LockAcquire<'a> {
     Skipped,
 }
 
+/// Outcome of the `spawn_blocking` reindex body. Reported back to the
+/// outer task so the watcher loop can distinguish a successful
+/// reindex (no state change needed) from a lock-skipped batch (mark
+/// `dirty` so the next debounce retries) and from a reindex that
+/// panicked or was wrapped to `Ok(())` for any reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReindexOutcome {
+    /// Reindex ran to completion (success, error, or caught panic —
+    /// all of which still drop the lock on `ProjectWriteGuard`'s
+    /// `Drop`).
+    Completed,
+    /// Lock was busy for the full budget — reindex never ran.
+    Skipped,
+}
+
 impl IndexWatcher {
     /// Start watching a project path and trigger incremental reindex on changes.
     pub fn start(project_path: PathBuf, handle: ProjectHandle) -> anyhow::Result<Self> {
@@ -98,14 +113,24 @@ impl IndexWatcher {
                             let budget = Duration::from_secs(REINDEX_BUDGET_SECS);
                             let backoff = Duration::from_millis(RETRY_BACKOFF_MS);
                             let reindex_budget = budget;
-                            let blocking = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                            let blocking = tokio::task::spawn_blocking(move || -> ReindexOutcome {
                                 let mut idx = match acquire_with_budget(
                                     &handle_clone,
                                     budget,
                                     backoff,
                                 ) {
                                     LockAcquire::Acquired(g) => g,
-                                    LockAcquire::Skipped => return Ok(()),
+                                    // The lock was busy for the full
+                                    // budget. The caller must mark
+                                    // `dirty` again so the next
+                                    // debounce tick retries — treating
+                                    // this as success would silently
+                                    // drop the pending changes and
+                                    // leave the index permanently
+                                    // stale.
+                                    LockAcquire::Skipped => {
+                                        return ReindexOutcome::Skipped;
+                                    }
                                 };
                                 // Panic-safety wrapper: a panic inside
                                 // the reindex still releases the lock
@@ -117,36 +142,68 @@ impl IndexWatcher {
                                     }),
                                 );
                                 match reindex_result {
-                                    Ok(Ok(_)) => Ok(()),
+                                    Ok(Ok(_)) => ReindexOutcome::Completed,
                                     Ok(Err(e)) => {
                                         warn!("Auto-reindex failed: {}", e);
-                                        Ok(())
+                                        ReindexOutcome::Completed
                                     }
                                     Err(_) => {
                                         warn!("Auto-reindex panicked; lock will release on drop");
-                                        Ok(())
+                                        ReindexOutcome::Completed
                                     }
                                 }
                             });
                             match tokio::time::timeout(reindex_budget, blocking).await {
-                                Ok(_) => {}
-                                Err(_) => {
-                                    // Reindex exceeded the budget. The
-                                    // underlying `spawn_blocking` task
-                                    // continues until the reindex body
-                                    // returns (the lock still drops on
-                                    // the `ProjectWriteGuard`'s `Drop`),
-                                    // but the outer task no longer
-                                    // awaits it — so a slow reindex
-                                    // cannot stall the watcher loop.
-                                    // Preserve `dirty` so the next
-                                    // debounce tick retries instead of
-                                    // silently dropping the changes.
+                                Ok(Ok(ReindexOutcome::Completed)) => {}
+                                Ok(Ok(ReindexOutcome::Skipped)) => {
+                                    // Lock was busy for the full
+                                    // budget — preserve `dirty` so
+                                    // the next debounce tick
+                                    // retries instead of silently
+                                    // dropping the changes.
                                     warn!(
-                                        "Auto-reindex exceeded {}s budget; detached",
+                                        "Watcher: skipping reindex; write lock busy for >{}s",
                                         REINDEX_BUDGET_SECS
                                     );
                                     dirty = true;
+                                }
+                                Ok(Err(join_err)) => {
+                                    // `spawn_blocking` itself failed
+                                    // (panic inside the task). The
+                                    // lock state is undefined here;
+                                    // surface the error and let the
+                                    // next tick re-arm the reindex.
+                                    warn!(
+                                        "Watcher: reindex task join failed: {}",
+                                        join_err
+                                    );
+                                    dirty = true;
+                                }
+                                Err(_) => {
+                                    // Reindex exceeded the budget.
+                                    // `spawn_blocking` is not
+                                    // cancellable, so the detached
+                                    // task continues running and
+                                    // holds the `ProjectWriteGuard`
+                                    // until the reindex body returns
+                                    // — the lock eventually drops on
+                                    // `Drop`. The watcher loop
+                                    // returns to its select arm so a
+                                    // hung reindex cannot stall
+                                    // subsequent debounce ticks.
+                                    // To avoid a cascade of
+                                    // pinned threadpool workers,
+                                    // suppress the immediate retry
+                                    // and let the next *user-driven*
+                                    // file change re-arm the
+                                    // reindex. The change is still
+                                    // recorded in the watcher's
+                                    // event channel if another file
+                                    // mutation occurs.
+                                    warn!(
+                                        "Auto-reindex exceeded {}s budget; detached (lock will drop on reindex completion)",
+                                        REINDEX_BUDGET_SECS
+                                    );
                                 }
                             }
                         }
