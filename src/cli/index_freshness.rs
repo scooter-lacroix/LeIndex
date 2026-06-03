@@ -175,6 +175,18 @@ pub(crate) fn is_stale_fast(
             }
         }
     }
+    // Source count mismatch: O(1) check that catches file additions or
+    // deletions even when directory mtimes are not updated reliably.
+    let source_count = if let Some(scan) = ctx.project_scan {
+        Some(scan.source_paths.len())
+    } else {
+        cached_scan.as_ref().map(|scan| scan.source_paths.len())
+    };
+    if let Some(count) = source_count {
+        if count != indexed_files.len() {
+            return true;
+        }
+    }
     // Directory mtime sentinel check
     let source_dirs: Vec<PathBuf> = if let Some(scan) = ctx.project_scan {
         scan.source_directories.clone()
