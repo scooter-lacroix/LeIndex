@@ -254,25 +254,34 @@ impl IndexWatcher {
                                     // returns to its select arm so a
                                     // hung reindex cannot stall
                                     // subsequent debounce ticks.
-                                    // To avoid a cascade of
-                                    // pinned threadpool workers,
-                                    // suppress the immediate retry
-                                    // and let the next *user-driven*
-                                    // file change re-arm the
-                                    // reindex. The change is still
-                                    // recorded in the watcher's
-                                    // event channel if another file
+                                    //
+                                    // We set `dirty = true` so the
+                                    // next tick retries: the original
+                                    // file change that triggered this
+                                    // reindex is still unserved (the
+                                    // body never completed), and
+                                    // waiting for a *user-driven*
+                                    // file change to re-arm the
+                                    // reindex would leave the index
+                                    // silently stale if no further
                                     // mutation occurs. The
-                                    // `debounce.reset()` waits a
-                                    // full `debounce_interval` from
-                                    // "now" before the next tick,
-                                    // matching the explicit
-                                    // "suppress the immediate retry"
-                                    // contract.
+                                    // `debounce.reset()` caps the
+                                    // retry rate at one per
+                                    // `debounce_interval` so a
+                                    // permanently-hung reindex (lock
+                                    // held forever by the detached
+                                    // task) cannot spawn a tight
+                                    // loop of `spawn_blocking`
+                                    // retries — each retry's
+                                    // `try_acquire_lock` will fail
+                                    // fast with `Skipped`, releasing
+                                    // the threadpool worker within
+                                    // microseconds.
                                     warn!(
-                                        "Auto-reindex exceeded {}s budget; detached (lock will drop on reindex completion)",
+                                        "Auto-reindex exceeded {}s budget; detached (lock will drop on reindex completion); retrying on next tick",
                                         REINDEX_BUDGET_SECS
                                     );
+                                    dirty = true;
                                     debounce.reset();
                                 }
                             }
@@ -490,5 +499,70 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(10), debounce.tick())
             .await
             .expect("tick must fire after one full debounce_interval from reset");
+    }
+
+    /// Regression for kilo-code-bot round 17: the reindex-timeout
+    /// `Err(_)` arm previously did NOT set `dirty = true`. The
+    /// rationale was to avoid a cascade of pinned threadpool
+    /// workers while a detached reindex still held the lock — but
+    /// that left the original change silently unserved if no
+    /// further user-driven file change arrived. With the round-16
+    /// `debounce.reset()` cap in place, the cascade risk is gone:
+    /// the retry rate is bounded at one per `debounce_interval`
+    /// (each retry's `try_acquire_lock` fails fast with `Skipped`
+    /// and releases the threadpool worker within microseconds). The
+    /// fix sets `dirty = true` in the timeout arm to match the
+    /// Skipped / Failed / join-error arms.
+    ///
+    /// This is a static structural check: the timeout arm must
+    /// contain both `dirty = true` and `debounce.reset()` so the
+    /// next tick retries the reindex.
+    #[test]
+    fn test_watcher_timeout_arm_sets_dirty_and_resets() {
+        let source = include_str!("watcher.rs");
+
+        // Locate the `Err(_) => {` timeout arm inside the
+        // `tokio::time::timeout(reindex_budget, blocking).await`
+        // match. The arm that does NOT match
+        // `Ok(Ok(ReindexOutcome::Completed))`,
+        // `Ok(Ok(ReindexOutcome::Skipped))`, or
+        // `Ok(Err(join_err))` is the timeout arm.
+        let timeout_arm_marker = "Err(_) => {";
+        let timeout_pos = source
+            .find(timeout_arm_marker)
+            .expect("Err(_) timeout arm must exist in watcher.rs");
+        // Find the next match arm opening (`Ok(Ok(Completed))` or
+        // any other `=>` at the same indent level). Slice from
+        // `timeout_pos` to the next outer closing brace to scope
+        // the search to the timeout arm body.
+        let arm_body_start = timeout_pos + timeout_arm_marker.len();
+        // The arm body ends at the next `}\n                            }`
+        // pattern (close of the match arm + close of the
+        // `tokio::time::timeout(...)` match). Find the close of
+        // the immediate arm by scanning forward for `                            }`
+        // (the match arm closes at the same indent as the match
+        // expression).
+        let arm_body_end_needle = "\
+                            }";
+        let arm_body_end = source[arm_body_start..]
+            .find(arm_body_end_needle)
+            .map(|i| arm_body_start + i)
+            .unwrap_or(source.len());
+        let arm_body = &source[arm_body_start..arm_body_end];
+
+        assert!(
+            arm_body.contains("dirty = true"),
+            "timeout arm must set `dirty = true` so the next tick retries the reindex; \
+             otherwise the original change is silently dropped if no further user file \
+             change arrives. Arm body:\n{}",
+            arm_body
+        );
+        assert!(
+            arm_body.contains("debounce.reset()"),
+            "timeout arm must call `debounce.reset()` to cap the retry rate at one \
+             per `debounce_interval`; without the reset, a tight re-spawn loop is \
+             possible. Arm body:\n{}",
+            arm_body
+        );
     }
 }
