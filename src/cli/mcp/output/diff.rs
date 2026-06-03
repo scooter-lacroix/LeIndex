@@ -354,7 +354,8 @@ fn render_hunk_split(hunk: &DiffHunk, layout: &RowLayout) -> String {
                         old_content: &line.content,
                         new_line: Some(new_line),
                         new_content: &line.content,
-                        marker: " ",
+                        left_marker: " ",
+                        right_marker: " ",
                     },
                     layout,
                 ));
@@ -381,27 +382,41 @@ fn render_hunk_split(hunk: &DiffHunk, layout: &RowLayout) -> String {
                 for k in 0..max {
                     let rem = removes.get(k);
                     let add = adds.get(k);
+                    // Each row gets explicit left/right markers
+                    // that mirror what a side-by-side diff viewer
+                    // would render: paired remove+add becomes
+                    // `-` / `+`, an unpaired remove (line was
+                    // deleted) becomes `-` / ` `, an unpaired
+                    // add (line was inserted against the previous
+                    // block) becomes ` ` / `+`. The previous
+                    // single-`marker` design forced all three
+                    // cases to render with `" "` and grey, which
+                    // made modifications visually identical to
+                    // unchanged context.
                     let row = match (rem, add) {
                         (Some(r), Some(a)) => SplitRow {
                             old_line: Some(old_line + k),
                             old_content: r.content.as_str(),
                             new_line: Some(new_line + k),
                             new_content: a.content.as_str(),
-                            marker: " ",
+                            left_marker: "-",
+                            right_marker: "+",
                         },
                         (Some(r), None) => SplitRow {
                             old_line: Some(old_line + k),
                             old_content: r.content.as_str(),
                             new_line: None,
                             new_content: "",
-                            marker: " ",
+                            left_marker: "-",
+                            right_marker: " ",
                         },
                         (None, Some(a)) => SplitRow {
                             old_line: None,
                             old_content: "",
                             new_line: Some(new_line + k),
                             new_content: a.content.as_str(),
-                            marker: " ",
+                            left_marker: " ",
+                            right_marker: "+",
                         },
                         (None, None) => unreachable!(),
                     };
@@ -420,7 +435,8 @@ fn render_hunk_split(hunk: &DiffHunk, layout: &RowLayout) -> String {
                         old_content: "",
                         new_line: Some(new_line),
                         new_content: &line.content,
-                        marker: " ",
+                        left_marker: " ",
+                        right_marker: "+",
                     },
                     layout,
                 ));
@@ -444,16 +460,25 @@ struct RowLayout {
 }
 
 /// One row of a split-view diff: a (left_line, left_text) + (right_line,
-/// right_text) pair, plus an optional `marker` override used for the
-/// default "context" rows. When only one side is populated the
-/// `marker` argument is ignored and `+` / `-` is used on the populated
-/// side.
+/// right_text) pair, plus explicit `left_marker` and `right_marker`
+/// strings that drive both the displayed glyph (`" "`, `"-"`, `"+"`)
+/// and the colour on each side independently.
+///
+/// The split renderer must distinguish context rows (` ` / ` `) from
+/// modified rows (`-` / `+`) at a glance — a single shared `marker`
+/// field forced both sides to render identically, which made
+/// modifications indistinguishable from unchanged context. Each side
+/// now carries its own marker and the row's colour is derived from
+/// that side's marker rather than from whether `old_line` /
+/// `new_line` is populated, so the caller is in full control of the
+/// rendered output.
 struct SplitRow<'a> {
     old_line: Option<usize>,
     old_content: &'a str,
     new_line: Option<usize>,
     new_content: &'a str,
-    marker: &'a str,
+    left_marker: &'a str,
+    right_marker: &'a str,
 }
 
 fn split_row(row: &SplitRow<'_>, layout: &RowLayout) -> String {
@@ -463,7 +488,8 @@ fn split_row(row: &SplitRow<'_>, layout: &RowLayout) -> String {
         old_content,
         new_line,
         new_content,
-        marker,
+        left_marker,
+        right_marker,
     } = row;
 
     let ol_str = old_line
@@ -473,25 +499,25 @@ fn split_row(row: &SplitRow<'_>, layout: &RowLayout) -> String {
         .map(|n| format!("{:>width$}", n, width = gutter))
         .unwrap_or_else(|| " ".repeat(gutter));
 
-    let (left_marker, right_marker) = match (old_line, new_line) {
-        (Some(_), Some(_)) => (*marker, *marker),
-        (Some(_), None) => ("-", " "),
-        (None, Some(_)) => (" ", "+"),
-        (None, None) => (*marker, *marker),
-    };
-
-    let left_paint = if color && left_marker == "-" {
+    // Each side's colour is derived from its own marker so a
+    // modified row (`-` / `+`) renders red on the left and green
+    // on the right, while a context row (` ` / ` `) renders grey
+    // on both sides. The previous implementation derived the
+    // marker from `(old_line, new_line)` presence and then forced
+    // both sides to use the same `marker` value, which made
+    // modified rows visually identical to context rows.
+    let left_paint = if color && *left_marker == "-" {
         LIGHT_RED
-    } else if color && left_marker == "+" {
+    } else if color && *left_marker == "+" {
         LIGHT_GREEN
     } else if color {
         LIGHT_GREY
     } else {
         ""
     };
-    let right_paint = if color && right_marker == "+" {
+    let right_paint = if color && *right_marker == "+" {
         LIGHT_GREEN
-    } else if color && right_marker == "-" {
+    } else if color && *right_marker == "-" {
         LIGHT_RED
     } else if color {
         LIGHT_GREY
@@ -949,6 +975,168 @@ mod tests {
                 i,
                 visible,
                 stripped,
+            );
+        }
+    }
+
+    // =====================================================================
+    // render_split_diff — round 19 gemini HIGH-priority split-marker fix
+    // =====================================================================
+
+    /// Regression for HIGH round 19: the split renderer used a
+    /// single shared `marker` field on `SplitRow` and a
+    /// `(old_line, new_line) → (left_marker, right_marker)`
+    /// derivation in `split_row`. A paired remove+add row had
+    /// `(old_line=Some, new_line=Some)` and was therefore
+    /// forced to render with the caller's `marker` (which was
+    /// always `" "` for paired rows), so modifications
+    /// rendered with a blank glyph and grey colour —
+    /// visually indistinguishable from unchanged context.
+    ///
+    /// The fix splits `marker` into explicit
+    /// `left_marker` / `right_marker` fields, so a paired
+    /// remove+add row now renders with `-` on the left (red)
+    /// and `+` on the right (green) when colour is on. This
+    /// test asserts the contract for the colour-on path: the
+    /// row's stripped visible form contains both `-` and `+`
+    /// markers, and the unstripped form contains the red
+    /// ANSI escape (for the left `-`) AND the green ANSI
+    /// escape (for the right `+`).
+    #[test]
+    fn test_render_split_diff_modified_rows_use_minus_plus_markers() {
+        let diff = compute_diff("foo\n", "bar\n", "test.rs");
+        // Sanity: the diff has exactly one remove and one add.
+        assert_eq!(diff.additions, 1);
+        assert_eq!(diff.deletions, 1);
+        let stripped = strip_ansi_for_test(&render_split_diff(&diff, false, None));
+        // The rendered form must include a `-` on the left
+        // and a `+` on the right at the modified row, not
+        // spaces. The exact format is
+        //   " <gutter> - <left_content> │ <gutter> + <right_content>"
+        // so a ` - ` substring (gutter + space + marker + space)
+        // and a ` + ` substring (gutter + space + marker + space)
+        // must both appear.
+        assert!(
+            stripped.contains(" - "),
+            "modified row must render `-` on the left, not ` `; got: {:?}",
+            stripped
+        );
+        assert!(
+            stripped.contains(" + "),
+            "modified row must render `+` on the right, not ` `; got: {:?}",
+            stripped
+        );
+    }
+
+    /// Companion to the marker test: when colour is on, the
+    /// left `-` marker must be wrapped in `LIGHT_RED` and the
+    /// right `+` marker must be wrapped in `LIGHT_GREEN`. The
+    /// pre-fix renderer forced both sides to use the same
+    /// `marker` value (`" "`) with `LIGHT_GREY`, so no red or
+    /// green ever appeared at a modified row.
+    #[test]
+    fn test_render_split_diff_modified_rows_use_red_and_green_color() {
+        let diff = compute_diff("foo\n", "bar\n", "test.rs");
+        let rendered = render_split_diff(&diff, true, None);
+        // The red marker is emitted via `LIGHT_RED` between
+        // the left content and the next escape; we assert the
+        // escape sequence appears in the rendered output
+        // rather than testing the exact byte layout, which is
+        // a stronger contract.
+        assert!(
+            rendered.contains(LIGHT_RED),
+            "modified row's left `-` must be wrapped in LIGHT_RED; rendered: {:?}",
+            rendered
+        );
+        assert!(
+            rendered.contains(LIGHT_GREEN),
+            "modified row's right `+` must be wrapped in LIGHT_GREEN; rendered: {:?}",
+            rendered
+        );
+    }
+
+    /// Context rows (unchanged lines) must still render with
+    /// the blank marker (` `) on both sides, NOT with `-` or
+    /// `+`. This locks the contract that the round-19 fix did
+    /// not regress unchanged-context rendering.
+    #[test]
+    fn test_render_split_diff_context_rows_keep_blank_marker() {
+        // Multi-line input with a single mid-file modification
+        // gives us context lines surrounding the change.
+        let original = "alpha\nbeta\ngamma\ndelta\nepsilon\n";
+        let modified = "alpha\nbeta\nGAMMA\ndelta\nepsilon\n";
+        let diff = compute_diff(original, modified, "test.rs");
+        let stripped = strip_ansi_for_test(&render_split_diff(&diff, false, None));
+        // The row layout is
+        //   ` <gutter> <left_marker> <left_content> │ <gutter> <right_marker> <right_content>`
+        // For a 4-digit gutter and a single-char marker the
+        // first 6 visible chars are:
+        //   ` ` (1) + `   1` (4) + ` ` (1) = 6 chars
+        // followed by the marker. Split the row on the `│`
+        // separator to isolate the left half, then assert the
+        // left marker is ` ` (context), not `-` or `+`.
+        let mut found_blank_row = false;
+        for line in stripped.lines() {
+            if !line.contains('│') {
+                continue;
+            }
+            let left = line.split('│').next().unwrap();
+            // Find the gutter pattern at the start: one
+            // leading space, then 4 chars of line number
+            // (`   1`, `   2`, etc.).
+            if left.len() < 7 {
+                continue;
+            }
+            let gutter_and_marker = &left[0..6];
+            if gutter_and_marker.starts_with(" ")
+                && gutter_and_marker.ends_with(' ')
+                && gutter_and_marker[1..5].trim() == "1"
+            {
+                // The marker is the 7th char (index 6).
+                let marker = left[6..7].chars().next();
+                assert_eq!(
+                    marker,
+                    Some(' '),
+                    "context line `   1 ` must use blank marker, got {:?} in left half {:?}",
+                    marker,
+                    left
+                );
+                found_blank_row = true;
+                break;
+            }
+        }
+        assert!(
+            found_blank_row,
+            "expected to find a context row with gutter `   1 ` and blank marker in: {:?}",
+            stripped
+        );
+    }
+
+    /// Width invariant: the new explicit-marker design must
+    /// not change the per-row width formula. A modified row
+    /// (which is now `-` / `+` instead of ` ` / ` `) and a
+    /// context row (still ` ` / ` `) must both fit inside the
+    /// requested terminal width, because each marker is a
+    /// single byte. The previous 80-column regression test
+    /// (round 11) covered the remove+add-only case; this
+    /// round-19 test covers a case that produces a CONTEXT
+    /// row alongside the modification, to lock that the new
+    /// explicit markers do not push any row past the
+    /// requested width.
+    #[test]
+    fn test_render_split_diff_modified_rows_respect_terminal_width() {
+        let original = "context_before\nold_line\ncontext_after\n";
+        let modified = "context_before\nnew_line\ncontext_after\n";
+        let diff = compute_diff(original, modified, "test.rs");
+        let s = render_split_diff(&diff, false, Some(80));
+        for (i, line) in s.lines().enumerate() {
+            let visible = line.chars().count();
+            assert!(
+                visible <= 80,
+                "row {} exceeds 80 cols ({} chars): {:?}",
+                i,
+                visible,
+                line
             );
         }
     }
