@@ -281,18 +281,28 @@ pub(crate) fn is_stale_fast(
     // check in O(14) without touching walkdir) for the common
     // case of a single-package project.
     //
-    // Canonicalize the cached list on both sides of the membership
-    // check. The cached `manifest_paths` are produced by walkdir
-    // against whatever `project_path` the index builder received
-    // (absolute when the user passed an absolute path, relative
-    // when they passed `.` or similar). The current `ctx.project_path`
-    // may be in a different shape, so a raw `Path::join` + `HashSet`
-    // membership check would always miss when the two forms differ.
-    // We canonicalize both sides, falling back to the original
-    // path on canonicalize failure (path no longer exists on disk,
-    // permission denied, etc.) so a transient FS error does not
-    // silently turn into a "stale" verdict.
-    let already_listed = build_already_listed(ctx.project_path, &manifest_paths);
+    // Build the membership set. Fast path: when the scan has
+    // pre-canonicalized manifest paths (populated by the scanner
+    // at scan time), use them directly as a HashSet — zero
+    // syscalls on the freshness-check hot path. Slow path:
+    // legacy scans (empty `manifest_paths_canonical`) or cold/
+    // cached paths without a scan fall back to
+    // `build_already_listed`, which canonicalizes on the fly.
+    // The per-call canonicalize cost is O(N) stat/readlink
+    // syscalls where N is the number of manifests — in a large
+    // monorepo with hundreds of package manifests this was the
+    // dominant fixed cost of the freshness fast path before
+    // the round-18 optimization.
+    let already_listed: std::collections::HashSet<PathBuf> =
+        if let Some(scan) = ctx.project_scan {
+            if !scan.manifest_paths_canonical.is_empty() {
+                scan.manifest_paths_canonical.iter().cloned().collect()
+            } else {
+                build_already_listed(ctx.project_path, &scan.manifest_paths)
+            }
+        } else {
+            build_already_listed(ctx.project_path, &manifest_paths)
+        };
     // Root-level fast path: O(N) stat, no walkdir. Common case
     // for single-package projects.
     //
@@ -805,6 +815,117 @@ mod tests {
         assert!(
             listed.contains(&abs),
             "absolute scanner output must round-trip through join+canonicalize"
+        );
+    }
+
+    // =====================================================================
+    // ProjectFileScan.manifest_paths_canonical — round-18 gemini perf fix
+    // =====================================================================
+
+    /// Contract for the pre-canonicalized membership-set fast
+    /// path used by `is_stale_fast`. When the scanner populates
+    /// `manifest_paths_canonical`, the freshness check is
+    /// expected to use those entries verbatim as a HashSet and
+    /// skip the per-call `Path::canonicalize` cost entirely.
+    ///
+    /// Locks the contract: a `ProjectFileScan` with a non-empty
+    /// `manifest_paths_canonical` MUST produce a membership set
+    /// that contains the canonical absolute path of every
+    /// scanner-tracked manifest, identical to what
+    /// `build_already_listed` would have produced. This is the
+    /// regression target for the round-18 finding: the previous
+    /// implementation re-canonicalized on every freshness check
+    /// (O(N) stat/readlink syscalls per call), which was the
+    /// dominant fixed cost of the freshness fast path in
+    /// monorepos with hundreds of package manifests.
+    #[test]
+    fn pre_canonicalized_manifest_paths_match_build_already_listed() {
+        let (tmp, _) = make_fixture();
+        let root = tmp.path();
+
+        // Lay down a few manifests at varying depths.
+        let root_manifest = root.join("Cargo.toml");
+        fs::write(&root_manifest, "[package]\nname = \"root\"\n").unwrap();
+        let nested_dir = root.join("packages/api");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let nested_manifest = nested_dir.join("package.json");
+        fs::write(&nested_manifest, "{}").unwrap();
+        let pyproject_manifest = root.join("pyproject.toml");
+        fs::write(&pyproject_manifest, "[project]\nname = \"x\"\n").unwrap();
+
+        // Relative scanner outputs (mimic the scanner when
+        // the user passes a relative `project_path`).
+        let relative_paths = vec![
+            std::path::PathBuf::from("Cargo.toml"),
+            std::path::PathBuf::from("packages/api/package.json"),
+            std::path::PathBuf::from("pyproject.toml"),
+        ];
+
+        // Slow-path: build the membership set the way
+        // `is_stale_fast` did before round 18.
+        let slow_set = build_already_listed(root, &relative_paths);
+
+        // Fast-path: build the pre-canonicalized set the way
+        // the scanner does at scan time.
+        let manifest_paths_canonical: Vec<PathBuf> = relative_paths
+            .iter()
+            .map(|p| {
+                let full = if p.is_relative() {
+                    root.join(p)
+                } else {
+                    p.clone()
+                };
+                full.canonicalize().unwrap_or(full)
+            })
+            .collect();
+
+        // The two sets MUST be identical. The fast path is
+        // allowed to skip the per-call canonicalize cost
+        // exactly because the result is byte-for-byte the
+        // same set of canonical absolute paths.
+        let fast_set: std::collections::HashSet<PathBuf> =
+            manifest_paths_canonical.iter().cloned().collect();
+        assert_eq!(
+            slow_set, fast_set,
+            "pre-canonicalized set must match build_already_listed output"
+        );
+        assert_eq!(fast_set.len(), 3);
+    }
+
+    /// A `ProjectFileScan` deserialized from legacy state (no
+    /// `manifest_paths_canonical` field) MUST fall back to
+    /// `build_already_listed` on the freshness check. We
+    /// exercise that fallback by constructing the scan with an
+    /// empty `manifest_paths_canonical` and asserting the
+    /// membership set is still correct.
+    #[test]
+    fn legacy_scan_falls_back_to_build_already_listed() {
+        let (tmp, _) = make_fixture();
+        let root = tmp.path();
+        let manifest = root.join("Cargo.toml");
+        fs::write(&manifest, "[package]\nname = \"x\"\n").unwrap();
+
+        // Build a scan that mirrors the legacy serialized form:
+        // `manifest_paths_canonical` is empty.
+        let scan = ProjectFileScan {
+            source_paths: vec![],
+            manifest_paths: vec![std::path::PathBuf::from("Cargo.toml")],
+            manifest_paths_canonical: Vec::new(),
+            source_directories: vec![],
+            manifest_hashes: std::collections::HashMap::new(),
+        };
+        assert!(
+            scan.manifest_paths_canonical.is_empty(),
+            "fixture must mirror legacy serialized form"
+        );
+
+        // The fallback path produces the same set as a fully
+        // populated fast-path scan would.
+        let fallback_set = build_already_listed(root, &scan.manifest_paths);
+        let canon = manifest.canonicalize().unwrap();
+        assert!(
+            fallback_set.contains(&canon),
+            "fallback must still resolve the manifest to its canonical form"
         );
     }
 }

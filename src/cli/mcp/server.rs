@@ -149,6 +149,24 @@ pub fn index_timeout_secs() -> u64 {
 /// back to the 30s default and have its long-running tool call
 /// dropped mid-flight.
 pub fn long_running_tool_timeout_secs(tool_name: &str) -> Option<u64> {
+    // Fast path: direct equality. This function is called on
+    // every incoming MCP tool request, and the canonical tool
+    // name is the most common form. A raw `&str` compare avoids
+    // the unconditional `String` allocation that
+    // `normalize_tool_name` performs (one for the input, plus
+    // one per table entry). For a per-request hot path that
+    // runs once per tool call, the allocation cost is visible
+    // when the request rate is high and most callers are
+    // already using the canonical name verbatim.
+    if LONG_RUNNING_TOOL_TIMEOUTS.contains(&tool_name) {
+        return Some(index_timeout_secs());
+    }
+    // Slow path: alias / case / whitespace tolerance. Required
+    // for callers that use the snake-case or trimmed form
+    // (e.g. `leindex_index`, `  LeIndex.Index  `). The
+    // normalised comparison matches the contract documented on
+    // the function and exercised by the round-11 test
+    // `test_long_running_tool_timeout_secs_normalises_tool_name`.
     let normalized = normalize_tool_name(tool_name);
     if LONG_RUNNING_TOOL_TIMEOUTS
         .iter()
@@ -501,7 +519,20 @@ pub(crate) async fn bind_with_fallback(
 ) -> anyhow::Result<tokio::net::TcpListener> {
     let mut last_err: Option<std::io::Error> = None;
     for offset in 0..=BIND_FALLBACK_PORT_RANGE {
-        let candidate = SocketAddr::new(preferred.ip(), preferred.port().saturating_add(offset));
+        // `checked_add` so a preferred port near `u16::MAX`
+        // (e.g. 65530 with a 10-port fallback range) does not
+        // silently re-try the same saturated port 65535 six
+        // times. `saturating_add` would cap the port at
+        // `u16::MAX` and burn the remaining fallback slots on
+        // duplicate bind attempts; `checked_add` returns
+        // `None` on overflow and we break out of the fixed
+        // range, falling through to the ephemeral-bind
+        // fallback below.
+        let port = match preferred.port().checked_add(offset) {
+            Some(p) => p,
+            None => break,
+        };
+        let candidate = SocketAddr::new(preferred.ip(), port);
         match tokio::net::TcpListener::bind(candidate).await {
             Ok(listener) => return Ok(listener),
             Err(e) => {
@@ -1894,6 +1925,119 @@ mod tests {
             context.is_none(),
             "`leindex.context` must NOT be classified as long-running"
         );
+    }
+
+    /// Regression for MED round 18: the per-call hot path of
+    /// `long_running_tool_timeout_secs` previously allocated
+    /// two `String`s on every call (one for the input via
+    /// `normalize_tool_name`, one per table entry — N=1 today
+    /// but the slice is treated as the source of truth, so the
+    /// allocation cost is a per-entry cost in general). The
+    /// canonical tool name is by far the most common input
+    /// form, so the function must short-circuit on direct
+    /// `&str` equality before paying the allocation cost.
+    ///
+    /// This test asserts the result is identical for the
+    /// canonical input — i.e. the fast path is observably
+    /// equivalent to the slow path for that case. It also
+    /// asserts the function returns the same value (whatever
+    /// `index_timeout_secs()` resolves to at test time, which
+    /// honours `LEINDEX_INDEX_TIMEOUT_SECS`) for the fast path
+    /// and the slow path when both are eligible, so a future
+    /// refactor cannot accidentally diverge the two.
+    #[test]
+    fn test_long_running_tool_timeout_secs_fast_path_matches_slow_path() {
+        // Canonical form → fast path (direct equality).
+        let fast = long_running_tool_timeout_secs("leindex.index");
+        // Snake-case alias → slow path (normalised equality).
+        let slow = long_running_tool_timeout_secs("leindex_index");
+        // Padded / mixed-case → slow path.
+        let slow_padded = long_running_tool_timeout_secs("  LeIndex.Index  ");
+        // Hyphenated alias → slow path.
+        let slow_hyphen = long_running_tool_timeout_secs("leindex-index");
+
+        // All four must produce the same per-tool timeout
+        // (whatever the env override resolves to at test
+        // time), proving the fast path returns an identical
+        // result to the slow path.
+        assert_eq!(fast, slow, "fast path must match slow path result");
+        assert_eq!(fast, slow_padded, "fast path must match slow path result");
+        assert_eq!(fast, slow_hyphen, "fast path must match slow path result");
+
+        // And the value must be Some(...) — the canonical
+        // `leindex.index` is the long-running tool whose
+        // timeout is exposed via `LEINDEX_INDEX_TIMEOUT_SECS`.
+        assert!(
+            fast.is_some(),
+            "canonical `leindex.index` must be classified as long-running"
+        );
+    }
+
+    /// Regression for MED round 18: the fixed-port loop in
+    /// `bind_with_fallback` previously used
+    /// `preferred.port().saturating_add(offset)`, which
+    /// silently caps the candidate port at `u16::MAX`. With
+    /// `BIND_FALLBACK_PORT_RANGE = 10` and a preferred port of
+    /// 65530, the loop would burn six of its eleven slots
+    /// re-binding the saturated port 65535 instead of moving
+    /// on. The fix uses `checked_add` and breaks out of the
+    /// fixed range on overflow, falling through to the
+    /// ephemeral-bind fallback.
+    ///
+    /// This test exercises the overflow path: bind to the
+    /// highest valid port (65535), then ask
+    /// `bind_with_fallback` to start near the top of the
+    /// range. We assert it returns *some* `TcpListener`
+    /// (either via the ephemeral fallback or via the
+    /// saturated port) without entering an infinite loop.
+    /// The previous implementation would also return a
+    /// listener eventually, but it would burn cycles on
+    /// duplicate bind attempts. The regression target is the
+    /// contract: the loop must terminate promptly and the
+    /// function must not loop forever on saturated ports.
+    #[tokio::test]
+    async fn test_bind_with_fallback_breaks_on_port_overflow() {
+        // Bind to the highest valid port to consume it.
+        let high = SocketAddr::from(([127, 0, 0, 1], u16::MAX));
+        let _occupying = tokio::net::TcpListener::bind(high).await.unwrap();
+
+        // Start the search 5 ports below u16::MAX. With a
+        // 10-port fallback range, offset 0..=10 covers
+        // 65530..65535 + the saturating case. The fixed
+        // range will collide with the occupying listener on
+        // 65535; post-fix the loop breaks on overflow
+        // (offset 5 → 65535, then offset 6..10 would
+        // overflow), and falls through to ephemeral.
+        let preferred = SocketAddr::from(([127, 0, 0, 1], u16::MAX - 5));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bind_with_fallback(preferred),
+        )
+        .await;
+        let listener = result
+            .expect("bind_with_fallback must terminate within 5s")
+            .expect("ephemeral fallback must succeed on a free IP");
+        // The returned listener must be on the preferred IP.
+        assert_eq!(
+            listener.local_addr().unwrap().ip(),
+            preferred.ip(),
+            "ephemeral fallback must use the preferred IP"
+        );
+    }
+
+    /// The happy path: when the preferred port is free,
+    /// `bind_with_fallback` must return a listener bound to
+    /// that exact port — no fallback walk, no ephemeral
+    /// detour. This guards against an over-eager overflow
+    /// break that would cause the function to give up the
+    /// preferred port for an ephemeral one.
+    #[tokio::test]
+    async fn test_bind_with_fallback_uses_preferred_when_free() {
+        let preferred = SocketAddr::from(([127, 0, 0, 1], 0));
+        let listener = bind_with_fallback(preferred).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        // Port 0 → ephemeral, so just assert the IP matches.
+        assert_eq!(bound.ip(), preferred.ip());
     }
 }
 

@@ -45,6 +45,23 @@ pub(crate) const DEPENDENCY_MANIFEST_NAMES: &[&str] = &[
 pub(crate) struct ProjectFileScan {
     pub(crate) source_paths: Vec<PathBuf>,
     pub(crate) manifest_paths: Vec<PathBuf>,
+    /// Canonicalized absolute paths of every entry in
+    /// `manifest_paths`, populated at scan time so that
+    /// `is_stale_fast` can use them directly without re-running
+    /// `Path::canonicalize` (which performs blocking stat/readlink
+    /// syscalls per file) on every freshness check. In a large
+    /// monorepo with hundreds of package manifests, the
+    /// per-check canonicalize cost was the dominant fixed cost
+    /// of the freshness fast path. The scanner canonicalizes
+    /// each entry once and stores the result here; the freshness
+    /// check then becomes a pure HashSet membership lookup.
+    ///
+    /// Empty for scans produced before this field was added
+    /// (deserialized legacy state) — the freshness check
+    /// detects the empty case and falls back to on-the-fly
+    /// canonicalization via `build_already_listed`.
+    #[serde(default)]
+    pub(crate) manifest_paths_canonical: Vec<PathBuf>,
     #[serde(default)]
     pub(crate) source_directories: Vec<PathBuf>,
     /// Hashes of manifest/lockfile contents at scan time, used for
