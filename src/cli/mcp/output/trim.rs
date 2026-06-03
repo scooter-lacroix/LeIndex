@@ -328,6 +328,19 @@ fn trim_phase(data: &Value) -> Value {
     if let Some(df) = data.get("deleted_files") {
         out.insert("deleted_files".to_string(), df.clone());
     }
+    // Pass through fields that render_phase reads for metadata display.
+    // mode, phases, and summary are not currently emitted by the upstream
+    // PhaseAnalysisReport, but the pass-through is defensive so the
+    // renderer will show them if they ever appear.
+    if let Some(v) = data.get("mode") {
+        out.insert("mode".to_string(), v.clone());
+    }
+    if let Some(v) = data.get("phases") {
+        out.insert("phases".to_string(), v.clone());
+    }
+    if let Some(v) = data.get("summary") {
+        out.insert("summary".to_string(), v.clone());
+    }
     // Keep phase summaries 1-5 (the bulk of the analysis output)
     for n in 1u8..=5 {
         let key = format!("phase{}", n);
