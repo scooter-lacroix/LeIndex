@@ -1361,8 +1361,18 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
 /// the raw `Value` (clean JSON for the LLM); the CLI uses this function
 /// to produce a human-readable, colored view of the same data.
 pub fn render_tool_output(name: &str, data: &Value, args: &Value) -> String {
+    render_tool_output_with_color(name, data, args, true)
+}
+
+/// Render a tool's value *without* ANSI color codes. Used by the MCP
+/// transport to produce clean text for the LLM (the CLI uses the
+/// colored `render_tool_output`).
+pub fn render_tool_output_plain(name: &str, data: &Value, args: &Value) -> String {
+    render_tool_output_with_color(name, data, args, false)
+}
+
+fn render_tool_output_with_color(name: &str, data: &Value, args: &Value, color: bool) -> String {
     let normalized = normalize_tool_name(name);
-    let color = true;
     let query = args
         .get("query")
         .and_then(|v| v.as_str())

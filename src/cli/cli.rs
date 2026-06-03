@@ -941,13 +941,50 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         .get_diagnostics()
         .context("Failed to get diagnostics")?;
 
+    // Use coverage report for accurate indexed_files count
+    let indexed_ct = leindex
+        .coverage_report()
+        .ok()
+        .map(|c| c.indexed_files)
+        .unwrap_or(diag.stats.files_parsed);
+
+    // Compute staleness the same way DiagnosticsHandler::execute does
+    let (changed, deleted) = leindex.check_freshness().unwrap_or_default();
+    let is_stale = !changed.is_empty() || !deleted.is_empty();
+    let stale = is_stale || diag.index_health == "stale";
+
+    // Estimate last_indexed_secs_ago from storage_path mtime
+    let storage_path = leindex.storage_path();
+    let last_indexed_secs_ago = std::fs::metadata(storage_path.join("leindex.db"))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+        .map(|d| d.as_secs());
+
+    // Populate issues matching DiagnosticsHandler::execute shape
+    let mut issues: Vec<serde_json::Value> = Vec::new();
+    if diag.stats.failed_parses > 0 {
+        issues.push(serde_json::json!({
+            "severity": "warning",
+            "message": format!("{} files failed to parse", diag.stats.failed_parses),
+        }));
+    }
+    if stale {
+        issues.push(serde_json::json!({
+            "severity": "warning",
+            "message": "Index may be stale. Call LeIndex [Index] with force_reindex=true for fresh results.",
+        }));
+    }
+
     // Convert to JSON for formatter
     let diag_json = serde_json::json!({
         "project_path": diag.project_path,
-        "indexed_files": diag.stats.files_parsed,
+        "indexed_files": indexed_ct,
         "index_size_mb": diag.memory_usage_bytes as f64 / 1024.0 / 1024.0,
         "symbol_count": diag.stats.indexed_nodes,
-        "issues": []
+        "stale": stale,
+        "last_indexed_secs_ago": last_indexed_secs_ago,
+        "issues": issues,
     });
 
     // Use the unified CLI renderer so `leindex diagnostics` and

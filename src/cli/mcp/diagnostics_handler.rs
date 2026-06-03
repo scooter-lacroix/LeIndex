@@ -61,6 +61,18 @@ impl DiagnosticsHandler {
             .unwrap_or(0);
         let coverage = guard.coverage_report().ok();
 
+        // Extract values from diagnostics before it's consumed by serde
+        let indexed_files_ct = coverage
+            .as_ref()
+            .map(|c| c.indexed_files)
+            .unwrap_or(diagnostics.stats.files_parsed);
+        let symbol_count = diagnostics.stats.indexed_nodes;
+        let size_mb = diagnostics.memory_usage_bytes as f64 / 1024.0 / 1024.0;
+        let failed_parses = diagnostics.stats.failed_parses;
+        let index_health = diagnostics.index_health.clone();
+        let is_stale = !changed.is_empty() || !deleted.is_empty();
+        let stale_bool = is_stale || index_health == "stale";
+
         let mut diag_json = serde_json::to_value(diagnostics)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?;
 
@@ -68,7 +80,44 @@ impl DiagnosticsHandler {
             map.insert("storage_path".to_string(), serde_json::json!(storage_path));
             map.insert("db_size_bytes".to_string(), serde_json::json!(db_size));
 
-            let staleness = if changed.is_empty() && deleted.is_empty() {
+            // Flat fields expected by trim_diagnostics / render_diagnostics
+            map.insert("indexed_files".to_string(), serde_json::json!(indexed_files_ct));
+            map.insert("symbol_count".to_string(), serde_json::json!(symbol_count));
+            map.insert("index_size_mb".to_string(), serde_json::json!(size_mb));
+            map.insert("stale".to_string(), serde_json::json!(stale_bool));
+
+            // last_indexed_secs_ago: rough estimate from storage_path mtime
+            let lm = std::fs::metadata(guard.storage_path().join("leindex.db"))
+                .and_then(|m| m.modified())
+                .ok();
+            let secs_ago = lm.and_then(|t| {
+                std::time::SystemTime::now()
+                    .duration_since(t)
+                    .ok()
+                    .map(|d| d.as_secs())
+            });
+            map.insert(
+                "last_indexed_secs_ago".to_string(),
+                serde_json::json!(secs_ago),
+            );
+
+            // issues: collect any non-empty warning indicators
+            let mut issues: Vec<Value> = Vec::new();
+            if failed_parses > 0 {
+                issues.push(serde_json::json!({
+                    "severity": "warning",
+                    "message": format!("{} files failed to parse", failed_parses),
+                }));
+            }
+            if stale_bool {
+                issues.push(serde_json::json!({
+                    "severity": "warning",
+                    "message": "Index may be stale. Call LeIndex [Index] with force_reindex=true for fresh results.",
+                }));
+            }
+            map.insert("issues".to_string(), serde_json::json!(issues));
+
+            let staleness = if !stale_bool {
                 serde_json::json!({
                     "status": "fresh",
                     "changed_files": 0,

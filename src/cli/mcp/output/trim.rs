@@ -312,21 +312,90 @@ fn trim_file_summary(data: &Value) -> Value {
 }
 
 fn trim_phase(data: &Value) -> Value {
-    serde_json::json!({
-        "mode": data.get("mode"),
-        "phases": data.get("phases"),
-        "summary": data.get("summary"),
-    })
+    let mut out = serde_json::Map::new();
+    if let Some(gen) = data.get("generation") {
+        out.insert("generation".to_string(), gen.clone());
+    }
+    if let Some(ep) = data.get("executed_phases") {
+        out.insert("executed_phases".to_string(), ep.clone());
+    }
+    if let Some(ch) = data.get("cache_hit") {
+        out.insert("cache_hit".to_string(), ch.clone());
+    }
+    if let Some(cf) = data.get("changed_files") {
+        out.insert("changed_files".to_string(), cf.clone());
+    }
+    if let Some(df) = data.get("deleted_files") {
+        out.insert("deleted_files".to_string(), df.clone());
+    }
+    // Pass through fields that render_phase reads for metadata display.
+    // mode, phases, and summary are not currently emitted by the upstream
+    // PhaseAnalysisReport, but the pass-through is defensive so the
+    // renderer will show them if they ever appear.
+    if let Some(v) = data.get("mode") {
+        out.insert("mode".to_string(), v.clone());
+    }
+    if let Some(v) = data.get("phases") {
+        out.insert("phases".to_string(), v.clone());
+    }
+    if let Some(v) = data.get("summary") {
+        out.insert("summary".to_string(), v.clone());
+    }
+    // Keep phase summaries 1-5 (the bulk of the analysis output)
+    for n in 1u8..=5 {
+        let key = format!("phase{}", n);
+        if let Some(v) = data.get(&key) {
+            out.insert(key, v.clone());
+        }
+    }
+    // Keep single-file symbols and reference material
+    if let Some(v) = data.get("file_symbols") {
+        out.insert("file_symbols".to_string(), v.clone());
+    }
+    if let Some(v) = data.get("phase_explanations") {
+        out.insert("phase_explanations".to_string(), v.clone());
+    }
+    // Keep formatted_output but cap it safely at char boundaries.
+    // Byte-slicing `&s[..4000]` panics when byte 4000 falls mid-UTF-8.
+    if let Some(v) = data.get("formatted_output") {
+        if let Some(s) = v.as_str() {
+            let capped = match s.char_indices().nth(4000) {
+                Some((idx, _)) => &s[..idx],
+                None => s,
+            };
+            out.insert("formatted_output".to_string(), Value::String(capped.to_string()));
+        } else {
+            out.insert("formatted_output".to_string(), v.clone());
+        }
+    }
+    Value::Object(out)
 }
 
 fn trim_git_status(data: &Value) -> Value {
+    let branch = data.get("branch");
+    let summary = data.get("summary");
+    let modified_files = data.get("modified_files");
+    let staged_files = data.get("staged_files");
+    let untracked_files = data.get("untracked_files");
+    let changed_symbols = data.get("changed_symbols").and_then(|v| {
+        let arr = v.as_array()?;
+        Some(serde_json::Value::Array(
+            arr.iter().map(|entry| {
+                serde_json::json!({
+                    "file": entry.get("file"),
+                    "status": entry.get("status"),
+                    "symbols": take_n(entry.get("symbols").unwrap_or(&Value::Null), 5),
+                })
+            }).collect(),
+        ))
+    });
     serde_json::json!({
-        "branch": data.get("branch"),
-        "status": data.get("status"),
-        "staged": data.get("staged"),
-        "modified": data.get("modified"),
-        "untracked": data.get("untracked"),
-        "deleted": data.get("deleted"),
+        "branch": branch,
+        "summary": summary,
+        "modified_files": take_n(modified_files.unwrap_or(&Value::Null), 50),
+        "staged_files": take_n(staged_files.unwrap_or(&Value::Null), 50),
+        "untracked_files": take_n(untracked_files.unwrap_or(&Value::Null), 50),
+        "changed_symbols": changed_symbols,
     })
 }
 

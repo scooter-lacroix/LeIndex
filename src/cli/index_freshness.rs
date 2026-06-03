@@ -142,53 +142,51 @@ pub(crate) fn is_stale_fast(
     };
 
     let mut cold_manifest_paths: Option<Vec<PathBuf>> = None;
-    let mut source_count: Option<usize> = None;
     let mut cached_manifest_paths: Option<Vec<PathBuf>> = None;
     let mut cached_scan: Option<ProjectFileScan> = None;
-    match ctx.project_scan {
-        Some(cache) => {
-            source_count = Some(cache.source_paths.len());
-        }
-        None => {
-            let cache_key = crate::cli::memory::project_scan_cache_key(ctx.project_id);
-            if let Some(entry) = ctx.cache_spiller.store().peek(&cache_key) {
-                if let CacheEntry::Binary {
-                    serialized_data, ..
-                } = entry
-                {
-                    if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(serialized_data) {
-                        cached_manifest_paths = Some(scan.manifest_paths.clone());
-                        cached_scan = Some(scan.clone());
-                        source_count = Some(scan.source_paths.len());
-                    }
-                }
-            } else if let Ok(CacheEntry::Binary {
+    if ctx.project_scan.is_none() {
+        let cache_key = crate::cli::memory::project_scan_cache_key(ctx.project_id);
+        if let Some(entry) = ctx.cache_spiller.store().peek(&cache_key) {
+            if let CacheEntry::Binary {
                 serialized_data, ..
-            }) = ctx.cache_spiller.store().load_from_disk(&cache_key)
+            } = entry
             {
-                if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
+                if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(serialized_data) {
                     cached_manifest_paths = Some(scan.manifest_paths.clone());
-                    cached_scan = Some(scan.clone());
-                    source_count = Some(scan.source_paths.len());
+                    cached_scan = Some(scan);
                 }
             }
-            if source_count.is_none() {
-                match scan_fn() {
-                    Ok(scan) => {
-                        cold_manifest_paths = Some(scan.manifest_paths.clone());
-                        source_count = Some(scan.source_paths.len());
-                    }
-                    Err(_) => return true,
-                }
+        } else if let Ok(CacheEntry::Binary {
+            serialized_data, ..
+        }) = ctx.cache_spiller.store().load_from_disk(&cache_key)
+        {
+            if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
+                cached_manifest_paths = Some(scan.manifest_paths.clone());
+                cached_scan = Some(scan);
             }
         }
-    };
-    let source_count = source_count.unwrap_or(indexed_files.len());
-
-    if source_count != indexed_files.len() {
-        return true;
+        if cached_scan.is_none() {
+            match scan_fn() {
+                Ok(scan) => {
+                    cold_manifest_paths = Some(scan.manifest_paths.clone());
+                    cached_scan = Some(scan);
+                }
+                Err(_) => return true,
+            }
+        }
     }
-
+    // Source count mismatch: O(1) check that catches file additions or
+    // deletions even when directory mtimes are not updated reliably.
+    let source_count = if let Some(scan) = ctx.project_scan {
+        Some(scan.source_paths.len())
+    } else {
+        cached_scan.as_ref().map(|scan| scan.source_paths.len())
+    };
+    if let Some(count) = source_count {
+        if count != indexed_files.len() {
+            return true;
+        }
+    }
     // Directory mtime sentinel check
     let source_dirs: Vec<PathBuf> = if let Some(scan) = ctx.project_scan {
         scan.source_directories.clone()
