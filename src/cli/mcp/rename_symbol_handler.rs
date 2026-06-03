@@ -280,6 +280,23 @@ Grep + multi-file Edit with a single atomic operation."
             .map_err(JsonRpcError::internal_error)?;
         }
 
+        // Invalidate the registry's staleness cache so the next
+        // read tool re-runs `is_stale_fast` instead of reusing a
+        // pre-write `false` cached result. The watcher (when
+        // enabled via `LEINDEX_WATCHER=1`) does this on its own
+        // reindex path; this explicit call covers the
+        // watcher-disabled default mode where the 30-second
+        // negative-cache TTL would otherwise silently mask the
+        // rename. Capture the project root under a short read
+        // lock first; the rename has already been flushed to
+        // disk, so a follow-up read re-runs `is_stale_fast` from
+        // current file mtimes.
+        let project_root = {
+            let guard = handle.read().await;
+            guard.project_path().to_path_buf()
+        };
+        registry.invalidate_stale_cache(&project_root).await;
+
         let mut response_data = serde_json::json!({
             "old_name": old_name,
             "new_name": new_name,

@@ -121,6 +121,20 @@ context (symbols, types) immediately so the model knows how the new file fits in
                 ))
             })?;
 
+        // Invalidate the registry's staleness cache so the next
+        // read tool re-runs `is_stale_fast` instead of reusing a
+        // pre-write `false` cached result. The watcher (when
+        // enabled via `LEINDEX_WATCHER=1`) does this on its own
+        // reindex path; this explicit call covers the
+        // watcher-disabled default mode where the 30-second
+        // negative-cache TTL would otherwise silently mask the
+        // write.
+        let project_root = {
+            let guard = handle.read().await;
+            guard.project_path().to_path_buf()
+        };
+        registry.invalidate_stale_cache(&project_root).await;
+
         // Surface PDG context for the new file
         let language = crate::parse::grammar::LanguageId::from_extension(
             abs_path.extension().and_then(|e| e.to_str()).unwrap_or(""),

@@ -617,6 +617,21 @@ pub(super) fn render_diff_value(data: &Value, color: bool) -> String {
                 ) {
                     if let Some(hunks) = inner.get("hunks").and_then(|v| v.as_array()) {
                         out.push_str(&render_one_diff(file, inner, hunks, color));
+                    } else if let Some(s) = inner.as_str() {
+                        // Pre-rendered diff text: handlers may ship
+                        // a plain string instead of a structured
+                        // `{hunks: [...]}` object (e.g. older or
+                        // external producers). Surface the text
+                        // under the same `── file ──` header so the
+                        // user still sees the diff body instead of
+                        // just an empty header.
+                        out.push_str(&format!(
+                            "{}── {} ──{}\n{}\n",
+                            if color { LIGHT_CYAN } else { "" },
+                            file,
+                            if color { RESET } else { "" },
+                            s,
+                        ));
                     } else {
                         out.push_str(&format!(
                             "{}── {} ──{}\n",
@@ -1006,6 +1021,46 @@ mod tests {
             "(no changes) must not be colorised, got: {:?}",
             &s[no_changes_idx..no_changes_idx + 30],
         );
+    }
+
+    /// Regression for MED round 15 (gemini `3344869688`):
+    /// `render_diff_value`'s `DiffPayload::List` arm used to
+    /// silently discard pre-rendered string diffs — when an
+    /// entry's `diff` field was a plain string instead of a
+    /// `{hunks: [...]}` object, only the `── file ──` header
+    /// was emitted and the body was dropped. The post-fix code
+    /// adds an `inner.as_str()` fallback that surfaces the text
+    /// under the same header, so older/external producers that
+    /// ship a pre-rendered diff string are still rendered
+    /// correctly.
+    #[test]
+    fn test_render_diff_value_list_with_pre_rendered_string() {
+        let data = serde_json::json!({
+            "diffs": [
+                {
+                    "file": "src/foo.rs",
+                    "diff": "@@ -1,1 +1,1 @@\n-old\n+new",
+                },
+                {
+                    "file": "src/bar.rs",
+                    "diff": serde_json::json!({"hunks": []}),
+                },
+            ],
+        });
+        let s = render_diff_value(&data, false);
+        // Pre-rendered string body must appear in the output.
+        assert!(
+            s.contains("-old") && s.contains("+new"),
+            "pre-rendered diff string must be rendered, got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("src/foo.rs"),
+            "file header must be rendered, got: {:?}",
+            s
+        );
+        // Structured-but-empty entry still renders the header.
+        assert!(s.contains("src/bar.rs"));
     }
 }
 

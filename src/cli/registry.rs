@@ -271,6 +271,22 @@ impl ProjectRegistry {
         }
     }
 
+    /// Invalidate the staleness cache entry for `path`.
+    ///
+    /// Write handlers (`edit-apply`, `write-file`, `rename-symbol`)
+    /// must call this after a successful write so that the next
+    /// read tool re-runs `is_stale_fast` instead of reusing a
+    /// pre-write `false` cached result. The watcher (when enabled
+    /// via `LEINDEX_WATCHER=1`) already invalidates the cache on
+    /// its own reindex path, so the explicit call here only matters
+    /// in the watcher-disabled default mode — the case where the
+    /// 30-second negative-cache TTL was silently masking edits
+    /// behind a `false` freshness result.
+    pub async fn invalidate_stale_cache(&self, path: &Path) {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.stale_cache.write().await.remove(&canonical);
+    }
+
     /// Get an existing project, or create + load from storage (no auto-index).
     ///
     /// If `project_path` is `None`, returns the current default project.
@@ -1004,6 +1020,74 @@ mod tests {
         assert!(
             !registry.stale_cache.read().await.contains_key(&canonical),
             "stale cache entry should be removed on evict"
+        );
+    }
+
+    /// Regression for P2 round 15 (codex `3344884534`): write
+    /// handlers (`edit-apply`, `write-file`, `rename-symbol`) must
+    /// invalidate the staleness cache after a successful write so
+    /// that the next read tool re-runs `is_stale_fast` instead of
+    /// reusing a pre-write `false` cached result. The watcher
+    /// (when enabled) does this on its own reindex path; the
+    /// explicit call covers the watcher-disabled default mode
+    /// where the 30-second negative-cache TTL would otherwise
+    /// silently mask the edit.
+    #[tokio::test]
+    async fn test_invalidate_stale_cache_removes_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        let leindex = LeIndex::new(tmp.path()).unwrap();
+        let registry = ProjectRegistry::with_initial_project(5, leindex);
+
+        let canonical = tmp.path().canonicalize().unwrap();
+
+        // Prime the cache with a `false` result (the scenario
+        // the codex comment describes: a previous read tool ran
+        // `is_stale_fast` and got back `false`).
+        registry
+            .stale_cache
+            .write()
+            .await
+            .insert(canonical.clone(), (std::time::Instant::now(), false));
+        assert!(registry.stale_cache.read().await.contains_key(&canonical));
+
+        // The write handler calls this after the disk write.
+        registry.invalidate_stale_cache(&canonical).await;
+
+        assert!(
+            !registry.stale_cache.read().await.contains_key(&canonical),
+            "stale cache entry must be removed on invalidate"
+        );
+    }
+
+    /// `invalidate_stale_cache` canonicalises its input the same
+    /// way the cache key is built (the cache is keyed on
+    /// `project_path.canonicalize()`), so a caller passing either
+    /// a relative or non-canonical path still finds the entry.
+    #[tokio::test]
+    async fn test_invalidate_stale_cache_canonicalises_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        let leindex = LeIndex::new(tmp.path()).unwrap();
+        let registry = ProjectRegistry::with_initial_project(5, leindex);
+
+        let canonical = tmp.path().canonicalize().unwrap();
+        registry
+            .stale_cache
+            .write()
+            .await
+            .insert(canonical.clone(), (std::time::Instant::now(), false));
+
+        // Pass a non-canonical path (the temp dir as-is — on
+        // macOS this is under `/var/folders/...` which is itself
+        // a symlink-resolved path so canonicalize is a no-op,
+        // but the test still exercises the canonicalize branch).
+        registry.invalidate_stale_cache(tmp.path()).await;
+        assert!(
+            !registry.stale_cache.read().await.contains_key(&canonical),
+            "invalidate must canonicalise the input before lookup"
         );
     }
 }

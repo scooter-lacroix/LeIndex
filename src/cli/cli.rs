@@ -1041,7 +1041,7 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
     let bound_addr = listener
         .local_addr()
         .context("Failed to read bound address")?;
-    if bound_addr != addr {
+    if bound_addr.port() != addr.port() {
         eprintln!(
             "\nWARNING: preferred port {} was unavailable; bound to fallback {}\n",
             addr.port(),

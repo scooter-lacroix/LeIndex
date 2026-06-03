@@ -220,7 +220,17 @@ multiple or byte-offset edits. Supports dry_run=true for preview."
             tracing::warn!("Failed to refresh index after edit-apply: {}", e);
             // Continue despite reindex failure - edit was applied successfully
         }
+        let project_root = guard.project_path().to_path_buf();
         drop(guard); // Release write lock before continuing
+
+        // 5a. Invalidate the registry's staleness cache so the next
+        // read tool re-runs `is_stale_fast` instead of reusing a
+        // pre-write `false` cached result. The watcher (when enabled)
+        // does this on its own reindex path; this explicit call
+        // covers the watcher-disabled default mode where the
+        // 30-second negative-cache TTL would otherwise silently
+        // mask the edit.
+        registry.invalidate_stale_cache(&project_root).await;
 
         // 6. PDG Context Enrichment
         let mut affected_nodes: Vec<String> = Vec::new();
