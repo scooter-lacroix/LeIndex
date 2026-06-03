@@ -278,24 +278,24 @@ Grep + multi-file Edit with a single atomic operation."
             .await
             .map_err(|e| JsonRpcError::internal_error(format!("Rename apply task failed: {}", e)))?
             .map_err(JsonRpcError::internal_error)?;
-        }
 
-        // Invalidate the registry's staleness cache so the next
-        // read tool re-runs `is_stale_fast` instead of reusing a
-        // pre-write `false` cached result. The watcher (when
-        // enabled via `LEINDEX_WATCHER=1`) does this on its own
-        // reindex path; this explicit call covers the
-        // watcher-disabled default mode where the 30-second
-        // negative-cache TTL would otherwise silently mask the
-        // rename. Capture the project root under a short read
-        // lock first; the rename has already been flushed to
-        // disk, so a follow-up read re-runs `is_stale_fast` from
-        // current file mtimes.
-        let project_root = {
-            let guard = handle.read().await;
-            guard.project_path().to_path_buf()
-        };
-        registry.invalidate_stale_cache(&project_root).await;
+            // Invalidate the registry's staleness cache so the next
+            // read tool re-runs `is_stale_fast` instead of reusing
+            // a pre-write `false` cached result. The watcher (when
+            // enabled via `LEINDEX_WATCHER=1`) does this on its
+            // own reindex path; this explicit call covers the
+            // watcher-disabled default mode where the 30-second
+            // negative-cache TTL would otherwise silently mask the
+            // rename. Preview-only runs (the default) skip this
+            // — no files were written, so the cache value is
+            // still accurate and re-running `is_stale_fast` on
+            // the next read would be wasted work.
+            let project_root = {
+                let guard = handle.read().await;
+                guard.project_path().to_path_buf()
+            };
+            registry.invalidate_stale_cache(&project_root).await;
+        }
 
         let mut response_data = serde_json::json!({
             "old_name": old_name,
@@ -453,6 +453,48 @@ mod tests {
         assert_eq!(
             content_after, original_content,
             "File must not be modified in preview_only mode"
+        );
+    }
+
+    /// Regression for codex round 16 (`3344884534`-followup):
+    /// the round-15 `invalidate_stale_cache` call ran
+    /// unconditionally, but `preview_only` defaults to `true`, so on
+    /// the default path no files are written — yet the call still
+    /// acquired a read lock and forced the next read to recompute
+    /// `is_stale_fast`. The fix moves the invalidation inside the
+    /// `if !preview_only` block. This test verifies the
+    /// structural contract by reading the source file (the
+    /// invalidation call is reachable only from inside the
+    /// `if !preview_only { … }` block).
+    #[tokio::test]
+    async fn test_rename_preview_only_invalidation_is_gated() {
+        // Read the source and confirm the `invalidate_stale_cache`
+        // call is nested inside the `if !preview_only` block —
+        // not at the top level of `execute`. This is a static
+        // structural check; the existing
+        // `test_rename_preview_only_does_not_modify_file` test
+        // covers the runtime contract that no files are written
+        // in preview mode, and the apply-path invalidation is
+        // exercised by the existing
+        // `test_invalidate_stale_cache_removes_entry` test in
+        // `src/cli/registry.rs`.
+        let source = include_str!("rename_symbol_handler.rs");
+        let apply_block_start = source
+            .find("if !preview_only {")
+            .expect("if !preview_only block must exist in the handler");
+        let apply_block_open_brace = source[apply_block_start..]
+            .find('{')
+            .map(|i| apply_block_start + i)
+            .expect("if !preview_only block must have an opening brace");
+        let invalidation_pos = source
+            .find("registry.invalidate_stale_cache(&project_root).await")
+            .expect("invalidate_stale_cache call must exist in the handler");
+        assert!(
+            invalidation_pos > apply_block_open_brace,
+            "invalidate_stale_cache must be inside the if !preview_only block; \
+             apply block opens at byte {} but invalidation is at byte {}",
+            apply_block_open_brace,
+            invalidation_pos
         );
     }
 

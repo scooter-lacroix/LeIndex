@@ -86,7 +86,17 @@ impl IndexWatcher {
         // Debounced consumer — coalesces events over the configured window
         let debounce_interval = tokio::time::Duration::from_millis(DEBOUNCE_INTERVAL_MS);
         tokio::spawn(async move {
+            // `Interval::MissedTickBehavior::Delay` makes the next
+            // tick fire one full period after the body returns
+            // (rather than bursting all missed ticks). Combined
+            // with the `debounce.reset()` calls below, this caps
+            // the reindex re-spawn rate at one per `debounce_interval`
+            // even when the body sets `dirty = true` (Skipped /
+            // Failed / join error): the interval is reset to a full
+            // period from "now", so a tight re-spawn loop is
+            // impossible.
             let mut debounce = tokio::time::interval(debounce_interval);
+            debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut dirty = false;
 
             loop {
@@ -180,16 +190,26 @@ impl IndexWatcher {
                             match tokio::time::timeout(reindex_budget, blocking).await {
                                 Ok(Ok(ReindexOutcome::Completed)) => {}
                                 Ok(Ok(ReindexOutcome::Skipped)) => {
-                                    // Lock was busy for the full
-                                    // budget — preserve `dirty` so
-                                    // the next debounce tick
-                                    // retries instead of silently
-                                    // dropping the changes.
+                                    // Lock is currently held by
+                                    // another reindex (fail-fast
+                                    // `try_write` returned
+                                    // `Skipped`). Preserve `dirty`
+                                    // and reset the debounce so the
+                                    // next tick retries instead of
+                                    // silently dropping the changes
+                                    // — without the reset, the
+                                    // `Interval` would fire its
+                                    // already-elapsed next tick on
+                                    // the very next loop iteration,
+                                    // re-spawning a `spawn_blocking`
+                                    // task immediately. The reset
+                                    // caps the re-spawn rate at one
+                                    // per `debounce_interval`.
                                     warn!(
-                                        "Watcher: skipping reindex; write lock busy for >{}s",
-                                        REINDEX_BUDGET_SECS
+                                        "Watcher: skipping reindex; write lock is currently busy"
                                     );
                                     dirty = true;
+                                    debounce.reset();
                                 }
                                 Ok(Ok(ReindexOutcome::Failed(reason))) => {
                                     // The reindex body errored or
@@ -197,26 +217,30 @@ impl IndexWatcher {
                                     // released via `Drop`, but the
                                     // on-disk / in-memory state is
                                     // potentially inconsistent —
-                                    // re-arm `dirty` so the next
-                                    // debounce tick retries with a
-                                    // full rebuild.
+                                    // re-arm `dirty` and reset the
+                                    // debounce so the next tick
+                                    // retries with a full rebuild.
                                     warn!(
                                         "Watcher: reindex did not complete cleanly ({}); retrying on next tick",
                                         reason
                                     );
                                     dirty = true;
+                                    debounce.reset();
                                 }
                                 Ok(Err(join_err)) => {
                                     // `spawn_blocking` itself failed
                                     // (panic inside the task). The
                                     // lock state is undefined here;
-                                    // surface the error and let the
-                                    // next tick re-arm the reindex.
+                                    // surface the error, re-arm
+                                    // `dirty`, and reset the
+                                    // debounce so the next tick
+                                    // retries.
                                     warn!(
                                         "Watcher: reindex task join failed: {}",
                                         join_err
                                     );
                                     dirty = true;
+                                    debounce.reset();
                                 }
                                 Err(_) => {
                                     // Reindex exceeded the budget.
@@ -238,11 +262,18 @@ impl IndexWatcher {
                                     // reindex. The change is still
                                     // recorded in the watcher's
                                     // event channel if another file
-                                    // mutation occurs.
+                                    // mutation occurs. The
+                                    // `debounce.reset()` waits a
+                                    // full `debounce_interval` from
+                                    // "now" before the next tick,
+                                    // matching the explicit
+                                    // "suppress the immediate retry"
+                                    // contract.
                                     warn!(
                                         "Auto-reindex exceeded {}s budget; detached (lock will drop on reindex completion)",
                                         REINDEX_BUDGET_SECS
                                     );
+                                    debounce.reset();
                                 }
                             }
                         }
@@ -255,19 +286,18 @@ impl IndexWatcher {
     }
 }
 
-/// Try to acquire the per-project write lock within `budget` total time.
+/// Try to acquire the per-project write lock once and return
+/// immediately.
 ///
-/// Returns `LockAcquire::Acquired(guard)` if the lock was obtained, or
-/// `LockAcquire::Skipped` if the budget elapsed while the lock was held
-/// by another caller. The busy-wait with `std::thread::sleep` runs
-/// inside `spawn_blocking`, so the threadpool impact is bounded to
-/// one thread per project for at most `REINDEX_BUDGET_SECS` (default
-/// 30s). The outer `tokio::time::timeout` on the `spawn_blocking` join
-/// Try to acquire the project write lock once and return
-/// immediately. On `try_write` failure we return `Skipped`; the
-/// outer async watcher loop's debounced retry path (sleep when
-/// `dirty = true`) handles retries, so the spawn_blocking thread
-/// is never pinned waiting for the lock.
+/// Calls [`ProjectHandle::try_write`] (a non-blocking
+/// `try_lock`) and returns [`LockAcquire::Acquired`] with the
+/// guard on success, or [`LockAcquire::Skipped`] if the lock is
+/// currently held. There is no budget, no sleep, and no
+/// `spawn_blocking` involvement: the function is fail-fast and
+/// returns within microseconds. Retries are the caller's
+/// responsibility — the outer async watcher loop's debounced
+/// retry path (`debounce.reset()` + `dirty = true`) handles
+/// the case where the lock was busy.
 fn try_acquire_lock<'a>(handle: &'a ProjectHandle) -> LockAcquire<'a> {
     match handle.try_write() {
         Ok(g) => LockAcquire::Acquired(g),
@@ -397,5 +427,68 @@ mod tests {
             "try_acquire_lock must be fail-fast; took {:?} (would be ~30s with the old budgeted loop)",
             elapsed
         );
+    }
+
+    /// Regression for CRITICAL round 16 (gemini `3344869691` + busy-loop
+    /// followup): when the reindex body sets `dirty = true` (Skipped,
+    /// Failed, or join error), the debounce interval must be reset so
+    /// the next tick fires one full `debounce_interval` from "now"
+    /// rather than from the previous tick. Without the reset, a busy
+    /// lock would cause a tight re-spawn loop where each iteration
+    /// immediately re-fires the already-elapsed tick.
+    ///
+    /// This test verifies the `Interval::reset()` contract under
+    /// `tokio::time::pause()`: after consuming a tick, the next tick
+    /// is pending; calling `reset()` keeps the next tick pending (it
+    /// has been rescheduled to `now + period`); advancing by the
+    /// full period makes the next tick ready. This is the exact
+    /// sequence the watcher body uses when it sets `dirty = true`
+    /// in the Skipped / Failed / join-error / timeout arms.
+    #[tokio::test(start_paused = true)]
+    async fn test_debounce_resets_on_dirty_re_arm() {
+        use std::time::Duration;
+        let debounce_interval = Duration::from_millis(500);
+        let mut debounce = tokio::time::interval(debounce_interval);
+        debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        // First tick is immediate (Interval starts with a ready tick).
+        // This represents the initial debounce firing on watcher
+        // startup before any file event has arrived.
+        tokio::time::timeout(Duration::from_millis(10), debounce.tick())
+            .await
+            .expect("first tick must be ready");
+
+        // Without reset, the next tick is at +debounce_interval from
+        // the previous tick. Verify it is not yet ready.
+        tokio::time::timeout(Duration::from_millis(10), debounce.tick())
+            .await
+            .expect_err("next tick must NOT be ready immediately after consume");
+
+        // Simulate the body setting `dirty = true` and calling
+        // `debounce.reset()`: advance the clock by a small amount
+        // (representing the time spent in the reindex body) and
+        // call `reset()` to reschedule the next tick to `now + period`.
+        tokio::time::advance(Duration::from_millis(10)).await;
+        debounce.reset();
+
+        // After reset(), the next tick must NOT be ready — it has
+        // been rescheduled to `now + debounce_interval`. If the
+        // production code skipped the `reset()` call, the next tick
+        // would fire at the original schedule (now + remaining
+        // period), which is what causes the re-spawn storm. The
+        // reset pushes the next attempt to a full period from the
+        // current time, capping the re-spawn rate.
+        tokio::time::timeout(Duration::from_millis(10), debounce.tick())
+            .await
+            .expect_err("post-reset tick must NOT be ready immediately");
+
+        // Advance the clock by the full `debounce_interval`. The
+        // reset window has elapsed; the next tick must now be
+        // ready. This proves the reset moved the tick to
+        // `now + period` rather than the original schedule.
+        tokio::time::advance(debounce_interval).await;
+        tokio::time::timeout(Duration::from_millis(10), debounce.tick())
+            .await
+            .expect("tick must fire after one full debounce_interval from reset");
     }
 }
