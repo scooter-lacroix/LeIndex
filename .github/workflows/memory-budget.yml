@@ -58,12 +58,54 @@ jobs:
             memcheck-${{ runner.os }}-
 
       - name: Download model assets
+        env:
+          # Authenticated HuggingFace requests get a higher rate
+          # limit per IP. The token is optional — when the
+          # workflow has no `HF_TOKEN` secret, unauthenticated
+          # requests still work, just with a tighter per-minute
+          # cap that the retry policy below absorbs.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          set -e
           mkdir -p models
           HF_REPO="onnx-community/Qwen3-Embedding-0.6B-ONNX"
-          curl --fail --location --progress-bar -o models/qwen3-embed-0.6b.onnx \
+          # HuggingFace serves from a CDN that returns HTTP 429
+          # (Too Many Requests) under bursty CI load. The default
+          # curl behaviour is to fail on the first 429, which
+          # is what caused the 2026-06-02 memory-budget run to
+          # fail. We:
+          #   - retry up to 5 times on ANY error (the
+          #     --retry-all-errors flag), so transient 429s are
+          #     absorbed without manual re-runs
+          #   - wait 15s between retries (--retry-delay) so we
+          #     back off past the rate-limit window
+          #   - cap each curl call at 5 minutes (--retry-max-time)
+          #     so a wedged connection cannot stall the workflow
+          #   - use --retry-connrefused so a CDN edge node that
+          #     drops the TCP connection also triggers a retry
+          #   - pass the token as a Bearer header when present
+          #     (HF raises the per-IP cap for authenticated
+          #     clients; absent the token, unauthenticated
+          #     requests still work, just with tighter limits)
+          HF_AUTH=()
+          if [[ -n "${HF_TOKEN}" ]]; then
+            HF_AUTH=(-H "Authorization: Bearer ${HF_TOKEN}")
+          fi
+          CURL_COMMON=(
+            --fail
+            --location
+            --progress-bar
+            --retry 5
+            --retry-delay 15
+            --retry-all-errors
+            --retry-connrefused
+            --retry-max-time 300
+          )
+          curl "${CURL_COMMON[@]}" "${HF_AUTH[@]}" \
+            -o models/qwen3-embed-0.6b.onnx \
             "https://huggingface.co/${HF_REPO}/resolve/main/onnx/model.onnx"
-          curl --fail --location --progress-bar -o models/tokenizer.json \
+          curl "${CURL_COMMON[@]}" "${HF_AUTH[@]}" \
+            -o models/tokenizer.json \
             "https://huggingface.co/${HF_REPO}/resolve/main/tokenizer.json"
 
       - name: Build release binary

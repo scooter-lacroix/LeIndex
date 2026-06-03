@@ -233,7 +233,7 @@ impl TrigramIndex {
         let entry_count = self.postings.len() as u32;
         // Pre-pass: compute exact size to avoid over-allocation.
         // Header: 4 (version) + 4 (entry count). Per entry: 4 (key) + 4 (len) + 4 * posting_list.len().
-        let total_size: usize = 4 + 4 + self.postings.iter().map(|(_, list)| 8 + list.len() * 4).sum::<usize>();
+        let total_size: usize = 4 + 4 + self.postings.values().map(|list| 8 + list.len() * 4).sum::<usize>();
         let mut buf = Vec::with_capacity(total_size);
 
         buf.extend_from_slice(&TRIGRAM_INDEX_VERSION.to_le_bytes());

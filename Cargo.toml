@@ -1,6 +1,6 @@
 [package]
 name = "leindex"
-version = "1.7.1"
+version = "1.8.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["LeIndex Contributors"]
@@ -287,7 +287,7 @@ unicode-normalization = { version = "0.1", optional = true }
 # ONNX Runtime dependencies — delegated to the worker crate (VAL-CPHASE-002)
 # The main crate depends only on the protocol types (no ONNX runtime deps).
 # The worker binary enables the `onnx` feature separately.
-leindex-embed = { version = "1.7.1", path = "crates/leindex-embed", optional = true, default-features = false }
+leindex-embed = { version = "1.8.0", path = "crates/leindex-embed", optional = true, default-features = false }
 
 # Remote embedding API dependencies (for cloud-based embeddings)
 reqwest = { version = "0.12", features = ["json", "rustls-tls-webpki-roots", "gzip", "deflate"], optional = true, default-features = false }

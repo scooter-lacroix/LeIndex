@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 1.7.1 - Rust Edition
+# Version: 1.8.0 - Rust Edition
 # Platform: macOS
 #
 # Installer:
@@ -17,7 +17,7 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="1.7.1"
+readonly SCRIPT_VERSION="1.8.0"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1

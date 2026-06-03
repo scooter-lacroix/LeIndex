@@ -451,7 +451,7 @@ leindex serve [OPTIONS]
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--host <HOST>` | 127.0.0.1 | Host address to bind to |
-| `--port <PORT>` | 47268 | Port to listen on |
+| `--port <PORT>` | 47500 | Port to listen on |
 
 #### Examples
 
@@ -480,7 +480,7 @@ leindex -p /path/to/project serve --port 4000
 ```
 LeIndex MCP Server
 
-Server starting on http://127.0.0.1:47268
+Server starting on http://127.0.0.1:47500
 
 Available endpoints:
   POST /mcp           - JSON-RPC 2.0 endpoint
@@ -488,7 +488,7 @@ Available endpoints:
   GET  /health         - Health check
 
 Configuration:
-  Port: 47268 (override with LEINDEX_PORT env var)
+  Port: 47500 (override with LEINDEX_PORT env var; auto-falls back to next consecutive ports if taken)
 
 Press Ctrl+C to stop the server
 ```
@@ -645,7 +645,7 @@ leindex dashboard --port 3001
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LEINDEX_PORT` | 47268 | Override default port for `serve` command |
+| `LEINDEX_PORT` | 47500 | Override default port for `serve` command |
 | `LEINDEX_DASHBOARD_DIR` | `~/.leindex/dashboard` | Override dashboard asset directory |
 | `RUST_LOG` | info | Logging level (debug, trace, warn, error) |
 
@@ -719,7 +719,7 @@ leindex serve --port 3000
 LEINDEX_PORT=3000 leindex serve
 
 # Find what's using the port
-lsof -i :47268
+lsof -i :47500
 ```
 
 ### Slow Search Results
@@ -764,7 +764,7 @@ leindex -v index /path/to/project
 **Solution:**
 ```bash
 # Verify server is running
-curl http://127.0.0.1:47268/health
+curl http://127.0.0.1:47500/health
 
 # Check server logs
 leindex -v serve

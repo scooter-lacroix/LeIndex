@@ -135,7 +135,7 @@ The npm package downloads a platform-specific bundle containing the main binary,
 | Name | Required | Description | Default |
 |------|----------|-------------|---------|
 | `LEINDEX_HOME` | No | Override storage/index home directory | `~/.leindex` |
-| `LEINDEX_PORT` | No | Override HTTP server port | `47268` |
+| `LEINDEX_PORT` | No | Override HTTP server port | `47500` |
 
 ### Index and search
 
@@ -183,7 +183,7 @@ LeIndex runs as an **MCP server**, allowing tools like **Claude Code**, **Cursor
 leindex mcp
 
 # Or run the HTTP MCP server
-leindex serve --host 127.0.0.1 --port 47268
+leindex serve --host 127.0.0.1 --port 47500
 ```
 
 ```text
@@ -286,8 +286,8 @@ Every MCP tool is also available from the CLI bridge:
 
 ```bash
 leindex tools list
-leindex tools help leindex_project_map
-leindex tools run leindex_project_map --args '{"path":"src","depth":2}'
+leindex tools help leindex-project-map
+leindex tools run leindex-project-map --args '{"path":"src","depth":2}'
 ```
 
 <details>
@@ -620,26 +620,57 @@ If no embedding backend is configured, LeIndex falls back to TF-IDF for keyword-
 
 ---
 
-## MCP Tools (16)
+## MCP Tools (20)
 
 | Tool | Purpose |
 |------|---------|
-| `leindex_index` | Index a project |
-| `leindex_search` | Semantic code search |
-| `leindex_deep_analyze` | Deep analysis with PDG traversal |
-| `leindex_context` | Expand context around a symbol |
-| `leindex_phase_analysis` | 5-phase additive analysis |
-| `leindex_file_summary` | Structural file analysis |
-| `leindex_symbol_lookup` | Symbol definition + callers/callees |
-| `leindex_project_map` | Annotated project structure |
-| `leindex_grep_symbols` | Structural symbol search |
-| `leindex_read_symbol` | Read symbol source with deps |
-| `leindex_edit_preview` | Preview edits with impact report |
-| `leindex_edit_apply` | Apply code edits |
-| `leindex_rename_symbol` | Rename across all references |
-| `leindex_impact_analysis` | Blast radius analysis |
-| `leindex_diagnostics` | Index health and stats |
-| `phase_analysis` | Alias for phase analysis |
+| `LeIndex [Context]` | Expand context around a code node via PDG |
+| `LeIndex [Deep Analyze]` | Deep analysis: semantic + PDG traversal |
+| `LeIndex [Diagnostics]` | Index health and stats |
+| `LeIndex [Edit Apply]` | PRIMARY file editor (use instead of `edit_file`) |
+| `LeIndex [Edit Preview]` | Preview a code edit with impact report |
+| `LeIndex [File Summary]` | Structural file analysis |
+| `LeIndex [Git Status]` | Git status with PDG structural analysis |
+| `LeIndex [Grep Symbols]` | Structural symbol search |
+| `LeIndex [Impact Analysis]` | Blast radius analysis |
+| `LeIndex [Index]` | Index a project |
+| `LeIndex [Phase Analysis]` | 5-phase additive analysis |
+| `Phase Analysis` | Compatibility alias for `LeIndex [Phase Analysis]` (same handler, no-bracket title for legacy clients) |
+| `LeIndex [Project Map]` | Annotated project structure |
+| `LeIndex [Read File]` | PRIMARY file reader (replaces `Read`) |
+| `LeIndex [Read Symbol]` | PRIMARY symbol reader (replaces `Read` for symbols) |
+| `LeIndex [Rename Symbol]` | Rename across all references |
+| `LeIndex [Search]` | Semantic code search |
+| `LeIndex [Symbol Lookup]` | Symbol definition + callers/callees |
+| `LeIndex [Text Search]` | PRIMARY text search (replaces `Grep`/`rg`) |
+| `LeIndex [Write]` | Create or overwrite a file |
+
+MCP tool names returned by `tools/list` are the exact strings emitted
+by each handler (e.g. `leindex.index`, `leindex.search`,
+`leindex.edit-preview`, `leindex.write`). The naming is a **mix** of
+dotted and hyphenated forms — single-word tools use a dot
+(`leindex.context`, `leindex.index`, `leindex.search`, `leindex.write`,
+`leindex.diagnostics`), multi-word tools use hyphens
+(`leindex.edit-preview`, `leindex.edit-apply`, `leindex.read-file`,
+`leindex.symbol-lookup`, `leindex.phase-analysis`, etc.). Use these
+exact names when calling `tools/call` — dispatch in
+`handle_tool_call` is exact-equality on the handler name, so a
+hyphen-vs-dot mismatch (e.g. `leindex-search` vs `leindex.search`)
+returns `method-not-found`. The display form above (`LeIndex [...]`)
+is the human-readable title; it is not accepted on the wire. The
+underscore form (`leindex_edit_preview`) is only used by the CLI
+bridge (`leindex tools help`, `leindex tools run`).
+
+### Output formatting
+
+- **MCP payloads** are trimmed to the minimum needed for an LLM: short
+  snippets, capped counts, dropped internal byte ranges and verbose
+  fields. No ANSI color, no UI chrome.
+- **CLI output** is rendered for human reading: split-view color diffs
+  for `LeIndex [Edit Preview]`, `LeIndex [Edit Apply]`, and
+  `LeIndex [Rename Symbol]` (line numbers + `│` separator + paired
+  `+`/`-` markers); tree-style map for `LeIndex [Project Map]`;
+  structured tables for `LeIndex [Search]` and `LeIndex [Context]`.
 
 ---
 

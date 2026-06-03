@@ -519,15 +519,16 @@ pub(crate) fn find_normalised_whitespace(haystack: &str, needle: &str) -> Option
     None
 }
 
-/// Generate a unified diff between two strings.
-pub(crate) fn make_diff(original: &str, modified: &str, file_path: &str) -> String {
-    let patch = diffy::create_patch(original, modified);
-    let patch_str = patch.to_string();
-    if patch_str.is_empty() {
-        format!("--- {}\n+++ {}\n(no changes)\n", file_path, file_path)
-    } else {
-        format!("--- {}\n+++ {}\n{}", file_path, file_path, patch_str)
-    }
+/// Generate a structured diff between two strings. Handlers return the
+/// JSON shape (so the LLM gets a clean, parseable diff) and callers
+/// that want a string render it via `output::render_unified_diff` or
+/// `output::render_split_diff`.
+pub(crate) fn make_diff(
+    original: &str,
+    modified: &str,
+    file_path: &str,
+) -> crate::cli::mcp::output::DiffResult {
+    crate::cli::mcp::output::compute_diff(original, modified, file_path)
 }
 
 /// JSON schema for the phase analysis tool arguments.
@@ -932,19 +933,13 @@ mod tests {
     }
 
     #[test]
-    fn test_make_diff_generates_unified_diff() {
+    fn test_make_diff_generates_structured_diff() {
         let original = "line1\nline2\nline3\n";
         let modified = "line1\nmodified\nline3\n";
         let diff = make_diff(original, modified, "test.rs");
-        assert!(
-            diff.contains("--- test.rs"),
-            "Should have original file header"
-        );
-        assert!(
-            diff.contains("+++ test.rs"),
-            "Should have modified file header"
-        );
-        assert!(diff.contains("-line2"), "Should show removed line");
-        assert!(diff.contains("+modified"), "Should show added line");
+        assert_eq!(diff.file_path, "test.rs");
+        assert_eq!(diff.additions, 1);
+        assert_eq!(diff.deletions, 1);
+        assert!(diff.has_changes());
     }
 }

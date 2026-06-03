@@ -15,6 +15,28 @@ use super::history::EditHistory;
 use crate::graph::pdg::ProgramDependenceGraph as PDG;
 use crate::storage::{Storage, UniqueProjectId};
 
+/// Returns true when `error` reports a cross-device rename/copy.
+///
+/// `std::io::ErrorKind::CrossesDevices` is only stable from Rust 1.85, but
+/// this crate targets MSRV 1.75. We compare the platform's raw OS error
+/// code instead so the same logic works everywhere. The constants are
+/// pulled from the platform's system headers at build time via the
+/// `libc` crate so they are never out of sync with the host kernel.
+fn is_cross_device_error(error: &std::io::Error) -> bool {
+    // EXDEV: <asm-generic/errno-base.h> on Linux and <sys/errno.h> on
+    // macOS/BSDs. ERROR_NOT_SAME_DEVICE: <winerror.h> on Windows, but the
+    // `libc` crate does not bind Win32 API error codes (only POSIX + the
+    // C standard library), so we hardcode the numeric value 17 on
+    // Windows. On non-unix, non-windows targets the check is a no-op.
+    #[cfg(unix)]
+    let code = libc::EXDEV;
+    #[cfg(windows)]
+    let code = 17; // Win32 ERROR_NOT_SAME_DEVICE
+    #[cfg(not(any(unix, windows)))]
+    let code = 0;
+    error.raw_os_error() == Some(code)
+}
+
 /// Error types for the edit engine.
 #[derive(thiserror::Error, Debug)]
 pub enum EditError {
@@ -1247,7 +1269,7 @@ impl WorktreeSession {
                 let backup_result = std::fs::rename(original, backup_path);
                 if let Err(e) = backup_result {
                     // Check if it's a cross-device error
-                    if e.kind() == std::io::ErrorKind::CrossesDevices {
+                    if is_cross_device_error(&e) {
                         // Fallback to copy + remove for cross-device moves
                         if let Err(copy_err) = std::fs::copy(original, backup_path) {
                             // Roll back previously processed files
@@ -1286,7 +1308,7 @@ impl WorktreeSession {
             let move_result = std::fs::rename(staged, original);
             if let Err(e) = move_result {
                 // Check if it's a cross-device error
-                if e.kind() == std::io::ErrorKind::CrossesDevices {
+                if is_cross_device_error(&e) {
                     // Fallback to copy + remove for cross-device moves
                     if let Err(copy_err) = std::fs::copy(staged, original) {
                         // Restore backup if it was created

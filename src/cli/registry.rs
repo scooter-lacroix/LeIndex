@@ -43,6 +43,33 @@ use tracing::{debug, info, warn};
 /// Default maximum number of projects kept in memory simultaneously.
 pub const DEFAULT_MAX_PROJECTS: usize = 5;
 
+/// TTL for the per-project staleness cache.
+///
+/// `is_stale_fast` walks the source directory tree (even after the dead
+/// `walkdir` block is removed, it still does many `stat()` calls). At 2
+/// seconds the cache was thrashing under normal editor save patterns,
+/// causing every tool call to re-stat hundreds of files. 30 seconds is a
+/// good balance: edits are noticed within a reasonable window, but a burst
+/// of tool calls shares one freshness check.
+pub const STALE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Environment variable that explicitly enables the file-watcher auto-reindex.
+///
+/// Default is OFF because the recursive watcher is the single largest source
+/// of "operations hang / time out" reports: it fires on every file change
+/// (cargo build, git, editor saves, target/ churn) and holds the per-project
+/// write lock, blocking every other tool call for the duration of the
+/// incremental reindex. Set `LEINDEX_WATCHER=1` to opt in.
+pub const WATCHER_ENABLE_ENV: &str = "LEINDEX_WATCHER";
+
+/// Returns true if the file-watcher is enabled for this process.
+pub fn watcher_enabled() -> bool {
+    match std::env::var(WATCHER_ENABLE_ENV) {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ProjectRwLock — read/write API over a Mutex for !Sync inner types
 // ---------------------------------------------------------------------------
@@ -188,7 +215,11 @@ pub struct ProjectRegistry {
     watchers: Mutex<HashMap<PathBuf, IndexWatcher>>,
 
     /// Per-project staleness cache: (timestamp, stale_result).
-    /// Avoids re-computing is_stale_fast on every tool call within a 2-second window.
+    ///
+    /// Avoids re-computing `is_stale_fast` on every tool call. The TTL is
+    /// `STALE_CACHE_TTL` (30 seconds) — long enough to coalesce the burst
+    /// of freshness checks that arrive at startup, short enough that a
+    /// file edit becomes visible to subsequent reads within reasonable time.
     stale_cache: RwLock<HashMap<PathBuf, (std::time::Instant, bool)>>,
 }
 
@@ -219,12 +250,15 @@ impl ProjectRegistry {
 
         let mut slots = HashMap::new();
         slots.insert(path.clone(), Arc::new(Mutex::new(())));
+        // File-watcher is opt-in. The default behavior (no watcher) keeps
+        // every other tool call latency-free during dev work; users who
+        // want hot auto-reindex set `LEINDEX_WATCHER=1`.
         let mut watchers = HashMap::new();
-        watchers.insert(
-            path.clone(),
-            IndexWatcher::start(path.clone(), handle.clone())
-                .expect("failed to start watcher for initial project"),
-        );
+        if watcher_enabled() {
+            if let Ok(w) = IndexWatcher::start(path.clone(), handle.clone()) {
+                watchers.insert(path.clone(), w);
+            }
+        }
 
         Self {
             projects: RwLock::new(map),
@@ -235,6 +269,23 @@ impl ProjectRegistry {
             watchers: Mutex::new(watchers),
             stale_cache: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Invalidate the staleness cache entry for `path`.
+    ///
+    /// Write handlers (`edit-apply`, `write-file`, `rename-symbol`)
+    /// must call this after a successful write so that the next
+    /// read tool re-runs `is_stale_fast` instead of reusing a
+    /// pre-write `false` cached result.
+    ///
+    /// `path` **must** be an already-canonicalized project path (e.g.
+    /// the return value of [`ProjectHandle::project_path`]). The cache
+    /// key is built from [`LeIndex::project_path`], which is
+    /// canonicalized at construction time. Every built-in caller
+    /// passes `guard.project_path().to_path_buf()`, which satisfies
+    /// this contract.
+    pub async fn invalidate_stale_cache(&self, path: &Path) {
+        self.stale_cache.write().await.remove(path);
     }
 
     /// Get an existing project, or create + load from storage (no auto-index).
@@ -275,13 +326,13 @@ impl ProjectRegistry {
             let idx = handle.read().await;
             let not_indexed = !idx.is_indexed();
 
-            // Check stale cache first (2-second TTL)
+            // Check stale cache first (STALE_CACHE_TTL).
             let stale = if not_indexed {
                 false
             } else {
                 let cache = self.stale_cache.read().await;
                 if let Some((ts, result)) = cache.get(&canonical) {
-                    if ts.elapsed() < std::time::Duration::from_secs(2) {
+                    if ts.elapsed() < STALE_CACHE_TTL {
                         *result
                     } else {
                         // Cache expired — compute fresh
@@ -311,9 +362,15 @@ impl ProjectRegistry {
             let _ = self.index_handle(&handle, false).await?;
             // stale_cache is invalidated inside index_handle() after successful swap
         } else if needs_refresh {
-            let _ = self.index_handle(&handle, false).await?;
-            debug!("Auto-refreshed stale index");
-            // stale_cache is invalidated inside index_handle() after successful swap
+            // Read paths (search/symbol-lookup/etc.) must NEVER auto-trigger a
+            // full reindex — that's the single biggest source of "all
+            // operations hang and time out" reports. If the on-disk index is
+            // stale we serve the existing results with a `_warning` field
+            // (added in `wrap_with_meta`) so the caller knows.
+            //
+            // Use the explicit `leindex.index` tool (force_reindex=true) to
+            // rebuild the index when freshness matters.
+            debug!("Index is stale; serving existing results without auto-rebuild");
         }
 
         Ok(handle)
@@ -472,8 +529,19 @@ impl ProjectRegistry {
             projects.insert(canonical.clone(), handle.clone());
         }
 
-        // Start file watcher for auto-reindex
-        {
+        // Start file watcher for auto-reindex — opt-in only.
+        //
+        // The watcher is the single largest contributor to "all operations
+        // time out" reports. It is recursive on the project root (including
+        // `target/`, `node_modules/`, `leann_index/`, etc.) and triggers an
+        // incremental reindex on every filesystem event. The reindex holds
+        // the per-project write lock, so any concurrent tool call waits for
+        // it to complete — under normal dev activity (cargo build, git
+        // status, editor save), this can block for many seconds.
+        //
+        // Default off. Enable with `LEINDEX_WATCHER=1` if hot auto-reindex
+        // is actually needed.
+        if watcher_enabled() {
             let mut watchers = self.watchers.lock().await;
             if !watchers.contains_key(&canonical) {
                 if let Ok(w) = IndexWatcher::start(canonical.clone(), handle.clone()) {
@@ -554,11 +622,9 @@ impl ProjectRegistry {
         }
 
         // Invalidate stale-cache entry so get_or_create() won't reuse
-        // the pre-indexing staleness result.
-        let canonical = project_path
-            .canonicalize()
-            .unwrap_or_else(|_| project_path.clone());
-        self.stale_cache.write().await.remove(&canonical);
+        // the pre-indexing staleness result. `project_path` is
+        // already canonical (from `LeIndex::project_path`).
+        self.stale_cache.write().await.remove(&project_path);
 
         let stats = {
             let idx = handle.read().await;
@@ -953,6 +1019,72 @@ mod tests {
         assert!(
             !registry.stale_cache.read().await.contains_key(&canonical),
             "stale cache entry should be removed on evict"
+        );
+    }
+
+    /// Regression for P2 round 15 (codex `3344884534`): write
+    /// handlers (`edit-apply`, `write-file`, `rename-symbol`) must
+    /// invalidate the staleness cache after a successful write so
+    /// that the next read tool re-runs `is_stale_fast` instead of
+    /// reusing a pre-write `false` cached result. The watcher
+    /// (when enabled) does this on its own reindex path; the
+    /// explicit call covers the watcher-disabled default mode
+    /// where the 30-second negative-cache TTL would otherwise
+    /// silently mask the edit.
+    #[tokio::test]
+    async fn test_invalidate_stale_cache_removes_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        let leindex = LeIndex::new(tmp.path()).unwrap();
+        let registry = ProjectRegistry::with_initial_project(5, leindex);
+
+        let canonical = tmp.path().canonicalize().unwrap();
+
+        // Prime the cache with a `false` result (the scenario
+        // the codex comment describes: a previous read tool ran
+        // `is_stale_fast` and got back `false`).
+        registry
+            .stale_cache
+            .write()
+            .await
+            .insert(canonical.clone(), (std::time::Instant::now(), false));
+        assert!(registry.stale_cache.read().await.contains_key(&canonical));
+
+        // The write handler calls this after the disk write.
+        registry.invalidate_stale_cache(&canonical).await;
+
+        assert!(
+            !registry.stale_cache.read().await.contains_key(&canonical),
+            "stale cache entry must be removed on invalidate"
+        );
+    }
+
+    /// `invalidate_stale_cache` requires an already-canonicalized
+    /// path. The cache key is built from `LeIndex::project_path`,
+    /// which is canonicalized at construction, so callers must pass
+    /// `guard.project_path().to_path_buf()` (or equivalent).
+    #[tokio::test]
+    async fn test_invalidate_stale_cache_requires_canonical_input() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
+
+        let leindex = LeIndex::new(tmp.path()).unwrap();
+        let registry = ProjectRegistry::with_initial_project(5, leindex);
+
+        let canonical = tmp.path().canonicalize().unwrap();
+        registry
+            .stale_cache
+            .write()
+            .await
+            .insert(canonical.clone(), (std::time::Instant::now(), false));
+
+        // Must pass the canonicalized path — the function no longer
+        // re-canonicalizes internally.
+        registry.invalidate_stale_cache(&canonical).await;
+        assert!(
+            !registry.stale_cache.read().await.contains_key(&canonical),
+            "stale cache entry must be removed on invalidate with canonical input"
         );
     }
 }

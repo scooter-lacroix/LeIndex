@@ -1031,9 +1031,32 @@ pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan>
         }
     }
 
+    // Pre-canonicalize each manifest path so `is_stale_fast`
+    // can use the result directly without re-running
+    // `Path::canonicalize` (stat/readlink per file) on every
+    // freshness check. Relative scanner outputs (which occur
+    // when the caller passes a relative `project_path`) are
+    // joined against `project_path` first to match the
+    // round-13 `build_already_listed` contract — a relative
+    // path canonicalized directly would resolve against CWD,
+    // not the project root, producing false negatives in the
+    // freshness check when CWD ≠ project root.
+    let manifest_paths_canonical: Vec<PathBuf> = manifest_paths
+        .iter()
+        .map(|p| {
+            let full = if p.is_relative() {
+                project_path.join(p)
+            } else {
+                p.clone()
+            };
+            full.canonicalize().unwrap_or(full)
+        })
+        .collect();
+
     Ok(ProjectFileScan {
         source_paths,
         manifest_paths,
+        manifest_paths_canonical,
         source_directories,
         manifest_hashes,
     })
@@ -2040,6 +2063,7 @@ mod tests {
         let old_scan = ProjectFileScan {
             source_paths: vec![PathBuf::from("/project/src/main.rs")],
             manifest_paths: vec![manifest_path.clone()],
+            manifest_paths_canonical: Vec::new(),
             source_directories: vec![PathBuf::from("/project/src")],
             manifest_hashes: old_hashes,
         };
@@ -2071,9 +2095,10 @@ mod tests {
         current_hashes.insert(manifest_path.display().to_string(), "abc123".to_string());
 
         let current_scan = ProjectFileScan {
-            source_paths: vec![PathBuf::from("/project/src/main.rs")],
+            source_paths: vec![],
             manifest_paths: vec![manifest_path.clone()],
-            source_directories: vec![PathBuf::from("/project/src")],
+            manifest_paths_canonical: Vec::new(),
+            source_directories: vec![],
             manifest_hashes: current_hashes,
         };
 
@@ -2110,6 +2135,7 @@ mod tests {
         let old_scan = ProjectFileScan {
             source_paths: vec![PathBuf::from("/project/src/main.rs")],
             manifest_paths: vec![manifest_path.clone()],
+            manifest_paths_canonical: Vec::new(),
             source_directories: vec![PathBuf::from("/project/src")],
             manifest_hashes: old_hashes,
         };
@@ -2134,6 +2160,7 @@ mod tests {
         let current_scan = ProjectFileScan {
             source_paths: vec![PathBuf::from("/project/src/main.rs")],
             manifest_paths: vec![manifest_path.clone()],
+            manifest_paths_canonical: Vec::new(),
             source_directories: vec![PathBuf::from("/project/src")],
             manifest_hashes: current_hashes,
         };
@@ -2177,6 +2204,7 @@ mod tests {
         let disk_scan = ProjectFileScan {
             source_paths: vec![],
             manifest_paths: vec![manifest_path.clone()],
+            manifest_paths_canonical: Vec::new(),
             source_directories: vec![],
             manifest_hashes: disk_hashes,
         };
@@ -2201,6 +2229,7 @@ mod tests {
         let mem_scan = ProjectFileScan {
             source_paths: vec![],
             manifest_paths: vec![manifest_path.clone()],
+            manifest_paths_canonical: Vec::new(),
             source_directories: vec![],
             manifest_hashes: mem_hashes,
         };
@@ -2221,9 +2250,10 @@ mod tests {
             "current_hash".to_string(),
         );
         let current_scan = ProjectFileScan {
-            source_paths: vec![],
+            source_paths: vec![PathBuf::from("/project/src/main.rs")],
             manifest_paths: vec![manifest_path.clone()],
-            source_directories: vec![],
+            manifest_paths_canonical: Vec::new(),
+            source_directories: vec![PathBuf::from("/project/src")],
             manifest_hashes: current_hashes,
         };
 

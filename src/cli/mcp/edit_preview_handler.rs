@@ -156,6 +156,7 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
 
         // 5. Generate diff and compute impact
         let diff = make_diff(&original, &modified, &file_path);
+        let diff_json = diff.to_json();
 
         let (validation_json, affected_nodes, affected_files, breaking_changes) = {
             let guard = handle.read().await;
@@ -247,7 +248,8 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
 
         let mut response = serde_json::json!({
             "preview_token": preview_token,
-            "diff": diff,
+            "diff": diff_json,
+            "diff_text": crate::cli::mcp::output::render_unified_diff(&diff, false),
             "affected_symbols": affected_nodes,
             "affected_files": affected_files.into_iter().collect::<Vec<_>>(),
             "breaking_changes": breaking_changes,
