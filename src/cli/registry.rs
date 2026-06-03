@@ -276,15 +276,16 @@ impl ProjectRegistry {
     /// Write handlers (`edit-apply`, `write-file`, `rename-symbol`)
     /// must call this after a successful write so that the next
     /// read tool re-runs `is_stale_fast` instead of reusing a
-    /// pre-write `false` cached result. The watcher (when enabled
-    /// via `LEINDEX_WATCHER=1`) already invalidates the cache on
-    /// its own reindex path, so the explicit call here only matters
-    /// in the watcher-disabled default mode — the case where the
-    /// 30-second negative-cache TTL was silently masking edits
-    /// behind a `false` freshness result.
+    /// pre-write `false` cached result.
+    ///
+    /// `path` **must** be an already-canonicalized project path (e.g.
+    /// the return value of [`ProjectHandle::project_path`]). The cache
+    /// key is built from [`LeIndex::project_path`], which is
+    /// canonicalized at construction time. Every built-in caller
+    /// passes `guard.project_path().to_path_buf()`, which satisfies
+    /// this contract.
     pub async fn invalidate_stale_cache(&self, path: &Path) {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        self.stale_cache.write().await.remove(&canonical);
+        self.stale_cache.write().await.remove(path);
     }
 
     /// Get an existing project, or create + load from storage (no auto-index).
@@ -621,11 +622,9 @@ impl ProjectRegistry {
         }
 
         // Invalidate stale-cache entry so get_or_create() won't reuse
-        // the pre-indexing staleness result.
-        let canonical = project_path
-            .canonicalize()
-            .unwrap_or_else(|_| project_path.clone());
-        self.stale_cache.write().await.remove(&canonical);
+        // the pre-indexing staleness result. `project_path` is
+        // already canonical (from `LeIndex::project_path`).
+        self.stale_cache.write().await.remove(&project_path);
 
         let stats = {
             let idx = handle.read().await;
@@ -1061,12 +1060,12 @@ mod tests {
         );
     }
 
-    /// `invalidate_stale_cache` canonicalises its input the same
-    /// way the cache key is built (the cache is keyed on
-    /// `project_path.canonicalize()`), so a caller passing either
-    /// a relative or non-canonical path still finds the entry.
+    /// `invalidate_stale_cache` requires an already-canonicalized
+    /// path. The cache key is built from `LeIndex::project_path`,
+    /// which is canonicalized at construction, so callers must pass
+    /// `guard.project_path().to_path_buf()` (or equivalent).
     #[tokio::test]
-    async fn test_invalidate_stale_cache_canonicalises_input() {
+    async fn test_invalidate_stale_cache_requires_canonical_input() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
 
@@ -1080,14 +1079,12 @@ mod tests {
             .await
             .insert(canonical.clone(), (std::time::Instant::now(), false));
 
-        // Pass a non-canonical path (the temp dir as-is — on
-        // macOS this is under `/var/folders/...` which is itself
-        // a symlink-resolved path so canonicalize is a no-op,
-        // but the test still exercises the canonicalize branch).
-        registry.invalidate_stale_cache(tmp.path()).await;
+        // Must pass the canonicalized path — the function no longer
+        // re-canonicalizes internally.
+        registry.invalidate_stale_cache(&canonical).await;
         assert!(
             !registry.stale_cache.read().await.contains_key(&canonical),
-            "invalidate must canonicalise the input before lookup"
+            "stale cache entry must be removed on invalidate with canonical input"
         );
     }
 }

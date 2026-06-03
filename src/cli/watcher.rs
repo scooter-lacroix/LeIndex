@@ -108,6 +108,17 @@ impl IndexWatcher {
                         if dirty {
                             dirty = false;
                             debug!("File changes detected, triggering incremental reindex");
+                            // Fail-fast: avoid wasting a spawn_blocking
+                            // threadpool slot when the lock is currently
+                            // busy. This is purely an optimization — the
+                            // inner try_acquire_lock still handles TOCTOU
+                            // races, and Skipped inside spawn_blocking
+                            // preserves dirty for the next debounce tick.
+                            if handle.try_write().is_err() {
+                                dirty = true;
+                                debounce.reset();
+                                continue;
+                            }
                             let handle_clone = handle.clone();
                             // Run the budget-wait + reindex on
                             // `spawn_blocking`. The threadpool impact
