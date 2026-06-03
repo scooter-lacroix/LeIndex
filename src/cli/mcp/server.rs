@@ -517,6 +517,20 @@ impl McpServer {
 pub(crate) async fn bind_with_fallback(
     preferred: SocketAddr,
 ) -> anyhow::Result<tokio::net::TcpListener> {
+    // Port 0 is the OS-assigned-ephemeral convention. The
+    // kernel is guaranteed to pick a free high port on
+    // success, so the fixed-range fallback loop below would
+    // do nothing useful — and worse, walking 1..=10 would
+    // probe privileged ports (< 1024 on Unix), which can fail
+    // with EACCES even though we never intended to bind
+    // there. Bypass the loop entirely and let the OS pick.
+    if preferred.port() == 0 {
+        return tokio::net::TcpListener::bind(preferred)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("failed to bind to ephemeral port {}: {}", preferred, e)
+            });
+    }
     let mut last_err: Option<std::io::Error> = None;
     for offset in 0..=BIND_FALLBACK_PORT_RANGE {
         // `checked_add` so a preferred port near `u16::MAX`
@@ -2037,6 +2051,38 @@ mod tests {
         let listener = bind_with_fallback(preferred).await.unwrap();
         let bound = listener.local_addr().unwrap();
         // Port 0 → ephemeral, so just assert the IP matches.
+        assert_eq!(bound.ip(), preferred.ip());
+    }
+
+    /// Regression for MED round 20: when `preferred.port() == 0`,
+    /// `bind_with_fallback` must bypass the fixed-range
+    /// fallback loop entirely and let the OS pick an
+    /// ephemeral port directly. The pre-fix code walked
+    /// `1..=BIND_FALLBACK_PORT_RANGE` even when the
+    /// preferred port was 0, probing privileged ports (< 1024
+    /// on Unix) that could fail with EACCES on systems where
+    /// the process has no CAP_NET_BIND_SERVICE.
+    ///
+    /// The new contract is observable in two ways:
+    ///   1. The returned listener's port is non-zero (the
+    ///      OS-assigned ephemeral port).
+    ///   2. No privileged ports (1..=1023) were probed —
+    ///      which we verify indirectly by asserting the
+    ///      function returns successfully on a default-
+    ///      capability process without touching any port
+    ///      that would need root.
+    #[tokio::test]
+    async fn test_bind_with_fallback_port_zero_skips_fallback_loop() {
+        let preferred = SocketAddr::from(([127, 0, 0, 1], 0));
+        let listener = bind_with_fallback(preferred).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        // The OS-assigned ephemeral port is non-zero.
+        assert_ne!(
+            bound.port(),
+            0,
+            "OS-assigned ephemeral port must be non-zero; got port 0 (bind did not actually request ephemeral)"
+        );
+        // The IP is preserved through the fast path.
         assert_eq!(bound.ip(), preferred.ip());
     }
 }

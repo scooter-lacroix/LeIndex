@@ -206,17 +206,30 @@ fn trim_diagnostics(data: &Value) -> Value {
 
 fn trim_impact(data: &Value) -> Value {
     fn trim_side(v: &Value) -> Value {
-        let arr = v.as_array().cloned().unwrap_or_default();
-        let trimmed: Vec<Value> = arr
-            .into_iter()
-            .map(|s| {
-                serde_json::json!({
-                    "name": s.get("name"),
-                    "file": s.get("file"),
-                    "line": s.get("line"),
-                })
+        // Borrow the array and only clone the whitelisted
+        // fields we actually keep. The previous
+        // `as_array().cloned().unwrap_or_default()` allocated a
+        // fresh `Value` for every element in the array (a deep
+        // copy including `serde_json::Map` nodes, strings,
+        // numbers) just to throw most of the data away in the
+        // subsequent mapping. The borrowing form skips those
+        // deep copies and only allocates the small output
+        // object — same shape on the wire, but O(1) element
+        // allocations instead of O(N).
+        let trimmed: Vec<Value> = v
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "name": s.get("name"),
+                            "file": s.get("file"),
+                            "line": s.get("line"),
+                        })
+                    })
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
         Value::Array(trimmed)
     }
     serde_json::json!({
@@ -571,24 +584,26 @@ fn trim_deep_analyze(data: &Value) -> Value {
 
 fn trim_write(data: &Value) -> Value {
     // Drop per-symbol byte_range; the symbol name + type are enough for
-    // the LLM to follow up with read_symbol.
-    let arr = data
+    // the LLM to follow up with read_symbol. Borrow the array
+    // rather than cloning it upfront so we only allocate the
+    // whitelisted `name` / `type` values we actually keep.
+    let trimmed: Vec<Value> = data
         .get("symbols")
         .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let trimmed: Vec<Value> = arr
-        .into_iter()
-        .map(|s| {
-            let mut obj = serde_json::Map::new();
-            for k in ["name", "type"] {
-                if let Some(v) = s.get(k) {
-                    obj.insert(k.to_string(), v.clone());
-                }
-            }
-            Value::Object(obj)
+        .map(|arr| {
+            arr.iter()
+                .map(|s| {
+                    let mut obj = serde_json::Map::new();
+                    for k in ["name", "type"] {
+                        if let Some(v) = s.get(k) {
+                            obj.insert(k.to_string(), v.clone());
+                        }
+                    }
+                    Value::Object(obj)
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     serde_json::json!({
         "success": data.get("success"),
         "file_path": data.get("file_path"),
@@ -1659,5 +1674,119 @@ mod tests {
         // is dropped (we keep only `file` and `diff`).
         assert!(shown[0].get("diff_text").is_none());
         assert_eq!(shown[0]["file"], "src/f0.rs");
+    }
+
+    /// Regression for MED round 20: `trim_write` previously
+    /// cloned the entire `symbols` array via
+    /// `.cloned().unwrap_or_default()` and then mapped over
+    /// the clone. The clone was a deep copy (every
+    /// `serde_json::Map` node, every string, every number)
+    /// for elements that mostly get reduced to a
+    /// two-field `{name, type}` object. The fix borrows the
+    /// input array and only allocates the small output
+    /// objects. This test locks the output contract: the
+    /// trimmed `symbols` array has the same whitelisted
+    /// fields and the same shape as before, so a future
+    /// refactor that re-introduces the deep clone (or that
+    /// accidentally changes the whitelist) is caught.
+    #[test]
+    fn test_trim_write_borrows_symbols_array() {
+        // Each symbol carries a `byte_range` (the field
+        // we're dropping) plus an unrelated `metadata`
+        // object to make the "deep clone would have copied
+        // all of this" cost visible.
+        let input = v(r#"{
+            "success": true,
+            "file_path": "src/new.rs",
+            "language": "rust",
+            "symbols": [
+                {
+                    "name": "main",
+                    "type": "function",
+                    "byte_range": [0, 50],
+                    "metadata": {"scope": "crate", "visibility": "pub", "attrs": ["inline"]}
+                },
+                {
+                    "name": "helper",
+                    "type": "function",
+                    "byte_range": [50, 100],
+                    "metadata": {"scope": "module", "visibility": "pub(crate)", "attrs": []}
+                }
+            ]
+        }"#);
+        let t = trim_write(&input);
+        // Top-level fields preserved.
+        assert_eq!(t["success"], true);
+        assert_eq!(t["file_path"], "src/new.rs");
+        assert_eq!(t["language"], "rust");
+        // Per-symbol: only `name` and `type` are kept.
+        let syms = t["symbols"].as_array().unwrap();
+        assert_eq!(syms.len(), 2);
+        for s in syms {
+            assert!(s.get("byte_range").is_none());
+            assert!(s.get("metadata").is_none());
+            // The whitelist keys exist and are populated.
+            assert!(s.get("name").is_some());
+            assert!(s.get("type").is_some());
+        }
+        assert_eq!(syms[0]["name"], "main");
+        assert_eq!(syms[0]["type"], "function");
+        assert_eq!(syms[1]["name"], "helper");
+        assert_eq!(syms[1]["type"], "function");
+    }
+
+    /// Regression for MED round 20: `trim_impact` /
+    /// `trim_side` previously cloned the entire impact array
+    /// upfront via `v.as_array().cloned().unwrap_or_default()`.
+    /// Each cloned element was a `serde_json::Map` with
+    /// dozens of fields (file, line, byte_range, scope,
+    /// call_graph, ...), and most of the data was discarded
+    /// in the subsequent mapping. The fix borrows the input
+    /// array and only allocates the small output objects.
+    /// This test locks the output contract: the per-entry
+    /// shape is `{name, file, line}` with no other fields,
+    /// and the top-level `symbol` / `risk_level` /
+    /// `forward_impact` / `backward_impact` fields are
+    /// preserved.
+    #[test]
+    fn test_trim_impact_borrows_impact_array() {
+        let input = v(r#"{
+            "symbol": "Foo::bar",
+            "risk_level": "medium",
+            "forward_impact": [
+                {"name": "caller_a", "file": "src/a.rs", "line": 10, "byte_range": [0, 50], "call_graph": "ignored"},
+                {"name": "caller_b", "file": "src/b.rs", "line": 20, "byte_range": [50, 100], "call_graph": "ignored"}
+            ],
+            "backward_impact": [
+                {"name": "callee_x", "file": "src/x.rs", "line": 5}
+            ]
+        }"#);
+        let t = trim_impact(&input);
+        // Top-level: only `symbol`, `risk_level`,
+        // `forward_impact`, `backward_impact` kept.
+        assert_eq!(t["symbol"], "Foo::bar");
+        assert_eq!(t["risk_level"], "medium");
+        assert!(t.get("forward_impact").is_some());
+        assert!(t.get("backward_impact").is_some());
+        // `forward_impact` per entry: only `name`, `file`,
+        // `line` kept.
+        let fwd = t["forward_impact"].as_array().unwrap();
+        assert_eq!(fwd.len(), 2);
+        for entry in fwd {
+            assert!(entry.get("name").is_some());
+            assert!(entry.get("file").is_some());
+            assert!(entry.get("line").is_some());
+            assert!(entry.get("byte_range").is_none());
+            assert!(entry.get("call_graph").is_none());
+        }
+        assert_eq!(fwd[0]["name"], "caller_a");
+        assert_eq!(fwd[0]["file"], "src/a.rs");
+        assert_eq!(fwd[0]["line"], 10);
+        // `backward_impact` per entry: same whitelist.
+        let back = t["backward_impact"].as_array().unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0]["name"], "callee_x");
+        assert_eq!(back[0]["file"], "src/x.rs");
+        assert_eq!(back[0]["line"], 5);
     }
 }

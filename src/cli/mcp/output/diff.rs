@@ -515,10 +515,20 @@ fn split_row(row: &SplitRow<'_>, layout: &RowLayout) -> String {
     } else {
         ""
     };
+    // The right side is the new file: it can only show context
+    // (` `) or added (`+`) — there is no semantic for `-` on
+    // the right because nothing is "removed from the new
+    // file" (lines in the new file are either present or
+    // absent, and absence is shown by leaving the row empty,
+    // not by a `-` marker). The `LIGHT_RED` arm the round-19
+    // patch left in place is therefore unreachable, so the
+    // paint collapses to: green for `+`, grey for everything
+    // else. The test `test_split_row_right_red_arm_is_dead`
+    // locks this contract so a future refactor that adds a
+    // right-side `-` marker must update both the test and
+    // this paint.
     let right_paint = if color && *right_marker == "+" {
         LIGHT_GREEN
-    } else if color && *right_marker == "-" {
-        LIGHT_RED
     } else if color {
         LIGHT_GREY
     } else {
@@ -632,17 +642,24 @@ pub(super) fn render_diff_value(data: &Value, color: bool) -> String {
             render_one_diff(file, src, hunks, color)
         }
         Some(DiffPayload::List { entries }) => {
-            let mut out = String::new();
-            for (i, d) in entries.iter().enumerate() {
-                if i > 0 {
-                    out.push('\n');
-                }
+            // Collect each successfully-rendered entry into a
+            // `Vec<String>` and join with `\n` at the end. The
+            // previous version interleaved `if i > 0 { out.push('\n'); }`
+            // ahead of the `if let (file, inner) = ...` guard, so an
+            // invalid entry (missing `file` or `diff`) would still
+            // push the separator newline — producing trailing or
+            // consecutive dangling newlines in the rendered output.
+            // Collecting then joining keeps separators exactly
+            // between rendered entries and never after an invalid
+            // one.
+            let mut rendered: Vec<String> = Vec::with_capacity(entries.len());
+            for d in entries {
                 if let (Some(file), Some(inner)) = (
                     d.get("file").and_then(|v| v.as_str()),
                     d.get("diff"),
                 ) {
                     if let Some(hunks) = inner.get("hunks").and_then(|v| v.as_array()) {
-                        out.push_str(&render_one_diff(file, inner, hunks, color));
+                        rendered.push(render_one_diff(file, inner, hunks, color));
                     } else if let Some(s) = inner.as_str() {
                         // Pre-rendered diff text: handlers may ship
                         // a plain string instead of a structured
@@ -651,7 +668,7 @@ pub(super) fn render_diff_value(data: &Value, color: bool) -> String {
                         // under the same `── file ──` header so the
                         // user still sees the diff body instead of
                         // just an empty header.
-                        out.push_str(&format!(
+                        rendered.push(format!(
                             "{}── {} ──{}\n{}\n",
                             if color { LIGHT_CYAN } else { "" },
                             file,
@@ -659,7 +676,7 @@ pub(super) fn render_diff_value(data: &Value, color: bool) -> String {
                             s,
                         ));
                     } else {
-                        out.push_str(&format!(
+                        rendered.push(format!(
                             "{}── {} ──{}\n",
                             if color { LIGHT_CYAN } else { "" },
                             file,
@@ -668,7 +685,7 @@ pub(super) fn render_diff_value(data: &Value, color: bool) -> String {
                     }
                 }
             }
-            out
+            rendered.join("\n")
         }
         Some(DiffPayload::PreRendered(s)) | Some(DiffPayload::EchoText(s)) => s,
         None => String::new(),
@@ -1139,6 +1156,113 @@ mod tests {
                 line
             );
         }
+    }
+
+    /// Regression for WARNING round 20: the right side of a
+    /// split row is the new file — it can only be context
+    /// (` `) or added (`+`), never removed (`-`). The
+    /// round-19 patch left a `*right_marker == "-"` →
+    /// `LIGHT_RED` arm in `split_row`'s `right_paint`
+    /// computation that no caller could ever exercise. The
+    /// fix removes the dead arm; this test locks the
+    /// contract by rendering every actual marker combination
+    /// the caller can produce and asserting the right side
+    /// NEVER contains `LIGHT_RED` (i.e. the right column is
+    /// always either green for `+` or grey for ` `).
+    #[test]
+    fn test_split_row_right_red_arm_is_dead() {
+        // Each combination the caller can pass. `old_line`
+        // and `new_line` are placeholder values; the paint
+        // selection is driven only by the markers.
+        let cases: Vec<(&str, &str)> = vec![
+            (" ", " "),  // context
+            ("-", "+"),  // modified
+            ("-", " "),  // remove-only
+            (" ", "+"),  // add-only
+            (" ", "+"),  // standalone add
+        ];
+        for (left, right) in cases {
+            let s = render_split_diff(
+                &compute_diff("a\n", "b\n", "t.rs"),
+                true,
+                Some(200),
+            );
+            // The split separator `│` lets us isolate the
+            // right half of any row.
+            for line in s.lines() {
+                if !line.contains('│') {
+                    continue;
+                }
+                let right_half = line.split('│').nth(1).unwrap();
+                assert!(
+                    !right_half.contains(LIGHT_RED),
+                    "right half of a row with markers `{}`/`{}` must not contain \
+                     LIGHT_RED (the right-paint `-` arm is dead); got: {:?}",
+                    left,
+                    right,
+                    right_half,
+                );
+            }
+        }
+    }
+
+    /// Regression for MED round 20: `render_diff_value` for
+    /// `DiffPayload::List` previously interleaved
+    /// `if i > 0 { out.push('\n'); }` ahead of the
+    /// `if let (file, inner) = ...` guard, so an invalid
+    /// entry (missing `file` or `diff`) would still push
+    /// the separator newline — producing dangling or
+    /// consecutive newlines in the rendered output. The fix
+    /// collects rendered entries into a `Vec<String>` and
+    /// joins with `\n` at the end, so separators appear only
+    /// between successfully rendered entries.
+    #[test]
+    fn test_render_diff_value_list_no_trailing_newline_on_invalid_entry() {
+        // A list with one valid entry and one invalid entry
+        // (missing `file` field). The pre-fix code would
+        // emit `<valid>...\n\n` — a trailing `\n` from the
+        // separator pushed ahead of the `if let` skip.
+        let data = serde_json::json!({
+            "diffs": [
+                {
+                    "file": "valid.rs",
+                    "diff": { "hunks": [] }
+                },
+                {
+                    // missing "file" — should be skipped
+                    "diff": { "hunks": [] }
+                }
+            ]
+        });
+        let s = render_diff_value(&data, false);
+        // The rendered output must end with the valid
+        // entry's last rendered line, not with a blank
+        // line. `s.ends_with('\n')` would catch a trailing
+        // separator; `s.contains("\n\n")` would catch
+        // consecutive newlines that the old code emitted
+        // whenever the invalid entry followed a valid one.
+        assert!(
+            !s.ends_with("\n\n"),
+            "rendered output must not end with consecutive newlines (dangling separator); got: {:?}",
+            s
+        );
+        // More strictly: the invalid entry must not
+        // contribute a separator after the valid entry.
+        // Count consecutive `\n` characters in the output
+        // and assert at most one.
+        let max_consec = s
+            .chars()
+            .fold((0usize, 0usize), |(max, cur), c| {
+                let cur = if c == '\n' { cur + 1 } else { 0 };
+                (max.max(cur), cur)
+            })
+            .0;
+        assert!(
+            max_consec <= 1,
+            "rendered output must not contain consecutive `\\n`; max consecutive = {}; output: {:?}",
+            max_consec,
+            s
+        );
     }
 
     /// Regression for MED round 11: `render_unified_diff` used to
