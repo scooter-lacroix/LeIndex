@@ -342,10 +342,14 @@ fn trim_phase(data: &Value) -> Value {
     if let Some(v) = data.get("phase_explanations") {
         out.insert("phase_explanations".to_string(), v.clone());
     }
-    // Keep formatted_output but cap it
+    // Keep formatted_output but cap it safely at char boundaries.
+    // Byte-slicing `&s[..4000]` panics when byte 4000 falls mid-UTF-8.
     if let Some(v) = data.get("formatted_output") {
         if let Some(s) = v.as_str() {
-            let capped = if s.len() > 4000 { &s[..4000] } else { s };
+            let capped = match s.char_indices().nth(4000) {
+                Some((idx, _)) => &s[..idx],
+                None => s,
+            };
             out.insert("formatted_output".to_string(), Value::String(capped.to_string()));
         } else {
             out.insert("formatted_output".to_string(), v.clone());

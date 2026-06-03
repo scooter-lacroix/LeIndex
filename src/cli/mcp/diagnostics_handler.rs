@@ -71,7 +71,7 @@ impl DiagnosticsHandler {
         let failed_parses = diagnostics.stats.failed_parses;
         let index_health = diagnostics.index_health.clone();
         let is_stale = !changed.is_empty() || !deleted.is_empty();
-        let stale_bool = is_stale || index_health == "stale" || failed_parses > 0;
+        let stale_bool = is_stale || index_health == "stale";
 
         let mut diag_json = serde_json::to_value(diagnostics)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?;
@@ -117,7 +117,7 @@ impl DiagnosticsHandler {
             }
             map.insert("issues".to_string(), serde_json::json!(issues));
 
-            let staleness = if !is_stale {
+            let staleness = if !stale_bool {
                 serde_json::json!({
                     "status": "fresh",
                     "changed_files": 0,

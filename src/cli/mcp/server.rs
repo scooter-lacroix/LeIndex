@@ -1040,7 +1040,9 @@ pub async fn handle_tool_call(
                 &trimmed,
                 &call_args,
             );
-            let payload = if !rendered.is_empty() {
+            let is_substantive = rendered.trim().lines().count() > 1
+                || rendered.trim().len() > 80;
+            let payload = if is_substantive {
                 rendered
             } else {
                 serde_json::to_string_pretty(&trimmed)
