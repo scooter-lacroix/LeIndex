@@ -1017,6 +1017,11 @@ pub async fn handle_tool_call(
         .find(|h| h.name() == tool_call.name)
         .ok_or_else(|| JsonRpcError::method_not_found(tool_call.name.clone()))?;
 
+    // Clone arguments before moving them into execute (we need them
+    // for render_tool_output_plain which needs the original args).
+    let call_args = tool_call.arguments.clone();
+    let call_name = tool_call.name.clone();
+
     // Execute the tool and wrap the result in standard MCP content format
     match handler.execute(registry, tool_call.arguments).await {
         Ok(value) => {
@@ -1024,11 +1029,23 @@ pub async fn handle_tool_call(
             // tool's raw value through the per-tool payload trimmer so we
             // hand the model only the fields it needs (no scoring
             // internals, no byte ranges, no tfidf/neural split, etc.).
-            // The CLI surface uses `output::render_tool_output` over the
-            // same value for its human-readable view.
-            let trimmed = crate::cli::mcp::output::trim_llm_payload(&tool_call.name, &value);
-            let payload = serde_json::to_string_pretty(&trimmed)
-                .unwrap_or_else(|_| "Error serializing result".to_string());
+            let trimmed = crate::cli::mcp::output::trim_llm_payload(&call_name, &value);
+
+            // Prefer a clean human-readable rendering over raw JSON.
+            // The CLI surface uses `render_tool_output` (colored); the
+            // MCP transport uses the same render functions but without
+            // ANSI codes so the LLM sees clean text.
+            let rendered = crate::cli::mcp::output::render_tool_output_plain(
+                &call_name,
+                &trimmed,
+                &call_args,
+            );
+            let payload = if !rendered.is_empty() {
+                rendered
+            } else {
+                serde_json::to_string_pretty(&trimmed)
+                    .unwrap_or_else(|_| "Error serializing result".to_string())
+            };
             Ok(serde_json::json!({
                 "content": [
                     {

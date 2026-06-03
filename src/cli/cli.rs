@@ -941,10 +941,17 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         .get_diagnostics()
         .context("Failed to get diagnostics")?;
 
+    // Use coverage report for accurate indexed_files count
+    let indexed_ct = leindex
+        .coverage_report()
+        .ok()
+        .map(|c| c.indexed_files)
+        .unwrap_or(diag.stats.files_parsed);
+
     // Convert to JSON for formatter
     let diag_json = serde_json::json!({
         "project_path": diag.project_path,
-        "indexed_files": diag.stats.files_parsed,
+        "indexed_files": indexed_ct,
         "index_size_mb": diag.memory_usage_bytes as f64 / 1024.0 / 1024.0,
         "symbol_count": diag.stats.indexed_nodes,
         "issues": []

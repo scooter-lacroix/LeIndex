@@ -172,7 +172,7 @@ pub use diff::{
     DiffOp, DiffResult,
 };
 pub use render::{
-    render_tree, render_tool_output, DiagnosticsFormatter, FileSummaryFormatter, GitStatusFormatter,
+    render_tree, render_tool_output, render_tool_output_plain, DiagnosticsFormatter, FileSummaryFormatter, GitStatusFormatter,
     ImpactFormatter, PhaseFormatter, ProjectMapFormatter, SearchFormatter, SymbolLookupFormatter,
 };
 pub use trim::trim_llm_payload;
