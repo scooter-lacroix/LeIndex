@@ -735,8 +735,14 @@ pub struct SearchQuery {
     /// Whether to expand context using graph traversal
     pub expand_context: bool,
 
-    /// Optional query embedding for semantic search
+    /// Optional query embedding for semantic search (TF-IDF)
     pub query_embedding: Option<Vec<f32>>,
+
+    /// Optional neural query embedding for deep semantic search.
+    ///
+    /// Populated when ONNX (or remote) embeddings are available.
+    /// When `None`, neural scoring is skipped and TF-IDF fallback is used.
+    pub query_neural_embedding: Option<Vec<f32>>,
 
     /// Minimum relevance threshold (0.0-1.0)
     pub threshold: Option<f32>,
@@ -1365,7 +1371,7 @@ impl SearchEngine {
     /// # Panics
     ///
     /// Panics if node count exceeds MAX_NODES (prevents memory exhaustion).
-    pub fn index_nodes(&mut self, mut nodes: Vec<NodeInfo>) {
+    pub fn index_nodes(&mut self, nodes: Vec<NodeInfo>) {
         if nodes.len() > MAX_NODES {
             panic!(
                 "Cannot index more than {} nodes (provided: {})",
@@ -1374,7 +1380,17 @@ impl SearchEngine {
             );
         }
 
-        // Clear cache when re-indexing
+        // Clear all state for a full reindex
+        self.clear_index();
+        // Append nodes incrementally
+        self.append_nodes(nodes);
+    }
+
+    /// Clear all indexed nodes and internal data structures.
+    ///
+    /// Called before a full reindex to reset the search engine state.
+    pub fn clear_index(&mut self) {
+        self.nodes.clear();
         self.complexity_cache.clear();
         self.text_index.clear();
         self.search_cache.clear();
@@ -1382,11 +1398,33 @@ impl SearchEngine {
         self.node_id_to_idx.clear();
         self.node_tokens.clear();
         self.vector_index.clear();
+    }
+
+    /// Append nodes to the existing index without clearing.
+    ///
+    /// This supports incremental/batch indexing where nodes are processed
+    /// in chunks and appended to the search engine across multiple calls.
+    /// Internal data structures (inverted index, vector index, caches) are
+    /// updated incrementally.
+    ///
+    /// # Panics
+    ///
+    /// Panics if total node count exceeds MAX_NODES after appending.
+    pub fn append_nodes(&mut self, mut nodes: Vec<NodeInfo>) {
+        if self.nodes.len() + nodes.len() > MAX_NODES {
+            panic!(
+                "Cannot index more than {} nodes (current: {}, appending: {})",
+                MAX_NODES,
+                self.nodes.len(),
+                nodes.len()
+            );
+        }
 
         // Build node_id_to_idx for O(1) node lookups (A1 optimization)
         // Build complexity cache, inverted index, and token cache before taking ownership
         for (idx, node) in nodes.iter().enumerate() {
-            self.node_id_to_idx.insert(node.node_id.clone(), idx);
+            let global_idx = self.nodes.len() + idx;
+            self.node_id_to_idx.insert(node.node_id.clone(), global_idx);
             self.complexity_cache
                 .insert(node.node_id.clone(), node.complexity);
 
@@ -1440,12 +1478,9 @@ impl SearchEngine {
             }
         }
 
-        // Move nodes into storage — no clone needed since indexes are already built
-        self.nodes = nodes;
-
         // Extract signatures before clearing content (for search results)
         // This must happen before T13 optimization clears the content
-        for node in &mut self.nodes {
+        for node in &mut nodes {
             node.signature = Self::extract_signature_from_content(&node.content);
         }
 
@@ -1453,9 +1488,12 @@ impl SearchEngine {
         // The inverted index (text_index) already captures all tokens,
         // and the Storage layer retains original source files on disk.
         // This reduces memory by ~15MB at 5K nodes.
-        for node in &mut self.nodes {
+        for node in &mut nodes {
             node.content.clear();
         }
+
+        // Append nodes to storage
+        self.nodes.extend(nodes);
     }
 
     /// Extract signature from node content.
@@ -1981,11 +2019,21 @@ impl SearchEngine {
             // Normalize complexity to 0-1 range (divide by 100, not 10)
             let structural_score = (node.complexity as f32 / 100.0).min(1.0);
 
-            // Neural score is 0.0 in this context (vector index only has TF-IDF embeddings)
-            let neural_score = 0.0;
+            // Compute neural score using cosine similarity between the query's
+            // neural embedding and the node's neural embedding.
+            // Falls back to 0.0 when neural embeddings are unavailable.
+            let neural_score = match (&query.query_neural_embedding, &node.neural_embedding) {
+                (Some(q_emb), Some(n_emb)) => {
+                    crate::search::vector::cosine_similarity(q_emb, n_emb)
+                }
+                _ => 0.0,
+            };
 
-            // Use custom weights based on query type if provided
-            let score = if let Some(qt) = query.query_type {
+            // Use custom weights based on query type if provided.
+            // When neural embeddings are unavailable, redistribute neural weight
+            // to TF-IDF and text match for better ranking quality.
+            let neural_available = query.query_neural_embedding.is_some();
+            let mut score = if let Some(qt) = query.query_type {
                 match qt {
                     crate::search::ranking::QueryType::Text => {
                         // Prose/Text mode: heavily favor keyword overlap
@@ -1994,10 +2042,27 @@ impl SearchEngine {
                             .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
                     }
                     crate::search::ranking::QueryType::Semantic => {
-                        // Semantic-heavy mode
-                        self.scorer
-                            .with_weights_hybrid(0.7, 0.1, 0.1, 0.1)
-                            .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
+                        if neural_available {
+                            // Semantic mode with neural embeddings: balanced
+                            self.scorer
+                                .with_weights_hybrid(0.3, 0.3, 0.1, 0.3)
+                                .score_hybrid(
+                                    tfidf_score,
+                                    neural_score,
+                                    structural_score,
+                                    text_score,
+                                )
+                        } else {
+                            // Semantic mode without neural: TF-IDF + text focused
+                            self.scorer
+                                .with_weights_hybrid(0.4, 0.0, 0.15, 0.45)
+                                .score_hybrid(
+                                    tfidf_score,
+                                    neural_score,
+                                    structural_score,
+                                    text_score,
+                                )
+                        }
                     }
                     crate::search::ranking::QueryType::Structural => {
                         // Structural-heavy mode
@@ -2011,6 +2076,13 @@ impl SearchEngine {
                 self.scorer
                     .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
             };
+
+            // Penalize fully-qualified external references (e.g., "crate::mod::func")
+            // so actual definitions rank higher than import/use references.
+            let symbol_lower = node.symbol_name.to_ascii_lowercase();
+            if symbol_lower.contains("::") || symbol_lower.contains('.') {
+                score.overall *= 0.7;
+            }
 
             if score.overall > 0.0 {
                 // Apply relevance threshold if specified
@@ -2251,18 +2323,45 @@ impl SearchEngine {
             }
 
             let structural_score = (node.complexity as f32 / 100.0).min(1.0);
-            let neural_score = 0.0;
 
-            let score = if let Some(qt) = query.query_type {
+            // Compute neural score using cosine similarity between the query's
+            // neural embedding and the node's neural embedding.
+            // Falls back to 0.0 when neural embeddings are unavailable.
+            let neural_score = match (&query.query_neural_embedding, &node.neural_embedding) {
+                (Some(q_emb), Some(n_emb)) => {
+                    crate::search::vector::cosine_similarity(q_emb, n_emb)
+                }
+                _ => 0.0,
+            };
+
+            let neural_available = query.query_neural_embedding.is_some();
+            let mut score = if let Some(qt) = query.query_type {
                 match qt {
                     crate::search::ranking::QueryType::Text => self
                         .scorer
                         .with_weights_hybrid(0.2, 0.05, 0.05, 0.7)
                         .score_hybrid(tfidf_score, neural_score, structural_score, text_score),
-                    crate::search::ranking::QueryType::Semantic => self
-                        .scorer
-                        .with_weights_hybrid(0.7, 0.1, 0.1, 0.1)
-                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score),
+                    crate::search::ranking::QueryType::Semantic => {
+                        if neural_available {
+                            self.scorer
+                                .with_weights_hybrid(0.3, 0.3, 0.1, 0.3)
+                                .score_hybrid(
+                                    tfidf_score,
+                                    neural_score,
+                                    structural_score,
+                                    text_score,
+                                )
+                        } else {
+                            self.scorer
+                                .with_weights_hybrid(0.4, 0.0, 0.15, 0.45)
+                                .score_hybrid(
+                                    tfidf_score,
+                                    neural_score,
+                                    structural_score,
+                                    text_score,
+                                )
+                        }
+                    }
                     crate::search::ranking::QueryType::Structural => self
                         .scorer
                         .with_weights_hybrid(0.3, 0.0, 0.5, 0.2)
@@ -2272,6 +2371,13 @@ impl SearchEngine {
                 self.scorer
                     .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
             };
+
+            // Penalize fully-qualified external references (e.g., "crate::mod::func")
+            // so actual definitions rank higher than import/use references.
+            let symbol_lower = node.symbol_name.to_ascii_lowercase();
+            if symbol_lower.contains("::") || symbol_lower.contains('.') {
+                score.overall *= 0.7;
+            }
 
             if score.overall > 0.0 {
                 if let Some(threshold) = query.threshold {
@@ -2361,24 +2467,37 @@ impl SearchEngine {
         symbol_name: &str,
         file_path: &str,
     ) -> f32 {
-        // Boost matches in symbol name
-        let symbol_boost = if symbol_name
-            .to_ascii_lowercase()
-            .contains(&precomputed.query_lower)
-        {
-            0.5
+        let symbol_lower = symbol_name.to_ascii_lowercase();
+
+        // Detect fully-qualified external references (e.g., "crate::module::function_name").
+        // These should rank lower than actual definitions.
+        let is_qualified_ref = symbol_lower.contains("::") || symbol_lower.contains('.');
+
+        // Exact symbol name match: maximum boost
+        let symbol_boost = if symbol_lower == precomputed.query_lower {
+            1.0
+        } else if symbol_lower.contains(&precomputed.query_lower) {
+            // Query is a substring of symbol name (e.g., query "tool_call" in "handle_tool_call")
+            if is_qualified_ref {
+                // Lower boost for qualified references (e.g., "crate.module.handle_tool_call")
+                0.3
+            } else {
+                0.7
+            }
+        } else if precomputed.query_lower.contains(&symbol_lower) && !symbol_lower.is_empty() {
+            // Symbol name is a substring of query (e.g., query "handle_tool_call" in "tool_call")
+            0.4
         } else {
             0.0
         };
 
         // Penalty for test-related files to address Limitation 4
-        let test_penalty = if file_path.to_ascii_lowercase().contains("test")
-            || symbol_name.to_ascii_lowercase().contains("test")
-        {
-            0.3
-        } else {
-            0.0
-        };
+        let test_penalty =
+            if file_path.to_ascii_lowercase().contains("test") || symbol_lower.contains("test") {
+                0.3
+            } else {
+                0.0
+            };
 
         // Use cached node tokens for overlap calculation (T14 optimization)
         // Tokens were cached during index_nodes() — no re-tokenization needed.
@@ -2764,6 +2883,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -2791,6 +2911,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -2848,6 +2969,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -2868,6 +2990,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: Some(0.5),
             query_type: None,
         };
@@ -2960,6 +3083,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3060,6 +3184,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3117,6 +3242,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3170,6 +3296,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3223,6 +3350,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3289,6 +3417,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3447,6 +3576,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3663,6 +3793,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3704,6 +3835,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3821,6 +3953,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3861,6 +3994,7 @@ mod tests {
                 semantic: false,
                 expand_context: false,
                 query_embedding: None,
+                query_neural_embedding: None,
                 threshold: None,
                 query_type: None,
             };
@@ -3891,6 +4025,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -4574,6 +4709,7 @@ mod tests {
             semantic: true,
             expand_context: false,
             query_embedding: Some(vec![0.9, 0.1, 0.0]),
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -4618,6 +4754,7 @@ mod tests {
             semantic: true,
             expand_context: false,
             query_embedding: Some(vec![0.0, 0.9, 0.1]),
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -4689,6 +4826,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };

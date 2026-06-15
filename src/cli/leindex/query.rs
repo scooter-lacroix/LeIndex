@@ -69,6 +69,7 @@ impl LeIndex {
             semantic: true,
             expand_context: false,
             query_embedding: Some(self.generate_query_embedding(query)),
+            query_neural_embedding: self.generate_query_neural_embedding(query),
             threshold: Some(0.1), // Added default threshold for better quality
             query_type,
         };
@@ -177,6 +178,7 @@ impl LeIndex {
             semantic: true,
             expand_context: false,
             query_embedding: Some(self.generate_query_embedding(query)),
+            query_neural_embedding: self.generate_query_neural_embedding(query),
             threshold: Some(0.1), // Added threshold for better quality
             query_type: Some(crate::search::ranking::QueryType::Semantic),
         };
@@ -341,6 +343,39 @@ impl LeIndex {
         } else {
             generate_deterministic_embedding(query)
         }
+    }
+
+    /// Generate a neural embedding for a query string.
+    ///
+    /// Uses ONNX (or remote) neural embeddings when available, projecting
+    /// the query into the same neural vector space as the indexed nodes.
+    /// Returns `None` when neural embeddings are unavailable (TF-IDF fallback).
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    pub fn generate_query_neural_embedding(&self, query: &str) -> Option<Vec<f32>> {
+        if let Some(ref emb) = self.embedder {
+            match emb.embed_neural_blocking(query) {
+                Some(Ok(vec)) => Some(vec),
+                Some(Err(e)) => {
+                    debug!(
+                        "Neural embedding failed for query, using TF-IDF fallback: {}",
+                        e
+                    );
+                    None
+                }
+                None => None, // TF-IDF only mode, no neural available
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Generate a neural embedding for a query string (no-op without ONNX feature).
+    ///
+    /// Always returns `None` when compiled without the `onnx` or `remote-embeddings`
+    /// feature flag, ensuring TF-IDF fallback is used.
+    #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+    pub fn generate_query_neural_embedding(&self, _query: &str) -> Option<Vec<f32>> {
+        None
     }
 
     /// Expand context using PDG traversal

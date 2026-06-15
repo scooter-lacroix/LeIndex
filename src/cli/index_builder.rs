@@ -1336,6 +1336,10 @@ pub(crate) fn index_nodes_with_embedder(
     let mut shed_count: usize = 0;
     let mut hoisted_count: usize = 0;
 
+    // Clear the search engine once before batch processing begins.
+    // Each batch will append nodes incrementally via append_nodes().
+    search_engine.clear_index();
+
     let mut nodes: Vec<NodeInfo> = Vec::with_capacity(batch_size);
 
     for batch in node_indices.chunks(batch_size) {
@@ -1458,7 +1462,7 @@ pub(crate) fn index_nodes_with_embedder(
             }
         }
 
-        search_engine.index_nodes(std::mem::replace(
+        search_engine.append_nodes(std::mem::replace(
             &mut nodes,
             Vec::with_capacity(batch_size),
         ));
@@ -2398,7 +2402,8 @@ mod tests {
             tfidf_embedder.dimension,
             crate::search::search::DEFAULT_EMBEDDING_DIMENSION
         );
-        assert_eq!(engine.node_count(), 3);
+        // All 6 nodes should be indexed (append_nodes accumulates across batches)
+        assert_eq!(engine.node_count(), 6);
     }
 
     #[test]

@@ -843,6 +843,7 @@ mod tests {
             semantic: true,
             expand_context: false,
             query_embedding: Some(query_embedding.clone()),
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -930,6 +931,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -979,6 +981,7 @@ mod tests {
             semantic: true,
             expand_context: false,
             query_embedding: Some(query_embedding),
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -1051,6 +1054,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -1108,6 +1112,7 @@ mod tests {
             semantic: true,
             expand_context: false,
             query_embedding: Some(query_embedding),
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -1145,6 +1150,7 @@ mod tests {
             semantic: true,
             expand_context: false,
             query_embedding: Some(query_embedding),
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -1169,6 +1175,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
