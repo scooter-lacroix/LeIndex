@@ -289,8 +289,9 @@ For the exact source implementation use LeIndex [Read Symbol]."
             .ok_or_else(|| JsonRpcError::internal_error("PDG node disappeared after lookup"))?;
 
         // Callees (direct)
-        let callees: Vec<Value> = if include_callees {
-            pdg.neighbors(node_id)
+        let (callees, callees_truncated) = if include_callees {
+            let all_callees: Vec<Value> = pdg
+                .neighbors(node_id)
                 .iter()
                 .filter_map(|&cid| {
                     pdg.get_node(cid).map(|cn| {
@@ -301,15 +302,20 @@ For the exact source implementation use LeIndex [Read Symbol]."
                         })
                     })
                 })
-                .take(50)
-                .collect()
+                .collect();
+            let total = all_callees.len();
+            let truncated = total > 50;
+            (
+                all_callees.into_iter().take(50).collect::<Vec<_>>(),
+                truncated,
+            )
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
 
         // Callers (direct)
-        let callers: Vec<Value> = if include_callers {
-            get_direct_callers(pdg, node_id)
+        let (callers, callers_truncated) = if include_callers {
+            let all_callers: Vec<Value> = get_direct_callers(pdg, node_id)
                 .iter()
                 .filter_map(|&cid| {
                     pdg.get_node(cid).map(|cn| {
@@ -320,10 +326,15 @@ For the exact source implementation use LeIndex [Read Symbol]."
                         })
                     })
                 })
-                .take(50)
-                .collect()
+                .collect();
+            let total = all_callers.len();
+            let truncated = total > 50;
+            (
+                all_callers.into_iter().take(50).collect::<Vec<_>>(),
+                truncated,
+            )
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
 
         // Forward impact (depth-bounded transitive dependents)
@@ -352,6 +363,8 @@ For the exact source implementation use LeIndex [Read Symbol]."
             "language": node.language,
             "callers": callers,
             "callees": callees,
+            "callers_truncated": callers_truncated,
+            "callees_truncated": callees_truncated,
             "impact_radius": impact_radius
         });
 

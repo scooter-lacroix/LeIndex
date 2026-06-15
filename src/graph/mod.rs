@@ -24,6 +24,7 @@ pub use cross_project::{CrossProjectPDG, ExternalNodeRef, MergeError};
 pub use embedding::NodeEmbedding;
 pub use external_deps::{annotate_external_nodes, ExternalDependencyRegistry};
 pub use extraction::extract_pdg_from_signatures;
+pub use extraction::resolve_cross_file_call_edges;
 pub use pdg::{Edge, Node, ProgramDependenceGraph};
 pub use traversal::{GravityTraversal, TraversalConfig};
 

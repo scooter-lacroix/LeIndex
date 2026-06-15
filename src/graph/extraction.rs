@@ -1029,6 +1029,441 @@ pub fn extract_call_edges(
     edges
 }
 
+/// Resolve cross-file call edges after all per-file PDGs have been merged.
+///
+/// During per-file PDG extraction, `extract_call_edges` can only resolve calls
+/// to symbols defined in the same file (because the resolution maps are built
+/// from that file's signatures alone). This function performs a second pass
+/// over the merged PDG using ALL signatures from ALL files, adding call edges
+/// that span file boundaries.
+///
+/// # Arguments
+///
+/// * `pdg` - The merged PDG containing nodes from all files
+/// * `all_signatures` - Signatures from all files in the project
+///
+/// This function mutates the PDG in-place, adding new `Call` edges for
+/// cross-file call relationships that were not resolved during per-file
+/// extraction.
+pub fn resolve_cross_file_call_edges(
+    pdg: &mut ProgramDependenceGraph,
+    all_signatures: &[SignatureInfo],
+) {
+    use crate::graph::pdg::{EdgeType, NodeId};
+
+    // Build lookup maps from the merged PDG nodes.
+    // Node ids are formatted as "file_path:qualified_name".
+    // We build maps keyed by various forms of the qualified name for resolution.
+    let mut qname_to_node: HashMap<String, NodeId> = HashMap::new();
+    let mut exact_map: HashMap<String, Vec<NodeId>> = HashMap::new();
+    let mut last_map: HashMap<String, Vec<NodeId>> = HashMap::new();
+    let mut suffix_map: HashMap<String, Vec<NodeId>> = HashMap::new();
+
+    for nid in pdg.node_indices() {
+        if let Some(node) = pdg.get_node(nid) {
+            // Skip external nodes - they are references, not definitions.
+            // We only want to resolve calls to actual definitions.
+            if node.node_type == crate::graph::pdg::NodeType::External {
+                continue;
+            }
+
+            // Extract the qualified_name from the node id
+            // Node id format: "file_path:qualified_name"
+            let qname = node
+                .id
+                .rsplit_once(':')
+                .map(|(_, qn)| qn)
+                .unwrap_or(&node.id);
+
+            // Prefer non-module nodes for qname_to_node (don't overwrite
+            // a function/method node with a module node)
+            let is_module = node.node_type == crate::graph::pdg::NodeType::Module;
+            let should_insert = if is_module {
+                !qname_to_node.contains_key(qname)
+            } else {
+                true
+            };
+
+            if should_insert {
+                qname_to_node.insert(qname.to_string(), nid);
+            }
+
+            let normalized = normalize_symbol(qname);
+            let segments: Vec<&str> = normalized.split('.').filter(|s| !s.is_empty()).collect();
+
+            exact_map.entry(normalized.clone()).or_default().push(nid);
+
+            if let Some(last) = segments.last() {
+                last_map.entry(last.to_string()).or_default().push(nid);
+            }
+
+            for len in 2..=3_usize.min(segments.len()) {
+                let start = segments.len() - len;
+                let key = segments[start..].join(".");
+                suffix_map.entry(key).or_default().push(nid);
+            }
+
+            // Also index by node name for last-segment resolution
+            // Only for non-module nodes to avoid noise
+            if !is_module {
+                last_map.entry(node.name.to_string()).or_default().push(nid);
+            }
+        }
+    }
+
+    // Build alias map from all imports
+    let mut alias_map: HashMap<String, String> = HashMap::new();
+    for sig in all_signatures {
+        for import in &sig.imports {
+            let alias = import.alias.clone().or_else(|| {
+                import
+                    .path
+                    .split(['.', ':', '/', '\\'])
+                    .next_back()
+                    .map(|s| s.to_string())
+            });
+            if let Some(alias) = alias {
+                alias_map
+                    .entry(alias)
+                    .or_insert_with(|| import.path.clone());
+            }
+        }
+    }
+
+    // Track existing call edges to avoid duplicates
+    let mut existing_edges: HashSet<(NodeId, NodeId)> = HashSet::new();
+    for edge_idx in pdg.edge_indices() {
+        if let Some(edge) = pdg.get_edge(edge_idx) {
+            if edge.edge_type == EdgeType::Call {
+                if let Some((s, t)) = pdg.edge_endpoints(edge_idx) {
+                    existing_edges.insert((s, t));
+                }
+            }
+        }
+    }
+
+    let mut new_edges = Vec::new();
+
+    for sig in all_signatures {
+        // Find the caller's node in the PDG
+        let caller_id = qname_to_node.get(&sig.qualified_name).copied();
+        let caller_id = match caller_id {
+            Some(id) => id,
+            None => continue,
+        };
+
+        let caller_ns = {
+            let norm = normalize_symbol(&sig.qualified_name);
+            let segs: Vec<&str> = norm.split('.').collect();
+            if segs.len() > 1 {
+                Some(segs[..segs.len() - 1].join("."))
+            } else {
+                None
+            }
+        };
+
+        for call_target in &sig.calls {
+            let mut candidates = vec![call_target.clone()];
+
+            let call_segs: Vec<String> = normalize_symbol(call_target)
+                .split('.')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+
+            // Resolve via import aliases
+            if let Some(first) = call_segs.first() {
+                if let Some(import_path) = alias_map.get(first) {
+                    if call_segs.len() == 1 {
+                        candidates.push(import_path.clone());
+                    } else {
+                        candidates.push(format!("{}.{}", import_path, call_segs[1..].join(".")));
+                    }
+                }
+            }
+
+            // Resolve via caller namespace (self.method, super::method, etc.)
+            if let Some(ns) = &caller_ns {
+                if let Some(first) = call_segs.first() {
+                    if matches!(
+                        first.as_str(),
+                        "self" | "this" | "super" | "Self" | "crate" | "base"
+                    ) {
+                        let rest = call_segs[1..].join(".");
+                        if !rest.is_empty() {
+                            candidates.push(format!("{}.{}", ns, rest));
+                        }
+                    } else if call_segs.len() == 1 {
+                        // Bare function call - try resolving in caller's namespace
+                        candidates.push(format!("{}.{}", ns, first));
+                    }
+                }
+            }
+
+            // Try to resolve each candidate against the global maps
+            let mut targets: Vec<NodeId> = Vec::new();
+            let mut last_segment_fallback: Option<String> = None;
+            for candidate in &candidates {
+                let norm = normalize_symbol(candidate);
+                let segs: Vec<String> = norm
+                    .split('.')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+
+                // 1. Try exact match first (highest confidence)
+                if let Some(ids) = exact_map.get(&norm) {
+                    targets.extend(ids.iter().copied());
+                }
+
+                // 2. Try suffix matching (2-3 segments from the end)
+                // This handles cases like `module.function_name` or `class.method_name`
+                for len in 2..=3_usize.min(segs.len()) {
+                    let start = segs.len() - len;
+                    let key = segs[start..].join(".");
+                    if let Some(ids) = suffix_map.get(&key) {
+                        targets.extend(ids.iter().copied());
+                    }
+                }
+
+                // 3. For bare names (single segment), use last_map
+                if segs.len() == 1 {
+                    if let Some(ids) = last_map.get(&norm) {
+                        targets.extend(ids.iter().copied());
+                    }
+                }
+
+                // 4. Track last segment for fallback (see below)
+                if last_segment_fallback.is_none() {
+                    if let Some(last) = segs.last() {
+                        last_segment_fallback = Some(last.clone());
+                    }
+                }
+            }
+
+            // 5. Fallback: if no targets found via exact/suffix matching,
+            // try matching the last segment of the call target against
+            // node names. This handles fully-qualified calls like
+            // `crate::module::function_name` where the PDG node only has
+            // the bare name `function_name`.
+            if targets.is_empty() {
+                if let Some(last_seg) = last_segment_fallback {
+                    // Only do this for non-trivial names (avoid matching
+                    // common method names like `clone`, `name`, `new`, etc.)
+                    const COMMON_NAMES: &[&str] = &[
+                        "new",
+                        "clone",
+                        "name",
+                        "len",
+                        "get",
+                        "set",
+                        "add",
+                        "remove",
+                        "push",
+                        "pop",
+                        "iter",
+                        "next",
+                        "send",
+                        "recv",
+                        "read",
+                        "write",
+                        "open",
+                        "close",
+                        "start",
+                        "stop",
+                        "run",
+                        "exec",
+                        "call",
+                        "apply",
+                        "map",
+                        "filter",
+                        "fold",
+                        "collect",
+                        "into",
+                        "from",
+                        "to",
+                        "as",
+                        "is",
+                        "has",
+                        "can",
+                        "should",
+                        "will",
+                        "do",
+                        "done",
+                        "ok",
+                        "err",
+                        "some",
+                        "none",
+                        "true",
+                        "false",
+                        "nil",
+                        "null",
+                        "self",
+                        "super",
+                        "init",
+                        "free",
+                        "drop",
+                        "copy",
+                        "dup",
+                        "swap",
+                        "cmp",
+                        "eq",
+                        "ne",
+                        "lt",
+                        "le",
+                        "gt",
+                        "ge",
+                        "hash",
+                        "fmt",
+                        "dbg",
+                        "print",
+                        "println",
+                        "format",
+                        "parse",
+                        "unwrap",
+                        "expect",
+                        "ok_or",
+                        "ok_or_else",
+                        "map_err",
+                        "and_then",
+                        "or_else",
+                        "unwrap_or",
+                        "unwrap_or_else",
+                        "unwrap_or_default",
+                        "is_some",
+                        "is_none",
+                        "is_ok",
+                        "is_err",
+                        "as_ref",
+                        "as_mut",
+                        "as_str",
+                        "as_bytes",
+                        "trim",
+                        "split",
+                        "join",
+                        "replace",
+                        "contains",
+                        "starts_with",
+                        "ends_with",
+                        "find",
+                        "rfind",
+                        "matches",
+                        "parse",
+                        "to_string",
+                        "to_owned",
+                        "to_vec",
+                        "into_string",
+                        "into_bytes",
+                        "into_vec",
+                        "iter",
+                        "into_iter",
+                        "keys",
+                        "values",
+                        "entries",
+                        // Additional common names that produce false positives
+                        "execute",
+                        "handle",
+                        "process",
+                        "update",
+                        "create",
+                        "delete",
+                        "save",
+                        "load",
+                        "fetch",
+                        "build",
+                        "make",
+                        "spawn",
+                        "fork",
+                        "warn",
+                        "info",
+                        "error",
+                        "trace",
+                        "debug",
+                        "log",
+                        "json",
+                        "yaml",
+                        "toml",
+                        "xml",
+                        "html",
+                        "csv",
+                        "Ok",
+                        "Err",
+                        "Some",
+                        "None",
+                        "Result",
+                        "Option",
+                        "Vec",
+                        "Box",
+                        "Rc",
+                        "Arc",
+                        "Cell",
+                        "RefCell",
+                        "Mutex",
+                        "RwLock",
+                        "String",
+                        "str",
+                        "Vec",
+                        "HashMap",
+                        "HashSet",
+                        "BTreeMap",
+                        "BTreeSet",
+                        "VecDeque",
+                        "LinkedList",
+                        "JsonRpcError",
+                        "Error",
+                        "Result",
+                        "Response",
+                        "Request",
+                        "Value",
+                        "serde",
+                        "serde_json",
+                        "display",
+                        "render",
+                    ];
+                    if !COMMON_NAMES.contains(&last_seg.as_str()) && last_seg.len() > 2 {
+                        if let Some(ids) = last_map.get(&last_seg) {
+                            targets.extend(ids.iter().copied());
+                        }
+                    }
+                }
+            }
+
+            for target_id in targets {
+                if caller_id != target_id && !existing_edges.contains(&(caller_id, target_id)) {
+                    existing_edges.insert((caller_id, target_id));
+                    new_edges.push((caller_id, target_id));
+                }
+            }
+            let callee_name = normalize_symbol(call_target);
+            if let Some((scoped_prefix, _member)) = callee_name.rsplit_once('.') {
+                let bare_type = scoped_prefix.rsplit('.').next().unwrap_or(scoped_prefix);
+                let looks_like_type = bare_type.chars().next().is_some_and(|c| c.is_uppercase());
+                if looks_like_type {
+                    let struct_nid = qname_to_node
+                        .get(scoped_prefix)
+                        .or_else(|| last_map.get(bare_type).and_then(|v| v.first()))
+                        .copied();
+                    if let Some(snid) = struct_nid {
+                        let pair = (caller_id, snid);
+                        if !existing_edges.contains(&pair) {
+                            existing_edges.insert(pair);
+                            new_edges.push(pair);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !new_edges.is_empty() {
+        tracing::debug!(
+            "Cross-file call edge resolution: added {} new edges",
+            new_edges.len()
+        );
+        pdg.add_call_edges(new_edges);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Phase 5: Import edge extraction with robust multi-line parsing
 //

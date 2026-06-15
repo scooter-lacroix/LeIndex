@@ -988,7 +988,7 @@ fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
         if !arr.is_empty() {
             out.push('\n');
             out.push_str("  Callers:\n");
-            for c in arr.iter().take(15) {
+            for c in arr.iter().take(50) {
                 let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                 let file = c.get("file").and_then(|v| v.as_str()).unwrap_or("");
                 let typ = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1011,13 +1011,24 @@ fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
                     if color { RESET } else { "" },
                 ));
             }
+            if data
+                .get("callers_truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                out.push_str(&format!(
+                    "    {}... (showing 50 of more){}\n",
+                    if color { DIM } else { "" },
+                    if color { RESET } else { "" },
+                ));
+            }
         }
     }
     if let Some(arr) = data.get("callees").and_then(|v| v.as_array()) {
         if !arr.is_empty() {
             out.push('\n');
             out.push_str("  Callees:\n");
-            for c in arr.iter().take(15) {
+            for c in arr.iter().take(50) {
                 let name = c.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                 let file = c.get("file").and_then(|v| v.as_str()).unwrap_or("");
                 let typ = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1033,6 +1044,17 @@ fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
                     } else {
                         String::new()
                     },
+                    if color { RESET } else { "" },
+                ));
+            }
+            if data
+                .get("callees_truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                out.push_str(&format!(
+                    "    {}... (showing 50 of more){}\n",
+                    if color { DIM } else { "" },
                     if color { RESET } else { "" },
                 ));
             }

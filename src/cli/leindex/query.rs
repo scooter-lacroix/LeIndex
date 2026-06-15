@@ -325,6 +325,16 @@ impl LeIndex {
                 )
             };
 
+        // Compute line number from byte range
+        let line_number = if byte_range.0 > 0 && !file_path.is_empty() {
+            std::fs::read_to_string(&file_path)
+                .ok()
+                .map(|content| content[..byte_range.0.min(content.len())].lines().count())
+                .filter(|n| *n > 0)
+        } else {
+            None
+        };
+
         let results = vec![SearchResult {
             rank: 1,
             node_id: result_node_id,
@@ -339,7 +349,7 @@ impl LeIndex {
             score: crate::search::ranking::Score::default(),
             context: None,
             byte_range,
-            line_number: None,
+            line_number,
         }];
 
         let context = self.expand_context(pdg, &results, token_budget)?;
@@ -654,16 +664,29 @@ impl LeIndex {
                 context.push_str(&format!("// File: {}\n", node.file_path));
                 context.push_str(&format!("// Type: {:?}\n", node.node_type));
 
-                // Retrieve actual source code if byte_range is valid
-                if node.byte_range.1 > node.byte_range.0 {
+                // Compute line number from byte range
+                if node.byte_range.0 > 0 {
                     if let Ok(content) = std::fs::read(&*node.file_path) {
                         let start = node.byte_range.0;
                         let end = node.byte_range.1.min(content.len());
-                        if let Ok(code) = std::str::from_utf8(&content[start..end]) {
-                            context.push_str(code);
-                            context.push('\n');
+
+                        // Compute starting line number
+                        let line_num = content[..start.min(content.len())]
+                            .iter()
+                            .filter(|&&b| b == b'\n')
+                            .count()
+                            + 1;
+                        context.push_str(&format!("// Line: {}\n", line_num));
+
+                        if end > start {
+                            if let Ok(code) = std::str::from_utf8(&content[start..end]) {
+                                context.push_str(code);
+                                context.push('\n');
+                            } else {
+                                context.push_str("// [Error: Source code is not valid UTF-8]\n");
+                            }
                         } else {
-                            context.push_str("// [Error: Source code is not valid UTF-8]\n");
+                            context.push_str("// [No source code range available for this node]\n");
                         }
                     } else {
                         context.push_str(&format!(
