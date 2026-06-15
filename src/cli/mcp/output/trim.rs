@@ -206,38 +206,16 @@ fn trim_diagnostics(data: &Value) -> Value {
 }
 
 fn trim_impact(data: &Value) -> Value {
-    fn trim_side(v: &Value) -> Value {
-        // Borrow the array and only clone the whitelisted
-        // fields we actually keep. The previous
-        // `as_array().cloned().unwrap_or_default()` allocated a
-        // fresh `Value` for every element in the array (a deep
-        // copy including `serde_json::Map` nodes, strings,
-        // numbers) just to throw most of the data away in the
-        // subsequent mapping. The borrowing form skips those
-        // deep copies and only allocates the small output
-        // object — same shape on the wire, but O(1) element
-        // allocations instead of O(N).
-        let trimmed: Vec<Value> = v
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "name": s.get("name"),
-                            "file": s.get("file"),
-                            "line": s.get("line"),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Value::Array(trimmed)
-    }
     serde_json::json!({
         "symbol": data.get("symbol"),
+        "file": data.get("file"),
+        "change_type": data.get("change_type"),
+        "direct_callers": data.get("direct_callers"),
+        "transitive_affected_symbols": data.get("transitive_affected_symbols"),
+        "transitive_affected_files": data.get("transitive_affected_files"),
+        "transitive_callers": data.get("transitive_callers"),
         "risk_level": data.get("risk_level"),
-        "forward_impact": data.get("forward_impact").map(trim_side),
-        "backward_impact": data.get("backward_impact").map(trim_side),
+        "summary": data.get("summary"),
     })
 }
 
@@ -308,9 +286,12 @@ fn trim_file_summary(data: &Value) -> Value {
     serde_json::json!({
         "file_path": data.get("file_path"),
         "language": data.get("language"),
-        "size": data.get("size"),
-        "complexity": data.get("complexity"),
+        "line_count": data.get("line_count"),
+        "symbol_count": data.get("symbol_count"),
+        "symbols_shown": data.get("symbols_shown"),
+        "symbols_truncated": data.get("symbols_truncated"),
         "symbols": data.get("symbols"),
+        "module_role": data.get("module_role"),
     })
 }
 
@@ -1926,42 +1907,39 @@ mod tests {
     fn test_trim_impact_borrows_impact_array() {
         let input = v(r#"{
             "symbol": "Foo::bar",
+            "file": "src/foo.rs",
+            "change_type": "modify",
             "risk_level": "medium",
-            "forward_impact": [
-                {"name": "caller_a", "file": "src/a.rs", "line": 10, "byte_range": [0, 50], "call_graph": "ignored"},
-                {"name": "caller_b", "file": "src/b.rs", "line": 20, "byte_range": [50, 100], "call_graph": "ignored"}
-            ],
-            "backward_impact": [
-                {"name": "callee_x", "file": "src/x.rs", "line": 5}
-            ]
+            "direct_callers": ["caller_a", "caller_b"],
+            "transitive_affected_symbols": ["callee_x", "callee_y", "callee_z"],
+            "transitive_affected_files": 2,
+            "transitive_callers": 5,
+            "summary": "Changing 'Foo::bar' directly affects 3 symbols in 2 files (risk: medium)"
         }"#);
         let t = trim_impact(&input);
-        // Top-level: only `symbol`, `risk_level`,
-        // `forward_impact`, `backward_impact` kept.
+        // Top-level: all handler fields are preserved.
         assert_eq!(t["symbol"], "Foo::bar");
+        assert_eq!(t["file"], "src/foo.rs");
+        assert_eq!(t["change_type"], "modify");
         assert_eq!(t["risk_level"], "medium");
-        assert!(t.get("forward_impact").is_some());
-        assert!(t.get("backward_impact").is_some());
-        // `forward_impact` per entry: only `name`, `file`,
-        // `line` kept.
-        let fwd = t["forward_impact"].as_array().unwrap();
-        assert_eq!(fwd.len(), 2);
-        for entry in fwd {
-            assert!(entry.get("name").is_some());
-            assert!(entry.get("file").is_some());
-            assert!(entry.get("line").is_some());
-            assert!(entry.get("byte_range").is_none());
-            assert!(entry.get("call_graph").is_none());
-        }
-        assert_eq!(fwd[0]["name"], "caller_a");
-        assert_eq!(fwd[0]["file"], "src/a.rs");
-        assert_eq!(fwd[0]["line"], 10);
-        // `backward_impact` per entry: same whitelist.
-        let back = t["backward_impact"].as_array().unwrap();
-        assert_eq!(back.len(), 1);
-        assert_eq!(back[0]["name"], "callee_x");
-        assert_eq!(back[0]["file"], "src/x.rs");
-        assert_eq!(back[0]["line"], 5);
+        assert!(t.get("direct_callers").is_some());
+        assert!(t.get("transitive_affected_symbols").is_some());
+        assert!(t.get("transitive_affected_files").is_some());
+        assert!(t.get("transitive_callers").is_some());
+        assert!(t.get("summary").is_some());
+        // direct_callers array preserved
+        let callers = t["direct_callers"].as_array().unwrap();
+        assert_eq!(callers.len(), 2);
+        assert_eq!(callers[0], "caller_a");
+        // transitive_affected_symbols array preserved
+        let affected = t["transitive_affected_symbols"].as_array().unwrap();
+        assert_eq!(affected.len(), 3);
+        assert_eq!(affected[0], "callee_x");
+        // summary string preserved
+        assert!(t["summary"]
+            .as_str()
+            .unwrap()
+            .contains("3 symbols"));
     }
 
     #[test]

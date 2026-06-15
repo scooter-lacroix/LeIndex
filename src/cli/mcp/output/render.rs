@@ -177,13 +177,32 @@ fn render_tree_node(
     let count_color = if color { DIM } else { "" };
     let reset = if color { RESET } else { "" };
 
+    // Dependency info for file nodes
+    let incoming = node
+        .get("incoming_dependencies")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let outgoing = node
+        .get("outgoing_dependencies")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let dep_suffix = if incoming > 0 || outgoing > 0 {
+        format!(
+            "  {}[{}→{}←{}]{}",
+            count_color, outgoing, incoming, reset, reset,
+        )
+    } else {
+        String::new()
+    };
+
     if is_root {
         out.push_str(&format!(
-            "{}{}{}{}\n",
+            "{}{}{}{}{}\n",
             name_color,
             name,
             reset,
             suffix(symbol_count, count_color, reset),
+            dep_suffix,
         ));
     } else {
         // `suffix(symbol_count, count_color, reset)` already wraps the
@@ -197,13 +216,14 @@ fn render_tree_node(
         // trailing `reset`; the suffix already opens and closes
         // colour for the symbol-count segment.
         out.push_str(&format!(
-            "{}{}{}{}{}{}\n",
+            "{}{}{}{}{}{}{}\n",
             prefix,
             connector,
             name_color,
             name,
             reset,
             suffix(symbol_count, count_color, reset),
+            dep_suffix,
         ));
     }
 
@@ -630,6 +650,14 @@ fn render_project_map(data: &Value, color: bool) -> String {
             out.push_str(&field("Lines of code", &v.to_string(), color));
         }
     }
+    // Also show total_files_in_scope from the handler output
+    // (the handler puts this at top level, not under "stats")
+    if let Some(v) = data.get("total_files_in_scope").and_then(|v| v.as_u64()) {
+        if data.get("stats").is_none() {
+            out.push('\n');
+        }
+        out.push_str(&field("Files in scope", &v.to_string(), color));
+    }
     out
 }
 
@@ -799,6 +827,12 @@ fn render_impact(data: &Value, color: bool) -> String {
     if let Some(sym) = data.get("symbol").and_then(|v| v.as_str()) {
         out.push_str(&field("Symbol", sym, color));
     }
+    if let Some(file) = data.get("file").and_then(|v| v.as_str()) {
+        out.push_str(&field("File", file, color));
+    }
+    if let Some(ct) = data.get("change_type").and_then(|v| v.as_str()) {
+        out.push_str(&field("Change type", ct, color));
+    }
     if let Some(risk) = data.get("risk_level").and_then(|v| v.as_str()) {
         let (icon, c) = if color {
             match risk.to_lowercase().as_str() {
@@ -821,25 +855,96 @@ fn render_impact(data: &Value, color: bool) -> String {
             if color { RESET } else { "" },
         ));
     }
-    render_impact_side(
-        data,
-        "forward_impact",
-        "Forward (callers of callees)",
-        "→",
-        color,
-        &mut out,
-    );
-    render_impact_side(
-        data,
-        "backward_impact",
-        "Backward (what calls this)",
-        "←",
-        color,
-        &mut out,
-    );
+
+    // Direct callers
+    if let Some(arr) = data.get("direct_callers").and_then(|v| v.as_array()) {
+        if !arr.is_empty() {
+            out.push('\n');
+            out.push_str(&format!(
+                "  {}Direct callers ({}):{}\n",
+                if color { BOLD } else { "" },
+                arr.len(),
+                if color { RESET } else { "" },
+            ));
+            for item in arr.iter().take(20) {
+                let name = item
+                    .as_str()
+                    .unwrap_or_else(|| item.get("name").and_then(|v| v.as_str()).unwrap_or("?"));
+                out.push_str(&format!(
+                    "    {}← {}{}\n",
+                    if color { LIGHT_CYAN } else { "" },
+                    name,
+                    if color { RESET } else { "" },
+                ));
+            }
+        }
+    }
+
+    // Transitive affected symbols
+    if let Some(arr) = data
+        .get("transitive_affected_symbols")
+        .and_then(|v| v.as_array())
+    {
+        if !arr.is_empty() {
+            out.push('\n');
+            out.push_str(&format!(
+                "  {}Transitive affected symbols ({}):{}\n",
+                if color { BOLD } else { "" },
+                arr.len(),
+                if color { RESET } else { "" },
+            ));
+            for item in arr.iter().take(30) {
+                let name = item
+                    .as_str()
+                    .unwrap_or_else(|| item.get("name").and_then(|v| v.as_str()).unwrap_or("?"));
+                out.push_str(&format!(
+                    "    {}→ {}{}\n",
+                    if color { LIGHT_YELLOW } else { "" },
+                    name,
+                    if color { RESET } else { "" },
+                ));
+            }
+            if arr.len() > 30 {
+                out.push_str(&format!(
+                    "    {}… {} more{}\n",
+                    if color { DIM } else { "" },
+                    arr.len() - 30,
+                    if color { RESET } else { "" },
+                ));
+            }
+        }
+    }
+
+    // Summary with numeric counts
+    if let Some(s) = data.get("summary").and_then(|v| v.as_str()) {
+        out.push('\n');
+        out.push_str(&format!(
+            "  {}Summary:{} {}\n",
+            if color { BOLD } else { "" },
+            if color { RESET } else { "" },
+            s,
+        ));
+    }
+
+    // Numeric counts from handler fields
+    let affected_files = data
+        .get("transitive_affected_files")
+        .and_then(|v| v.as_u64());
+    let transitive_callers = data.get("transitive_callers").and_then(|v| v.as_u64());
+    if affected_files.is_some() || transitive_callers.is_some() {
+        out.push('\n');
+        if let Some(af) = affected_files {
+            out.push_str(&field("Affected files", &af.to_string(), color));
+        }
+        if let Some(tc) = transitive_callers {
+            out.push_str(&field("Transitive callers", &tc.to_string(), color));
+        }
+    }
+
     out
 }
 
+#[allow(dead_code)]
 fn render_impact_side(
     data: &Value,
     key: &str,
@@ -1120,47 +1225,151 @@ fn render_git_status(data: &Value, color: bool) -> String {
     if let Some(b) = data.get("branch").and_then(|v| v.as_str()) {
         out.push_str(&field("Branch", b, color));
     }
-    if let Some(s) = data.get("status").and_then(|v| v.as_str()) {
-        let c = if color {
-            match s {
-                "clean" => LIGHT_GREEN,
-                "dirty" => LIGHT_YELLOW,
-                _ => WHITE,
-            }
-        } else {
-            ""
-        };
-        out.push_str(&format!(
-            "  {}{}:{} {}{}{}{}\n",
-            if color { BOLD } else { "" },
-            "Status",
-            if color { RESET } else { "" },
-            c,
-            s,
-            if color { RESET } else { "" },
-            "",
-        ));
+
+    // Summary counts
+    if let Some(s) = data.get("summary").and_then(|v| v.as_object()) {
+        let modified = s.get("modified").and_then(|v| v.as_u64()).unwrap_or(0);
+        let staged = s.get("staged").and_then(|v| v.as_u64()).unwrap_or(0);
+        let untracked = s.get("untracked").and_then(|v| v.as_u64()).unwrap_or(0);
+        if modified > 0 || staged > 0 || untracked > 0 {
+            out.push_str(&format!(
+                "  {}{} modified, {} staged, {} untracked{}\n",
+                if color { DIM } else { "" },
+                modified,
+                staged,
+                untracked,
+                if color { RESET } else { "" },
+            ));
+        }
     }
-    git_status_section(data, "staged", "Staged", "+", LIGHT_GREEN, color, &mut out);
-    git_status_section(
+
+    // File lists — handler returns string arrays under
+    // modified_files / staged_files / untracked_files
+    git_status_file_list(
         data,
-        "modified",
+        "modified_files",
         "Modified",
         "~",
         LIGHT_YELLOW,
         color,
         &mut out,
     );
-    git_status_section(
+    git_status_file_list(
         data,
-        "untracked",
+        "staged_files",
+        "Staged",
+        "+",
+        LIGHT_GREEN,
+        color,
+        &mut out,
+    );
+    git_status_file_list(
+        data,
+        "untracked_files",
         "Untracked",
         "?",
         LIGHT_GREY,
         color,
         &mut out,
     );
-    git_status_section(data, "deleted", "Deleted", "✗", LIGHT_RED, color, &mut out);
+
+    // Changed symbols with structural impact
+    if let Some(arr) = data.get("changed_symbols").and_then(|v| v.as_array()) {
+        if !arr.is_empty() {
+            out.push('\n');
+            out.push_str(&format!(
+                "  {}Changed Symbols:{}\n",
+                if color { BOLD } else { "" },
+                if color { RESET } else { "" },
+            ));
+            for entry in arr.iter().take(20) {
+                let file = entry.get("file").and_then(|v| v.as_str()).unwrap_or("?");
+                let status = entry
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("modified");
+                let symbols = entry
+                    .get("symbols")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "    {}{}{} {}({}){}\n",
+                    if color { LIGHT_YELLOW } else { "" },
+                    file,
+                    if color { RESET } else { "" },
+                    if color { DIM } else { "" },
+                    status,
+                    if color { RESET } else { "" },
+                ));
+                for sym in symbols.iter().take(10) {
+                    let name = sym.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                    let typ = sym.get("type").and_then(|v| v.as_str()).unwrap_or("symbol");
+                    let caller_count = sym
+                        .get("caller_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let impact = sym
+                        .get("forward_impact_count")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let (icon, ic) = if color {
+                        match typ {
+                            "function" | "fn" => ("ƒ", LIGHT_GREEN),
+                            "method" => ("m", LIGHT_CYAN),
+                            "struct" => ("S", LIGHT_MAGENTA),
+                            _ => ("•", WHITE),
+                        }
+                    } else {
+                        ("•", "")
+                    };
+                    out.push_str(&format!(
+                        "      {}{}{} {}{}{} {}{} callers, {} impact{}\n",
+                        ic,
+                        icon,
+                        if color { RESET } else { "" },
+                        if color { LIGHT_CYAN } else { "" },
+                        name,
+                        if color { RESET } else { "" },
+                        if color { DIM } else { "" },
+                        caller_count,
+                        impact,
+                        if color { RESET } else { "" },
+                    ));
+                }
+                if symbols.is_empty() {
+                    out.push_str(&format!(
+                        "      {}No indexed symbols{}\n",
+                        if color { DIM } else { "" },
+                        if color { RESET } else { "" },
+                    ));
+                }
+            }
+        }
+    }
+
+    // Impact summary
+    if let Some(imp) = data.get("impact_summary").and_then(|v| v.as_object()) {
+        let total = imp
+            .get("total_affected_symbols")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let affected = imp
+            .get("affected_files")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        if total > 0 {
+            out.push('\n');
+            out.push_str(&format!(
+                "  {}Impact:{} {} affected symbols across {} files\n",
+                if color { BOLD } else { "" },
+                if color { RESET } else { "" },
+                total,
+                affected,
+            ));
+        }
+    }
 
     // Show PDG enrichment status so the LLM knows whether structural
     // analysis was available (VAL-TRANSPORT-008).
@@ -1181,14 +1390,13 @@ fn render_git_status(data: &Value, color: bool) -> String {
         };
         out.push('\n');
         out.push_str(&format!(
-            "  {}PDG Enrichment:{} {}{}{} {}{}\n",
+            "  {}PDG Enrichment:{} {}{}{} {}\n",
             if color { BOLD } else { "" },
             if color { RESET } else { "" },
             if color { icon_color } else { "" },
             icon,
             if color { RESET } else { "" },
             status_text,
-            "",
         ));
         if !available {
             if let Some(reason) = pdg.get("reason").and_then(|v| v.as_str()) {
@@ -1205,7 +1413,9 @@ fn render_git_status(data: &Value, color: bool) -> String {
     out
 }
 
-fn git_status_section(
+/// Render a file list section for git status. The handler returns
+/// arrays of strings (file paths), not objects with a `path` field.
+fn git_status_file_list(
     data: &Value,
     key: &str,
     label: &str,
@@ -1217,15 +1427,26 @@ fn git_status_section(
     if let Some(arr) = data.get(key).and_then(|v| v.as_array()) {
         if !arr.is_empty() {
             out.push('\n');
-            out.push_str(&format!("  {}:\n", label));
-            for f in arr.iter().take(20) {
-                let path = f.get("path").and_then(|v| v.as_str()).unwrap_or("?");
+            out.push_str(&format!("  {} ({}):\n", label, arr.len(),));
+            for f in arr.iter().take(30) {
+                // Files are plain strings in the handler output
+                let path = f
+                    .as_str()
+                    .unwrap_or_else(|| f.get("path").and_then(|v| v.as_str()).unwrap_or("?"));
                 out.push_str(&format!(
                     "    {}{}{} {}\n",
                     if color { marker_color } else { "" },
                     marker,
                     if color { RESET } else { "" },
                     path,
+                ));
+            }
+            if arr.len() > 30 {
+                out.push_str(&format!(
+                    "    {}… {} more{}\n",
+                    if color { DIM } else { "" },
+                    arr.len() - 30,
+                    if color { RESET } else { "" },
                 ));
             }
         }
@@ -1241,39 +1462,22 @@ fn render_file_summary(data: &Value, color: bool) -> String {
     if let Some(lang) = data.get("language").and_then(|v| v.as_str()) {
         out.push_str(&field("Language", lang, color));
     }
-    if let Some(size) = data.get("size").and_then(|v| v.as_u64()) {
-        out.push_str(&field("Size", &format!("{} bytes", size), color));
+    if let Some(lc) = data.get("line_count").and_then(|v| v.as_u64()) {
+        out.push_str(&field("Lines", &lc.to_string(), color));
     }
-    if let Some(complexity) = data.get("complexity").and_then(|v| v.as_u64()) {
-        let (label, c) = if color {
-            match complexity {
-                0..=5 => ("Low", LIGHT_GREEN),
-                6..=15 => ("Medium", LIGHT_YELLOW),
-                _ => ("High", LIGHT_RED),
-            }
-        } else {
-            ("", "")
-        };
-        out.push_str(&format!(
-            "  {}{}:{} {}{} {}{}{}\n",
-            if color { BOLD } else { "" },
-            "Complexity",
-            if color { RESET } else { "" },
-            c,
-            complexity,
-            if color { RESET } else { "" },
-            label,
-            if color { RESET } else { "" },
-        ));
+    if let Some(sc) = data.get("symbol_count").and_then(|v| v.as_u64()) {
+        out.push_str(&field("Symbols", &sc.to_string(), color));
+    }
+    if let Some(role) = data.get("module_role").and_then(|v| v.as_str()) {
+        out.push_str(&field("Role", role, color));
     }
     if let Some(arr) = data.get("symbols").and_then(|v| v.as_array()) {
         if !arr.is_empty() {
             out.push('\n');
             out.push_str("  Symbols:\n");
-            for sym in arr.iter().take(20) {
+            for sym in arr.iter().take(50) {
                 let name = sym.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                 let typ = sym.get("type").and_then(|v| v.as_str()).unwrap_or("symbol");
-                let line = sym.get("line").and_then(|v| v.as_u64());
                 let (icon, c) = if color {
                     match typ {
                         "function" | "fn" => ("ƒ", LIGHT_GREEN),
@@ -1290,15 +1494,32 @@ fn render_file_summary(data: &Value, color: bool) -> String {
                     ("•", "")
                 };
                 out.push_str(&format!(
-                    "    {}{}{} {}{}{}{}{}\n",
+                    "    {}{}{} {}{}{}\n",
                     c,
                     icon,
                     if color { RESET } else { "" },
                     if color { LIGHT_CYAN } else { "" },
                     name,
                     if color { RESET } else { "" },
-                    line.map(|l| format!(" :{}", l)).unwrap_or_default(),
-                    "",
+                ));
+            }
+            // Truncation indicator
+            let truncated = data
+                .get("symbols_truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let total = data
+                .get("symbol_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            let shown = arr.len().min(50);
+            if truncated || shown < total {
+                let hidden = total.saturating_sub(shown);
+                out.push_str(&format!(
+                    "    {}… {} more symbols (truncated){}\n",
+                    if color { DIM } else { "" },
+                    hidden,
+                    if color { RESET } else { "" },
                 ));
             }
         }

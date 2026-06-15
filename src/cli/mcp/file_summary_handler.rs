@@ -112,11 +112,14 @@ use LeIndex [Read Symbol]."
             .map(|n| n.language.clone())
             .unwrap_or_default();
 
-        // Build symbol list
+        // Build symbol list — filter out nodes with empty names (use
+        // statements, module declarations, anonymous blocks, etc.)
         let mut symbols: Vec<Value> = Vec::new();
         let mut total_chars = 0usize;
         let chars_per_token = 4usize;
         let char_budget = token_budget * chars_per_token;
+        let mut total_named_symbols = 0usize;
+        let mut budget_exhausted = false;
 
         for &nid in &node_ids {
             let node = match pdg.get_node(nid) {
@@ -124,11 +127,26 @@ use LeIndex [Read Symbol]."
                 None => continue,
             };
 
+            // Skip nodes with empty names — they are structural nodes
+            // (use statements, module decls, anonymous blocks) that
+            // add noise to the symbol inventory.
+            if node.name.is_empty() {
+                continue;
+            }
+
             // Apply focus filter
             if let Some(ref focus) = focus_symbol {
                 if !node.name.to_lowercase().contains(&focus.to_lowercase()) {
                     continue;
                 }
+            }
+
+            total_named_symbols += 1;
+
+            // If we already hit the budget, stop adding but keep
+            // counting for the truncation indicator.
+            if budget_exhausted {
+                continue;
             }
 
             // Outgoing edges = dependencies
@@ -183,7 +201,7 @@ use LeIndex [Read Symbol]."
             let sym_str = sym.to_string();
             total_chars += sym_str.len();
             if total_chars > char_budget {
-                break;
+                budget_exhausted = true;
             }
             symbols.push(sym);
         }
@@ -208,7 +226,9 @@ use LeIndex [Read Symbol]."
                 "file_path": file_path,
                 "language": language,
                 "line_count": line_count,
-                "symbol_count": symbols.len(),
+                "symbol_count": total_named_symbols,
+                "symbols_shown": symbols.len(),
+                "symbols_truncated": budget_exhausted,
                 "symbols": symbols,
                 "module_role": module_role
             }),
