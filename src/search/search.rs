@@ -1933,8 +1933,12 @@ impl SearchEngine {
             };
 
             if let Some(emb) = embedding {
+                // Search for more vector results than top_k to ensure good
+                // coverage of relevant nodes. Text index matches may not
+                // overlap with top vector results, so we need a larger pool.
+                let vector_search_k = (query.top_k * 10).max(100);
                 self.vector_index
-                    .search(&emb, query.top_k)
+                    .search(&emb, vector_search_k)
                     .into_iter()
                     .collect()
             } else {
@@ -2072,16 +2076,50 @@ impl SearchEngine {
                     }
                 }
             } else {
-                // Default hybrid scoring
-                self.scorer
-                    .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
+                // Default hybrid scoring.
+                // When neural embeddings are unavailable, redistribute weight
+                // to text match (the primary signal for keyword queries).
+                // TF-IDF is only computed in semantic mode, so when not semantic
+                // we give its weight to text match as well.
+                if neural_available {
+                    self.scorer.score_hybrid(
+                        tfidf_score,
+                        neural_score,
+                        structural_score,
+                        text_score,
+                    )
+                } else if query.semantic {
+                    self.scorer
+                        .with_weights_hybrid(0.40, 0.0, 0.20, 0.40)
+                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
+                } else {
+                    // Non-semantic, non-neural: text match is the dominant signal
+                    self.scorer
+                        .with_weights_hybrid(0.0, 0.0, 0.15, 0.85)
+                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
+                }
             };
 
             // Penalize fully-qualified external references (e.g., "crate::mod::func")
             // so actual definitions rank higher than import/use references.
             let symbol_lower = node.symbol_name.to_ascii_lowercase();
-            if symbol_lower.contains("::") || symbol_lower.contains('.') {
+            let is_qualified_ref = symbol_lower.contains("::") || symbol_lower.contains('.');
+            if is_qualified_ref {
                 score.overall *= 0.7;
+            }
+
+            // Boost exact symbol name matches (non-qualified definitions)
+            // so the actual function/struct definition ranks above references.
+            if !is_qualified_ref {
+                if symbol_lower == text_query.query_lower {
+                    // Exact match: strong boost
+                    score.overall = (score.overall * 1.8).min(1.0);
+                } else if !symbol_lower.is_empty() && text_query.query_lower.contains(&symbol_lower)
+                {
+                    // Symbol name appears within the query (e.g., query
+                    // "SearchEngine struct" matches symbol "SearchEngine")
+                    score.overall = (score.overall * 1.3).min(1.0);
+                }
             }
 
             if score.overall > 0.0 {
@@ -2368,15 +2406,40 @@ impl SearchEngine {
                         .score_hybrid(tfidf_score, neural_score, structural_score, text_score),
                 }
             } else {
-                self.scorer
-                    .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
+                if neural_available {
+                    self.scorer.score_hybrid(
+                        tfidf_score,
+                        neural_score,
+                        structural_score,
+                        text_score,
+                    )
+                } else if query.semantic {
+                    self.scorer
+                        .with_weights_hybrid(0.40, 0.0, 0.20, 0.40)
+                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
+                } else {
+                    self.scorer
+                        .with_weights_hybrid(0.0, 0.0, 0.15, 0.85)
+                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
+                }
             };
 
             // Penalize fully-qualified external references (e.g., "crate::mod::func")
             // so actual definitions rank higher than import/use references.
             let symbol_lower = node.symbol_name.to_ascii_lowercase();
-            if symbol_lower.contains("::") || symbol_lower.contains('.') {
+            let is_qualified_ref = symbol_lower.contains("::") || symbol_lower.contains('.');
+            if is_qualified_ref {
                 score.overall *= 0.7;
+            }
+
+            // Boost exact symbol name matches (non-qualified definitions)
+            if !is_qualified_ref {
+                if symbol_lower == text_query.query_lower {
+                    score.overall = (score.overall * 1.8).min(1.0);
+                } else if !symbol_lower.is_empty() && text_query.query_lower.contains(&symbol_lower)
+                {
+                    score.overall = (score.overall * 1.3).min(1.0);
+                }
             }
 
             if score.overall > 0.0 {
