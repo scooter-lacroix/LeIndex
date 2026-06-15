@@ -403,6 +403,8 @@ fn trim_git_status(data: &Value) -> Value {
         "staged_files": take_n(staged_files.unwrap_or(&Value::Null), 50),
         "untracked_files": take_n(untracked_files.unwrap_or(&Value::Null), 50),
         "changed_symbols": changed_symbols,
+        "pdg_enrichment": data.get("pdg_enrichment").unwrap_or(&Value::Null),
+        "impact_summary": data.get("impact_summary").unwrap_or(&Value::Null),
     })
 }
 
@@ -1957,5 +1959,69 @@ mod tests {
         assert_eq!(back[0]["name"], "callee_x");
         assert_eq!(back[0]["file"], "src/x.rs");
         assert_eq!(back[0]["line"], 5);
+    }
+
+    #[test]
+    fn test_trim_git_status_preserves_pdg_enrichment() {
+        // Regression: trim_git_status must preserve pdg_enrichment
+        // and impact_summary so they survive trimming and reach the
+        // MCP response (VAL-TRANSPORT-008).
+        let input = v(r#"{
+            "is_git_repo": true,
+            "branch": "main",
+            "summary": {"modified": 1, "staged": 0, "untracked": 0},
+            "modified_files": ["src/main.rs"],
+            "staged_files": [],
+            "untracked_files": [],
+            "changed_symbols": [
+                {"file": "src/main.rs", "status": "modified", "symbols": [{"name": "main"}]}
+            ],
+            "pdg_enrichment": {"available": true},
+            "impact_summary": {
+                "total_affected_symbols": 3,
+                "affected_files": ["src/main.rs"],
+                "pdg_enriched": true
+            },
+            "diff": "some diff"
+        }"#);
+        let t = trim_git_status(&input);
+        // Core fields preserved
+        assert_eq!(t["branch"], "main");
+        assert!(t["modified_files"].is_array());
+        assert!(t["changed_symbols"].is_array());
+        // pdg_enrichment and impact_summary must survive trimming
+        assert!(t.get("pdg_enrichment").is_some());
+        assert_eq!(t["pdg_enrichment"]["available"], true);
+        assert!(t.get("impact_summary").is_some());
+        assert_eq!(t["impact_summary"]["total_affected_symbols"], 3);
+    }
+
+    #[test]
+    fn test_trim_git_status_pdg_unavailable() {
+        // When PDG is unavailable, pdg_enrichment should still be
+        // present with available=false.
+        let input = v(r#"{
+            "branch": "main",
+            "summary": {"modified": 0, "staged": 0, "untracked": 0},
+            "modified_files": [],
+            "staged_files": [],
+            "untracked_files": [],
+            "changed_symbols": [],
+            "pdg_enrichment": {
+                "available": false,
+                "reason": "PDG load failed",
+                "error": "database error"
+            },
+            "impact_summary": {
+                "total_affected_symbols": 0,
+                "affected_files": [],
+                "pdg_enriched": false
+            }
+        }"#);
+        let t = trim_git_status(&input);
+        assert_eq!(t["pdg_enrichment"]["available"], false);
+        assert_eq!(t["pdg_enrichment"]["reason"], "PDG load failed");
+        assert_eq!(t["pdg_enrichment"]["error"], "database error");
+        assert_eq!(t["impact_summary"]["pdg_enriched"], false);
     }
 }

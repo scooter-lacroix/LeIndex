@@ -1129,6 +1129,47 @@ fn render_git_status(data: &Value, color: bool) -> String {
         &mut out,
     );
     git_status_section(data, "deleted", "Deleted", "✗", LIGHT_RED, color, &mut out);
+
+    // Show PDG enrichment status so the LLM knows whether structural
+    // analysis was available (VAL-TRANSPORT-008).
+    if let Some(pdg) = data.get("pdg_enrichment") {
+        let available = pdg
+            .get("available")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let (icon, icon_color) = if available {
+            ("✓", LIGHT_GREEN)
+        } else {
+            ("⚠", LIGHT_YELLOW)
+        };
+        let status_text = if available {
+            "available"
+        } else {
+            "unavailable"
+        };
+        out.push('\n');
+        out.push_str(&format!(
+            "  {}PDG Enrichment:{} {}{}{} {}{}\n",
+            if color { BOLD } else { "" },
+            if color { RESET } else { "" },
+            if color { icon_color } else { "" },
+            icon,
+            if color { RESET } else { "" },
+            status_text,
+            "",
+        ));
+        if !available {
+            if let Some(reason) = pdg.get("reason").and_then(|v| v.as_str()) {
+                out.push_str(&format!(
+                    "    {}Reason:{} {}\n",
+                    if color { DIM } else { "" },
+                    if color { RESET } else { "" },
+                    reason,
+                ));
+            }
+        }
+    }
+
     out
 }
 
