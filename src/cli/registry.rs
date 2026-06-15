@@ -65,7 +65,10 @@ pub const WATCHER_ENABLE_ENV: &str = "LEINDEX_WATCHER";
 /// Returns true if the file-watcher is enabled for this process.
 pub fn watcher_enabled() -> bool {
     match std::env::var(WATCHER_ENABLE_ENV) {
-        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Ok(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
         Err(_) => false,
     }
 }
@@ -359,7 +362,7 @@ impl ProjectRegistry {
         };
 
         if needs_index {
-            let _ = self.index_handle(&handle, false).await?;
+            self.index_handle(&handle, false).await?;
             // stale_cache is invalidated inside index_handle() after successful swap
         } else if needs_refresh {
             // Read paths (search/symbol-lookup/etc.) must NEVER auto-trigger a
@@ -413,7 +416,13 @@ impl ProjectRegistry {
 
         if let Some(handle) = removed {
             if let Ok(mut idx) = handle.try_write() {
-                let _ = idx.close();
+                if let Err(e) = idx.close() {
+                    warn!(
+                        "Failed to close storage for evicted project {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
             }
             info!("Evicted project: {}", path.display());
         }
@@ -496,7 +505,14 @@ impl ProjectRegistry {
         })?;
         // Load from storage to populate search_engine (is_indexed() depends on it).
         // PDG remains in memory; ensure_pdg_loaded() is a no-op after this.
-        let _ = leindex.load_from_storage();
+        if let Err(e) = leindex.load_from_storage() {
+            warn!(
+                "Failed to load project from storage for {}: {}. \
+                 The project will be auto-indexed on first tool call.",
+                canonical.display(),
+                e
+            );
+        }
 
         // Corruption detection and auto-repair
         let corruption =
@@ -508,7 +524,14 @@ impl ProjectRegistry {
                 corruption.message()
             );
             let storage_path = canonical.join(".leindex");
-            let _ = std::fs::remove_dir_all(&storage_path);
+            if let Err(e) = std::fs::remove_dir_all(&storage_path) {
+                warn!(
+                    "Failed to remove corrupted storage at {}: {}. \
+                     Attempting reindex anyway.",
+                    storage_path.display(),
+                    e
+                );
+            }
 
             let mut fresh = LeIndex::new(&canonical).map_err(|e| {
                 JsonRpcError::init_failed(
@@ -687,7 +710,13 @@ impl ProjectRegistry {
 
             if let Some(handle) = removed {
                 if let Ok(mut idx) = handle.try_write() {
-                    let _ = idx.close();
+                    if let Err(e) = idx.close() {
+                        warn!(
+                            "Failed to close storage for LRU-evicted project {}: {}",
+                            path.display(),
+                            e
+                        );
+                    }
                 }
             }
 

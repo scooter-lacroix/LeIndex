@@ -92,11 +92,16 @@ impl LeIndex {
                     .map(|node| node.id.clone()),
             );
             index_builder::remove_file_from_pdg(&mut pdg, path)?;
-            let _ = crate::storage::pdg_store::delete_file_data(
+            if let Err(e) = crate::storage::pdg_store::delete_file_data(
                 &mut self.storage,
                 &self.project_id,
                 path,
-            );
+            ) {
+                warn!(
+                    "Failed to delete file data from storage for '{}' during incremental reindex: {}",
+                    path, e
+                );
+            }
         }
 
         for result in parsing_results.into_iter() {
@@ -116,12 +121,17 @@ impl LeIndex {
             );
             index_builder::merge_pdgs(&mut pdg, file_pdg);
             if let Some(hash) = source_file_hashes.get(&file_path) {
-                let _ = crate::storage::pdg_store::update_indexed_file(
+                if let Err(e) = crate::storage::pdg_store::update_indexed_file(
                     &mut self.storage,
                     &self.project_id,
                     &file_path,
                     hash,
-                );
+                ) {
+                    warn!(
+                        "Failed to update indexed file record for '{}' during incremental reindex: {}",
+                        file_path, e
+                    );
+                }
             }
         }
 
@@ -239,9 +249,8 @@ impl LeIndex {
 
             let tokens = index_builder::tokenize_code(&node_content);
 
-            let signature = crate::search::search::SearchEngine::extract_signature_from_content(
-                &node_content,
-            );
+            let signature =
+                crate::search::search::SearchEngine::extract_signature_from_content(&node_content);
             let tfidf_embedding = embedder.embed_tfidf(&tokens);
 
             // Defer neural embedding to batch call below
@@ -269,7 +278,10 @@ impl LeIndex {
         if !neural_pending.is_empty() {
             #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
             let batch_results = {
-                let texts: Vec<String> = neural_pending.iter().map(|&idx| updated_nodes[idx].content.clone()).collect();
+                let texts: Vec<String> = neural_pending
+                    .iter()
+                    .map(|&idx| updated_nodes[idx].content.clone())
+                    .collect();
                 embedder.embed_neural_batch_blocking(&texts)
             };
             #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
@@ -486,7 +498,10 @@ impl LeIndex {
         }
 
         // Step 4: Parse changed files
-        progress_stderr(&format!("Indexing: parsing {} files...", files_to_parse.len()));
+        progress_stderr(&format!(
+            "Indexing: parsing {} files...",
+            files_to_parse.len()
+        ));
         let parsing_results = if !files_to_parse.is_empty() {
             let parser = crate::parse::parallel::ParallelParser::new();
             parser.parse_files(files_to_parse)
@@ -513,13 +528,35 @@ impl LeIndex {
         let failed = parsing_results.iter().filter(|r| r.is_failure()).count();
         let total_sigs: usize = parsing_results.iter().map(|r| r.signatures.len()).sum();
 
+        // Log individual parse failures with file path context
+        for result in parsing_results.iter().filter(|r| r.is_failure()) {
+            warn!(
+                "Parse failure for '{}' during indexing: {}",
+                result.file_path.display(),
+                result.error.as_deref().unwrap_or("unknown error")
+            );
+        }
+
+        if failed > 0 {
+            warn!(
+                "Indexing completed with {} parse failure(s) out of {} file(s)",
+                failed,
+                successful + failed
+            );
+        }
+
         for path in &deleted_files {
             index_builder::remove_file_from_pdg(&mut pdg, path)?;
-            let _ = crate::storage::pdg_store::delete_file_data(
+            if let Err(e) = crate::storage::pdg_store::delete_file_data(
                 &mut self.storage,
                 &self.project_id,
                 path,
-            );
+            ) {
+                warn!(
+                    "Failed to delete file data from storage for '{}' during indexing: {}",
+                    path, e
+                );
+            }
         }
 
         // Iterate over parsing_results directly, avoiding intermediate HashMap construction
@@ -546,12 +583,17 @@ impl LeIndex {
             index_builder::merge_pdgs(&mut pdg, file_pdg);
 
             if let Some(hash) = source_file_hashes.get(&file_path) {
-                let _ = crate::storage::pdg_store::update_indexed_file(
+                if let Err(e) = crate::storage::pdg_store::update_indexed_file(
                     &mut self.storage,
                     &self.project_id,
                     &file_path,
                     hash,
-                );
+                ) {
+                    warn!(
+                        "Failed to update indexed file record for '{}' during indexing: {}",
+                        file_path, e
+                    );
+                }
             }
         }
 
