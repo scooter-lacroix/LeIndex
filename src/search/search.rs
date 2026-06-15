@@ -310,16 +310,23 @@ impl WorkHoister {
     /// Returns `Some((tfidf_embedding, neural_embedding))` if found, `None` otherwise.
     pub fn lookup(&mut self, content: &str) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
         let hash = blake3::hash(content.as_bytes());
-        self.cache.get(&hash).map(|entry| {
-            (entry.embedding.clone(), entry.neural_embedding.clone())
-        })
+        self.cache
+            .get(&hash)
+            .map(|entry| (entry.embedding.clone(), entry.neural_embedding.clone()))
     }
 
     /// Store a computed embedding for the given content.
     /// If the cache is full, evicts the least-recently-used entry first.
-    pub fn store(&mut self, content: &str, embedding: Vec<f32>, neural_embedding: Option<Vec<f32>>) {
+    pub fn store(
+        &mut self,
+        content: &str,
+        embedding: Vec<f32>,
+        neural_embedding: Option<Vec<f32>>,
+    ) {
         let hash = blake3::hash(content.as_bytes());
-        let neural_byte_size = neural_embedding.as_ref().map_or(0, |v| v.len() * std::mem::size_of::<f32>());
+        let neural_byte_size = neural_embedding
+            .as_ref()
+            .map_or(0, |v| v.len() * std::mem::size_of::<f32>());
         let byte_size = 32 + embedding.len() * std::mem::size_of::<f32>() + neural_byte_size;
         let entry = HoistedWork {
             embedding,
@@ -2139,7 +2146,12 @@ impl SearchEngine {
         // Check staged-search cache (key includes query, top_k, threshold, semantic, coarse_multiplier, query_type)
         let cache_key = format!(
             "staged:{}:{}:{:?}:{}:{:?}:{:?}",
-            query.query, query.top_k, query.threshold, query.semantic, config.coarse_multiplier, query.query_type
+            query.query,
+            query.top_k,
+            query.threshold,
+            query.semantic,
+            config.coarse_multiplier,
+            query.query_type
         );
         if let Some(cached) = self.search_cache.get(&cache_key) {
             let count = cached.len();

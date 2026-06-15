@@ -458,7 +458,14 @@ fn fuzzy_find_node(
         return None;
     }
 
-    let event_loop_aliases: &[&str] = &["run", "main", "event_loop", "event loop", "winit", "app_runner"];
+    let event_loop_aliases: &[&str] = &[
+        "run",
+        "main",
+        "event_loop",
+        "event loop",
+        "winit",
+        "app_runner",
+    ];
 
     let is_event_loop_query = event_loop_aliases
         .iter()
@@ -475,7 +482,11 @@ fn fuzzy_find_node(
             let id_lower = node.id.to_lowercase();
             if id_lower.contains(&query_lower) {
                 ID_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
-            } else if is_event_loop_query && event_loop_aliases.iter().any(|alias| name_lower.contains(alias)) {
+            } else if is_event_loop_query
+                && event_loop_aliases
+                    .iter()
+                    .any(|alias| name_lower.contains(alias))
+            {
                 ALIAS_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
             } else {
                 return;

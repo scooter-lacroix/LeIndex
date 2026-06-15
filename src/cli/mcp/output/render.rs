@@ -32,7 +32,10 @@ pub(super) fn header(title: &str, color: bool) -> String {
 
 fn field(name: &str, value: &str, color: bool) -> String {
     if color {
-        format!("  {}{}:{} {}{}{}\n", BOLD, name, RESET, LIGHT_CYAN, value, RESET)
+        format!(
+            "  {}{}:{} {}{}{}\n",
+            BOLD, name, RESET, LIGHT_CYAN, value, RESET
+        )
     } else {
         format!("  {}: {}\n", name, value)
     }
@@ -126,7 +129,13 @@ fn extract_array(data: &Value, keys: &[&str]) -> Vec<Value> {
 pub fn render_tree(nodes: &[Value], color: bool) -> String {
     let mut out = String::new();
     for (i, node) in nodes.iter().enumerate() {
-        out.push_str(&render_tree_node(node, "", i == nodes.len() - 1, color, true));
+        out.push_str(&render_tree_node(
+            node,
+            "",
+            i == nodes.len() - 1,
+            color,
+            true,
+        ));
     }
     out
 }
@@ -171,7 +180,10 @@ fn render_tree_node(
     if is_root {
         out.push_str(&format!(
             "{}{}{}{}\n",
-            name_color, name, reset, suffix(symbol_count, count_color, reset),
+            name_color,
+            name,
+            reset,
+            suffix(symbol_count, count_color, reset),
         ));
     } else {
         // `suffix(symbol_count, count_color, reset)` already wraps the
@@ -195,25 +207,25 @@ fn render_tree_node(
         ));
     }
 
-        if let Some(kids) = children {
-            // The child prefix is the vertical continuation that should
-            // appear to the left of a grandchild's connector — it shows
-            // whether this node has a sibling (│) or is the last ( ).
-            // Root nodes pass no continuation because they have no
-            // connector themselves; the first level of children sits at
-            // column 0.
-            let child_prefix = if is_last { "    " } else { "│   " };
-            let combined_prefix = format!("{}{}", prefix, child_prefix);
-            for (i, child) in kids.iter().enumerate() {
-                out.push_str(&render_tree_node(
-                    child,
-                    &combined_prefix,
-                    i == kids.len() - 1,
-                    color,
-                    false,
-                ));
-            }
+    if let Some(kids) = children {
+        // The child prefix is the vertical continuation that should
+        // appear to the left of a grandchild's connector — it shows
+        // whether this node has a sibling (│) or is the last ( ).
+        // Root nodes pass no continuation because they have no
+        // connector themselves; the first level of children sits at
+        // column 0.
+        let child_prefix = if is_last { "    " } else { "│   " };
+        let combined_prefix = format!("{}{}", prefix, child_prefix);
+        for (i, child) in kids.iter().enumerate() {
+            out.push_str(&render_tree_node(
+                child,
+                &combined_prefix,
+                i == kids.len() - 1,
+                color,
+                false,
+            ));
         }
+    }
     out
 }
 
@@ -230,7 +242,10 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
             query,
         );
     }
-    let mut out = header(&format!("Search: \"{}\" ({} results)", query, arr.len()), color);
+    let mut out = header(
+        &format!("Search: \"{}\" ({} results)", query, arr.len()),
+        color,
+    );
     out.push('\n');
     for (idx, r) in arr.iter().enumerate() {
         let file = r.get("file_path").and_then(|v| v.as_str()).unwrap_or("?");
@@ -266,7 +281,8 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
         out.push_str(if color { RESET } else { "" });
 
         if let Some(sym) = symbol {
-            out.push_str(&format!(" :: {}{}{}",
+            out.push_str(&format!(
+                " :: {}{}{}",
                 if color { LIGHT_CYAN } else { "" },
                 sym,
                 if color { RESET } else { "" },
@@ -274,7 +290,8 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
         }
 
         if let Some(typ) = symbol_type {
-            out.push_str(&format!(" {}[{}]{}",
+            out.push_str(&format!(
+                " {}[{}]{}",
                 if color { DIM } else { "" },
                 typ,
                 if color { RESET } else { "" },
@@ -283,7 +300,8 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
 
         if let Some(sc) = score {
             let pct = (sc * 100.0).round() as usize;
-            out.push_str(&format!("  {}{}%{}",
+            out.push_str(&format!(
+                "  {}{}%{}",
                 if color { DIM } else { "" },
                 pct,
                 if color { RESET } else { "" }
@@ -303,7 +321,8 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
         if let Some(sig) = signature {
             let trimmed = sig.trim();
             if !trimmed.is_empty() {
-                out.push_str(&format!("      {}{}{}\n",
+                out.push_str(&format!(
+                    "      {}{}{}\n",
                     if color { DIM } else { "" },
                     truncate_chars(trimmed, 160),
                     if color { RESET } else { "" },
@@ -315,7 +334,8 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
             if let Some(ctx) = context {
                 let first = ctx.lines().next().unwrap_or("").trim();
                 if !first.is_empty() {
-                    out.push_str(&format!("      {}{}{}\n",
+                    out.push_str(&format!(
+                        "      {}{}{}\n",
                         if color { DIM } else { "" },
                         truncate_chars(first, 160),
                         if color { RESET } else { "" },
@@ -331,7 +351,8 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
                 // whitespace.
                 let trimmed = snip.trim();
                 if !trimmed.is_empty() {
-                    out.push_str(&format!("      {}{}{}\n",
+                    out.push_str(&format!(
+                        "      {}{}{}\n",
                         if color { DIM } else { "" },
                         truncate_chars(trimmed, 160),
                         if color { RESET } else { "" },
@@ -352,9 +373,11 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
                     let start = br[0].as_u64().unwrap_or(0);
                     let end = br[1].as_u64().unwrap_or(0);
                     if end > start {
-                        out.push_str(&format!("      {}(bytes {}-{}){}\n",
+                        out.push_str(&format!(
+                            "      {}(bytes {}-{}){}\n",
                             if color { DIM } else { "" },
-                            start, end,
+                            start,
+                            end,
                             if color { RESET } else { "" },
                         ));
                     }
@@ -427,11 +450,7 @@ fn render_context(data: &Value, node_id: &str, color: bool) -> String {
             let start = br[0].as_u64().unwrap_or(0);
             let end = br[1].as_u64().unwrap_or(0);
             if end > start {
-                out.push_str(&field(
-                    "Range",
-                    &format!("bytes {}-{}", start, end),
-                    color,
-                ));
+                out.push_str(&field("Range", &format!("bytes {}-{}", start, end), color));
             }
         }
     }
@@ -464,9 +483,15 @@ fn render_context(data: &Value, node_id: &str, color: bool) -> String {
         for r in results {
             let symbol = r.get("symbol_name").and_then(|v| v.as_str()).unwrap_or("?");
             let file = r.get("file_path").and_then(|v| v.as_str()).unwrap_or("?");
-            out.push_str(&format!("  → {}{}{} {}{}{}\n",
-                if color { LIGHT_CYAN } else { "" }, symbol, if color { RESET } else { "" },
-                if color { DIM } else { "" }, file, if color { RESET } else { "" }));
+            out.push_str(&format!(
+                "  → {}{}{} {}{}{}\n",
+                if color { LIGHT_CYAN } else { "" },
+                symbol,
+                if color { RESET } else { "" },
+                if color { DIM } else { "" },
+                file,
+                if color { RESET } else { "" }
+            ));
         }
     }
     out
@@ -537,10 +562,7 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
                     .get("severity")
                     .and_then(|v| v.as_str())
                     .unwrap_or("info");
-                let msg = issue
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
+                let msg = issue.get("message").and_then(|v| v.as_str()).unwrap_or("?");
                 let sev_color = if color {
                     match sev {
                         "error" => LIGHT_RED,
@@ -552,7 +574,11 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
                 };
                 out.push_str(&format!(
                     "    {}{}{} {}{}{}\n",
-                    sev_color, sev, if color { RESET } else { "" }, msg, "",
+                    sev_color,
+                    sev,
+                    if color { RESET } else { "" },
+                    msg,
+                    "",
                     "",
                 ));
             }
@@ -611,9 +637,17 @@ fn render_flat_files(files: &[Value], color: bool) -> String {
             .or_else(|| f.get("relative_path").and_then(|v| v.as_str()))
             .unwrap_or("?");
         let syms = f.get("symbol_count").and_then(|v| v.as_u64()).unwrap_or(0);
-        let cx = f.get("total_complexity").and_then(|v| v.as_u64()).unwrap_or(0);
-        let deps = f.get("incoming_dependencies").and_then(|v| v.as_u64()).unwrap_or(0)
-            + f.get("outgoing_dependencies").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cx = f
+            .get("total_complexity")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let deps = f
+            .get("incoming_dependencies")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            + f.get("outgoing_dependencies")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
         // The complexity value is shown as a colour-coded integer
         // (`cx:{N}`); the human-readable label ("low" / "med" /
         // "high") was previously computed alongside the colour but
@@ -777,8 +811,22 @@ fn render_impact(data: &Value, color: bool) -> String {
             if color { RESET } else { "" },
         ));
     }
-    render_impact_side(data, "forward_impact", "Forward (callers of callees)", "→", color, &mut out);
-    render_impact_side(data, "backward_impact", "Backward (what calls this)", "←", color, &mut out);
+    render_impact_side(
+        data,
+        "forward_impact",
+        "Forward (callers of callees)",
+        "→",
+        color,
+        &mut out,
+    );
+    render_impact_side(
+        data,
+        "backward_impact",
+        "Backward (what calls this)",
+        "←",
+        color,
+        &mut out,
+    );
     out
 }
 
@@ -847,10 +895,7 @@ fn render_symbol_lookup(data: &Value, color: bool) -> String {
                     if color { DIM } else { "" },
                     idx + 1,
                     if color { RESET } else { "" },
-                    entry
-                        .get("symbol")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("?"),
+                    entry.get("symbol").and_then(|v| v.as_str()).unwrap_or("?"),
                 ));
                 out.push_str(&render_symbol_lookup_single(entry, color));
             }
@@ -893,8 +938,14 @@ fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
         out.push_str(&field("Complexity", &cx.to_string(), color));
     }
     if let Some(ir) = data.get("impact_radius").and_then(|v| v.as_object()) {
-        let syms = ir.get("affected_symbols").and_then(|v| v.as_u64()).unwrap_or(0);
-        let files = ir.get("affected_files").and_then(|v| v.as_u64()).unwrap_or(0);
+        let syms = ir
+            .get("affected_symbols")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let files = ir
+            .get("affected_files")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         out.push_str(&field(
             "Impact",
             &format!("{} symbols / {} files", syms, files),
@@ -1059,8 +1110,24 @@ fn render_git_status(data: &Value, color: bool) -> String {
         ));
     }
     git_status_section(data, "staged", "Staged", "+", LIGHT_GREEN, color, &mut out);
-    git_status_section(data, "modified", "Modified", "~", LIGHT_YELLOW, color, &mut out);
-    git_status_section(data, "untracked", "Untracked", "?", LIGHT_GREY, color, &mut out);
+    git_status_section(
+        data,
+        "modified",
+        "Modified",
+        "~",
+        LIGHT_YELLOW,
+        color,
+        &mut out,
+    );
+    git_status_section(
+        data,
+        "untracked",
+        "Untracked",
+        "?",
+        LIGHT_GREY,
+        color,
+        &mut out,
+    );
     git_status_section(data, "deleted", "Deleted", "✗", LIGHT_RED, color, &mut out);
     out
 }
@@ -1202,7 +1269,10 @@ fn render_write(data: &Value, color: bool) -> String {
     // the confirmation and the structural context the handler
     // actually returned.
     let mut out = String::new();
-    let success = data.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let success = data
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let (status_label, status_color) = if success {
         ("Wrote", if color { LIGHT_GREEN } else { "" })
     } else {
@@ -1273,7 +1343,10 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
     // the file path, the affected-symbol/file summary, breaking
     // changes, and the surrounding-region excerpt.
     let mut out = String::new();
-    let success = data.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
+    let success = data
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let changes_applied = data
         .get("changes_applied")
         .and_then(|v| v.as_u64())
@@ -1281,7 +1354,10 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
     let (status_label, status_color) = if !success {
         ("Edit apply failed", if color { LIGHT_RED } else { "" })
     } else if changes_applied == 0 {
-        ("No-op (content identical)", if color { LIGHT_YELLOW } else { "" })
+        (
+            "No-op (content identical)",
+            if color { LIGHT_YELLOW } else { "" },
+        )
     } else {
         ("Applied", if color { LIGHT_GREEN } else { "" })
     };
@@ -1299,11 +1375,7 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
     }
     if let Some(arr) = data.get("affected_symbols").and_then(|v| v.as_array()) {
         if !arr.is_empty() {
-            out.push_str(&field(
-                "Affected symbols",
-                &arr.len().to_string(),
-                color,
-            ));
+            out.push_str(&field("Affected symbols", &arr.len().to_string(), color));
         }
     }
     if let Some(arr) = data.get("affected_files").and_then(|v| v.as_array()) {
@@ -1313,11 +1385,7 @@ fn render_edit_apply(data: &Value, color: bool) -> String {
     }
     if let Some(bc) = data.get("breaking_changes").and_then(|v| v.as_array()) {
         if !bc.is_empty() {
-            out.push_str(&field(
-                "Breaking changes",
-                &bc.len().to_string(),
-                color,
-            ));
+            out.push_str(&field("Breaking changes", &bc.len().to_string(), color));
         }
     }
     if let Some(region_value) = data.get("edit_region") {
@@ -1408,14 +1476,8 @@ pub fn render_tool_output_plain(name: &str, data: &Value, args: &Value) -> Strin
 
 fn render_tool_output_with_color(name: &str, data: &Value, args: &Value, color: bool) -> String {
     let normalized = normalize_tool_name(name);
-    let query = args
-        .get("query")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let node_id = args
-        .get("node_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
+    let node_id = args.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
 
     match normalized.as_str() {
         "leindex_search" | "search" => render_search(data, query, color),
@@ -1726,7 +1788,12 @@ mod tests {
         // The top-level must be src + tests.
         let names: Vec<String> = tree
             .iter()
-            .map(|n| n.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .map(|n| {
+                n.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
             .collect();
         assert_eq!(names, vec!["src", "tests"]);
         // Inside `src`, the child directory must be `cli` (not `src`).
@@ -1734,18 +1801,25 @@ mod tests {
         let src_children = src.get("children").and_then(|v| v.as_array()).unwrap();
         let src_child_names: Vec<String> = src_children
             .iter()
-            .map(|n| n.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .map(|n| {
+                n.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
             .collect();
         assert_eq!(src_child_names, vec!["cli"]);
         // Inside `cli`, the grandchild directory must be `sub`.
-        let cli = src_children
-            .iter()
-            .find(|n| n["name"] == "cli")
-            .unwrap();
+        let cli = src_children.iter().find(|n| n["name"] == "cli").unwrap();
         let cli_children = cli.get("children").and_then(|v| v.as_array()).unwrap();
         let cli_child_names: Vec<String> = cli_children
             .iter()
-            .map(|n| n.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .map(|n| {
+                n.get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
             .collect();
         assert_eq!(cli_child_names, vec!["main.rs", "sub"]);
     }
@@ -1770,11 +1844,19 @@ mod tests {
         let lines: Vec<&str> = s.lines().collect();
         // The first file line should sit under `src` with a `│` prefix.
         let a_line = lines.iter().find(|l| l.contains("a.rs")).unwrap();
-        assert!(a_line.contains("│   └──"), "a.rs should be under 'src' with continuation: {:?}", a_line);
+        assert!(
+            a_line.contains("│   └──"),
+            "a.rs should be under 'src' with continuation: {:?}",
+            a_line
+        );
         // The second file line should sit under `tests` with a space
         // prefix (no continuation since tests is the last root child).
         let b_line = lines.iter().find(|l| l.contains("b.rs")).unwrap();
-        assert!(b_line.starts_with("    └──"), "b.rs should be under 'tests' with space indent: {:?}", b_line);
+        assert!(
+            b_line.starts_with("    └──"),
+            "b.rs should be under 'tests' with space indent: {:?}",
+            b_line
+        );
     }
 
     #[test]
@@ -1782,7 +1864,9 @@ mod tests {
         let args = v(r#"{"query": "foo", "top_k": 1}"#);
         // Search payload (using trimmed form so the renderer sees what
         // the LLM would see).
-        let search_data = trim_search(&v(r#"{"results": [{"file_path": "/p.rs", "symbol_name": "f", "score": {"overall": 0.5}}]}"#));
+        let search_data = trim_search(&v(
+            r#"{"results": [{"file_path": "/p.rs", "symbol_name": "f", "score": {"overall": 0.5}}]}"#,
+        ));
         let s = render_tool_output("leindex.search", &search_data, &args);
         assert!(s.contains("Search: \"foo\""), "got: {}", s);
         assert!(s.contains("/p.rs"), "got: {}", s);
@@ -1836,7 +1920,11 @@ mod tests {
             }]
         }"#);
         let s = render_tool_output("leindex.search", &payload, &args);
-        assert!(s.contains("fn main()"), "snippet must print when signature is empty: {}", s);
+        assert!(
+            s.contains("fn main()"),
+            "snippet must print when signature is empty: {}",
+            s
+        );
     }
 
     #[test]
@@ -1899,15 +1987,31 @@ mod tests {
         assert!(s.contains("bytes 10-60"), "missing byte range: {}", s);
         assert!(s.contains("Complexity"), "missing Complexity field: {}", s);
         assert!(s.contains("Impact"), "missing Impact field: {}", s);
-        assert!(s.contains("5 symbols / 2 files"), "missing impact counts: {}", s);
+        assert!(
+            s.contains("5 symbols / 2 files"),
+            "missing impact counts: {}",
+            s
+        );
         assert!(s.contains("caller_a"), "missing caller: {}", s);
         assert!(s.contains("Callers"));
         // Source preview (first non-empty line).
         assert!(s.contains("fn main()"), "missing source preview: {}", s);
         // Legacy aliases must NOT appear in the rendered output.
-        assert!(!s.contains("file_path"), "renderer still emits file_path alias: {}", s);
-        assert!(!s.contains("symbol_type"), "renderer still emits symbol_type alias: {}", s);
-        assert!(!s.contains("Signature"), "renderer still emits Signature (legacy alias): {}", s);
+        assert!(
+            !s.contains("file_path"),
+            "renderer still emits file_path alias: {}",
+            s
+        );
+        assert!(
+            !s.contains("symbol_type"),
+            "renderer still emits symbol_type alias: {}",
+            s
+        );
+        assert!(
+            !s.contains("Signature"),
+            "renderer still emits Signature (legacy alias): {}",
+            s
+        );
     }
 
     #[test]
@@ -1959,12 +2063,24 @@ mod tests {
         let s = render_tool_output("leindex.edit-apply", &payload, &args);
         assert!(s.contains("Applied"), "missing applied header: {}", s);
         assert!(s.contains("src/lib.rs"), "missing file path: {}", s);
-        assert!(s.contains("Affected symbols"), "missing affected symbols: {}", s);
-        assert!(s.contains("Affected files"), "missing affected files: {}", s);
+        assert!(
+            s.contains("Affected symbols"),
+            "missing affected symbols: {}",
+            s
+        );
+        assert!(
+            s.contains("Affected files"),
+            "missing affected files: {}",
+            s
+        );
         // The surrounding region must be shown.
         assert!(s.contains("// hello"), "missing surrounding region: {}", s);
         // Diff-style gutters must NOT appear.
-        assert!(!s.contains("│"), "edit-apply must not render diff gutter: {}", s);
+        assert!(
+            !s.contains("│"),
+            "edit-apply must not render diff gutter: {}",
+            s
+        );
     }
 
     #[test]
@@ -1978,7 +2094,11 @@ mod tests {
         }"#);
         let s = render_tool_output("leindex.edit-apply", &payload, &args);
         assert!(s.contains("No-op"), "missing no-op header: {}", s);
-        assert!(s.contains("content identical"), "missing no-op message: {}", s);
+        assert!(
+            s.contains("content identical"),
+            "missing no-op message: {}",
+            s
+        );
     }
 
     #[test]
@@ -2121,10 +2241,7 @@ mod tests {
         // gutter lines.
         let stripped = strip_ansi(&s);
         // The first gutter line should be "   1│", not "15342│".
-        let first_gutter = stripped
-            .lines()
-            .find(|l| l.contains('│'))
-            .unwrap_or("");
+        let first_gutter = stripped.lines().find(|l| l.contains('│')).unwrap_or("");
         assert!(
             first_gutter.contains("   1│"),
             "first gutter line must start at 1, got {:?}",
@@ -2160,12 +2277,13 @@ mod tests {
         }"#);
         let s = render_tool_output("leindex.context", &payload, &args);
         let stripped = strip_ansi(&s);
-        assert!(stripped.contains("Line: 42"), "missing line field: {}", stripped);
+        assert!(
+            stripped.contains("Line: 42"),
+            "missing line field: {}",
+            stripped
+        );
         // The gutter must start at 42 (right-padded to width 4).
-        let first_gutter = stripped
-            .lines()
-            .find(|l| l.contains('│'))
-            .unwrap_or("");
+        let first_gutter = stripped.lines().find(|l| l.contains('│')).unwrap_or("");
         assert!(
             first_gutter.contains("  42│"),
             "gutter must start at 42, got {:?}",
@@ -2233,7 +2351,11 @@ mod tests {
         }"#);
         let s = render_tool_output("leindex.symbol-lookup", &payload, &args);
         // Batch header and count.
-        assert!(s.contains("Symbol Lookup (batch)"), "missing batch header: {}", s);
+        assert!(
+            s.contains("Symbol Lookup (batch)"),
+            "missing batch header: {}",
+            s
+        );
         assert!(s.contains("Count"), "missing Count field: {}", s);
         // Each entry must appear with its own Symbol / File / Type.
         assert!(s.contains("main"), "missing first entry symbol: {}", s);
@@ -2241,8 +2363,16 @@ mod tests {
         assert!(s.contains("src/main.rs"), "missing first entry file: {}", s);
         assert!(s.contains("src/lib.rs"), "missing second entry file: {}", s);
         // The byte range from each entry must be present.
-        assert!(s.contains("bytes 10-60"), "missing first entry range: {}", s);
-        assert!(s.contains("bytes 100-200"), "missing second entry range: {}", s);
+        assert!(
+            s.contains("bytes 10-60"),
+            "missing first entry range: {}",
+            s
+        );
+        assert!(
+            s.contains("bytes 100-200"),
+            "missing second entry range: {}",
+            s
+        );
     }
 
     /// Empty batch returns the wrapper with a "(no results)" marker
@@ -2252,7 +2382,11 @@ mod tests {
         let args = v(r#"{"symbols": []}"#);
         let payload = v(r#"{"batch": true, "count": 0, "results": []}"#);
         let s = render_tool_output("leindex.symbol-lookup", &payload, &args);
-        assert!(s.contains("Symbol Lookup (batch)"), "missing batch header: {}", s);
+        assert!(
+            s.contains("Symbol Lookup (batch)"),
+            "missing batch header: {}",
+            s
+        );
         assert!(s.contains("(no results)"), "missing empty marker: {}", s);
     }
 }

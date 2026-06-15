@@ -52,9 +52,9 @@ fn test_val_measure_007_one_baseline_per_phase() {
             // Must have phase field matching the filename
             let phase_name = json
                 .get("phase")
-                .expect(&format!("{}: missing 'phase' field", path.display()))
+                .unwrap_or_else(|| panic!("{}: missing 'phase' field", path.display()))
                 .as_str()
-                .expect(&format!("{}: 'phase' should be a string", path.display()));
+                .unwrap_or_else(|| panic!("{}: 'phase' should be a string", path.display()));
             assert_eq!(
                 phase_name,
                 *phase,

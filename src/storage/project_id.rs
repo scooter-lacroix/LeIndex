@@ -393,7 +393,7 @@ mod tests {
         let id1 = UniqueProjectId::generate(path1, &[]);
 
         let path2 = Path::new("/different/path/leindex");
-        let id2 = UniqueProjectId::generate(path2, &[id1.clone()]);
+        let id2 = UniqueProjectId::generate(path2, std::slice::from_ref(&id1));
 
         assert_eq!(id1.instance, 0);
         assert_eq!(id2.instance, 1);
@@ -542,7 +542,7 @@ mod tests {
         let id1 = UniqueProjectId::generate(path1, &[]);
 
         let path2 = Path::new("/different/path/project");
-        let id2 = UniqueProjectId::generate(path2, &[id1.clone()]);
+        let id2 = UniqueProjectId::generate(path2, std::slice::from_ref(&id1));
 
         let path3 = Path::new("/another/path/project");
         let id3 = UniqueProjectId::generate(path3, &[id1.clone(), id2.clone()]);

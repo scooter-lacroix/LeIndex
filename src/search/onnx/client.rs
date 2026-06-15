@@ -401,8 +401,7 @@ impl EmbeddingClient {
                 #[cfg(not(unix))]
                 {
                     // Wait up to 2 seconds for graceful exit after stdin drop.
-                    let deadline =
-                        std::time::Instant::now() + std::time::Duration::from_secs(2);
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
                     loop {
                         match handle.child.try_wait() {
                             Ok(Some(_)) => break,

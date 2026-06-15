@@ -283,27 +283,27 @@ pub fn render_split_diff(diff: &DiffResult, color: bool, width: Option<usize>) -
     ));
 
     let gutter = 4usize; // 4-digit line number
-    // The split-view format string in `split_row` emits the
-    // following per row, excluding the gutter and the two
-    // content halves:
-    //   1 leading space
-    //   1 space between the left gutter and the left marker
-    //   1 space between the left marker and the left content
-    //   3 chars for the ` │ ` centre separator
-    //   1 space between the right gutter and the right marker
-    //   1 space between the right marker and the right content
-    //   2 trailing reset escapes when colour is enabled (each
-    //     contributes an ANSI CSI sequence; when colour is off
-    //     these are empty strings and contribute 0 to the
-    //     visible width).
-    // The empirical constant that keeps the rendered row
-    // inside the requested terminal width is 10 (8 separator
-    // chars + 2 to absorb ANSI colour escapes that still
-    // contribute to string length in some callers). Using
-    // `5` here was too small and could push the rendered row
-    // past the terminal width on an 80-column terminal,
-    // causing awkward wrapping. The `gutter * 2 + 10` formula
-    // is what the regression test below asserts against.
+                         // The split-view format string in `split_row` emits the
+                         // following per row, excluding the gutter and the two
+                         // content halves:
+                         //   1 leading space
+                         //   1 space between the left gutter and the left marker
+                         //   1 space between the left marker and the left content
+                         //   3 chars for the ` │ ` centre separator
+                         //   1 space between the right gutter and the right marker
+                         //   1 space between the right marker and the right content
+                         //   2 trailing reset escapes when colour is enabled (each
+                         //     contributes an ANSI CSI sequence; when colour is off
+                         //     these are empty strings and contribute 0 to the
+                         //     visible width).
+                         // The empirical constant that keeps the rendered row
+                         // inside the requested terminal width is 10 (8 separator
+                         // chars + 2 to absorb ANSI colour escapes that still
+                         // contribute to string length in some callers). Using
+                         // `5` here was too small and could push the rendered row
+                         // past the terminal width on an 80-column terminal,
+                         // causing awkward wrapping. The `gutter * 2 + 10` formula
+                         // is what the regression test below asserts against.
     let half = match width {
         Some(w) => w.saturating_sub(gutter * 2 + 10) / 2,
         None => 60,
@@ -330,7 +330,14 @@ pub fn render_split_diff(diff: &DiffResult, color: bool, width: Option<usize>) -
             hunk.lines.iter().filter(|l| l.op != DiffOp::Remove).count(),
             if color { RESET } else { "" },
         ));
-        out.push_str(&render_hunk_split(hunk, &RowLayout { gutter, half, color }));
+        out.push_str(&render_hunk_split(
+            hunk,
+            &RowLayout {
+                gutter,
+                half,
+                color,
+            },
+        ));
     }
     out
 }
@@ -482,7 +489,11 @@ struct SplitRow<'a> {
 }
 
 fn split_row(row: &SplitRow<'_>, layout: &RowLayout) -> String {
-    let RowLayout { gutter, half, color } = *layout;
+    let RowLayout {
+        gutter,
+        half,
+        color,
+    } = *layout;
     let SplitRow {
         old_line,
         old_content,
@@ -596,7 +607,11 @@ fn classify_diff_payload(data: &Value) -> Option<DiffPayload<'_>> {
         data.get("file_path").and_then(|v| v.as_str()),
         data.get("hunks").and_then(|v| v.as_array()),
     ) {
-        return Some(DiffPayload::Embedded { file, src: data, hunks });
+        return Some(DiffPayload::Embedded {
+            file,
+            src: data,
+            hunks,
+        });
     }
     // (b) wrapped in `diff: {…}` with structured content
     if let Some(inner) = data.get("diff") {
@@ -604,7 +619,11 @@ fn classify_diff_payload(data: &Value) -> Option<DiffPayload<'_>> {
             inner.get("file_path").and_then(|v| v.as_str()),
             inner.get("hunks").and_then(|v| v.as_array()),
         ) {
-            return Some(DiffPayload::Wrapped { file, src: inner, hunks });
+            return Some(DiffPayload::Wrapped {
+                file,
+                src: inner,
+                hunks,
+            });
         }
         // (d) `diff` is a pre-rendered string
         if let Some(s) = inner.as_str() {
@@ -638,9 +657,7 @@ pub(super) fn render_diff_value(data: &Value, color: bool) -> String {
         Some(DiffPayload::Embedded { file, src, hunks }) => {
             render_one_diff(file, src, hunks, color)
         }
-        Some(DiffPayload::Wrapped { file, src, hunks }) => {
-            render_one_diff(file, src, hunks, color)
-        }
+        Some(DiffPayload::Wrapped { file, src, hunks }) => render_one_diff(file, src, hunks, color),
         Some(DiffPayload::List { entries }) => {
             // Collect each successfully-rendered entry into a
             // `Vec<String>` and join with `\n` at the end. The
@@ -654,10 +671,9 @@ pub(super) fn render_diff_value(data: &Value, color: bool) -> String {
             // one.
             let mut rendered: Vec<String> = Vec::with_capacity(entries.len());
             for d in entries {
-                if let (Some(file), Some(inner)) = (
-                    d.get("file").and_then(|v| v.as_str()),
-                    d.get("diff"),
-                ) {
+                if let (Some(file), Some(inner)) =
+                    (d.get("file").and_then(|v| v.as_str()), d.get("diff"))
+                {
                     if let Some(hunks) = inner.get("hunks").and_then(|v| v.as_array()) {
                         rendered.push(render_one_diff(file, inner, hunks, color));
                     } else if let Some(s) = inner.as_str() {
@@ -714,8 +730,14 @@ fn render_one_diff(file: &str, src: &Value, hunks: &[Value], color: bool) -> Str
                 };
                 lines.push(DiffLine {
                     op,
-                    old_line: l.get("old_line").and_then(|v| v.as_u64()).map(|n| n as usize),
-                    new_line: l.get("new_line").and_then(|v| v.as_u64()).map(|n| n as usize),
+                    old_line: l
+                        .get("old_line")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize),
+                    new_line: l
+                        .get("new_line")
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as usize),
                     content: l
                         .get("content")
                         .and_then(|v| v.as_str())
@@ -781,6 +803,25 @@ impl Default for DiffFormatter {
 // =============================================================================
 // Tests
 // =============================================================================
+/// Strip CSI (SGR) escapes for test assertions on visible text.
+#[cfg(test)]
+fn strip_ansi_for_test(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut iter = s.chars().peekable();
+    while let Some(c) = iter.next() {
+        if c == '\x1b' && iter.peek() == Some(&'[') {
+            iter.next();
+            for c2 in iter.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
 
 #[cfg(test)]
 mod tests {
@@ -911,12 +952,24 @@ mod tests {
         });
         let s = render_diff_value(&data, false);
         // Must produce a non-empty diff header for the listed file.
-        assert!(s.contains("src/foo.rs"), "expected file path in render, got: {:?}", s);
+        assert!(
+            s.contains("src/foo.rs"),
+            "expected file path in render, got: {:?}",
+            s
+        );
         assert!(s.contains("@@"), "expected hunk header, got: {:?}", s);
         // Removed line content from the inner diff must appear in the
         // rendered output (split-view places it on the left side).
-        assert!(s.contains("let x = 1;"), "expected removed line, got: {:?}", s);
-        assert!(s.contains("let x = 2;"), "expected added line, got: {:?}", s);
+        assert!(
+            s.contains("let x = 1;"),
+            "expected removed line, got: {:?}",
+            s
+        );
+        assert!(
+            s.contains("let x = 2;"),
+            "expected added line, got: {:?}",
+            s
+        );
     }
 
     /// Empty `diffs[]` array should fall through to the next shape
@@ -1175,18 +1228,14 @@ mod tests {
         // and `new_line` are placeholder values; the paint
         // selection is driven only by the markers.
         let cases: Vec<(&str, &str)> = vec![
-            (" ", " "),  // context
-            ("-", "+"),  // modified
-            ("-", " "),  // remove-only
-            (" ", "+"),  // add-only
-            (" ", "+"),  // standalone add
+            (" ", " "), // context
+            ("-", "+"), // modified
+            ("-", " "), // remove-only
+            (" ", "+"), // add-only
+            (" ", "+"), // standalone add
         ];
         for (left, right) in cases {
-            let s = render_split_diff(
-                &compute_diff("a\n", "b\n", "t.rs"),
-                true,
-                Some(200),
-            );
+            let s = render_split_diff(&compute_diff("a\n", "b\n", "t.rs"), true, Some(200));
             // The split separator `│` lets us isolate the
             // right half of any row.
             for line in s.lines() {
@@ -1374,26 +1423,4 @@ mod tests {
         // Structured-but-empty entry still renders the header.
         assert!(s.contains("src/bar.rs"));
     }
-}
-
-/// Strip CSI (SGR) escapes for test assertions on visible text.
-#[cfg(test)]
-fn strip_ansi_for_test(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut iter = s.chars().peekable();
-    while let Some(c) = iter.next() {
-        if c == '\x1b' {
-            if iter.peek() == Some(&'[') {
-                iter.next();
-                for c2 in iter.by_ref() {
-                    if c2.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-                continue;
-            }
-        }
-        out.push(c);
-    }
-    out
 }

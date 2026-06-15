@@ -112,11 +112,7 @@ pub(crate) fn trim_search(data: &Value) -> Value {
                     .and_then(|v| v.get("overall"))
                     .filter(|v| !v.is_null())
                     .cloned()
-                    .or_else(|| {
-                        r.get("score")
-                            .filter(|v| !v.is_null())
-                            .cloned()
-                    })
+                    .or_else(|| r.get("score").filter(|v| !v.is_null()).cloned())
                     .unwrap_or(Value::Null);
                 serde_json::json!({
                     "file_path": r.get("file_path").cloned().unwrap_or(Value::Null),
@@ -264,7 +260,9 @@ fn trim_symbol_lookup(data: &Value) -> Value {
             out.insert("batch".to_string(), Value::Bool(true));
             out.insert(
                 "count".to_string(),
-                data.get("count").cloned().unwrap_or(Value::from(trimmed_results.len())),
+                data.get("count")
+                    .cloned()
+                    .unwrap_or(Value::from(trimmed_results.len())),
             );
             out.insert("results".to_string(), Value::Array(trimmed_results));
             return Value::Object(out);
@@ -367,7 +365,10 @@ fn trim_phase(data: &Value) -> Value {
                 Some((idx, _)) => &s[..idx],
                 None => s,
             };
-            out.insert("formatted_output".to_string(), Value::String(capped.to_string()));
+            out.insert(
+                "formatted_output".to_string(),
+                Value::String(capped.to_string()),
+            );
         } else {
             out.insert("formatted_output".to_string(), v.clone());
         }
@@ -384,13 +385,15 @@ fn trim_git_status(data: &Value) -> Value {
     let changed_symbols = data.get("changed_symbols").and_then(|v| {
         let arr = v.as_array()?;
         Some(serde_json::Value::Array(
-            arr.iter().map(|entry| {
-                serde_json::json!({
-                    "file": entry.get("file"),
-                    "status": entry.get("status"),
-                    "symbols": take_n(entry.get("symbols").unwrap_or(&Value::Null), 5),
+            arr.iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "file": entry.get("file"),
+                        "status": entry.get("status"),
+                        "symbols": take_n(entry.get("symbols").unwrap_or(&Value::Null), 5),
+                    })
                 })
-            }).collect(),
+                .collect(),
         ))
     });
     serde_json::json!({
@@ -409,12 +412,30 @@ fn trim_read_file(data: &Value) -> Value {
     // the handler populated it; the per-entry callers/callees arrays
     // can also be capped.
     let mut out = serde_json::Map::new();
-    out.insert("file_path".to_string(), data.get("file_path").cloned().unwrap_or(Value::Null));
-    out.insert("language".to_string(), data.get("language").cloned().unwrap_or(Value::Null));
-    out.insert("total_lines".to_string(), data.get("total_lines").cloned().unwrap_or(Value::Null));
-    out.insert("start_line".to_string(), data.get("start_line").cloned().unwrap_or(Value::Null));
-    out.insert("end_line".to_string(), data.get("end_line").cloned().unwrap_or(Value::Null));
-    out.insert("content".to_string(), data.get("content").cloned().unwrap_or(Value::Null));
+    out.insert(
+        "file_path".to_string(),
+        data.get("file_path").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "language".to_string(),
+        data.get("language").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "total_lines".to_string(),
+        data.get("total_lines").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "start_line".to_string(),
+        data.get("start_line").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "end_line".to_string(),
+        data.get("end_line").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "content".to_string(),
+        data.get("content").cloned().unwrap_or(Value::Null),
+    );
     if let Some(ctx) = data.get("context") {
         if let Some(obj) = ctx.as_object() {
             let mut trimmed_ctx = serde_json::Map::new();
@@ -602,10 +623,22 @@ fn trim_text_search(data: &Value) -> Value {
         })
         .collect();
     let mut out = serde_json::Map::new();
-    out.insert("count".to_string(), data.get("count").cloned().unwrap_or(Value::Null));
-    out.insert("total_matched".to_string(), data.get("total_matched").cloned().unwrap_or(Value::Null));
-    out.insert("has_more".to_string(), data.get("has_more").cloned().unwrap_or(Value::Null));
-    out.insert("offset".to_string(), data.get("offset").cloned().unwrap_or(Value::Null));
+    out.insert(
+        "count".to_string(),
+        data.get("count").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "total_matched".to_string(),
+        data.get("total_matched").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "has_more".to_string(),
+        data.get("has_more").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "offset".to_string(),
+        data.get("offset").cloned().unwrap_or(Value::Null),
+    );
     out.insert("results".to_string(), Value::Array(trimmed));
     Value::Object(out)
 }
@@ -635,7 +668,13 @@ fn trim_deep_analyze(data: &Value) -> Value {
                 .take(10)
                 .map(|r| {
                     let mut obj = serde_json::Map::new();
-                    for k in ["rank", "file_path", "symbol_name", "symbol_type", "signature"] {
+                    for k in [
+                        "rank",
+                        "file_path",
+                        "symbol_name",
+                        "symbol_type",
+                        "signature",
+                    ] {
                         if let Some(v) = r.get(k) {
                             obj.insert(k.to_string(), v.clone());
                         }
@@ -836,11 +875,14 @@ mod tests {
         assert_eq!(t["processing_time_ms"], 5);
         // The stale-index `_warning` is preserved by `merge_meta`
         // after the trim, not by the trim function itself.
-        let merged = trim_llm_payload("leindex.context", &v(r#"{
+        let merged = trim_llm_payload(
+            "leindex.context",
+            &v(r#"{
             "query": "q", "results": [], "context": "c",
             "tokens_used": 0, "processing_time_ms": 0,
             "_warning": "stale"
-        }"#));
+        }"#),
+        );
         assert_eq!(merged["_warning"], "stale");
     }
 
@@ -1013,8 +1055,11 @@ mod tests {
 
     #[test]
     fn test_trim_read_symbol_caps_callers() {
-        let callers: Vec<Value> = (0..20).map(|i| serde_json::json!({"name": format!("c{}", i), "file": "a.rs", "line": i})).collect();
-        let input = v(&format!(r#"{{
+        let callers: Vec<Value> = (0..20)
+            .map(|i| serde_json::json!({"name": format!("c{}", i), "file": "a.rs", "line": i}))
+            .collect();
+        let input = v(&format!(
+            r#"{{
             "symbol": "main",
             "type": "function",
             "file": "src/main.rs",
@@ -1026,14 +1071,21 @@ mod tests {
             "source": "{}",
             "callers": {},
             "callees": []
-        }}"#, "x".repeat(3000), serde_json::to_string(&callers).unwrap()));
+        }}"#,
+            "x".repeat(3000),
+            serde_json::to_string(&callers).unwrap()
+        ));
         let t = trim_read_symbol(&input);
         // Source is truncated to 2000 chars + 3-char "..." ellipsis.
         // The previous byte-slice version could panic on multi-byte
         // UTF-8 sequences; the new char-boundary truncation cannot.
         let src = t["source"].as_str().unwrap();
         assert!(src.chars().count() <= 2003, "got {}", src.chars().count());
-        assert!(src.ends_with("..."), "missing ellipsis: {:?}", &src[src.len() - 10..]);
+        assert!(
+            src.ends_with("..."),
+            "missing ellipsis: {:?}",
+            &src[src.len() - 10..]
+        );
         assert_eq!(t["source_truncated"], true);
         // Callers capped at 5
         assert_eq!(t["callers"].as_array().unwrap().len(), 5);
@@ -1067,7 +1119,7 @@ mod tests {
         assert!(r.get("language").is_none());
         assert_eq!(r["callers"].as_array().unwrap().len(), 5);
         assert_eq!(r["callee_count"], Value::Null); // not present in input
-        // caller_count (kept) reflects blast radius even when callers list is capped
+                                                    // caller_count (kept) reflects blast radius even when callers list is capped
         assert_eq!(r["caller_count"], 10);
     }
 
@@ -1115,13 +1167,16 @@ mod tests {
                 })
             })
             .collect();
-        let input = v(&format!(r#"{{
+        let input = v(&format!(
+            r#"{{
             "query": "what is X",
             "tokens_used": 1500,
             "processing_time_ms": 250,
             "context": "expanded prose here",
             "results": {}
-        }}"#, serde_json::to_string(&results).unwrap()));
+        }}"#,
+            serde_json::to_string(&results).unwrap()
+        ));
         let t = trim_deep_analyze(&input);
         // Capped at 10
         assert_eq!(t["results"].as_array().unwrap().len(), 10);
@@ -1185,7 +1240,9 @@ mod tests {
         assert!(out.get("count").is_some());
 
         // Edit payload keeps the structured diff
-        let edit_data = v(r#"{"preview_token": "x", "diff": {"file_path": "a.rs", "hunks": []}, "diff_text": "unified", "validation": {}}"#);
+        let edit_data = v(
+            r#"{"preview_token": "x", "diff": {"file_path": "a.rs", "hunks": []}, "diff_text": "unified", "validation": {}}"#,
+        );
         let out = trim_llm_payload("leindex.edit_preview", &edit_data);
         assert!(out.get("diff").is_some());
         assert!(out.get("diff_text").is_none());
@@ -1337,7 +1394,9 @@ mod tests {
         }"#);
         let out = trim_llm_payload("leindex.read-symbol", &data);
         assert_eq!(out["symbol"], "compute");
-        let deps = out["dependencies"].as_array().expect("dependencies must be an array");
+        let deps = out["dependencies"]
+            .as_array()
+            .expect("dependencies must be an array");
         assert_eq!(deps.len(), 2);
         assert_eq!(deps[0], "fn helper_a()");
         assert_eq!(deps[1], "fn helper_b()");
@@ -1375,8 +1434,14 @@ mod tests {
         // trim path's snippet transform takes the first line
         // and truncates to 240 chars. Assert the body text is
         // present (not the literal `null`).
-        let s = snippet.as_str().expect("snippet must be a string, not null");
-        assert!(s.contains("fn compute()"), "snippet should contain content body: {}", s);
+        let s = snippet
+            .as_str()
+            .expect("snippet must be a string, not null");
+        assert!(
+            s.contains("fn compute()"),
+            "snippet should contain content body: {}",
+            s
+        );
     }
 
     #[test]
@@ -1450,7 +1515,10 @@ mod tests {
         assert_eq!(out["count"], 1);
         assert_eq!(out["offset"], 0);
         assert_eq!(out["has_more"], false);
-        assert!(out.get("suggestion").is_none(), "no suggestion key when absent");
+        assert!(
+            out.get("suggestion").is_none(),
+            "no suggestion key when absent"
+        );
     }
 
     /// Regression for HIGH round 12: `trim_search` used to clone the
@@ -1507,7 +1575,11 @@ mod tests {
         // (243 chars total — `truncate_chars(s, 240)` preserves
         // 240 input chars and appends "...").
         let snippet0 = results[0]["snippet"].as_str().unwrap();
-        assert_eq!(snippet0.len(), 243, "snippet must be 240 chars + '...' ellipsis");
+        assert_eq!(
+            snippet0.len(),
+            243,
+            "snippet must be 240 chars + '...' ellipsis"
+        );
         assert!(snippet0.ends_with("..."));
         assert!(snippet0[..240].chars().all(|c| c == 'x'));
         assert_eq!(results[0]["symbol"], "alpha");
@@ -1539,7 +1611,8 @@ mod tests {
         // be passed through.
         let mut callers = Vec::new();
         for i in 0..7 {
-            callers.push(serde_json::json!({"name": format!("c{}", i), "file": "x.rs", "type": "fn"}));
+            callers
+                .push(serde_json::json!({"name": format!("c{}", i), "file": "x.rs", "type": "fn"}));
         }
         let data = v(&format!(
             r#"{{
@@ -1554,8 +1627,15 @@ mod tests {
             serde_json::to_string(&callers).unwrap()
         ));
         let out = trim_llm_payload("leindex.read-symbol", &data);
-        assert_eq!(out["callers"].as_array().unwrap().len(), 5, "first 5 callers passed through");
-        assert_eq!(out["callers_more"], true, "more than 5 callers => callers_more true");
+        assert_eq!(
+            out["callers"].as_array().unwrap().len(),
+            5,
+            "first 5 callers passed through"
+        );
+        assert_eq!(
+            out["callers_more"], true,
+            "more than 5 callers => callers_more true"
+        );
 
         // 3 callers — `callers_more` must be false, all 3 pass through.
         let mut small_callers = Vec::new();
@@ -1572,7 +1652,10 @@ mod tests {
         ));
         let out = trim_llm_payload("leindex.read-symbol", &data);
         assert_eq!(out["callers"].as_array().unwrap().len(), 3);
-        assert_eq!(out["callers_more"], false, "3 callers => callers_more false");
+        assert_eq!(
+            out["callers_more"], false,
+            "3 callers => callers_more false"
+        );
     }
 
     /// Regression for HIGH round 12: `trim_deep_analyze` used to
@@ -1612,7 +1695,11 @@ mod tests {
             serde_json::to_string(&results).unwrap()
         ));
         let out = trim_llm_payload("leindex.deep-analyze", &data);
-        assert_eq!(out["results"].as_array().unwrap().len(), 10, "cap at 10 entries");
+        assert_eq!(
+            out["results"].as_array().unwrap().len(),
+            10,
+            "cap at 10 entries"
+        );
         assert_eq!(out["results_more"], 5, "results_more = 15 - 10 = 5");
         // First entry: whitelisted fields present, dropped fields absent.
         let first = &out["results"].as_array().unwrap()[0];
@@ -1621,9 +1708,15 @@ mod tests {
         assert_eq!(first["symbol_name"], "sym0");
         assert_eq!(first["symbol_type"], "function");
         assert_eq!(first["signature"], "fn sym0()");
-        assert!(first.get("byte_range").is_none(), "byte_range must be dropped");
+        assert!(
+            first.get("byte_range").is_none(),
+            "byte_range must be dropped"
+        );
         assert!(first.get("language").is_none(), "language must be dropped");
-        assert!(first.get("complexity").is_none(), "complexity must be dropped");
+        assert!(
+            first.get("complexity").is_none(),
+            "complexity must be dropped"
+        );
 
         // 5 results: no cap, all pass through, results_more = 0.
         let mut small = Vec::new();
@@ -1695,7 +1788,10 @@ mod tests {
         let arr = out.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         let foo = &arr[0];
-        assert!(foo.get("complexity").is_none(), "complexity must be dropped");
+        assert!(
+            foo.get("complexity").is_none(),
+            "complexity must be dropped"
+        );
         assert_eq!(foo["name"], "foo");
         assert_eq!(
             foo["callers"].as_array().unwrap().len(),

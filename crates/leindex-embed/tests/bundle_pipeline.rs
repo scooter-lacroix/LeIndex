@@ -168,9 +168,9 @@ fn test_bundle_size_guard_maximum() {
     const MAX_MODEL_SIZE_MB: u64 = 800; // 800 MiB for single model
 
     // Guard values should be positive and reasonable
-    assert!(MAX_BUNDLE_SIZE_MB > 0);
-    assert!(MAX_MODEL_SIZE_MB > 0);
-    assert!(
+    const _: () = assert!(MAX_BUNDLE_SIZE_MB > 0);
+    const _: () = assert!(MAX_MODEL_SIZE_MB > 0);
+    const _: () = assert!(
         MAX_MODEL_SIZE_MB < MAX_BUNDLE_SIZE_MB,
         "Single model guard should be less than total bundle guard"
     );

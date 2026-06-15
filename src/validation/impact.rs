@@ -347,8 +347,6 @@ mod tests {
     fn test_impact_analyzer_new() {
         let pdg = Arc::new(ProgramDependenceGraph::new());
         let _analyzer = ImpactAnalyzer::new(pdg);
-        // Just verify it was created
-        assert!(true);
     }
 
     #[test]

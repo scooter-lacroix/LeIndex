@@ -87,9 +87,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let missing = dir.path().join("missing.json");
 
-        let err = OrchestrationState::load_from_path(&missing)
-            .err()
-            .expect("must fail");
+        let err = OrchestrationState::load_from_path(&missing).expect_err("must fail");
         assert!(err.to_string().contains("No such file") || err.to_string().contains("os error"));
     }
 }

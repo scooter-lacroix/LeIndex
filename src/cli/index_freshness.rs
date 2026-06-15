@@ -291,16 +291,15 @@ pub(crate) fn is_stale_fast(
     // monorepo with hundreds of package manifests this was the
     // dominant fixed cost of the freshness fast path before
     // the round-18 optimization.
-    let already_listed: std::collections::HashSet<PathBuf> =
-        if let Some(scan) = ctx.project_scan {
-            if !scan.manifest_paths_canonical.is_empty() {
-                scan.manifest_paths_canonical.iter().cloned().collect()
-            } else {
-                build_already_listed(ctx.project_path, &scan.manifest_paths)
-            }
+    let already_listed: std::collections::HashSet<PathBuf> = if let Some(scan) = ctx.project_scan {
+        if !scan.manifest_paths_canonical.is_empty() {
+            scan.manifest_paths_canonical.iter().cloned().collect()
         } else {
-            build_already_listed(ctx.project_path, &manifest_paths)
-        };
+            build_already_listed(ctx.project_path, &scan.manifest_paths)
+        }
+    } else {
+        build_already_listed(ctx.project_path, &manifest_paths)
+    };
     // Root-level fast path: O(N) stat, no walkdir. Common case
     // for single-package projects.
     //
@@ -598,7 +597,11 @@ mod tests {
         let (tmp, listed) = make_fixture();
         let root = tmp.path();
         fs::create_dir_all(root.join("target/some-build/src")).unwrap();
-        fs::write(root.join("target/some-build/Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::write(
+            root.join("target/some-build/Cargo.toml"),
+            "[package]\nname=\"x\"\n",
+        )
+        .unwrap();
         assert!(
             !find_new_nested_manifest(root, &listed),
             "target/Cargo.toml must be skipped"
@@ -809,7 +812,7 @@ mod tests {
         let manifest = root.join("package.json");
         fs::write(&manifest, "{}").unwrap();
         let abs = manifest.canonicalize().unwrap();
-        let listed = build_already_listed(root, &[abs.clone()]);
+        let listed = build_already_listed(root, std::slice::from_ref(&abs));
         assert!(
             listed.contains(&abs),
             "absolute scanner output must round-trip through join+canonicalize"

@@ -1371,15 +1371,16 @@ pub(crate) fn index_nodes_with_embedder(
                 // if we've already computed one for identical content.
                 // Both TF-IDF and neural embeddings are cached to avoid redundant
                 // ONNX inference on cache hits.
-                let (tfidf_embedding, cached_neural) = if let Some((tfidf, neural)) = work_hoister.lookup(&node_content) {
-                    hoisted_count += 1;
-                    (tfidf, neural)
-                } else {
-                    let embedding = embedder.embed_tfidf(&tokens);
-                    // Don't store yet — we'll store after computing neural embedding
-                    // so both are cached together.
-                    (embedding, None)
-                };
+                let (tfidf_embedding, cached_neural) =
+                    if let Some((tfidf, neural)) = work_hoister.lookup(&node_content) {
+                        hoisted_count += 1;
+                        (tfidf, neural)
+                    } else {
+                        let embedding = embedder.embed_tfidf(&tokens);
+                        // Don't store yet — we'll store after computing neural embedding
+                        // so both are cached together.
+                        (embedding, None)
+                    };
 
                 // Determine neural embedding: use cache hit, or defer to batch call.
                 let neural_embedding;
@@ -1436,7 +1437,10 @@ pub(crate) fn index_nodes_with_embedder(
         if !neural_pending.is_empty() {
             #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
             let batch_results = {
-                let texts: Vec<String> = neural_pending.iter().map(|&idx| nodes[idx].content.clone()).collect();
+                let texts: Vec<String> = neural_pending
+                    .iter()
+                    .map(|&idx| nodes[idx].content.clone())
+                    .collect();
                 embedder.embed_neural_batch_blocking(&texts)
             };
             #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
@@ -1454,7 +1458,10 @@ pub(crate) fn index_nodes_with_embedder(
             }
         }
 
-        search_engine.index_nodes(std::mem::replace(&mut nodes, Vec::with_capacity(batch_size)));
+        search_engine.index_nodes(std::mem::replace(
+            &mut nodes,
+            Vec::with_capacity(batch_size),
+        ));
     }
 
     // A+ logging: per-batch stats at info! level (invisible under default WARN).
@@ -1708,6 +1715,7 @@ pub(crate) fn try_load_mmap_embeddings(
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::infallible_destructuring_match)]
 mod tests {
     use super::*;
 

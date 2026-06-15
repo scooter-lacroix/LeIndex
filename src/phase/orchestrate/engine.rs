@@ -193,8 +193,10 @@ mod tests {
         };
         let mut engine = OrchestrationEngine::new(runner);
 
-        let mut options = PhaseOptions::default();
-        options.mode = FormatMode::Ultra;
+        let options = PhaseOptions {
+            mode: FormatMode::Ultra,
+            ..PhaseOptions::default()
+        };
 
         let context = OrchestrationContext {
             options,

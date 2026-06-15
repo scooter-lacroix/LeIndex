@@ -76,7 +76,7 @@ fn test_borrowed_slice_stable_across_repeated_reads() {
 fn test_borrowed_slice_all_rows_stable() {
     let (_dir, index) = create_test_index();
 
-    let expected = vec![
+    let expected = [
         vec![1.0, 0.0, 0.0],
         vec![0.0, 1.0, 0.0],
         vec![0.0, 0.0, 1.0],
@@ -393,9 +393,9 @@ fn test_large_dimension_borrowed_access() {
         assert_eq!(slice[i as usize], 1.0);
 
         // All other dimensions should be 0.0
-        for j in 0..dim {
+        for (j, val) in slice.iter().take(dim).enumerate() {
             if j != i as usize {
-                assert_eq!(slice[j], 0.0, "dim {} should be 0.0 for row {}", j, i);
+                assert_eq!(*val, 0.0, "dim {} should be 0.0 for row {}", j, i);
             }
         }
     }

@@ -131,13 +131,7 @@ impl TrigramIndex {
     /// Add a single node to the index (for incremental updates).
     ///
     /// Call this when a new node is added to the PDG after the initial build.
-    pub fn add_node(
-        &mut self,
-        node_id: NodeId,
-        name: &str,
-        node_id_str: &str,
-        file_path: &str,
-    ) {
+    pub fn add_node(&mut self, node_id: NodeId, name: &str, node_id_str: &str, file_path: &str) {
         let node_idx = node_id.index() as u32;
         self.node_count += 1;
 
@@ -172,13 +166,7 @@ impl TrigramIndex {
     /// Call this when a node is removed from the PDG.
     /// Uses targeted removal: extracts trigrams from the node's text fields
     /// and only cleans those specific posting lists, avoiding O(T) scan.
-    pub fn remove_node(
-        &mut self,
-        node_id: NodeId,
-        name: &str,
-        node_id_str: &str,
-        file_path: &str,
-    ) {
+    pub fn remove_node(&mut self, node_id: NodeId, name: &str, node_id_str: &str, file_path: &str) {
         let node_idx = node_id.index() as u32;
         if self.node_count > 0 {
             self.node_count -= 1;
@@ -233,7 +221,13 @@ impl TrigramIndex {
         let entry_count = self.postings.len() as u32;
         // Pre-pass: compute exact size to avoid over-allocation.
         // Header: 4 (version) + 4 (entry count). Per entry: 4 (key) + 4 (len) + 4 * posting_list.len().
-        let total_size: usize = 4 + 4 + self.postings.values().map(|list| 8 + list.len() * 4).sum::<usize>();
+        let total_size: usize = 4
+            + 4
+            + self
+                .postings
+                .values()
+                .map(|list| 8 + list.len() * 4)
+                .sum::<usize>();
         let mut buf = Vec::with_capacity(total_size);
 
         buf.extend_from_slice(&TRIGRAM_INDEX_VERSION.to_le_bytes());

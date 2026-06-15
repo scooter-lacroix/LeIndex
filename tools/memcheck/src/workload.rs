@@ -264,13 +264,12 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
     std::thread::sleep(STARTUP_GRACE);
 
     // MCP handshake: send initialize request, read response.
-    let init_request = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#;
+    let init_request =
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"capabilities":{}}}"#;
     stdin_pipe
         .write_all(format!("{}\n", init_request).as_bytes())
         .context("failed to write initialize request to MCP stdin")?;
-    stdin_pipe
-        .flush()
-        .context("failed to flush MCP stdin")?;
+    stdin_pipe.flush().context("failed to flush MCP stdin")?;
 
     // Read the initialize response (line-delimited JSON).
     let mut init_response = String::new();
@@ -286,14 +285,11 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
     }
 
     // Send initialized notification (no response expected).
-    let initialized_notification =
-        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
+    let initialized_notification = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
     stdin_pipe
         .write_all(format!("{}\n", initialized_notification).as_bytes())
         .context("failed to write initialized notification to MCP stdin")?;
-    stdin_pipe
-        .flush()
-        .context("failed to flush MCP stdin")?;
+    stdin_pipe.flush().context("failed to flush MCP stdin")?;
 
     // Trigger a search via tools/call in a background thread.
     // This sends the request to the MCP process we are sampling, which will
@@ -312,7 +308,10 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
             fixture_path.replace('\\', "\\\\").replace('"', "\\\"")
         );
         if let Err(e) = stdin_pipe.write_all(format!("{}\n", search_request).as_bytes()) {
-            eprintln!("memcheck: failed to write search request to MCP stdin: {}", e);
+            eprintln!(
+                "memcheck: failed to write search request to MCP stdin: {}",
+                e
+            );
             let _ = tx.send(());
             return;
         }

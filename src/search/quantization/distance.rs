@@ -281,7 +281,7 @@ mod tests {
         let distance_fn = Int8AdcDistance::cosine();
         let distance =
             distance_fn.eval(std::slice::from_ref(&stored), std::slice::from_ref(&stored));
-        assert!(distance >= 0.0 && distance <= 1.0);
+        assert!((0.0..=1.0).contains(&distance));
         clear_adc_query_context();
     }
 }

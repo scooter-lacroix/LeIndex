@@ -233,8 +233,10 @@ fn test_worker_idle_timeout_teardown() {
 
 #[test]
 fn test_worker_idle_timer_expires() {
-    let mut config = RuntimeConfig::default();
-    config.idle_timeout = Duration::from_millis(5);
+    let config = RuntimeConfig {
+        idle_timeout: Duration::from_millis(5),
+        ..RuntimeConfig::default()
+    };
     let rt = WorkerRuntime::new(config);
 
     assert!(!rt.is_idle_expired(), "should not be expired immediately");
@@ -620,8 +622,10 @@ fn test_split_preserves_batch_identity() {
 
 #[test]
 fn test_oversized_single_text_truncated() {
-    let mut config = RuntimeConfig::default();
-    config.max_text_size = 50;
+    let config = RuntimeConfig {
+        max_text_size: 50,
+        ..RuntimeConfig::default()
+    };
     let rt = WorkerRuntime::new(config);
 
     let long_text = "a".repeat(200);
@@ -672,8 +676,10 @@ fn test_truncate_at_exact_boundary() {
 
 #[test]
 fn test_batch_truncate_multiple_oversized_texts() {
-    let mut config = RuntimeConfig::default();
-    config.max_text_size = 20;
+    let config = RuntimeConfig {
+        max_text_size: 20,
+        ..RuntimeConfig::default()
+    };
     let rt = WorkerRuntime::new(config);
 
     let request = EmbedRequest {

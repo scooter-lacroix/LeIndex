@@ -96,7 +96,10 @@ impl DiagnosticsHandler {
             );
 
             // Flat fields expected by trim_diagnostics / render_diagnostics
-            map.insert("indexed_files".to_string(), serde_json::json!(indexed_files_ct));
+            map.insert(
+                "indexed_files".to_string(),
+                serde_json::json!(indexed_files_ct),
+            );
             map.insert("symbol_count".to_string(), serde_json::json!(symbol_count));
             map.insert("index_size_mb".to_string(), serde_json::json!(size_mb));
             map.insert("stale".to_string(), serde_json::json!(stale_bool));

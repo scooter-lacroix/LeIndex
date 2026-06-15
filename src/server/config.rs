@@ -226,14 +226,14 @@ mod tests {
         let config = ServerConfig::default();
         assert_eq!(config.host, DEFAULT_HOST);
         assert_eq!(config.port, DEFAULT_PORT);
-        assert!(config.cors_origins.len() > 0);
+        assert!(!config.cors_origins.is_empty());
         assert_eq!(config.db_path, "leindex.db");
         assert_eq!(config.max_ws_connections, MAX_WS_CONNECTIONS);
         assert_eq!(
             config.ws_heartbeat_interval_secs,
             WS_HEARTBEAT_INTERVAL_SECS
         );
-        assert_eq!(config.enable_logging, true);
+        assert!(config.enable_logging);
         assert_eq!(config.log_level, "info");
     }
 

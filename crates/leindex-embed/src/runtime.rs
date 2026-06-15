@@ -264,18 +264,10 @@ impl WorkerRuntime {
         // Configure execution providers based on selection
         let mut session_builder = match provider_name {
             "cuda" => {
-                try_provider_or_cpu!(
-                    session_builder,
-                    ort::ep::CUDA::default().build(),
-                    "CUDA"
-                )
+                try_provider_or_cpu!(session_builder, ort::ep::CUDA::default().build(), "CUDA")
             }
             "rocm" => {
-                try_provider_or_cpu!(
-                    session_builder,
-                    ort::ep::ROCm::default().build(),
-                    "ROCm"
-                )
+                try_provider_or_cpu!(session_builder, ort::ep::ROCm::default().build(), "ROCm")
             }
             "coreml" => {
                 try_provider_or_cpu!(
@@ -284,9 +276,7 @@ impl WorkerRuntime {
                     "CoreML"
                 )
             }
-            _ => {
-                session_builder.with_execution_providers([ort::ep::CPU::default().build()])?
-            }
+            _ => session_builder.with_execution_providers([ort::ep::CPU::default().build()])?,
         };
 
         session_builder.commit_from_file(model_path)
@@ -316,7 +306,11 @@ impl WorkerRuntime {
     /// 4. Check idle timeout and exit if expired
     ///
     /// VAL-CPHASE-004: Uses local IPC only (stdin/stdout pipes or Unix socket).
-    pub fn run<R: Read + Send + 'static, W: Write>(&mut self, reader: R, writer: W) -> anyhow::Result<()> {
+    pub fn run<R: Read + Send + 'static, W: Write>(
+        &mut self,
+        reader: R,
+        writer: W,
+    ) -> anyhow::Result<()> {
         // Emit startup report
         let startup = self.build_startup_report();
         startup.log();
@@ -680,11 +674,7 @@ impl WorkerRuntime {
 
         // Extract the actual output shape from the ONNX tensor.
         // Expected: [batch_size, seq_len, hidden_dim] or [batch_size, hidden_dim].
-        let output_shape: Vec<usize> = outputs[0]
-            .shape()
-            .iter()
-            .map(|&d| d as usize)
-            .collect();
+        let output_shape: Vec<usize> = outputs[0].shape().iter().map(|&d| d as usize).collect();
 
         // try_extract_array returns an ndarray::ArrayView (borrowed). We call
         // to_owned() to get an owned ArrayD<f32>, then into_raw_vec_and_offset()
@@ -744,7 +734,11 @@ impl WorkerRuntime {
                         }
                     }
                 }
-                return Ok(EmbedResponse { count: batch_size, dimension: dim, vectors: embeddings_f32 });
+                return Ok(EmbedResponse {
+                    count: batch_size,
+                    dimension: dim,
+                    vectors: embeddings_f32,
+                });
             }
             _ => {
                 return Err(WorkerError {
@@ -1029,9 +1023,7 @@ impl WorkerRuntime {
                     kind: ErrorKind::Inference,
                     message: format!(
                         "unsupported rerank output shape {:?}; expected [{}] or [{}, 1]",
-                        shape,
-                        batch_size,
-                        batch_size
+                        shape, batch_size, batch_size
                     ),
                 });
             }
@@ -1127,8 +1119,10 @@ mod tests {
 
     #[test]
     fn test_runtime_idle_expired_with_zero_timeout() {
-        let mut config = RuntimeConfig::default();
-        config.idle_timeout = Duration::from_secs(0);
+        let config = RuntimeConfig {
+            idle_timeout: Duration::from_secs(0),
+            ..RuntimeConfig::default()
+        };
         let rt = WorkerRuntime::new(config);
         // With zero timeout, it should be expired immediately
         // (but we need at least a tiny delay for the check)
@@ -1138,8 +1132,10 @@ mod tests {
 
     #[test]
     fn test_runtime_touch_resets_idle() {
-        let mut config = RuntimeConfig::default();
-        config.idle_timeout = Duration::from_millis(10);
+        let config = RuntimeConfig {
+            idle_timeout: Duration::from_millis(10),
+            ..RuntimeConfig::default()
+        };
         let mut rt = WorkerRuntime::new(config);
 
         std::thread::sleep(Duration::from_millis(20));
@@ -1171,8 +1167,10 @@ mod tests {
 
     #[test]
     fn test_truncate_text_exceeds_limit() {
-        let mut config = RuntimeConfig::default();
-        config.max_text_size = 10;
+        let config = RuntimeConfig {
+            max_text_size: 10,
+            ..RuntimeConfig::default()
+        };
         let rt = WorkerRuntime::new(config);
         let text = "hello world, this is a long string".to_string();
         let result = rt.truncate_text(text);
@@ -1182,8 +1180,10 @@ mod tests {
 
     #[test]
     fn test_truncate_text_unicode_boundary() {
-        let mut config = RuntimeConfig::default();
-        config.max_text_size = 10;
+        let config = RuntimeConfig {
+            max_text_size: 10,
+            ..RuntimeConfig::default()
+        };
         let rt = WorkerRuntime::new(config);
         // "héllo" has multi-byte chars
         let text = "héllo wörld test".to_string();
@@ -1410,9 +1410,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify both responses were written
-        let output = result.unwrap();
-        // The writer was consumed, but we can verify the run completed
-        let _ = output;
+        result.unwrap();
     }
 
     #[test]

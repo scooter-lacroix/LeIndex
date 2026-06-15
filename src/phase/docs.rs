@@ -59,7 +59,7 @@ mod tests {
     #[test]
     fn analyze_docs_propagates_read_error() {
         let missing = PathBuf::from("/definitely/missing/docs-file.md");
-        let err = analyze_docs(&[missing]).err().expect("must fail");
+        let err = analyze_docs(&[missing]).expect_err("must fail");
         assert!(err.to_string().contains("failed reading docs file"));
     }
 }

@@ -524,8 +524,6 @@ mod tests {
     fn test_reference_checker_new() {
         let pdg = Arc::new(ProgramDependenceGraph::new());
         let _checker = ReferenceChecker::new(pdg);
-        // Just verify it was created
-        assert!(true);
     }
 
     #[test]

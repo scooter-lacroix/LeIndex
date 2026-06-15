@@ -788,12 +788,8 @@ impl ProgramDependenceGraph {
                 .remove(&(node.name.clone(), node.file_path.to_string()));
 
             // Update trigram index
-            self.trigram_index.remove_node(
-                node_id,
-                &node.name,
-                &node.id,
-                &node.file_path,
-            );
+            self.trigram_index
+                .remove_node(node_id, &node.name, &node.id, &node.file_path);
 
             Some(node)
         } else {
