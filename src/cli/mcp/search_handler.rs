@@ -60,10 +60,12 @@ to auto-switch/auto-index projects."
                 },
                 "search_mode": {
                     "type": "string",
-                    "enum": ["code", "prose", "auto"],
+                    "enum": ["code", "prose", "auto", "exact", "semantic"],
                     "description": "Scoring mode: 'code' (default) emphasizes semantic/structural similarity, \
         'prose' boosts text-match weight for natural-language queries (e.g. roadmap, README content), \
-        'auto' detects based on query shape.",
+        'auto' detects based on query shape, \
+        'exact' prioritizes exact symbol name matches (higher text/structural weights), \
+        'semantic' prioritizes conceptual relevance (higher TF-IDF semantic weights).",
                     "default": "code"
                 }
             },
@@ -89,6 +91,8 @@ to auto-switch/auto-index projects."
         let query_type = match search_mode {
             "prose" => Some(crate::search::ranking::QueryType::Text),
             "code" => Some(crate::search::ranking::QueryType::Semantic),
+            "exact" => Some(crate::search::ranking::QueryType::Exact),
+            "semantic" => Some(crate::search::ranking::QueryType::Semantic),
             "auto" => {
                 let q_lower = query.to_lowercase();
                 let prose_keywords = [
