@@ -935,9 +935,16 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     // Create LeIndex and try to load from storage
     let mut leindex = LeIndex::new(&canonical_path).context("Failed to create LeIndex instance")?;
 
-    // Load from storage if available
-    if let Err(e) = leindex.load_from_storage() {
-        warn!("Failed to load from storage: {}", e);
+    // For diagnostics, use the lightweight loading path: load PDG + persisted
+    // stats without rebuilding the search engine (which is O(N) and takes
+    // ~800ms for 10K nodes). The diagnostics output only needs PDG node/edge
+    // counts and persisted IndexStats, not a functional search index.
+    if let Err(e) = leindex.load_pdg_from_storage() {
+        warn!("Failed to load PDG from storage: {}", e);
+    }
+    // Load persisted stats (total_signatures, indexed_nodes, etc.)
+    if let Err(e) = leindex.load_stats_from_storage() {
+        warn!("Failed to load persisted stats: {}", e);
     }
 
     // Get diagnostics
@@ -952,10 +959,21 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         .map(|c| c.indexed_files)
         .unwrap_or(diag.stats.files_parsed);
 
-    // Compute staleness the same way DiagnosticsHandler::execute does
-    let (changed, deleted) = leindex.check_freshness().unwrap_or_default();
+    // Compute staleness: use is_stale_fast() for the boolean check (fast:
+    // mtime + count comparison), and only run the expensive check_freshness()
+    // (which hashes ALL source files) when stale to get detailed lists.
+    let stale_fast = leindex.is_stale_fast();
+    let (changed, deleted) = if stale_fast {
+        leindex.check_freshness().unwrap_or_default()
+    } else {
+        (vec![], vec![])
+    };
     let is_stale = !changed.is_empty() || !deleted.is_empty();
-    let stale = is_stale || diag.index_health == "stale";
+    // When is_stale_fast() reported stale, we ran check_freshness() which
+    // is authoritative (hash-based). If check_freshness found no changes,
+    // the is_stale_fast positive was a false positive (e.g., same-second
+    // mtime) and the index is actually fresh.
+    let stale = if stale_fast { is_stale } else { false };
 
     // Estimate last_indexed_secs_ago from storage_path mtime
     let storage_path = leindex.storage_path();

@@ -54,7 +54,16 @@ impl DiagnosticsHandler {
             JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e))
         })?;
 
-        let (changed, deleted) = guard.check_freshness().unwrap_or_else(|_| (vec![], vec![]));
+        // Use is_stale_fast() for the boolean staleness check (fast: mtime +
+        // count comparison). Only run the expensive check_freshness() (which
+        // hashes ALL source files) when the index is actually stale, to
+        // provide detailed changed/deleted file lists.
+        let stale_fast = guard.is_stale_fast();
+        let (changed, deleted) = if stale_fast {
+            guard.check_freshness().unwrap_or_else(|_| (vec![], vec![]))
+        } else {
+            (vec![], vec![])
+        };
         let storage_path = guard.storage_path().display().to_string();
         let db_size = std::fs::metadata(guard.storage_path().join("leindex.db"))
             .map(|m| m.len())
@@ -73,7 +82,11 @@ impl DiagnosticsHandler {
         let failed_parses = diagnostics.stats.failed_parses;
         let index_health = diagnostics.index_health.clone();
         let is_stale = !changed.is_empty() || !deleted.is_empty();
-        let stale_bool = is_stale || index_health == "stale";
+        // When is_stale_fast() reported stale, we ran check_freshness() which
+        // is authoritative (hash-based). If check_freshness found no changes,
+        // the is_stale_fast positive was a false positive (e.g., same-second
+        // mtime) and the index is actually fresh.
+        let stale_bool = if stale_fast { is_stale } else { false };
         let pdg_nodes = diagnostics.pdg_nodes;
         let pdg_edges = diagnostics.pdg_edges;
         let embedding_model = diagnostics.embedding_model.clone();

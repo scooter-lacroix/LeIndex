@@ -221,19 +221,22 @@ pub(crate) fn is_stale_fast(
         }
     }
 
-    // Quick spot-check: sample indexed files for deletion or modification
-    let sample_size = (indexed_files.len() / 20).clamp(50, 500);
-    for (checked, indexed_path) in indexed_files.keys().enumerate() {
-        if checked >= sample_size {
-            break;
-        }
+    // Check ALL indexed source files for deletion or modification.
+    // This is O(N) stat() calls but each stat is ~0.01ms, so even for
+    // 1000 files the total cost is ~10ms — well within the 1000ms budget.
+    // Using >= instead of > catches same-second modifications (where the
+    // file mtime equals the DB mtime). This may produce false positives
+    // (files indexed in the same second as the DB write), but those are
+    // resolved by the authoritative check_freshness() hash comparison
+    // that the caller runs when is_stale_fast returns true.
+    for indexed_path in indexed_files.keys() {
         let full_path = ctx.project_path.join(indexed_path);
         if !full_path.exists() {
             return true;
         }
         if let Ok(metadata) = std::fs::metadata(&full_path) {
             if let Ok(modified) = metadata.modified() {
-                if modified > db_time {
+                if modified >= db_time {
                     return true;
                 }
             }

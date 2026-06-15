@@ -41,11 +41,26 @@ impl LeIndex {
         // ~64 bytes per edge (two indices + edge metadata)
         let pdg_estimated_bytes = pdg_nodes * 200 + pdg_edges * 64;
 
-        let search_index_nodes = self.search_engine.node_count();
+        let search_index_nodes = {
+            let live = self.search_engine.node_count();
+            if live > 0 {
+                live
+            } else {
+                // Search engine not rebuilt (lightweight diagnostics path).
+                // Fall back to persisted stats for the node count.
+                self.stats.indexed_nodes
+            }
+        };
 
+        // Determine index health based on actual staleness, not parse failures.
+        // A freshly indexed project with some unparseable files is still "healthy"
+        // (the index reflects the current state of the source tree). "stale" means
+        // the on-disk files have changed since the last index, which is detected
+        // separately via is_stale_fast / check_freshness.
+        let is_stale = self.is_stale_fast();
         let index_health = if !pdg_loaded || pdg_nodes == 0 {
             "empty".to_string()
-        } else if self.stats.failed_parses > 0 {
+        } else if is_stale {
             "stale".to_string()
         } else {
             "healthy".to_string()
