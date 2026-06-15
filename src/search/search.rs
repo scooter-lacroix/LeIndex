@@ -2122,6 +2122,13 @@ impl SearchEngine {
                 }
             }
 
+            // Apply archive directory penalty: files under archive/, .archive/,
+            // or docs/archive/ are heavily deprioritized so they don't appear
+            // in top results unless the query explicitly targets archived content.
+            if Self::is_archive_path(&node.file_path) {
+                score.overall *= 0.1;
+            }
+
             if score.overall > 0.0 {
                 // Apply relevance threshold if specified
                 if let Some(threshold) = query.threshold {
@@ -2440,6 +2447,13 @@ impl SearchEngine {
                 {
                     score.overall = (score.overall * 1.3).min(1.0);
                 }
+            }
+
+            // Apply archive directory penalty: files under archive/, .archive/,
+            // or docs/archive/ are heavily deprioritized so they don't appear
+            // in top results unless the query explicitly targets archived content.
+            if Self::is_archive_path(&node.file_path) {
+                score.overall *= 0.1;
             }
 
             if score.overall > 0.0 {
@@ -2803,6 +2817,23 @@ impl SearchEngine {
                     + 128 // overhead estimate for rank, score, complexity, byte_range, etc.
             })
             .sum()
+    }
+
+    /// Check if a file path is inside an archive directory.
+    ///
+    /// Returns `true` if any path component is `archive` or `.archive`.
+    /// This catches paths like:
+    /// - `archive/src/foo.rs`
+    /// - `.archive/old_code.rs`
+    /// - `docs/archive/leindex_pre_step5.rs`
+    /// - `src/.archive/backup.rs`
+    ///
+    /// Used to apply a ranking penalty so archived files don't appear
+    /// in top search results unless the query explicitly targets them.
+    fn is_archive_path(file_path: &str) -> bool {
+        file_path
+            .split('/')
+            .any(|component| component == "archive" || component == ".archive")
     }
 }
 
@@ -4899,5 +4930,118 @@ mod tests {
             !results.is_empty(),
             "Search should still find results via inverted index after content cleared"
         );
+    }
+
+    #[test]
+    fn test_is_archive_path_detection() {
+        // Root-level archive directories
+        assert!(SearchEngine::is_archive_path("archive/src/main.rs"));
+        assert!(SearchEngine::is_archive_path(".archive/old_code.rs"));
+
+        // Nested archive directories
+        assert!(SearchEngine::is_archive_path(
+            "docs/archive/leindex_pre_step5.rs"
+        ));
+        assert!(SearchEngine::is_archive_path("src/.archive/backup.rs"));
+        assert!(SearchEngine::is_archive_path("maestro/archive/config.yaml"));
+
+        // Deeply nested
+        assert!(SearchEngine::is_archive_path(
+            "project/.archive/sub/deep/file.rs"
+        ));
+        assert!(SearchEngine::is_archive_path("a/b/c/archive/d/e/f.rs"));
+
+        // Non-archive paths should NOT match
+        assert!(!SearchEngine::is_archive_path("src/main.rs"));
+        assert!(!SearchEngine::is_archive_path("src/search/search.rs"));
+        assert!(!SearchEngine::is_archive_path("docs/README.md"));
+        assert!(!SearchEngine::is_archive_path("tests/archived_test.rs"));
+        assert!(!SearchEngine::is_archive_path("my_archive_helper.rs"));
+        assert!(!SearchEngine::is_archive_path("src/archive_helper.rs"));
+    }
+
+    #[test]
+    fn test_archive_files_deprioritized_in_search() {
+        // Create nodes with the same symbol name in both src/ and archive/
+        let src_node = NodeInfo {
+            node_id: "src_index_project".to_string(),
+            file_path: "src/cli/leindex/indexing.rs".to_string(),
+            symbol_name: "index_project".to_string(),
+            language: "rust".to_string(),
+            content: "pub fn index_project() {}".to_string(),
+            byte_range: (0, 30),
+            tfidf_embedding: vec![1.0, 0.0, 0.0],
+            neural_embedding: None,
+            complexity: 5,
+            signature: None,
+            pre_tokenized: None,
+        };
+
+        let archive_node = NodeInfo {
+            node_id: "archive_index_project".to_string(),
+            file_path: "docs/archive/leindex_pre_step5.rs".to_string(),
+            symbol_name: "index_project".to_string(),
+            language: "rust".to_string(),
+            content: "pub fn index_project() {}".to_string(),
+            byte_range: (0, 30),
+            tfidf_embedding: vec![1.0, 0.0, 0.0],
+            neural_embedding: None,
+            complexity: 5,
+            signature: None,
+            pre_tokenized: None,
+        };
+
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(vec![src_node, archive_node]);
+
+        let query = SearchQuery {
+            query: "index_project".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(vec![1.0, 0.0, 0.0]),
+            query_neural_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+
+        let results = engine.search(query).unwrap();
+        assert!(!results.is_empty(), "Should have results");
+
+        // The src/ result must rank higher than the archive/ result
+        let src_rank = results
+            .iter()
+            .position(|r| r.file_path.starts_with("src/"))
+            .expect("src/ result should exist");
+        let archive_rank = results
+            .iter()
+            .position(|r| SearchEngine::is_archive_path(&r.file_path));
+
+        if let Some(arch_rank) = archive_rank {
+            assert!(
+                src_rank < arch_rank,
+                "src/ result (rank {}) must appear before archive/ result (rank {})",
+                src_rank + 1,
+                arch_rank + 1
+            );
+        }
+
+        // Verify the archive result has a lower score
+        if let Some(arch_result) = results
+            .iter()
+            .find(|r| SearchEngine::is_archive_path(&r.file_path))
+        {
+            let src_result = results
+                .iter()
+                .find(|r| r.file_path.starts_with("src/"))
+                .expect("src/ result should exist");
+            assert!(
+                src_result.score.overall > arch_result.score.overall,
+                "src/ score ({:.4}) must be higher than archive/ score ({:.4})",
+                src_result.score.overall,
+                arch_result.score.overall
+            );
+        }
     }
 }

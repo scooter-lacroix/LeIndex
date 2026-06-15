@@ -155,8 +155,10 @@ fn should_skip_dir(file_name: &str) -> bool {
     // and config::ExclusionConfig defaults.
     matches!(
         file_name,
+        // Archived / deprecated code
+        ".archive" | "archive"
         // Version control
-        ".git" | ".hg" | ".svn"
+        | ".git" | ".hg" | ".svn"
         // Build outputs
         | "target" | "build" | "dist" | "out" | ".next" | "coverage"
         // Package managers / dependencies
@@ -345,6 +347,9 @@ mod tests {
         assert!(should_skip_dir(".vscode"));
         // Misc generated
         assert!(should_skip_dir(".leindex"));
+        // Archived / deprecated code
+        assert!(should_skip_dir("archive"));
+        assert!(should_skip_dir(".archive"));
         // Ensure normal dirs are NOT skipped
         assert!(!should_skip_dir("src"));
         assert!(!should_skip_dir("lib"));
