@@ -198,8 +198,12 @@ fn trim_diagnostics(data: &Value) -> Value {
         "indexed_files": data.get("indexed_files"),
         "symbol_count": data.get("symbol_count"),
         "index_size_mb": data.get("index_size_mb"),
+        "memory_rss_mb": data.get("memory_rss_mb"),
+        "db_size_bytes": data.get("db_size_bytes"),
         "stale": data.get("stale"),
         "last_indexed_secs_ago": data.get("last_indexed_secs_ago"),
+        "freshness": data.get("freshness"),
+        "system_health": data.get("system_health"),
         "issues": data.get("issues"),
     })
 }

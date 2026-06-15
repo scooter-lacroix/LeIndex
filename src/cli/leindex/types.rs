@@ -214,6 +214,15 @@ pub struct Diagnostics {
     pub search_index_nodes: usize,
     /// Overall index health: "healthy", "stale", or "empty"
     pub index_health: String,
+    /// Number of PDG nodes (symbols in the Program Dependence Graph)
+    #[serde(default)]
+    pub pdg_nodes: usize,
+    /// Number of PDG edges (relationships in the Program Dependence Graph)
+    #[serde(default)]
+    pub pdg_edges: usize,
+    /// Embedding model status: "tfidf_only", "onnx_hybrid", "remote_hybrid", or "unknown"
+    #[serde(default)]
+    pub embedding_model: String,
 }
 
 /// Coverage report of indexed vs source files.

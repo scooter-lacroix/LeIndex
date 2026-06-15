@@ -487,11 +487,46 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
     if let Some(v) = data.get("index_size_mb").and_then(|v| v.as_f64()) {
         out.push_str(&field("Index size", &format!("{:.2} MB", v), color));
     }
+    if let Some(v) = data.get("memory_rss_mb").and_then(|v| v.as_f64()) {
+        out.push_str(&field("Memory RSS", &format!("{:.2} MB", v), color));
+    }
+    if let Some(v) = data.get("db_size_bytes").and_then(|v| v.as_u64()) {
+        out.push_str(&field("DB size", &format!("{} bytes", v), color));
+    }
     if let Some(v) = data.get("stale").and_then(|v| v.as_bool()) {
         out.push_str(&field("Stale", &v.to_string(), color));
     }
     if let Some(v) = data.get("last_indexed_secs_ago").and_then(|v| v.as_u64()) {
         out.push_str(&field("Last indexed", &format!("{}s ago", v), color));
+    }
+    // System health section
+    if let Some(sh) = data.get("system_health") {
+        out.push('\n');
+        out.push_str("  System Health:\n");
+        if let Some(v) = sh.get("index_health").and_then(|v| v.as_str()) {
+            out.push_str(&field("  Index health", v, color));
+        }
+        if let Some(v) = sh.get("pdg_loaded").and_then(|v| v.as_bool()) {
+            out.push_str(&field("  PDG loaded", &v.to_string(), color));
+        }
+        if let Some(v) = sh.get("pdg_nodes").and_then(|v| v.as_u64()) {
+            out.push_str(&field("  PDG nodes", &v.to_string(), color));
+        }
+        if let Some(v) = sh.get("pdg_edges").and_then(|v| v.as_u64()) {
+            out.push_str(&field("  PDG edges", &v.to_string(), color));
+        }
+        if let Some(v) = sh.get("search_index_nodes").and_then(|v| v.as_u64()) {
+            out.push_str(&field("  Search nodes", &v.to_string(), color));
+        }
+        if let Some(v) = sh.get("embedding_model").and_then(|v| v.as_str()) {
+            out.push_str(&field("  Embedding model", v, color));
+        }
+        if let Some(v) = sh.get("total_signatures").and_then(|v| v.as_u64()) {
+            out.push_str(&field("  Total signatures", &v.to_string(), color));
+        }
+        if let Some(v) = sh.get("failed_parses").and_then(|v| v.as_u64()) {
+            out.push_str(&field("  Failed parses", &v.to_string(), color));
+        }
     }
     if let Some(arr) = data.get("issues").and_then(|v| v.as_array()) {
         if !arr.is_empty() {

@@ -140,6 +140,9 @@ fn test_diagnostics_serialization() {
         pdg_estimated_bytes: 60000,
         search_index_nodes: 100,
         index_health: "healthy".to_string(),
+        pdg_nodes: 500,
+        pdg_edges: 800,
+        embedding_model: "tfidf_only".to_string(),
     };
 
     let json = serde_json::to_string(&diagnostics).unwrap();

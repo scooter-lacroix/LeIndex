@@ -59,6 +59,22 @@ impl LeIndex {
             "warm".to_string()
         };
 
+        // Determine embedding model status from the embedder variant.
+        let embedding_model = match &self.embedder {
+            None => "unknown".to_string(),
+            Some(crate::cli::index_builder::HybridEmbedder::TfIdfOnly(_)) => {
+                "tfidf_only".to_string()
+            }
+            #[cfg(feature = "onnx")]
+            Some(crate::cli::index_builder::HybridEmbedder::HybridLocal { .. }) => {
+                "onnx_hybrid".to_string()
+            }
+            #[cfg(feature = "remote-embeddings")]
+            Some(crate::cli::index_builder::HybridEmbedder::HybridRemote { .. }) => {
+                "remote_hybrid".to_string()
+            }
+        };
+
         Ok(super::Diagnostics {
             project_path: self.project_path.display().to_string(),
             project_id: self.project_id.clone(),
@@ -86,6 +102,9 @@ impl LeIndex {
             pdg_estimated_bytes,
             search_index_nodes,
             index_health,
+            pdg_nodes,
+            pdg_edges,
+            embedding_model,
         })
     }
 

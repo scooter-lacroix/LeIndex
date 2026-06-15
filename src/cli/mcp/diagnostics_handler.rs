@@ -67,11 +67,22 @@ impl DiagnosticsHandler {
             .map(|c| c.indexed_files)
             .unwrap_or(diagnostics.stats.files_parsed);
         let symbol_count = diagnostics.stats.indexed_nodes;
+        let memory_rss_mb =
+            (diagnostics.memory_usage_bytes as f64 / 1024.0 / 1024.0 * 100.0).round() / 100.0;
         let size_mb = diagnostics.memory_usage_bytes as f64 / 1024.0 / 1024.0;
         let failed_parses = diagnostics.stats.failed_parses;
         let index_health = diagnostics.index_health.clone();
         let is_stale = !changed.is_empty() || !deleted.is_empty();
         let stale_bool = is_stale || index_health == "stale";
+        let pdg_nodes = diagnostics.pdg_nodes;
+        let pdg_edges = diagnostics.pdg_edges;
+        let embedding_model = diagnostics.embedding_model.clone();
+        let pdg_loaded = diagnostics.pdg_loaded;
+        let search_index_nodes = diagnostics.search_index_nodes;
+        let total_signatures = diagnostics.stats.total_signatures;
+        let indexed_nodes = diagnostics.stats.indexed_nodes;
+        let files_parsed = diagnostics.stats.files_parsed;
+        let indexing_time_ms = diagnostics.stats.indexing_time_ms;
 
         let mut diag_json = serde_json::to_value(diagnostics)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?;
@@ -79,12 +90,35 @@ impl DiagnosticsHandler {
         if let Value::Object(ref mut map) = diag_json {
             map.insert("storage_path".to_string(), serde_json::json!(storage_path));
             map.insert("db_size_bytes".to_string(), serde_json::json!(db_size));
+            map.insert(
+                "memory_rss_mb".to_string(),
+                serde_json::json!(memory_rss_mb),
+            );
 
             // Flat fields expected by trim_diagnostics / render_diagnostics
             map.insert("indexed_files".to_string(), serde_json::json!(indexed_files_ct));
             map.insert("symbol_count".to_string(), serde_json::json!(symbol_count));
             map.insert("index_size_mb".to_string(), serde_json::json!(size_mb));
             map.insert("stale".to_string(), serde_json::json!(stale_bool));
+
+            // System health metrics: index freshness, PDG node/edge counts,
+            // embedding model status, search index size.
+            map.insert(
+                "system_health".to_string(),
+                serde_json::json!({
+                    "index_health": index_health,
+                    "pdg_loaded": pdg_loaded,
+                    "pdg_nodes": pdg_nodes,
+                    "pdg_edges": pdg_edges,
+                    "search_index_nodes": search_index_nodes,
+                    "embedding_model": embedding_model,
+                    "total_signatures": total_signatures,
+                    "indexed_nodes": indexed_nodes,
+                    "files_parsed": files_parsed,
+                    "failed_parses": failed_parses,
+                    "indexing_time_ms": indexing_time_ms,
+                }),
+            );
 
             // last_indexed_secs_ago: rough estimate from storage_path mtime
             let lm = std::fs::metadata(guard.storage_path().join("leindex.db"))
