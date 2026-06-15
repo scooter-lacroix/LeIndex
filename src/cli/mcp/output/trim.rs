@@ -496,27 +496,42 @@ fn trim_read_symbol(data: &Value) -> Value {
             out.insert(k.to_string(), v.clone());
         }
     }
-    // The source body is the dominant token cost. Truncate to 2k chars
-    // and expose a flag so the LLM knows to call again with a wider
-    // budget if it really needs the full body. Truncate on character
-    // boundaries directly from the source `&str` — slicing at a fixed
-    // byte offset can panic when the offset lands inside a multi-byte
-    // UTF-8 sequence (e.g. emoji, identifiers in non-ASCII source).
+    // The source body is the dominant token cost. The handler already
+    // caps it at `token_budget * 4` chars. If the handler provided
+    // `source_truncated` and `_source_char_budget`, trust those values
+    // and only apply a secondary trim if the budget exceeds a safety
+    // ceiling (32k chars = ~8k tokens). This ensures the LLM gets the
+    // full source it requested (up to its token_budget) rather than
+    // an arbitrary 2000-char truncation.
     //
-    // `char_indices().nth(2000)` is a single pass: it walks the UTF-8
-    // string once and stops at the (n+1)-th character, returning the
-    // byte offset of the truncation boundary. We then append the
-    // standard `...` ellipsis so the LLM sees a 2003-char preview.
-    // The previous `chars().count() > 2000` + `truncate_chars(...)`
-    // path scanned the entire string twice on every call, which
-    // dominated trim cost for very large sources.
+    // Truncate on character boundaries directly from the source `&str`
+    // — slicing at a fixed byte offset can panic when the offset lands
+    // inside a multi-byte UTF-8 sequence.
+    let safety_cap = 32_000usize;
+    let budget = data
+        .get("_source_char_budget")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(2000);
+    let trim_cap = budget.min(safety_cap);
+
     if let Some(src) = data.get("source").and_then(|v| v.as_str()) {
-        let (head, truncated) = match src.char_indices().nth(2000) {
+        let (head, truncated) = match src.char_indices().nth(trim_cap) {
             Some((idx, _)) => (format!("{}...", &src[..idx]), true),
             None => (src.to_string(), false),
         };
         out.insert("source".to_string(), Value::String(head));
-        out.insert("source_truncated".to_string(), Value::Bool(truncated));
+        // Use the handler's source_truncated flag when available (it's
+        // accurate: it compares full source length against the actual
+        // budget). Fall back to the trim-based calculation.
+        let handler_truncated = data
+            .get("source_truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(truncated);
+        out.insert(
+            "source_truncated".to_string(),
+            Value::Bool(handler_truncated),
+        );
     }
     // callers/callees: keep 5 by default, expose `*_more` flag.
     // The length check uses `as_array().map(|a| a.len())` rather
@@ -587,8 +602,10 @@ fn trim_grep_symbols(data: &Value) -> Value {
 }
 
 fn trim_text_search(data: &Value) -> Value {
-    // Drop the `before`/`after` context windows — the LLM already has
-    // the matched line and can call read_file for context.
+    // Keep before/after context windows when present — the caller
+    // explicitly requested context via context_lines and the handler
+    // already caps at 10 lines per side. Dropping them silently would
+    // make the tool useless for the "understand match context" use case.
     let arr = data
         .get("results")
         .and_then(|v| v.as_array())
@@ -598,7 +615,15 @@ fn trim_text_search(data: &Value) -> Value {
         .into_iter()
         .map(|r| {
             let mut obj = serde_json::Map::new();
-            for k in ["file", "line", "content", "in_symbol", "symbol_type"] {
+            for k in [
+                "file",
+                "line",
+                "content",
+                "before",
+                "after",
+                "in_symbol",
+                "symbol_type",
+            ] {
                 if let Some(v) = r.get(k) {
                     obj.insert(k.to_string(), v.clone());
                 }
@@ -729,8 +754,8 @@ fn trim_index(data: &Value) -> Value {
 fn trim_edit(data: &Value) -> Value {
     // The edit handlers return different shapes for `preview` vs
     // `apply`:
-    //   * `edit_preview` → `preview_token`, `diff`, `affected_*`,
-    //     `risk_level`, `change_count`, `validation`
+    //   * `edit_preview` → `preview_token`, `diff`, `diff_text`,
+    //     `affected_*`, `risk_level`, `change_count`, `validation`
     //   * `edit_apply`   → `success`, `changes_applied`, `file_path`,
     //     `edit_region`, `message` (a no-op confirmation), plus the
     //     same diff/affected_* fields
@@ -738,14 +763,16 @@ fn trim_edit(data: &Value) -> Value {
     // We want to keep the union of both shapes so an MCP `edit_apply`
     // call still surfaces the success confirmation and verification
     // context, and an `edit_preview` call still gets the diff. The
-    // `diff_text` echo and the internal `validation` subtree are
-    // dropped (the model doesn't need a second copy of the diff or
-    // the full validator report).
+    // `diff_text` is kept so the LLM can see the unified diff without
+    // parsing the structured `diff` object. The internal `validation`
+    // subtree is dropped (the model doesn't need the full validator
+    // report).
     let mut out = serde_json::Map::new();
     for k in [
         // shared / preview-shaped
         "preview_token",
         "diff",
+        "diff_text",
         "affected_symbols",
         "affected_files",
         "breaking_changes",
@@ -791,12 +818,40 @@ fn trim_rename_symbol(data: &Value) -> Value {
                 .collect()
         })
         .unwrap_or_default();
-    serde_json::json!({
-        "diffs": shown,
-        "diffs_more": total.saturating_sub(25),
-        "old_name": data.get("old_name"),
-        "new_name": data.get("new_name"),
-    })
+    // files_affected reflects the TOTAL number of affected files (from
+    // the handler), not the trimmed diffs count. This matches the
+    // assertion that files_affected equals the original diffs length.
+    let files_affected = data
+        .get("files_affected")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(total);
+    let mut out = serde_json::Map::new();
+    out.insert("diffs".to_string(), Value::Array(shown));
+    out.insert(
+        "diffs_more".to_string(),
+        Value::from(total.saturating_sub(25)),
+    );
+    out.insert(
+        "old_name".to_string(),
+        data.get("old_name").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "new_name".to_string(),
+        data.get("new_name").cloned().unwrap_or(Value::Null),
+    );
+    out.insert("files_affected".to_string(), Value::from(files_affected));
+    out.insert(
+        "preview_only".to_string(),
+        data.get("preview_only")
+            .cloned()
+            .unwrap_or(Value::Bool(true)),
+    );
+    out.insert(
+        "applied".to_string(),
+        data.get("applied").cloned().unwrap_or(Value::Bool(false)),
+    );
+    Value::Object(out)
 }
 
 // =============================================================================
@@ -1012,8 +1067,11 @@ mod tests {
         assert_eq!(t["preview_token"], "tok");
         assert!(t["diff"].is_object());
         assert_eq!(t["risk_level"], "low");
-        // diff_text echo + validation subtree are dropped
-        assert!(t.get("diff_text").is_none());
+        assert_eq!(t["change_count"], 1);
+        assert_eq!(t["affected_symbols"][0], "main");
+        // diff_text is now preserved so the LLM can see the unified diff
+        assert!(t.get("diff_text").is_some());
+        // validation subtree is dropped (internal detail)
         assert!(t.get("validation").is_none());
     }
 
@@ -1110,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn test_trim_text_search_drops_context_windows() {
+    fn test_trim_text_search_preserves_context_windows() {
         let input = v(r#"{
             "count": 1,
             "total_matched": 1,
@@ -1130,8 +1188,10 @@ mod tests {
         }"#);
         let t = trim_text_search(&input);
         let r = &t["results"][0];
-        assert!(r.get("before").is_none());
-        assert!(r.get("after").is_none());
+        // before/after context windows are now preserved so the LLM
+        // can understand match context without a follow-up read_file.
+        assert!(r.get("before").is_some());
+        assert!(r.get("after").is_some());
         assert_eq!(r["file"], "src/foo.rs");
         assert_eq!(r["line"], 42);
     }
@@ -1225,13 +1285,13 @@ mod tests {
         assert!(out.get("results").is_some());
         assert!(out.get("count").is_some());
 
-        // Edit payload keeps the structured diff
+        // Edit payload keeps the structured diff and diff_text
         let edit_data = v(
             r#"{"preview_token": "x", "diff": {"file_path": "a.rs", "hunks": []}, "diff_text": "unified", "validation": {}}"#,
         );
         let out = trim_llm_payload("leindex.edit_preview", &edit_data);
         assert!(out.get("diff").is_some());
-        assert!(out.get("diff_text").is_none());
+        assert!(out.get("diff_text").is_some());
         assert!(out.get("validation").is_none());
 
         // Unknown tool passes through unchanged
@@ -1936,10 +1996,7 @@ mod tests {
         assert_eq!(affected.len(), 3);
         assert_eq!(affected[0], "callee_x");
         // summary string preserved
-        assert!(t["summary"]
-            .as_str()
-            .unwrap()
-            .contains("3 symbols"));
+        assert!(t["summary"].as_str().unwrap().contains("3 symbols"));
     }
 
     #[test]

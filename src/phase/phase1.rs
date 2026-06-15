@@ -18,6 +18,12 @@ pub struct Phase1Summary {
     pub language_distribution: HashMap<String, usize>,
     /// Parser completeness scores by language.
     pub parser_completeness: Vec<LanguageCompleteness>,
+    /// True when incremental refresh found no changed files and the
+    /// PDG was loaded from cache without re-parsing. This distinguishes
+    /// a cache hit (parsed_files=0 because nothing changed) from a
+    /// parse failure (parsed_files=0 because parsing broke).
+    #[serde(default)]
+    pub cache_hit: bool,
 }
 
 /// Run phase 1 structural scan.
@@ -30,6 +36,15 @@ pub fn run(context: &PhaseExecutionContext) -> Phase1Summary {
                 .or_insert(0) += 1;
         }
     }
+
+    // On an incremental run with no changed files, parse_results is empty
+    // and the PDG was loaded from cache. Distinguish this from a parse
+    // failure by checking whether the inventory is non-empty but no
+    // files were parsed (indicating cache hit, not failure).
+    let cache_hit = context.parse_results.is_empty()
+        && !context.file_inventory.is_empty()
+        && context.changed_files.is_empty()
+        && context.deleted_files.is_empty();
 
     Phase1Summary {
         total_files: context.file_inventory.len(),
@@ -46,5 +61,6 @@ pub fn run(context: &PhaseExecutionContext) -> Phase1Summary {
             .sum(),
         language_distribution,
         parser_completeness: score_languages(&context.parse_results),
+        cache_hit,
     }
 }

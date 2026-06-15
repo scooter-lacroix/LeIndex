@@ -78,7 +78,14 @@ without reading the entire file. Accepts project_path to auto-switch between pro
 
         let result = guard
             .expand_node_context(&node_id, token_budget)
-            .map_err(|e| JsonRpcError::internal_error(format!("Context expansion error: {}", e)))?;
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("not found") {
+                    JsonRpcError::invalid_params(msg)
+                } else {
+                    JsonRpcError::internal_error(format!("Context expansion error: {}", e))
+                }
+            })?;
 
         serde_json::to_value(result)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))

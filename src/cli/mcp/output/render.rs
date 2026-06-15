@@ -1623,6 +1623,145 @@ fn render_write(data: &Value, color: bool) -> String {
     out
 }
 
+/// Render edit-preview output: diff followed by metadata fields
+/// (affected_symbols, affected_files, risk_level, change_count).
+fn render_edit_preview(data: &Value, color: bool) -> String {
+    let diff_text = render_diff_value(data, color);
+    let mut out = diff_text;
+
+    // Append metadata fields after the diff so the LLM sees both
+    // the change and its impact assessment.
+    let mut meta_lines = Vec::new();
+
+    if let Some(symbols) = data.get("affected_symbols").and_then(|v| v.as_array()) {
+        if !symbols.is_empty() {
+            let names: Vec<&str> = symbols.iter().filter_map(|v| v.as_str()).collect();
+            meta_lines.push(format!(
+                "  {}Affected symbols:{} {}",
+                if color { BOLD } else { "" },
+                if color { RESET } else { "" },
+                names.join(", ")
+            ));
+        }
+    }
+
+    if let Some(files) = data.get("affected_files").and_then(|v| v.as_array()) {
+        if !files.is_empty() {
+            let names: Vec<&str> = files.iter().filter_map(|v| v.as_str()).collect();
+            meta_lines.push(format!(
+                "  {}Affected files:{} {}",
+                if color { BOLD } else { "" },
+                if color { RESET } else { "" },
+                names.join(", ")
+            ));
+        }
+    }
+
+    if let Some(risk) = data.get("risk_level").and_then(|v| v.as_str()) {
+        meta_lines.push(format!(
+            "  {}Risk level:{} {}",
+            if color { BOLD } else { "" },
+            if color { RESET } else { "" },
+            risk
+        ));
+    }
+
+    if let Some(count) = data.get("change_count").and_then(|v| v.as_u64()) {
+        meta_lines.push(format!(
+            "  {}Change count:{} {}",
+            if color { BOLD } else { "" },
+            if color { RESET } else { "" },
+            count
+        ));
+    }
+
+    if let Some(breaks) = data.get("breaking_changes").and_then(|v| v.as_array()) {
+        if !breaks.is_empty() {
+            for b in breaks {
+                if let Some(s) = b.as_str() {
+                    meta_lines.push(format!(
+                        "  {}Breaking:{} {}",
+                        if color { BOLD } else { "" },
+                        if color { RESET } else { "" },
+                        s
+                    ));
+                }
+            }
+        }
+    }
+
+    if !meta_lines.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&meta_lines.join("\n"));
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Render rename-symbol output: multi-file diffs followed by metadata
+/// (old_name, new_name, files_affected, preview_only).
+fn render_rename_symbol(data: &Value, color: bool) -> String {
+    let diff_text = render_diff_value(data, color);
+    let mut out = diff_text;
+
+    let mut meta_lines = Vec::new();
+
+    if let Some(old) = data.get("old_name").and_then(|v| v.as_str()) {
+        if let Some(new) = data.get("new_name").and_then(|v| v.as_str()) {
+            meta_lines.push(format!(
+                "  {}Rename:{} {} → {}",
+                if color { BOLD } else { "" },
+                if color { RESET } else { "" },
+                old,
+                new
+            ));
+        }
+    }
+
+    if let Some(count) = data.get("files_affected").and_then(|v| v.as_u64()) {
+        meta_lines.push(format!(
+            "  {}Files affected:{} {}",
+            if color { BOLD } else { "" },
+            if color { RESET } else { "" },
+            count
+        ));
+    }
+
+    if let Some(diffs_more) = data.get("diffs_more").and_then(|v| v.as_u64()) {
+        if diffs_more > 0 {
+            meta_lines.push(format!(
+                "  {}Additional diffs:{} {} more (not shown)",
+                if color { BOLD } else { "" },
+                if color { RESET } else { "" },
+                diffs_more
+            ));
+        }
+    }
+
+    if let Some(preview) = data.get("preview_only").and_then(|v| v.as_bool()) {
+        if preview {
+            meta_lines.push(format!(
+                "  {}Preview only:{} changes not applied",
+                if color { BOLD } else { "" },
+                if color { RESET } else { "" }
+            ));
+        }
+    }
+
+    if !meta_lines.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&meta_lines.join("\n"));
+        out.push('\n');
+    }
+
+    out
+}
+
 fn render_edit_apply(data: &Value, color: bool) -> String {
     // `EditApplyHandler` returns a confirmation payload with shape
     // (see `src/cli/mcp/edit_apply_handler.rs::EditApplyHandler::
@@ -1784,7 +1923,7 @@ fn render_tool_output_with_color(name: &str, data: &Value, args: &Value, color: 
         "leindex_git_status" | "git_status" => render_git_status(data, color),
         "leindex_file_summary" | "file_summary" => render_file_summary(data, color),
         "leindex_read_file" | "read_file" => render_read_file(data, color),
-        "leindex_edit_preview" | "edit_preview" => render_diff_value(data, color),
+        "leindex_edit_preview" | "edit_preview" => render_edit_preview(data, color),
         // `EditApplyHandler` returns a confirmation payload
         // (`success, changes_applied, file_path, edit_region, …`)
         // not a diff, so `render_diff_value` returns an empty
@@ -1795,7 +1934,7 @@ fn render_tool_output_with_color(name: &str, data: &Value, args: &Value, color: 
         // (`{success, file_path, language, symbols}`) not a diff, so
         // `render_diff_value` would return an empty string here.
         "leindex_write" | "write" => render_write(data, color),
-        "leindex_rename_symbol" | "rename_symbol" => render_diff_value(data, color),
+        "leindex_rename_symbol" | "rename_symbol" => render_rename_symbol(data, color),
         _ => render_default(data, color),
     }
 }

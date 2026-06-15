@@ -315,14 +315,14 @@ impl LeIndex {
                     )
                 }
             } else {
-                (
-                    node_id.to_string(),
-                    String::new(),
-                    node_id.to_string(),
-                    "unknown".to_string(),
-                    (0, 0),
-                    0,
-                )
+                // Node not found: return a clear error instead of a
+                // degenerate empty result that confuses the caller.
+                return Err(anyhow::anyhow!(
+                    "Node '{}' not found in the project index. \
+                    Use LeIndex [Search] or LeIndex [Grep Symbols] to find valid node IDs. \
+                    The index uses short symbol names (e.g., 'handle_tool_call', not 'server.rs:handle_tool_call').",
+                    node_id
+                ));
             };
 
         // Compute line number from byte range

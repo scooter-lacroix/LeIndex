@@ -234,6 +234,20 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
                         }
                     }
                 }
+
+                // For text replacements, find symbols in the edited file
+                // that overlap with the changed region. This gives the
+                // LLM actionable information about which symbols are
+                // affected by the edit.
+                if nodes.is_empty() {
+                    let file_path_str = abs_file_path.to_string_lossy().to_string();
+                    let file_nodes = pdg.nodes_in_file(&file_path_str);
+                    for nid in file_nodes {
+                        if let Some(n) = pdg.get_node(nid) {
+                            nodes.push(n.name.clone());
+                        }
+                    }
+                }
             }
             (validation, nodes, files, breaks)
         };
