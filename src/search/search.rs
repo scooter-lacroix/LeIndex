@@ -812,6 +812,13 @@ pub struct SearchResult {
 
     /// Byte range in source
     pub byte_range: (usize, usize),
+
+    /// 1-based line number of the symbol's definition in the source file.
+    ///
+    /// Populated by `LeIndex::search()` from the PDG node's byte_range.
+    /// `None` when the line number cannot be determined (e.g., no PDG).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_number: Option<usize>,
 }
 
 // ============================================================================
@@ -2154,6 +2161,7 @@ impl SearchEngine {
                     score,
                     context: None,
                     byte_range: node.byte_range,
+                    line_number: None, // enriched by LeIndex::search()
                 });
             }
         }
@@ -2478,6 +2486,7 @@ impl SearchEngine {
                     score,
                     context: None,
                     byte_range: node.byte_range,
+                    line_number: None,
                 });
             }
         }

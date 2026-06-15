@@ -134,6 +134,7 @@ pub(crate) fn trim_search(data: &Value) -> Value {
                         .cloned()
                         .unwrap_or(Value::Null),
                     "symbol_type": r.get("symbol_type").cloned().unwrap_or(Value::Null),
+                    "line_number": r.get("line_number").cloned().unwrap_or(Value::Null),
                     "score": score,
                     "snippet": snippet,
                 })
@@ -938,6 +939,7 @@ mod tests {
                     "symbol_type": "function",
                     "language": "rust",
                     "byte_range": [0, 100],
+                    "line_number": 42,
                     "complexity": 3,
                     "caller_count": 5,
                     "dependency_count": 2,
@@ -955,6 +957,7 @@ mod tests {
         assert_eq!(r["file_path"], "/p/src/foo.rs");
         assert_eq!(r["symbol"], "main");
         assert_eq!(r["symbol_type"], "function");
+        assert_eq!(r["line_number"], 42);
         assert_eq!(r["score"], 0.85);
         assert_eq!(r["snippet"], "// first line");
         // Verbose fields the LLM doesn't need

@@ -269,6 +269,7 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
         // or `context` to fall back on, so read `snippet` directly.
         let snippet = r.get("snippet").and_then(|v| v.as_str());
         let byte_range = r.get("byte_range").and_then(|v| v.as_array());
+        let line_number = r.get("line_number").and_then(|v| v.as_u64());
 
         out.push_str(&format!(
             "  {}{}.{} {}",
@@ -294,6 +295,15 @@ fn render_search(data: &Value, query: &str, color: bool) -> String {
                 " {}[{}]{}",
                 if color { DIM } else { "" },
                 typ,
+                if color { RESET } else { "" },
+            ));
+        }
+
+        if let Some(ln) = line_number {
+            out.push_str(&format!(
+                " {}:{}{}",
+                if color { DIM } else { "" },
+                ln,
                 if color { RESET } else { "" },
             ));
         }

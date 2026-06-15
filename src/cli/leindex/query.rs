@@ -79,9 +79,13 @@ impl LeIndex {
             .search(search_query)
             .context("Search operation failed")?;
 
-        // Enrich results with PDG metadata: symbol_type, caller_count, dependency_count.
+        // Enrich results with PDG metadata: symbol_type, caller_count, dependency_count, line_number.
         // These require the in-memory PDG which is available here but not in lerecherche.
         if let Some(pdg) = &self.pdg {
+            // Cache file contents to avoid re-reading the same file for multiple results
+            let mut file_cache: std::collections::HashMap<String, Vec<u8>> =
+                std::collections::HashMap::new();
+
             for result in &mut results {
                 // Look up the PDG node by its string ID
                 if let Some(node_idx) = pdg.find_by_id(&result.node_id) {
@@ -94,6 +98,36 @@ impl LeIndex {
                             crate::graph::pdg::NodeType::Module => "module".to_string(),
                             crate::graph::pdg::NodeType::External => "external".to_string(),
                         });
+
+                        // Compute line number from byte_range, or fall back to
+                        // searching for the symbol name in the file content
+                        let file_path_str = node.file_path.to_string();
+                        let needs_line = result.line_number.is_none();
+                        if needs_line {
+                            let content =
+                                file_cache.entry(file_path_str.clone()).or_insert_with(|| {
+                                    std::fs::read(&file_path_str).unwrap_or_default()
+                                });
+
+                            if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
+                                // Compute from byte_range
+                                let byte_offset = node.byte_range.0.min(content.len());
+                                let line_num = content[..byte_offset]
+                                    .iter()
+                                    .filter(|&&b| b == b'\n')
+                                    .count()
+                                    + 1;
+                                result.line_number = Some(line_num);
+                            } else if !node.name.is_empty() {
+                                // Fallback: find the symbol name in the file content
+                                let name_bytes = node.name.as_bytes();
+                                if let Some(pos) = find_subsequence(content, name_bytes) {
+                                    let line_num =
+                                        content[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
+                                    result.line_number = Some(line_num);
+                                }
+                            }
+                        }
                     }
                     result.caller_count = Some(pdg.predecessor_count(node_idx));
                     result.dependency_count = Some(pdg.neighbors(node_idx).len());
@@ -305,6 +339,7 @@ impl LeIndex {
             score: crate::search::ranking::Score::default(),
             context: None,
             byte_range,
+            line_number: None,
         }];
 
         let context = self.expand_context(pdg, &results, token_budget)?;
@@ -514,6 +549,9 @@ impl LeIndex {
 
         // Enrich with PDG metadata (same as regular search)
         if let Some(pdg) = &self.pdg {
+            let mut file_cache: std::collections::HashMap<String, Vec<u8>> =
+                std::collections::HashMap::new();
+
             for result in &mut final_results {
                 if let Some(node_idx) = pdg.find_by_id(&result.node_id) {
                     if let Some(node) = pdg.get_node(node_idx) {
@@ -525,6 +563,34 @@ impl LeIndex {
                             crate::graph::pdg::NodeType::Module => "module".to_string(),
                             crate::graph::pdg::NodeType::External => "external".to_string(),
                         });
+
+                        // Compute line number from byte_range, or fall back to
+                        // searching for the symbol name in the file content
+                        let file_path_str = node.file_path.to_string();
+                        let needs_line = result.line_number.is_none();
+                        if needs_line {
+                            let content =
+                                file_cache.entry(file_path_str.clone()).or_insert_with(|| {
+                                    std::fs::read(&file_path_str).unwrap_or_default()
+                                });
+
+                            if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
+                                let byte_offset = node.byte_range.0.min(content.len());
+                                let line_num = content[..byte_offset]
+                                    .iter()
+                                    .filter(|&&b| b == b'\n')
+                                    .count()
+                                    + 1;
+                                result.line_number = Some(line_num);
+                            } else if !node.name.is_empty() {
+                                let name_bytes = node.name.as_bytes();
+                                if let Some(pos) = find_subsequence(content, name_bytes) {
+                                    let line_num =
+                                        content[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
+                                    result.line_number = Some(line_num);
+                                }
+                            }
+                        }
                     }
                     result.caller_count = Some(pdg.predecessor_count(node_idx));
                     result.dependency_count = Some(pdg.neighbors(node_idx).len());
@@ -959,4 +1025,17 @@ fn is_source_code_file(file_path: &str) -> bool {
 
     let lower = file_path.to_ascii_lowercase();
     SOURCE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// Find the first occurrence of `needle` in `haystack`.
+///
+/// Used to locate a symbol name in file content as a fallback for
+/// computing line numbers when byte_range is unavailable (e.g., import nodes).
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }
