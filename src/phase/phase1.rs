@@ -46,6 +46,15 @@ pub fn run(context: &PhaseExecutionContext) -> Phase1Summary {
         && context.changed_files.is_empty()
         && context.deleted_files.is_empty();
 
+    // Compute parser completeness from parse results when available.
+    // On a cache hit (no changed files), fall back to PDG node counts
+    // so that language coverage is still reported.
+    let parser_completeness = if !context.parse_results.is_empty() {
+        score_languages(&context.parse_results)
+    } else {
+        completeness_from_pdg(&language_distribution)
+    };
+
     Phase1Summary {
         total_files: context.file_inventory.len(),
         parsed_files: context.parse_results.len(),
@@ -60,7 +69,29 @@ pub fn run(context: &PhaseExecutionContext) -> Phase1Summary {
             .map(|r| r.signatures.len())
             .sum(),
         language_distribution,
-        parser_completeness: score_languages(&context.parse_results),
+        parser_completeness,
         cache_hit,
     }
+}
+
+/// Build a best-effort LanguageCompleteness list from PDG language distribution.
+///
+/// When parse_results are unavailable (cache hit), we infer language coverage
+/// from the PDG node counts. Since we don't have per-signature call/import
+/// details, we set all ratios to 1.0 (the nodes exist, so they were extracted)
+/// and the score to 1.0.
+fn completeness_from_pdg(
+    language_distribution: &HashMap<String, usize>,
+) -> Vec<LanguageCompleteness> {
+    language_distribution
+        .iter()
+        .map(|(language, &count)| LanguageCompleteness {
+            language: language.clone(),
+            signatures: count,
+            calls_ratio: 1.0,
+            imports_ratio: 1.0,
+            byte_range_ratio: 1.0,
+            score: 1.0,
+        })
+        .collect()
 }

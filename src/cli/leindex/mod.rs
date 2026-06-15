@@ -229,7 +229,7 @@ impl LeIndex {
         let project_config =
             crate::cli::config::ProjectConfig::load(&project_path).unwrap_or_default();
 
-        Ok(Self {
+        let instance = Self {
             project_path,
             storage_path,
             project_id,
@@ -252,9 +252,20 @@ impl LeIndex {
                 external_deps_in_lockfile: 0,
                 external_deps_resolved: 0,
                 external_deps_unresolved: 0,
+                external_deps_total: 0,
+                external_deps_builtin: 0,
             },
             embedder: None,
-        })
+        };
+
+        // Restore persisted index stats (if any) so diagnostics can report
+        // accurate totals without requiring a full re-index.
+        let mut instance = instance;
+        if let Err(err) = instance.load_stats_from_storage() {
+            warn!("Failed to load persisted index stats: {err:#}");
+        }
+
+        Ok(instance)
     }
 
     // ---- Internal helpers ----
@@ -596,5 +607,32 @@ impl LeIndex {
     #[inline]
     pub fn get_cache_stats(&self) -> Result<crate::cli::memory::MemoryStats> {
         self.cache.get_cache_stats()
+    }
+
+    // ---- Index Stats Persistence ----
+
+    /// Persist IndexStats to a JSON file in the storage directory so that
+    /// diagnostics can report accurate totals after loading from storage.
+    pub(crate) fn save_stats_to_storage(&self) -> Result<()> {
+        let stats_path = self.storage_path.join("index_stats.json");
+        let json = serde_json::to_string(&self.stats).context("Failed to serialize IndexStats")?;
+        std::fs::write(&stats_path, json)
+            .with_context(|| format!("Failed to write index stats to {:?}", stats_path))?;
+        Ok(())
+    }
+
+    /// Load IndexStats from the JSON file in the storage directory.
+    /// Returns silently if the file does not exist (first run or pre-feature).
+    pub(crate) fn load_stats_from_storage(&mut self) -> Result<()> {
+        let stats_path = self.storage_path.join("index_stats.json");
+        if !stats_path.exists() {
+            return Ok(());
+        }
+        let json = std::fs::read_to_string(&stats_path)
+            .with_context(|| format!("Failed to read index stats from {:?}", stats_path))?;
+        let stored: IndexStats =
+            serde_json::from_str(&json).context("Failed to deserialize IndexStats")?;
+        self.stats = stored;
+        Ok(())
     }
 }

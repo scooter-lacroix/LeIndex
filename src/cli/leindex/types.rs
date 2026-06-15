@@ -25,6 +25,8 @@ pub(crate) const DEPENDENCY_MANIFEST_NAMES: &[&str] = &[
     "npm-shrinkwrap.json",
     "yarn.lock",
     "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
     "requirements.txt",
     "Pipfile.lock",
     "pyproject.toml",
@@ -129,6 +131,14 @@ pub struct IndexStats {
     /// Number of unique external imports still unresolved after manifest matching
     #[serde(default)]
     pub external_deps_unresolved: usize,
+
+    /// Total number of external module nodes in the PDG
+    #[serde(default)]
+    pub external_deps_total: usize,
+
+    /// Number of external nodes recognized as builtin/system modules
+    #[serde(default)]
+    pub external_deps_builtin: usize,
 }
 
 /// Result from a deep analysis operation

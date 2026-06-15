@@ -640,10 +640,12 @@ impl LeIndex {
                 annotation_stats.unresolved
             );
         }
-        let (ext_in_lockfile, ext_resolved, ext_unresolved) = (
+        let (ext_in_lockfile, ext_resolved, ext_unresolved, ext_total, ext_builtin) = (
             ext_registry.len(),
             annotation_stats.resolved,
             annotation_stats.unresolved,
+            annotation_stats.total_external,
+            annotation_stats.builtin,
         );
 
         let pdg_node_count = pdg.node_count();
@@ -728,6 +730,8 @@ impl LeIndex {
             external_deps_in_lockfile: ext_in_lockfile,
             external_deps_resolved: ext_resolved,
             external_deps_unresolved: ext_unresolved,
+            external_deps_total: ext_total,
+            external_deps_builtin: ext_builtin,
         };
 
         // Normalize external nodes (legacy compat)
@@ -749,6 +753,11 @@ impl LeIndex {
         // Update last_indexed timestamp in project_metadata
         if let Err(err) = self.update_last_indexed_timestamp() {
             warn!("Failed to update last_indexed timestamp: {err:#}");
+        }
+        // Persist IndexStats so diagnostics can report accurate totals
+        // after loading from storage (without a full re-index).
+        if let Err(err) = self.save_stats_to_storage() {
+            warn!("Failed to persist index stats: {err:#}");
         }
 
         // Note: ONNX worker idle-unload is handled by the worker's own idle
@@ -870,6 +879,11 @@ impl LeIndex {
 
         info!("Rebuilt search index with {} nodes", indexed_count);
 
+        // Load persisted stats first (to restore total_signatures, total_files, etc.),
+        // then overwrite the live PDG/search counts with freshly computed values.
+        if let Err(err) = self.load_stats_from_storage() {
+            warn!("Failed to load persisted index stats: {err:#}");
+        }
         self.stats.pdg_nodes = pdg_node_count;
         self.stats.pdg_edges = pdg_edge_count;
         self.stats.indexed_nodes = indexed_count;

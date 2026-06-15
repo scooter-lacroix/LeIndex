@@ -72,6 +72,8 @@ fn test_stats_serialization() {
         external_deps_in_lockfile: 0,
         external_deps_resolved: 0,
         external_deps_unresolved: 0,
+        external_deps_total: 0,
+        external_deps_builtin: 0,
     };
 
     let json = serde_json::to_string(&stats).unwrap();
@@ -118,6 +120,8 @@ fn test_diagnostics_serialization() {
             external_deps_in_lockfile: 0,
             external_deps_resolved: 0,
             external_deps_unresolved: 0,
+            external_deps_total: 0,
+            external_deps_builtin: 0,
         },
         memory_usage_bytes: 1024,
         total_memory_bytes: 8192,

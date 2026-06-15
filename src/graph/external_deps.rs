@@ -158,6 +158,8 @@ impl ExternalDependencyRegistry {
                     "package.json" => local.parse_package_json(&content),
                     "yarn.lock" => local.parse_yarn_lock(&content),
                     "pnpm-lock.yaml" => local.parse_pnpm_lock(&content),
+                    "bun.lock" => local.parse_bun_lock(&content),
+                    "bun.lockb" => {} // Binary format, skip
                     "requirements.txt" => local.parse_requirements_txt(&content),
                     "Pipfile.lock" => local.parse_pipfile_lock(&content),
                     "pyproject.toml" => local.parse_pyproject_toml(&content),
@@ -521,6 +523,68 @@ impl ExternalDependencyRegistry {
         }
     }
 
+    /// Parse bun.lock (JSONC format with trailing commas).
+    ///
+    /// The `packages` section maps package names to arrays where the first
+    /// element is `"name@version"`.  The `workspaces` section contains
+    /// `dependencies` and `devDependencies` maps with version constraints.
+    fn parse_bun_lock(&mut self, content: &str) {
+        // bun.lock uses JSONC (trailing commas). Strip them before parsing.
+        let cleaned = strip_trailing_commas(content);
+        let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cleaned) else {
+            return;
+        };
+
+        // Parse the "packages" section (resolved lockfile entries).
+        if let Some(packages) = parsed.get("packages").and_then(|v| v.as_object()) {
+            for (key, val) in packages {
+                // Each value is an array: ["name@version", "", {dependencies}, "integrity"]
+                if let Some(arr) = val.as_array() {
+                    if let Some(spec) = arr.first().and_then(|v| v.as_str()) {
+                        // Extract version from "name@version" string.
+                        // For scoped packages like "@babel/core@7.29.0", we need
+                        // to find the last '@' after the scope.
+                        let version = if let Some(stripped) = spec.strip_prefix('@') {
+                            stripped
+                                .rfind('@')
+                                .map(|pos| stripped[pos + 1..].to_string())
+                        } else {
+                            spec.rfind('@').map(|pos| spec[pos + 1..].to_string())
+                        };
+                        let version = version.unwrap_or_else(|| "*".to_string());
+                        self.insert(ExternalDependency {
+                            name: key.clone(),
+                            version,
+                            ecosystem: Ecosystem::Npm,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Also parse workspace dependency constraints as fallback.
+        if let Some(workspaces) = parsed.get("workspaces").and_then(|v| v.as_object()) {
+            for (_ws_name, ws_val) in workspaces {
+                for section in &["dependencies", "devDependencies"] {
+                    if let Some(deps) = ws_val.get(section).and_then(|v| v.as_object()) {
+                        for (name, version) in deps {
+                            // Don't overwrite lockfile entries.
+                            if self.by_name.contains_key(name) {
+                                continue;
+                            }
+                            let version = version.as_str().unwrap_or("*").to_string();
+                            self.insert(ExternalDependency {
+                                name: name.clone(),
+                                version,
+                                ecosystem: Ecosystem::Npm,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Parse requirements.txt (pip format).
     ///
     /// ```text
@@ -852,6 +916,57 @@ fn unquote(s: &str) -> String {
     s.trim().trim_matches('"').trim_matches('\'').to_string()
 }
 
+/// Strip trailing commas from JSONC content to make it valid JSON.
+/// Removes commas that appear immediately before `}` or `]`, handling
+/// whitespace and newlines between the comma and the closing bracket.
+fn strip_trailing_commas(content: &str) -> String {
+    // Simple state machine: track string context and remove trailing commas.
+    let mut result = String::with_capacity(content.len());
+    let mut in_string = false;
+    let chars: Vec<char> = content.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if in_string {
+            result.push(c);
+            if c == '"' && (i == 0 || chars[i - 1] != '\\') {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if c == '"' {
+            in_string = true;
+            result.push(c);
+            i += 1;
+            continue;
+        }
+
+        if c == ',' {
+            // Look ahead past whitespace for } or ]
+            let mut j = i + 1;
+            while j < chars.len()
+                && (chars[j] == ' ' || chars[j] == '\t' || chars[j] == '\n' || chars[j] == '\r')
+            {
+                j += 1;
+            }
+            if j < chars.len() && (chars[j] == '}' || chars[j] == ']') {
+                // Skip the trailing comma
+                i += 1;
+                continue;
+            }
+        }
+
+        result.push(c);
+        i += 1;
+    }
+
+    result
+}
+
 fn parse_python_dependency_list(raw: &str) -> Vec<ExternalDependency> {
     let mut deps = Vec::new();
     let mut item = String::new();
@@ -978,23 +1093,59 @@ fn is_probable_builtin_import(import_name: &str) -> bool {
         return false;
     }
 
-    const RUST_BUILTINS: &[&str] = &["std", "core", "alloc", "proc_macro", "test"];
+    const RUST_BUILTINS: &[&str] = &[
+        "std",
+        "core",
+        "alloc",
+        "proc_macro",
+        "test",
+        // Rust path keywords that are internal, not external deps.
+        "crate",
+        "super",
+        "self",
+        "Self",
+    ];
     const NODE_BUILTINS: &[&str] = &[
         "assert",
+        "async_hooks",
         "buffer",
         "child_process",
+        "cluster",
+        "console",
+        "constants",
         "crypto",
+        "dgram",
+        "diagnostics_channel",
+        "dns",
+        "domain",
         "events",
         "fs",
         "http",
+        "http2",
         "https",
+        "inspector",
+        "module",
         "net",
         "os",
         "path",
+        "perf_hooks",
+        "process",
+        "punycode",
+        "querystring",
+        "readline",
+        "repl",
         "stream",
+        "string_decoder",
+        "sys",
+        "timers",
         "tls",
+        "trace_events",
+        "tty",
         "url",
         "util",
+        "v8",
+        "vm",
+        "wasi",
         "worker_threads",
         "zlib",
     ];
@@ -1002,45 +1153,111 @@ fn is_probable_builtin_import(import_name: &str) -> bool {
         "abc",
         "argparse",
         "asyncio",
+        "base64",
+        "bisect",
+        "calendar",
         "collections",
+        "concurrent",
+        "configparser",
+        "contextlib",
+        "copy",
+        "csv",
         "datetime",
+        "decimal",
+        "difflib",
+        "email",
+        "enum",
         "functools",
+        "glob",
+        "hashlib",
+        "heapq",
+        "html",
+        "http",
+        "importlib",
+        "inspect",
+        "io",
         "itertools",
         "json",
         "logging",
         "math",
+        "multiprocessing",
+        "operator",
         "os",
         "pathlib",
+        "pickle",
+        "platform",
+        "pprint",
+        "queue",
+        "random",
         "re",
+        "shutil",
+        "signal",
+        "socket",
+        "sqlite3",
+        "ssl",
+        "statistics",
+        "string",
+        "struct",
         "subprocess",
         "sys",
+        "tarfile",
+        "tempfile",
+        "textwrap",
+        "threading",
         "time",
+        "traceback",
         "typing",
         "unittest",
+        "urllib",
+        "uuid",
+        "warnings",
+        "weakref",
+        "xml",
+        "zipfile",
     ];
     const GO_BUILTINS: &[&str] = &[
         "bufio",
         "bytes",
+        "compress",
         "context",
+        "container",
         "crypto",
         "database.sql",
+        "debug",
+        "embed",
+        "encoding",
         "encoding.json",
         "errors",
+        "expvar",
+        "flag",
         "fmt",
+        "go",
+        "hash",
+        "html",
+        "image",
         "io",
         "log",
         "math",
+        "mime",
+        "net",
         "net.http",
         "net.url",
         "os",
         "path",
+        "plugin",
+        "reflect",
         "regexp",
+        "runtime",
         "sort",
         "strconv",
         "strings",
         "sync",
+        "syscall",
         "testing",
+        "text",
         "time",
+        "unicode",
+        "unsafe",
     ];
 
     RUST_BUILTINS
@@ -1147,6 +1364,8 @@ pub fn discover_dependency_manifests(
         "Cargo.toml",
         "Gemfile.lock",
         "Pipfile.lock",
+        "bun.lock",
+        "bun.lockb",
         "composer.lock",
         "go.mod",
         "go.sum",
