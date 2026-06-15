@@ -322,6 +322,10 @@ impl LeIndex {
             warn!("Failed to persist mmap embeddings: {err:#}");
         }
 
+        // Clear search query and analysis caches so stale results are not
+        // served after an incremental reindex (VAL-INDEX-005).
+        index_builder::clear_query_caches(&mut self.cache.cache_spiller, &self.project_id);
+
         info!(
             "Watcher incremental reindex completed in {}ms",
             self.stats.indexing_time_ms
@@ -759,6 +763,12 @@ impl LeIndex {
         if let Err(err) = self.save_stats_to_storage() {
             warn!("Failed to persist index stats: {err:#}");
         }
+
+        // Clear search query and analysis caches so stale results are not
+        // served after a reindex (VAL-INDEX-005). The cache key fingerprint
+        // now includes more stats fields, but we also proactively remove
+        // old cached entries to handle edge cases and keep the cache dir clean.
+        index_builder::clear_query_caches(&mut self.cache.cache_spiller, &self.project_id);
 
         // Note: ONNX worker idle-unload is handled by the worker's own idle
         // timeout (see leindex-embed runtime.rs). We do NOT call

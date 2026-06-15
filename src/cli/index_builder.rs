@@ -1608,9 +1608,20 @@ pub(crate) fn files_importing_from_manifests(
 // ============================================================================
 
 pub(crate) fn index_fingerprint(stats: &IndexStats) -> String {
+    // Include all numeric stats so that any content change invalidates
+    // the search cache. Previously only pdg_nodes/pdg_edges/indexed_nodes
+    // were used, which meant modifying a file (replacing one function with
+    // another) produced the same fingerprint and stale cached search
+    // results were returned (VAL-INDEX-005).
     format!(
-        "{}:{}:{}",
-        stats.pdg_nodes, stats.pdg_edges, stats.indexed_nodes
+        "{}:{}:{}:{}:{}:{}:{}",
+        stats.total_files,
+        stats.files_parsed,
+        stats.total_signatures,
+        stats.pdg_nodes,
+        stats.pdg_edges,
+        stats.indexed_nodes,
+        stats.indexing_time_ms,
     )
 }
 
@@ -1680,6 +1691,64 @@ pub(crate) fn persist_embeddings_to_mmap(
         "Persisted embeddings to mmap file"
     );
     Ok(())
+}
+
+/// Clear persisted search query and analysis cache entries for a project.
+///
+/// After indexing (full or incremental), previously cached search results
+/// may be stale. This function removes all `search:query:` and `analysis:`
+/// cache entries from both the in-memory store and the disk cache directory.
+///
+/// This is critical for VAL-INDEX-005: without cache invalidation, modifying
+/// a source file and running `leindex.index` (force_reindex=false) would
+/// produce a fresh PDG but stale search results would still be served from
+/// the disk cache.
+pub(crate) fn clear_query_caches(
+    cache_spiller: &mut crate::cli::memory::CacheSpiller,
+    project_id: &str,
+) {
+    let store = cache_spiller.store_mut();
+
+    // Build the sanitized prefix for search query cache keys.
+    // The key format is: search:query:{project_id}:{fingerprint}:{top_k}:{query:?}
+    // After sanitization, colons become underscores.
+    let search_prefix = format!("search_query_{}", sanitize_for_prefix(project_id));
+    let analysis_prefix = format!("analysis_analyze_{}", sanitize_for_prefix(project_id));
+
+    // Remove from in-memory cache
+    let mem_search = store.remove_prefix("search:query:");
+    let mem_analysis = store.remove_prefix("analysis:analyze:");
+
+    // Remove from disk
+    let disk_search = store.remove_spilled_prefix(&search_prefix);
+    let disk_analysis = store.remove_spilled_prefix(&analysis_prefix);
+
+    if mem_search + mem_analysis + disk_search + disk_analysis > 0 {
+        info!(
+            "Cleared query caches: {} search (mem:{} disk:{}), {} analysis (mem:{} disk:{})",
+            mem_search + disk_search,
+            mem_search,
+            disk_search,
+            mem_analysis + disk_analysis,
+            mem_analysis,
+            disk_analysis,
+        );
+    }
+}
+
+/// Sanitize a project ID for use as a disk cache filename prefix.
+/// The disk cache filenames are sanitized versions of the full cache key.
+fn sanitize_for_prefix(s: &str) -> String {
+    s.chars()
+        .take(20)
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Try to load a previously persisted mmap embedding index.

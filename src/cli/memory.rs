@@ -492,6 +492,44 @@ impl CacheStore {
         Ok(())
     }
 
+    /// Remove all in-memory entries whose key starts with `prefix`.
+    /// Returns the number of entries removed.
+    pub fn remove_prefix(&mut self, prefix: &str) -> usize {
+        let keys_to_remove: Vec<CacheKey> = self
+            .cache
+            .iter()
+            .filter(|(k, _)| k.starts_with(prefix))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let count = keys_to_remove.len();
+        for key in keys_to_remove {
+            self.remove(&key);
+        }
+        count
+    }
+
+    /// Remove all disk-spilled entries whose sanitized key starts with
+    /// `sanitized_prefix`. Returns the number of files deleted.
+    pub fn remove_spilled_prefix(&self, sanitized_prefix: &str) -> usize {
+        let mut count = 0;
+        if !self.cache_dir.exists() {
+            return 0;
+        }
+        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.ends_with(".bin")
+                        && name.starts_with(sanitized_prefix)
+                        && std::fs::remove_file(entry.path()).is_ok()
+                    {
+                        count += 1;
+                    }
+                }
+            }
+        }
+        count
+    }
+
     /// Get size of spilled cache on disk
     pub fn spilled_size_bytes(&self) -> Result<usize, Error> {
         if !self.cache_dir.exists() {
