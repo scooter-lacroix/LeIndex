@@ -171,22 +171,10 @@ impl LeIndex {
         }
 
         // Step 1: Semantic search for entry points
-        let search_query = SearchQuery {
-            query: query.to_string(),
-            top_k: 10,
-            token_budget: Some(token_budget),
-            semantic: true,
-            expand_context: false,
-            query_embedding: Some(self.generate_query_embedding(query)),
-            query_neural_embedding: self.generate_query_neural_embedding(query),
-            threshold: Some(0.1), // Added threshold for better quality
-            query_type: Some(crate::search::ranking::QueryType::Semantic),
-        };
-
-        let results = self
-            .search_engine
-            .search(search_query)
-            .context("Search for analysis failed")?;
+        // For natural language queries like "How does search scoring work?",
+        // we perform multiple searches with different query formulations
+        // and merge the results to get better coverage of relevant code.
+        let results = self.analyze_search(query)?;
 
         // Step 2: Expand context using PDG traversal
         let context = if let Some(ref pdg) = self.pdg {
@@ -378,6 +366,175 @@ impl LeIndex {
         None
     }
 
+    /// Perform multi-query search for deep analysis.
+    ///
+    /// For natural language queries like "How does search scoring work?",
+    /// this method:
+    /// 1. Searches with the original query (semantic mode)
+    /// 2. Extracts key technical terms and searches with those
+    /// 3. Merges and deduplicates results, prioritizing source code files
+    fn analyze_search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
+        // Primary search with the full query
+        let primary_query = SearchQuery {
+            query: query.to_string(),
+            top_k: 15,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(self.generate_query_embedding(query)),
+            query_neural_embedding: self.generate_query_neural_embedding(query),
+            threshold: Some(0.05),
+            query_type: Some(crate::search::ranking::QueryType::Semantic),
+        };
+
+        let primary_results = self
+            .search_engine
+            .search(primary_query)
+            .context("Search for analysis failed")?;
+
+        // Extract key terms from the query for a secondary search.
+        // This helps find relevant code that doesn't contain the exact
+        // query words but contains related technical terms.
+        let key_terms = extract_analysis_keywords(query);
+
+        // Only do secondary search if key terms differ significantly from original
+        let secondary_results = if key_terms != query.to_lowercase() && !key_terms.is_empty() {
+            let secondary_query = SearchQuery {
+                query: key_terms.clone(),
+                top_k: 15,
+                token_budget: None,
+                semantic: true,
+                expand_context: false,
+                query_embedding: Some(self.generate_query_embedding(&key_terms)),
+                query_neural_embedding: self.generate_query_neural_embedding(&key_terms),
+                threshold: Some(0.05),
+                query_type: Some(crate::search::ranking::QueryType::Semantic),
+            };
+
+            self.search_engine
+                .search(secondary_query)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Third search: use stemmed keywords to find related code.
+        // For example, "scoring" → "score" to find score_hybrid, calculate_text_score, etc.
+        let stemmed_terms = extract_stemmed_keywords(query);
+        let stemmed_results = if !stemmed_terms.is_empty() && stemmed_terms != key_terms {
+            let stemmed_query = SearchQuery {
+                query: stemmed_terms.clone(),
+                top_k: 15,
+                token_budget: None,
+                semantic: true,
+                expand_context: false,
+                query_embedding: Some(self.generate_query_embedding(&stemmed_terms)),
+                query_neural_embedding: self.generate_query_neural_embedding(&stemmed_terms),
+                threshold: Some(0.05),
+                query_type: Some(crate::search::ranking::QueryType::Semantic),
+            };
+
+            self.search_engine.search(stemmed_query).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        // Merge results: deduplicate by node_id, keeping the highest score.
+        // Apply source code prioritization: boost source files, penalize
+        // non-source files (docs, scripts, configs).
+        let mut merged: std::collections::HashMap<String, SearchResult> =
+            std::collections::HashMap::new();
+
+        for result in primary_results
+            .into_iter()
+            .chain(secondary_results)
+            .chain(stemmed_results)
+        {
+            let node_id = result.node_id.clone();
+            let new_score = result.score.overall;
+            match merged.entry(node_id) {
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    // Keep the result with the higher overall score
+                    if new_score > e.get().score.overall {
+                        e.insert(result);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(result);
+                }
+            }
+        }
+
+        let mut results: Vec<SearchResult> = merged.into_values().collect();
+
+        // Apply source code prioritization
+        for result in &mut results {
+            if !is_source_code_file(&result.file_path) {
+                // Penalize non-source files (docs, scripts, configs)
+                result.score.overall *= 0.3;
+            }
+        }
+
+        // Apply diversity boost: ensure results from different files
+        // get representation. Group by file path and apply a small penalty
+        // to results from files that already have many entries, so that
+        // results from a variety of files appear in the top 10.
+        let mut file_counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        // Sort first by score to establish ranking order
+        results.sort_by(|a, b| {
+            b.score
+                .overall
+                .partial_cmp(&a.score.overall)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for result in &mut results {
+            let count = file_counts.get(&result.file_path).copied().unwrap_or(0);
+            // Apply diminishing returns: each additional result from the
+            // same file gets a 10% penalty
+            if count > 0 {
+                result.score.overall *= (0.9_f32).powi(count as i32);
+            }
+            *file_counts.entry(result.file_path.clone()).or_default() += 1;
+        }
+
+        // Sort by adjusted score
+        results.sort_by(|a, b| {
+            b.score
+                .overall
+                .partial_cmp(&a.score.overall)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        // Take top 10 and re-rank
+        let mut final_results: Vec<SearchResult> = results.into_iter().take(10).collect();
+        for (i, result) in final_results.iter_mut().enumerate() {
+            result.rank = i + 1;
+        }
+
+        // Enrich with PDG metadata (same as regular search)
+        if let Some(pdg) = &self.pdg {
+            for result in &mut final_results {
+                if let Some(node_idx) = pdg.find_by_id(&result.node_id) {
+                    if let Some(node) = pdg.get_node(node_idx) {
+                        result.symbol_type = Some(match node.node_type {
+                            crate::graph::pdg::NodeType::Function => "function".to_string(),
+                            crate::graph::pdg::NodeType::Class => "class".to_string(),
+                            crate::graph::pdg::NodeType::Method => "method".to_string(),
+                            crate::graph::pdg::NodeType::Variable => "variable".to_string(),
+                            crate::graph::pdg::NodeType::Module => "module".to_string(),
+                            crate::graph::pdg::NodeType::External => "external".to_string(),
+                        });
+                    }
+                    result.caller_count = Some(pdg.predecessor_count(node_idx));
+                    result.dependency_count = Some(pdg.neighbors(node_idx).len());
+                }
+            }
+        }
+
+        Ok(final_results)
+    }
+
     /// Expand context using PDG traversal
     fn expand_context(
         &self,
@@ -397,14 +554,31 @@ impl LeIndex {
         let entry_points: Vec<_> = results
             .iter()
             .filter_map(|r| {
-                pdg.find_by_symbol(&r.node_id)
+                let found = pdg
+                    .find_by_symbol(&r.node_id)
                     .or_else(|| pdg.find_by_name(&r.node_id))
                     .or_else(|| pdg.find_by_name(&r.symbol_name))
-                    .or_else(|| fuzzy_find_node(pdg, &r.symbol_name))
+                    .or_else(|| fuzzy_find_node(pdg, &r.symbol_name));
+                if found.is_none() {
+                    debug!(
+                        "expand_context: could not find node for node_id='{}', symbol_name='{}'",
+                        r.node_id, r.symbol_name
+                    );
+                }
+                found
             })
             .collect();
 
+        debug!(
+            "expand_context: {} entry points from {} results, pdg node_count={}",
+            entry_points.len(),
+            results.len(),
+            pdg.node_count()
+        );
+
         let expanded_node_ids = traversal.expand_context(pdg, entry_points);
+
+        debug!("expand_context: {} expanded nodes", expanded_node_ids.len());
 
         let mut context = String::from("/* Context Expansion via Gravity Traversal */\n");
 
@@ -585,4 +759,204 @@ fn fuzzy_find_node(
     }
 
     best_match.map(|(nid, _)| nid)
+}
+
+/// Extract stemmed technical terms from a natural language query.
+///
+/// Applies simple suffix-stripping to convert English word forms to their
+/// likely root forms found in code identifiers:
+/// - "scoring" → "score" (drop -ing)
+/// - "running" → "run" (drop -ning → -n)
+/// - "indexed" → "index" (drop -ed)
+/// - "queries" → "query" (drop -ies → -y)
+/// - "handlers" → "handler" (drop -s)
+///
+/// This helps find code symbols that use the base form of words
+/// appearing in natural language questions.
+fn extract_stemmed_keywords(query: &str) -> String {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let mut stemmed: Vec<String> = Vec::new();
+
+    for word in words {
+        let lower = word
+            .to_lowercase()
+            .trim_matches(|c: char| !c.is_alphanumeric() && c != '_')
+            .to_string();
+
+        // Skip stop words
+        if ANALYSIS_STOP_WORDS.contains(&lower.as_str()) || lower.len() <= 1 {
+            continue;
+        }
+
+        // Apply simple stemming rules
+        let stem = simple_stem(&lower);
+        if !stem.is_empty() && !stemmed.contains(&stem) {
+            stemmed.push(stem);
+        }
+    }
+
+    stemmed.join(" ")
+}
+
+/// Apply simple suffix-stripping stemming to a word.
+///
+/// This is a very basic stemmer that handles common English suffixes
+/// found in technical writing. It's not a full Porter stemmer, but it
+/// covers the most common cases for code search.
+fn simple_stem(word: &str) -> String {
+    if word.len() <= 3 {
+        return word.to_string();
+    }
+
+    // Order matters: check longer suffixes first
+
+    // -ing → base (e.g., "scoring" → "scor" → "score")
+    // But handle "ning" → "n" (e.g., "running" → "runn" → "run")
+    if let Some(base) = word.strip_suffix("ing") {
+        // If base ends in double consonant, remove one (e.g., "runn" → "run")
+        if base.len() > 2 {
+            let chars: Vec<char> = base.chars().collect();
+            if chars[chars.len() - 1] == chars[chars.len() - 2] && !is_vowel(chars[chars.len() - 1])
+            {
+                return base[..base.len() - 1].to_string();
+            }
+        }
+        // Try adding 'e' back (e.g., "scor" → "score", "rat" → "rate")
+        if base.len() >= 2 {
+            let base_with_e = format!("{}e", base);
+            // Heuristic: if base ends in consonant-vowel-consonant, add 'e'
+            let chars: Vec<char> = base.chars().collect();
+            if chars.len() >= 2
+                && !is_vowel(chars[chars.len() - 1])
+                && is_vowel(chars[chars.len() - 2])
+            {
+                return base_with_e;
+            }
+        }
+        return base.to_string();
+    }
+
+    // -ied → -y (e.g., "applied" → "apply")
+    if let Some(base) = word.strip_suffix("ied") {
+        if word.len() > 4 {
+            return format!("{}y", base);
+        }
+    }
+
+    // -ed → base (e.g., "indexed" → "index", "scored" → "score")
+    if let Some(base) = word.strip_suffix("ed") {
+        // If base ends in double consonant, remove one
+        if base.len() > 2 {
+            let chars: Vec<char> = base.chars().collect();
+            if chars[chars.len() - 1] == chars[chars.len() - 2] && !is_vowel(chars[chars.len() - 1])
+            {
+                return base[..base.len() - 1].to_string();
+            }
+        }
+        return base.to_string();
+    }
+
+    // -ies → -y (e.g., "queries" → "query")
+    if let Some(base) = word.strip_suffix("ies") {
+        if word.len() > 4 {
+            return format!("{}y", base);
+        }
+    }
+
+    // -es → base (e.g., "boxes" → "box", but not "score" → "scor")
+    if let Some(base) = word.strip_suffix("es") {
+        if word.len() > 4 {
+            // Only strip 'es' if base ends in 's', 'x', 'z', 'ch', 'sh'
+            if base.ends_with('s')
+                || base.ends_with('x')
+                || base.ends_with('z')
+                || base.ends_with("ch")
+                || base.ends_with("sh")
+            {
+                return base.to_string();
+            }
+        }
+    }
+
+    // -s → base (e.g., "handlers" → "handler", but not "is" → "i")
+    if let Some(base) = word.strip_suffix('s') {
+        if !base.ends_with('s') && word.len() > 3 {
+            return base.to_string();
+        }
+    }
+
+    word.to_string()
+}
+
+/// Check if a character is a vowel.
+fn is_vowel(c: char) -> bool {
+    matches!(c.to_ascii_lowercase(), 'a' | 'e' | 'i' | 'o' | 'u')
+}
+
+/// Common English stop words to filter out from analysis queries.
+///
+/// These are removed so that natural language questions like
+/// "How does search scoring work?" are reduced to their key
+/// technical terms ("search scoring") for more targeted code search.
+const ANALYSIS_STOP_WORDS: &[&str] = &[
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "have", "has", "had",
+    "do", "does", "did", "will", "would", "could", "should", "may", "might", "must", "shall",
+    "can", "need", "dare", "ought", "used", "to", "of", "in", "for", "on", "with", "at", "by",
+    "from", "as", "into", "through", "during", "before", "after", "above", "below", "up", "down",
+    "out", "off", "over", "under", "again", "further", "then", "once", "here", "there", "when",
+    "where", "why", "how", "all", "each", "every", "both", "few", "more", "most", "other", "some",
+    "such", "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "just", "also",
+    "now", "and", "or", "but", "if", "while", "about", "against", "between", "into", "this",
+    "that", "these", "those", "it", "its", "i", "me", "my", "we", "us", "our", "you", "your", "he",
+    "him", "his", "she", "her", "they", "them", "their", "what", "which", "who", "whom", "whose",
+];
+
+/// Extract key technical terms from a natural language analysis query.
+///
+/// Removes common English stop words and question words, leaving the
+/// technical terms that are most likely to match code symbols.
+///
+/// # Examples
+/// - "How does search scoring work?" → "search scoring"
+/// - "Where is user data stored?" → "user data stored"
+/// - "score_hybrid" → "score_hybrid" (unchanged, already technical)
+fn extract_analysis_keywords(query: &str) -> String {
+    let words: Vec<&str> = query.split_whitespace().collect();
+    let filtered: Vec<&str> = words
+        .iter()
+        .filter(|word| {
+            let lower = word.to_lowercase();
+            let lower_trimmed = lower.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+            // Keep words that are:
+            // 1. Not stop words
+            // 2. Not single characters (unless they're part of a technical term)
+            // 3. Longer than 1 character
+            !ANALYSIS_STOP_WORDS.contains(&lower_trimmed) && lower_trimmed.len() > 1
+        })
+        .copied()
+        .collect();
+
+    if filtered.is_empty() {
+        // If all words were stop words, return the original query
+        query.to_string()
+    } else {
+        filtered.join(" ")
+    }
+}
+
+/// Check if a file path points to a source code file.
+///
+/// Source code files have extensions like .rs, .py, .ts, .js, .go, etc.
+/// Non-source files include documentation (.md, .txt), scripts (.sh, .bat),
+/// and configuration files (.yaml, .json, .toml).
+fn is_source_code_file(file_path: &str) -> bool {
+    const SOURCE_EXTENSIONS: &[&str] = &[
+        ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".kt", ".swift", ".c", ".h",
+        ".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".cs", ".rb", ".php", ".scala", ".clj", ".ex",
+        ".exs", ".erl", ".hs", ".ml", ".fs", ".fsx", ".lua", ".r", ".dart", ".vim", ".el", ".lisp",
+        ".scm", ".jl",
+    ];
+
+    let lower = file_path.to_ascii_lowercase();
+    SOURCE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
 }
