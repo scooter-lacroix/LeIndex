@@ -832,7 +832,11 @@ async fn cmd_context_impl(
 
     println!(
         "{}",
-        render_tool_output("leindex.context", &value, &serde_json::json!({ "node_id": &node_id }))
+        render_tool_output(
+            "leindex.context",
+            &value,
+            &serde_json::json!({ "node_id": &node_id })
+        )
     );
 
     Ok(())
@@ -1033,11 +1037,8 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
 
             // Use the unified renderer — same path used by the MCP transport
             // so CLI and LLM-visible payloads stay in lock-step.
-            let formatted = crate::cli::mcp::output::render_tool_output(
-                &name,
-                &value,
-                &parsed_args,
-            );
+            let formatted =
+                crate::cli::mcp::output::render_tool_output(&name, &value, &parsed_args);
 
             println!("{}", formatted);
             Ok(())
@@ -1073,8 +1074,9 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
     // process (or to a process that no longer owns the port).
     // Doing the bind here lets us print the actual bound address.
     let server = McpServer::with_address(addr).context("Failed to create MCP server")?;
-    let listener =
-        crate::cli::mcp::server::bind_with_fallback(addr).await.context("Bind failed")?;
+    let listener = crate::cli::mcp::server::bind_with_fallback(addr)
+        .await
+        .context("Bind failed")?;
     let bound_addr = listener
         .local_addr()
         .context("Failed to read bound address")?;
@@ -1161,8 +1163,9 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
             Some(ref p) => p
                 .canonicalize()
                 .with_context(|| format!("Cannot resolve project path '{}'", p.display()))?,
-            None => std::env::current_dir()
-                .context("Cannot determine current working directory")?,
+            None => {
+                std::env::current_dir().context("Cannot determine current working directory")?
+            }
         };
         registry.set_default_path(resolved_path.clone()).await;
         info!("Default project path set to: {}", resolved_path.display());
@@ -1207,7 +1210,10 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 
             const MAX_STDIN_PAYLOAD: usize = 10 * 1024 * 1024; // 10 MiB
             if length > MAX_STDIN_PAYLOAD {
-                eprintln!("[ERROR] Payload too large: {} bytes (max: {} bytes)", length, MAX_STDIN_PAYLOAD);
+                eprintln!(
+                    "[ERROR] Payload too large: {} bytes (max: {} bytes)",
+                    length, MAX_STDIN_PAYLOAD
+                );
                 // Consume remaining headers first to align the stream
                 loop {
                     let mut header = String::new();
@@ -1826,7 +1832,8 @@ async fn handle_mcp_request(
     _project_path: PathBuf,
 ) -> anyhow::Result<Option<JsonRpcResponse>> {
     use crate::cli::mcp::server::{
-        handle_tool_call, list_tools_json, HANDLERS, SERVER_INSTANCE, SERVER_STATE,
+        handle_tool_call, list_tools_json, long_running_tool_timeout_secs,
+        DEFAULT_REQUEST_TIMEOUT_SECS, HANDLERS, SERVER_INSTANCE, SERVER_STATE,
     };
 
     let method_name = request.method.clone();
@@ -1919,8 +1926,38 @@ async fn handle_mcp_request(
             Ok(Some(JsonRpcResponse::success(id, serde_json::json!({}))))
         }
         "tools/call" => {
-            // Use the centralized tool call handler that formats for MCP
-            let result = handle_tool_call(state, handlers, &request).await;
+            // Per-tool-call hard timeout, mirroring the HTTP transport
+            // (server.rs tools/call arm). Without this, a slow or hung
+            // tool call blocks the stdio read loop indefinitely, making
+            // the MCP server appear dead to the client.
+            //
+            // Long-running tools listed in LONG_RUNNING_TOOL_TIMEOUTS
+            // (e.g. leindex.index, which can take several minutes for a
+            // first-time build of a large monorepo) get an extended cap
+            // so the timeout does not drop the future mid-swap. All
+            // other tools use DEFAULT_REQUEST_TIMEOUT_SECS (30s).
+            let tool_name = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let cap_secs =
+                long_running_tool_timeout_secs(tool_name).unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+            let timeout_duration = std::time::Duration::from_secs(cap_secs);
+
+            let tool_result = tokio::time::timeout(
+                timeout_duration,
+                handle_tool_call(state, handlers, &request),
+            )
+            .await;
+
+            let result = match tool_result {
+                Ok(r) => r,
+                Err(_) => Err(crate::cli::mcp::protocol::JsonRpcError::internal_error(
+                    format!("Tool call timed out after {}s", cap_secs),
+                )),
+            };
             Ok(Some(JsonRpcResponse::from_result(id, result)))
         }
         "tools/list" => {
