@@ -641,11 +641,12 @@ async fn cmd_index_impl(
     if !force {
         // Create temporary LeIndex to check if already indexed
         if let Ok(check_leindex) = LeIndex::new(&canonical_path) {
-            if check_leindex.is_indexed() {
-                println!("Project already indexed. Use --force to re-index.");
-                println!("  Use --force to re-index if you have made changes.");
+            if check_leindex.is_indexed() && !check_leindex.is_stale_fast() {
+                println!("Project already indexed and up-to-date. Use --force to re-index.");
                 return Ok(());
             }
+            // If indexed but stale, fall through to incremental reindex
+            // (VAL-INDEX-005). If not indexed at all, fall through to full index.
         }
     }
 
