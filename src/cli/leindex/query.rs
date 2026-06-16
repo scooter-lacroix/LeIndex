@@ -325,12 +325,16 @@ impl LeIndex {
                 ));
             };
 
-        // Compute line number from byte range
-        let line_number = if byte_range.0 > 0 && !file_path.is_empty() {
-            std::fs::read_to_string(&file_path)
-                .ok()
-                .map(|content| content[..byte_range.0.min(content.len())].lines().count())
-                .filter(|n| *n > 0)
+        // Compute line number from byte range.
+        // Use byte-counting (count '\n' + 1) so that byte 0 correctly maps
+        // to line 1.  The previous implementation used `.lines().count()`
+        // which returns 0 for an empty slice (byte 0) and then filtered
+        // that out, producing None instead of line 1.
+        let line_number = if !file_path.is_empty() {
+            std::fs::read(&file_path).ok().map(|content| {
+                let offset = byte_range.0.min(content.len());
+                content[..offset].iter().filter(|&&b| b == b'\n').count() + 1
+            })
         } else {
             None
         };
@@ -664,38 +668,36 @@ impl LeIndex {
                 context.push_str(&format!("// File: {}\n", node.file_path));
                 context.push_str(&format!("// Type: {:?}\n", node.node_type));
 
-                // Compute line number from byte range
-                if node.byte_range.0 > 0 {
-                    if let Ok(content) = std::fs::read(&*node.file_path) {
-                        let start = node.byte_range.0;
-                        let end = node.byte_range.1.min(content.len());
+                // Compute line number from byte range.
+                // byte_range.0 == 0 is valid (file start, line 1) so we
+                // must not use `> 0` as the guard.
+                if let Ok(content) = std::fs::read(&*node.file_path) {
+                    let start = node.byte_range.0;
+                    let end = node.byte_range.1.min(content.len());
 
-                        // Compute starting line number
-                        let line_num = content[..start.min(content.len())]
-                            .iter()
-                            .filter(|&&b| b == b'\n')
-                            .count()
-                            + 1;
-                        context.push_str(&format!("// Line: {}\n", line_num));
+                    // Compute starting line number
+                    let line_num = content[..start.min(content.len())]
+                        .iter()
+                        .filter(|&&b| b == b'\n')
+                        .count()
+                        + 1;
+                    context.push_str(&format!("// Line: {}\n", line_num));
 
-                        if end > start {
-                            if let Ok(code) = std::str::from_utf8(&content[start..end]) {
-                                context.push_str(code);
-                                context.push('\n');
-                            } else {
-                                context.push_str("// [Error: Source code is not valid UTF-8]\n");
-                            }
+                    if end > start {
+                        if let Ok(code) = std::str::from_utf8(&content[start..end]) {
+                            context.push_str(code);
+                            context.push('\n');
                         } else {
-                            context.push_str("// [No source code range available for this node]\n");
+                            context.push_str("// [Error: Source code is not valid UTF-8]\n");
                         }
                     } else {
-                        context.push_str(&format!(
-                            "// [Error: Could not read file: {}]\n",
-                            node.file_path
-                        ));
+                        context.push_str("// [No source code range available for this node]\n");
                     }
                 } else {
-                    context.push_str("// [No source code range available for this node]\n");
+                    context.push_str(&format!(
+                        "// [Error: Could not read file: {}]\n",
+                        node.file_path
+                    ));
                 }
             }
         }

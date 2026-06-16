@@ -944,39 +944,6 @@ fn render_impact(data: &Value, color: bool) -> String {
     out
 }
 
-#[allow(dead_code)]
-fn render_impact_side(
-    data: &Value,
-    key: &str,
-    label: &str,
-    arrow: &str,
-    color: bool,
-    out: &mut String,
-) {
-    if let Some(arr) = data.get(key).and_then(|v| v.as_array()) {
-        if !arr.is_empty() {
-            out.push('\n');
-            out.push_str(&format!("  {}:\n", label));
-            for item in arr.iter().take(20) {
-                let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                let file = item.get("file").and_then(|v| v.as_str()).unwrap_or("");
-                let line = item.get("line").and_then(|v| v.as_u64());
-                out.push_str(&format!(
-                    "    {}{}{} {}{}{}{}{}\n",
-                    if color { LIGHT_CYAN } else { "" },
-                    arrow,
-                    name,
-                    if color { RESET } else { "" },
-                    if color { DIM } else { "" },
-                    file,
-                    line.map(|l| format!(":{}", l)).unwrap_or_default(),
-                    if color { RESET } else { "" },
-                ));
-            }
-        }
-    }
-}
-
 fn render_symbol_lookup(data: &Value, color: bool) -> String {
     // `lookup_single_symbol` returns the shape (see
     // `src/cli/mcp/symbol_lookup_handler.rs::lookup_single_symbol`):

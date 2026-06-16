@@ -2292,4 +2292,308 @@ mod tests {
             "Both: cyclomatic=10 overrides param count"
         );
     }
+
+    // -----------------------------------------------------------------
+    // Tests for resolve_cross_file_call_edges
+    // -----------------------------------------------------------------
+
+    /// Helper: count Call edges in a PDG
+    fn count_call_edges(pdg: &ProgramDependenceGraph) -> usize {
+        pdg.edge_indices()
+            .filter_map(|e| pdg.get_edge(e))
+            .filter(|e| e.edge_type == crate::graph::pdg::EdgeType::Call)
+            .count()
+    }
+
+    /// Helper: check if a Call edge exists from caller to callee
+    fn has_call_edge(pdg: &ProgramDependenceGraph, caller_name: &str, callee_name: &str) -> bool {
+        let caller_nid = pdg.node_indices().find(|&n| {
+            pdg.get_node(n)
+                .map(|node| &*node.name == caller_name)
+                .unwrap_or(false)
+        });
+        let callee_nid = pdg.node_indices().find(|&n| {
+            pdg.get_node(n)
+                .map(|node| &*node.name == callee_name)
+                .unwrap_or(false)
+        });
+
+        match (caller_nid, callee_nid) {
+            (Some(c), Some(d)) => {
+                // Check if there's a Call edge from c to d
+                pdg.neighbors(c).contains(&d)
+            }
+            _ => false,
+        }
+    }
+
+    /// Tier 1: Exact match - caller references callee by exact qualified name
+    #[test]
+    fn cross_file_exact_match() {
+        // File A has a function that calls a function in File B by exact name
+        let callee = sig("target_func", "target_func", false);
+        let mut caller = sig("caller_func", "caller_func", false);
+        caller.calls.push("target_func".to_string());
+
+        // Build PDG with nodes from two different files
+        let pdg_a = extract_pdg_from_signatures(vec![caller], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        // Merge into a single PDG
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        let edges_before = count_call_edges(&merged);
+        resolve_cross_file_call_edges(
+            &mut merged,
+            &[
+                SignatureInfo {
+                    name: "caller_func".to_string(),
+                    qualified_name: "caller_func".to_string(),
+                    calls: vec!["target_func".to_string()],
+                    ..sig("caller_func", "caller_func", false)
+                },
+                SignatureInfo {
+                    name: "target_func".to_string(),
+                    qualified_name: "target_func".to_string(),
+                    calls: vec![],
+                    ..sig("target_func", "target_func", false)
+                },
+            ],
+        );
+        let edges_after = count_call_edges(&merged);
+
+        assert!(
+            edges_after > edges_before,
+            "Exact match should create a new call edge (before={}, after={})",
+            edges_before,
+            edges_after
+        );
+        assert!(
+            has_call_edge(&merged, "caller_func", "target_func"),
+            "Should have call edge from caller_func to target_func"
+        );
+    }
+
+    /// Tier 2: Suffix match - caller references callee via module-qualified path
+    #[test]
+    fn cross_file_suffix_match() {
+        // callee is defined as `my_module.helper_func` in file B
+        // caller calls `my_module.helper_func` - should match via exact normalized name
+        let callee = sig("helper_func", "my_module.helper_func", false);
+        let mut caller = sig("do_work", "do_work", false);
+        caller.calls.push("my_module.helper_func".to_string());
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        resolve_cross_file_call_edges(
+            &mut merged,
+            &[caller, sig("helper_func", "my_module.helper_func", false)],
+        );
+
+        assert!(
+            has_call_edge(&merged, "do_work", "helper_func"),
+            "Suffix match: should have call edge from do_work to helper_func"
+        );
+    }
+
+    /// Tier 2b: Suffix match with 2+ segments from the end
+    #[test]
+    fn cross_file_suffix_match_multi_segment() {
+        // callee is `crate::network::send_request` in file B
+        // caller calls `network.send_request` - should match via suffix
+        let callee = sig("send_request", "crate.network.send_request", false);
+        let mut caller = sig("handle_request", "handle_request", false);
+        caller.calls.push("network.send_request".to_string());
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        resolve_cross_file_call_edges(
+            &mut merged,
+            &[
+                caller,
+                sig("send_request", "crate.network.send_request", false),
+            ],
+        );
+
+        assert!(
+            has_call_edge(&merged, "handle_request", "send_request"),
+            "Multi-segment suffix match: should have call edge from handle_request to send_request"
+        );
+    }
+
+    /// Tier 3: Last-segment fallback - fully qualified call resolved via last segment
+    #[test]
+    fn cross_file_last_segment_fallback() {
+        // callee is defined as `process_data` in file B
+        // caller calls `some.long.path.process_data` - no exact/suffix match,
+        // but last-segment fallback should find it
+        let callee = sig("process_data", "process_data", false);
+        let mut caller = sig("main_func", "main_func", false);
+        caller.calls.push("some.long.path.process_data".to_string());
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        resolve_cross_file_call_edges(
+            &mut merged,
+            &[caller, sig("process_data", "process_data", false)],
+        );
+
+        assert!(
+            has_call_edge(&merged, "main_func", "process_data"),
+            "Last-segment fallback: should have call edge from main_func to process_data"
+        );
+    }
+
+    /// Tier 4: COMMON_NAMES exclusion - common names should NOT be resolved
+    /// via last-segment fallback to avoid false positives
+    #[test]
+    fn cross_file_common_names_excluded() {
+        // callee is named "clone" (a common name) in file B
+        // caller calls `some.path.clone` - should NOT match via last-segment
+        // fallback because "clone" is in COMMON_NAMES
+        let callee = sig("clone", "clone", false);
+        let mut caller = sig("caller", "caller", false);
+        caller.calls.push("some.path.clone".to_string());
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        let edges_before = count_call_edges(&merged);
+        resolve_cross_file_call_edges(&mut merged, &[caller, sig("clone", "clone", false)]);
+        let edges_after = count_call_edges(&merged);
+
+        assert_eq!(
+            edges_before, edges_after,
+            "COMMON_NAMES exclusion: 'clone' should NOT be resolved via last-segment fallback"
+        );
+        assert!(
+            !has_call_edge(&merged, "caller", "clone"),
+            "Should NOT have call edge from caller to clone (common name excluded)"
+        );
+    }
+
+    /// Verify that COMMON_NAMES exclusion also applies to other common names
+    #[test]
+    fn cross_file_common_names_excluded_execute() {
+        let callee = sig("execute", "execute", false);
+        let mut caller = sig("runner", "runner", false);
+        caller.calls.push("module.sub.execute".to_string());
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        let edges_before = count_call_edges(&merged);
+        resolve_cross_file_call_edges(&mut merged, &[caller, sig("execute", "execute", false)]);
+        let edges_after = count_call_edges(&merged);
+
+        assert_eq!(
+            edges_before, edges_after,
+            "COMMON_NAMES exclusion: 'execute' should NOT be resolved via last-segment fallback"
+        );
+    }
+
+    /// Verify that short names (len <= 2) are excluded from last-segment fallback
+    #[test]
+    fn cross_file_short_names_excluded_from_fallback() {
+        let callee = sig("fn", "fn", false);
+        let mut caller = sig("caller", "caller", false);
+        caller.calls.push("some.path.fn".to_string());
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        let edges_before = count_call_edges(&merged);
+        resolve_cross_file_call_edges(&mut merged, &[caller, sig("fn", "fn", false)]);
+        let edges_after = count_call_edges(&merged);
+
+        assert_eq!(
+            edges_before, edges_after,
+            "Short name 'fn' (len=2) should NOT be resolved via last-segment fallback"
+        );
+    }
 }

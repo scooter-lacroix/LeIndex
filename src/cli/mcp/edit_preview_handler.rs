@@ -236,15 +236,41 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
                 }
 
                 // For text replacements, find symbols in the edited file
-                // that overlap with the changed region. This gives the
-                // LLM actionable information about which symbols are
-                // affected by the edit.
+                // whose byte ranges overlap with the changed region(s).
+                // Previously this used pdg.nodes_in_file() which returns
+                // ALL symbols in the file, over-reporting affected symbols.
                 if nodes.is_empty() {
-                    let file_path_str = abs_file_path.to_string_lossy().to_string();
-                    let file_nodes = pdg.nodes_in_file(&file_path_str);
+                    // Collect byte ranges from ReplaceText changes
+                    let edit_ranges: Vec<(usize, usize)> = changes
+                        .iter()
+                        .filter_map(|c| match c {
+                            crate::edit::EditChange::ReplaceText { start, end, .. } => {
+                                Some((*start, *end))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+
+                    // Try both the user-provided path (often relative, matching
+                    // what the PDG stores) and the absolute path.
+                    let file_nodes = pdg.nodes_in_file(&file_path);
+                    let file_nodes = if file_nodes.is_empty() {
+                        pdg.nodes_in_file(&abs_file_path.to_string_lossy())
+                    } else {
+                        file_nodes
+                    };
                     for nid in file_nodes {
                         if let Some(n) = pdg.get_node(nid) {
-                            nodes.push(n.name.clone());
+                            // Only include symbols whose byte range overlaps
+                            // with at least one edit region.
+                            let overlaps = edit_ranges.iter().any(|&(es, ee)| {
+                                // Two ranges [s1, e1) and [s2, e2) overlap when
+                                // s1 < e2 && s2 < e1
+                                n.byte_range.0 < ee && es < n.byte_range.1
+                            });
+                            if overlaps {
+                                nodes.push(n.name.clone());
+                            }
                         }
                     }
                 }
