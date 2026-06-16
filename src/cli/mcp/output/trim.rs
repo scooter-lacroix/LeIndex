@@ -312,10 +312,10 @@ fn trim_phase(data: &Value) -> Value {
     if let Some(df) = data.get("deleted_files") {
         out.insert("deleted_files".to_string(), df.clone());
     }
-    // Pass through fields that render_phase reads for metadata display.
-    // mode, phases, and summary are not currently emitted by the upstream
-    // PhaseAnalysisReport, but the pass-through is defensive so the
-    // renderer will show them if they ever appear.
+    // Legacy fields (mode, phases, summary) from the original PhaseAnalysisReport.
+    // render_phase no longer reads these; it now uses executed_phases, cache_hit,
+    // generation, phase1-5, and formatted_output. The pass-through is kept for
+    // backward compatibility in case upstream emits them.
     if let Some(v) = data.get("mode") {
         out.insert("mode".to_string(), v.clone());
     }
