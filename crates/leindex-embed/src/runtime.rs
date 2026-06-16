@@ -45,6 +45,12 @@ pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 /// Default maximum single-text size in bytes (1 MiB).
 pub const DEFAULT_MAX_TEXT_SIZE: usize = 1024 * 1024;
 
+/// Maximum texts per ONNX inference call. Prevents memory explosion when
+/// embedding large codebases (10,000+ nodes).
+/// Memory per sub-batch: ~640 MiB for [32, 512, 1024] tensor + activations.
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+const ONNX_INFERENCE_BATCH_SIZE: usize = 32;
+
 /// Configuration for the worker runtime.
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -70,7 +76,9 @@ impl Default for RuntimeConfig {
             max_text_size: DEFAULT_MAX_TEXT_SIZE,
             model_name: "qwen3-embed-0.6b".to_string(),
             embedding_dim: 1024,
-            execution_provider: "cpu".to_string(),
+            // Default to "auto" which will detect the best available provider.
+            // The worker will try MIGraphX (AMD GPU), then CUDA, then CPU.
+            execution_provider: "auto".to_string(),
         }
     }
 }
@@ -103,7 +111,7 @@ impl RuntimeConfig {
             .unwrap_or(1024);
 
         let execution_provider = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER")
-            .unwrap_or_else(|_| "cpu".to_string());
+            .unwrap_or_else(|_| "auto".to_string());
 
         Self {
             idle_timeout,
@@ -266,8 +274,23 @@ impl WorkerRuntime {
             "cuda" => {
                 try_provider_or_cpu!(session_builder, ort::ep::CUDA::default().build(), "CUDA")
             }
+            "migraphx" | "auto" => {
+                // For "auto", the provider selector already determined MIGraphX
+                // is the best available. For explicit "migraphx", use it directly.
+                try_provider_or_cpu!(
+                    session_builder,
+                    ort::ep::MIGraphX::default().build(),
+                    "MIGraphX"
+                )
+            }
             "rocm" => {
-                try_provider_or_cpu!(session_builder, ort::ep::ROCm::default().build(), "ROCm")
+                // ROCm EP is deprecated in favor of MIGraphX. Try MIGraphX first,
+                // then fall back to ROCm if available (old ORT builds), then CPU.
+                try_provider_or_cpu!(
+                    session_builder,
+                    ort::ep::MIGraphX::default().build(),
+                    "MIGraphX"
+                )
             }
             "coreml" => {
                 try_provider_or_cpu!(
@@ -577,7 +600,7 @@ impl WorkerRuntime {
         texts: &[String],
         expected_dim: usize,
     ) -> Result<EmbedResponse, WorkerError> {
-        // Batch tokenize all texts
+        // Batch tokenize all texts (tokenizer handles this efficiently)
         let encodings = tokenizer
             .encode_batch(texts.to_vec(), true)
             .map_err(|e| WorkerError {
@@ -589,25 +612,62 @@ impl WorkerRuntime {
             return Ok(EmbedResponse::new(vec![], 0, expected_dim));
         }
 
-        // Determine max sequence length in this batch
+        if expected_dim == 0 {
+            return Err(WorkerError {
+                kind: ErrorKind::InvalidRequest,
+                message: "expected_dim must be non-zero".to_string(),
+            });
+        }
+
+        // Process encodings in sub-batches to bound peak memory.
+        // Each sub-batch runs one ONNX session.run() call with at most
+        // ONNX_INFERENCE_BATCH_SIZE texts, keeping tensor allocation bounded.
+        let mut all_pooled: Vec<f32> = Vec::with_capacity(encodings.len() * expected_dim);
+
+        for sub_batch in encodings.chunks(ONNX_INFERENCE_BATCH_SIZE) {
+            let sub_pooled = self.run_onnx_embed_sub_batch(
+                session,
+                sub_batch,
+                expected_dim,
+            )?;
+            all_pooled.extend_from_slice(&sub_pooled);
+        }
+
+        let total_count = encodings.len();
+        Ok(EmbedResponse::new(all_pooled, total_count, expected_dim))
+    }
+
+    /// Run ONNX inference on a single sub-batch of encodings and return
+    /// the pooled + L2-normalized vectors (flattened row-major).
+    #[cfg(feature = "onnx")]
+    fn run_onnx_embed_sub_batch(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        encodings: &[tokenizers::Encoding],
+        expected_dim: usize,
+    ) -> Result<Vec<f32>, WorkerError> {
+        let batch_size = encodings.len();
+        if batch_size == 0 {
+            return Ok(vec![]);
+        }
+
+        // Determine max sequence length within this sub-batch (capped at DEFAULT_MAX_SEQ_LEN)
         let max_len = encodings
             .iter()
             .map(|e| e.len())
             .max()
             .unwrap_or(0)
-            .min(DEFAULT_MAX_SEQ_LEN); // Cap at max sequence length for memory safety
+            .min(DEFAULT_MAX_SEQ_LEN);
 
         if max_len == 0 {
-            return Ok(EmbedResponse::new(vec![], 0, expected_dim));
+            return Ok(vec![0.0f32; batch_size * expected_dim]);
         }
-
-        let batch_size = encodings.len();
 
         // Create input tensors: [batch_size, seq_len]
         let mut input_ids: Vec<i64> = Vec::with_capacity(batch_size * max_len);
         let mut attention_mask: Vec<i64> = Vec::with_capacity(batch_size * max_len);
 
-        for encoding in &encodings {
+        for encoding in encodings {
             let ids = encoding.get_ids();
             let mask = encoding.get_attention_mask();
 
@@ -626,12 +686,12 @@ impl WorkerRuntime {
         // Run inference with properly shaped tensors
         // Shape: [batch_size, seq_len]
         let input_ids_tensor = ort::value::Tensor::from_array(
-            ndarray::Array2::from_shape_vec((batch_size, max_len), input_ids).map_err(|e| {
-                WorkerError {
+            ndarray::Array2::from_shape_vec((batch_size, max_len), input_ids.clone()).map_err(
+                |e| WorkerError {
                     kind: ErrorKind::Inference,
                     message: format!("failed to create input_ids array: {}", e),
-                }
-            })?,
+                },
+            )?,
         )
         .map_err(|e| WorkerError {
             kind: ErrorKind::Inference,
@@ -689,13 +749,6 @@ impl WorkerRuntime {
             .into_raw_vec_and_offset()
             .0;
 
-        if expected_dim == 0 {
-            return Err(WorkerError {
-                kind: ErrorKind::InvalidRequest,
-                message: "expected_dim must be non-zero".to_string(),
-            });
-        }
-
         // Derive seq_len and hidden_dim from the actual tensor shape.
         let (actual_seq_len, hidden_dim) = match output_shape.as_slice() {
             [bs, sl, hd] if *bs == batch_size => {
@@ -734,11 +787,7 @@ impl WorkerRuntime {
                         }
                     }
                 }
-                return Ok(EmbedResponse {
-                    count: batch_size,
-                    dimension: dim,
-                    vectors: embeddings_f32,
-                });
+                return Ok(embeddings_f32);
             }
             _ => {
                 return Err(WorkerError {
@@ -763,14 +812,17 @@ impl WorkerRuntime {
             });
         }
 
-        // Apply mean pooling using attention mask
-        self.pool_and_normalize(
+        // Apply mean pooling using attention mask, then L2 normalize.
+        // This is done per sub-batch.
+        let pooled = self.pool_and_normalize(
             embeddings_f32,
             batch_size,
             actual_seq_len,
             attention_mask,
             hidden_dim,
-        )
+        )?;
+
+        Ok(pooled.vectors)
     }
 
     #[cfg(feature = "onnx")]
@@ -894,7 +946,7 @@ impl WorkerRuntime {
             .map(|doc| format!("Query: {} Document: {}", rerank_req.query, doc.content))
             .collect();
 
-        // Batch tokenize all pairs
+        // Batch tokenize all pairs (tokenizer handles this efficiently)
         let encodings = tokenizer
             .encode_batch(pair_texts, true)
             .map_err(|e| WorkerError {
@@ -906,7 +958,57 @@ impl WorkerRuntime {
             return Ok(RerankResponse { results: vec![] });
         }
 
+        // Process encodings in sub-batches to bound peak memory.
+        // Each sub-batch runs one ONNX session.run() call with at most
+        // ONNX_INFERENCE_BATCH_SIZE texts.
+        let mut all_rerank_scores: Vec<f32> =
+            Vec::with_capacity(rerank_req.documents.len());
+
+        for sub_batch in encodings.chunks(ONNX_INFERENCE_BATCH_SIZE) {
+            let sub_scores =
+                self.run_onnx_rerank_sub_batch(session, sub_batch)?;
+            all_rerank_scores.extend_from_slice(&sub_scores);
+        }
+
+        // Build results with combined scores: 70% rerank + 30% initial
+        let mut results: Vec<_> = rerank_req
+            .documents
+            .iter()
+            .zip(all_rerank_scores.into_iter())
+            .map(|(doc, rerank_score)| {
+                let combined_score = 0.7 * rerank_score + 0.3 * doc.initial_score;
+                protocol::RerankResult {
+                    id: doc.id.clone(),
+                    original_score: doc.initial_score,
+                    rerank_score,
+                    combined_score,
+                }
+            })
+            .collect();
+
+        // Sort by combined score descending
+        results.sort_by(|a, b| {
+            b.combined_score
+                .partial_cmp(&a.combined_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        Ok(RerankResponse { results })
+    }
+
+    /// Run ONNX rerank inference on a single sub-batch of encodings
+    /// and return the scalar rerank scores.
+    #[cfg(feature = "onnx")]
+    fn run_onnx_rerank_sub_batch(
+        &self,
+        session: &Arc<Mutex<Session>>,
+        encodings: &[tokenizers::Encoding],
+    ) -> Result<Vec<f32>, WorkerError> {
         let batch_size = encodings.len();
+        if batch_size == 0 {
+            return Ok(vec![]);
+        }
+
         let max_len = encodings
             .iter()
             .map(|e| e.len())
@@ -915,25 +1017,15 @@ impl WorkerRuntime {
             .min(512);
 
         if max_len == 0 {
-            // Return passthrough scores if tokenization failed
-            let results: Vec<_> = rerank_req
-                .documents
-                .iter()
-                .map(|doc| protocol::RerankResult {
-                    id: doc.id.clone(),
-                    original_score: doc.initial_score,
-                    rerank_score: doc.initial_score,
-                    combined_score: doc.initial_score,
-                })
-                .collect();
-            return Ok(RerankResponse { results });
+            // Return zero scores if tokenization produced nothing
+            return Ok(vec![0.0f32; batch_size]);
         }
 
         // Build input_ids and attention_mask vectors from encodings
         let mut input_ids: Vec<i64> = Vec::with_capacity(batch_size * max_len);
         let mut attention_mask: Vec<i64> = Vec::with_capacity(batch_size * max_len);
 
-        for encoding in &encodings {
+        for encoding in encodings {
             let ids = encoding.get_ids();
             let mask = encoding.get_attention_mask();
 
@@ -1029,30 +1121,7 @@ impl WorkerRuntime {
             }
         };
 
-        // Build results with combined scores: 70% rerank + 30% initial
-        let mut results: Vec<_> = rerank_req
-            .documents
-            .iter()
-            .zip(rerank_scores.into_iter())
-            .map(|(doc, rerank_score)| {
-                let combined_score = 0.7 * rerank_score + 0.3 * doc.initial_score;
-                protocol::RerankResult {
-                    id: doc.id.clone(),
-                    original_score: doc.initial_score,
-                    rerank_score,
-                    combined_score,
-                }
-            })
-            .collect();
-
-        // Sort by combined score descending
-        results.sort_by(|a, b| {
-            b.combined_score
-                .partial_cmp(&a.combined_score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        Ok(RerankResponse { results })
+        Ok(rerank_scores)
     }
 
     /// Truncate a single text to the configured maximum size.

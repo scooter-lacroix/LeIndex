@@ -1325,6 +1325,29 @@ pub(crate) fn index_nodes_with_embedder(
             pdg_edges: pdg.edge_count(),
         };
 
+        // VAL-ONNX-001: When onnx feature is enabled, create a hybrid_local
+        // embedder so neural embeddings are used during indexing and search.
+        // Falls back to tfidf_only if the ONNX worker cannot be initialized.
+        #[cfg(feature = "onnx")]
+        {
+            match HybridEmbedder::hybrid_local(tfidf_embedder, None) {
+                Ok(hybrid) => hybrid,
+                Err(e) => {
+                    warn!(
+                        "Failed to create hybrid_local embedder (ONNX), falling back to tfidf_only: {}",
+                        e
+                    );
+                    HybridEmbedder::tfidf_only(TfIdfEmbedder {
+                        vocab: final_scores.iter().map(|(t, _)| t.clone()).collect(),
+                        idf: final_scores.iter().map(|(_, s)| *s).collect(),
+                        dimension: crate::search::search::DEFAULT_EMBEDDING_DIMENSION,
+                        pdg_nodes: pdg.node_count(),
+                        pdg_edges: pdg.edge_count(),
+                    })
+                }
+            }
+        }
+        #[cfg(not(feature = "onnx"))]
         HybridEmbedder::tfidf_only(tfidf_embedder)
     };
 
@@ -1437,28 +1460,34 @@ pub(crate) fn index_nodes_with_embedder(
             }
         }
 
-        // Batch neural embedding: one IPC call for all pending nodes in this chunk.
+        // Batch neural embedding: process pending nodes in sub-chunks to cap
+        // IPC payload size and ONNX worker memory usage.
         if !neural_pending.is_empty() {
-            #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-            let batch_results = {
-                let texts: Vec<String> = neural_pending
-                    .iter()
-                    .map(|&idx| nodes[idx].content.clone())
-                    .collect();
-                embedder.embed_neural_batch_blocking(&texts)
-            };
-            #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
-            let batch_results: Vec<Option<Vec<f32>>> = vec![None; neural_pending.len()];
-
-            for (i, &node_vec_idx) in neural_pending.iter().enumerate() {
-                let neural = batch_results.get(i).and_then(|r| r.clone());
-                // Store in work hoister so future cache hits avoid re-computation
-                work_hoister.store(
-                    &nodes[node_vec_idx].content,
-                    nodes[node_vec_idx].tfidf_embedding.clone(),
-                    neural.clone(),
-                );
-                nodes[node_vec_idx].neural_embedding = neural;
+            const NEURAL_IPC_BATCH: usize = 256;
+            for ipc_chunk in neural_pending.chunks(NEURAL_IPC_BATCH) {
+                #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+                {
+                    let texts: Vec<String> = ipc_chunk
+                        .iter()
+                        .map(|&idx| nodes[idx].content.clone())
+                        .collect();
+                    let batch_results = embedder.embed_neural_batch_blocking(&texts);
+                    for (i, &node_vec_idx) in ipc_chunk.iter().enumerate() {
+                        let neural = batch_results.get(i).and_then(|r| r.clone());
+                        work_hoister.store(
+                            &nodes[node_vec_idx].content,
+                            nodes[node_vec_idx].tfidf_embedding.clone(),
+                            neural.clone(),
+                        );
+                        nodes[node_vec_idx].neural_embedding = neural;
+                    }
+                }
+                #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+                {
+                    for &node_vec_idx in ipc_chunk {
+                        nodes[node_vec_idx].neural_embedding = None;
+                    }
+                }
             }
         }
 
