@@ -252,17 +252,46 @@ impl ExecutionProviderSelector {
     /// Check if MIGraphX is available on this system.
     /// MIGraphX is the modern AMD GPU execution provider for ONNX Runtime,
     /// replacing the deprecated ROCmExecutionProvider.
+    ///
+    /// This check uses two strategies:
+    /// 1. Ask the ONNX Runtime if MIGraphX is compiled in via `is_available()`
+    /// 2. If that returns false, check for ROCm/MIGraphX system presence as a
+    ///    heuristic. The actual registration may still succeed (or fail) when
+    ///    we attempt to build the session, at which point we fall back to CPU.
     fn is_migraphx_available() -> bool {
         #[cfg(feature = "onnx")]
         {
-            ort::ep::MIGraphX::default().is_available().unwrap_or(false)
+            // First, ask ORT if MIGraphX is available in the loaded binary
+            if ort::ep::MIGraphX::default().is_available().unwrap_or(false) {
+                return true;
+            }
+            // Fallback heuristic: if ROCm + MIGraphX are installed on the system,
+            // assume the EP can be registered. The session builder will fall back
+            // to CPU if registration actually fails.
+            // This is necessary because GetAvailableProviders() may not list
+            // MIGraphX when it's loaded as a shared provider plugin.
+            if std::path::Path::new("/opt/rocm/lib/libmigraphx_c.so").exists()
+                || std::path::Path::new("/opt/rocm/bin/migraphx-driver").exists()
+            {
+                tracing::debug!(
+                    "MIGraphX not in GetAvailableProviders() but ROCm/MIGraphX \
+                     libraries detected; will attempt registration"
+                );
+                return true;
+            }
+            false
         }
         #[cfg(not(feature = "onnx"))]
         {
             // Conservative fallback: check for MIGraphX binary presence
             std::path::Path::new("/opt/rocm/bin/migraphx-driver").exists()
+                || std::path::Path::new("/opt/rocm/lib/libmigraphx_c.so").exists()
                 || std::env::var("ROCM_PATH")
-                    .map(|p| std::path::Path::new(&p).join("bin/migraphx-driver").exists())
+                    .map(|p| {
+                        std::path::Path::new(&p)
+                            .join("bin/migraphx-driver")
+                            .exists()
+                    })
                     .unwrap_or(false)
         }
     }
@@ -364,8 +393,7 @@ mod tests {
             Err(fallback) => {
                 assert_eq!(fallback.fallback_name(), "cpu");
                 assert!(
-                    fallback.reason().contains("ROCm")
-                        || fallback.reason().contains("MIGraphX")
+                    fallback.reason().contains("ROCm") || fallback.reason().contains("MIGraphX")
                 );
             }
         }

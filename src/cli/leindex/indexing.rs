@@ -345,6 +345,16 @@ impl LeIndex {
         {
             warn!("Failed to persist mmap embeddings: {err:#}");
         }
+        // Persist neural embeddings separately for fast load_from_storage
+        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+        {
+            if let Err(err) = index_builder::persist_neural_embeddings_to_mmap(
+                &self.search_engine,
+                &self.project_path,
+            ) {
+                warn!("Failed to persist neural mmap embeddings: {err:#}");
+            }
+        }
 
         // Clear search query and analysis caches so stale results are not
         // served after an incremental reindex (VAL-INDEX-005).
@@ -800,6 +810,16 @@ impl LeIndex {
         {
             warn!("Failed to persist mmap embeddings: {err:#}");
         }
+        // Persist neural embeddings separately for fast load_from_storage
+        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+        {
+            if let Err(err) = index_builder::persist_neural_embeddings_to_mmap(
+                &self.search_engine,
+                &self.project_path,
+            ) {
+                warn!("Failed to persist neural mmap embeddings: {err:#}");
+            }
+        }
 
         // Update last_indexed timestamp in project_metadata
         if let Err(err) = self.update_last_indexed_timestamp() {
@@ -896,46 +916,38 @@ impl LeIndex {
         let embedder = if let Some(embedder) = persisted_embedder {
             if embedder.is_fresh(pdg_node_count, pdg_edge_count) {
                 info!("Loaded persisted embedder from storage");
-                // VAL-ONNX-001: Wrap as hybrid_local when onnx feature is enabled
-                #[cfg(feature = "onnx")]
-                let hybrid_embedder = {
-                    match index_builder::HybridEmbedder::hybrid_local(embedder, None) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            warn!("Failed to create hybrid_local from persisted embedder (ONNX), falling back to tfidf_only: {}", e);
-                            let fallback =
-                                index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_else(|| {
-                                        index_builder::TfIdfEmbedder::build_from_tokens(&[])
-                                    });
-                            index_builder::HybridEmbedder::tfidf_only(fallback)
-                        }
-                    }
-                };
-                #[cfg(not(feature = "onnx"))]
-                let hybrid_embedder = index_builder::HybridEmbedder::tfidf_only(embedder);
+                // Use tfidf_only during load_from_storage to avoid expensive
+                // batch neural embedding of all nodes. Neural embeddings are
+                // restored from the persisted mmap file below.
+                let tfidf_embedder = index_builder::HybridEmbedder::tfidf_only(embedder);
                 index_builder::index_nodes_with_embedder(
                     &pdg,
                     &mut self.search_engine,
                     &mut self.cache.file_stats_cache,
                     batch_size,
-                    Some(hybrid_embedder),
+                    Some(tfidf_embedder),
                     None,
                 )?
             } else {
                 info!("Persisted embedder is stale; rebuilding TF-IDF index");
+                // Pass the stale embedder wrapped as tfidf_only to avoid
+                // triggering batch neural embedding during search-time index
+                // reconstruction. Neural embeddings are restored from the
+                // persisted mmap file below.
+                let stale_tfidf = index_builder::HybridEmbedder::tfidf_only(embedder);
                 index_builder::index_nodes_with_embedder(
                     &pdg,
                     &mut self.search_engine,
                     &mut self.cache.file_stats_cache,
                     batch_size,
-                    None,
+                    Some(stale_tfidf),
                     None,
                 )?
             }
         } else {
+            // No persisted embedder at all; pass None to let the function
+            // build a fresh vocab. This will create a hybrid_local embedder
+            // when onnx is enabled, but only on first run (no existing index).
             index_builder::index_nodes_with_embedder(
                 &pdg,
                 &mut self.search_engine,
@@ -945,7 +957,60 @@ impl LeIndex {
                 None,
             )?
         };
-        self.embedder = Some(embedder);
+
+        // Restore neural embeddings from persisted neural mmap file (if available).
+        // This avoids re-computing neural embeddings for all nodes during search.
+        // Neural embeddings are generated during a full `leindex index` run and
+        // persisted to .leindex/neural_embeddings.bin. If the file is missing
+        // (e.g., first run, or index was built without onnx feature), neural
+        // scores will be 0 until a full reindex with ONNX is performed.
+        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+        {
+            if let Some(neural_mmap) =
+                index_builder::try_load_neural_mmap_embeddings(&self.project_path)
+            {
+                let restored = self.search_engine.restore_neural_embeddings(&neural_mmap);
+                if restored > 0 {
+                    info!(
+                        "Restored {} neural embeddings from persisted neural mmap file",
+                        restored
+                    );
+                } else {
+                    info!("Neural mmap file loaded but no matching node IDs found; neural scores will be 0");
+                }
+            } else {
+                info!("No persisted neural embeddings found; run 'leindex index --force' with onnx feature to generate them");
+            }
+        }
+
+        // VAL-ONNX-001: After indexing with tfidf_only, upgrade the embedder
+        // to hybrid_local for query-time neural embedding (single query, not batch).
+        #[cfg(feature = "onnx")]
+        {
+            if let Some(tfidf) = index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
+                .ok()
+                .flatten()
+            {
+                match index_builder::HybridEmbedder::hybrid_local(tfidf, None) {
+                    Ok(hybrid) => {
+                        self.embedder = Some(hybrid);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to create hybrid_local embedder for query embedding: {}",
+                            e
+                        );
+                        self.embedder = Some(embedder);
+                    }
+                }
+            } else {
+                self.embedder = Some(embedder);
+            }
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            self.embedder = Some(embedder);
+        }
         if let Some(embedder) = &self.embedder {
             if let Err(err) = embedder.persist_to_storage(&self.project_path, &pdg) {
                 warn!("Failed to persist embedder: {err:#}");
@@ -973,6 +1038,16 @@ impl LeIndex {
             index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)
         {
             warn!("Failed to persist mmap embeddings: {err:#}");
+        }
+        // Persist neural embeddings separately for fast load_from_storage
+        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+        {
+            if let Err(err) = index_builder::persist_neural_embeddings_to_mmap(
+                &self.search_engine,
+                &self.project_path,
+            ) {
+                warn!("Failed to persist neural mmap embeddings: {err:#}");
+            }
         }
 
         Ok(())

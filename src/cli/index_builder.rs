@@ -1328,6 +1328,7 @@ pub(crate) fn index_nodes_with_embedder(
         // VAL-ONNX-001: When onnx feature is enabled, create a hybrid_local
         // embedder so neural embeddings are used during indexing and search.
         // Falls back to tfidf_only if the ONNX worker cannot be initialized.
+        // Callers who want tfidf_only should pass an explicit tfidf_only embedder.
         #[cfg(feature = "onnx")]
         {
             match HybridEmbedder::hybrid_local(tfidf_embedder, None) {
@@ -1720,6 +1721,66 @@ pub(crate) fn persist_embeddings_to_mmap(
         "Persisted embeddings to mmap file"
     );
     Ok(())
+}
+
+/// Persist neural embeddings to a separate mmap file for fast load_from_storage.
+///
+/// This stores the ONNX neural embeddings (1024-dim) separately from the
+/// TF-IDF embeddings (768-dim) so they can be restored without re-computing
+/// ONNX inference for all nodes.
+pub(crate) fn persist_neural_embeddings_to_mmap(
+    search_engine: &SearchEngine,
+    project_path: &Path,
+) -> Result<()> {
+    let embeddings = search_engine.collect_neural_embeddings();
+    if embeddings.is_empty() {
+        return Ok(());
+    }
+    let path = neural_mmap_embeddings_path(project_path);
+    crate::search::vector::write_mmap_embeddings(&path, &embeddings)
+        .map_err(|e| anyhow::anyhow!("Failed to write neural mmap embeddings: {e}"))?;
+    info!(
+        count = embeddings.len(),
+        path = %path.display(),
+        "Persisted neural embeddings to mmap file"
+    );
+    Ok(())
+}
+
+/// Path for the neural embeddings mmap file.
+fn neural_mmap_embeddings_path(project_path: &Path) -> PathBuf {
+    project_path.join(".leindex").join("neural_embeddings.bin")
+}
+
+/// Try to load previously persisted neural embeddings from mmap file.
+///
+/// Returns `None` if the file does not exist or is corrupt.
+pub(crate) fn try_load_neural_mmap_embeddings(
+    project_path: &Path,
+) -> Option<crate::search::vector::MmapEmbeddingIndex> {
+    let path = neural_mmap_embeddings_path(project_path);
+    if !path.exists() {
+        return None;
+    }
+    match crate::search::vector::MmapEmbeddingIndex::open(&path) {
+        Ok(index) => {
+            info!(
+                nodes = index.len(),
+                dim = index.dimension(),
+                path = %path.display(),
+                "Loaded neural mmap embedding index"
+            );
+            Some(index)
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to load neural mmap embedding index"
+            );
+            None
+        }
+    }
 }
 
 /// Clear persisted search query and analysis cache entries for a project.

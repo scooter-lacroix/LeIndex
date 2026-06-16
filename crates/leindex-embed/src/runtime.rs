@@ -30,7 +30,7 @@ use crate::startup::{StartupReport, StartupReporter};
 
 // ONNX Runtime imports - only available with "onnx" feature
 #[cfg(feature = "onnx")]
-use ort::session::{Session, builder::GraphOptimizationLevel};
+use ort::session::{builder::GraphOptimizationLevel, Session};
 
 /// Default idle timeout in seconds before the worker tears itself down.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes
@@ -661,19 +661,11 @@ impl WorkerRuntime {
                         padded.push(template.clone());
                     }
                 }
-                let sub_pooled = self.run_onnx_embed_sub_batch(
-                    session,
-                    &padded,
-                    expected_dim,
-                )?;
+                let sub_pooled = self.run_onnx_embed_sub_batch(session, &padded, expected_dim)?;
                 // Only keep results for the real texts, discard padding
                 all_pooled.extend_from_slice(&sub_pooled[..sub_batch.len() * expected_dim]);
             } else {
-                let sub_pooled = self.run_onnx_embed_sub_batch(
-                    session,
-                    sub_batch,
-                    expected_dim,
-                )?;
+                let sub_pooled = self.run_onnx_embed_sub_batch(session, sub_batch, expected_dim)?;
                 all_pooled.extend_from_slice(&sub_pooled);
             }
         }
@@ -1006,8 +998,7 @@ impl WorkerRuntime {
         // Process encodings in sub-batches to bound peak memory.
         // Each sub-batch runs one ONNX session.run() call with at most
         // ONNX_INFERENCE_BATCH_SIZE texts.
-        let mut all_rerank_scores: Vec<f32> =
-            Vec::with_capacity(rerank_req.documents.len());
+        let mut all_rerank_scores: Vec<f32> = Vec::with_capacity(rerank_req.documents.len());
 
         let total_docs = encodings.len();
         for (chunk_idx, sub_batch) in encodings.chunks(ONNX_INFERENCE_BATCH_SIZE).enumerate() {
@@ -1025,12 +1016,10 @@ impl WorkerRuntime {
                         padded.push(template.clone());
                     }
                 }
-                let sub_scores =
-                    self.run_onnx_rerank_sub_batch(session, &padded)?;
+                let sub_scores = self.run_onnx_rerank_sub_batch(session, &padded)?;
                 all_rerank_scores.extend_from_slice(&sub_scores[..sub_batch.len()]);
             } else {
-                let sub_scores =
-                    self.run_onnx_rerank_sub_batch(session, sub_batch)?;
+                let sub_scores = self.run_onnx_rerank_sub_batch(session, sub_batch)?;
                 all_rerank_scores.extend_from_slice(&sub_scores);
             }
         }

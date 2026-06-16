@@ -1503,6 +1503,34 @@ impl SearchEngine {
         self.nodes.extend(nodes);
     }
 
+    /// Restore neural embeddings from a persisted mmap embedding index.
+    ///
+    /// This updates the `neural_embedding` field on each node that has a
+    /// matching entry in the mmap index. Nodes without a matching entry
+    /// retain their existing neural embedding (typically `None`).
+    ///
+    /// Returns the number of nodes that were updated.
+    pub fn restore_neural_embeddings(
+        &mut self,
+        mmap_index: &crate::search::vector::MmapEmbeddingIndex,
+    ) -> usize {
+        let mut updated = 0;
+        for node in &mut self.nodes {
+            if let Some(embedding) = mmap_index.get_embedding(&node.node_id) {
+                if !embedding.is_empty() {
+                    node.neural_embedding = Some(embedding);
+                    updated += 1;
+                }
+            }
+        }
+        tracing::info!(
+            "Restored {} neural embeddings from mmap ({} total nodes)",
+            updated,
+            self.nodes.len()
+        );
+        updated
+    }
+
     /// Extract signature from node content.
     ///
     /// Returns the first non-empty, non-comment line after the header.
@@ -1698,6 +1726,22 @@ impl SearchEngine {
             .iter()
             .filter(|n| !n.tfidf_embedding.is_empty())
             .map(|n| (n.node_id.clone(), n.tfidf_embedding.clone()))
+            .collect()
+    }
+
+    /// Collect neural embeddings for persistence.
+    ///
+    /// Returns `(node_id, neural_embedding)` pairs for all nodes that have
+    /// non-empty neural embeddings.
+    pub fn collect_neural_embeddings(&self) -> Vec<(String, Vec<f32>)> {
+        self.nodes
+            .iter()
+            .filter_map(|n| {
+                n.neural_embedding
+                    .as_ref()
+                    .filter(|e| !e.is_empty())
+                    .map(|e| (n.node_id.clone(), e.clone()))
+            })
             .collect()
     }
 

@@ -16,6 +16,11 @@ default = []
 # Only needed for the worker binary, not for the main crate.
 # The `migraphx` feature enables AMD GPU acceleration via MIGraphX,
 # which is the modern replacement for the deprecated ROCmExecutionProvider.
+#
+# ort-sys does not ship prebuilt MIGraphX binaries, so when building with
+# `onnx-migraphx`, set ORT_LIB_PATH to a directory containing a
+# MIGraphX-enabled libonnxruntime.so and ORT_PREFER_DYNAMIC_LINK=1 to
+# dynamically link against it instead of downloading the CPU-only prebuilt.
 onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 onnx-migraphx = ["onnx", "ort/migraphx"]
 
@@ -30,7 +35,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # ONNX Runtime dependencies — owned exclusively by the worker crate
-ort = { version = "2.0.0-rc.12", optional = true, features = ["ndarray"] }
+# Use api-23 (not the default api-24) because the MIGraphX-enabled ONNX Runtime
+# library (1.23.2 from onnxruntime-migraphx) only supports API version 23.
+# The default api-24 requires ONNX Runtime 1.24.x which has no MIGraphX build.
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["ndarray", "std", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-23"] }
 tokenizers = { version = "0.20", optional = true }
 ndarray = { version = "0.17", optional = true }
 dirs = { version = "5" }

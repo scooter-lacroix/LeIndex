@@ -19,11 +19,9 @@ use std::time::Duration;
 
 use leindex_embed::batch::{self, BatchConfig, SplitResult};
 use leindex_embed::model_path::ModelResolver;
-use leindex_embed::protocol::{
-    self, BatchId, EmbedRequest, EmbedResponse, MsgType, Request,
-};
 #[cfg(not(feature = "onnx"))]
 use leindex_embed::protocol::Response;
+use leindex_embed::protocol::{self, BatchId, EmbedRequest, EmbedResponse, MsgType, Request};
 use leindex_embed::provider::ExecutionProviderSelector;
 use leindex_embed::runtime::{RuntimeConfig, WorkerRuntime};
 use leindex_embed::startup::{StartupReport, StartupReporter};
