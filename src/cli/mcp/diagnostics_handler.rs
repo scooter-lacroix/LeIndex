@@ -87,6 +87,10 @@ impl DiagnosticsHandler {
         // the is_stale_fast positive was a false positive (e.g., same-second
         // mtime) and the index is actually fresh.
         let stale_bool = if stale_fast { is_stale } else { false };
+        // Live PDG counts from the in-memory graph (pdg.node_count() /
+        // pdg.edge_count()). These reflect the current state of the loaded
+        // PDG and may differ from the index-time snapshot in stats.pdg_nodes
+        // / stats.pdg_edges if the PDG was partially loaded or modified.
         let pdg_nodes = diagnostics.pdg_nodes;
         let pdg_edges = diagnostics.pdg_edges;
         let embedding_model = diagnostics.embedding_model.clone();
@@ -117,8 +121,11 @@ impl DiagnosticsHandler {
             map.insert("index_size_mb".to_string(), serde_json::json!(size_mb));
             map.insert("stale".to_string(), serde_json::json!(stale_bool));
 
-            // System health metrics: index freshness, PDG node/edge counts,
-            // embedding model status, search index size.
+            // System health metrics: index freshness, live PDG node/edge
+            // counts (from the in-memory graph), embedding model status,
+            // search index size. Note: pdg_nodes/pdg_edges here are live
+            // counts from the loaded PDG, while the same fields under
+            // `stats` are index-time snapshots persisted to storage.
             map.insert(
                 "system_health".to_string(),
                 serde_json::json!({

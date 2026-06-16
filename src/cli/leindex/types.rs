@@ -108,10 +108,16 @@ pub struct IndexStats {
     /// Total number of code signatures extracted across all files
     pub total_signatures: usize,
 
-    /// Total number of nodes created in the Program Dependence Graph
+    /// Number of PDG nodes recorded at indexing time (persisted to storage).
+    /// This is a snapshot from the last `index_project` run and may differ
+    /// from the live PDG counts in `Diagnostics.pdg_nodes` if the PDG was
+    /// modified or partially loaded after indexing.
     pub pdg_nodes: usize,
 
-    /// Total number of edges created in the Program Dependence Graph
+    /// Number of PDG edges recorded at indexing time (persisted to storage).
+    /// This is a snapshot from the last `index_project` run and may differ
+    /// from the live PDG counts in `Diagnostics.pdg_edges` if the PDG was
+    /// modified or partially loaded after indexing.
     pub pdg_edges: usize,
 
     /// Total number of nodes successfully indexed for semantic search
@@ -224,10 +230,18 @@ pub struct Diagnostics {
     pub search_index_nodes: usize,
     /// Overall index health: "healthy", "stale", or "empty"
     pub index_health: String,
-    /// Number of PDG nodes (symbols in the Program Dependence Graph)
+    /// Live PDG node count from the in-memory Program Dependence Graph
+    /// (`pdg.node_count()` at diagnostics time). This reflects the current
+    /// state of the loaded PDG, which may differ from the index-time snapshot
+    /// in `stats.pdg_nodes` if the PDG was partially loaded or modified after
+    /// indexing. When no PDG is loaded, this is 0.
     #[serde(default)]
     pub pdg_nodes: usize,
-    /// Number of PDG edges (relationships in the Program Dependence Graph)
+    /// Live PDG edge count from the in-memory Program Dependence Graph
+    /// (`pdg.edge_count()` at diagnostics time). This reflects the current
+    /// state of the loaded PDG, which may differ from the index-time snapshot
+    /// in `stats.pdg_edges` if the PDG was partially loaded or modified after
+    /// indexing. When no PDG is loaded, this is 0.
     #[serde(default)]
     pub pdg_edges: usize,
     /// Embedding model status: "tfidf_only", "onnx_hybrid", "remote_hybrid", or "unknown"

@@ -1851,8 +1851,8 @@ async fn handle_mcp_request(
     _project_path: PathBuf,
 ) -> anyhow::Result<Option<JsonRpcResponse>> {
     use crate::cli::mcp::server::{
-        handle_tool_call, list_tools_json, long_running_tool_timeout_secs,
-        DEFAULT_REQUEST_TIMEOUT_SECS, HANDLERS, SERVER_INSTANCE, SERVER_STATE,
+        handle_tool_call, list_tools_json, long_running_tool_timeout_secs, HANDLERS,
+        SERVER_INSTANCE, SERVER_STATE,
     };
 
     let method_name = request.method.clone();
@@ -1954,15 +1954,18 @@ async fn handle_mcp_request(
             // (e.g. leindex.index, which can take several minutes for a
             // first-time build of a large monorepo) get an extended cap
             // so the timeout does not drop the future mid-swap. All
-            // other tools use DEFAULT_REQUEST_TIMEOUT_SECS (30s).
+            // other tools use the configurable
+            // `server_instance.config.request_timeout_secs` (30s by
+            // default), matching the HTTP transport path which reads
+            // from the same config source.
             let tool_name = request
                 .params
                 .as_ref()
                 .and_then(|p| p.get("name"))
                 .and_then(|n| n.as_str())
                 .unwrap_or("");
-            let cap_secs =
-                long_running_tool_timeout_secs(tool_name).unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+            let cap_secs = long_running_tool_timeout_secs(tool_name)
+                .unwrap_or(server_instance.config.request_timeout_secs);
             let timeout_duration = std::time::Duration::from_secs(cap_secs);
 
             let tool_result = tokio::time::timeout(

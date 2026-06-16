@@ -537,7 +537,11 @@ impl LeIndex {
             warn!(
                 "Parse failure for '{}' during indexing: {}",
                 result.file_path.display(),
-                result.error.as_deref().unwrap_or("unknown error")
+                result
+                    .error
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("unknown error")
             );
         }
 
