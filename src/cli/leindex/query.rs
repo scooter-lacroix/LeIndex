@@ -11,6 +11,18 @@ use crate::search::search::{SearchQuery, SearchResult};
 use anyhow::{Context, Result};
 use tracing::{debug, warn};
 
+/// Maximum wall-clock time allowed for generating a single query neural
+/// embedding via ONNX/remote backends.
+///
+/// On CPU-only systems the 600M-parameter model can take >120 seconds per
+/// inference, which would hang the search path for the full 300-second IPC
+/// timeout.  When the embedding does not complete within this duration we
+/// abandon it and fall back to TF-IDF for the query embedding.  Pre-computed
+/// neural node embeddings from indexing are still used for scoring, so search
+/// results remain useful.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+const QUERY_EMBED_TIMEOUT_SECS: u64 = 15;
+
 impl LeIndex {
     /// Search the indexed code
     ///
@@ -387,22 +399,53 @@ impl LeIndex {
     /// Uses ONNX (or remote) neural embeddings when available, projecting
     /// the query into the same neural vector space as the indexed nodes.
     /// Returns `None` when neural embeddings are unavailable (TF-IDF fallback).
+    ///
+    /// A [`QUERY_EMBED_TIMEOUT_SECS`]-second timeout prevents CPU-only ONNX
+    /// inference (which can take >120 s with the 600M-parameter model) from
+    /// hanging the search path.  When the timeout fires the function logs a
+    /// warning and returns `None`, causing the caller to fall back to TF-IDF
+    /// for the query embedding.  Pre-computed neural node embeddings from
+    /// indexing are still used for scoring via cosine similarity, so search
+    /// results remain useful even with a TF-IDF query embedding.
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     pub fn generate_query_neural_embedding(&self, query: &str) -> Option<Vec<f32>> {
-        if let Some(ref emb) = self.embedder {
-            match emb.embed_neural_blocking(query) {
-                Some(Ok(vec)) => Some(vec),
-                Some(Err(e)) => {
-                    debug!(
-                        "Neural embedding failed for query, using TF-IDF fallback: {}",
-                        e
-                    );
-                    None
-                }
-                None => None, // TF-IDF only mode, no neural available
+        let emb = self.embedder.as_ref()?;
+
+        // Channel-based timeout pattern: spawn a detached worker thread that
+        // runs the (potentially very slow) blocking embedding call, then wait
+        // on the receiver with a bounded timeout.  If the timeout fires we
+        // proceed without the neural embedding; the worker thread is left to
+        // complete (or be killed at process exit) since we cannot cancel
+        // ONNX inference mid-flight.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let emb_clone = emb.clone();
+        let query_owned = query.to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(emb_clone.embed_neural_blocking(&query_owned));
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_secs(QUERY_EMBED_TIMEOUT_SECS)) {
+            Ok(Some(Ok(vec))) => Some(vec),
+            Ok(Some(Err(e))) => {
+                debug!(
+                    "Neural embedding failed for query, using TF-IDF fallback: {}",
+                    e
+                );
+                None
             }
-        } else {
-            None
+            Ok(None) => None, // TF-IDF only mode, no neural available
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                warn!(
+                    timeout_secs = QUERY_EMBED_TIMEOUT_SECS,
+                    "Neural query embedding timed out after {}s, using TF-IDF fallback",
+                    QUERY_EMBED_TIMEOUT_SECS
+                );
+                None
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                warn!("Neural embedding thread panicked or disconnected, using TF-IDF fallback");
+                None
+            }
         }
     }
 
