@@ -1921,9 +1921,11 @@ impl SearchEngine {
 
         // Pre-compute vector search if semantic search is requested
         let vector_results: std::collections::HashMap<String, f32> = if query.semantic {
-            // Use provided query embedding if available
-            let embedding = if let Some(emb) = query.query_embedding {
-                Some(emb)
+            // Use provided query embedding if available.
+            // Note: we take a reference (not move) so that `query` remains
+            // borrowable for `compute_score` later in the loop.
+            let embedding = if let Some(ref emb) = query.query_embedding {
+                Some(emb.clone())
             } else {
                 // Fallback: find if there's a node with a TF-IDF embedding we can use
                 // This is legacy behavior, should be avoided
@@ -2027,157 +2029,9 @@ impl SearchEngine {
                 continue;
             }
 
-            // Normalize complexity to 0-1 range (divide by 100, not 10)
-            let structural_score = (node.complexity as f32 / 100.0).min(1.0);
-
-            // Compute neural score using cosine similarity between the query's
-            // neural embedding and the node's neural embedding.
-            // Falls back to 0.0 when neural embeddings are unavailable.
-            let neural_score = match (&query.query_neural_embedding, &node.neural_embedding) {
-                (Some(q_emb), Some(n_emb)) => {
-                    crate::search::vector::cosine_similarity(q_emb, n_emb)
-                }
-                _ => 0.0,
-            };
-
-            // Use custom weights based on query type if provided.
-            // When neural embeddings are unavailable, redistribute neural weight
-            // to TF-IDF and text match for better ranking quality.
-            let neural_available = query.query_neural_embedding.is_some();
-            let is_exact_mode = query
-                .query_type
-                .map(|qt| qt == crate::search::ranking::QueryType::Exact)
-                .unwrap_or(false);
-            let mut score = if let Some(qt) = query.query_type {
-                match qt {
-                    crate::search::ranking::QueryType::Text => {
-                        // Prose/Text mode: heavily favor keyword overlap
-                        self.scorer
-                            .with_weights_hybrid(0.2, 0.05, 0.05, 0.7)
-                            .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
-                    }
-                    crate::search::ranking::QueryType::Exact => {
-                        // Exact mode: prioritize exact symbol name matches.
-                        // Higher text and structural weights, lower TF-IDF.
-                        // This ensures exact name matches rank above conceptual matches.
-                        if neural_available {
-                            self.scorer
-                                .with_weights_hybrid(0.15, 0.15, 0.25, 0.45)
-                                .score_hybrid(
-                                    tfidf_score,
-                                    neural_score,
-                                    structural_score,
-                                    text_score,
-                                )
-                        } else {
-                            self.scorer
-                                .with_weights_hybrid(0.15, 0.0, 0.30, 0.55)
-                                .score_hybrid(
-                                    tfidf_score,
-                                    neural_score,
-                                    structural_score,
-                                    text_score,
-                                )
-                        }
-                    }
-                    crate::search::ranking::QueryType::Semantic => {
-                        if neural_available {
-                            // Semantic mode with neural embeddings: balanced
-                            self.scorer
-                                .with_weights_hybrid(0.3, 0.3, 0.1, 0.3)
-                                .score_hybrid(
-                                    tfidf_score,
-                                    neural_score,
-                                    structural_score,
-                                    text_score,
-                                )
-                        } else {
-                            // Semantic mode without neural: TF-IDF focused for
-                            // conceptual relevance. Lower text weight so that
-                            // conceptual/TF-IDF matches rank above exact-name matches.
-                            self.scorer
-                                .with_weights_hybrid(0.55, 0.0, 0.15, 0.30)
-                                .score_hybrid(
-                                    tfidf_score,
-                                    neural_score,
-                                    structural_score,
-                                    text_score,
-                                )
-                        }
-                    }
-                    crate::search::ranking::QueryType::Structural => {
-                        // Structural-heavy mode
-                        self.scorer
-                            .with_weights_hybrid(0.3, 0.0, 0.5, 0.2)
-                            .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
-                    }
-                }
-            } else {
-                // Default hybrid scoring.
-                // When neural embeddings are unavailable, redistribute weight
-                // to text match (the primary signal for keyword queries).
-                // TF-IDF is only computed in semantic mode, so when not semantic
-                // we give its weight to text match as well.
-                if neural_available {
-                    self.scorer.score_hybrid(
-                        tfidf_score,
-                        neural_score,
-                        structural_score,
-                        text_score,
-                    )
-                } else if query.semantic {
-                    self.scorer
-                        .with_weights_hybrid(0.40, 0.0, 0.20, 0.40)
-                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
-                } else {
-                    // Non-semantic, non-neural: text match is the dominant signal
-                    self.scorer
-                        .with_weights_hybrid(0.0, 0.0, 0.15, 0.85)
-                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
-                }
-            };
-
-            // Penalize fully-qualified external references (e.g., "crate::mod::func")
-            // so actual definitions rank higher than import/use references.
-            let symbol_lower = node.symbol_name.to_ascii_lowercase();
-            let is_qualified_ref = symbol_lower.contains("::") || symbol_lower.contains('.');
-            if is_qualified_ref {
-                score.overall *= 0.7;
-            }
-
-            // Boost exact symbol name matches (non-qualified definitions)
-            // so the actual function/struct definition ranks above references.
-            // The boost strength depends on search_mode: exact mode gets a
-            // stronger boost, semantic mode gets a weaker boost so conceptual
-            // relevance (TF-IDF) can compete with name matches.
-            if !is_qualified_ref {
-                if symbol_lower == text_query.query_lower {
-                    // Exact name match: boost strength varies by mode
-                    let boost = if is_exact_mode {
-                        2.2 // Exact mode: very strong boost
-                    } else {
-                        1.8 // Default/semantic: standard boost
-                    };
-                    score.overall = (score.overall * boost).min(1.0);
-                } else if !symbol_lower.is_empty() && text_query.query_lower.contains(&symbol_lower)
-                {
-                    // Symbol name appears within the query (e.g., query
-                    // "SearchEngine struct" matches symbol "SearchEngine")
-                    let boost = if is_exact_mode {
-                        1.5 // Exact mode: stronger partial boost
-                    } else {
-                        1.3 // Default/semantic: standard partial boost
-                    };
-                    score.overall = (score.overall * boost).min(1.0);
-                }
-            }
-
-            // Apply archive directory penalty: files under archive/, .archive/,
-            // or docs/archive/ are heavily deprioritized so they don't appear
-            // in top results unless the query explicitly targets archived content.
-            if Self::is_archive_path(&node.file_path) {
-                score.overall *= 0.1;
-            }
+            // Compute composite score using the shared scoring logic
+            // (single source of truth — VAL-QUALITY-005).
+            let score = self.compute_score(&query, &text_query, node, text_score, tfidf_score);
 
             if score.overall > 0.0 {
                 // Apply relevance threshold if specified
@@ -2418,128 +2272,9 @@ impl SearchEngine {
                 continue;
             }
 
-            let structural_score = (node.complexity as f32 / 100.0).min(1.0);
-
-            // Compute neural score using cosine similarity between the query's
-            // neural embedding and the node's neural embedding.
-            // Falls back to 0.0 when neural embeddings are unavailable.
-            let neural_score = match (&query.query_neural_embedding, &node.neural_embedding) {
-                (Some(q_emb), Some(n_emb)) => {
-                    crate::search::vector::cosine_similarity(q_emb, n_emb)
-                }
-                _ => 0.0,
-            };
-
-            let neural_available = query.query_neural_embedding.is_some();
-            let is_exact_mode = query
-                .query_type
-                .map(|qt| qt == crate::search::ranking::QueryType::Exact)
-                .unwrap_or(false);
-            let mut score = if let Some(qt) = query.query_type {
-                match qt {
-                    crate::search::ranking::QueryType::Text => self
-                        .scorer
-                        .with_weights_hybrid(0.2, 0.05, 0.05, 0.7)
-                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score),
-                    crate::search::ranking::QueryType::Exact => {
-                        // Exact mode: prioritize exact symbol name matches.
-                        // Higher text and structural weights, lower TF-IDF.
-                        if neural_available {
-                            self.scorer
-                                .with_weights_hybrid(0.15, 0.15, 0.25, 0.45)
-                                .score_hybrid(
-                                    tfidf_score,
-                                    neural_score,
-                                    structural_score,
-                                    text_score,
-                                )
-                        } else {
-                            self.scorer
-                                .with_weights_hybrid(0.15, 0.0, 0.30, 0.55)
-                                .score_hybrid(
-                                    tfidf_score,
-                                    neural_score,
-                                    structural_score,
-                                    text_score,
-                                )
-                        }
-                    }
-                    crate::search::ranking::QueryType::Semantic => {
-                        if neural_available {
-                            self.scorer
-                                .with_weights_hybrid(0.3, 0.3, 0.1, 0.3)
-                                .score_hybrid(
-                                    tfidf_score,
-                                    neural_score,
-                                    structural_score,
-                                    text_score,
-                                )
-                        } else {
-                            // Semantic mode without neural: TF-IDF focused for
-                            // conceptual relevance. Lower text weight so that
-                            // conceptual/TF-IDF matches rank above exact-name matches.
-                            self.scorer
-                                .with_weights_hybrid(0.55, 0.0, 0.15, 0.30)
-                                .score_hybrid(
-                                    tfidf_score,
-                                    neural_score,
-                                    structural_score,
-                                    text_score,
-                                )
-                        }
-                    }
-                    crate::search::ranking::QueryType::Structural => self
-                        .scorer
-                        .with_weights_hybrid(0.3, 0.0, 0.5, 0.2)
-                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score),
-                }
-            } else {
-                if neural_available {
-                    self.scorer.score_hybrid(
-                        tfidf_score,
-                        neural_score,
-                        structural_score,
-                        text_score,
-                    )
-                } else if query.semantic {
-                    self.scorer
-                        .with_weights_hybrid(0.40, 0.0, 0.20, 0.40)
-                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
-                } else {
-                    self.scorer
-                        .with_weights_hybrid(0.0, 0.0, 0.15, 0.85)
-                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
-                }
-            };
-
-            // Penalize fully-qualified external references (e.g., "crate::mod::func")
-            // so actual definitions rank higher than import/use references.
-            let symbol_lower = node.symbol_name.to_ascii_lowercase();
-            let is_qualified_ref = symbol_lower.contains("::") || symbol_lower.contains('.');
-            if is_qualified_ref {
-                score.overall *= 0.7;
-            }
-
-            // Boost exact symbol name matches (non-qualified definitions)
-            // The boost strength depends on search_mode: exact mode gets a
-            // stronger boost, semantic mode gets a weaker boost.
-            if !is_qualified_ref {
-                if symbol_lower == text_query.query_lower {
-                    let boost = if is_exact_mode { 2.2 } else { 1.8 };
-                    score.overall = (score.overall * boost).min(1.0);
-                } else if !symbol_lower.is_empty() && text_query.query_lower.contains(&symbol_lower)
-                {
-                    let boost = if is_exact_mode { 1.5 } else { 1.3 };
-                    score.overall = (score.overall * boost).min(1.0);
-                }
-            }
-
-            // Apply archive directory penalty: files under archive/, .archive/,
-            // or docs/archive/ are heavily deprioritized so they don't appear
-            // in top results unless the query explicitly targets archived content.
-            if Self::is_archive_path(&node.file_path) {
-                score.overall *= 0.1;
-            }
+            // Compute composite score using the shared scoring logic
+            // (single source of truth — VAL-QUALITY-005).
+            let score = self.compute_score(&query, &text_query, node, text_score, tfidf_score);
 
             if score.overall > 0.0 {
                 if let Some(threshold) = query.threshold {
@@ -2611,6 +2346,114 @@ impl SearchEngine {
         }
 
         Ok((final_results, metrics))
+    }
+
+    // ----------------------------------------------------------------
+    // Shared scoring weights (VAL-QUALITY-005)
+    //
+    // Both `search()` and `search_staged()` delegate to `compute_score()`
+    // so that the weight distribution lives in exactly one place.
+    // ----------------------------------------------------------------
+
+    /// Compute the composite [`Score`] for a single candidate node.
+    ///
+    /// This is the single source of truth for scoring weight selection.
+    /// Both [`search`](Self::search) and [`search_staged`](Self::search_staged)
+    /// call this method, ensuring the weight distributions cannot drift apart.
+    ///
+    /// The weight tuple `(tfidf, neural, structural, text)` is chosen based on:
+    /// - `query.query_type` (Text, Exact, Semantic, Structural, or None)
+    /// - Whether neural embeddings are available
+    /// - Whether semantic (TF-IDF vector) search is enabled
+    ///
+    /// After computing the base composite score, the method applies:
+    /// - Qualified-reference penalty (0.7x for `::` or `.` in symbol name)
+    /// - Exact-name-match boost (stronger in Exact mode)
+    /// - Partial-name-match boost (stronger in Exact mode)
+    /// - Archive directory penalty (0.1x for archive paths)
+    fn compute_score(
+        &self,
+        query: &SearchQuery,
+        text_query: &TextQueryPreprocessed,
+        node: &NodeInfo,
+        text_score: f32,
+        tfidf_score: f32,
+    ) -> Score {
+        let structural_score = (node.complexity as f32 / 100.0).min(1.0);
+
+        let neural_score = match (&query.query_neural_embedding, &node.neural_embedding) {
+            (Some(q_emb), Some(n_emb)) => crate::search::vector::cosine_similarity(q_emb, n_emb),
+            _ => 0.0,
+        };
+
+        let neural_available = query.query_neural_embedding.is_some();
+        let is_exact_mode = query
+            .query_type
+            .map(|qt| qt == crate::search::ranking::QueryType::Exact)
+            .unwrap_or(false);
+
+        // --- Weight selection (single source of truth) ---
+        let (w_tfidf, w_neural, w_structural, w_text) = match query.query_type {
+            Some(crate::search::ranking::QueryType::Text) => (0.2, 0.05, 0.05, 0.7),
+            Some(crate::search::ranking::QueryType::Exact) => {
+                if neural_available {
+                    (0.15, 0.15, 0.25, 0.45)
+                } else {
+                    (0.15, 0.0, 0.30, 0.55)
+                }
+            }
+            Some(crate::search::ranking::QueryType::Semantic) => {
+                if neural_available {
+                    (0.3, 0.3, 0.1, 0.3)
+                } else {
+                    (0.55, 0.0, 0.15, 0.30)
+                }
+            }
+            Some(crate::search::ranking::QueryType::Structural) => (0.3, 0.0, 0.5, 0.2),
+            None => {
+                if neural_available {
+                    // Default scorer weights (HybridScorer::for_code):
+                    // tfidf=0.30, neural=0.40, structural=0.15, text=0.15
+                    (0.30, 0.40, 0.15, 0.15)
+                } else if query.semantic {
+                    (0.40, 0.0, 0.20, 0.40)
+                } else {
+                    (0.0, 0.0, 0.15, 0.85)
+                }
+            }
+        };
+
+        let mut score = self
+            .scorer
+            .with_weights_hybrid(w_tfidf, w_neural, w_structural, w_text)
+            .score_hybrid(tfidf_score, neural_score, structural_score, text_score);
+
+        // --- Post-scoring adjustments (shared logic) ---
+
+        // Penalize fully-qualified external references
+        let symbol_lower = node.symbol_name.to_ascii_lowercase();
+        let is_qualified_ref = symbol_lower.contains("::") || symbol_lower.contains('.');
+        if is_qualified_ref {
+            score.overall *= 0.7;
+        }
+
+        // Boost exact and partial symbol name matches
+        if !is_qualified_ref {
+            if symbol_lower == text_query.query_lower {
+                let boost = if is_exact_mode { 2.2 } else { 1.8 };
+                score.overall = (score.overall * boost).min(1.0);
+            } else if !symbol_lower.is_empty() && text_query.query_lower.contains(&symbol_lower) {
+                let boost = if is_exact_mode { 1.5 } else { 1.3 };
+                score.overall = (score.overall * boost).min(1.0);
+            }
+        }
+
+        // Archive directory penalty
+        if Self::is_archive_path(&node.file_path) {
+            score.overall *= 0.1;
+        }
+
+        score
     }
 
     /// Optimized text score calculation using cached node tokens and pre-computed query data
