@@ -291,47 +291,36 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
         .context("failed to write initialized notification to MCP stdin")?;
     stdin_pipe.flush().context("failed to flush MCP stdin")?;
 
-    // Trigger a search via tools/call in a background thread.
-    // This sends the request to the MCP process we are sampling, which will
-    // activate the embedding path and spawn the worker as a child.
+    // Send the search request directly so stdin stays open during sampling.
     //
-    // A channel-based timeout guards against hangs: if the MCP server never
-    // responds, read_line blocks forever in the search thread. The timed recv
-    // prevents the sampling thread from blocking indefinitely, allowing
-    // kill_child to terminate the process (which closes pipes and unblocks
-    // the read).
+    // Previously this used a background thread that moved stdin_pipe and
+    // stdout_reader. When the thread finished (after reading the response),
+    // it dropped stdin_pipe, closing the child's stdin. The MCP server then
+    // saw EOF and exited before the sampling loop could collect enough
+    // samples, resulting in mapped_file_kib=0 and anon_kib=0.
+    //
+    // Now we send the request, sample while stdin remains open, then read
+    // the response afterwards.
     let fixture_path = config.fixture.display().to_string();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let search_handle = std::thread::spawn(move || {
-        let search_request = format!(
-            r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search","arguments":{{"query":"function","project_path":"{}"}}}}}}"#,
-            fixture_path.replace('\\', "\\\\").replace('"', "\\\"")
+    let search_request = format!(
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search","arguments":{{"query":"function","project_path":"{}"}}}}}}"#,
+        fixture_path.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    if let Err(e) = stdin_pipe.write_all(format!("{}\n", search_request).as_bytes()) {
+        eprintln!(
+            "memcheck: failed to write search request to MCP stdin: {}",
+            e
         );
-        if let Err(e) = stdin_pipe.write_all(format!("{}\n", search_request).as_bytes()) {
-            eprintln!(
-                "memcheck: failed to write search request to MCP stdin: {}",
-                e
-            );
-            let _ = tx.send(());
-            return;
-        }
-        if let Err(e) = stdin_pipe.flush() {
-            eprintln!("memcheck: failed to flush MCP stdin after search: {}", e);
-            let _ = tx.send(());
-            return;
-        }
-        // Read the search response so the MCP process can complete.
-        let mut search_response = String::new();
-        if let Err(e) = stdout_reader.read_line(&mut search_response) {
-            eprintln!(
-                "memcheck: failed to read search response from MCP stdout: {}",
-                e
-            );
-        }
-        let _ = tx.send(());
-    });
+    }
+    if let Err(e) = stdin_pipe.flush() {
+        eprintln!(
+            "memcheck: failed to flush MCP stdin after search: {}",
+            e
+        );
+    }
 
     // Sample the MCP process (and its worker child) for the dwell period.
+    // stdin_pipe is still in scope so the child process stays alive.
     let dwell = Duration::from_secs(5);
     let report = sample_pid_for_duration(
         pid,
@@ -341,14 +330,36 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
         Some(WORKER_BINARY_NAME),
     )?;
 
-    // Wait for the search to finish with a timeout.
-    match rx.recv_timeout(std::time::Duration::from_secs(30)) {
-        Ok(()) => {}
+    // Read the search response now that sampling is complete.
+    // Use a short timeout via a background thread so we don't block forever
+    // if the MCP server never responds.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let search_handle = std::thread::spawn(move || {
+        let mut search_response = String::new();
+        if let Err(e) = stdout_reader.read_line(&mut search_response) {
+            eprintln!(
+                "memcheck: failed to read search response from MCP stdout: {}",
+                e
+            );
+        }
+        let _ = tx.send(search_response);
+    });
+
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(response) => {
+            if config.verbose {
+                eprintln!(
+                    "memcheck: MCP search response: {}",
+                    response.trim()
+                );
+            }
+        }
         Err(_) => {
-            eprintln!("memcheck: WARNING: embed_active search thread timed out, detaching");
+            eprintln!("memcheck: WARNING: embed_active search response timed out, detaching");
         }
     }
     drop(search_handle);
+    drop(stdin_pipe);
 
     if config.verbose {
         eprintln!(
