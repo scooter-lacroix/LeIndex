@@ -107,13 +107,15 @@ pub(crate) fn check_manifest_stale(
     false
 }
 
-/// Fast-path freshness check: O(1) for indexed files, O(D) for source
-/// directories (typically 10-20), and O(M) for manifest files.
+/// Fast-path freshness check: O(1) for source count, O(N) for indexed
+/// files (full stat() scan of every indexed file), and O(M) for manifest
+/// files.
 ///
 /// Detection layers (in order):
 /// 1. Source count mismatch (cached vs indexed)
 /// 2. Directory mtime sentinel — detects new file additions in <1ms
-/// 3. Mtime sampling of 50-500 indexed files
+/// 3. Full O(N) mtime scan of all indexed source files — detects
+///    modifications and deletions by stat()'ing every indexed file
 /// 4. Root-manifest stat (O(14) — catches `Cargo.toml` /
 ///    `package.json` / `pyproject.toml` at the project root)
 /// 5. Bounded-depth nested-manifest walkdir (`max_depth(5)`,

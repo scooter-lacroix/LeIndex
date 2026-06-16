@@ -931,8 +931,21 @@ fn strip_trailing_commas(content: &str) -> String {
 
         if in_string {
             result.push(c);
-            if c == '"' && (i == 0 || chars[i - 1] != '\\') {
-                in_string = false;
+            if c == '"' {
+                // Count consecutive backslashes preceding this quote.
+                // An even count means the quote is unescaped (each pair \\ is
+                // an escaped backslash), so it terminates the string.
+                // An odd count means the quote itself is escaped (\"), so
+                // the string continues.
+                let mut backslashes = 0usize;
+                let mut k = i;
+                while k > 0 && chars[k - 1] == '\\' {
+                    backslashes += 1;
+                    k -= 1;
+                }
+                if backslashes % 2 == 0 {
+                    in_string = false;
+                }
             }
             i += 1;
             continue;
@@ -1222,11 +1235,11 @@ fn is_probable_builtin_import(import_name: &str) -> bool {
         "context",
         "container",
         "crypto",
-        "database.sql",
+        "database/sql",
         "debug",
         "embed",
         "encoding",
-        "encoding.json",
+        "encoding/json",
         "errors",
         "expvar",
         "flag",
@@ -1240,8 +1253,8 @@ fn is_probable_builtin_import(import_name: &str) -> bool {
         "math",
         "mime",
         "net",
-        "net.http",
-        "net.url",
+        "net/http",
+        "net/url",
         "os",
         "path",
         "plugin",
@@ -1266,10 +1279,14 @@ fn is_probable_builtin_import(import_name: &str) -> bool {
         .chain(PY_BUILTINS.iter())
         .chain(GO_BUILTINS.iter())
         .any(|prefix| {
-            normalized == *prefix
-                || normalized.starts_with(&format!("{}.", prefix))
-                || normalized == format!("node.{}", prefix)
-                || normalized.starts_with(&format!("node.{}.", prefix))
+            // Normalize prefix the same way as the import so that Go
+            // builtins written with slashes (e.g. "database/sql") match
+            // the dot-normalized import name (e.g. "database.sql").
+            let norm_prefix = normalise_import(prefix);
+            normalized == norm_prefix
+                || normalized.starts_with(&format!("{}.", norm_prefix))
+                || normalized == format!("node.{}", norm_prefix)
+                || normalized.starts_with(&format!("node.{}.", norm_prefix))
         })
 }
 
@@ -1962,5 +1979,154 @@ PLATFORMS
         let stats = annotate_external_nodes(&mut pdg, &registry);
         assert_eq!(stats.total_external, 2);
         assert_eq!(stats.unresolved, 1);
+    }
+
+    #[test]
+    fn parse_bun_lock_basic() {
+        let content = r#"{
+  "lockfileVersion": 1,
+  "packages": {
+    "react": ["react@18.2.0", "", {}, "sha512-abc="],
+    "@types/react": ["@types/react@18.2.45", "", {}, "sha512-def="],
+    "lodash": ["lodash@4.17.21", "", {}, "sha512-ghi="]
+  }
+}"#;
+        let mut registry = ExternalDependencyRegistry::new();
+        registry.parse_bun_lock(content);
+
+        assert_eq!(registry.len(), 3);
+        let react = registry.resolve("react").unwrap();
+        assert_eq!(react.version, "18.2.0");
+        assert_eq!(react.ecosystem, Ecosystem::Npm);
+
+        let types_react = registry.resolve("@types/react").unwrap();
+        assert_eq!(types_react.version, "18.2.45");
+
+        let lodash = registry.resolve("lodash").unwrap();
+        assert_eq!(lodash.version, "4.17.21");
+    }
+
+    #[test]
+    fn parse_bun_lock_with_trailing_commas() {
+        // bun.lock uses JSONC format with trailing commas
+        let content = r#"{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "my-app",
+      "dependencies": {
+        "react": "^18.2.0",
+        "zod": "^3.23.8",
+      },
+      "devDependencies": {
+        "typescript": "^5.4.0",
+      },
+    },
+  },
+  "packages": {
+    "react": ["react@18.2.0", "", {}, "sha512-abc="],
+    "zod": ["zod@3.23.8", "", {}, "sha512-def="],
+  },
+}"#;
+        let mut registry = ExternalDependencyRegistry::new();
+        registry.parse_bun_lock(content);
+
+        // Packages from lockfile should be resolved with exact versions
+        let react = registry.resolve("react").unwrap();
+        assert_eq!(react.version, "18.2.0");
+
+        let zod = registry.resolve("zod").unwrap();
+        assert_eq!(zod.version, "3.23.8");
+
+        // Workspace deps that aren't in packages should be included as fallback
+        let ts = registry.resolve("typescript").unwrap();
+        assert_eq!(ts.version, "^5.4.0");
+    }
+
+    #[test]
+    fn parse_bun_lock_scoped_packages() {
+        let content = r#"{
+  "packages": {
+    "@babel/core": ["@babel/core@7.29.0", "", {}, "sha512-abc="],
+    "@eslint/js": ["@eslint/js@10.0.1", "", {}, "sha512-def="]
+  }
+}"#;
+        let mut registry = ExternalDependencyRegistry::new();
+        registry.parse_bun_lock(content);
+
+        assert_eq!(registry.len(), 2);
+        let babel = registry.resolve("@babel/core").unwrap();
+        assert_eq!(babel.version, "7.29.0");
+
+        let eslint = registry.resolve("@eslint/js").unwrap();
+        assert_eq!(eslint.version, "10.0.1");
+    }
+
+    #[test]
+    fn parse_bun_lock_empty_and_invalid() {
+        // Empty JSON
+        let mut registry = ExternalDependencyRegistry::new();
+        registry.parse_bun_lock("{}");
+        assert_eq!(registry.len(), 0);
+
+        // Invalid JSON
+        registry.parse_bun_lock("not valid json at all");
+        assert_eq!(registry.len(), 0);
+
+        // No packages or workspaces
+        registry.parse_bun_lock(r#"{"lockfileVersion": 1}"#);
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn strip_trailing_commas_handles_escaped_backslashes() {
+        // A string containing an escaped backslash before a quote:
+        // "foo\\" — the \\ is an escaped backslash, so the " after it
+        // terminates the string. The old code (checking only the single
+        // preceding char) would incorrectly think the quote was escaped.
+        let input = r#"{"key": "value\\", "num": 42,}"#;
+        let result = strip_trailing_commas(input);
+        // The trailing comma after 42 should be removed
+        assert!(
+            !result.contains("42,}"),
+            "trailing comma should be stripped, got: {}",
+            result
+        );
+        assert!(result.contains("42"));
+        // The backslash pair should be preserved
+        assert!(
+            result.contains("value\\\\"),
+            "escaped backslashes should be preserved, got: {}",
+            result
+        );
+
+        // Verify the result is valid JSON
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("result should be valid JSON");
+        assert_eq!(parsed["key"], r"value\");
+        assert_eq!(parsed["num"], 42);
+    }
+
+    #[test]
+    fn strip_trailing_commas_handles_escaped_quote() {
+        // A string with an escaped quote: "foo\"" — the \" is an escaped
+        // quote, so the string does NOT terminate there. The final "
+        // terminates the string. The trailing comma after should be stripped.
+        let input = r#"{"key": "foo\"bar", "num": 42,}"#;
+        let result = strip_trailing_commas(input);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("result should be valid JSON");
+        assert_eq!(parsed["key"], r#"foo"bar"#);
+        assert_eq!(parsed["num"], 42);
+    }
+
+    #[test]
+    fn strip_trailing_commas_preserves_commas_inside_strings() {
+        // Commas inside strings should NOT be stripped even if followed by }
+        let input = r#"{"key": "a,b}", "num": 42}"#;
+        let result = strip_trailing_commas(input);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&result).expect("result should be valid JSON");
+        assert_eq!(parsed["key"], "a,b}");
     }
 }

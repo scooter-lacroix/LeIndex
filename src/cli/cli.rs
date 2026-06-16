@@ -637,26 +637,22 @@ async fn cmd_index_impl(
 
     info!("Indexing project at: {}", canonical_path.display());
 
-    // Check if already indexed (unless force)
-    if !force {
-        // Create temporary LeIndex to check if already indexed
-        if let Ok(check_leindex) = LeIndex::new(&canonical_path) {
-            if check_leindex.is_indexed() && !check_leindex.is_stale_fast() {
-                println!("Project already indexed and up-to-date. Use --force to re-index.");
-                return Ok(());
-            }
-            // If indexed but stale, fall through to incremental reindex
-            // (VAL-INDEX-005). If not indexed at all, fall through to full index.
-        }
-    }
-
     // Apply hard RSS limit via rlimit if requested (Linux-only)
     if let Some(mb) = max_memory {
         crate::cli::memory_cap::apply_hard_limit(mb)?;
     }
 
-    // Create LeIndex and index the project
+    // Create a single LeIndex instance and reuse it for both the staleness
+    // check and the indexing operation (VAL-QUALITY-015).
     let mut leindex = LeIndex::new(&canonical_path).context("Failed to create LeIndex instance")?;
+
+    // Check if already indexed (unless force)
+    if !force && leindex.is_indexed() && !leindex.is_stale_fast() {
+        println!("Project already indexed and up-to-date. Use --force to re-index.");
+        return Ok(());
+    }
+    // If indexed but stale, fall through to incremental reindex
+    // (VAL-INDEX-005). If not indexed at all, fall through to full index.
 
     let max_memory_bytes = max_memory.map(|mb| mb * 1024 * 1024);
     let stats = tokio::task::spawn_blocking(move || {
