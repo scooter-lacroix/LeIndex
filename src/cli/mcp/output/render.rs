@@ -2,7 +2,7 @@
 //!
 //! Each `render_*` function reads a JSON `Value` (the same data the
 //! LLM sees) and produces a human-readable, colored string for the
-//! CLI. They use shared helpers (`header`, `field`, `status_icon`,
+//! CLI. They use shared helpers (`header`, `field`,
 //! `suffix`) defined at the top of this file so the visual style stays
 //! consistent across tools.
 //!
@@ -38,17 +38,6 @@ fn field(name: &str, value: &str, color: bool) -> String {
         )
     } else {
         format!("  {}: {}\n", name, value)
-    }
-}
-
-fn status_icon(status: &str) -> (&'static str, &'static str) {
-    match status {
-        "completed" | "success" | "clean" => ("✓", LIGHT_GREEN),
-        "failed" | "error" | "dirty" | "high" => ("✗", LIGHT_RED),
-        "warning" | "medium" => ("⚠", LIGHT_YELLOW),
-        "skipped" => ("○", DIM),
-        "low" => ("·", LIGHT_GREEN),
-        _ => ("•", WHITE),
     }
 }
 
@@ -1138,51 +1127,164 @@ fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
 fn render_phase(data: &Value, color: bool) -> String {
     let mut out = header("Phase Analysis", color);
     out.push('\n');
-    if let Some(mode) = data.get("mode").and_then(|v| v.as_str()) {
-        out.push_str(&field("Mode", mode, color));
-    }
-    if let Some(arr) = data.get("phases").and_then(|v| v.as_array()) {
-        out.push('\n');
-        for p in arr {
-            let num = p.get("phase").and_then(|v| v.as_u64()).unwrap_or(0);
-            let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let status = p.get("status").and_then(|v| v.as_str()).unwrap_or("?");
-            let findings = p.get("findings").and_then(|v| v.as_u64()).unwrap_or(0);
-            let (icon, c) = if color {
-                status_icon(status)
-            } else {
-                (status_icon(status).0, "")
-            };
-            out.push_str(&format!(
-                "  {}{}{} {}{}Phase {}{} {} {}{}({} findings){}\n",
-                c,
-                icon,
-                if color { RESET } else { "" },
-                if color { BOLD } else { "" },
-                if color { RESET } else { "" },
-                num,
-                if color { RESET } else { "" },
-                name,
-                if color { DIM } else { "" },
-                "",
-                findings,
-                if color { RESET } else { "" },
-            ));
+
+    // Show executed phases
+    if let Some(ep) = data.get("executed_phases").and_then(|v| v.as_array()) {
+        let nums: Vec<String> = ep
+            .iter()
+            .filter_map(|v| v.as_u64().map(|n| n.to_string()))
+            .collect();
+        if !nums.is_empty() {
+            out.push_str(&field("Executed phases", &nums.join(", "), color));
         }
     }
-    if let Some(summary) = data.get("summary").and_then(|v| v.as_str()) {
+
+    // Show cache hit status
+    if let Some(ch) = data.get("cache_hit").and_then(|v| v.as_bool()) {
+        out.push_str(&field(
+            "Cache hit",
+            if ch { "true" } else { "false" },
+            color,
+        ));
+    }
+
+    // Show generation
+    if let Some(gen) = data.get("generation").and_then(|v| v.as_str()) {
+        out.push_str(&field("Generation", gen, color));
+    }
+
+    // Phase 1: Parsing & signatures
+    if let Some(p1) = data.get("phase1") {
         out.push('\n');
-        let truncated = truncate_chars(summary, 300);
+        let files = p1.get("total_files").and_then(|v| v.as_u64()).unwrap_or(0);
+        let sigs = p1.get("signatures").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cache = p1
+            .get("cache_hit")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let label = if cache { "cache hit" } else { "parsed" };
         out.push_str(&format!(
-            "  {}{}:{} {}{}{}\n",
+            "  {}Phase 1:{} {} files, {} signatures ({}){}\n",
             if color { BOLD } else { "" },
-            "Summary",
             if color { RESET } else { "" },
-            if color { DIM } else { "" },
-            truncated,
+            files,
+            sigs,
+            label,
             if color { RESET } else { "" },
         ));
     }
+
+    // Phase 2: Import graph
+    if let Some(p2) = data.get("phase2") {
+        let internal = p2
+            .get("internal_import_edges")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let external = p2
+            .get("external_import_edges")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let unresolved = p2
+            .get("unresolved_modules")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "  {}Phase 2:{} {} internal, {} external, {} unresolved modules{}\n",
+            if color { BOLD } else { "" },
+            if color { RESET } else { "" },
+            internal,
+            external,
+            unresolved,
+            if color { RESET } else { "" },
+        ));
+    }
+
+    // Phase 3: Entry points & impact
+    if let Some(p3) = data.get("phase3") {
+        let entries = p3
+            .get("entry_points")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let impacted = p3
+            .get("impacted_nodes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "  {}Phase 3:{} {} entry points, {} impacted nodes{}\n",
+            if color { BOLD } else { "" },
+            if color { RESET } else { "" },
+            entries,
+            impacted,
+            if color { RESET } else { "" },
+        ));
+    }
+
+    // Phase 4: Complexity hotspots
+    if let Some(p4) = data.get("phase4") {
+        let hotspots = p4
+            .get("hotspots")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "  {}Phase 4:{} {} hotspots{}\n",
+            if color { BOLD } else { "" },
+            if color { RESET } else { "" },
+            hotspots,
+            if color { RESET } else { "" },
+        ));
+        // List top hotspots
+        if let Some(hs_arr) = p4.get("hotspots").and_then(|v| v.as_array()) {
+            for (i, h) in hs_arr.iter().take(5).enumerate() {
+                let name = h.get("node_id").and_then(|v| v.as_str()).unwrap_or("?");
+                let score = h.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let cx = h.get("complexity").and_then(|v| v.as_u64()).unwrap_or(0);
+                out.push_str(&format!(
+                    "    {}. {} {}(score: {:.2}, complexity: {}){}\n",
+                    i + 1,
+                    name,
+                    if color { DIM } else { "" },
+                    score,
+                    cx,
+                    if color { RESET } else { "" },
+                ));
+            }
+        }
+    }
+
+    // Phase 5: Recommendations
+    if let Some(p5) = data.get("phase5") {
+        let recs = p5
+            .get("recommendations")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        out.push_str(&format!(
+            "  {}Phase 5:{} {} recommendations{}\n",
+            if color { BOLD } else { "" },
+            if color { RESET } else { "" },
+            recs,
+            if color { RESET } else { "" },
+        ));
+    }
+
+    // Show formatted_output if present (the full human-readable report)
+    if let Some(formatted) = data.get("formatted_output").and_then(|v| v.as_str()) {
+        if !formatted.is_empty() {
+            out.push('\n');
+            let truncated = truncate_chars(formatted, 2000);
+            for line in truncated.lines() {
+                out.push_str(&format!(
+                    "  {}{}{}\n",
+                    if color { DIM } else { "" },
+                    line,
+                    if color { RESET } else { "" },
+                ));
+            }
+        }
+    }
+
     out
 }
 
