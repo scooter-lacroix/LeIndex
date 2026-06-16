@@ -45,11 +45,15 @@ pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 /// Default maximum single-text size in bytes (1 MiB).
 pub const DEFAULT_MAX_TEXT_SIZE: usize = 1024 * 1024;
 
-/// Maximum texts per ONNX inference call. Prevents memory explosion when
-/// embedding large codebases (10,000+ nodes).
-/// Memory per sub-batch: ~640 MiB for [32, 512, 1024] tensor + activations.
+/// Maximum texts per ONNX inference call.
+///
+/// The qwen3-embed-0.6b.onnx model was exported with a fixed batch dimension
+/// of 1 in its internal attention mask tensors. Any batch_size > 1 causes
+/// "Shape mismatch attempting to re-use buffer" errors in ONNX Runtime.
+/// Processing one text at a time is the only correct approach for this model.
+/// At ~17ms per text on CPU, 10,000 texts takes ~2.8 minutes.
 #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-const ONNX_INFERENCE_BATCH_SIZE: usize = 32;
+const ONNX_INFERENCE_BATCH_SIZE: usize = 1;
 
 /// Configuration for the worker runtime.
 #[derive(Debug, Clone)]
