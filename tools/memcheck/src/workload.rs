@@ -313,10 +313,7 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
         );
     }
     if let Err(e) = stdin_pipe.flush() {
-        eprintln!(
-            "memcheck: failed to flush MCP stdin after search: {}",
-            e
-        );
+        eprintln!("memcheck: failed to flush MCP stdin after search: {}", e);
     }
 
     // Sample the MCP process (and its worker child) for the dwell period.
@@ -348,10 +345,7 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
     match rx.recv_timeout(std::time::Duration::from_secs(5)) {
         Ok(response) => {
             if config.verbose {
-                eprintln!(
-                    "memcheck: MCP search response: {}",
-                    response.trim()
-                );
+                eprintln!("memcheck: MCP search response: {}", response.trim());
             }
         }
         Err(_) => {

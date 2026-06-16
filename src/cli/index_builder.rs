@@ -1728,6 +1728,7 @@ pub(crate) fn persist_embeddings_to_mmap(
 /// This stores the ONNX neural embeddings (1024-dim) separately from the
 /// TF-IDF embeddings (768-dim) so they can be restored without re-computing
 /// ONNX inference for all nodes.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
 pub(crate) fn persist_neural_embeddings_to_mmap(
     search_engine: &SearchEngine,
     project_path: &Path,
@@ -1748,6 +1749,7 @@ pub(crate) fn persist_neural_embeddings_to_mmap(
 }
 
 /// Path for the neural embeddings mmap file.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
 fn neural_mmap_embeddings_path(project_path: &Path) -> PathBuf {
     project_path.join(".leindex").join("neural_embeddings.bin")
 }
@@ -1755,6 +1757,7 @@ fn neural_mmap_embeddings_path(project_path: &Path) -> PathBuf {
 /// Try to load previously persisted neural embeddings from mmap file.
 ///
 /// Returns `None` if the file does not exist or is corrupt.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
 pub(crate) fn try_load_neural_mmap_embeddings(
     project_path: &Path,
 ) -> Option<crate::search::vector::MmapEmbeddingIndex> {
