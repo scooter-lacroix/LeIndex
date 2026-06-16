@@ -2766,7 +2766,7 @@ mod tests {
             let text = "test code embedding";
             if let Some(Ok(neural_embedding)) = embedder.embed_neural_blocking(text) {
                 assert!(
-                    neural_embedding.len() > 0,
+                    !neural_embedding.is_empty(),
                     "neural embedding should have non-zero dimension"
                 );
                 // Real embeddings should have non-zero values

@@ -32,9 +32,16 @@ impl ModelResolver {
         let mut dirs = Vec::new();
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(parent) = exe_path.parent() {
+                // 1. exe_parent/models (e.g., target/release/models)
                 dirs.push(parent.join("models"));
                 if let Some(grandparent) = parent.parent() {
+                    // 2. exe_parent/../models (e.g., target/models)
                     dirs.push(grandparent.join("models"));
+                    // VAL-ONNX-004: 3. exe_parent/../../models (e.g., workspace root models)
+                    // When running from target/release/, models are at ../../models/
+                    if let Some(great_grandparent) = grandparent.parent() {
+                        dirs.push(great_grandparent.join("models"));
+                    }
                 }
             }
         }

@@ -52,7 +52,10 @@ pub enum Provider {
     Cpu,
     /// CUDA GPU execution provider.
     Cuda,
-    /// ROCm GPU execution provider.
+    /// MIGraphX GPU execution provider (AMD GPUs via ROCm).
+    /// This is the modern replacement for the deprecated ROCmExecutionProvider.
+    Migraphx,
+    /// ROCm GPU execution provider (deprecated, use MIGraphX instead).
     Rocm,
     /// CoreML execution provider (macOS).
     CoreMl,
@@ -64,6 +67,7 @@ impl Provider {
         match self {
             Provider::Cpu => "cpu".to_string(),
             Provider::Cuda => "cuda".to_string(),
+            Provider::Migraphx => "migraphx".to_string(),
             Provider::Rocm => "rocm".to_string(),
             Provider::CoreMl => "coreml".to_string(),
         }
@@ -74,6 +78,7 @@ impl Provider {
         match name.to_lowercase().as_str() {
             "cpu" => Some(Provider::Cpu),
             "cuda" | "gpu" => Some(Provider::Cuda),
+            "migraphx" => Some(Provider::Migraphx),
             "rocm" => Some(Provider::Rocm),
             "coreml" => Some(Provider::CoreMl),
             _ => None,
@@ -94,7 +99,40 @@ impl ExecutionProviderSelector {
     ///
     /// Returns `Ok(ProviderSelection)` if the requested provider is available,
     /// or `Err(ProviderSelection)` with a fallback to CPU if not.
+    ///
+    /// Note: "rocm" is accepted as an alias for "migraphx" because the
+    /// ROCmExecutionProvider has been removed from ONNX Runtime (replaced
+    /// by MIGraphX). This maintains backwards compatibility for users who
+    /// set LEINDEX_WORKER_EXECUTION_PROVIDER=rocm.
     pub fn select(requested: &str) -> Result<ProviderSelection, ProviderSelection> {
+        // "auto" tries to find the best available GPU provider
+        if requested.eq_ignore_ascii_case("auto") {
+            // Try MIGraphX first (modern AMD GPU provider)
+            if Self::is_migraphx_available() {
+                return Ok(ProviderSelection {
+                    provider: Provider::Migraphx,
+                    is_requested: true,
+                    fallback_reason: Some("auto-detected MIGraphX (AMD GPU)".to_string()),
+                });
+            }
+            // Try CUDA next (NVIDIA GPU)
+            if Self::is_cuda_available() {
+                return Ok(ProviderSelection {
+                    provider: Provider::Cuda,
+                    is_requested: true,
+                    fallback_reason: Some("auto-detected CUDA (NVIDIA GPU)".to_string()),
+                });
+            }
+            // Fall back to CPU
+            return Err(ProviderSelection {
+                provider: Provider::Cpu,
+                is_requested: false,
+                fallback_reason: Some(
+                    "auto: no GPU execution provider found, falling back to CPU".to_string(),
+                ),
+            });
+        }
+
         let requested_provider = Provider::from_name(requested);
 
         match requested_provider {
@@ -120,8 +158,8 @@ impl ExecutionProviderSelector {
                     })
                 }
             }
-            Some(provider @ Provider::Rocm) => {
-                if Self::is_rocm_available() {
+            Some(provider @ Provider::Migraphx) => {
+                if Self::is_migraphx_available() {
                     Ok(ProviderSelection {
                         provider,
                         is_requested: true,
@@ -131,7 +169,39 @@ impl ExecutionProviderSelector {
                     Err(ProviderSelection {
                         provider: Provider::Cpu,
                         is_requested: false,
-                        fallback_reason: Some("ROCm runtime not found on this system".to_string()),
+                        fallback_reason: Some(
+                            "MIGraphX not found on this system (requires ROCm + MIGraphX)"
+                                .to_string(),
+                        ),
+                    })
+                }
+            }
+            // "rocm" maps to MIGraphX since ROCmExecutionProvider was removed from ORT
+            Some(provider @ Provider::Rocm) => {
+                if Self::is_migraphx_available() {
+                    Ok(ProviderSelection {
+                        // Use MIGraphX as the actual provider
+                        provider: Provider::Migraphx,
+                        is_requested: true,
+                        fallback_reason: Some(
+                            "ROCm EP is deprecated, using MIGraphX (the modern AMD GPU provider)"
+                                .to_string(),
+                        ),
+                    })
+                } else if Self::is_rocm_available() {
+                    // Very old ORT builds may still have ROCM EP
+                    Ok(ProviderSelection {
+                        provider,
+                        is_requested: true,
+                        fallback_reason: None,
+                    })
+                } else {
+                    Err(ProviderSelection {
+                        provider: Provider::Cpu,
+                        is_requested: false,
+                        fallback_reason: Some(
+                            "Neither MIGraphX nor ROCm runtime found on this system".to_string(),
+                        ),
                     })
                 }
             }
@@ -179,7 +249,28 @@ impl ExecutionProviderSelector {
         }
     }
 
+    /// Check if MIGraphX is available on this system.
+    /// MIGraphX is the modern AMD GPU execution provider for ONNX Runtime,
+    /// replacing the deprecated ROCmExecutionProvider.
+    fn is_migraphx_available() -> bool {
+        #[cfg(feature = "onnx")]
+        {
+            ort::ep::MIGraphX::default().is_available().unwrap_or(false)
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            // Conservative fallback: check for MIGraphX binary presence
+            std::path::Path::new("/opt/rocm/bin/migraphx-driver").exists()
+                || std::env::var("ROCM_PATH")
+                    .map(|p| std::path::Path::new(&p).join("bin/migraphx-driver").exists())
+                    .unwrap_or(false)
+        }
+    }
+
     /// Check if ROCm is available on this system.
+    /// Note: ROCm being available does not mean the deprecated ROCmExecutionProvider
+    /// is compiled into the ONNX Runtime build. Use `is_migraphx_available()` for
+    /// the modern AMD GPU provider.
     fn is_rocm_available() -> bool {
         #[cfg(feature = "onnx")]
         {
@@ -263,13 +354,35 @@ mod tests {
     #[test]
     fn test_rocm_provider_selection() {
         let result = ExecutionProviderSelector::select("rocm");
+        // "rocm" now maps to MIGraphX (the modern AMD GPU provider)
         match result {
             Ok(selection) => {
-                assert_eq!(selection.name(), "rocm");
+                // Should use migraphx (or rocm on very old ORT builds)
+                let name = selection.name();
+                assert!(name == "migraphx" || name == "rocm");
             }
             Err(fallback) => {
                 assert_eq!(fallback.fallback_name(), "cpu");
-                assert!(fallback.reason().contains("ROCm"));
+                assert!(
+                    fallback.reason().contains("ROCm")
+                        || fallback.reason().contains("MIGraphX")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_migraphx_provider_selection() {
+        let result = ExecutionProviderSelector::select("migraphx");
+        match result {
+            Ok(selection) => {
+                assert_eq!(selection.name(), "migraphx");
+                assert!(selection.is_requested_provider());
+            }
+            Err(fallback) => {
+                assert_eq!(fallback.fallback_name(), "cpu");
+                assert!(!fallback.is_requested_provider());
+                assert!(fallback.reason().contains("MIGraphX"));
             }
         }
     }
@@ -292,6 +405,7 @@ mod tests {
     fn test_provider_from_name() {
         assert_eq!(Provider::from_name("cpu"), Some(Provider::Cpu));
         assert_eq!(Provider::from_name("CUDA"), Some(Provider::Cuda));
+        assert_eq!(Provider::from_name("migraphx"), Some(Provider::Migraphx));
         assert_eq!(Provider::from_name("rocm"), Some(Provider::Rocm));
         assert_eq!(Provider::from_name("CoreML"), Some(Provider::CoreMl));
         assert_eq!(Provider::from_name("unknown"), None);
@@ -301,6 +415,7 @@ mod tests {
     fn test_provider_name() {
         assert_eq!(Provider::Cpu.name(), "cpu");
         assert_eq!(Provider::Cuda.name(), "cuda");
+        assert_eq!(Provider::Migraphx.name(), "migraphx");
         assert_eq!(Provider::Rocm.name(), "rocm");
         assert_eq!(Provider::CoreMl.name(), "coreml");
     }

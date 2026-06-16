@@ -210,6 +210,11 @@ turso = ["dep:libsql", "dep:rusqlite_migration"]
 # ONNX inference is delegated to the leindex-embed worker process.
 onnx = ["search", "dep:leindex-embed", "dep:which"]
 
+# AMD GPU acceleration via MIGraphX (requires ROCm installed).
+# MIGraphX is the modern replacement for the deprecated ROCmExecutionProvider.
+# Use with: cargo build --features onnx-migraphx
+onnx-migraphx = ["onnx", "leindex-embed/onnx-migraphx"]
+
 # Remote embedding API support (OpenAI, etc.)
 # Opt-in feature: Use cloud-based embedding services instead of local models
 # Use with: cargo build --features "remote-embeddings"

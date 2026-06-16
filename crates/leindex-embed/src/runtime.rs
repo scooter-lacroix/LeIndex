@@ -30,7 +30,7 @@ use crate::startup::{StartupReport, StartupReporter};
 
 // ONNX Runtime imports - only available with "onnx" feature
 #[cfg(feature = "onnx")]
-use ort::session::Session;
+use ort::session::{Session, builder::GraphOptimizationLevel};
 
 /// Default idle timeout in seconds before the worker tears itself down.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes
@@ -171,6 +171,7 @@ impl WorkerRuntime {
     }
 
     #[cfg(feature = "onnx")]
+    #[allow(clippy::type_complexity)]
     fn init_onnx(
         config: &RuntimeConfig,
     ) -> (
@@ -261,13 +262,25 @@ impl WorkerRuntime {
                     Err(e) => {
                         tracing::warn!("{} EP not available: {}, falling back to CPU", $name, e);
                         Session::builder()?
+                            .with_memory_pattern(false)?
+                            .with_optimization_level(GraphOptimizationLevel::Level1)?
                             .with_execution_providers([ort::ep::CPU::default().build()])?
                     }
                 }
             };
         }
 
-        let session_builder = Session::builder()?;
+        let session_builder = Session::builder()?
+            // Disable memory pattern reuse to prevent shape mismatch errors when
+            // sub-batch sizes vary between inference calls (e.g., [32, seq, dim]
+            // followed by [12, seq, dim]). Without this, ORT caches an internal
+            // buffer shaped for the first batch size and fails on subsequent calls
+            // with a different batch size: "{1,1,143,143} != {12,1,143,143}".
+            .with_memory_pattern(false)?
+            // Use Level1 optimization to avoid Level2+ graph transformations
+            // that fuse attention mask operations into nodes with fixed buffer
+            // shapes, causing the same shape mismatch on variable batch sizes.
+            .with_optimization_level(GraphOptimizationLevel::Level1)?;
 
         // Configure execution providers based on selection
         let mut session_builder = match provider_name {
@@ -572,12 +585,12 @@ impl WorkerRuntime {
         #[cfg(feature = "onnx")]
         {
             if let (Some(session), Some(tokenizer)) = (&self.session, &self.tokenizer) {
-                return self.run_onnx_embed(session, tokenizer, &texts, embed_req.expected_dim);
+                self.run_onnx_embed(session, tokenizer, &texts, embed_req.expected_dim)
             } else {
-                return Err(WorkerError {
+                Err(WorkerError {
                     kind: ErrorKind::ModelNotFound,
                     message: "ONNX session or tokenizer not initialized".to_string(),
-                });
+                })
             }
         }
 
@@ -624,13 +637,41 @@ impl WorkerRuntime {
         // ONNX_INFERENCE_BATCH_SIZE texts, keeping tensor allocation bounded.
         let mut all_pooled: Vec<f32> = Vec::with_capacity(encodings.len() * expected_dim);
 
-        for sub_batch in encodings.chunks(ONNX_INFERENCE_BATCH_SIZE) {
-            let sub_pooled = self.run_onnx_embed_sub_batch(
-                session,
-                sub_batch,
-                expected_dim,
-            )?;
-            all_pooled.extend_from_slice(&sub_pooled);
+        let total_texts = encodings.len();
+        for (chunk_idx, sub_batch) in encodings.chunks(ONNX_INFERENCE_BATCH_SIZE).enumerate() {
+            // Pad the last sub-batch to ONNX_INFERENCE_BATCH_SIZE with dummy texts.
+            // The qwen3-embed model has internal attention bias tensors that assume
+            // a fixed batch dimension. When the last sub-batch has fewer texts than
+            // prior sub-batches, ONNX Runtime's internal buffer reuse causes a shape
+            // mismatch error. Padding ensures all sub-batches have the same batch size.
+            let is_last_chunk = (chunk_idx + 1) * ONNX_INFERENCE_BATCH_SIZE >= total_texts;
+            let needs_padding = is_last_chunk && sub_batch.len() < ONNX_INFERENCE_BATCH_SIZE;
+
+            if needs_padding {
+                let pad_count = ONNX_INFERENCE_BATCH_SIZE - sub_batch.len();
+                let mut padded: Vec<tokenizers::Encoding> = sub_batch.to_vec();
+                // Use the first encoding as a template for padding (its results will be discarded)
+                if let Some(template) = sub_batch.first() {
+                    let template = template.clone();
+                    for _ in 0..pad_count {
+                        padded.push(template.clone());
+                    }
+                }
+                let sub_pooled = self.run_onnx_embed_sub_batch(
+                    session,
+                    &padded,
+                    expected_dim,
+                )?;
+                // Only keep results for the real texts, discard padding
+                all_pooled.extend_from_slice(&sub_pooled[..sub_batch.len() * expected_dim]);
+            } else {
+                let sub_pooled = self.run_onnx_embed_sub_batch(
+                    session,
+                    sub_batch,
+                    expected_dim,
+                )?;
+                all_pooled.extend_from_slice(&sub_pooled);
+            }
         }
 
         let total_count = encodings.len();
@@ -849,10 +890,10 @@ impl WorkerRuntime {
             for s in 0..seq_len {
                 let mask_val = attention_mask.get(b * seq_len + s).copied().unwrap_or(0);
                 if mask_val > 0 {
-                    for h in 0..hidden_dim {
+                    for (h, sum_val) in sum.iter_mut().enumerate() {
                         let idx = b * seq_len * hidden_dim + s * hidden_dim + h;
                         if let Some(&val) = embeddings.get(idx) {
-                            sum[h] += val;
+                            *sum_val += val;
                         }
                     }
                     weight_sum += 1.0f32;
@@ -861,21 +902,21 @@ impl WorkerRuntime {
 
             // Mean pooling
             if weight_sum > 0.0f32 {
-                for h in 0..hidden_dim {
-                    sum[h] /= weight_sum;
+                for sum_val in sum.iter_mut() {
+                    *sum_val /= weight_sum;
                 }
             }
 
             // L2 normalize
             let mut norm: f32 = 0.0f32;
-            for h in 0..hidden_dim {
-                norm += sum[h] * sum[h];
+            for &val in sum.iter() {
+                norm += val * val;
             }
             norm = norm.sqrt();
 
             if norm > 1e-10f32 {
-                for h in 0..hidden_dim {
-                    sum[h] /= norm;
+                for sum_val in sum.iter_mut() {
+                    *sum_val /= norm;
                 }
             }
 
@@ -905,12 +946,12 @@ impl WorkerRuntime {
         #[cfg(feature = "onnx")]
         {
             if let (Some(session), Some(tokenizer)) = (&self.session, &self.tokenizer) {
-                return self.run_onnx_rerank(session, tokenizer, &rerank_req);
+                self.run_onnx_rerank(session, tokenizer, &rerank_req)
             } else {
-                return Err(WorkerError {
+                Err(WorkerError {
                     kind: ErrorKind::ModelNotFound,
                     message: "ONNX session or tokenizer not initialized for rerank".to_string(),
-                });
+                })
             }
         }
 
@@ -964,17 +1005,37 @@ impl WorkerRuntime {
         let mut all_rerank_scores: Vec<f32> =
             Vec::with_capacity(rerank_req.documents.len());
 
-        for sub_batch in encodings.chunks(ONNX_INFERENCE_BATCH_SIZE) {
-            let sub_scores =
-                self.run_onnx_rerank_sub_batch(session, sub_batch)?;
-            all_rerank_scores.extend_from_slice(&sub_scores);
+        let total_docs = encodings.len();
+        for (chunk_idx, sub_batch) in encodings.chunks(ONNX_INFERENCE_BATCH_SIZE).enumerate() {
+            // Pad the last sub-batch to ONNX_INFERENCE_BATCH_SIZE to prevent
+            // shape mismatch errors from ONNX Runtime buffer reuse.
+            let is_last_chunk = (chunk_idx + 1) * ONNX_INFERENCE_BATCH_SIZE >= total_docs;
+            let needs_padding = is_last_chunk && sub_batch.len() < ONNX_INFERENCE_BATCH_SIZE;
+
+            if needs_padding {
+                let pad_count = ONNX_INFERENCE_BATCH_SIZE - sub_batch.len();
+                let mut padded: Vec<tokenizers::Encoding> = sub_batch.to_vec();
+                if let Some(template) = sub_batch.first() {
+                    let template = template.clone();
+                    for _ in 0..pad_count {
+                        padded.push(template.clone());
+                    }
+                }
+                let sub_scores =
+                    self.run_onnx_rerank_sub_batch(session, &padded)?;
+                all_rerank_scores.extend_from_slice(&sub_scores[..sub_batch.len()]);
+            } else {
+                let sub_scores =
+                    self.run_onnx_rerank_sub_batch(session, sub_batch)?;
+                all_rerank_scores.extend_from_slice(&sub_scores);
+            }
         }
 
         // Build results with combined scores: 70% rerank + 30% initial
         let mut results: Vec<_> = rerank_req
             .documents
             .iter()
-            .zip(all_rerank_scores.into_iter())
+            .zip(all_rerank_scores)
             .map(|(doc, rerank_score)| {
                 let combined_score = 0.7 * rerank_score + 0.3 * doc.initial_score;
                 protocol::RerankResult {

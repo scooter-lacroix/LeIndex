@@ -80,7 +80,9 @@ const MAX_RESPONSE_FRAME_SIZE: u32 = 64 * 1024 * 1024; // 64 MiB
 ///
 /// If the worker does not respond within this window, the IPC operation
 /// fails with a timeout error rather than blocking indefinitely.
-const IPC_TIMEOUT_SECS: u64 = 30;
+/// Set to 300 seconds to accommodate large batch embeddings on CPU
+/// (9992+ texts can take over a minute on CPU; GPU is much faster).
+const IPC_TIMEOUT_SECS: u64 = 300;
 
 fn platform_binary_name(binary_name: &str) -> String {
     if cfg!(windows) {
@@ -241,6 +243,12 @@ enum ReadRequest {
     Shutdown,
 }
 
+impl Default for EmbeddingClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EmbeddingClient {
     /// Create a new embedding client.
     ///
@@ -284,10 +292,24 @@ impl EmbeddingClient {
             ClientError::SpawnFailed(format!("failed to resolve worker binary: {}", e))
         })?;
 
-        let mut child = Command::new(&worker_path)
+        let mut cmd = Command::new(&worker_path);
+        // VAL-ONNX-002: Explicitly pass key env vars to the worker process
+        // so it can locate model files and select the correct execution provider.
+        // std::process::Command inherits the parent environment by default, but
+        // we set these explicitly for clarity and robustness.
+        if let Ok(model_path) = std::env::var("LEINDEX_MODEL_PATH") {
+            cmd.env("LEINDEX_MODEL_PATH", &model_path);
+        }
+        if let Ok(provider) = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER") {
+            cmd.env("LEINDEX_WORKER_EXECUTION_PROVIDER", &provider);
+        }
+
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // VAL-ONNX-003: Inherit stderr so worker startup errors and model
+            // loading issues are visible during debugging.
+            .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| ClientError::SpawnFailed(e.to_string()))?;
 
@@ -439,7 +461,7 @@ impl EmbeddingClient {
 
         // Attempt 1: initial try
         match self.embed_attempt(batch_id, texts, expected_dim) {
-            Ok(response) => return EmbedResult::Success(response),
+            Ok(response) => EmbedResult::Success(response),
             Err(first_error) => {
                 // VAL-CPHASE-017: Retry once after killing the failed worker
                 tracing::warn!(
@@ -460,10 +482,10 @@ impl EmbeddingClient {
                             retry_batch = %retry_batch_id,
                             "ONNX worker retry succeeded"
                         );
-                        return EmbedResult::Success(response);
+                        EmbedResult::Success(response)
                     }
                     Err(retry_error) => {
-                        // VAL-CPHASE-018: Second failure → TF-IDF fallback for this batch only
+                        // VAL-CPHASE-018: Second failure -> TF-IDF fallback for this batch only
                         // VAL-CPHASE-019: Emit actionable warning
                         tracing::warn!(
                             batch_id = %batch_id,
@@ -479,10 +501,10 @@ impl EmbeddingClient {
                         // spawned for later requests
                         self.kill_worker();
 
-                        return EmbedResult::Fallback {
+                        EmbedResult::Fallback {
                             batch_id,
                             error: retry_error,
-                        };
+                        }
                     }
                 }
             }

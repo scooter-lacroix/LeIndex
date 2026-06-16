@@ -543,6 +543,10 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
     if let Some(v) = data.get("last_indexed_secs_ago").and_then(|v| v.as_u64()) {
         out.push_str(&field("Last indexed", &format!("{}s ago", v), color));
     }
+    // VAL-ONNX-006: Show embedding model status at top level for CLI diagnostics
+    if let Some(v) = data.get("embedding_model").and_then(|v| v.as_str()) {
+        out.push_str(&field("Embedding model", v, color));
+    }
     // System health section
     if let Some(sh) = data.get("system_health") {
         out.push('\n');

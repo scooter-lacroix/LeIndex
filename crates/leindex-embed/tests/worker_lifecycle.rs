@@ -20,17 +20,17 @@ use std::time::Duration;
 use leindex_embed::batch::{self, BatchConfig, SplitResult};
 use leindex_embed::model_path::ModelResolver;
 use leindex_embed::protocol::{
-    self, BatchId, EmbedRequest, EmbedResponse, MsgType, Request, Response,
+    self, BatchId, EmbedRequest, EmbedResponse, MsgType, Request,
 };
+#[cfg(not(feature = "onnx"))]
+use leindex_embed::protocol::Response;
 use leindex_embed::provider::ExecutionProviderSelector;
 use leindex_embed::runtime::{RuntimeConfig, WorkerRuntime};
 use leindex_embed::startup::{StartupReport, StartupReporter};
 
 #[cfg(feature = "onnx")]
 mod rerank_output_shape_tests {
-    use super::*;
     use ndarray::ArrayD;
-    use std::sync::{Arc, Mutex};
 
     struct FakeOutput {
         shape: Vec<usize>,

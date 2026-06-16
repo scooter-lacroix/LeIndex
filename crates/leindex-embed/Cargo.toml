@@ -14,7 +14,10 @@ default = []
 
 # Neural embeddings with ONNX Runtime and tokenizers
 # Only needed for the worker binary, not for the main crate.
+# The `migraphx` feature enables AMD GPU acceleration via MIGraphX,
+# which is the modern replacement for the deprecated ROCmExecutionProvider.
 onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+onnx-migraphx = ["onnx", "ort/migraphx"]
 
 [dependencies]
 # Protocol serialization

@@ -13,7 +13,7 @@ use std::time::Duration;
 /// Startup report emitted by the worker on launch.
 #[derive(Debug, Clone)]
 pub struct StartupReport {
-    /// Execution provider name (e.g., "cpu", "cuda", "rocm").
+    /// Execution provider name (e.g., "cpu", "cuda", "migraphx", "rocm").
     pub execution_provider: String,
     /// Whether the requested provider was available.
     pub provider_available: bool,

@@ -18,7 +18,11 @@ use leindex_embed::runtime::{RuntimeConfig, WorkerRuntime};
 
 fn main() {
     // Initialize minimal logging
+    // IMPORTANT: tracing output MUST go to stderr, not stdout, because stdout
+    // is used for IPC frame communication with the parent leindex process.
+    // Writing tracing logs to stdout would corrupt the IPC protocol.
     let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),

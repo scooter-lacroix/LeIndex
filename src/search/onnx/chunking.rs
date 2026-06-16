@@ -59,13 +59,6 @@ impl CrossLanguageChunker {
         Self { config }
     }
 
-    /// Create with default configuration
-    pub fn default() -> Self {
-        Self {
-            config: ChunkConfig::default(),
-        }
-    }
-
     /// Chunk a code file for cross-language semantic understanding
     ///
     /// This method chunks code while preserving:
