@@ -8,6 +8,7 @@ description = "ONNX embedding worker for LeIndex — runs neural embedding and r
 license = "MIT"
 repository = "https://github.com/scooter-lacroix/LeIndex"
 homepage = "https://github.com/scooter-lacroix/LeIndex#readme"
+build = "build.rs"
 
 [features]
 default = []
@@ -35,10 +36,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # ONNX Runtime dependencies — owned exclusively by the worker crate
-# Use api-23 (not the default api-24) because the MIGraphX-enabled ONNX Runtime
-# library (1.23.2 from onnxruntime-migraphx) only supports API version 23.
-# The default api-24 requires ONNX Runtime 1.24.x which has no MIGraphX build.
-ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["ndarray", "std", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-23"] }
+# Use api-24 to match the struct layout of ORT 1.25.0 (onnxruntime-migraphx 1.25.0).
+# ORT 1.25.0 has the 13-field OrtApi struct that ort-sys 2.0.0-rc.12 expects.
+# The previous api-23 caused a struct layout mismatch segfault with ORT 1.23.2.
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["ndarray", "std", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-24"] }
 tokenizers = { version = "0.20", optional = true }
 ndarray = { version = "0.17", optional = true }
 dirs = { version = "5" }

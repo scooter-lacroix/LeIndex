@@ -1,7 +1,11 @@
 fn main() {
+    // Add rpath $ORIGIN so the binary finds libonnxruntime.so next to itself
     #[cfg(feature = "onnx")]
     {
         println!("cargo:rerun-if-changed=build.rs");
+
+        // Linker flag: search shared libs in the binary's own directory
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
 
         let model_dir = std::path::Path::new("models");
         let embed_model = model_dir.join("qwen3-embed-0.6b.onnx");
