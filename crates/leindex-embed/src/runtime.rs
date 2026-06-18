@@ -314,6 +314,42 @@ impl WorkerRuntime {
             // shapes, causing the same shape mismatch on variable batch sizes.
             .with_optimization_level(GraphOptimizationLevel::Level1)?;
 
+        // VAL-ORT-015 / VAL-ORT-016: dynamic-load pre-flight check.
+        //
+        // When the `ort` crate's `load-dynamic` feature is used, the ORT binary
+        // is NOT known at compile time. The selector in `provider.rs` may report
+        // MIGraphX as available based on a useful-but-imprecise heuristic
+        // (presence of ROCm under /opt/rocm). The heuristic is right most of the
+        // time, but it can be wrong if the discovered libonnxruntime is a
+        // CPU-only build despite ROCm being installed.
+        //
+        // Before attempting registration, we consult
+        // [`crate::provider::is_migraphx_compiled_in`] which purely probes the
+        // loaded ORT binary via `GetAvailableProviders()`. If the EP truly is not
+        // compiled in, we log an explicit, actionable fallback message and skip
+        // the registration attempt entirely. The session will fall back to CPU
+        // inside ORT, but the operator can see exactly why MIGraphX was not used.
+        //
+        // This keeps the existing `try_provider_or_cpu!` path for genuine
+        // session-build errors that occur even when the EP IS compiled in (e.g.,
+        // missing GPU driver, no compatible device) while producing a clearer
+        // log message for the common dynamic-load incompatibility case.
+        match provider_name {
+            "migraphx" | "rocm" if !crate::provider::is_migraphx_compiled_in() => {
+                tracing::warn!(
+                    "MIGraphX EP not available in the dynamically loaded ONNX \
+                     Runtime binary (got provider_name={}, is_migraphx_compiled_in=false); \
+                     falling back to CPU. Install onnxruntime-migraphx or point \
+                     ORT_DYLIB_PATH at a migraphx-enabled libonnxruntime.",
+                    provider_name
+                );
+                return session_builder
+                    .with_execution_providers([ort::ep::CPU::default().build()])?
+                    .commit_from_file(model_path);
+            }
+            _ => {}
+        }
+
         // Configure execution providers based on selection
         let mut session_builder = match provider_name {
             "cuda" => {
@@ -322,6 +358,12 @@ impl WorkerRuntime {
             "migraphx" | "auto" => {
                 // For "auto", the provider selector already determined MIGraphX
                 // is the best available. For explicit "migraphx", use it directly.
+                // VAL-ORT-015: with the pre-flight check above, we know MIGraphX
+                // is compiled in when provider_name=="migraphx". For "auto", we
+                // still let the heuristic-driven path through (the auto-detector
+                // may believe MIGraphX is available even without the EP compiled
+                // in), and `try_provider_or_cpu!` will fall back if registration
+                // fails.
                 try_provider_or_cpu!(
                     session_builder,
                     ort::ep::MIGraphX::default().build(),
@@ -331,6 +373,8 @@ impl WorkerRuntime {
             "rocm" => {
                 // ROCm EP is deprecated in favor of MIGraphX. Try MIGraphX first,
                 // then fall back to ROCm if available (old ORT builds), then CPU.
+                // (The pre-flight check above has already handled the case where
+                // MIGraphX is not compiled in and the user passed "rocm".)
                 try_provider_or_cpu!(
                     session_builder,
                     ort::ep::MIGraphX::default().build(),

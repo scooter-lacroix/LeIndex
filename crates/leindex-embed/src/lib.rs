@@ -43,7 +43,7 @@ pub use ort_discovery::{
     discover_and_init, last_outcome as last_ort_outcome, DiscoveryOutcome, DiscoverySource,
     InitResult,
 };
-pub use provider::ExecutionProviderSelector;
+pub use provider::{is_cuda_compiled_in, is_migraphx_compiled_in, ExecutionProviderSelector};
 pub use runtime::{
     RuntimeConfig, WorkerRuntime, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_FRAME_SIZE,
     DEFAULT_MAX_TEXT_SIZE,

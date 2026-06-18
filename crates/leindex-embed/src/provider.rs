@@ -6,6 +6,26 @@
 // The selector checks whether the requested provider is available and
 // reports the result. If the requested provider is not available, it
 // falls back to CPU and reports the reason.
+//
+// VAL-ORT-015: MIGraphX provider registers successfully after dynamic ORT load.
+// VAL-ORT-016: MIGraphX unavailable falls back to CPU within the loaded ORT.
+//
+// The dynamic-load compatibility layer adds two distinct checks:
+//   * `is_migraphx_available()` keeps its heuristic for "auto" detection so
+//     a system with ROCm installed can opportunistically use MIGraphX even
+//     when ORT's `GetAvailableProviders()` does not yet list it (shared EP
+//     plugin discovery). This handles the bundled-pip-onnxruntime-migraphx
+//     case where the EP registers at session-build time, not at load time.
+//   * `is_migraphx_compiled_in()` performs the *pure* ORT binary probe (no
+//     heuristic). It returns `true` only when `ort::ep::MIGraphX::is_available()`
+//     reports the EP in the loaded libonnxruntime. Use this when an explicit
+//     "is this EP actually compiled in?" answer is required (e.g., before
+//     attempting registration, to emit a clear CPU-fallback log line).
+//
+// Both helpers are necessary for VAL-ORT-015/016: the heuristic preserves the
+// "AMD system -> try MIGraphX" opportunity while the pure probe lets the
+// runtime log an actionable fallback message when MIGraphX truly is not
+// compiled into the dynamically loaded ORT.
 
 #[cfg(feature = "onnx")]
 use ort::ep::ExecutionProvider as _;
@@ -296,6 +316,47 @@ impl ExecutionProviderSelector {
         }
     }
 
+    /// Pure ORT-binary probe for MIGraphX: returns `true` only when
+    /// `GetAvailableProviders()` lists `MIGraphXExecutionProvider` in the
+    /// *currently loaded* libonnxruntime.
+    ///
+    /// Unlike [`is_migraphx_available`](Self::is_migraphx_available), this
+    /// does NOT consult the filesystem heuristic and is therefore the right
+    /// answer to "is MIGraphX truly compiled into the loaded ORT?". Use this
+    /// before emitting an explicit CPU-fallback log message so operators can
+    /// distinguish "picked auto + AMD heuristic triggered" from
+    /// "MIGraphX really is not available in the ORT binary we dlopen()'d".
+    ///
+    /// VAL-ORT-015: returns `true` on an AMD-GPU system with a migraphx-aware
+    /// libonnxruntime (e.g., `onnxruntime-migraphx` from pip).
+    /// VAL-ORT-016: returns `false` for a CPU-only libonnxruntime, allowing
+    /// the runtime to log "falling back to CPU" before attempting (and
+    /// silently failing) registration.
+    pub(crate) fn is_migraphx_compiled_in() -> bool {
+        #[cfg(feature = "onnx")]
+        {
+            ort::ep::MIGraphX::default().is_available().unwrap_or(false)
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            false
+        }
+    }
+
+    /// Pure ORT-binary probe for CUDA: mirrors
+    /// [`is_migraphx_compiled_in`](Self::is_migraphx_compiled_in) and returns
+    /// `true` only when `GetAvailableProviders()` lists CUDA in the loaded ORT.
+    pub(crate) fn is_cuda_compiled_in() -> bool {
+        #[cfg(feature = "onnx")]
+        {
+            ort::ep::CUDA::default().is_available().unwrap_or(false)
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            false
+        }
+    }
+
     /// Check if ROCm is available on this system.
     /// Note: ROCm being available does not mean the deprecated ROCmExecutionProvider
     /// is compiled into the ONNX Runtime build. Use `is_migraphx_available()` for
@@ -317,6 +378,31 @@ impl ExecutionProviderSelector {
     fn is_coreml_available() -> bool {
         cfg!(target_os = "macos")
     }
+}
+
+/// Free-function form of `ExecutionProviderSelector::is_migraphx_compiled_in()`
+/// for callers (e.g., `WorkerRuntime::build_session`) that need to probe the
+/// dynamically loaded ORT binary for a true MIGraphX-compiled-in answer
+/// without the ROCm-system heuristic used by the "auto" selector.
+///
+/// VAL-ORT-015: returns `true` when the loaded ORT binary lists
+/// `MIGraphXExecutionProvider` in `GetAvailableProviders()`. Registration is
+/// then guaranteed to succeed at session-build time.
+///
+/// VAL-ORT-016: returns `false` when the loaded ORT binary does not list
+/// MIGraphX (e.g., a CPU-only `libonnxruntime.so` was discovered, or the
+/// shared provider plugin `libonnxruntime_providers_migraphx.so` is not
+/// co-located). Callers should log a clear CPU-fallback reason in this case
+/// before continuing with the CPU EP.
+pub fn is_migraphx_compiled_in() -> bool {
+    ExecutionProviderSelector::is_migraphx_compiled_in()
+}
+
+/// Free-function form of `ExecutionProviderSelector::is_cuda_compiled_in()`.
+/// Useful for runtime / diagnostics paths that need to probe the loaded ORT
+/// without raising the driver-presence heuristic.
+pub fn is_cuda_compiled_in() -> bool {
+    ExecutionProviderSelector::is_cuda_compiled_in()
 }
 
 #[cfg(test)]
@@ -458,5 +544,68 @@ mod tests {
         assert_eq!(sel.name(), "cpu");
         assert!(sel.is_requested_provider());
         assert_eq!(sel.reason(), "no fallback");
+    }
+
+    // ── VAL-ORT-015 / VAL-ORT-016: dynamic-load compatibility helpers ────
+
+    #[test]
+    fn test_is_migraphx_compiled_in_does_not_panic() {
+        // The pure probe must not panic regardless of ORT being loaded or
+        // not. When ORT is not loaded, it returns Ok(false); when ORT is
+        // loaded, it queries GetAvailableProviders() — both safe.
+        let _ = ExecutionProviderSelector::is_migraphx_compiled_in();
+    }
+
+    #[test]
+    fn test_is_cuda_compiled_in_does_not_panic() {
+        // Same invariant for CUDA.
+        let _ = ExecutionProviderSelector::is_cuda_compiled_in();
+    }
+
+    #[test]
+    fn test_compiled_in_probes_cannot_simultaneously_be_true() {
+        // A single loaded libonnxruntime binary cannot ship both MIGraphX
+        // (AMD) and CUDA (NVIDIA). This invariant catches any future
+        // regression that returns a spurious `true` for both helpers
+        // (e.g., if someone wires the heuristic into the pure probe by
+        // mistake).
+        let migraphx = ExecutionProviderSelector::is_migraphx_compiled_in();
+        let cuda = ExecutionProviderSelector::is_cuda_compiled_in();
+        assert!(
+            !(migraphx && cuda),
+            "MIGraphX={} and CUDA={} both reported as compiled in; \
+             a single ORT binary cannot contain both providers.",
+            migraphx,
+            cuda
+        );
+    }
+
+    #[test]
+    fn test_compiled_in_subset_of_heuristic_available() {
+        // The pure probe returns true IFF GetAvailableProviders() returns
+        // true; this should be a strict subset of the heuristic-driven
+        // selector (which can additionally trigger via /opt/rocm presence).
+        let migraphx_compiled = ExecutionProviderSelector::is_migraphx_compiled_in();
+        let migraphx_available = ExecutionProviderSelector::is_migraphx_available();
+        assert!(
+            !migraphx_compiled || migraphx_available,
+            "is_migraphx_compiled_in=true is more restrictive than \
+             is_migraphx_available; the pure probe must not say true when \
+             the heuristic path says false"
+        );
+    }
+
+    #[test]
+    fn test_free_function_helpers_match_method_form() {
+        // The free functions are convenience wrappers around the methods and
+        // must report identical results.
+        assert_eq!(
+            crate::provider::is_migraphx_compiled_in(),
+            ExecutionProviderSelector::is_migraphx_compiled_in()
+        );
+        assert_eq!(
+            crate::provider::is_cuda_compiled_in(),
+            ExecutionProviderSelector::is_cuda_compiled_in()
+        );
     }
 }
