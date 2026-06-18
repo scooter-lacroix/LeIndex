@@ -548,7 +548,7 @@ impl WorkerRuntime {
             let _batch_id = frame.header.batch_id;
 
             // Process the request
-            let response = self.dispatch(frame);
+            let response = self.dispatch(&frame);
 
             // Write the response frame
             let wire = response.encode_wire()?;
@@ -561,7 +561,7 @@ impl WorkerRuntime {
     }
 
     /// Dispatch a request frame to the appropriate handler.
-    pub fn dispatch(&self, frame: Frame) -> Frame {
+    pub fn dispatch(&self, frame: &Frame) -> Frame {
         let batch_id = frame.header.batch_id;
 
         match frame.header.msg_type {
@@ -595,7 +595,7 @@ impl WorkerRuntime {
     ///
     /// VAL-CPHASE-012: Returns flat row-major output with dimension and count metadata.
     /// VAL-CPHASE-013: Batch ordering is preserved through IPC.
-    fn handle_embed(&self, frame: Frame) -> Result<EmbedResponse, WorkerError> {
+    fn handle_embed(&self, frame: &Frame) -> Result<EmbedResponse, WorkerError> {
         let request: Request = frame.decode_payload().map_err(|e| WorkerError {
             kind: ErrorKind::InvalidRequest,
             message: format!("failed to decode embed request: {}", e),
@@ -889,10 +889,10 @@ impl WorkerRuntime {
         // Apply mean pooling using attention mask, then L2 normalize.
         // This is done per sub-batch.
         let pooled = self.pool_and_normalize(
-            embeddings_f32,
+            &embeddings_f32,
             batch_size,
             actual_seq_len,
-            attention_mask,
+            &attention_mask,
             hidden_dim,
         )?;
 
@@ -902,10 +902,10 @@ impl WorkerRuntime {
     #[cfg(feature = "onnx")]
     fn pool_and_normalize(
         &self,
-        embeddings: Vec<f32>,
+        embeddings: &[f32],
         batch_size: usize,
         seq_len: usize,
-        attention_mask: Vec<i64>,
+        attention_mask: &[i64],
         expected_dim: usize,
     ) -> Result<EmbedResponse, WorkerError> {
         // Reshape: [batch_size, seq_len, hidden_dim]
@@ -960,7 +960,7 @@ impl WorkerRuntime {
     }
 
     /// Handle a rerank request.
-    fn handle_rerank(&self, frame: Frame) -> Result<RerankResponse, WorkerError> {
+    fn handle_rerank(&self, frame: &Frame) -> Result<RerankResponse, WorkerError> {
         let request: Request = frame.decode_payload().map_err(|e| WorkerError {
             kind: ErrorKind::InvalidRequest,
             message: format!("failed to decode rerank request: {}", e),
@@ -1363,7 +1363,7 @@ mod tests {
             expected_dim: 1024,
         };
         let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-        let result = rt.handle_embed(frame);
+        let result = rt.handle_embed(&frame);
 
         // Empty batch returns Ok early (before any ONNX session check),
         // so .unwrap() is safe regardless of feature flag.
@@ -1383,7 +1383,7 @@ mod tests {
             expected_dim: 8,
         };
         let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-        let result = rt.handle_embed(frame);
+        let result = rt.handle_embed(&frame);
 
         // When ORT or the model is unavailable (no model on disk, ORT not
         // discovered, etc.), the worker returns ModelNotFound. On a developer
@@ -1425,7 +1425,7 @@ mod tests {
             expected_dim: 4,
         };
         let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-        let result = rt.handle_embed(frame);
+        let result = rt.handle_embed(&frame);
 
         // Same rationale as test_handle_embed_returns_flat_row_major: developer
         // machines with ORT + a real model present may reach inference and
@@ -1463,7 +1463,7 @@ mod tests {
             expected_dim: 4,
         };
         let frame = protocol::embed_request_frame(BatchId::new(42), request).unwrap();
-        let response_frame = rt.dispatch(frame);
+        let response_frame = rt.dispatch(&frame);
 
         assert_eq!(response_frame.header.batch_id, BatchId::new(42));
 
@@ -1494,7 +1494,7 @@ mod tests {
             }],
         };
         let frame = protocol::rerank_request_frame(BatchId::new(7), request).unwrap();
-        let response_frame = rt.dispatch(frame);
+        let response_frame = rt.dispatch(&frame);
 
         assert_eq!(response_frame.header.batch_id, BatchId::new(7));
 
@@ -1523,7 +1523,7 @@ mod tests {
             },
             payload: vec![],
         };
-        let response_frame = rt.dispatch(frame);
+        let response_frame = rt.dispatch(&frame);
 
         assert_eq!(response_frame.header.batch_id, BatchId::new(99));
         assert_eq!(response_frame.header.msg_type, MsgType::Error);

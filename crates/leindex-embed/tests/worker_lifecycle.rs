@@ -112,7 +112,7 @@ fn test_worker_cold_starts_on_first_demand() {
         expected_dim: 8,
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-    let response_frame = rt.dispatch(frame);
+    let response_frame = rt.dispatch(&frame);
 
     // Without a real ONNX session, dispatch returns an error frame
     #[cfg(feature = "onnx")]
@@ -154,7 +154,7 @@ fn test_worker_reusable_across_batches() {
         expected_dim: 4,
     };
     let frame1 = protocol::embed_request_frame(BatchId::new(1), request1).unwrap();
-    let response1 = rt.dispatch(frame1);
+    let response1 = rt.dispatch(&frame1);
     assert_eq!(response1.header.msg_type, expected_msg_type);
 
     // Second batch — same runtime, no restart
@@ -163,7 +163,7 @@ fn test_worker_reusable_across_batches() {
         expected_dim: 4,
     };
     let frame2 = protocol::embed_request_frame(BatchId::new(2), request2).unwrap();
-    let response2 = rt.dispatch(frame2);
+    let response2 = rt.dispatch(&frame2);
     assert_eq!(response2.header.msg_type, expected_msg_type);
 
     // Third batch
@@ -172,7 +172,7 @@ fn test_worker_reusable_across_batches() {
         expected_dim: 4,
     };
     let frame3 = protocol::embed_request_frame(BatchId::new(3), request3).unwrap();
-    let response3 = rt.dispatch(frame3);
+    let response3 = rt.dispatch(&frame3);
     assert_eq!(response3.header.msg_type, expected_msg_type);
 
     // All batch IDs should be distinct
@@ -267,7 +267,7 @@ fn test_worker_restart_after_teardown() {
         expected_dim: 4,
     };
     let frame1 = protocol::embed_request_frame(BatchId::new(1), request1).unwrap();
-    let response1 = rt1.dispatch(frame1);
+    let response1 = rt1.dispatch(&frame1);
     assert_eq!(response1.header.batch_id, BatchId::new(1));
     drop(rt1); // Simulate teardown
 
@@ -279,7 +279,7 @@ fn test_worker_restart_after_teardown() {
         expected_dim: 4,
     };
     let frame2 = protocol::embed_request_frame(BatchId::new(2), request2).unwrap();
-    let response2 = rt2.dispatch(frame2);
+    let response2 = rt2.dispatch(&frame2);
     assert_eq!(response2.header.batch_id, BatchId::new(2));
     assert_eq!(response2.header.msg_type, expected_msg_type);
 }
@@ -463,7 +463,7 @@ fn test_embed_response_flat_row_major() {
         expected_dim: 4,
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-    let response_frame = rt.dispatch(frame);
+    let response_frame = rt.dispatch(&frame);
 
     // Without a real ONNX session, dispatch returns an error frame
     #[cfg(feature = "onnx")]
@@ -517,7 +517,7 @@ fn test_batch_ordering_preserved() {
     }
 
     // Verify the response (error without ONNX session, success without feature)
-    let response_frame = rt.dispatch(frame);
+    let response_frame = rt.dispatch(&frame);
 
     #[cfg(feature = "onnx")]
     {
@@ -638,7 +638,7 @@ fn test_oversized_single_text_truncated() {
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
 
     // Should not panic — the oversized text is truncated
-    let response_frame = rt.dispatch(frame);
+    let response_frame = rt.dispatch(&frame);
 
     // Without a real ONNX session, dispatch returns an error frame
     #[cfg(feature = "onnx")]
@@ -694,7 +694,7 @@ fn test_batch_truncate_multiple_oversized_texts() {
         expected_dim: 4,
     };
     let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-    let response_frame = rt.dispatch(frame);
+    let response_frame = rt.dispatch(&frame);
 
     // Without a real ONNX session, dispatch returns an error frame
     #[cfg(feature = "onnx")]

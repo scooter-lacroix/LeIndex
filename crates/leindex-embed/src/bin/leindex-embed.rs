@@ -82,7 +82,7 @@ mod tests {
             expected_dim: 8,
         };
         let frame = protocol::embed_request_frame(BatchId::new(42), request).unwrap();
-        let response_frame = rt.dispatch(frame);
+        let response_frame = rt.dispatch(&frame);
 
         assert_eq!(response_frame.header.batch_id, BatchId::new(42));
 

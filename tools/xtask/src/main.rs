@@ -34,14 +34,15 @@ enum Commands {
 }
 
 /// Workspace root — xtask lives at `<root>/tools/xtask`.
-fn workspace_root() -> PathBuf {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    PathBuf::from(manifest_dir)
+fn workspace_root() -> Result<PathBuf> {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .context("CARGO_MANIFEST_DIR must be set by cargo when running xtask")?;
+    let manifest_path = PathBuf::from(manifest_dir);
+    let root = manifest_path
         .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_path_buf()
+        .and_then(|p| p.parent())
+        .context("expected xtask crate to live at <workspace>/tools/xtask")?;
+    Ok(root.to_path_buf())
 }
 
 fn main() -> Result<()> {
@@ -57,7 +58,7 @@ fn main() -> Result<()> {
 }
 
 fn run_memcheck(update_baseline: bool) -> Result<()> {
-    let root = workspace_root();
+    let root = workspace_root()?;
     let fixture = root.join("tests/fixtures/memcheck/small_repo");
     let leindex_bin = root.join("target/release/leindex");
     let leindex_embed_bin = root.join("target/release/leindex-embed");

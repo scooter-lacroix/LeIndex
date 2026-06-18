@@ -51,6 +51,11 @@ dirs = { version = "5" }
 [dev-dependencies]
 tempfile = "3.13"
 
+# Inherits workspace lint policy from the root Cargo.toml
+# `[workspace.lints.clippy]` table (replaces the legacy clippy.toml arrays).
+[lints]
+workspace = true
+
 [[bin]]
 name = "leindex-embed"
 path = "src/bin/leindex-embed.rs"

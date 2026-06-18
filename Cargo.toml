@@ -398,3 +398,70 @@ members = [
     "tools/memcheck",
     "tools/xtask",
 ]
+
+# Workspace-wide lint policy. Replaces the legacy `clippy.toml` arrays
+# (`allow = [...]`, `deny = [...]`, `warn = [...]`), which clippy 1.96+ no
+# longer parses (clippy.toml is now reserved for configuration thresholds,
+# not lint levels). Per the Cargo `[lints]` RFC, lint levels live here and
+# are inherited by every workspace member via `[lints] workspace = true`.
+#
+# Migration notes from the legacy file:
+#   * The `allow = [...]` block is preserved 1:1 below; these mirror
+#     in-source #[allow]s the codebase has always carried.
+#   * The `deny = [...]` block kept only the lints the codebase is
+#     universally clean under (across default, onnx, onnx-migraphx, and
+#     all-features, including tests and benches). Lints such as
+#     `print_stdout`/`unwrap_used`/`expect_used`/`panic`/
+#     `needless_pass_by_value`/`float_cmp` had widespread pre-existing
+#     usage (mostly in `src/cli/` where stdout printing is intentional,
+#     and in tests where strict float equality is the correct semantic),
+#     and were never actually enforced because the legacy clippy.toml
+#     arrays were already rejected by clippy 1.96+. Re-introducing those
+#     at `deny` would surface ~180 pre-existing violations, contradicting
+#     the feature contract "No new clippy warnings introduced". These
+#     lints remain at clippy's default level (`allow`, since they belong
+#     to the `restriction`/`pedantic` groups). A follow-up can tighten
+#     them in scoped #![deny] blocks after cleaning up the call sites.
+#   * Legacy `commented_code` and `drop_ref` entries were dropped: neither
+#     name resolves under clippy 1.96 (`drop_ref` was renamed away long
+#     before 1.96 and `commented_code` is not a real clippy lint).
+#   * The legacy `warn = [...]` block enabled the `pedantic`, `nursery`,
+#     `cargo`, and `restriction` groups. Under clippy 1.96 those groups
+#     now trip 50+ lints on idiomatic code (`indexing_slicing`,
+#     `as_conversions`, `arithmetic_side_effects`, `integer_division`,
+#     etc.). Since the legacy file was rejected before applying them,
+#     re-introducing the group-level `warn` would surface those lints as
+#     new warnings, again contradicting the feature contract. The default
+#     clippy groups (`style`/`perf`/`complexity`/`correctness`) remain
+#     active at their default `warn` level via `clippy::all`; no explicit
+#     entry is needed for them.
+[workspace.lints.clippy]
+# ── Allowed — intentional codebase patterns (mirror in-source #[allow]) ──
+too_many_arguments = "allow"        # CLI handlers carry rich context; counted
+module_inception = "allow"          # Multiple crate roots intentionally mirror
+result_unit_err = "allow"           # Registry operations surface cover Err(())
+arc_with_non_send_sync = "allow"    # Tokio Mutex<Arc<...>> pattern
+type_complexity = "allow"           # Rich filter builder types in handlers
+new_without_default = "allow"       # Index query builders (no default meaningful)
+should_implement_trait = "allow"    # Newtype around rusqlite types
+manual_find = "allow"               # C# parser — tree-sitter query idiom
+only_used_in_recursion = "allow"    # C# parser inherently recursive
+
+# ── Denied — downward pressure: lints the codebase is currently clean ──
+# under, so any new occurrence indicates a real regression.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+bool_assert_comparison = "deny"
+clone_on_copy = "deny"
+equatable_if_let = "deny"
+match_like_matches_macro = "deny"
+single_match = "deny"
+suspicious_else_formatting = "deny"
+
+# Default clippy groups (style/perf/complexity/correctness) remain active at
+# their default `warn` level via `clippy::all`; no override needed here.
+
+# Root package inherits workspace lints.
+[lints]
+workspace = true
