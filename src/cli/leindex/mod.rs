@@ -5,6 +5,7 @@
 mod diagnostics;
 mod indexing;
 mod query;
+pub(crate) mod setup;
 mod types;
 
 #[cfg(test)]

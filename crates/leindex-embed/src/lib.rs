@@ -25,6 +25,7 @@
 // VAL-CPHASE-015: Single oversized text is reduced before IPC framing.
 
 pub mod batch;
+pub mod config;
 pub mod model_path;
 pub mod ort_discovery;
 pub mod protocol;
@@ -38,6 +39,9 @@ pub use protocol::{
 };
 
 pub use batch::{split_request, stitch_responses, truncate_text, BatchConfig};
+pub use config::{
+    ConfigError, IndexingConfig, LeIndexConfig, NeuralConfig, RecoveryAction, SearchConfig,
+};
 pub use model_path::ModelResolver;
 pub use ort_discovery::{
     discover_and_init, last_outcome as last_ort_outcome, DiscoveryOutcome, DiscoverySource,
@@ -49,3 +53,17 @@ pub use runtime::{
     DEFAULT_MAX_TEXT_SIZE,
 };
 pub use startup::{StartupReport, StartupReporter};
+
+// ── Test utilities ──────────────────────────────────────────────────────
+//
+// A crate-level mutex shared across all test modules so that tests mutating
+// process-global state (env vars like LEINDEX_HOME, ORT_DYLIB_PATH) can be
+// serialized. Each test module's TEST_LOCK references this to avoid parallel
+// conflicts between e.g. config and ort_discovery tests.
+#[cfg(test)]
+pub(crate) mod test_util {
+    use std::sync::Mutex;
+
+    /// Global lock for serializing env-var-mutating tests across all modules.
+    pub static ENV_TEST_LOCK: Mutex<()> = Mutex::new(());
+}

@@ -99,6 +99,8 @@ pub mod memory;
 pub mod memory_cap;
 /// Lightweight memory report for graceful shutdown.
 pub mod memory_report;
+/// Neural search configuration schema for ~/.leindex/config/leindex.toml.
+pub mod neural_config;
 /// Multi-project registry with per-project concurrency.
 #[cfg(feature = "mcp-server")]
 pub mod registry;

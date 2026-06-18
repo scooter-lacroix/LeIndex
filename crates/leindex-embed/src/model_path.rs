@@ -163,14 +163,13 @@ impl ModelResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Global lock serialising env-var mutation across all model_path tests.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Use the crate-level shared lock for env-var-mutating test serialization.
+    use crate::test_util::ENV_TEST_LOCK;
 
     #[test]
     fn test_resolve_model_not_found() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Clear any env override
         std::env::remove_var("LEINDEX_MODEL_PATH");
 
@@ -183,7 +182,7 @@ mod tests {
 
     #[test]
     fn test_resolve_tokenizer_not_found() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("LEINDEX_MODEL_PATH");
 
         // Use a model name guaranteed not to correspond to a real model. The
@@ -212,7 +211,7 @@ mod tests {
 
     #[test]
     fn test_resolve_with_env_override_missing_file() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Set env to a temp dir that doesn't have the model
         let temp_dir = tempfile::tempdir().unwrap();
         std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path());
@@ -226,7 +225,7 @@ mod tests {
 
     #[test]
     fn test_resolve_with_env_override_existing_file() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::tempdir().unwrap();
         let model_file = temp_dir.path().join("test-model.onnx");
         std::fs::write(&model_file, b"fake model").unwrap();
@@ -242,7 +241,7 @@ mod tests {
 
     #[test]
     fn test_resolve_tokenizer_with_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::tempdir().unwrap();
         let tokenizer_file = temp_dir.path().join("tokenizer.json");
         std::fs::write(&tokenizer_file, b"{}").unwrap();
@@ -258,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_source_for_path_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::tempdir().unwrap();
         std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path());
 
@@ -270,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_source_for_path_user_cache() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("LEINDEX_MODEL_PATH");
         let path = PathBuf::from("/some/random/path/model.onnx");
         assert_eq!(ModelResolver::source_for_path(&path), "user_cache");

@@ -403,10 +403,9 @@ pub fn discover_and_init() -> InitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Serialise tests that mutate process-global state (env vars, LAST_OUTCOME).
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
+    // Use the crate-level shared lock so env-mutating tests serialize across modules.
+    use crate::test_util::ENV_TEST_LOCK;
 
     fn make_fake_lib(dir: &Path) -> PathBuf {
         let name = ort_lib_names()[0];
@@ -417,7 +416,7 @@ mod tests {
 
     #[test]
     fn test_discover_candidates_includes_env_var() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var(ORT_DYLIB_ENV, tmp.path().join("env.so"));
 
@@ -431,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_discover_candidates_excludes_empty_env() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK.lock().unwrap();
         std::env::set_var(ORT_DYLIB_ENV, "");
         let candidates = discover_candidates();
         assert!(!candidates
@@ -442,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_discover_candidates_includes_user_lib() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK.lock().unwrap();
         std::env::remove_var(ORT_DYLIB_ENV);
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
@@ -458,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_discover_candidates_includes_system_paths() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK.lock().unwrap();
         std::env::remove_var(ORT_DYLIB_ENV);
         std::env::remove_var(LEINDEX_HOME_ENV);
 
@@ -474,7 +473,7 @@ mod tests {
 
     #[test]
     fn test_read_config_ort_path_returns_value() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
 
@@ -495,7 +494,7 @@ mod tests {
 
     #[test]
     fn test_read_config_ort_path_returns_none_when_missing() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
 
@@ -517,7 +516,7 @@ mod tests {
 
     #[test]
     fn test_read_config_ort_path_handles_single_quotes() {
-        let _g = TEST_LOCK.lock().unwrap();
+        let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
 

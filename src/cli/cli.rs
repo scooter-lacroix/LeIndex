@@ -229,6 +229,33 @@ pub enum Commands {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
+
+    /// Configure neural search: install ORT, set up models, and write config
+    ///
+    /// Run `leindex setup` for an interactive wizard, or use flags for
+    /// non-interactive mode. Neural embeddings provide semantic code search
+    /// (finding symbols by meaning). TF-IDF search works without setup.
+    Setup {
+        /// Enable neural embeddings (non-interactive mode)
+        #[arg(long = "neural")]
+        neural: bool,
+
+        /// Disable neural embeddings (TF-IDF only, non-interactive)
+        #[arg(long = "no-neural", conflicts_with = "neural")]
+        no_neural: bool,
+
+        /// Use CPU execution provider (conflicts with --gpu)
+        #[arg(long = "cpu", conflicts_with = "gpu")]
+        cpu: bool,
+
+        /// Use GPU execution provider: amd (MIGraphX/ROCm) or nvidia (CUDA)
+        #[arg(long = "gpu", value_name = "amd|nvidia", conflicts_with = "cpu")]
+        gpu: Option<String>,
+
+        /// Check current setup status without modifying anything
+        #[arg(long = "check")]
+        check: bool,
+    },
 }
 
 /// Subcommands for inspecting and executing MCP tools from the CLI.
@@ -363,6 +390,13 @@ impl Cli {
                 max_age_days,
                 dry_run,
             } => cmd_cleanup_impl(max_age_days, dry_run).await,
+            Commands::Setup {
+                neural,
+                no_neural,
+                cpu,
+                gpu,
+                check,
+            } => cmd_setup_impl(neural, no_neural, cpu, gpu, check).await,
         };
 
         // Write the memory report (if tracking was enabled) before returning.
@@ -1755,6 +1789,96 @@ async fn cmd_dashboard_impl(port: u16, prod: bool) -> AnyhowResult<()> {
     Ok(())
 }
 
+/// Setup command implementation — interactive and non-interactive setup wizard.
+///
+/// VAL-SETUP-001: `leindex setup` is listed in --help
+/// VAL-SETUP-009-015: Non-interactive flag handling and conflict detection
+/// VAL-SETUP-014: --check mode reads config and reports status
+async fn cmd_setup_impl(
+    neural: bool,
+    no_neural: bool,
+    cpu: bool,
+    gpu: Option<String>,
+    check: bool,
+) -> AnyhowResult<()> {
+    use crate::cli::leindex::setup;
+
+    // VAL-SETUP-014: --check mode is read-only
+    if check {
+        check_neutral_conflicts(neural, no_neural, cpu, gpu.as_deref())?;
+        let result = setup::run_check().map_err(|e| anyhow::anyhow!("{}", e))?;
+        // Exit code reflects completeness
+        if !result.fully_configured {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // Parse GPU vendor if provided
+    let gpu_vendor = if let Some(ref gpu_str) = gpu {
+        Some(setup::parse_gpu_vendor(gpu_str).map_err(|e| anyhow::anyhow!("{}", e))?)
+    } else {
+        None
+    };
+
+    // Determine the mode: interactive or non-interactive
+    let has_flags = neural || no_neural || cpu || gpu.is_some();
+
+    let choices = if has_flags {
+        // Non-interactive mode: resolve from flags
+        // VAL-SETUP-015: conflicts are validated by clap (conflicts_with) and
+        // also redundantly checked here for the --neural + --no-neural case
+        // (clap's conflicts_with on bool flags detects only when explicitly given).
+        check_neutral_conflicts(neural, no_neural, cpu, gpu.as_deref())?;
+        setup::resolve_from_flags(neural, no_neural, cpu, gpu_vendor)
+            .map_err(|e| anyhow::anyhow!("{}", e))?
+    } else if setup::is_interactive() {
+        // Interactive mode: show prompts
+        // VAL-SETUP-002: prompts neural? -> CPU/GPU -> AMD/NVIDIA
+        setup::run_interactive_flow().map_err(|e| anyhow::anyhow!("{}", e))?
+    } else {
+        // No flags and not interactive: show guidance and exit with error
+        eprintln!("No setup options specified and stdin is not interactive (not a TTY).");
+        eprintln!("For non-interactive setup, use flags:");
+        eprintln!("  leindex setup --neural --cpu       # CPU neural search");
+        eprintln!("  leindex setup --neural --gpu amd   # AMD GPU (MIGraphX)");
+        eprintln!("  leindex setup --neural --gpu nvidia # NVIDIA GPU (CUDA)");
+        eprintln!("  leindex setup --no-neural          # TF-IDF only");
+        eprintln!("  leindex setup --check              # Show current status");
+        anyhow::bail!("No setup options specified in non-interactive mode");
+    };
+
+    // Execute the setup with the resolved choices
+    let result = setup::execute_setup(&choices).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    // Print the final summary
+    // VAL-SETUP-034: surfaces neural on/off, provider, ORT, model, config
+    setup::print_summary(&result);
+
+    Ok(())
+}
+
+/// Validate flag conflicts that clap cannot always catch via `conflicts_with`.
+///
+/// clap's `conflicts_with` on Option/String fields works well, but boolean flag
+/// pairs like --neural + --no-neural need an explicit check because clap only
+/// errors if both are explicitly set (which is the desired behavior). This is a
+/// redundancy safety net.
+fn check_neutral_conflicts(
+    neural: bool,
+    no_neural: bool,
+    cpu: bool,
+    gpu: Option<&str>,
+) -> AnyhowResult<()> {
+    if neural && no_neural {
+        anyhow::bail!("Cannot use --neural and --no-neural together. Choose one.");
+    }
+    if cpu && gpu.is_some() {
+        anyhow::bail!("Cannot use --cpu and --gpu together. Choose one execution provider.");
+    }
+    Ok(())
+}
+
 /// Cleanup command implementation — remove stale LeIndex temp artifacts.
 async fn cmd_cleanup_impl(max_age_days: u64, dry_run: bool) -> AnyhowResult<()> {
     use crate::cli::cleanup::run_gc;
@@ -2217,5 +2341,112 @@ mod tests {
     fn test_memory_report_flag_absent_by_default() {
         let cli = Cli::try_parse_from(["leindex", "index", "/tmp/project"]).unwrap();
         assert!(cli.memory_report.is_none());
+    }
+
+    #[test]
+    fn test_setup_command_parsing() {
+        // VAL-SETUP-001: setup command is registered
+        let cli = Cli::try_parse_from(["leindex", "setup", "--neural", "--cpu"]).unwrap();
+        match cli.command {
+            Some(Commands::Setup {
+                neural,
+                no_neural,
+                cpu,
+                gpu,
+                check,
+            }) => {
+                assert!(neural);
+                assert!(!no_neural);
+                assert!(cpu);
+                assert!(gpu.is_none());
+                assert!(!check);
+            }
+            _ => panic!("Expected Setup command"),
+        }
+    }
+
+    #[test]
+    fn test_setup_command_gpu_amd() {
+        let cli = Cli::try_parse_from(["leindex", "setup", "--neural", "--gpu", "amd"]).unwrap();
+        match cli.command {
+            Some(Commands::Setup {
+                neural, cpu, gpu, ..
+            }) => {
+                assert!(neural);
+                assert!(!cpu);
+                assert_eq!(gpu.as_deref(), Some("amd"));
+            }
+            _ => panic!("Expected Setup command"),
+        }
+    }
+
+    #[test]
+    fn test_setup_command_gpu_nvidia() {
+        let cli = Cli::try_parse_from(["leindex", "setup", "--neural", "--gpu", "nvidia"]).unwrap();
+        match cli.command {
+            Some(Commands::Setup {
+                neural, cpu, gpu, ..
+            }) => {
+                assert!(neural);
+                assert!(!cpu);
+                assert_eq!(gpu.as_deref(), Some("nvidia"));
+            }
+            _ => panic!("Expected Setup command"),
+        }
+    }
+
+    #[test]
+    fn test_setup_command_no_neural() {
+        // VAL-SETUP-013: --no-neural flag
+        let cli = Cli::try_parse_from(["leindex", "setup", "--no-neural"]).unwrap();
+        match cli.command {
+            Some(Commands::Setup {
+                neural,
+                no_neural,
+                cpu,
+                gpu,
+                check,
+            }) => {
+                assert!(!neural);
+                assert!(no_neural);
+                assert!(!cpu);
+                assert!(gpu.is_none());
+                assert!(!check);
+            }
+            _ => panic!("Expected Setup command"),
+        }
+    }
+
+    #[test]
+    fn test_setup_command_check() {
+        // VAL-SETUP-014: --check flag
+        let cli = Cli::try_parse_from(["leindex", "setup", "--check"]).unwrap();
+        match cli.command {
+            Some(Commands::Setup { check, .. }) => assert!(check),
+            _ => panic!("Expected Setup command"),
+        }
+    }
+
+    #[test]
+    fn test_setup_command_neural_gpu_conflict_rejected() {
+        // VAL-SETUP-015: conflicting flags produce error
+        let result = Cli::try_parse_from(["leindex", "setup", "--neural", "--cpu", "--gpu", "amd"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_setup_command_neural_no_neural_conflict_rejected() {
+        // VAL-SETUP-015: --neural + --no-neural is a conflict
+        let result = Cli::try_parse_from(["leindex", "setup", "--neural", "--no-neural"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_setup_help_is_valid() {
+        // VAL-SETUP-001: leindex setup --help exits 0
+        let result = Cli::try_parse_from(["leindex", "setup", "--help"]);
+        assert!(result.is_err()); // clap exits with error for --help
+        let err = result.unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::DisplayHelp));
     }
 }
