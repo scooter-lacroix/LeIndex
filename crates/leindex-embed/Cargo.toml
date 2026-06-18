@@ -48,6 +48,9 @@ tokenizers = { version = "0.20", optional = true }
 ndarray = { version = "0.17", optional = true }
 dirs = { version = "5" }
 toml = { version = "0.8" }
+# Used by the worker binary to set PR_SET_PDEATHSIG on Linux so the worker
+# is auto-SIGKILLed when its parent dies (prevents orphaned worker leaks).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.13"

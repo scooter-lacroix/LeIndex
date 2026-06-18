@@ -1966,6 +1966,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "dirs",
+ "libc",
  "ndarray",
  "ort",
  "serde",

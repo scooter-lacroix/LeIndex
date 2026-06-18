@@ -33,7 +33,13 @@ use crate::startup::{StartupReport, StartupReporter};
 use ort::session::{builder::GraphOptimizationLevel, Session};
 
 /// Default idle timeout in seconds before the worker tears itself down.
-pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes
+///
+/// Reduced from 300s (5 min) to 60s (1 min) to limit the window during which
+/// orphaned worker processes can accumulate. Combined with PR_SET_PDEATHSIG
+/// (set in the worker's `main()`), this bounds stale worker lifetime so the
+/// ~1.5 GB ROCm/MIGraphX runtime held by each worker is reclaimed quickly
+/// after the parent leindex process exits.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 60; // 1 minute
 
 /// Default maximum sequence length for tokenization.
 // TODO: make this configurable from model config / RuntimeConfig.
@@ -1308,7 +1314,7 @@ mod tests {
     #[test]
     fn test_runtime_config_default() {
         let config = RuntimeConfig::default();
-        assert_eq!(config.idle_timeout, Duration::from_secs(300));
+        assert_eq!(config.idle_timeout, Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
         assert_eq!(config.max_frame_size, 16 * 1024 * 1024);
         assert_eq!(config.max_text_size, 1024 * 1024);
         assert_eq!(config.embedding_dim, 1024);

@@ -466,9 +466,126 @@ fn launch_mcp_process(config: &WorkloadConfig) -> Result<Child> {
 }
 
 /// Kill a child process gracefully (SIGKILL then reap).
+///
+/// In addition to killing the primary child, this also reaps any orphaned
+/// `leindex-embed` worker processes that the child spawned. Without this
+/// explicit cleanup, killing the main leindex process with SIGKILL would
+/// orphan the worker (each ~1.5 GB with ROCm libs loaded), and prior to the
+/// PR_SET_PDEATHSIG fix the worker would linger until its 5-minute idle
+/// timeout. This belt-and-suspenders cleanup ensures the memcheck harness
+/// never accumulates stale workers between phases even if PR_SET_PDEATHSIG
+/// is somehow unavailable (e.g., non-Linux platforms or older kernels).
 fn kill_child(mut child: Child) {
+    let pid = child.id();
+
+    // Kill the primary child first.
     let _ = child.kill();
     let _ = child.wait();
+
+    // Reap any leindex-embed worker children that the now-killed process
+    // spawned. We do this AFTER killing the parent so the workers are
+    // already orphaned (reparented to init) and we can find them by name
+    // without needing the parent pid relationship.
+    reap_worker_processes(pid);
+}
+
+/// Find and kill any lingering `leindex-embed` worker processes.
+///
+/// Scans `/proc` for processes whose name matches `leindex-embed` and whose
+/// PPID is either the just-killed parent or 1 (already orphaned). This is the
+/// memcheck-harness-side counterpart to the worker's PR_SET_PDEATHSIG guard:
+/// it guarantees no worker survives past a phase boundary even on platforms
+/// where PR_SET_PDEATHSIG is unavailable.
+///
+/// On non-Linux platforms this is a no-op (the memcheck harness is Linux-only
+/// anyway, but the conditional keeps the code portable).
+fn reap_worker_processes(parent_pid: u32) {
+    let worker_name = WORKER_BINARY_NAME;
+    let to_kill = find_worker_pids(parent_pid, worker_name);
+    for worker_pid in to_kill {
+        // SAFETY: `kill(pid, SIGKILL)` is a scalar syscall with no pointer
+        // arguments. We ignore the return value because the worker may have
+        // already exited between our scan and the kill.
+        unsafe {
+            let _ = libc::kill(worker_pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+/// Scan `/proc` for worker processes matching `worker_name` whose PPID is
+/// either `parent_pid` or 1 (already orphaned by the parent's death).
+fn find_worker_pids(parent_pid: u32, worker_name: &str) -> Vec<u32> {
+    let mut found = Vec::new();
+
+    let proc_dir = match std::fs::read_dir("/proc") {
+        Ok(d) => d,
+        Err(_) => return found,
+    };
+
+    for entry in proc_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+
+        let candidate_pid: u32 = match name_str.parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        if candidate_pid == parent_pid || candidate_pid == std::process::id() {
+            continue;
+        }
+
+        // Read the process name and ppid.
+        let comm = match read_proc_comm(candidate_pid) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // comm is truncated to 15 chars on Linux, so use starts_with.
+        if comm != worker_name && !comm.starts_with(worker_name) {
+            continue;
+        }
+
+        // Resolve the ppid and accept either the just-killed parent or init (1).
+        let ppid = read_proc_ppid(candidate_pid);
+        if ppid == parent_pid || ppid == 1 {
+            found.push(candidate_pid);
+        }
+    }
+
+    found
+}
+
+/// Read the process name from `/proc/<pid>/comm`.
+fn read_proc_comm(pid: u32) -> Option<String> {
+    let path = format!("/proc/{}/comm", pid);
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Read the parent PID from `/proc/<pid>/stat`.
+fn read_proc_ppid(pid: u32) -> u32 {
+    let path = format!("/proc/{}/stat", pid);
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+
+    // Format: pid (comm) state ppid ...
+    // The comm field may contain spaces and parens, so find the last ')'
+    // and parse from there.
+    let Some(close_paren) = content.rfind(')') else {
+        return 0;
+    };
+
+    let rest = &content[close_paren + 1..];
+    let mut fields = rest.split_whitespace();
+
+    fields.next(); // state
+    fields.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0)
 }
 
 /// Sample a PID for a fixed duration, collecting full memory samples.
@@ -734,5 +851,61 @@ mod tests {
         assert_eq!(report.rss_max_kib, 60000);
         assert_eq!(report.worker_rss_max_kib, 90000);
         assert_eq!(report.combined_rss_max_kib, 145000); // 55000 + 90000
+    }
+
+    // ── Worker-reaping cleanup tests ───────────────────────────────────
+    //
+    // These tests exercise the helper functions used by `kill_child` to
+    // scan /proc for orphaned `leindex-embed` workers after a phase ends.
+
+    #[test]
+    fn test_read_proc_comm_for_self() {
+        let pid = std::process::id();
+        let comm = read_proc_comm(pid);
+        assert!(comm.is_some(), "should be able to read comm for self");
+        let comm = comm.unwrap();
+        assert!(!comm.is_empty());
+        // The memcheck test binary's comm should not match the worker name.
+        assert_ne!(comm, WORKER_BINARY_NAME);
+    }
+
+    #[test]
+    fn test_read_proc_ppid_for_self() {
+        let pid = std::process::id();
+        let ppid = read_proc_ppid(pid);
+        // ppid should be a positive value (the test runner or shell).
+        assert!(ppid > 0, "ppid should be positive, got {}", ppid);
+    }
+
+    #[test]
+    fn test_read_proc_ppid_missing_pid() {
+        // A PID that almost certainly does not exist.
+        let ppid = read_proc_ppid(u32::MAX);
+        assert_eq!(ppid, 0, "missing pid should return 0 ppid");
+    }
+
+    #[test]
+    fn test_read_proc_comm_missing_pid() {
+        let comm = read_proc_comm(u32::MAX);
+        assert!(comm.is_none(), "missing pid should return None");
+    }
+
+    #[test]
+    fn test_find_worker_pids_finds_no_workers_for_self() {
+        // The memcheck test process should not have any leindex-embed children.
+        let pid = std::process::id();
+        let workers = find_worker_pids(pid, WORKER_BINARY_NAME);
+        assert!(
+            workers.is_empty(),
+            "expected no worker children for test process, found {:?}",
+            workers
+        );
+    }
+
+    #[test]
+    fn test_reap_worker_processes_no_crash_with_no_workers() {
+        // Ensures the reaper is a no-op when no workers are running.
+        // Use a deliberately unused parent pid that no real workers belong to.
+        reap_worker_processes(u32::MAX);
     }
 }
