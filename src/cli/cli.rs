@@ -1855,6 +1855,16 @@ async fn cmd_setup_impl(
     // VAL-SETUP-034: surfaces neural on/off, provider, ORT, model, config
     setup::print_summary(&result);
 
+    // VAL-SETUP-026: A failed smoke test means the install did not produce a
+    // working neural configuration. We exit non-zero so CI/scripts detect the
+    // failure, but we still printed the summary and persisted the config so
+    // the user has actionable diagnostics.
+    if let Some(ref smoke) = result.smoke_test {
+        if !smoke.passed {
+            std::process::exit(1);
+        }
+    }
+
     Ok(())
 }
 
