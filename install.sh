@@ -547,11 +547,23 @@ install_rust() {
 # ============================================================================
 
 install_leindex() {
-    print_step 5 7 "Building LeIndex"
+    print_step 5 8 "Building LeIndex"
 
     local install_method=""
     local repo_dir=""
     local should_cleanup=false
+
+    # Prefer a pre-built GitHub Release bundle when we are NOT inside a
+    # LeIndex development repository. This is the fast path for end users
+    # who curl-pipe install.sh — it copies binaries, bundled ORT libs,
+    # and models without requiring a Rust toolchain.
+    if [[ ! -f "Cargo.toml" ]]; then
+        log_info "Checking for pre-built release bundle..."
+        if try_install_from_release_bundle; then
+            return 0
+        fi
+        log_info "Proceeding with build from source..."
+    fi
 
     # Check if we're in the unified LeIndex repository (local development)
     if [[ -f "Cargo.toml" ]] && grep -q 'name = "'"$PROJECT_SLUG"'"' Cargo.toml 2>/dev/null; then
@@ -626,7 +638,20 @@ install_leindex() {
         fi
     fi
 
-    # Build from source
+    # Build from source.
+    # The `onnx` feature enables the load-dynamic ort strategy: NO ONNX
+    # Runtime is downloaded, linked, or vendored at build time. The worker
+    # binary discovers and dlopens libonnxruntime at runtime via the
+    # ort_discovery module (env var, config, ~/.leindex/lib/, sibling dir,
+    # pip site-packages, system paths). ORT does NOT need to be installed
+    # before running install.sh.
+    #
+    # We deliberately do NOT pass --features leindex/onnx-migraphx here.
+    # The MIGraphX (AMD GPU) provider is a runtime-only concern: the
+    # onnxruntime-migraphx pip wheel or the bundled lib/ (from the release
+    # bundle) provides the provider .so at runtime. Building with onnx
+    # (load-dynamic) produces a binary that can use CPU, CUDA, or MIGraphX
+    # ORT at runtime depending on which library is discovered.
     log_info "Building LeIndex..."
     if cargo build --release -p leindex -p leindex-embed --features leindex/onnx,leindex-embed/onnx 2>&1 | tee -a "$INSTALL_LOG"; then
         log_success "Build completed successfully"
@@ -678,6 +703,11 @@ install_leindex() {
 
     # Install bundled model assets
     install_model_assets "$repo_dir"
+
+    # Install bundled ORT runtime libraries (from release bundle lib/
+    # or a local lib/ directory). When building from source with
+    # load-dynamic, there is no lib/ directory — this is a safe no-op.
+    install_ort_libraries "$repo_dir"
 
     # Install dashboard assets for packaged installs and convenience.
     install_dashboard_assets "$repo_dir"
@@ -751,6 +781,264 @@ install_model_assets() {
     log_success "Model assets installed to $model_dir"
 }
 
+install_ort_libraries() {
+    # Copy bundled ONNX Runtime shared libraries from a release bundle (or a
+    # local lib/ directory) into $LEINDEX_HOME/lib/ so the worker's
+    # load-dynamic discovery chain finds ORT without requiring a separate
+    # `pip install onnxruntime` or `leindex setup` run.
+    #
+    # With the load-dynamic ort feature, NO ORT is linked at build time.
+    # The runtime discovery chain (in crates/leindex-embed/src/ort_discovery.rs)
+    # searches ORT_DYLIB_PATH env, config, ~/.leindex/lib/, sibling dir to
+    # the binary, pip site-packages, and system paths. Installing bundled
+    # libs to ~/.leindex/lib/ makes the GitHub Release bundle path zero-setup.
+    #
+    # When building from source via `cargo build` (no ORT at build time),
+    # there is no lib/ directory to copy; this function logs that and is
+    # a safe no-op.
+    local source_dir="$1"
+    local source_lib_dir="$source_dir/lib"
+
+    if [[ ! -d "$source_lib_dir" ]]; then
+        log_info "No bundled ORT libraries found (lib/ directory absent); use 'leindex setup' to install ORT"
+        return 0
+    fi
+
+    # Only proceed if there's at least one onnxruntime shared library present.
+    local ort_count
+    ort_count=$(find "$source_lib_dir" -maxdepth 1 \( -name 'libonnxruntime*' -o -name 'onnxruntime*.dll' \) 2>/dev/null | wc -l)
+    if [[ "$ort_count" -eq 0 ]]; then
+        log_info "No ONNX Runtime shared libraries in lib/; skipping ORT library install"
+        return 0
+    fi
+
+    local lib_dir="${LEINDEX_HOME}/lib"
+    log_info "Installing bundled ORT libraries to $lib_dir"
+    mkdir -p "$lib_dir"
+
+    # Copy atomically: stage into a temp directory, then swap.
+    local temp_lib_dir="${lib_dir}.tmp"
+    rm -rf "$temp_lib_dir"
+    mkdir -p "$temp_lib_dir"
+
+    # Copy all shared libraries from the bundle's lib/ directory.
+    # This covers libonnxruntime.so*, libonnxruntime.dylib*, onnxruntime.dll,
+    # and provider libraries (libonnxruntime_providers_shared.so,
+    # libonnxruntime_providers_migraphx.so, etc.).
+    local ort_files_found=false
+    while IFS= read -r -d '' lib_file; do
+        cp -P "$lib_file" "$temp_lib_dir/" 2>/dev/null || true
+        ort_files_found=true
+    done < <(find "$source_lib_dir" -maxdepth 1 \( -name 'libonnxruntime*' -o -name 'onnxruntime*.dll' -o -name 'libonnxruntime_providers*' -o -name 'onnxruntime_providers*' \) -print0 2>/dev/null)
+
+    if [[ "$ort_files_found" != true ]]; then
+        log_warn "No ORT shared libraries found in bundle lib/, skipping"
+        rm -rf "$temp_lib_dir"
+        return 0
+    fi
+
+    # Preserve any already-present libraries not in the bundle.
+    if [[ -d "$lib_dir" ]]; then
+        cp -an "$lib_dir/." "$temp_lib_dir/" 2>/dev/null || true
+    fi
+
+    rm -rf "$lib_dir"
+    mv "$temp_lib_dir" "$lib_dir"
+
+    local installed_count
+    installed_count=$(find "$lib_dir" -maxdepth 1 \( -name 'libonnxruntime*' -o -name 'onnxruntime*.dll' \) 2>/dev/null | wc -l)
+    log_success "ORT libraries installed ($installed_count files) to $lib_dir"
+}
+
+try_install_from_release_bundle() {
+    # Download and install the pre-built GitHub Release bundle instead of
+    # building from source. This path is fast (no Rust toolchain needed) and
+    # is the primary install path for end users who curl-pipe install.sh.
+    #
+    # The bundle layout (produced by .github/workflows/release.yml) is:
+    #   leindex-<version>-<platform>/
+    #   ├── bin/   (leindex, leindex-embed)
+    #   ├── lib/   (ORT runtime libraries for zero-setup neural search)
+    #   ├── models/ (qwen3-embed-0.6b.onnx + tokenizer + config)
+    #   └── INSTALL.txt
+    #
+    # This function installs bin/ → ~/.cargo/bin/, lib/ → ~/.leindex/lib/,
+    # models/ → ~/.leindex/models/. The discovery chain then finds the
+    # bundled ORT at ~/.leindex/lib/ without requiring `leindex setup`.
+
+    local version
+    version="${SCRIPT_VERSION}"
+    local repo_owner="scooter-lacroix"
+    local repo_name="LeIndex"
+    local gh_api="https://api.github.com/repos/${repo_owner}/${repo_name}"
+
+    # Detect platform and architecture.
+    local os_name arch asset_name
+    os_name="$(uname -s)"
+    arch="$(uname -m)"
+
+    case "$os_name" in
+        Linux)  os_name="linux" ;;
+        Darwin) os_name="macos" ;;
+        *) log_info "Bundle install not available for OS: $os_name"; return 1 ;;
+    esac
+
+    case "$arch" in
+        x86_64|amd64) arch="x86_64" ;;
+        aarch64|arm64) arch="aarch64" ;;
+        *) log_info "Bundle install not available for architecture: $arch"; return 1 ;;
+    esac
+
+    asset_name="${os_name}-${arch}"
+    if [[ "$os_name" == "macos" ]]; then
+        # Release bundles are published for macOS aarch64 (Apple Silicon) only.
+        if [[ "$arch" != "aarch64" ]]; then
+            log_info "Bundle install not available for macOS $arch (aarch64 only)"
+            return 1
+        fi
+    fi
+
+    local asset_filename="leindex-${version}-${asset_name}.tar.gz"
+
+    # Resolve the download URL. Use the GitHub API to find the asset in the
+    # matching version tag; fall back to the "latest" release if the exact
+    # version tag is not found.
+    local download_url=""
+    local gh_tag="v${version}"
+
+    if command -v curl &>/dev/null; then
+        # Try the exact version tag first, then "latest".
+        download_url=$(curl -sSL "${gh_api}/releases/tags/${gh_tag}" \
+            2>/dev/null | grep -o "\"browser_download_url\"[[:space:]]*:[[:space:]]*\"[^\"]*${asset_filename}\"" \
+            | head -1 | sed 's/.*"\(https[^"]*\)".*/\1/')
+        if [[ -z "$download_url" ]]; then
+            download_url=$(curl -sSL "${gh_api}/releases/latest" \
+                2>/dev/null | grep -o "\"browser_download_url\"[[:space:]]*:[[:space:]]*\"[^\"]*${asset_filename}\"" \
+                | head -1 | sed 's/.*"\(https[^"]*\)".*/\1/')
+        fi
+    fi
+
+    if [[ -z "$download_url" ]]; then
+        log_info "No pre-built bundle found for ${asset_filename}; falling back to build from source"
+        return 1
+    fi
+
+    log_info "Found release bundle: $download_url"
+
+    # Download the bundle to a temporary location.
+    local tmp_bundle
+    tmp_bundle=$(mktemp -d)
+    local archive_path="${tmp_bundle}/${asset_filename}"
+
+    log_info "Downloading LeIndex bundle (${asset_name})..."
+    if ! curl -fSL --retry 3 --retry-delay 5 -o "$archive_path" "$download_url" 2>&1 | tee -a "$INSTALL_LOG"; then
+        log_warn "Failed to download release bundle; falling back to build from source"
+        rm -rf "$tmp_bundle"
+        return 1
+    fi
+
+    # Extract the archive.
+    local extract_dir="${tmp_bundle}/extracted"
+    mkdir -p "$extract_dir"
+    if ! tar xzf "$archive_path" -C "$extract_dir" 2>&1 | tee -a "$INSTALL_LOG"; then
+        log_warn "Failed to extract release bundle; falling back to build from source"
+        rm -rf "$tmp_bundle"
+        return 1
+    fi
+
+    # The archive extracts to a single top-level directory.
+    local bundle_dir
+    bundle_dir=$(find "$extract_dir" -maxdepth 1 -type d -name "leindex-*-${asset_name}" | head -1)
+    if [[ -z "$bundle_dir" ]] || [[ ! -d "$bundle_dir" ]]; then
+        log_warn "Unexpected bundle layout; falling back to build from source"
+        rm -rf "$tmp_bundle"
+        return 1
+    fi
+
+    log_success "Bundle extracted to: $bundle_dir"
+
+    # Install binaries to ~/.cargo/bin/.
+    ensure_cargo_home_ready
+
+    local main_bin="${bundle_dir}/bin/leindex"
+    local worker_bin="${bundle_dir}/bin/leindex-embed"
+
+    if [[ -f "$main_bin" ]]; then
+        if cp "$main_bin" "$INSTALL_BIN_PATH" && chmod +x "$INSTALL_BIN_PATH"; then
+            log_success "Binary installed to: $INSTALL_BIN_PATH (from release bundle)"
+            cleanup_legacy_binary_locations
+        else
+            log_error "Failed to install binary from bundle to $INSTALL_BIN_PATH"
+            rm -rf "$tmp_bundle"
+            return 1
+        fi
+    else
+        log_error "Bundle binary not found: $main_bin"
+        rm -rf "$tmp_bundle"
+        return 1
+    fi
+
+    if [[ -f "$worker_bin" ]]; then
+        local worker_install_path="${INSTALL_BIN_DIR}/leindex-embed"
+        if cp "$worker_bin" "$worker_install_path" && chmod +x "$worker_install_path"; then
+            log_success "Worker binary installed to: $worker_install_path"
+        else
+            log_warn "Failed to install worker binary from bundle"
+        fi
+    fi
+
+    # Install bundled ORT libraries and model assets.
+    install_ort_libraries "$bundle_dir"
+    install_model_assets "$bundle_dir"
+
+    # Clean up.
+    rm -rf "$tmp_bundle"
+
+    log_success "LeIndex installed from release bundle"
+    return 0
+}
+
+run_setup_check() {
+    # Run `leindex setup --check` after install to report neural search
+    # status. If neural search is not configured, suggest running
+    # `leindex setup`. This is informational and never fatal — TF-IDF
+    # search works regardless of neural configuration.
+    local binary="$INSTALL_BIN_PATH"
+
+    if [[ ! -x "$binary" ]]; then
+        log_warn "Cannot run setup --check: binary not found at $binary"
+        return 0
+    fi
+
+    log_info "Running post-install setup check..."
+    echo ""
+
+    local setup_output
+    local setup_exit
+    setup_output=$("$binary" setup --check 2>&1) || true
+    setup_exit=$?
+
+    echo "$setup_output"
+
+    if [[ "$setup_exit" -ne 0 ]]; then
+        echo ""
+        log_info "Neural search is not yet configured."
+        echo "  To enable semantic search, run:  ${CYAN}leindex setup${NC}"
+        echo "  Or for non-interactive setup:     ${CYAN}leindex setup --neural --cpu${NC}"
+    else
+        # Check if neural search is actually configured by looking for
+        # the "Fully configured" or equivalent success indicator.
+        if echo "$setup_output" | grep -qi "not configured\|neural.*disabled\|not.*ready\|incomplete"; then
+            echo ""
+            log_info "Neural search detected as incomplete."
+            echo "  Run ${CYAN}leindex setup${NC} to complete configuration."
+        fi
+    fi
+
+    echo ""
+    return 0
+}
+
 install_dashboard_assets() {
     local repo_dir="$1"
     local source_dir="$repo_dir/dashboard"
@@ -799,7 +1087,7 @@ install_dashboard_assets() {
 }
 
 verify_installation() {
-    print_step 6 7 "Verifying Installation"
+    print_step 6 8 "Verifying Installation"
 
     local binary="$INSTALL_BIN_PATH"
 
@@ -856,7 +1144,7 @@ verify_installation() {
 }
 
 setup_directories() {
-    print_step 7 7 "Setting up Directories"
+    print_step 7 8 "Setting up Directories"
 
     # Create LeIndex data directories (bin directory is created during install)
     for dir in "$CONFIG_DIR" "$DATA_DIR" "$LOG_DIR" "$DASHBOARD_DIR"; do
@@ -2445,7 +2733,7 @@ main() {
     echo ""
 
     # Step 1: Detect OS and install system dependencies
-    print_step 1 7 "Detecting Operating System"
+    print_step 1 8 "Detecting Operating System"
     detect_os
     log_info "Detected OS: $OS_NAME"
 
@@ -2459,7 +2747,7 @@ main() {
     install_system_deps
 
     # Step 2: Install optional components
-    print_step 2 7 "Installing Optional Components"
+    print_step 2 8 "Installing Optional Components"
     if [[ "$NONINTERACTIVE" != true ]]; then
         echo ""
         log_info "Optional components:"
@@ -2481,11 +2769,11 @@ main() {
     fi
 
     # Step 3: Prepare any existing installation before continuing
-    print_step 3 7 "Preparing Existing Installation"
+    print_step 3 8 "Preparing Existing Installation"
     purge_existing_installation
 
     # Step 4: Check Rust
-    print_step 4 7 "Checking Rust Toolchain"
+    print_step 4 8 "Checking Rust Toolchain"
 
     if ! detect_rust; then
         echo ""
@@ -2520,6 +2808,10 @@ main() {
     # Step 7: Setup directories
     setup_directories
 
+    # Step 8: Run post-install setup check
+    print_step 8 8 "Neural Search Status Check"
+    run_setup_check
+
     # Update PATH
     update_path
     report_path_resolution
@@ -2551,6 +2843,7 @@ main() {
     echo "  ${CYAN}3.${NC} Run diagnostics: ${YELLOW}$PROJECT_SLUG diagnostics${NC}"
     echo "  ${CYAN}4.${NC} Start MCP server: ${YELLOW}$PROJECT_SLUG serve${NC}"
     echo "  ${CYAN}5.${NC} ${BOLD}Start frontend dashboard:${NC} ${YELLOW}$PROJECT_SLUG dashboard${NC}"
+    echo "  ${CYAN}6.${NC} ${BOLD}Enable neural search:${NC} ${YELLOW}$PROJECT_SLUG setup${NC}"
     echo ""
     echo "  ${BOLD}Frontend Dashboard:${NC}"
     echo "  The dashboard is available at: ${CYAN}http://localhost:5173${NC}"
