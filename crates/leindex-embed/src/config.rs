@@ -70,6 +70,13 @@ pub struct NeuralConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ort_dylib_path: Option<String>,
 
+    /// Installed ONNX Runtime version (e.g., "1.25.0"), recorded by setup.
+    ///
+    /// VAL-SETUP-020: Config records the ORT version so diagnostics and
+    /// `--check` can report it without re-querying pip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ort_version: Option<String>,
+
     /// Directory containing model files (ONNX model, tokenizer, etc.).
     #[serde(default = "default_model_dir")]
     pub model_dir: String,
@@ -107,6 +114,7 @@ impl Default for NeuralConfig {
             enabled: false,
             execution_provider: default_execution_provider(),
             ort_dylib_path: None,
+            ort_version: None,
             model_dir: default_model_dir(),
         }
     }
@@ -363,6 +371,7 @@ mod tests {
             enabled: true,
             execution_provider: "cpu".to_string(),
             ort_dylib_path: Some("/usr/local/lib/libonnxruntime.so".to_string()),
+            ort_version: Some("1.25.0".to_string()),
             model_dir: "/home/user/.leindex/models".to_string(),
         };
 
@@ -408,6 +417,7 @@ mod tests {
                 enabled: true,
                 execution_provider: "migraphx".to_string(),
                 ort_dylib_path: Some("/usr/local/lib/libonnxruntime.so.1.25.0".to_string()),
+                ort_version: Some("1.25.0".to_string()),
                 model_dir: "/home/user/.leindex/models".to_string(),
             },
             search: SearchConfig {
@@ -463,6 +473,7 @@ mod tests {
             enabled: true,
             execution_provider: "cpu".to_string(),
             ort_dylib_path: None,
+            ort_version: None,
             model_dir: "/models".to_string(),
         };
         let toml_str = toml::to_string(&config).unwrap();
@@ -511,6 +522,7 @@ mod tests {
                 enabled: true,
                 execution_provider: "cpu".to_string(),
                 ort_dylib_path: Some("/usr/lib/libonnxruntime.so".to_string()),
+                ort_version: Some("1.25.0".to_string()),
                 model_dir: tmp.path().join("models").display().to_string(),
             },
             ..Default::default()
@@ -536,6 +548,7 @@ mod tests {
                 enabled: true,
                 execution_provider: "cpu".to_string(),
                 ort_dylib_path: Some("/usr/lib/libonnxruntime.so".to_string()),
+                ort_version: Some("1.25.0".to_string()),
                 model_dir: "/models".to_string(),
             },
             ..Default::default()

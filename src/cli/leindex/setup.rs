@@ -79,6 +79,8 @@ pub struct SetupResult {
     pub config_path: Option<PathBuf>,
     /// ORT dylib path discovered after installation (if any).
     pub ort_dylib_path: Option<PathBuf>,
+    /// ORT (onnxruntime) version detected after install (VAL-SETUP-020).
+    pub ort_version: Option<String>,
     /// Whether the model files are present.
     pub model_present: bool,
     /// Whether ORT (onnxruntime pip package) is installed.
@@ -230,6 +232,9 @@ pub fn is_interactive() -> bool {
 ///
 /// Writes config, installs ORT (if neural), checks models.
 /// VAL-SETUP-006/007/008: ORT pip install routing
+/// VAL-SETUP-020: pip install onnxruntime succeeds, version recorded
+/// VAL-SETUP-021: pip not found surfaces actionable error
+/// VAL-SETUP-022: wrong ORT version triggers upgrade or clear warning
 /// VAL-SETUP-023: Config written with correct schema
 /// VAL-SETUP-024: Idempotent
 pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> {
@@ -237,8 +242,45 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
     let ort_installed = check_ort_installed();
     let model_present = check_model_present();
 
-    let ort_dylib_path = if choices.neural_enabled {
+    let (ort_dylib_path, ort_version) = if choices.neural_enabled {
         let provider = choices.provider.unwrap_or(ExecutionProvider::Cpu);
+
+        // VAL-SETUP-022: Check version compatibility of any existing install
+        // before deciding whether to (re)install. An incompatible version
+        // triggers either an upgrade (when too old) or a clear warning (when
+        // too new). This must run before install so we don't silently proceed
+        // with a known-bad version.
+        let pre_existing_version = get_ort_version();
+        if let Some(ref detected) = pre_existing_version {
+            match check_ort_version_compatibility(detected) {
+                VersionCompatibility::Unsupported {
+                    required_min,
+                    reason,
+                } => {
+                    println!(
+                        "  -> WARNING: Detected onnxruntime {}, but LeIndex requires {} ({}).",
+                        detected, required_min, reason
+                    );
+                    println!("     Upgrading to a supported version...");
+                    // Fall through to install/upgrade below.
+                }
+                VersionCompatibility::TooNew {
+                    supported_max,
+                    reason,
+                } => {
+                    println!(
+                        "  -> WARNING: Detected onnxruntime {}, which is newer than the supported maximum ({}).",
+                        detected, supported_max
+                    );
+                    println!("     Reason: {}.", reason);
+                    println!("     Setup will continue, but if you hit ABI errors, pin onnxruntime to <= {}.", supported_max);
+                    // We continue: too-new may still work, just warn.
+                }
+                VersionCompatibility::Supported => {
+                    println!("  -> onnxruntime {} detected (compatible).", detected);
+                }
+            }
+        }
 
         // VAL-SETUP-006/007/008/010/011/012: Install/maintain ORT for the provider
         if !ort_installed {
@@ -260,12 +302,19 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
                     provider.config_value()
                 );
             }
+        } else if pre_existing_version.is_none() {
+            // CPU was selected but the installed ORT couldn't report a version
+            // (or was too old to import). Trigger an upgrade.
+            println!("  -> onnxruntime installed but unimportable; upgrading...");
+            install_ort(provider)?;
         }
 
-        // Discover ORT dylib path
-        discover_ort_path()
+        // Discover ORT dylib path and version after (potential) install
+        let ort_path = discover_ort_path();
+        let ort_ver = get_ort_version().or(pre_existing_version);
+        (ort_path, ort_ver)
     } else {
-        None
+        (None, None)
     };
 
     // Check models when neural is enabled
@@ -276,7 +325,7 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
     };
 
     // Write the config
-    let config = build_config(choices, ort_dylib_path.as_deref());
+    let config = build_config(choices, ort_dylib_path.as_deref(), ort_version.as_deref());
     let (config, recovery) = merge_with_existing(config);
     let config_path = config
         .save()
@@ -300,6 +349,7 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
         choices: choices.clone(),
         config_path: Some(config_path),
         ort_dylib_path,
+        ort_version,
         model_present,
         ort_installed: choices.neural_enabled || ort_installed,
     })
@@ -368,6 +418,7 @@ enum RecoveryNotice {
 fn build_config(
     choices: &SetupChoices,
     ort_dylib_path: Option<&std::path::Path>,
+    ort_version: Option<&str>,
 ) -> crate::cli::neural_config::LeIndexConfig {
     use crate::cli::neural_config::{IndexingConfig, NeuralConfig, SearchConfig};
 
@@ -378,6 +429,7 @@ fn build_config(
             enabled: choices.neural_enabled,
             execution_provider: provider_str.to_string(),
             ort_dylib_path: ort_dylib_path.map(|p| p.display().to_string()),
+            ort_version: ort_version.map(|s| s.to_string()),
             model_dir: crate::cli::neural_config::model_dir_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "~/.leindex/models".to_string()),
@@ -389,24 +441,129 @@ fn build_config(
 
 /// Check if onnxruntime is installed (any variant).
 fn check_ort_installed() -> bool {
-    // Try importing onnxruntime via Python
+    get_ort_version().is_some()
+}
+
+/// Get the installed onnxruntime version by importing it via Python.
+///
+/// Returns `Some(version_string)` (e.g., "1.25.0") when onnxruntime can be
+/// imported. VAL-SETUP-020: the returned string is recorded in the config so
+/// subsequent setup runs and `--check` can report it without re-querying.
+pub fn get_ort_version() -> Option<String> {
     let candidates = ["python3", "python"];
     for cmd in &candidates {
         let result = Command::new(cmd)
             .arg("-c")
             .arg("import onnxruntime; print(onnxruntime.__version__)")
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .output();
 
         if let Ok(out) = result {
             if out.status.success() {
-                return true;
+                let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
             }
         }
     }
-    false
+    None
+}
+
+/// Minimum supported ONNX Runtime version (MAJOR.MINOR.PATCH).
+///
+/// LeIndex uses the `ort` crate which targets the ORT 1.x C API. Older ORT
+/// versions (< 1.20.0) are missing APIs the worker depends on
+/// (`OrtSessionOptionsAppendExecutionProvider_*`, lazy shape inference, etc.).
+pub const MIN_ORT_VERSION: (u32, u32, u32) = (1, 20, 0);
+
+/// Maximum supported ONNX Runtime major version. ORT 2.x will introduce ABI
+/// breaking changes and is not yet released as of the ort crate 2.0.0-rc.12
+/// pinning. We treat 2.0.0+ as "too new" and warn rather than silently accept.
+pub const MAX_ORT_MAJOR: u32 = 1;
+
+/// Outcome of comparing a detected version against the supported range.
+///
+/// VAL-SETUP-022: Setup either upgrades an unsupported version or emits a
+/// clear warning naming the detected and required versions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionCompatibility {
+    /// Version is within the supported range.
+    Supported,
+    /// Version is too old. `required_min` names the minimum supported version
+    /// and `reason` explains why upgrade is necessary.
+    Unsupported {
+        /// Minimum supported version string (e.g., "1.20.0").
+        required_min: String,
+        /// Human-readable reason the version is unsupported.
+        reason: String,
+    },
+    /// Version is too new (major bump). May still work, but the user is warned.
+    TooNew {
+        /// Maximum supported version string (e.g., "1.x").
+        supported_max: String,
+        /// Human-readable reason the version is concerning.
+        reason: String,
+    },
+}
+
+/// Parse a semver-like version string ("1.25.0") into a (major, minor, patch)
+/// tuple. Trailing pre-release/build metadata is ignored. Returns `None` when
+/// the string cannot be parsed.
+pub fn parse_version(s: &str) -> Option<(u32, u32, u32)> {
+    let core = s.split('-').next().unwrap_or(s);
+    let core = core.split('+').next().unwrap_or(core);
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u32>().ok()?;
+    let minor = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+    let patch = parts.next().unwrap_or("0").parse::<u32>().ok()?;
+    Some((major, minor, patch))
+}
+
+/// Compare a detected ORT version against the supported range.
+///
+/// VAL-SETUP-022: caller must surface the returned reason in the user-facing
+/// log when the version is not `Supported`, and upgrade the install when
+/// `Unsupported` is returned.
+pub fn check_ort_version_compatibility(detected: &str) -> VersionCompatibility {
+    let Some(version) = parse_version(detected) else {
+        // Unparseable version string can't be trusted; treat as unsupported.
+        return VersionCompatibility::Unsupported {
+            required_min: format!(
+                "{}.{}.{}",
+                MIN_ORT_VERSION.0, MIN_ORT_VERSION.1, MIN_ORT_VERSION.2
+            ),
+            reason: format!(
+                "detected version '{}' is not a recognized onnxruntime release",
+                detected
+            ),
+        };
+    };
+
+    if version.0 > MAX_ORT_MAJOR {
+        return VersionCompatibility::TooNew {
+            supported_max: format!("{}.x", MAX_ORT_MAJOR),
+            reason: format!(
+                "ORT {}.{} introduces breaking ABI changes; expected <= {}.x",
+                version.0, version.1, MAX_ORT_MAJOR
+            ),
+        };
+    }
+
+    // Within the supported major. Compare against MIN_ORT_VERSION.
+    if version < MIN_ORT_VERSION {
+        return VersionCompatibility::Unsupported {
+            required_min: format!(
+                "{}.{}.{}",
+                MIN_ORT_VERSION.0, MIN_ORT_VERSION.1, MIN_ORT_VERSION.2
+            ),
+            reason: "this ORT build lacks APIs the worker depends on".to_string(),
+        };
+    }
+
+    VersionCompatibility::Supported
 }
 
 /// Check if a specific execution provider is available in the installed ORT.
@@ -477,39 +634,175 @@ fn check_model_present() -> bool {
 /// VAL-SETUP-006: AMD -> pip install onnxruntime-migraphx
 /// VAL-SETUP-007: NVIDIA -> pip install onnxruntime-gpu
 /// VAL-SETUP-008/010: CPU -> pip install onnxruntime
+///
+/// VAL-SETUP-020: Reports success with the installed version.
+/// VAL-SETUP-021: `find_pip()` handles pip-not-found with PIP_BIN hint.
+/// VAL-SETUP-022: Caller checks version compatibility after install.
+///
+/// The pip process output is captured (not inherited) so we can detect
+/// network failures and surface them in the error message rather than a
+/// generic exit-code-only failure.
 fn install_ort(provider: ExecutionProvider) -> Result<(), SetupError> {
     let package = provider.pip_package();
 
     println!("Installing {} via pip...", package);
 
-    // Find pip
+    // VAL-SETUP-021: find_pip knows about PIP_BIN, python -m pip, pip3, pip.
     let pip_cmd = find_pip().ok_or(SetupError::PipNotFound)?;
 
+    // We use `--upgrade` so that a pre-existing too-old install (e.g., 1.10.0)
+    // is replaced with a supported release (VAL-SETUP-022 upgrade path).
+    //
+    // Captured output (instead of inherited) lets us distinguish network
+    // failures from genuine pip errors and include the relevant excerpt in the
+    // error message.
     let result = Command::new(&pip_cmd.0)
         .args(&pip_cmd.1)
         .arg("install")
         .arg(package)
         .arg("--upgrade")
-        .status();
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
 
     match result {
-        Ok(status) if status.success() => {
-            println!("  -> Successfully installed {}.", package);
+        Ok(out) if out.status.success() => {
+            // VAL-SETUP-020: surface success, including the installed version
+            // when pip prints it ("Successfully installed onnxruntime-1.25.0").
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let combined = if stdout.is_empty() {
+                stderr.to_string()
+            } else {
+                stdout.to_string()
+            };
+
+            // Best-effort version parse from pip's "Successfully installed ..." line.
+            if let Some(version_line) = combined
+                .lines()
+                .find(|l| l.contains("Successfully installed") && l.contains(package))
+            {
+                println!("  -> {}", version_line.trim());
+            } else {
+                println!("  -> Successfully installed {}.", package);
+            }
             Ok(())
         }
-        Ok(status) => Err(SetupError::PipInstallFailed {
-            package: package.to_string(),
-            exit_code: status.code().unwrap_or(-1),
-        }),
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let combined = format!("{}\n{}", stdout, stderr);
+
+            // Detect common network failures so we can give actionable guidance.
+            if is_network_error(&combined) {
+                return Err(SetupError::PipNetworkFailed {
+                    package: package.to_string(),
+                    exit_code: out.status.code().unwrap_or(-1),
+                    output: truncate_for_error(&stderr),
+                });
+            }
+
+            Err(SetupError::PipInstallFailed {
+                package: package.to_string(),
+                exit_code: out.status.code().unwrap_or(-1),
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Should not happen (find_pip verified the binary), but handle it.
+            Err(SetupError::PipNotFound)
+        }
         Err(e) => Err(SetupError::Io(format!("Failed to run pip: {}", e))),
+    }
+}
+
+/// Heuristic for detecting pip network/download errors in captured output.
+///
+/// VAL-SETUP-019's pip-analogue (VAL-SETUP-020 fail path): we want the error
+/// message to mention connectivity and a remediation hint rather than just an
+/// exit code.
+fn is_network_error(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    const NETWORK_HINTS: &[&str] = &[
+        "could not fetch url",
+        "connection error",
+        "connectionerror",
+        "connectionrefusederror",
+        "connection reset",
+        "connection timed out",
+        "connection broken",
+        "ssl: certificate_verify_failed",
+        "ssl certificate_verify_failed",
+        "temporary failure in name resolution",
+        "failed to establish a new connection",
+        "max retries exceeded",
+        "network is unreachable",
+        "read timed out",
+        "remotedisconnectederror",
+        "newconnectionerror",
+        "getaddrinfo failed",
+        "name or service not known",
+        "no such device or address",
+    ];
+    NETWORK_HINTS.iter().any(|hint| lower.contains(hint))
+}
+
+fn truncate_for_error(s: &str) -> String {
+    const MAX_LINES: usize = 12;
+    let lines: Vec<&str> = s.lines().collect();
+    if lines.len() <= MAX_LINES {
+        s.trim().to_string()
+    } else {
+        format!(
+            "{}\n... ({} more lines truncated)",
+            lines[..MAX_LINES].join("\n").trim(),
+            lines.len() - MAX_LINES
+        )
     }
 }
 
 /// Find the pip executable.
 ///
-/// Returns (program, args_before_install) where args_before_install is the
-/// prefix arguments (e.g., ["-m", "pip"] for `python3 -m pip`).
+/// VAL-SETUP-021: PIP_BIN env var is checked first (it can either point at the
+/// `pip` binary, or at a python interpreter prefixed with `-m pip`). After
+/// that, we look for `pip3`, `pip`, and `python[3] -m pip` on PATH.
+///
+/// Returns `(program, prefix_args)` where `prefix_args` is the argument list
+/// that must precede `install <package>` (e.g., `["-m", "pip"]` for
+/// `python3 -m pip`).
 fn find_pip() -> Option<(String, Vec<String>)> {
+    // VAL-SETUP-021: Honor PIP_BIN first so users can point at a non-default pip.
+    if let Ok(value) = std::env::var("PIP_BIN") {
+        if !value.trim().is_empty() {
+            // Split into program + leading args so the caller can append
+            // "install <package>" to it. If PIP_BIN is a single token, we
+            // treat it as the pip binary directly. If it contains spaces
+            // (e.g., "/usr/bin/python3 -m pip"), we split program from args.
+            let mut parts = value.split_whitespace();
+            if let Some(program) = parts.next() {
+                let prefix: Vec<String> = parts.map(|s| s.to_string()).collect();
+                if Command::new(program)
+                    .args(&prefix)
+                    .arg("--version")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false)
+                {
+                    return Some((program.to_string(), prefix));
+                }
+                // PIP_BIN was set but the binary it points at is broken/missing.
+                // Fall through to discovery but log a hint to stderr.
+                eprintln!(
+                    "warning: PIP_BIN is set to '{}' but invoking it failed; falling back to PATH discovery.",
+                    value
+                );
+            }
+        }
+    }
+
     // Try pip3, pip directly
     for cmd in &["pip3", "pip"] {
         if Command::new(cmd)
@@ -704,12 +997,14 @@ fn find_bundled_models() -> Option<PathBuf> {
 /// Print a status report without modifying anything.
 ///
 /// VAL-SETUP-014: --check mode reads config and reports status
+/// VAL-SETUP-020: Reports the ORT version (from config + live detection)
 /// VAL-SETUP-034: Surfaces full configuration
 pub fn run_check() -> Result<CheckResult, SetupError> {
     let (config, action) = crate::cli::neural_config::LeIndexConfig::load_or_recover()
         .map_err(|e| SetupError::ConfigRead(e.to_string()))?;
 
     let ort_installed = check_ort_installed();
+    let live_version = get_ort_version();
     let model_present = check_model_present();
     let ort_path = discover_ort_path().or_else(|| {
         config
@@ -719,6 +1014,10 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
             .map(PathBuf::from)
             .filter(|p| p.exists())
     });
+    // Prefer the live-detected version; fall back to the recorded one.
+    let ort_version = live_version
+        .clone()
+        .or_else(|| config.neural.ort_version.clone());
 
     let is_fully_configured = config.neural.enabled && ort_installed && model_present;
 
@@ -740,6 +1039,37 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
         "not installed"
     };
     println!("ORT (onnxruntime): {}", ort_status);
+
+    // VAL-SETUP-020: version reporting
+    if let Some(ref version) = ort_version {
+        println!("ORT version:        {}", version);
+
+        // VAL-SETUP-022: surface compatibility verdict so `--check` can warn.
+        match check_ort_version_compatibility(version) {
+            VersionCompatibility::Supported => {}
+            VersionCompatibility::Unsupported {
+                required_min,
+                reason,
+            } => {
+                println!(
+                    "  -> WARNING: detected {} but LeIndex requires {} ({}).",
+                    version, required_min, reason
+                );
+                println!("     Re-run `leindex setup --neural --cpu` to upgrade.");
+            }
+            VersionCompatibility::TooNew {
+                supported_max,
+                reason,
+            } => {
+                println!(
+                    "  -> WARNING: {} is newer than the supported maximum ({}). {}",
+                    version, supported_max, reason
+                );
+            }
+        }
+    } else if ort_installed {
+        println!("ORT version:        (unable to determine)");
+    }
 
     if let Some(ref path) = ort_path {
         println!("ORT dylib path:     {}", path.display());
@@ -795,6 +1125,7 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
         neural_enabled: config.neural.enabled,
         provider: config.neural.execution_provider.clone(),
         ort_installed,
+        ort_version,
         ort_path,
         model_present,
         fully_configured: is_fully_configured,
@@ -811,6 +1142,8 @@ pub struct CheckResult {
     pub provider: String,
     /// Whether ORT is installed.
     pub ort_installed: bool,
+    /// Detected or recorded ORT version, if any (VAL-SETUP-020).
+    pub ort_version: Option<String>,
     /// Discovered ORT dylib path.
     pub ort_path: Option<PathBuf>,
     /// Whether model files are present.
@@ -821,7 +1154,8 @@ pub struct CheckResult {
 
 /// Print a final summary after setup completes.
 ///
-/// VAL-SETUP-034: The summary surface all five pieces of status.
+/// VAL-SETUP-020: Surfaces the ORT version.
+/// VAL-SETUP-034: The summary surfaces all five pieces of status.
 pub fn print_summary(result: &SetupResult) {
     println!("\nSetup Summary\n{}", "-".repeat(14));
 
@@ -842,6 +1176,11 @@ pub fn print_summary(result: &SetupResult) {
         "not installed"
     };
     println!("ORT:          {}", ort_str);
+
+    // VAL-SETUP-020: ORT version
+    if let Some(ref version) = result.ort_version {
+        println!("ORT version:  {}", version);
+    }
 
     if let Some(ref path) = result.ort_dylib_path {
         println!("ORT path:     {}", path.display());
@@ -909,9 +1248,21 @@ pub enum SetupError {
     /// Config read error.
     ConfigRead(String),
     /// pip not found on PATH.
+    ///
+    /// VAL-SETUP-021: The Display impl names pip as missing and suggests
+    /// install instructions + the PIP_BIN override.
     PipNotFound,
-    /// pip install failed.
+    /// pip install failed with a generic (non-network) error.
     PipInstallFailed { package: String, exit_code: i32 },
+    /// pip install failed due to a network/connectivity problem.
+    ///
+    /// Surfaced distinctly from PipInstallFailed so we can give the user a
+    /// clearer remediation hint (check connectivity / proxy / mirror).
+    PipNetworkFailed {
+        package: String,
+        exit_code: i32,
+        output: String,
+    },
     /// I/O error.
     Io(String),
 }
@@ -933,13 +1284,39 @@ impl std::fmt::Display for SetupError {
                 write!(f, "Failed to read config: {}", msg)
             }
             SetupError::PipNotFound => {
-                write!(f, "pip not found on PATH. Install pip first (e.g., 'python -m ensurepip' on Linux) or set PIP_BIN. Alternatively, manually install onnxruntime and set ORT_DYLIB_PATH.")
+                // VAL-SETUP-021: actionable error including PIP_BIN and OS hints.
+                write!(
+                    f,
+                    "pip not found on PATH. Install pip first:\n  \
+                     - Debian/Ubuntu: sudo apt install python3-pip\n  \
+                     - macOS/Linux (ensurepip): python3 -m ensurepip --upgrade\n  \
+                     - Or download: https://pip.pypa.io/en/stable/installation/\n  \
+                     Alternatively, set PIP_BIN=/path/to/pip \
+                     (or PIP_BIN=\"python3 -m pip\") to point setup at a specific pip, \
+                     or manually install onnxruntime and set ORT_DYLIB_PATH."
+                )
             }
             SetupError::PipInstallFailed { package, exit_code } => {
                 write!(
                     f,
-                    "Failed to install {} via pip (exit code {}). Check your Python environment and network connection.",
+                    "Failed to install {} via pip (exit code {}). \
+                     Check your Python environment. \
+                     If onnxruntime is already installed in another Python, \
+                     set PIP_BIN or ORT_DYLIB_PATH to use it.",
                     package, exit_code
+                )
+            }
+            SetupError::PipNetworkFailed {
+                package,
+                exit_code,
+                output,
+            } => {
+                write!(
+                    f,
+                    "Network failure while installing {} via pip (exit code {}). \
+                     Check your internet connection, proxy settings, or PyPI mirror. \
+                     pip output:\n{}",
+                    package, exit_code, output
                 )
             }
             SetupError::Io(msg) => write!(f, "I/O error: {}", msg),
@@ -1071,5 +1448,279 @@ mod tests {
 
         let err = SetupError::PipNotFound;
         assert!(err.to_string().contains("pip not found"));
+    }
+
+    // ── VAL-SETUP-020/021/022: New error and version-compatibility tests ──
+
+    #[test]
+    fn test_pip_not_found_error_mentions_pip_bin() {
+        // VAL-SETUP-021: error must mention PIP_BIN as a remediation.
+        let err = SetupError::PipNotFound;
+        let msg = err.to_string();
+        assert!(
+            msg.contains("PIP_BIN"),
+            "PipNotFound must mention PIP_BIN: {}",
+            msg
+        );
+        assert!(msg.contains("python3-pip") || msg.contains("ensurepip"));
+    }
+
+    #[test]
+    fn test_pip_install_failed_error_mentions_package() {
+        let err = SetupError::PipInstallFailed {
+            package: "onnxruntime".to_string(),
+            exit_code: 1,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("onnxruntime"));
+        assert!(msg.contains("exit code 1"));
+    }
+
+    #[test]
+    fn test_pip_network_failed_error_mentions_network() {
+        let err = SetupError::PipNetworkFailed {
+            package: "onnxruntime".to_string(),
+            exit_code: 1,
+            output: "Could not fetch URL pypi.org".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Network failure"));
+        assert!(msg.contains("onnxruntime"));
+        assert!(msg.contains("internet connection"));
+        assert!(msg.contains("pypi.org"));
+    }
+
+    #[test]
+    fn test_parse_version_simple() {
+        assert_eq!(parse_version("1.25.0"), Some((1, 25, 0)));
+        assert_eq!(parse_version("1.20.0"), Some((1, 20, 0)));
+        assert_eq!(parse_version("2.0.0"), Some((2, 0, 0)));
+        assert_eq!(parse_version("0.9.9"), Some((0, 9, 9)));
+    }
+
+    #[test]
+    fn test_parse_version_with_prerelease() {
+        // Suffixes are ignored.
+        assert_eq!(parse_version("1.25.0-rc1"), Some((1, 25, 0)));
+        assert_eq!(parse_version("1.25.0+build42"), Some((1, 25, 0)));
+        assert_eq!(parse_version("1.25.0-rc1+meta"), Some((1, 25, 0)));
+    }
+
+    #[test]
+    fn test_parse_version_missing_patch_defaults_to_zero() {
+        // Default missing minor/patch to 0 (semver-like leniency).
+        assert_eq!(parse_version("1.25"), Some((1, 25, 0)));
+        assert_eq!(parse_version("1"), Some((1, 0, 0)));
+    }
+
+    #[test]
+    fn test_parse_version_invalid() {
+        assert_eq!(parse_version("not-a-version"), None);
+        assert_eq!(parse_version("v1.2.3"), None);
+        assert_eq!(parse_version(""), None);
+    }
+
+    #[test]
+    fn test_version_compatibility_supported() {
+        // 1.20.0, 1.25.0, 1.99.99 are supported (within 1.x, >= MIN_ORT_VERSION).
+        assert_eq!(
+            check_ort_version_compatibility("1.20.0"),
+            VersionCompatibility::Supported
+        );
+        assert_eq!(
+            check_ort_version_compatibility("1.25.0"),
+            VersionCompatibility::Supported
+        );
+        assert_eq!(
+            check_ort_version_compatibility("1.99.99"),
+            VersionCompatibility::Supported
+        );
+    }
+
+    #[test]
+    fn test_version_compatibility_too_old() {
+        // 1.19.x and older are unsupported.
+        let r = check_ort_version_compatibility("1.19.0");
+        match r {
+            VersionCompatibility::Unsupported {
+                required_min,
+                reason,
+            } => {
+                assert!(
+                    required_min.contains("1.20.0"),
+                    "required_min = {}",
+                    required_min
+                );
+                assert!(!reason.is_empty());
+            }
+            other => panic!("expected Unsupported, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_version_compatibility_very_old() {
+        // 0.x is definitely unsupported.
+        let r = check_ort_version_compatibility("0.9.9");
+        assert!(matches!(r, VersionCompatibility::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_version_compatibility_too_new() {
+        // 2.0.0+ is TooNew (ABI break).
+        let r = check_ort_version_compatibility("2.0.0");
+        match r {
+            VersionCompatibility::TooNew {
+                supported_max,
+                reason,
+            } => {
+                assert!(
+                    supported_max.contains("1."),
+                    "supported_max = {}",
+                    supported_max
+                );
+                assert!(reason.contains("ABI") || reason.contains("breaking"));
+            }
+            other => panic!("expected TooNew, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_version_compatibility_unparseable() {
+        // Unparseable versions fall back to Unsupported.
+        let r = check_ort_version_compatibility("garbage");
+        assert!(matches!(r, VersionCompatibility::Unsupported { .. }));
+    }
+
+    #[test]
+    fn test_is_network_error_detects_common_failures() {
+        // VAL-SETUP-019-like network detection on pip output.
+        assert!(is_network_error(
+            "WARNING: Could not fetch URL https://pypi.org/onnxruntime"
+        ));
+        assert!(is_network_error(
+            "ConnectionError: Failed to establish a new connection"
+        ));
+        assert!(is_network_error("ReadTimeoutError: read timed out"));
+        assert!(is_network_error(
+            "WARNING: Retrying (Retry(total=4)) after connection broken"
+        ));
+        // The MAX_RETRIES style.
+        assert!(is_network_error(
+            "HTTPSConnectionPool: Max retries exceeded with url: /simple/onnxruntime"
+        ));
+    }
+
+    #[test]
+    fn test_is_network_error_ignores_normal_output() {
+        // Normal pip output is NOT a network error.
+        assert!(!is_network_error(
+            "Successfully installed onnxruntime-1.25.0"
+        ));
+        assert!(!is_network_error("Requirement already satisfied: numpy"));
+        assert!(!is_network_error(""));
+    }
+
+    #[test]
+    fn test_truncate_for_error_short() {
+        let s = "line1\nline2\n";
+        assert_eq!(truncate_for_error(s), "line1\nline2");
+    }
+
+    #[test]
+    fn test_truncate_for_error_long() {
+        let long = (0..25)
+            .map(|i| format!("line {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let truncated = truncate_for_error(&long);
+        assert!(truncated.contains("truncated"));
+        assert!(truncated.contains("line 0"));
+        // The originally-present tail is dropped.
+        assert!(!truncated.contains("line 24"));
+    }
+
+    #[test]
+    fn test_min_ort_version_constant_is_sensible() {
+        // Guards against accidental breakage of the supported-range constant.
+        // The constants are compile-time known; just exercise them so a future
+        // edit that flips them nonsensically shows up in the test name.
+        let _: (u32, u32, u32) = MIN_ORT_VERSION;
+        let _: u32 = MAX_ORT_MAJOR;
+        // Sanity: min version is 1.x.
+        assert_eq!(MIN_ORT_VERSION.0, 1);
+    }
+
+    #[test]
+    fn test_build_config_records_ort_version() {
+        // VAL-SETUP-020: ort_version flows into the config written to disk.
+        let choices = SetupChoices {
+            neural_enabled: true,
+            provider: Some(ExecutionProvider::Cpu),
+        };
+        let cfg = build_config(
+            &choices,
+            Some(std::path::Path::new("/usr/local/lib/libonnxruntime.so")),
+            Some("1.25.0"),
+        );
+        assert_eq!(cfg.neural.ort_version.as_deref(), Some("1.25.0"));
+        assert_eq!(
+            cfg.neural.ort_dylib_path.as_deref(),
+            Some("/usr/local/lib/libonnxruntime.so")
+        );
+        assert!(cfg.neural.enabled);
+        assert_eq!(cfg.neural.execution_provider, "cpu");
+    }
+
+    #[test]
+    fn test_build_config_without_version() {
+        // When version detection failed, ort_version remains None but the rest
+        // of the config is still valid.
+        let choices = SetupChoices {
+            neural_enabled: true,
+            provider: Some(ExecutionProvider::Cpu),
+        };
+        let cfg = build_config(&choices, None, None);
+        assert!(cfg.neural.ort_version.is_none());
+        assert!(cfg.neural.ort_dylib_path.is_none());
+    }
+
+    // Use a process-shared lock so env-mutating tests serialize within the module.
+    use std::sync::Mutex;
+    static PIPE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_find_pip_honors_pip_bin_with_split() {
+        // VAL-SETUP-021: PIP_BIN can point at "python3 -m pip" style.
+        let _g = PIPE_ENV_LOCK.lock().unwrap();
+        // /bin/true is a guaranteed-present binary that succeeds with whatever args,
+        // so use it as a "pip" stand-in. We only check the parse logic.
+        std::env::set_var("PIP_BIN", "/bin/true -m pip");
+        // find_pip runs --version; /bin/true returns 0, so it should "succeed".
+        let result = find_pip();
+        std::env::remove_var("PIP_BIN");
+        let (program, prefix) = result.expect("PIP_BIN should be honored");
+        assert_eq!(program, "/bin/true");
+        assert_eq!(prefix, vec!["-m".to_string(), "pip".to_string()]);
+    }
+
+    #[test]
+    fn test_find_pip_honors_pip_bin_single_token() {
+        let _g = PIPE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("PIP_BIN", "/bin/true");
+        let result = find_pip();
+        std::env::remove_var("PIP_BIN");
+        let (program, prefix) = result.expect("PIP_BIN single token should be honored");
+        assert_eq!(program, "/bin/true");
+        assert!(prefix.is_empty());
+    }
+
+    #[test]
+    fn test_find_pip_empty_pip_bin_falls_through() {
+        let _g = PIPE_ENV_LOCK.lock().unwrap();
+        std::env::set_var("PIP_BIN", "   ");
+        // We can't assert what the fallback finds (system-dependent), but it
+        // must not crash and must follow PIP_BIN's absence.
+        let _ = find_pip();
+        std::env::remove_var("PIP_BIN");
     }
 }

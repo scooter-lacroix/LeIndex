@@ -117,6 +117,60 @@ fn resolve_worker_binary() -> Result<std::path::PathBuf, std::io::Error> {
     })
 }
 
+/// Read `ort_dylib_path` from the user-level `~/.leindex/config/leindex.toml`
+/// (honoring `$LEINDEX_HOME`).
+///
+/// VAL-SETUP-020/VAL-ORT-006: when the worker is spawned from the daemon we
+/// surface the dylib path chosen during `leindex setup` so the worker's ORT
+/// discovery chain picks the same build. The lookup is intentionally minimal
+/// (text scan, mirroring `leindex-embed::ort_discovery::read_config_ort_path`)
+/// because the file is tiny and pulling a full TOML parser into the search
+/// crate is not worth it.
+///
+/// Returns `None` when the config file is absent or the key is missing.
+fn read_ort_dylib_path_from_config() -> Option<String> {
+    let home = leindex_home_dir()?;
+    let cfg = home.join("config").join("leindex.toml");
+    let contents = std::fs::read_to_string(&cfg).ok()?;
+    for raw in contents.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("ort_dylib_path") {
+            let rest = rest.trim_start();
+            if let Some(value_part) = rest.strip_prefix('=') {
+                let value_part = value_part.trim();
+                // Trim surrounding quotes if present.
+                let trimmed = value_part.trim_matches(|c| c == '"' || c == '\'');
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the LeIndex home directory (`~/.leindex` or `$LEINDEX_HOME`).
+///
+/// Uses environment variables directly (rather than the `dirs` crate) so we
+/// don't couple the `onnx` feature to the `cli` feature's optional `dirs`
+/// dependency. `$LEINDEX_HOME` wins over `$HOME/.leindex` to stay consistent
+/// with the rest of the codebase (see `cli/neural_config.rs` and
+/// `crates/leindex-embed`).
+fn leindex_home_dir() -> Option<std::path::PathBuf> {
+    if let Ok(custom) = std::env::var("LEINDEX_HOME") {
+        let p = std::path::PathBuf::from(&custom);
+        if p.is_absolute() {
+            return Some(p);
+        }
+    }
+    std::env::var("HOME")
+        .ok()
+        .map(|h| std::path::PathBuf::from(h).join(".leindex"))
+}
+
 /// Errors that can occur when communicating with the embedding worker.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -302,6 +356,18 @@ impl EmbeddingClient {
         }
         if let Ok(provider) = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER") {
             cmd.env("LEINDEX_WORKER_EXECUTION_PROVIDER", &provider);
+        }
+        // VAL-SETUP-020/VAL-ORT-006: When ORT_DYLIB_PATH is not already in the
+        // ambient environment, propagate the path recorded in
+        // `~/.leindex/config/leindex.toml` so the worker reliably loads the
+        // ORT build chosen during `leindex setup`. This keeps the discovery
+        // chain consistent across both the interactive setup flow (which
+        // installs ORT via pip and remembers the discovered `.so`) and the
+        // plain-spawn path used by searches.
+        if std::env::var_os("ORT_DYLIB_PATH").is_none() {
+            if let Some(path) = read_ort_dylib_path_from_config() {
+                cmd.env("ORT_DYLIB_PATH", &path);
+            }
         }
 
         let mut child = cmd
@@ -905,5 +971,117 @@ mod tests {
             id2.0 > id1.0,
             "batch IDs should be monotonically increasing"
         );
+    }
+
+    // ── VAL-SETUP-020/VAL-ORT-006: config-driven ORT_DYLIB_PATH injection ──
+
+    // Use a process-shared lock so env-mutating tests serialize within the module.
+    use std::sync::Mutex;
+    static TEST_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn test_read_ort_dylib_path_from_config_returns_value() {
+        let _g = TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("LEINDEX_HOME", tmp.path());
+
+        let cfg_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("leindex.toml"),
+            "[neural]\nenabled = true\nexecution_provider = \"cpu\"\nort_dylib_path = \"/opt/onnxruntime/libonnxruntime.so\"\nort_version = \"1.25.0\"\nmodel_dir = \"/models\"\n",
+        )
+        .unwrap();
+
+        let parsed = read_ort_dylib_path_from_config();
+        assert_eq!(
+            parsed.as_deref(),
+            Some("/opt/onnxruntime/libonnxruntime.so")
+        );
+
+        std::env::remove_var("LEINDEX_HOME");
+    }
+
+    #[test]
+    fn test_read_ort_dylib_path_from_config_returns_none_when_absent() {
+        let _g = TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("LEINDEX_HOME", tmp.path());
+
+        // No config file at all.
+        assert_eq!(read_ort_dylib_path_from_config(), None);
+
+        // Config exists but lacks ort_dylib_path.
+        let cfg_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("leindex.toml"),
+            "[neural]\nenabled = true\nmodel_dir = \"/models\"\n",
+        )
+        .unwrap();
+        assert_eq!(read_ort_dylib_path_from_config(), None);
+
+        std::env::remove_var("LEINDEX_HOME");
+    }
+
+    #[test]
+    fn test_read_ort_dylib_path_from_config_handles_single_quotes() {
+        let _g = TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("LEINDEX_HOME", tmp.path());
+
+        let cfg_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("leindex.toml"),
+            "[neural]\nort_dylib_path = '/quote/ort.so'\n",
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_ort_dylib_path_from_config().as_deref(),
+            Some("/quote/ort.so")
+        );
+
+        std::env::remove_var("LEINDEX_HOME");
+    }
+
+    #[test]
+    fn test_leindex_home_dir_prefers_env_override() {
+        let _g = TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("LEINDEX_HOME", "/custom/leindex/home");
+        assert_eq!(
+            leindex_home_dir(),
+            Some(std::path::PathBuf::from("/custom/leindex/home"))
+        );
+        std::env::remove_var("LEINDEX_HOME");
+    }
+
+    #[test]
+    fn test_leindex_home_dir_falls_back_to_home() {
+        let _g = TEST_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("LEINDEX_HOME");
+        std::env::set_var("HOME", "/home/testuser");
+        let home = leindex_home_dir();
+        assert_eq!(
+            home,
+            Some(std::path::PathBuf::from("/home/testuser/.leindex"))
+        );
+        std::env::remove_var("HOME");
+    }
+
+    #[test]
+    fn test_leindex_home_dir_relative_env_ignored() {
+        let _g = TEST_ENV_LOCK.lock().unwrap();
+        std::env::set_var("LEINDEX_HOME", "relative/path");
+        std::env::set_var("HOME", "/home/fallback");
+        // Should fall back to HOME-based path, not use relative.
+        let home = leindex_home_dir();
+        assert_eq!(
+            home,
+            Some(std::path::PathBuf::from("/home/fallback/.leindex"))
+        );
+        std::env::remove_var("LEINDEX_HOME");
+        std::env::remove_var("HOME");
     }
 }

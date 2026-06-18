@@ -50,6 +50,13 @@ pub struct NeuralConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ort_dylib_path: Option<String>,
 
+    /// Installed ONNX Runtime version (e.g., "1.25.0").
+    ///
+    /// VAL-SETUP-020: Config records the ORT version discovered during setup
+    /// so subsequent runs and `--check` can report it without re-querying pip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ort_version: Option<String>,
+
     /// Directory containing model files.
     #[serde(default = "default_model_dir")]
     pub model_dir: String,
@@ -87,6 +94,7 @@ impl Default for NeuralConfig {
             enabled: false,
             execution_provider: default_execution_provider(),
             ort_dylib_path: None,
+            ort_version: None,
             model_dir: default_model_dir(),
         }
     }
@@ -293,7 +301,7 @@ impl std::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Alias for use in setup.rs as `crate::config_schema`.
+// Alias for use in setup.rs as `crate::config_schema`.
 
 #[cfg(test)]
 mod tests {
@@ -313,6 +321,7 @@ mod tests {
             enabled: true,
             execution_provider: "cpu".to_string(),
             ort_dylib_path: Some("/usr/local/lib/libonnxruntime.so".to_string()),
+            ort_version: Some("1.25.0".to_string()),
             model_dir: "/home/user/.leindex/models".to_string(),
         };
 
@@ -320,6 +329,7 @@ mod tests {
         assert!(toml_str.contains("enabled = true"));
         assert!(toml_str.contains("execution_provider = \"cpu\""));
         assert!(toml_str.contains("ort_dylib_path"));
+        assert!(toml_str.contains("ort_version"));
         assert!(toml_str.contains("model_dir"));
     }
 
