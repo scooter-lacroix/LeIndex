@@ -4,6 +4,7 @@
 
 mod diagnostics;
 mod indexing;
+pub(crate) mod model_download;
 mod query;
 pub(crate) mod setup;
 mod types;

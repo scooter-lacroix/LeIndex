@@ -317,8 +317,18 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
         (None, None)
     };
 
-    // Check models when neural is enabled
-    let model_present = if choices.neural_enabled && !model_present {
+    // Validate models whenever neural is enabled. We deliberately do NOT
+    // short-circuit on `check_model_present()` returning true because:
+    //   * VAL-SETUP-017 requires the second run to print "already present,
+    //     checksum verified" so the user knows the file is integrity-checked
+    //     and not just present on disk;
+    //   * VAL-SETUP-018 requires us to detect a corrupted file on re-run and
+    //     trigger a re-download before declaring success.
+    //
+    // Inside `ensure_models_present` we still print a per-file "already
+    // present, checksum verified" line so the second run is informative
+    // without doing any network round-trips.
+    let model_present = if choices.neural_enabled {
         ensure_models_present()?
     } else {
         model_present
@@ -602,6 +612,11 @@ fn check_provider_available(provider: ExecutionProvider) -> bool {
 }
 
 /// Check if model files are present in the model directory.
+///
+/// VAL-SETUP-014: used by `--check` mode to flag model presence. We count a
+/// file as "present" if it exists on disk; the checksum-aware variant is
+/// `model_checksum_status()` which returns one of Ok/Mismatch/Unknown so the
+/// caller can warn about a corrupted file without failing the existence check.
 fn check_model_present() -> bool {
     let model_name = "qwen3-embed-0.6b.onnx";
 
@@ -627,6 +642,62 @@ fn check_model_present() -> bool {
     }
 
     false
+}
+
+/// Outcome of comparing the on-disk model file against the checksum manifest.
+///
+/// VAL-SETUP-014: `--check` mode reports `Mismatch` so the user knows the
+/// model file is corrupted before re-running setup. VAL-SETUP-017/018 share
+/// the same primitive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelChecksumStatus {
+    /// File is missing entirely.
+    Missing,
+    /// File exists and the manifest's checksum matches.
+    Ok,
+    /// File exists but no checksum entry is available.
+    Unknown,
+    /// File exists but its computed SHA256 differs from the manifest.
+    Mismatch { expected: String, actual: String },
+}
+
+/// Check the model file's checksum status against the bundled manifest.
+///
+/// Walks the same model_dir / bundled / binary-side lookup as
+/// `check_model_present()`. When a `checksums.sha256` sibling file exists,
+/// its entry for `qwen3-embed-0.6b.onnx` is compared against the file's
+/// computed SHA256.
+pub fn model_checksum_status() -> ModelChecksumStatus {
+    use crate::cli::leindex::model_download::{
+        check_file_against_manifest, parse_checksums, CheckResult, MODEL_ONNX_FILENAME,
+    };
+
+    let model_dir = match crate::cli::neural_config::model_dir_path() {
+        Some(d) => d,
+        None => return ModelChecksumStatus::Missing,
+    };
+
+    let onnx_path = model_dir.join(MODEL_ONNX_FILENAME);
+    if !onnx_path.exists() {
+        return ModelChecksumStatus::Missing;
+    }
+
+    let manifest_path = model_dir.join("checksums.sha256");
+    let manifest_str = match std::fs::read_to_string(&manifest_path) {
+        Ok(s) => s,
+        Err(_) => return ModelChecksumStatus::Unknown,
+    };
+    let manifest = parse_checksums(&manifest_str);
+
+    match check_file_against_manifest(&onnx_path, &manifest) {
+        Ok(CheckResult::Verified) => ModelChecksumStatus::Ok,
+        Ok(CheckResult::NoEntry) => ModelChecksumStatus::Unknown,
+        Ok(CheckResult::Mismatch { expected, actual }) => {
+            ModelChecksumStatus::Mismatch { expected, actual }
+        }
+        Ok(CheckResult::Missing) => ModelChecksumStatus::Missing,
+        Err(_) => ModelChecksumStatus::Unknown,
+    }
 }
 
 /// Install ORT via pip for the given execution provider.
@@ -900,98 +971,304 @@ fn ort_lib_names() -> &'static [&'static str] {
     }
 }
 
-/// Ensure model files are present. Download from local bundle if available.
+/// Ensure model files are present, downloading from HuggingFace if needed.
+///
+/// VAL-SETUP-016: First run downloads model files to `~/.leindex/models/`,
+///   printing progress for each file fetched.
+/// VAL-SETUP-017: Second run skips when the on-disk file's SHA256 matches the
+///   entry in `checksums.sha256`.
+/// VAL-SETUP-018: A corrupted file (checksum mismatch) is deleted and
+///   re-downloaded, then verified again.
+/// VAL-SETUP-019: Network failures surface an actionable error mentioning
+///   connectivity and `LEINDEX_MODEL_PATH`; no partial file is left at the
+///   canonical target path.
+///
+/// The flow prefers, in order:
+///   1. Bundled model files (next to the running binary) — copy without
+///      hitting the network. This makes the GitHub Release bundle surface
+///      zero-network once `install.sh` places the binary + models together.
+///   2. Verified existing files in the model directory.
+///   3. HuggingFace CDN download (with retries).
+///
+/// `checksums.sha256` and `LICENSE` are treated as OPTIONAL because the
+/// onnx-community/Qwen3-Embedding-0.6B-ONNX repo does not host either file.
+/// When the manifest is unavailable, one is generated locally from the
+/// downloaded files so second-run verification still works.
 fn ensure_models_present() -> Result<bool, SetupError> {
-    let model_name = "qwen3-embed-0.6b.onnx";
-    let tokenizer_name = "tokenizer.json";
+    use crate::cli::leindex::model_download::{
+        self, check_file_against_manifest, download_file_with_retry, iter_model_files,
+        parse_checksums, CheckResult, DownloadOutcome, DEFAULT_DOWNLOAD_RETRIES,
+    };
 
     let model_dir = crate::cli::neural_config::model_dir_path()
         .ok_or_else(|| SetupError::Io("Cannot resolve model directory".to_string()))?;
 
-    // Create model directory
+    // Create model directory up front so subsequent file operations can rely
+    // on it existing.
     std::fs::create_dir_all(&model_dir)
         .map_err(|e| SetupError::Io(format!("Cannot create model dir: {}", e)))?;
 
-    // Try to copy from bundled location
-    let bundled = find_bundled_models();
+    let manifest_path = model_dir.join("checksums.sha256");
+    let model_onnx_name = model_download::MODEL_ONNX_FILENAME;
 
-    if let Some(bundled_dir) = bundled {
-        let model_src = bundled_dir.join(model_name);
-        let model_dst = model_dir.join(model_name);
+    // ── Step 1: copy from bundled location if present ────────────────────
+    // Bundled files (GitHub Release bundle layout) are a no-network fast path.
+    // We copy each missing file from the bundle, then fall through to the
+    // network path only for anything still missing or corrupted.
+    if let Some(bundled_dir) = model_download::find_bundled_models() {
+        copy_bundled_models(&bundled_dir, &model_dir);
+    }
 
-        if model_src.exists() && !model_dst.exists() {
-            println!("  -> Copying model files from {}...", bundled_dir.display());
+    // ── Step 2: download / verify every file ────────────────────────────
+    // The model triplet is split into "required" (onnx, tokenizer, config)
+    // and "optional" (checksums.sha256, LICENSE) files. The onnx-community
+    // HuggingFace repo does NOT ship `checksums.sha256` or `LICENSE`, so those
+    // downloads tolerate 404 / network failure. When the manifest is missing
+    // we generate it locally after the required downloads succeed, so
+    // second-run verification (VAL-SETUP-017) still works.
+    //
+    // Per-file strategy:
+    //   - Verified (checksum matches)   -> skip (VAL-SETUP-017)
+    //   - NoEntry (no checksum to cmp)  -> keep if present, else download
+    //   - Mismatch (checksum differs)   -> delete + re-download (VAL-SETUP-018)
+    //   - Missing                       -> download (VAL-SETUP-016)
+    let manifest_str = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+    let manifest = parse_checksums(&manifest_str);
 
-            // Copy model
-            if let Err(e) = std::fs::copy(&model_src, &model_dst) {
-                return Err(SetupError::Io(format!("Failed to copy model: {}", e)));
+    let mut downloaded_any = false;
+    let mut model_present_after = false;
+
+    for file in iter_model_files() {
+        let dest = model_dir.join(file.local);
+        // checksums.sha256 and LICENSE are not hosted by onnx-community; their
+        // absence is non-fatal.
+        let required = file.local != "checksums.sha256" && file.local != "LICENSE";
+
+        match check_file_against_manifest(&dest, &manifest)
+            .map_err(|e| SetupError::Io(format!("Cannot stat {}: {}", dest.display(), e)))?
+        {
+            CheckResult::Verified => {
+                // VAL-SETUP-017: skip download, file already good.
+                println!("  -> {} already present, checksum verified.", file.local);
+                if file.local == model_onnx_name {
+                    model_present_after = true;
+                }
+                continue;
             }
-
-            // Copy tokenizer
-            let tok_src = bundled_dir.join(tokenizer_name);
-            let tok_dst = model_dir.join(tokenizer_name);
-            if tok_src.exists() {
-                let _ = std::fs::copy(&tok_src, &tok_dst);
+            CheckResult::NoEntry => {
+                if dest.exists() {
+                    println!(
+                        "  -> {} present (no checksum entry; cannot verify).",
+                        file.local
+                    );
+                    if file.local == model_onnx_name {
+                        model_present_after = true;
+                    }
+                    continue;
+                }
+                // Fall through to the download branch.
             }
-
-            // Copy config.json if present
-            let cfg_src = bundled_dir.join("config.json");
-            let cfg_dst = model_dir.join("config.json");
-            if cfg_src.exists() {
-                let _ = std::fs::copy(&cfg_src, &cfg_dst);
+            CheckResult::Mismatch { expected, actual } => {
+                // VAL-SETUP-018: checksum failure triggers re-download.
+                println!(
+                    "  -> WARNING: {} checksum mismatch (expected {}..., got {}...).",
+                    file.local,
+                    short_hash(&expected),
+                    short_hash(&actual)
+                );
+                println!("     Removing corrupt file and re-downloading...");
+                let _ = std::fs::remove_file(&dest);
             }
-
-            // Copy checksums if present
-            let chk_src = bundled_dir.join("checksums.sha256");
-            let chk_dst = model_dir.join("checksums.sha256");
-            if chk_src.exists() {
-                let _ = std::fs::copy(&chk_src, &chk_dst);
+            CheckResult::Missing => {
+                // VAL-SETUP-016: first-run download.
             }
+        }
 
-            return Ok(true);
+        // Download branch.
+        let outcome: DownloadOutcome = match download_file_with_retry(
+            file,
+            &model_dir,
+            Some(&manifest_path),
+            DEFAULT_DOWNLOAD_RETRIES,
+        ) {
+            Ok(o) => o,
+            Err(e) => {
+                if !required {
+                    println!(
+                        "  -> {} not available on the CDN; skipping (non-fatal).",
+                        file.local
+                    );
+                    continue;
+                }
+                return Err(map_model_download_error(e));
+            }
+        };
+
+        // Re-read the manifest in case an earlier iteration fetched it, then
+        // verify the freshly-downloaded file so we can surface an explicit
+        // "verified" line for the user.
+        let fresh_manifest_str =
+            std::fs::read_to_string(&manifest_path).unwrap_or_else(|_| manifest_str.clone());
+        let fresh_manifest = parse_checksums(&fresh_manifest_str);
+        let recheck = check_file_against_manifest(&outcome.path, &fresh_manifest)
+            .unwrap_or(CheckResult::Missing);
+
+        match recheck {
+            CheckResult::Verified => {
+                println!("  -> {} downloaded, checksum verified.", file.local);
+            }
+            CheckResult::NoEntry => {
+                println!(
+                    "  -> {} downloaded (no checksum entry in manifest; cannot verify).",
+                    file.local
+                );
+            }
+            CheckResult::Mismatch { expected, actual } => {
+                // VAL-SETUP-019: a freshly-downloaded file that still fails
+                // the checksum check is suspicious (corrupted CDN mirror,
+                // tampering, repo layout change). Surface it clearly for
+                // required files; tolerate it for optional files.
+                if required {
+                    return Err(SetupError::ModelChecksumPostDownload {
+                        file: file.local.to_string(),
+                        expected,
+                        actual,
+                    });
+                } else {
+                    println!(
+                        "  -> WARNING: {} downloaded but checksum mismatch; \
+                         keeping anyway (non-required file).",
+                        file.local
+                    );
+                }
+            }
+            CheckResult::Missing => {
+                return Err(SetupError::Io(format!(
+                    "Download reported success but file is missing: {}",
+                    outcome.path.display()
+                )));
+            }
+        }
+
+        if file.local == model_onnx_name {
+            model_present_after = true;
+        }
+        downloaded_any = true;
+    }
+
+    // ── Step 3: ensure a checksum manifest exists for future runs ────────
+    // If we never obtained checksums.sha256 from the CDN (the onnx-community
+    // repo does not host one), generate one locally from the files we just
+    // downloaded. This makes VAL-SETUP-017 work on the second run: the
+    // locally-generated manifest becomes the source of truth, and any future
+    // corruption (VAL-SETUP-018) is detected against it.
+    if !manifest_path.exists() {
+        if let Err(e) = generate_local_checksum_manifest(&model_dir) {
+            eprintln!(
+                "warning: could not generate local checksum manifest ({}); \
+                 future runs cannot verify file integrity until checksums.sha256 \
+                 is present in {}.",
+                e,
+                model_dir.display()
+            );
+        } else {
+            println!("  -> Generated local checksums.sha256 for future verification.");
         }
     }
 
-    // If model already exists, we're good
-    if model_dir.join(model_name).exists() {
-        return Ok(true);
+    if downloaded_any {
+        println!("\nModel files ready at {}", model_dir.display());
     }
 
-    // Model not found and no bundled source - this is expected for first-time
-    // download which is handled by a separate feature. For now, warn but continue.
-    println!("  -> WARNING: Model files not found. Download will be available in a future update.");
-    println!("     Model dir: {}", model_dir.display());
-    println!("     You can manually copy model files to this directory.");
-
-    Ok(false)
+    Ok(model_present_after)
 }
 
-/// Find bundled model files relative to the binary.
-fn find_bundled_models() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            // Check exe_parent/models (target/release/models)
-            let candidate = parent.join("models");
-            if candidate.join("qwen3-embed-0.6b.onnx").exists() {
-                return Some(candidate);
+/// Write a `checksums.sha256` file into `model_dir` by computing SHA256 of
+/// each model file present. Used when the onnx-community CDN does not host a
+/// manifest (it does not), so that subsequent setup runs can verify file
+/// integrity (VAL-SETUP-017) and detect corruption (VAL-SETUP-018).
+fn generate_local_checksum_manifest(model_dir: &std::path::Path) -> std::io::Result<()> {
+    use crate::cli::leindex::model_download::{iter_model_files, sha256_of_file};
+    let manifest_path = model_dir.join("checksums.sha256");
+    let mut out = String::new();
+    for file in iter_model_files() {
+        if file.local == "checksums.sha256" {
+            continue;
+        }
+        let path = model_dir.join(file.local);
+        if path.exists() {
+            let hash = sha256_of_file(&path)?;
+            out.push_str(&hash);
+            out.push_str("  ");
+            out.push_str(file.local);
+            out.push('\n');
+        }
+    }
+    if out.is_empty() {
+        return Ok(());
+    }
+    std::fs::write(&manifest_path, out)
+}
+
+/// Copy every model file present in `bundled_dir` into `dest_dir`, skipping
+/// any that already exist in `dest_dir`. Used as a zero-network fast path when
+/// the user is running from a release bundle layout.
+fn copy_bundled_models(bundled_dir: &std::path::Path, dest_dir: &std::path::Path) {
+    let mut copied_any = false;
+    for file in crate::cli::leindex::model_download::iter_model_files() {
+        let src = bundled_dir.join(file.local);
+        let dst = dest_dir.join(file.local);
+        if src.exists() && !dst.exists() {
+            if !copied_any {
+                println!(
+                    "  -> Copying bundled model files from {}...",
+                    bundled_dir.display()
+                );
+                copied_any = true;
             }
-            // Check exe_parent/../models (target/models)
-            if let Some(gp) = parent.parent() {
-                let candidate = gp.join("models");
-                if candidate.join("qwen3-embed-0.6b.onnx").exists() {
-                    return Some(candidate);
-                }
-                // Check workspace root (target/../../models)
-                if let Some(ggp) = gp.parent() {
-                    let candidate = ggp.join("models");
-                    if candidate.join("qwen3-embed-0.6b.onnx").exists() {
-                        return Some(candidate);
-                    }
+            match std::fs::copy(&src, &dst) {
+                Ok(_) => {}
+                Err(e) => {
+                    eprintln!(
+                        "warning: failed to copy {} from bundle ({}); will download instead.",
+                        file.local, e
+                    );
                 }
             }
         }
     }
-    None
+}
+
+/// Strip a SHA256 hex string down to its first 12 chars for compact logging.
+fn short_hash(hash: &str) -> String {
+    if hash.len() <= 12 {
+        hash.to_string()
+    } else {
+        format!("{}...", &hash[..12])
+    }
+}
+
+/// Convert a [`model_download::ModelDownloadError`] into the equivalent
+/// [`SetupError`] so the caller-facing Display impl stays uniform.
+fn map_model_download_error(
+    e: crate::cli::leindex::model_download::ModelDownloadError,
+) -> SetupError {
+    use crate::cli::leindex::model_download::ModelDownloadError as Mde;
+    match e {
+        Mde::CurlNotFound => SetupError::CurlNotFound,
+        Mde::Io(path, msg) => SetupError::Io(format!("{}: {}", path.display(), msg)),
+        Mde::DownloadFailed {
+            file,
+            url,
+            exit_code,
+            network,
+        } => SetupError::ModelDownloadFailed {
+            file,
+            url,
+            exit_code,
+            network,
+        },
+    }
 }
 
 /// Print a status report without modifying anything.
@@ -1006,6 +1283,9 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
     let ort_installed = check_ort_installed();
     let live_version = get_ort_version();
     let model_present = check_model_present();
+    // VAL-SETUP-014/018: checksum status is surfaced so a corrupted file
+    // is visible from `--check` without needing to re-run setup.
+    let checksum_status = model_checksum_status();
     let ort_path = discover_ort_path().or_else(|| {
         config
             .neural
@@ -1019,7 +1299,13 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
         .clone()
         .or_else(|| config.neural.ort_version.clone());
 
-    let is_fully_configured = config.neural.enabled && ort_installed && model_present;
+    // VAL-SETUP-018: a checksum mismatch on the model file means the install
+    // is not actually ready even though the file is present; --check must
+    // surface the corruption instead of reporting "fully configured".
+    let fully_configured = config.neural.enabled
+        && ort_installed
+        && model_present
+        && !matches!(checksum_status, ModelChecksumStatus::Mismatch { .. });
 
     // Print the report
     println!("\nLeIndex Setup Status\n{}", "=".repeat(20));
@@ -1084,6 +1370,28 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
     println!("Model files:        {}", model_status);
     println!("Model directory:    {}", config.neural.model_dir);
 
+    // VAL-SETUP-017/018: report the checksum verdict so users can tell whether
+    // `~/.leindex/models/qwen3-embed-0.6b.onnx` is intact or needs re-download.
+    match &checksum_status {
+        ModelChecksumStatus::Ok => {
+            println!("Model checksum:     verified (matches checksums.sha256)");
+        }
+        ModelChecksumStatus::Unknown => {
+            println!("Model checksum:     no manifest entry (cannot verify)");
+        }
+        ModelChecksumStatus::Mismatch { expected, actual } => {
+            println!(
+                "Model checksum:     MISMATCH (expected {}..., got {}...).",
+                &expected[..expected.len().min(12)],
+                &actual[..actual.len().min(12)],
+            );
+            println!("     Re-run `leindex setup --neural --cpu` to re-download.");
+        }
+        ModelChecksumStatus::Missing => {
+            // Already reported via Model files: absent.
+        }
+    }
+
     // Search settings
     println!();
     println!("Search mode:        {}", config.search.search_mode);
@@ -1100,7 +1408,7 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
 
     // Overall status
     println!();
-    if is_fully_configured {
+    if fully_configured {
         println!("Status: Fully configured for neural search");
     } else if config.neural.enabled {
         println!("Status: Neural enabled but incomplete");
@@ -1128,7 +1436,7 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
         ort_version,
         ort_path,
         model_present,
-        fully_configured: is_fully_configured,
+        fully_configured,
     })
 }
 
@@ -1263,6 +1571,32 @@ pub enum SetupError {
         exit_code: i32,
         output: String,
     },
+    /// curl is not on PATH, so the model download cannot start.
+    ///
+    /// VAL-SETUP-016/019: model download requires curl. The Display impl
+    /// surfaces install instructions for each platform.
+    CurlNotFound,
+    /// Model file download failed.
+    ///
+    /// VAL-SETUP-019: when `network` is true, the message mentions
+    /// connectivity and `LEINDEX_MODEL_PATH` so the user has an actionable
+    /// remediation hint.
+    ModelDownloadFailed {
+        file: String,
+        url: String,
+        exit_code: i32,
+        network: bool,
+    },
+    /// Post-download SHA256 mismatch even after a fresh download.
+    ///
+    /// Indicates CDN corruption, a repo-layout drift, or tampering. Surface
+    /// both the expected and actual hashes so the user can compare against
+    /// `models/checksums.sha256` manually.
+    ModelChecksumPostDownload {
+        file: String,
+        expected: String,
+        actual: String,
+    },
     /// I/O error.
     Io(String),
 }
@@ -1317,6 +1651,63 @@ impl std::fmt::Display for SetupError {
                      Check your internet connection, proxy settings, or PyPI mirror. \
                      pip output:\n{}",
                     package, exit_code, output
+                )
+            }
+            SetupError::CurlNotFound => {
+                // VAL-SETUP-016/019: model download depends on curl.
+                write!(
+                    f,
+                    "curl not found on PATH. curl is required to download model \
+                     files (~600 MB) for neural search. Install curl:\n  \
+                     - Debian/Ubuntu: sudo apt install curl\n  \
+                     - macOS: curl ships with macOS (verify /usr/bin/curl)\n  \
+                     - Windows 10+: curl.exe is preinstalled\n  \
+                     Alternatively, copy model files manually to \
+                     ~/.leindex/models/ and re-run `leindex setup --check`."
+                )
+            }
+            SetupError::ModelDownloadFailed {
+                file,
+                url,
+                exit_code,
+                network,
+            } => {
+                if *network {
+                    // VAL-SETUP-019: actionable connectivity-themed message.
+                    write!(
+                        f,
+                        "Network failure downloading '{}' from {} (curl exit code {}). \
+                         Check your internet connection, DNS, proxy settings, or \
+                         the HuggingFace CDN status (https://status.huggingface.co). \
+                         Re-run `leindex setup` to retry, or set LEINDEX_MODEL_PATH \
+                         to point at an offline model directory containing '{}'.",
+                        file, url, exit_code, file
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Failed to download '{}' from {} (curl exit code {}). \
+                         The file may be temporarily unavailable on the CDN, or the \
+                         repo layout changed. Re-run `leindex setup` to retry, or \
+                         copy the model manually to ~/.leindex/models/. If you have \
+                         an offline copy, set LEINDEX_MODEL_PATH.",
+                        file, url, exit_code
+                    )
+                }
+            }
+            SetupError::ModelChecksumPostDownload {
+                file,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "Checksum mismatch after downloading '{}' (expected {}, got {}). \
+                     This usually indicates a CDN mirror returned a corrupted file or \
+                     the model repo layout changed. Wait a few minutes and re-run \
+                     `leindex setup`, or copy the file manually from a trusted source \
+                     to ~/.leindex/models/{}.",
+                    file, expected, actual, file
                 )
             }
             SetupError::Io(msg) => write!(f, "I/O error: {}", msg),
@@ -1448,6 +1839,89 @@ mod tests {
 
         let err = SetupError::PipNotFound;
         assert!(err.to_string().contains("pip not found"));
+    }
+
+    // ── VAL-SETUP-016/017/018/019: model download error surface tests ──
+
+    #[test]
+    fn test_curl_not_found_error_mentions_curl() {
+        // VAL-SETUP-016/019: curl-not-found error must name curl.
+        let err = SetupError::CurlNotFound;
+        let msg = err.to_string();
+        assert!(msg.contains("curl not found"), "{}", msg);
+        assert!(msg.contains("models/"), "{}", msg);
+    }
+
+    #[test]
+    fn test_model_download_network_error_mentions_connectivity() {
+        // VAL-SETUP-019: network-classified failure must mention connectivity
+        // AND the LEINDEX_MODEL_PATH remediation hint.
+        let err = SetupError::ModelDownloadFailed {
+            file: "qwen3-embed-0.6b.onnx".to_string(),
+            url: "https://huggingface.co/onnx-community/Qwen3-Embedding-0.6B-ONNX/resolve/main/onnx/model.onnx".to_string(),
+            exit_code: 28,
+            network: true,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Network failure"), "{}", msg);
+        assert!(msg.contains("internet connection"), "{}", msg);
+        assert!(msg.contains("LEINDEX_MODEL_PATH"), "{}", msg);
+        assert!(msg.contains("huggingface.co"), "{}", msg);
+        assert!(msg.contains("exit code 28"), "{}", msg);
+    }
+
+    #[test]
+    fn test_model_download_generic_error_is_actionable() {
+        // Non-network failure: should still name the URL and suggest re-run.
+        let err = SetupError::ModelDownloadFailed {
+            file: "tokenizer.json".to_string(),
+            url: "https://huggingface.co/onnx-community/Qwen3-Embedding-0.6B-ONNX/resolve/main/tokenizer.json".to_string(),
+            exit_code: 22,
+            network: false,
+        };
+        let msg = err.to_string();
+        // Generic branch does NOT mention "Network failure".
+        assert!(!msg.contains("Network failure"), "{}", msg);
+        assert!(msg.contains("tokenizer.json"), "{}", msg);
+        assert!(msg.contains("Re-run"), "{}", msg);
+    }
+
+    #[test]
+    fn test_model_checksum_post_download_error_names_file_and_hashes() {
+        let err = SetupError::ModelChecksumPostDownload {
+            file: "qwen3-embed-0.6b.onnx".to_string(),
+            expected: "aaaa1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd"
+                .to_string(),
+            actual: "bbbb1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd"
+                .to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Checksum mismatch"), "{}", msg);
+        assert!(msg.contains("qwen3-embed-0.6b.onnx"), "{}", msg);
+        // Display prints the full hashes (no shortening in this variant).
+        assert!(msg.contains("aaaa1234567890abcdef"), "{}", msg);
+        assert!(msg.contains("bbbb1234567890abcdef"), "{}", msg);
+        assert!(msg.contains("copy the file manually"), "{}", msg);
+    }
+
+    #[test]
+    fn test_model_checksum_status_missing_for_clean_dir() {
+        // VAL-SETUP-017: no model + no manifest -> Missing. We exercise this by
+        // pointing LEINDEX_HOME at a fresh tempdir.
+        let tmp = std::env::temp_dir().join(format!(
+            "leindex-setup-test-mcs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::env::set_var("LEINDEX_HOME", &tmp);
+        let status = model_checksum_status();
+        std::env::remove_var("LEINDEX_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(status, ModelChecksumStatus::Missing);
     }
 
     // ── VAL-SETUP-020/021/022: New error and version-compatibility tests ──

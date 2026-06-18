@@ -148,6 +148,7 @@ cli = [
     "dep:sysinfo",
     "dep:diffy",
     "dep:dialoguer",
+    "dep:sha2",
 ]
 
 # MCP server feature for CLI
@@ -313,6 +314,10 @@ dirs = { version = "5", optional = true }
 sysinfo = { version = "0.36.1", default-features = false, features = ["system"], optional = true }
 diffy = { version = "0.3", optional = true }
 dialoguer = { version = "0.11", optional = true }
+
+# SHA256 verification for downloaded model files during `leindex setup`.
+# VAL-SETUP-017/018: checksum verification of ~/.leindex/models/* artifacts.
+sha2 = { version = "0.10", optional = true }
 
 # Server feature dependencies (axum 0.7)
 axum = { version = "0.7", features = ["ws"], optional = true }
