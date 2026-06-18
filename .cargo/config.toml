@@ -1,11 +1,2 @@
 [alias]
 xtask = "run --package xtask --"
-
-# ONNX Runtime dynamic linking configuration for MIGraphX builds.
-# ORT 1.25.0 from onnxruntime-migraphx wheel must be dynamically linked so the
-# core library version (1.25.0) matches the MIGraphX execution provider (1.25.0).
-# Without this, ort-sys downloads a CPU-only prebuilt static library (1.24.2)
-# which causes std::bad_alloc when the 1.25.0 MIGraphX provider calls into it.
-[env]
-ORT_LIB_PATH = { value = "ort-lib", relative = true }
-ORT_PREFER_DYNAMIC_LINK = "1"

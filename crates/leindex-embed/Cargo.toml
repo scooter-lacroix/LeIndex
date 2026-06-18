@@ -18,10 +18,10 @@ default = []
 # The `migraphx` feature enables AMD GPU acceleration via MIGraphX,
 # which is the modern replacement for the deprecated ROCmExecutionProvider.
 #
-# ort-sys does not ship prebuilt MIGraphX binaries, so when building with
-# `onnx-migraphx`, set ORT_LIB_PATH to a directory containing a
-# MIGraphX-enabled libonnxruntime.so and ORT_PREFER_DYNAMIC_LINK=1 to
-# dynamically link against it instead of downloading the CPU-only prebuilt.
+# We use `load-dynamic` so NO ONNX Runtime is required at build time.
+# The worker discovers and dlopens libonnxruntime at runtime via the
+# ort_discovery module (env var, config, ~/.leindex/lib, sibling dir,
+# pip site-packages, system paths). See `ort_discovery.rs`.
 onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 onnx-migraphx = ["onnx", "ort/migraphx"]
 
@@ -39,7 +39,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Use api-24 to match the struct layout of ORT 1.25.0 (onnxruntime-migraphx 1.25.0).
 # ORT 1.25.0 has the 13-field OrtApi struct that ort-sys 2.0.0-rc.12 expects.
 # The previous api-23 caused a struct layout mismatch segfault with ORT 1.23.2.
-ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["ndarray", "std", "tracing", "download-binaries", "tls-native", "copy-dylibs", "api-24"] }
+#
+# `load-dynamic` replaces `download-binaries` + `copy-dylibs` + `tls-native`:
+# the ort crate no longer downloads, links, or vendor-copies any ORT library at
+# build time. The worker dlopens libonnxruntime at runtime via ort::init_from().
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["ndarray", "std", "tracing", "load-dynamic", "api-24"] }
 tokenizers = { version = "0.20", optional = true }
 ndarray = { version = "0.17", optional = true }
 dirs = { version = "5" }

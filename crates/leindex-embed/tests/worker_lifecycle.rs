@@ -298,6 +298,8 @@ fn test_startup_report_contains_required_fields() {
         model_path: Some(std::path::PathBuf::from("/opt/models/model.onnx")),
         model_path_source: Some("bundled".to_string()),
         model_error: None,
+        ort_path: None,
+        ort_source: None,
     };
 
     let line = report.to_log_line();
@@ -328,6 +330,8 @@ fn test_startup_report_with_fallback_reason() {
         )),
         model_path_source: Some("user_cache".to_string()),
         model_error: None,
+        ort_path: None,
+        ort_source: None,
     };
 
     let line = report.to_log_line();

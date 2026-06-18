@@ -164,6 +164,3 @@ docs/R15_*.md
 docs/planning/
 docs/review/
 docs/optimization/
-
-# ORT dynamic linking libraries (provided externally, not committed)
-ort-lib/

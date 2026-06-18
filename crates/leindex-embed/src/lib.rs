@@ -26,6 +26,7 @@
 
 pub mod batch;
 pub mod model_path;
+pub mod ort_discovery;
 pub mod protocol;
 pub mod provider;
 pub mod runtime;
@@ -38,6 +39,10 @@ pub use protocol::{
 
 pub use batch::{split_request, stitch_responses, truncate_text, BatchConfig};
 pub use model_path::ModelResolver;
+pub use ort_discovery::{
+    discover_and_init, last_outcome as last_ort_outcome, DiscoveryOutcome, DiscoverySource,
+    InitResult,
+};
 pub use provider::ExecutionProviderSelector;
 pub use runtime::{
     RuntimeConfig, WorkerRuntime, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_FRAME_SIZE,

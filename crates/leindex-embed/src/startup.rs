@@ -31,6 +31,12 @@ pub struct StartupReport {
     pub model_path_source: Option<String>,
     /// Error if model resolution failed.
     pub model_error: Option<String>,
+    /// VAL-ORT-022: Resolved ORT dylib path and discovery source. `None` when
+    /// ORT was not loadable (TF-IDF fallback path).
+    pub ort_path: Option<PathBuf>,
+    /// VAL-ORT-022: discovery source label ("env", "config", "user_lib",
+    /// "sibling", "pip", "system") for the loaded ORT dylib.
+    pub ort_source: Option<String>,
 }
 
 impl StartupReport {
@@ -57,14 +63,23 @@ impl StartupReport {
                 .unwrap_or_else(|| "not resolved".to_string()),
         };
 
+        // VAL-ORT-022: include resolved ORT path/source in the report so the
+        // daemon can surface `ort_path`/`ort_source` in `leindex diagnostics`.
+        let ort_info = match (&self.ort_path, &self.ort_source) {
+            (Some(path), Some(source)) => format!("{} [{}]", path.display(), source),
+            (Some(path), None) => path.display().to_string(),
+            (None, _) => "unavailable".to_string(),
+        };
+
         format!(
-            "startup_report provider={} status={} model={} quant={} warm_load={:?} path={}",
+            "startup_report provider={} status={} model={} quant={} warm_load={:?} path={} ort={}",
             self.execution_provider,
             provider_status,
             self.model_name,
             self.quantization_mode,
             self.warm_load_latency,
             model_info,
+            ort_info,
         )
     }
 
@@ -85,6 +100,8 @@ pub struct StartupReporter {
     model_path: Option<PathBuf>,
     model_path_source: Option<String>,
     model_error: Option<String>,
+    ort_path: Option<PathBuf>,
+    ort_source: Option<String>,
 }
 
 impl StartupReporter {
@@ -100,6 +117,8 @@ impl StartupReporter {
             model_path: None,
             model_path_source: None,
             model_error: None,
+            ort_path: None,
+            ort_source: None,
         }
     }
 
@@ -144,6 +163,14 @@ impl StartupReporter {
         self.model_path_source = None;
     }
 
+    /// VAL-ORT-022: Record the dynamically loaded ORT library path and its
+    /// discovery source. Call this from `WorkerRuntime::build_startup_report()`
+    /// after `ort_discovery::discover_and_init()` has run.
+    pub fn set_ort_path(&mut self, path: &Path, source: &str) {
+        self.ort_path = Some(path.to_path_buf());
+        self.ort_source = Some(source.to_string());
+    }
+
     /// Build the final startup report.
     pub fn build(self) -> StartupReport {
         StartupReport {
@@ -156,6 +183,8 @@ impl StartupReporter {
             model_path: self.model_path,
             model_path_source: self.model_path_source,
             model_error: self.model_error,
+            ort_path: self.ort_path,
+            ort_source: self.ort_source,
         }
     }
 }
@@ -182,6 +211,8 @@ mod tests {
             model_path: Some(PathBuf::from("/opt/leindex/models/qwen3-embed-0.6b.onnx")),
             model_path_source: Some("bundled".to_string()),
             model_error: None,
+            ort_path: None,
+            ort_source: None,
         };
 
         let line = report.to_log_line();
@@ -207,6 +238,8 @@ mod tests {
             )),
             model_path_source: Some("user_cache".to_string()),
             model_error: None,
+            ort_path: None,
+            ort_source: None,
         };
 
         let line = report.to_log_line();
@@ -228,6 +261,8 @@ mod tests {
             model_path: None,
             model_path_source: None,
             model_error: Some("model not found".to_string()),
+            ort_path: None,
+            ort_source: None,
         };
 
         let line = report.to_log_line();
@@ -287,6 +322,8 @@ mod tests {
             model_path: None,
             model_path_source: None,
             model_error: None,
+            ort_path: None,
+            ort_source: None,
         };
         // Should not panic
         report.log();
