@@ -43,7 +43,7 @@ Hidden compatibility aliases for the legacy crate names still exist for migratio
 
 ### MCP
 
-LeIndex exposes 16 MCP tools for indexing, retrieval, context, edits, and impact analysis.
+LeIndex exposes 20 MCP tools for indexing, retrieval, context, edits, and impact analysis.
 
 ### HTTP/WebSocket
 

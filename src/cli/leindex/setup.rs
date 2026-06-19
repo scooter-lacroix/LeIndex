@@ -815,9 +815,16 @@ fn merge_with_existing(
                         new_config.indexing = existing.indexing;
                     }
 
-                    // Check for stale ort-lib path
+                    // VAL-SETUP-030: Detect stale ORT dylib paths left over
+                    // from older installs. The pre-1.8 bundling strategy
+                    // shipped ONNX Runtime under a since-removed vendored
+                    // directory; configs pointing there are migrated to the
+                    // current discovery-chain model by re-running setup.
+                    // We flag migration when the configured ORT path no
+                    // longer resolves to a file on disk (any stale path,
+                    // not just the legacy vendored one).
                     if let Some(ref ort_path) = existing.neural.ort_dylib_path {
-                        if ort_path.contains("ort-lib") {
+                        if !std::path::Path::new(ort_path).exists() {
                             Some(RecoveryNotice::Migrated)
                         } else {
                             None

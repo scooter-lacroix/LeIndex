@@ -48,8 +48,12 @@ include = [
     "/docs/TOOL_SUPREMACY_BENCHMARKS.md",
 ]
 
-# Note: ONNX models (models/*.onnx) will be added to includes when R15 model conversion is complete
-# See docs/R15_MODEL_DISTRIBUTION.md for the complete model distribution strategy
+# Note: ONNX models (models/*.onnx) are bundled in GitHub Release archives
+# (see .github/workflows/release.yml) and installed by `leindex setup` /
+# install.sh into ~/.leindex/models/. The models/ directory is excluded from
+# the published crate to keep the crates.io download small; users obtain
+# models via `leindex setup` or the release bundle.
+# See docs/NEURAL_SETUP.md for setup instructions.
 
 [features]
 default = ["full"]

@@ -346,7 +346,7 @@ jobs:
       # worker `dlopen`s at runtime are extracted from the platform-
       # appropriate onnxruntime wheel (onnxruntime-migraphx for linux-x86_64
       # so VAL-RELEASE-006 ships the MIGraphX provider) and staged under
-      # /tmp/ort-libs/onnxruntime/capi/ for the Package step to copy.
+      # /tmp/ort-extract/onnxruntime/capi/ for the Package step to copy.
       #
       # The ORT version is pinned to 1.25.0 to match the version the
       # `ort` crate (2.0.0-rc.12) was migrated against, the local dev
@@ -368,8 +368,8 @@ jobs:
           set -e
           echo "Extracting ORT wheel for bundle lib/ ..."
           echo "  package=${ORT_PACKAGE} version=${ORT_VERSION} platform=${ORT_PLATFORM}"
-          rm -rf /tmp/ort-wheels /tmp/ort-libs
-          mkdir -p /tmp/ort-wheels /tmp/ort-libs
+          rm -rf /tmp/ort-wheels /tmp/ort-extract
+          mkdir -p /tmp/ort-wheels /tmp/ort-extract
 
           # Cross-compile targets (aarch64-linux built on ubuntu-latest)
           # cannot `pip install` the foreign wheel directly because the
@@ -390,10 +390,10 @@ jobs:
           # would have produced on a native run.
           WHEEL=$(ls /tmp/ort-wheels/*.whl | head -1)
           echo "Extracting $WHEEL"
-          python -m zipfile -e "$WHEEL" /tmp/ort-libs
+          python -m zipfile -e "$WHEEL" /tmp/ort-extract
 
           # Sanity-check the libraries we need actually landed in capi/.
-          CAPI=/tmp/ort-libs/onnxruntime/capi
+          CAPI=/tmp/ort-extract/onnxruntime/capi
           echo "Wheel capi/ contents:"
           ls -la "$CAPI" || true
           if [[ "$RUNNER_OS" == "Windows" ]]; then
@@ -492,7 +492,7 @@ jobs:
           #   libonnxruntime.so   -> libonnxruntime.so.1
           # This matches how `apt install libonnxruntime` lays the files
           # out under /usr/local/lib.
-          CAPI=/tmp/ort-libs/onnxruntime/capi
+          CAPI=/tmp/ort-extract/onnxruntime/capi
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             # onnxruntime.dll and the shared providers dll. Windows does
             # not use SONAME symlinks; the basename is sufficient.

@@ -2,6 +2,36 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [1.8.1] - 2026-06-19 — Distribution Pipeline Overhaul: load-dynamic ORT, Setup Wizard, Bundle lib/
+
+### Added
+
+- **Runtime ORT dynamic loading (`load-dynamic`)**: Switched `crates/leindex-embed` from build-time ONNX Runtime linking (`download-binaries` + `copy-dylibs`) to runtime dynamic loading. `cargo build --features onnx` and `--features onnx-migraphx` now build with **zero ORT installed** on the build host. The `ort-lib/` vendored directory, the `.cargo/config.toml` `ORT_LIB_PATH`/`ORT_PREFER_DYNAMIC_LINK` env entries, and the `$ORIGIN` rpath in both `build.rs` files have all been removed.
+- **ORt discovery chain**: A new `ort_discovery` module in `crates/leindex-embed` resolves `libonnxruntime` at runtime by searching, in order: `ORT_DYLIB_PATH` env var, `~/.leindex/config/leindex.toml`, `~/.leindex/lib/` (bundled libs), the directory next to the worker binary (release bundle `lib/`), pip `site-packages/onnxruntime/capi/`, and the system dynamic loader paths (`/usr/local/lib`, `/usr/lib`, ld.so.conf).
+- **Interactive setup wizard (`leindex setup`)**: A new `setup` subcommand provides an interactive, novice-friendly wizard that installs ONNX Runtime via pip (`onnxruntime`, `onnxruntime-gpu`, or `onnxruntime-migraphx`), downloads the `qwen3-embed-0.6b.onnx` model to `~/.leindex/models/` with SHA256 verification, writes `~/.leindex/config/leindex.toml`, and runs a post-setup embedding smoke test. Non-interactive flags (`--neural`, `--cpu`, `--gpu amd`, `--gpu nvidia`, `--no-neural`) are available for CI and scripts; `--check` prints a read-only status report.
+- **Release bundle `lib/`**: GitHub Release archives now ship ONNX Runtime shared libraries under a top-level `lib/` directory (extracted from the `onnxruntime*` pip wheel), alongside `bin/`, `models/`, and `INSTALL.txt`. The AMD (`linux-x86_64`) bundle additionally includes `libonnxruntime_providers_migraphx.so`. The worker discovers these via the sibling-directory discovery source, so the bundle delivers a zero-setup neural experience.
+- **`install.sh` bundle path**: The installer now downloads pre-built release bundles (with bundled ORT `lib/` and models) when run outside the repo, copies them into `~/.leindex/`, and runs `leindex setup --check` to report status. The build-from-source path uses `--features leindex/onnx,leindex-embed/onnx` (load-dynamic, no ORT at build time).
+- **npm `npm run setup`**: The `@leindex/mcp` package exposes a `setup` script and an `ORT_DYLIB_PATH`-aware MCP wrapper that points the worker at the bundled `lib/` ORT. The post-install hook extracts the bundle, including the `lib/` directory.
+- **PyPI `leindex-setup` console script**: `pip install leindex` now installs a `leindex-setup` console script entry point, a bootstrap wrapper that runs `cargo install` on first use, and (when a TTY is attached) offers to run `leindex setup`.
+- **Model download with checksums**: `leindex setup` downloads `qwen3-embed-0.6b.onnx`, `tokenizer.json`, `config.json`, `checksums.sha256`, and `LICENSE` from the ONNX-community HuggingFace CDN, verifies SHA256 checksums, skips re-download when checksums match, and re-downloads on checksum failure.
+- **`docs/NEURAL_SETUP.md`**: New troubleshooting guide covering CPU/GPU/AMD/NVIDIA setup paths, the ORT discovery chain, and common failure modes (ORT not found, version mismatch, corrupted model, GPU provider unavailable, pip missing).
+
+### Changed
+
+- **Version parity**: `Cargo.toml`, `crates/leindex-embed/Cargo.toml`, `install.sh` `SCRIPT_VERSION`, `packages/npm-leindex-mcp/package.json`, and `packages/pypi-leindex/pyproject.toml` are all kept in lockstep at `1.8.1`. The `release.yml` workflow fails on any mismatch.
+- **`clippy.toml` migration**: Replaced the legacy top-level lint arrays with Cargo `[workspace.lints]` so the lints parse under clippy 1.96+.
+
+### Removed
+
+- **`ort-lib/` directory**: The vendored ORT directory and all references in source, build scripts, workflows, and docs have been removed.
+- **`.cargo/config.toml` `ORT_LIB_PATH` / `ORT_PREFER_DYNAMIC_LINK`**: Obsolete build-time env entries dropped (load-dynamic loads ORT at runtime instead).
+- **`$ORIGIN` rpath**: Both root and `crates/leindex-embed/build.rs` no longer add the `$ORIGIN` rpath entry; the produced binaries have no `NEEDED libonnxruntime.so.*` entry (ORT is `dlopen`'d at runtime).
+
+### Migration Notes
+
+- Users on the pre-1.8 `ort-lib/`-based build should re-run `leindex setup`. The wizard will detect stale config paths and migrate them to the current discovery-chain model.
+- `cargo install leindex` no longer requires ORT to be present at install time; run `leindex setup` afterward to enable neural search. TF-IDF search works immediately without setup.
+
 ## [1.7.0] - 2026-05-15
 
 ### Added
