@@ -104,9 +104,21 @@ impl DiagnosticsHandler {
         let mut diag_json = serde_json::to_value(diagnostics)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?;
 
+        // ORT diagnostics: share the exact same collection used by the
+        // `leindex diagnostics` CLI so MCP output has parity (ort_path,
+        // ort_version, execution_provider).
+        let (ort_path, ort_version, execution_provider) =
+            crate::cli::cli::collect_ort_diagnostics();
+
         if let Value::Object(ref mut map) = diag_json {
             map.insert("storage_path".to_string(), serde_json::json!(storage_path));
             map.insert("db_size_bytes".to_string(), serde_json::json!(db_size));
+            map.insert("ort_path".to_string(), serde_json::json!(ort_path));
+            map.insert("ort_version".to_string(), serde_json::json!(ort_version));
+            map.insert(
+                "execution_provider".to_string(),
+                serde_json::json!(execution_provider),
+            );
             map.insert(
                 "memory_rss_mb".to_string(),
                 serde_json::json!(memory_rss_mb),

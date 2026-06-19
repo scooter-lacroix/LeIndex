@@ -1103,7 +1103,7 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 /// load ORT into the main daemon process. That keeps the diagnostics command
 /// cheap and side-effect-free; the leindex-embed worker performs its own
 /// discovery at spawn time.
-fn collect_ort_diagnostics() -> (Option<String>, Option<String>, String) {
+pub(crate) fn collect_ort_diagnostics() -> (Option<String>, Option<String>, String) {
     use crate::cli::leindex::setup;
 
     // ort_path: prefer the live discovery chain, fall back to configured path.

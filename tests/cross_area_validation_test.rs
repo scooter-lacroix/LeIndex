@@ -542,6 +542,28 @@ mod diagnostics_ort_info {
         );
     }
 
+    /// The MCP diagnostics handler must reach parity with the CLI by calling
+    /// the shared `collect_ort_diagnostics` helper and inserting the same three
+    /// ORT fields into its JSON output.
+    #[test]
+    fn mcp_diagnostics_handler_inserts_ort_info_fields() {
+        let handler = read_file("src/cli/mcp/diagnostics_handler.rs");
+
+        assert!(
+            handler.contains("collect_ort_diagnostics"),
+            "MCP diagnostics must call the shared ORT diagnostics helper"
+        );
+
+        for key in ["ort_path", "ort_version", "execution_provider"] {
+            let needle = format!("\"{}\"", key);
+            assert!(
+                handler.contains(&needle),
+                "MCP diagnostics output must insert `{}`",
+                key
+            );
+        }
+    }
+
     /// VAL-ORT-022: ort_discovery exposes `last_outcome()` so the worker can
     /// report the resolved ORT path it actually loaded (after init_from).
     #[test]
