@@ -335,3 +335,41 @@ mod version_parity {
         );
     }
 }
+
+// ============================================================================
+// Exit handling and model asset failure propagation
+// ============================================================================
+
+mod exit_handling {
+    use super::*;
+
+    #[test]
+    fn setup_check_preserves_exit_status_without_or_true() {
+        let script = install_sh();
+        assert!(
+            !script.contains(r#"setup_output=$("$binary" setup --check 2>&1) || true"#),
+            "run_setup_check must not use `|| true` before capturing setup_exit"
+        );
+        assert!(
+            script.contains("set +e") && script.contains("set -e"),
+            "run_setup_check should temporarily disable errexit, capture status, then restore errexit"
+        );
+        assert!(
+            script.contains("setup_exit=$?"),
+            "run_setup_check must capture setup --check exit status"
+        );
+    }
+
+    #[test]
+    fn model_asset_install_failure_is_checked_by_callers() {
+        let script = install_sh();
+        assert!(
+            script.contains(r#"if ! install_model_assets "$repo_dir"; then"#),
+            "source install path must check install_model_assets failure"
+        );
+        assert!(
+            script.contains(r#"if ! install_model_assets "$bundle_dir"; then"#),
+            "bundle install path must check install_model_assets failure"
+        );
+    }
+}

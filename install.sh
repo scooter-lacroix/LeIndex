@@ -702,7 +702,9 @@ install_leindex() {
     fi
 
     # Install bundled model assets
-    install_model_assets "$repo_dir"
+    if ! install_model_assets "$repo_dir"; then
+        log_warn "Model asset installation failed; neural setup will need to download models again"
+    fi
 
     # Install bundled ORT runtime libraries (from release bundle lib/
     # or a local lib/ directory). When building from source with
@@ -989,7 +991,9 @@ try_install_from_release_bundle() {
 
     # Install bundled ORT libraries and model assets.
     install_ort_libraries "$bundle_dir"
-    install_model_assets "$bundle_dir"
+    if ! install_model_assets "$bundle_dir"; then
+        log_warn "Model asset installation from bundle failed; neural setup will need to download models again"
+    fi
 
     # Clean up.
     rm -rf "$tmp_bundle"
@@ -1015,8 +1019,10 @@ run_setup_check() {
 
     local setup_output
     local setup_exit
-    setup_output=$("$binary" setup --check 2>&1) || true
+    set +e
+    setup_output=$("$binary" setup --check 2>&1)
     setup_exit=$?
+    set -e
 
     echo "$setup_output"
 
