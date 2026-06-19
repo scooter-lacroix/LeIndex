@@ -13,6 +13,7 @@ const fs = require('fs');
 
 const BIN_DIR = path.join(__dirname, 'bin');
 const MODELS_DIR = path.join(__dirname, 'models');
+const LIB_DIR = path.join(__dirname, 'lib');
 const binaryName = process.platform === 'win32' ? 'leindex.exe' : 'leindex';
 const workerBinaryName = process.platform === 'win32' ? 'leindex-embed.exe' : 'leindex-embed';
 const binaryPath = path.join(BIN_DIR, binaryName);
@@ -52,6 +53,17 @@ function getModelsPath() {
 }
 
 /**
+ * Get the path to bundled ORT shared libraries.
+ * @returns {string|null} Path to the lib directory, or null if not present
+ */
+function getLibPath() {
+  if (fs.existsSync(LIB_DIR)) {
+    return LIB_DIR;
+  }
+  return null;
+}
+
+/**
  * Execute LeIndex with given arguments
  * @param {string[]} args - Arguments to pass to LeIndex
  * @returns {Buffer} Command output
@@ -67,13 +79,30 @@ function exec(args = []) {
  */
 function startMcpServer() {
   const bin = getBinaryPath();
-  
+
   const env = Object.assign({}, process.env);
   const modelsPath = getModelsPath();
   if (modelsPath && !env.LEINDEX_MODEL_PATH) {
     env.LEINDEX_MODEL_PATH = modelsPath;
   }
-  
+  const libPath = getLibPath();
+  if (libPath && !env.ORT_DYLIB_PATH) {
+    const ortNames = process.platform === 'win32'
+      ? ['onnxruntime.dll']
+      : process.platform === 'darwin'
+        ? ['libonnxruntime.dylib']
+        : ['libonnxruntime.so'];
+    for (const name of ortNames) {
+      const candidate = path.join(libPath, name);
+      try {
+        if (fs.existsSync(candidate) && fs.lstatSync(candidate).size > 0) {
+          env.ORT_DYLIB_PATH = candidate;
+          break;
+        }
+      } catch (_) { /* try next */ }
+    }
+  }
+
   return spawn(bin, ['mcp', '--stdio'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: env
@@ -92,6 +121,7 @@ module.exports = {
   getBinaryPath,
   getWorkerBinaryPath,
   getModelsPath,
+  getLibPath,
   exec,
   startMcpServer,
   getVersion
@@ -109,6 +139,10 @@ if (require.main === module) {
   const models = getModelsPath();
   if (models) {
     console.log('Models:', models);
+  }
+  const lib = getLibPath();
+  if (lib) {
+    console.log('Lib:', lib);
   }
   console.log('\nUse "npx @leindex/mcp" in your MCP configuration.');
 }

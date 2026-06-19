@@ -18,9 +18,65 @@ const pkg = require('./package.json');
 
 const BIN_DIR = path.join(__dirname, 'bin');
 const MODELS_DIR = path.join(__dirname, 'models');
+// VAL-NPM-002: bundled ORT shared libraries are extracted here so the
+// worker discovers ORT via its bundled/sibling-library path without
+// requiring the user to run `leindex setup`.
+const LIB_DIR = path.join(__dirname, 'lib');
 const GITHUB_API_BASE = 'https://api.github.com/repos/scooter-lacroix/LeIndex';
 const DEFAULT_RELEASE_SELECTOR = 'latest';
 const MAX_REDIRECTS = 5;
+
+/**
+ * The unversioned ONNX Runtime shared library name on the current platform.
+ * The discovery chain in `crates/leindex-embed/src/ort_discovery.rs` looks for
+ * exactly these filenames at each candidate directory.
+ */
+function getOrtLibNames() {
+  if (process.platform === 'win32') {
+    return ['onnxruntime.dll'];
+  }
+  if (process.platform === 'darwin') {
+    return ['libonnxruntime.dylib'];
+  }
+  return ['libonnxruntime.so'];
+}
+
+/**
+ * Copy a single file from `src` to `dst`, preserving symlinks and the
+ * executable bit. Linux/macOS ORT bundles ship versioned symlinks like
+ * `libonnxruntime.so.1 -> libonnxruntime.so.1.25.0` and the worker's
+ * sibling-library discovery expects the unversioned `libonnxruntime.so`
+ * entry to remain a symlink (or a real file) at the same path, so we
+ * faithfully reproduce the source's file type instead of dereferencing.
+ *
+ * Returns a short label describing what was copied, for logging.
+ */
+function copyBundledEntry(src, dst) {
+  const stat = fs.lstatSync(src);
+
+  if (stat.isSymbolicLink()) {
+    const target = fs.readlinkSync(src);
+    try {
+      fs.symlinkSync(target, dst);
+    } catch (err) {
+      // Some filesystems / Windows without dev mode reject symlinks;
+      // fall back to copying the link target so the file still exists.
+      fs.copyFileSync(src, dst);
+    }
+    return 'symlink';
+  }
+
+  fs.copyFileSync(src, dst);
+  if (process.platform !== 'win32') {
+    // Preserve executable bit for shared libraries on Unix.
+    try {
+      fs.chmodSync(dst, stat.mode);
+    } catch (_) {
+      // Permissions may fail on exotic filesystems; non-fatal.
+    }
+  }
+  return 'file';
+}
 
 // Platform mapping
 const platforms = {
@@ -439,6 +495,48 @@ async function installFromBundle(release) {
       console.log('   ⚠ Model assets not found in bundle');
     }
 
+    // VAL-NPM-002: Install bundled ORT shared libraries under `lib/`.
+    // The worker's sibling-directory discovery path looks for
+    // `libonnxruntime.{so,dylib,dll}` here, so the package works with
+    // neural embeddings enabled without requiring `npm run setup` first.
+    const srcLib = path.join(bundleDir, 'lib');
+    if (fs.existsSync(srcLib)) {
+      if (!fs.existsSync(LIB_DIR)) {
+        fs.mkdirSync(LIB_DIR, { recursive: true });
+      }
+      // Clean any stale lib/ entries from a previous (or upgraded) bundle
+      // before copying the new ones, so renamed files don't linger.
+      for (const stale of fs.readdirSync(LIB_DIR)) {
+        const stalePath = path.join(LIB_DIR, stale);
+        try {
+          fs.rmSync(stalePath, { recursive: true, force: true });
+        } catch (_) {
+          // Non-fatal: leave the stale entry in place if we can't remove it.
+        }
+      }
+
+      const libFiles = fs.readdirSync(srcLib);
+      let copiedCount = 0;
+      let symlinkCount = 0;
+      for (const file of libFiles) {
+        const srcEntry = path.join(srcLib, file);
+        const dstEntry = path.join(LIB_DIR, file);
+        try {
+          const kind = copyBundledEntry(srcEntry, dstEntry);
+          if (kind === 'symlink') {
+            symlinkCount += 1;
+          } else {
+            copiedCount += 1;
+          }
+        } catch (err) {
+          console.log(`   ⚠ Failed to copy bundled library entry ${file}: ${err.message}`);
+        }
+      }
+      console.log(`   ✓ ORT runtime libraries installed (${copiedCount} files, ${symlinkCount} symlinks) under lib/`);
+    } else {
+      console.log('   ⚠ ORT libraries not found in bundle; run `npm run setup` to install ORT');
+    }
+
     // Verify main binary works
     const binaryPath = path.join(BIN_DIR, binaryName);
     const version = execFileSync(binaryPath, ['--version'], { encoding: 'utf8' }).trim();
@@ -593,9 +691,14 @@ async function install() {
 }
 
 module.exports = {
+  BIN_DIR,
+  MODELS_DIR,
+  LIB_DIR,
   computeFileSha256,
+  copyBundledEntry,
   getAssetName,
   getBundleAssetName,
+  getOrtLibNames,
   getRequestedRelease,
   parseExpectedChecksum,
   parseReleaseVersion,

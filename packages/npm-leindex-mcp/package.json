@@ -9,6 +9,7 @@
   },
   "scripts": {
     "postinstall": "node install.js",
+    "setup": "node bin/setup-wrapper.js",
     "test": "node test.js"
   },
   "keywords": [
@@ -48,6 +49,7 @@
     "index.js",
     "install.js",
     "bin/mcp-wrapper.js",
+    "bin/setup-wrapper.js",
     "README.md",
     "LICENSE"
   ],
