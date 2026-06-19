@@ -120,8 +120,8 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
 }
 console.log('  ✓ ORT discovery helpers wired up correctly\n');
 
-// Test 6: Binary check (if installed)
-console.log('Test 6: Binary installation');
+// Test 6: Binary version parity
+console.log('Test 6: Binary version parity');
 const binaryName = process.platform === 'win32' ? 'leindex.exe' : 'leindex';
 const binaryPath = path.join(__dirname, 'bin', binaryName);
 
@@ -133,20 +133,23 @@ if (fs.existsSync(binaryPath)) {
   } else {
     console.log('  ✓ Binary is installed');
 
-    // Try to get version
     try {
       const { execFileSync } = require('child_process');
       if (process.platform !== 'win32') {
         fs.chmodSync(binaryPath, 0o755);
       }
       const version = execFileSync(binaryPath, ['--version'], { encoding: 'utf8' }).trim();
-      if (version) {
-        console.log(`  ✓ Binary version: ${version}`);
-      } else {
-        console.log('  ⚠ Binary executed but returned an empty version string');
+      const expectedVersion = pkg.version;
+      const match = version.match(/leindex\s+([0-9]+\.[0-9]+\.[0-9]+)/);
+      if (!match) {
+        throw new Error(`Binary version output is not parseable: ${version}`);
       }
+      if (match[1] !== expectedVersion) {
+        throw new Error(`Binary version ${match[1]} does not match package version ${expectedVersion}`);
+      }
+      console.log(`  ✓ Binary version matches package: ${version}`);
     } catch (e) {
-      console.log('  ⚠ Binary exists but version check failed');
+      console.log(`  ⚠ Binary exists but version check failed: ${e.message}`);
     }
   }
 } else {

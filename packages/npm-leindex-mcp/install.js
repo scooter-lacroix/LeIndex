@@ -587,6 +587,30 @@ async function install() {
   console.log('🔧 LeIndex MCP Installer');
   console.log(`   Wrapper version: ${pkg.version}`);
   
+function parseLeindexVersion(output) {
+  const match = String(output).match(/leindex\s+([0-9]+\.[0-9]+\.[0-9]+)/);
+  return match ? match[1] : null;
+}
+
+function existingBinaryMatchesPackage(binaryPath) {
+  try {
+    const output = execFileSync(binaryPath, ['--version'], { encoding: 'utf8' }).trim();
+    const version = parseLeindexVersion(output);
+    return {
+      ok: version === pkg.version,
+      version,
+      output,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      version: null,
+      output: error.message,
+    };
+  }
+}
+
+async function install() {
   const { platform, arch } = getPlatform();
   console.log(`   Platform: ${platform} (${arch})`);
   console.log(`   Binary selector: ${getRequestedRelease()}\n`);
@@ -603,21 +627,28 @@ async function install() {
   
   // Check if already installed (both main and worker)
   if (fs.existsSync(binaryPath)) {
-    try {
-      const version = execFileSync(binaryPath, ['--version'], { encoding: 'utf8' }).trim();
-      const hasWorker = fs.existsSync(workerPath);
-      console.log(`   ✓ LeIndex already installed: ${version}`);
-      if (hasWorker) {
-        console.log('   ✓ Worker binary present');
-        console.log('\n📦 Installation complete!');
-        console.log('   Add this package to your MCP configuration to use LeIndex.');
-        return;
-      }
-      console.log('   ⚠ Worker binary missing; downloading bundled worker...');
-    } catch (e) {
-      // Version check failed, continue with download
-      try { fs.unlinkSync(binaryPath); } catch (_) {}
+    const existing = existingBinaryMatchesPackage(binaryPath);
+    const hasWorker = fs.existsSync(workerPath);
+
+    if (existing.ok && hasWorker) {
+      console.log(`   ✓ LeIndex already installed: ${existing.output}`);
+      console.log('   ✓ Worker binary present');
+      console.log('\n📦 Installation complete!');
+      console.log('   Add this package to your MCP configuration to use LeIndex.');
+      return;
     }
+
+    if (!existing.ok) {
+      console.log(
+        `   ⚠ Existing LeIndex binary is stale or unreadable: ${existing.version || existing.output}`
+      );
+      console.log(`   Reinstalling binary for package version ${pkg.version}...`);
+    } else if (!hasWorker) {
+      console.log('   ⚠ Worker binary missing; reinstalling bundled worker...');
+    }
+
+    try { fs.unlinkSync(binaryPath); } catch (_) {}
+    try { fs.unlinkSync(workerPath); } catch (_) {}
   }
   
   try {
