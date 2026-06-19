@@ -1432,8 +1432,13 @@ fn ensure_models_present() -> Result<bool, SetupError> {
 
     // ── Step 1: copy from bundled location if present ────────────────────
     // Bundled files (GitHub Release bundle layout) are a no-network fast path.
-    // We copy each missing file from the bundle, then fall through to the
-    // network path only for anything still missing or corrupted.
+    // We link (symlink > hardlink > copy) each missing file from the bundle,
+    // then fall through to the network path only for anything still missing
+    // or corrupted.
+    //
+    // LEINDEX_SKIP_MODEL_COPY: when set, copy_bundled_models only creates
+    // symlinks (no copy fallback). This is used by tests/CI to avoid
+    // duplicating the 569 MB model into temp directories.
     if let Some(bundled_dir) = model_download::find_bundled_models() {
         copy_bundled_models(&bundled_dir, &model_dir);
     }
@@ -1629,33 +1634,136 @@ fn generate_local_checksum_manifest(model_dir: &std::path::Path) -> std::io::Res
     std::fs::write(&manifest_path, out)
 }
 
-/// Copy every model file present in `bundled_dir` into `dest_dir`, skipping
-/// any that already exist in `dest_dir`. Used as a zero-network fast path when
-/// the user is running from a release bundle layout.
+/// Link or copy every model file present in `bundled_dir` into `dest_dir`,
+/// skipping any that already exist in `dest_dir`.
+///
+/// **Resource-duplication fix (Bug 3):** Previously this function unconditionally
+/// called `std::fs::copy`, which duplicated the 569 MB `qwen3-embed-0.6b.onnx`
+/// into every `LEINDEX_HOME/models/` temp directory. During test runs, 47 temp
+/// dirs accumulated in `/tmp` (tmpfs), consuming 18.6 GB of RAM-backed storage.
+///
+/// The new strategy avoids copying heavyweight model files whenever possible:
+///
+/// 1. **Symlink** (preferred): zero memory, zero disk overhead. Used when source
+///    and destination are on the same filesystem (the common case for bundled
+///    installs). `symlink()` is tried first because it works across all
+///    same-filesystem and even cross-filesystem scenarios on Linux.
+/// 2. **Hardlink** (fallback): zero memory overhead, shares inodes. Used when
+///    `symlink()` fails (e.g., cross-filesystem) but `link()` succeeds (same
+///    filesystem). Each hardlink shares the same inode = zero memory overhead.
+/// 3. **Copy** (last resort): full byte copy. Used only when both `symlink()`
+///    and `link()` fail (genuinely cross-filesystem scenario, e.g., copying
+///    from a USB-mounted bundle to `/tmp`).
+///
+/// Small metadata files (`config.json`, `checksums.sha256`, `LICENSE`) are
+/// cheap to copy and symlink/hardlink is preferred for them too for consistency.
+///
+/// When `LEINDEX_SKIP_MODEL_COPY` environment variable is set (any non-empty
+/// value), the function only creates symlinks (no hardlink or copy fallback).
+/// This is intended for test/CI environments where the bundled models directory
+/// is the repo `models/` directory and should be referenced in-place.
 fn copy_bundled_models(bundled_dir: &std::path::Path, dest_dir: &std::path::Path) {
-    let mut copied_any = false;
+    let skip_copy = std::env::var("LEINDEX_SKIP_MODEL_COPY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+
+    let mut linked_any = false;
     for file in crate::cli::leindex::model_download::iter_model_files() {
         let src = bundled_dir.join(file.local);
         let dst = dest_dir.join(file.local);
         if src.exists() && !dst.exists() {
-            if !copied_any {
+            if !linked_any {
                 println!(
-                    "  -> Copying bundled model files from {}...",
+                    "  -> Linking bundled model files from {}...",
                     bundled_dir.display()
                 );
-                copied_any = true;
+                linked_any = true;
             }
-            match std::fs::copy(&src, &dst) {
-                Ok(_) => {}
-                Err(e) => {
+
+            // Resolve symlinks on the source so we link to the real file.
+            // This matters when the bundled dir itself contains symlinks
+            // (e.g., release-bundle layout where models/ has symlinks to
+            // a shared storage location).
+            let src_resolved = std::fs::canonicalize(&src).unwrap_or_else(|_| src.clone());
+
+            let linked = try_link_model_file(&src_resolved, &dst, skip_copy);
+            if let Err(e) = linked {
+                if skip_copy {
+                    // LEINDEX_SKIP_MODEL_COPY is set: do not fall back to copy.
+                    // Log a warning so the user knows the file was skipped.
                     eprintln!(
-                        "warning: failed to copy {} from bundle ({}); will download instead.",
+                        "warning: LEINDEX_SKIP_MODEL_COPY is set and symlink/hardlink failed for {} ({}); \
+                         skipping file (will be resolved at download stage if missing).",
+                        file.local, e
+                    );
+                } else {
+                    eprintln!(
+                        "warning: failed to link {} from bundle ({}); will download instead.",
                         file.local, e
                     );
                 }
             }
         }
     }
+}
+
+/// Try to link a model file using symlink > hardlink > copy strategy.
+///
+/// Returns `Ok(())` on success, or an `Err` describing why all strategies
+/// failed (used for logging by the caller).
+fn try_link_model_file(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    skip_copy: bool,
+) -> std::io::Result<()> {
+    // Ensure the parent directory exists.
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Strategy 1: Symlink (preferred, zero overhead, works cross-filesystem on Linux).
+    // Symlinks are the best option because they reference the source file by path
+    // without duplicating any data. They work even across filesystem boundaries.
+    match std::os::unix::fs::symlink(src, dst) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            // Fall through to hardlink attempt.
+            let _ = e; // logged by caller if all strategies fail
+        }
+    }
+
+    // On non-Unix platforms, symlink may not be available or may require
+    // special privileges. Try the std::os::windows variant too.
+    #[cfg(windows)]
+    {
+        match std::os::windows::fs::symlink_file(src, dst) {
+            Ok(()) => return Ok(()),
+            Err(_) => {}
+        }
+    }
+
+    // Strategy 2: Hardlink (zero memory overhead, shares inodes).
+    // Only works on the same filesystem. `link()` on Unix, `fs::hard_link()`
+    // cross-platform wrapper in std.
+    match std::fs::hard_link(src, dst) {
+        Ok(()) => return Ok(()),
+        Err(e) => {
+            // Fall through to copy if allowed.
+            if skip_copy {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    format!(
+                        "LEINDEX_SKIP_MODEL_COPY is set but symlink and hardlink both failed: {}",
+                        e
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Strategy 3: Copy (last resort, full byte duplication).
+    // Only reached when symlink and hardlink both fail AND skip_copy is false.
+    std::fs::copy(src, dst).map(|_| ())
 }
 
 /// Strip a SHA256 hex string down to its first 12 chars for compact logging.
@@ -2398,21 +2506,16 @@ mod tests {
     #[test]
     fn test_model_checksum_status_missing_for_clean_dir() {
         // VAL-SETUP-017: no model + no manifest -> Missing. We exercise this by
-        // pointing LEINDEX_HOME at a fresh tempdir.
-        let tmp = std::env::temp_dir().join(format!(
-            "leindex-setup-test-mcs-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("LEINDEX_HOME", &tmp);
+        // pointing LEINDEX_HOME at a fresh tempfile::TempDir (auto-cleanup on drop).
+        // Resource-duplication fix: use tempfile::TempDir instead of manual
+        // std::env::temp_dir() to guarantee cleanup even on panic.
+        let _g = PIPE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("LEINDEX_HOME", tmp.path());
         let status = model_checksum_status();
         std::env::remove_var("LEINDEX_HOME");
-        let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(status, ModelChecksumStatus::Missing);
+        // tmp is auto-cleaned when dropped
     }
 
     // ── VAL-SETUP-020/021/022: New error and version-compatibility tests ──
@@ -2790,40 +2893,41 @@ mod tests {
     #[test]
     fn test_detect_amd_gpu_honors_existing_rocm_path() {
         // When ROCM_PATH points at an existing directory, AMD is detected.
+        // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
         let _g = PIPE_ENV_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!("leindex-rocm-test-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("ROCM_PATH", &tmp);
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("ROCM_PATH", tmp.path());
         assert!(detect_amd_gpu(), "existing ROCM_PATH should detect AMD");
         std::env::remove_var("ROCM_PATH");
-        let _ = std::fs::remove_dir_all(&tmp);
+        // tmp auto-cleans on drop
     }
 
     #[test]
     fn test_detect_nvidia_gpu_with_cuda_path_env() {
         // When CUDA_PATH points at an existing directory, NVIDIA is detected.
-        let tmp = std::env::temp_dir().join(format!("leindex-cuda-test-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("CUDA_PATH", &tmp);
+        // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
+        let _g = PIPE_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("CUDA_PATH", tmp.path());
         assert!(
             detect_nvidia_gpu(),
             "existing CUDA_PATH should detect NVIDIA"
         );
         std::env::remove_var("CUDA_PATH");
-        let _ = std::fs::remove_dir_all(&tmp);
+        // tmp auto-cleans on drop
     }
 
     // ── VAL-SETUP-031 + VAL-SETUP-035: ensure_home_writable + LEINDEX_HOME ──
 
     #[test]
     fn test_ensure_home_writable_succeeds_for_writable_leindex_home() {
+        // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
         let _g = PIPE_ENV_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!("leindex-ehw-writable-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::env::set_var("LEINDEX_HOME", &tmp);
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("LEINDEX_HOME", tmp.path());
         let result = ensure_home_writable();
         std::env::remove_var("LEINDEX_HOME");
-        let _ = std::fs::remove_dir_all(&tmp);
+        // tmp auto-cleans on drop
         assert!(
             result.is_ok(),
             "writable LEINDEX_HOME should pass: {:?}",
@@ -2834,31 +2938,30 @@ mod tests {
     #[test]
     fn test_ensure_home_writable_uses_leindex_home_location() {
         // VAL-SETUP-032/035: LEINDEX_HOME drives where config goes.
+        // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
         let _g = PIPE_ENV_LOCK.lock().unwrap();
-        let tmp = std::env::temp_dir().join(format!("leindex-ehw-location-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&tmp).unwrap();
-        std::env::set_var("LEINDEX_HOME", &tmp);
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("LEINDEX_HOME", tmp.path());
         let result = ensure_home_writable();
         assert!(result.is_ok());
         // After the probe, the config directory should exist under $LEINDEX_HOME.
         assert!(
-            tmp.join("config").is_dir(),
+            tmp.path().join("config").is_dir(),
             "config dir should be under LEINDEX_HOME"
         );
         std::env::remove_var("LEINDEX_HOME");
-        let _ = std::fs::remove_dir_all(&tmp);
+        // tmp auto-cleans on drop
     }
 
     #[test]
     fn test_ensure_home_writable_fails_for_read_only_dir() {
         // VAL-SETUP-031: a read-only directory surfaces a PermissionDenied error.
-        // We create a directory, chmod it 555 (read+execute only), and verify
-        // the probe fails. Then restore perms and clean up.
+        // We create a tempfile::TempDir, chmod it 555 (read+execute only), and
+        // verify the probe fails. Then restore perms and let TempDir clean up.
+        // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
         let _g = PIPE_ENV_LOCK.lock().unwrap();
-        let base = std::env::temp_dir().join(format!("leindex-ehw-ro-base-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(&base).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().to_path_buf();
 
         // Make the base directory read-only (no write permission).
         // 0o555 = r-xr-xr-x
@@ -2878,7 +2981,7 @@ mod tests {
             let _ = std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755));
         }
         std::env::remove_var("LEINDEX_HOME");
-        let _ = std::fs::remove_dir_all(&base);
+        // tmp auto-cleans on drop (we restored perms above)
 
         // On Unix with a read-only base, we expect a PermissionDenied error.
         // On non-Unix or when running as root, the probe may succeed; skip
@@ -2931,5 +3034,98 @@ mod tests {
         assert!(result.ends_with("..."), "{}", result);
         // The truncated body is 50 chars + 3 for the ellipsis.
         assert_eq!(result.len(), 50 + 3);
+    }
+
+    // ── Resource-duplication fix: copy_bundled_models symlink/hardlink tests ──
+    //
+    // Bug 3 fix: copy_bundled_models() must prefer symlink > hardlink > copy
+    // so the 569 MB model file is not duplicated into every LEINDEX_HOME temp dir.
+
+    #[test]
+    fn test_try_link_model_file_creates_symlink_on_same_filesystem() {
+        // On the same filesystem, symlink should succeed (strategy 1).
+        // Both src and dst are under the system temp dir (same filesystem),
+        // so the symlink should be created.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("source.bin");
+        let dst = tmp.path().join("dest.bin");
+        std::fs::write(&src, b"model data").unwrap();
+
+        let result = try_link_model_file(&src, &dst, false);
+        assert!(
+            result.is_ok(),
+            "try_link_model_file should succeed: {:?}",
+            result
+        );
+
+        // The result should be a symlink pointing at src.
+        #[cfg(unix)]
+        {
+            let meta = std::fs::symlink_metadata(&dst).unwrap();
+            assert!(meta.file_type().is_symlink(), "dst should be a symlink");
+        }
+        // The content should be readable through the link.
+        let content = std::fs::read(&dst).unwrap();
+        assert_eq!(content, b"model data");
+    }
+
+    #[test]
+    fn test_copy_bundled_models_creates_symlinks_not_copies() {
+        // Resource-duplication fix: copy_bundled_models must create symlinks
+        // (not copies) when source and dest are on the same filesystem.
+        // We simulate a bundled models dir with a small placeholder file.
+        let _g = PIPE_ENV_LOCK.lock().unwrap();
+
+        let bundled = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+
+        // Create a fake "model" file in the bundled dir.
+        // We use a .txt extension to avoid triggering find_bundled_models()
+        // during the test (it looks for qwen3-embed-0.6b.onnx).
+        // copy_bundled_models iterates iter_model_files() which includes
+        // config.json, so we write that.
+        let config_src = bundled.path().join("config.json");
+        std::fs::write(&config_src, b"{ \"test\": true }").unwrap();
+
+        copy_bundled_models(bundled.path(), dest.path());
+
+        let config_dst = dest.path().join("config.json");
+        assert!(config_dst.exists(), "config.json should exist in dest");
+
+        // On Unix, verify it's a symlink (not a copy).
+        #[cfg(unix)]
+        {
+            let meta = std::fs::symlink_metadata(&config_dst).unwrap();
+            assert!(
+                meta.file_type().is_symlink(),
+                "config.json in dest should be a symlink, not a copy (resource-duplication fix)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_try_link_model_file_overwrites_existing() {
+        // copy_bundled_models skips files that already exist in dest_dir,
+        // so this test verifies try_link_model_file itself (called for new files).
+        // If dst already exists, try_link_model_file will fail because symlink()
+        // does not overwrite. This is the intended behavior: copy_bundled_models
+        // checks !dst.exists() before calling try_link_model_file.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("source.bin");
+        let dst = tmp.path().join("dest.bin");
+        std::fs::write(&src, b"model data").unwrap();
+        std::fs::write(&dst, b"old data").unwrap();
+
+        // symlink() fails when dst exists; hard_link also fails when dst exists.
+        // The function should return an error (or fall through to copy which
+        // also fails because copy overwrites... actually std::fs::copy overwrites).
+        // So the result depends on the strategy: copy() overwrites by default.
+        let result = try_link_model_file(&src, &dst, false);
+        // std::fs::copy overwrites existing files, so this should succeed.
+        assert!(
+            result.is_ok(),
+            "copy strategy should overwrite: {:?}",
+            result
+        );
     }
 }

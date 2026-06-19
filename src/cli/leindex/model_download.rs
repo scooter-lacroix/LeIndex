@@ -539,17 +539,41 @@ pub fn iter_model_files() -> impl Iterator<Item = &'static ModelFile> {
 ///
 /// This mirrors `find_bundled_models` in `setup.rs`; kept here so the download
 /// module can prefer a bundled copy before reaching for the network.
+///
+/// **Resource-duplication fix (Bug 3):** The lookup now resolves symlinks on
+/// the candidate `models/` directories and on the model file itself. This is
+/// necessary because:
+/// 1. The release-bundle layout may contain `models/qwen3-embed-0.6b.onnx` as
+///    a symlink to a shared storage location.
+/// 2. When tests set `LEINDEX_SKIP_MODEL_COPY=1`, the bundled dir IS the repo
+///    `models/` directory, and we need to return the canonical path so the
+///    symlink created in `copy_bundled_models` points at the real file.
+/// 3. `current_exe()` may itself be a symlink (common in cargo workspaces and
+///    npm-installed binaries), so we canonicalize it before walking up.
+///
+/// The returned path is the canonicalized directory containing the model file,
+/// or `None` if no bundled model is found.
 pub fn find_bundled_models() -> Option<PathBuf> {
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            for dir in [
-                parent.join("models"),
-                parent.join("..").join("models"),
-                parent.join("..").join("..").join("models"),
-            ] {
-                if dir.join(MODEL_ONNX_FILENAME).exists() {
-                    return Some(dir);
-                }
+    // Canonicalize current_exe so symlinks in the binary path are resolved.
+    // This is important for npm installs and dev workspaces.
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    if let Some(parent) = exe.parent() {
+        for dir in [
+            parent.join("models"),
+            parent.join("..").join("models"),
+            parent.join("..").join("..").join("models"),
+        ] {
+            // Check both the raw path and the canonicalized path: the model
+            // file may be a symlink itself (release bundle), so we resolve it
+            // before checking existence. canonicalize follows all symlinks in
+            // the path and the final component.
+            let model_candidate = dir.join(MODEL_ONNX_FILENAME);
+            if model_candidate.exists() {
+                // Canonicalize the directory so callers get the real path.
+                // This ensures copy_bundled_models creates symlinks pointing
+                // at the actual file, not at another symlink chain.
+                return Some(std::fs::canonicalize(&dir).unwrap_or(dir));
             }
         }
     }
@@ -671,16 +695,16 @@ mod tests {
     #[test]
     fn test_sha256_of_known_bytes() {
         // sha256(b"hello\n") == 5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03
-        let dir = std::env::temp_dir().join(format!("leindex-mdl-test-sha-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("known.txt");
+        // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known.txt");
         std::fs::write(&path, b"hello\n").unwrap();
         let hash = sha256_of_file(&path).unwrap();
         assert_eq!(
             hash,
             "5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        // dir auto-cleans on drop
     }
 
     #[test]
@@ -702,27 +726,25 @@ mod tests {
     fn test_check_result_no_entry_when_manifest_lacks_filename() {
         // File is present but the manifest only mentions `tokenizer.json`,
         // not the file's actual name on disk.
-        let dir =
-            std::env::temp_dir().join(format!("leindex-mdl-test-noentry-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.json");
+        // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
         std::fs::write(&path, b"contents").unwrap();
         let mut manifest = std::collections::HashMap::new();
         // manifest intentionally lacks "config.json"
         manifest.insert("tokenizer.json".to_string(), "deadbeef".to_string());
         let res = check_file_against_manifest(&path, &manifest).unwrap();
         assert_eq!(res, CheckResult::NoEntry);
-        let _ = std::fs::remove_dir_all(&dir);
+        // dir auto-cleans on drop
     }
 
     #[test]
     fn test_check_result_verified_on_match() {
         // Use a manually-chosen filename written into the temp dir so the
         // manifest lookup by file_name matches.
-        let dir =
-            std::env::temp_dir().join(format!("leindex-mdl-test-verify-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("tokenizer.json");
+        // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokenizer.json");
         std::fs::write(&path, b"hello\n").unwrap();
         let mut manifest = std::collections::HashMap::new();
         manifest.insert(
@@ -731,16 +753,15 @@ mod tests {
         );
         let res = check_file_against_manifest(&path, &manifest).unwrap();
         assert_eq!(res, CheckResult::Verified);
-        let _ = std::fs::remove_dir_all(&dir);
+        // dir auto-cleans on drop
     }
 
     #[test]
     fn test_check_result_mismatch_on_wrong_checksum() {
         // VAL-SETUP-018: caller must re-download when this is returned.
-        let dir =
-            std::env::temp_dir().join(format!("leindex-mdl-test-mismatch-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.json");
+        // Resource-duplication fix: use tempfile::TempDir for auto-cleanup.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
         std::fs::write(&path, b"corrupted").unwrap();
         let mut manifest = std::collections::HashMap::new();
         manifest.insert(
@@ -768,7 +789,7 @@ mod tests {
             }
             other => panic!("expected Mismatch, got {:?}", other),
         }
-        let _ = std::fs::remove_dir_all(&dir);
+        // dir auto-cleans on drop
     }
 
     #[test]
