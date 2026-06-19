@@ -583,10 +583,6 @@ async function installFromBinary(release) {
   console.log('   Add this package to your MCP configuration to use LeIndex.');
 }
 
-async function install() {
-  console.log('🔧 LeIndex MCP Installer');
-  console.log(`   Wrapper version: ${pkg.version}`);
-  
 function parseLeindexVersion(output) {
   const match = String(output).match(/leindex\s+([0-9]+\.[0-9]+\.[0-9]+)/);
   return match ? match[1] : null;
@@ -611,6 +607,8 @@ function existingBinaryMatchesPackage(binaryPath) {
 }
 
 async function install() {
+  console.log('🔧 LeIndex MCP Installer');
+  console.log(`   Wrapper version: ${pkg.version}`);
   const { platform, arch } = getPlatform();
   console.log(`   Platform: ${platform} (${arch})`);
   console.log(`   Binary selector: ${getRequestedRelease()}\n`);

@@ -105,6 +105,11 @@ pub struct SmokeTestResult {
     /// Execution provider the worker reported as active.
     /// `None` when the worker could not start or did not report.
     pub execution_provider: Option<String>,
+    /// Execution provider configured for the smoke test request.
+    ///
+    /// This is intentionally separate from `execution_provider`: configured
+    /// provider is not evidence that the worker actually used that provider.
+    pub configured_provider_label: Option<String>,
     /// Error text from the worker on failure (truncated to a reasonable length).
     pub error: Option<String>,
 }
@@ -568,11 +573,11 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
             SmokeTestResult {
                 passed: true,
                 dimension: Some(dim),
-                execution_provider: Some(provider),
+                configured_provider_label: Some(provider),
                 ..
             } => {
                 println!("  -> {}.", result.status_line());
-                println!("  -> Execution provider: {} (configured; actual worker provider not captured).", provider);
+                println!("  -> Configured execution provider: {}.", provider);
                 let _ = dim; // already in status_line
             }
             SmokeTestResult { passed: true, .. } => {
@@ -725,10 +730,9 @@ fn run_embedding_smoke_test_inner(expected_provider: Option<ExecutionProvider>) 
     let provider_label: String = expected_provider
         .map(|p| p.config_value().to_string())
         .unwrap_or_else(|| "auto".to_string());
-    // Spawn the worker and run a single embedding. We capture stderr so we
-    // can parse the startup_report line and report the active EP, but we
-    // cannot inherit it here because EmbeddingClient owns the spawn. So we
-    // infer the active EP from the response / the configured provider.
+    // Spawn the worker and run a single embedding. EmbeddingClient does not
+    // currently expose the worker startup report, so the active EP remains
+    // unknown unless that plumbing is added later.
     match client.embed(&[SMOKE_TEST_TEXT.to_string()], SMOKE_TEST_EXPECTED_DIM) {
         Ok(response) => {
             if response.count == 0 {
@@ -736,6 +740,7 @@ fn run_embedding_smoke_test_inner(expected_provider: Option<ExecutionProvider>) 
                     passed: false,
                     dimension: None,
                     execution_provider: None,
+                    configured_provider_label: Some(provider_label),
                     error: Some("worker returned zero embeddings".to_string()),
                 };
             }
@@ -745,7 +750,8 @@ fn run_embedding_smoke_test_inner(expected_provider: Option<ExecutionProvider>) 
             SmokeTestResult {
                 passed,
                 dimension: Some(dim),
-                execution_provider: Some(provider_label),
+                execution_provider: None,
+                configured_provider_label: Some(provider_label),
                 error: if passed {
                     None
                 } else {
@@ -762,7 +768,8 @@ fn run_embedding_smoke_test_inner(expected_provider: Option<ExecutionProvider>) 
             SmokeTestResult {
                 passed: false,
                 dimension: None,
-                execution_provider: Some(provider_label),
+                execution_provider: None,
+                configured_provider_label: Some(provider_label),
                 error: Some(msg),
             }
         }
@@ -780,6 +787,7 @@ fn run_embedding_smoke_test_inner(
         passed: false,
         dimension: None,
         execution_provider: None,
+        configured_provider_label: None,
         error: Some("onnx feature is not compiled in; cannot run embedding smoke test".to_string()),
     }
 }
@@ -1343,6 +1351,65 @@ fn find_pip() -> Option<(String, Vec<String>)> {
 /// `leindex_embed::ort_discovery::discover_path_only()` but uses the main
 /// binary's process context (its own current_exe sibling, its own pip).
 pub(crate) fn discover_ort_path() -> Option<PathBuf> {
+    #[cfg(feature = "onnx")]
+    if let Some(outcome) = leindex_embed::ort_discovery::discover_path_only() {
+        return Some(outcome.path);
+    }
+
+    discover_ort_path_fallback()
+}
+
+/// Non-ONNX fallback for setup/check builds that cannot depend on the worker
+/// resolver. This preserves the documented priority before falling back to
+/// Python/system probes.
+fn discover_ort_path_fallback() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("ORT_DYLIB_PATH") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
+        }
+    }
+
+    if let Ok(config) = crate::cli::neural_config::LeIndexConfig::load() {
+        if let Some(path) = config.neural.ort_dylib_path {
+            let path = PathBuf::from(path);
+            if path.exists() {
+                return Some(path);
+            }
+        }
+    }
+
+    let leindex_home = std::env::var("LEINDEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|home| PathBuf::from(home).join(".leindex")))
+        .ok();
+    if let Some(home) = leindex_home {
+        let dir = home.join("lib");
+        for lib_name in ort_lib_names() {
+            let candidate = dir.join(lib_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+        if let Some(found) = scan_dir_for_ort_lib(&dir) {
+            return Some(found);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for lib_name in ort_lib_names() {
+                let candidate = dir.join(lib_name);
+                if candidate.exists() {
+                    return Some(candidate);
+                }
+            }
+            if let Some(found) = scan_dir_for_ort_lib(dir) {
+                return Some(found);
+            }
+        }
+    }
+
     // Try to find onnxruntime's capi directory via Python
     for py in &["python3", "python"] {
         let result = Command::new(py)
@@ -2117,6 +2184,9 @@ pub fn print_summary(result: &SetupResult) {
     // place along with ORT/model status.
     if let Some(ref smoke) = result.smoke_test {
         println!("Smoke test:   {}", smoke.status_line());
+        if let Some(ref provider) = smoke.configured_provider_label {
+            println!("Configured EP: {}", provider);
+        }
         if let Some(ref provider) = smoke.execution_provider {
             println!("Active EP:    {}", provider);
         }
@@ -2902,7 +2972,8 @@ mod tests {
         let result = SmokeTestResult {
             passed: true,
             dimension: Some(1024),
-            execution_provider: Some("cpu".to_string()),
+            execution_provider: None,
+            configured_provider_label: Some("cpu".to_string()),
             error: None,
         };
         let line = result.status_line();
@@ -2915,7 +2986,8 @@ mod tests {
         let result = SmokeTestResult {
             passed: false,
             dimension: None,
-            execution_provider: Some("cpu".to_string()),
+            execution_provider: None,
+            configured_provider_label: Some("cpu".to_string()),
             error: Some("worker failed to start".to_string()),
         };
         let line = result.status_line();
@@ -2930,11 +3002,17 @@ mod tests {
         let result = SmokeTestResult {
             passed: false,
             dimension: Some(768), // expected 1024
-            execution_provider: Some("migraphx".to_string()),
+            execution_provider: None,
+            configured_provider_label: Some("migraphx".to_string()),
             error: Some("expected 1024-dim vector, got 768-dim".to_string()),
         };
         assert!(!result.passed);
         assert_eq!(result.dimension, Some(768));
+        assert_eq!(
+            result.configured_provider_label.as_deref(),
+            Some("migraphx")
+        );
+        assert!(result.execution_provider.is_none());
     }
 
     // ── VAL-SETUP-031: Permission denied error ──

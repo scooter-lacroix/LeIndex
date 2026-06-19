@@ -2,6 +2,19 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [1.8.3] - 2026-06-19 - Distribution Remediation and Release Readiness
+
+### Fixed
+
+- **Runtime provider reporting**: Worker startup now reports the provider that actually initializes at runtime instead of echoing the configured preference, so setup and diagnostics no longer imply GPU acceleration when ORT falls back to CPU.
+- **Setup ORT discovery parity**: `leindex setup --check` now uses the same non-loading discovery path as runtime diagnostics before falling back through env, config, user-lib, sibling, pip, and system locations.
+- **Dynamic loader fallback**: The final `libonnxruntime` bare-name fallback no longer requires a filesystem path to exist before handing resolution to the platform loader.
+- **npm package validation**: Removed stale generated binary assumptions from the npm package test path so package checks validate the package-owned wrappers and install logic.
+
+### Changed
+
+- **Version parity**: `Cargo.toml`, `crates/leindex-embed/Cargo.toml`, `Cargo.lock`, `install.sh`, root and npm package metadata, PyPI metadata, and the PyPI runtime version constant are all kept in lockstep at `1.8.3`.
+
 ## [1.8.1] - 2026-06-19 — Distribution Pipeline Overhaul: load-dynamic ORT, Setup Wizard, Bundle lib/
 
 ### Added

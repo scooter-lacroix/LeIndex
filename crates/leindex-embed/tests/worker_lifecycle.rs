@@ -388,6 +388,47 @@ fn test_startup_report_marks_unavailable_provider() {
     );
 }
 
+#[test]
+fn test_startup_report_marks_actual_cpu_fallback() {
+    let mut reporter = StartupReporter::new();
+    reporter.set_execution_provider("cpu", false, Some("CUDA EP not available"));
+    reporter.set_model_name("qwen3-embed-0.6b");
+    reporter.set_quantization_mode("none");
+
+    let report = reporter.build();
+    let line = report.to_log_line();
+
+    assert_eq!(report.execution_provider, "cpu");
+    assert!(!report.provider_available);
+    assert!(line.contains("provider=cpu"));
+    assert!(line.contains("unavailable"));
+    assert!(line.contains("CUDA EP not available"));
+}
+
+#[test]
+fn test_runtime_startup_report_uses_session_provider_status() {
+    let runtime_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runtime.rs");
+    let runtime = std::fs::read_to_string(&runtime_path)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", runtime_path.display()));
+
+    assert!(
+        runtime.contains("provider_runtime_status"),
+        "WorkerRuntime must store provider status observed during session construction"
+    );
+    assert!(
+        runtime.contains("SessionBuildOutcome"),
+        "build_session must return provider status together with the session"
+    );
+    assert!(
+        runtime.contains("ProviderRuntimeStatus::fallback_to_cpu"),
+        "session construction must record CPU fallback as actual runtime status"
+    );
+    assert!(
+        runtime.contains("self.provider_runtime_status.execution_provider"),
+        "startup report must use runtime provider status, not selector heuristics"
+    );
+}
+
 // ── VAL-CPHASE-010: Model path resolution honors precedence ─────────────
 
 #[test]

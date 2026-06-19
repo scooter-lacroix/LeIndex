@@ -156,6 +156,43 @@ pub struct WorkerRuntime {
     /// Model load time for startup reporting.
     #[cfg(feature = "onnx")]
     model_load_time: Duration,
+
+    /// Actual provider status observed while building the ONNX session.
+    #[cfg(feature = "onnx")]
+    provider_runtime_status: ProviderRuntimeStatus,
+}
+
+#[cfg(feature = "onnx")]
+#[derive(Debug, Clone)]
+struct ProviderRuntimeStatus {
+    execution_provider: String,
+    provider_available: bool,
+    fallback_reason: Option<String>,
+}
+
+#[cfg(feature = "onnx")]
+impl ProviderRuntimeStatus {
+    fn available(name: impl Into<String>) -> Self {
+        Self {
+            execution_provider: name.into(),
+            provider_available: true,
+            fallback_reason: None,
+        }
+    }
+
+    fn fallback_to_cpu(reason: impl Into<String>) -> Self {
+        Self {
+            execution_provider: "cpu".to_string(),
+            provider_available: false,
+            fallback_reason: Some(reason.into()),
+        }
+    }
+}
+
+#[cfg(feature = "onnx")]
+struct SessionBuildOutcome {
+    session: Session,
+    provider_status: ProviderRuntimeStatus,
 }
 
 impl WorkerRuntime {
@@ -165,7 +202,8 @@ impl WorkerRuntime {
     /// for neural embedding inference.
     pub fn new(config: RuntimeConfig) -> Self {
         #[cfg(feature = "onnx")]
-        let (session, tokenizer, model_load_time) = Self::init_onnx(&config);
+        let (session, tokenizer, model_load_time, provider_runtime_status) =
+            Self::init_onnx(&config);
 
         Self {
             config,
@@ -177,6 +215,8 @@ impl WorkerRuntime {
             tokenizer,
             #[cfg(feature = "onnx")]
             model_load_time,
+            #[cfg(feature = "onnx")]
+            provider_runtime_status,
         }
     }
 
@@ -188,10 +228,14 @@ impl WorkerRuntime {
         Option<Arc<Mutex<Session>>>,
         Option<Arc<tokenizers::Tokenizer>>,
         Duration,
+        ProviderRuntimeStatus,
     ) {
         use std::time::Instant;
 
         let load_start = Instant::now();
+        let mut provider_runtime_status = ProviderRuntimeStatus::fallback_to_cpu(
+            "ONNX session was not initialized; neural embeddings disabled",
+        );
 
         // VAL-ORT-005..010, VAL-ORT-017: Discover and load ORT *before* any
         // Session::builder() call. With the `load-dynamic` feature, ORT is
@@ -217,7 +261,7 @@ impl WorkerRuntime {
                     "ONNX Runtime not found in any discovery source; \
                      set ORT_DYLIB_PATH or run `leindex setup`; neural embeddings disabled"
                 );
-                return (None, None, Duration::ZERO);
+                return (None, None, Duration::ZERO, provider_runtime_status);
             }
         }
 
@@ -226,7 +270,7 @@ impl WorkerRuntime {
             Ok(path) => path,
             Err(e) => {
                 tracing::warn!("failed to resolve ONNX model path: {}", e);
-                return (None, None, Duration::ZERO);
+                return (None, None, Duration::ZERO, provider_runtime_status);
             }
         };
 
@@ -235,7 +279,7 @@ impl WorkerRuntime {
             Ok(path) => path,
             Err(e) => {
                 tracing::warn!("failed to resolve tokenizer path: {}", e);
-                return (None, None, load_start.elapsed());
+                return (None, None, load_start.elapsed(), provider_runtime_status);
             }
         };
 
@@ -248,7 +292,7 @@ impl WorkerRuntime {
                     tokenizer_path.display(),
                     e
                 );
-                return (None, None, load_start.elapsed());
+                return (None, None, load_start.elapsed(), provider_runtime_status);
             }
         };
 
@@ -277,12 +321,21 @@ impl WorkerRuntime {
         }
 
         match session_result {
-            Ok(session) => (
-                Some(Arc::new(Mutex::new(session))),
+            Ok(outcome) => {
+                provider_runtime_status = outcome.provider_status;
+                (
+                    Some(Arc::new(Mutex::new(outcome.session))),
+                    Some(Arc::new(tokenizer)),
+                    model_load_time,
+                    provider_runtime_status,
+                )
+            }
+            Err(_) => (
+                None,
                 Some(Arc::new(tokenizer)),
                 model_load_time,
+                provider_runtime_status,
             ),
-            Err(_) => (None, Some(Arc::new(tokenizer)), model_load_time),
         }
     }
 
@@ -290,19 +343,24 @@ impl WorkerRuntime {
     fn build_session(
         model_path: &std::path::Path,
         provider_name: &str,
-    ) -> Result<Session, ort::Error> {
+    ) -> Result<SessionBuildOutcome, ort::Error> {
         /// Try to attach the given execution provider; on failure, create a fresh
         /// session builder and fall back to CPU.
         macro_rules! try_provider_or_cpu {
             ($builder:expr, $provider:expr, $name:literal) => {
                 match $builder.with_execution_providers([$provider]) {
-                    Ok(sb) => sb,
+                    Ok(sb) => (sb, ProviderRuntimeStatus::available(provider_name)),
                     Err(e) => {
-                        tracing::warn!("{} EP not available: {}, falling back to CPU", $name, e);
-                        Session::builder()?
-                            .with_memory_pattern(false)?
-                            .with_optimization_level(GraphOptimizationLevel::Level1)?
-                            .with_execution_providers([ort::ep::CPU::default().build()])?
+                        let reason =
+                            format!("{} EP not available: {}; falling back to CPU", $name, e);
+                        tracing::warn!("{}", reason);
+                        (
+                            Session::builder()?
+                                .with_memory_pattern(false)?
+                                .with_optimization_level(GraphOptimizationLevel::Level1)?
+                                .with_execution_providers([ort::ep::CPU::default().build()])?,
+                            ProviderRuntimeStatus::fallback_to_cpu(reason),
+                        )
                     }
                 }
             };
@@ -349,15 +407,21 @@ impl WorkerRuntime {
                      ORT_DYLIB_PATH at a migraphx-enabled libonnxruntime.",
                     provider_name
                 );
-                return session_builder
+                let session = session_builder
                     .with_execution_providers([ort::ep::CPU::default().build()])?
-                    .commit_from_file(model_path);
+                    .commit_from_file(model_path)?;
+                return Ok(SessionBuildOutcome {
+                    session,
+                    provider_status: ProviderRuntimeStatus::fallback_to_cpu(
+                        "MIGraphX EP not available in the dynamically loaded ONNX Runtime binary",
+                    ),
+                });
             }
             _ => {}
         }
 
         // Configure execution providers based on selection
-        let mut session_builder = match provider_name {
+        let (mut session_builder, provider_status) = match provider_name {
             "cuda" => {
                 try_provider_or_cpu!(session_builder, ort::ep::CUDA::default().build(), "CUDA")
             }
@@ -394,10 +458,17 @@ impl WorkerRuntime {
                     "CoreML"
                 )
             }
-            _ => session_builder.with_execution_providers([ort::ep::CPU::default().build()])?,
+            _ => (
+                session_builder.with_execution_providers([ort::ep::CPU::default().build()])?,
+                ProviderRuntimeStatus::available("cpu"),
+            ),
         };
 
-        session_builder.commit_from_file(model_path)
+        let session = session_builder.commit_from_file(model_path)?;
+        Ok(SessionBuildOutcome {
+            session,
+            provider_status,
+        })
     }
 
     /// Get a handle to the shutdown flag for external signaling.
@@ -455,17 +526,29 @@ impl WorkerRuntime {
         };
 
         // Determine execution provider
-        let provider_result = ExecutionProviderSelector::select(&self.config.execution_provider);
-        match provider_result {
-            Ok(provider) => {
-                reporter.set_execution_provider(&provider.name(), true, None);
-            }
-            Err(fallback) => {
-                reporter.set_execution_provider(
-                    &fallback.fallback_name(),
-                    false,
-                    Some(&fallback.reason()),
-                );
+        #[cfg(feature = "onnx")]
+        {
+            reporter.set_execution_provider(
+                &self.provider_runtime_status.execution_provider,
+                self.provider_runtime_status.provider_available,
+                self.provider_runtime_status.fallback_reason.as_deref(),
+            );
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            let provider_result =
+                ExecutionProviderSelector::select(&self.config.execution_provider);
+            match provider_result {
+                Ok(provider) => {
+                    reporter.set_execution_provider(&provider.name(), true, None);
+                }
+                Err(fallback) => {
+                    reporter.set_execution_provider(
+                        &fallback.fallback_name(),
+                        false,
+                        Some(&fallback.reason()),
+                    );
+                }
             }
         }
 

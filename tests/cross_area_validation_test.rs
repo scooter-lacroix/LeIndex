@@ -591,6 +591,42 @@ mod diagnostics_ort_info {
             );
         }
     }
+
+    #[test]
+    fn setup_ort_path_uses_worker_discovery_chain() {
+        let setup = read_file("src/cli/leindex/setup.rs");
+        let helper = setup
+            .split("pub(crate) fn discover_ort_path()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n\n").next())
+            .expect("setup discover_ort_path helper must exist");
+
+        assert!(
+            helper.contains("leindex_embed::ort_discovery::discover_path_only"),
+            "setup --check must use worker discover_path_only so ORT priority remains env/config/user_lib/sibling/pip/system"
+        );
+        assert!(
+            !helper.contains("for py in"),
+            "setup --check must not maintain a pip-first discovery chain"
+        );
+    }
+
+    #[test]
+    fn smoke_summary_distinguishes_active_from_configured_provider() {
+        let setup = read_file("src/cli/leindex/setup.rs");
+        assert!(
+            setup.contains("configured_provider_label"),
+            "SmokeTestResult must store configured provider separately from active provider"
+        );
+        assert!(
+            setup.contains("Configured EP:"),
+            "summary should label configured provider as configured, not active"
+        );
+        assert!(
+            setup.contains("Active EP:"),
+            "summary may still print Active EP when the worker actually reports it"
+        );
+    }
 }
 
 // ============================================================================

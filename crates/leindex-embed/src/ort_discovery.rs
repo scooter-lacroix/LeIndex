@@ -384,8 +384,11 @@ pub fn discover_and_init() -> InitResult {
     let mut searched: Vec<(DiscoverySource, String)> = Vec::new();
     let mut last_error: Option<String> = None;
 
-    let mut try_path = |source: DiscoverySource, path: PathBuf| -> Option<DiscoveryOutcome> {
-        if !path.exists() {
+    let mut try_path = |source: DiscoverySource,
+                        path: PathBuf,
+                        require_exists: bool|
+     -> Option<DiscoveryOutcome> {
+        if require_exists && !path.exists() {
             searched.push((source, path.display().to_string()));
             return None;
         }
@@ -417,7 +420,7 @@ pub fn discover_and_init() -> InitResult {
 
     // 1-4: high-priority static candidates (env / config / user_lib / sibling).
     for (source, path) in discover_candidates() {
-        if let Some(outcome) = try_path(source, path) {
+        if let Some(outcome) = try_path(source, path, true) {
             return InitResult::Initialized(outcome);
         }
     }
@@ -426,21 +429,25 @@ pub fn discover_and_init() -> InitResult {
     //    Tried BEFORE system paths so a setup-installed pip runtime wins over a
     //    stale system library.
     if let Some(path) = discover_pip_lib() {
-        if let Some(outcome) = try_path(DiscoverySource::Pip, path) {
+        if let Some(outcome) = try_path(DiscoverySource::Pip, path, true) {
             return InitResult::Initialized(outcome);
         }
     }
 
     // 6. system paths (final ordered fallback, after pip).
     for (source, path) in system_candidates() {
-        if let Some(outcome) = try_path(source, path) {
+        if let Some(outcome) = try_path(source, path, true) {
             return InitResult::Initialized(outcome);
         }
     }
 
     // Final fallback: try the bare library name. ort's setup_api() probes the
     // default loader path (`ld.so.conf`, `DYLD_LIBRARY_PATH`, `%PATH%`).
-    if let Some(outcome) = try_path(DiscoverySource::System, PathBuf::from(ort_lib_names()[0])) {
+    if let Some(outcome) = try_path(
+        DiscoverySource::System,
+        PathBuf::from(ort_lib_names()[0]),
+        false,
+    ) {
         return InitResult::Initialized(outcome);
     }
 
@@ -704,6 +711,27 @@ mod tests {
         assert!(
             pip < system,
             "path-only discovery must prefer pip over system"
+        );
+    }
+
+    #[test]
+    fn test_bare_loader_fallback_does_not_require_path_exists() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ort_discovery.rs");
+        let src = std::fs::read_to_string(path).unwrap();
+        let helper = src
+            .split("pub fn discover_and_init()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n\n#[cfg(not(feature = \"onnx\"))]").next())
+            .expect("discover_and_init must exist");
+
+        let bare_probe = "PathBuf::from(ort_lib_names()[0])";
+        let bare_probe_pos = helper
+            .find(bare_probe)
+            .expect("discover_and_init must try the bare ORT library name");
+        let after_bare_probe = &helper[bare_probe_pos..];
+        assert!(
+            after_bare_probe.contains("false"),
+            "bare dynamic-loader fallback must call try_path with require_exists=false"
         );
     }
 

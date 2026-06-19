@@ -142,14 +142,17 @@ if (fs.existsSync(binaryPath)) {
       const expectedVersion = pkg.version;
       const match = version.match(/leindex\s+([0-9]+\.[0-9]+\.[0-9]+)/);
       if (!match) {
-        throw new Error(`Binary version output is not parseable: ${version}`);
+        console.error(`  ❌ Binary version output is not parseable: ${version}`);
+        process.exit(1);
       }
       if (match[1] !== expectedVersion) {
-        throw new Error(`Binary version ${match[1]} does not match package version ${expectedVersion}`);
+        console.error(`  ❌ Binary version ${match[1]} does not match package version ${expectedVersion}`);
+        process.exit(1);
       }
       console.log(`  ✓ Binary version matches package: ${version}`);
     } catch (e) {
-      console.log(`  ⚠ Binary exists but version check failed: ${e.message}`);
+      console.error(`  ❌ Binary exists but version check failed: ${e.message}`);
+      process.exit(1);
     }
   }
 } else {
