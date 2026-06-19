@@ -191,6 +191,32 @@ mod ort_discovery_priority {
         );
     }
 
+    /// Runtime discovery must try the pip-installed ORT before system ORT so a
+    /// `leindex setup`-installed runtime wins over a stale `/usr/lib` library.
+    #[test]
+    fn pip_discovery_precedes_system_discovery() {
+        let src = read_file("crates/leindex-embed/src/ort_discovery.rs");
+
+        let discover_fn = src
+            .split("pub fn discover_and_init()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n\n///").next())
+            .expect("discover_and_init() must exist");
+
+        let pip_pos = discover_fn
+            .find("discover_pip_lib")
+            .expect("discover_and_init must consult pip ORT");
+        let system_pos = discover_fn
+            .find("system_candidates")
+            .or_else(|| discover_fn.find("DiscoverySource::System"))
+            .expect("discover_and_init must consult system ORT");
+
+        assert!(
+            pip_pos < system_pos,
+            "pip ORT must be tried before system ORT so setup-installed ORT wins over stale system libraries"
+        );
+    }
+
     /// VAL-CROSS-009: the npm wrapper's bundled-lib ORT_DYLIB_PATH override
     /// is applied only when the user has NOT already set ORT_DYLIB_PATH. This
     /// keeps the manual override universally available on the npm surface too.

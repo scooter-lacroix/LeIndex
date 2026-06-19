@@ -343,13 +343,24 @@ pub fn discover_candidates() -> Vec<(DiscoverySource, PathBuf)> {
     //    tests that just want to inspect the chain aren't penalised).
     // The actual pip candidate is appended by `discover_and_init()` below.
 
-    // 6. system paths
+    // 6. system paths are NOT included here. They are the final fallback and
+    //    are tried AFTER pip ORT (see `system_candidates()` /
+    //    `discover_and_init()`) so a `leindex setup`-installed pip runtime
+    //    wins over a stale system library.
+
+    out
+}
+
+/// Build the system-path candidate list. These are the lowest-priority ORT
+/// sources and are always tried AFTER the high-priority chain and the pip
+/// runtime, so a setup-installed pip ORT wins over a stale system library.
+fn system_candidates() -> Vec<(DiscoverySource, PathBuf)> {
+    let mut out: Vec<(DiscoverySource, PathBuf)> = Vec::new();
     for dir in system_lib_dirs() {
         for name in ort_lib_names() {
             out.push((DiscoverySource::System, dir.join(name)));
         }
     }
-
     out
 }
 
@@ -404,7 +415,7 @@ pub fn discover_and_init() -> InitResult {
         }
     };
 
-    // 1-4, 6: static candidates (env / config / user_lib / sibling / system).
+    // 1-4: high-priority static candidates (env / config / user_lib / sibling).
     for (source, path) in discover_candidates() {
         if let Some(outcome) = try_path(source, path) {
             return InitResult::Initialized(outcome);
@@ -412,8 +423,17 @@ pub fn discover_and_init() -> InitResult {
     }
 
     // 5. pip site-packages (lazy Python lookup so unit tests can skip it).
+    //    Tried BEFORE system paths so a setup-installed pip runtime wins over a
+    //    stale system library.
     if let Some(path) = discover_pip_lib() {
         if let Some(outcome) = try_path(DiscoverySource::Pip, path) {
+            return InitResult::Initialized(outcome);
+        }
+    }
+
+    // 6. system paths (final ordered fallback, after pip).
+    for (source, path) in system_candidates() {
+        if let Some(outcome) = try_path(source, path) {
             return InitResult::Initialized(outcome);
         }
     }
@@ -456,7 +476,7 @@ pub fn discover_and_init() -> InitResult {
 /// Returns the first existing candidate path using the documented discovery
 /// chain: env -> config -> `~/.leindex/lib/` -> sibling -> pip -> system.
 pub fn discover_path_only() -> Option<DiscoveryOutcome> {
-    // 1-3, 4, 6: static candidates.
+    // 1-4: high-priority static candidates (env / config / user_lib / sibling).
     for (source, path) in discover_candidates() {
         if path.exists() {
             return Some(DiscoveryOutcome { source, path });
@@ -465,6 +485,7 @@ pub fn discover_path_only() -> Option<DiscoveryOutcome> {
 
     // 5. pip site-packages (lazy Python lookup so the diagnostic command only
     //    shells out to Python when no higher-priority source is available).
+    //    Checked BEFORE system paths to mirror `discover_and_init()`.
     #[cfg(feature = "onnx")]
     if let Some(path) = discover_pip_lib() {
         if path.exists() {
@@ -472,6 +493,13 @@ pub fn discover_path_only() -> Option<DiscoveryOutcome> {
                 source: DiscoverySource::Pip,
                 path,
             });
+        }
+    }
+
+    // 6. system paths (final ordered fallback, after pip).
+    for (source, path) in system_candidates() {
+        if path.exists() {
+            return Some(DiscoveryOutcome { source, path });
         }
     }
 
@@ -539,7 +567,9 @@ mod tests {
         std::env::remove_var(ORT_DYLIB_ENV);
         std::env::remove_var(LEINDEX_HOME_ENV);
 
-        let candidates = discover_candidates();
+        // System paths now live in `system_candidates()` (final fallback,
+        // tried after pip), not in `discover_candidates()`.
+        let candidates = system_candidates();
         // System paths should be present at minimum on Unix.
         #[cfg(unix)]
         {
@@ -652,6 +682,29 @@ mod tests {
         let found = find_lib_in_dir(temp.path()).expect("ORT library should be found");
 
         assert_eq!(found, unversioned);
+    }
+
+    #[test]
+    fn test_discover_path_only_checks_pip_before_system() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/ort_discovery.rs");
+        let src = std::fs::read_to_string(path).unwrap();
+        let helper = src
+            .split("pub fn discover_path_only()")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n\n").next())
+            .expect("discover_path_only must exist");
+
+        let pip = helper
+            .find("discover_pip_lib")
+            .expect("path-only discovery must check pip");
+        let system = helper
+            .find("system_candidates")
+            .expect("path-only discovery must check system");
+
+        assert!(
+            pip < system,
+            "path-only discovery must prefer pip over system"
+        );
     }
 
     #[test]
