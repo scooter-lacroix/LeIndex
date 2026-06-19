@@ -32,6 +32,7 @@ pub mod protocol;
 pub mod provider;
 pub mod runtime;
 pub mod startup;
+pub mod worker_main;
 
 pub use protocol::{
     BatchId, EmbedRequest, EmbedResponse, ErrorKind, Frame, FrameHeader, Request, RerankRequest,

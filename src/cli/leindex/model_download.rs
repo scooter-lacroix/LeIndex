@@ -870,8 +870,12 @@ mod tests {
 
     #[test]
     fn test_default_retries_constant_is_at_least_one() {
-        assert!(DEFAULT_DOWNLOAD_RETRIES >= 1);
-        // RETRY_DELAY must be nonzero so backoff actually waits.
-        assert!(RETRY_DELAY > Duration::from_secs(0));
+        // Use a ref bind so the check is seen as a runtime value by clippy
+        // (avoids `assertions_on_constants` false positive for these
+        // documented invariants).
+        let retries = DEFAULT_DOWNLOAD_RETRIES;
+        let delay = RETRY_DELAY;
+        assert!(retries >= 1);
+        assert!(delay > Duration::from_secs(0));
     }
 }

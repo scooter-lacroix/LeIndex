@@ -210,7 +210,12 @@ turso = ["dep:libsql", "dep:rusqlite_migration"]
 #
 # VAL-CPHASE-002: The main crate no longer owns ONNX runtime deps directly.
 # ONNX inference is delegated to the leindex-embed worker process.
-onnx = ["search", "dep:leindex-embed", "dep:which"]
+#
+# VAL-CARGO-002/005: `cargo install leindex --features onnx` must install a
+# working worker binary alongside the main binary. We propagate the `onnx`
+# feature to the leindex-embed subcrate so the installed worker binary
+# contains real ONNX inference support (not a dummy-embedding fallback).
+onnx = ["search", "dep:leindex-embed", "leindex-embed/onnx", "dep:which"]
 
 # AMD GPU acceleration via MIGraphX (requires ROCm installed).
 # MIGraphX is the modern replacement for the deprecated ROCmExecutionProvider.
@@ -353,6 +358,19 @@ rand = "0.8"
 name = "leindex"
 path = "src/bin/leindex.rs"
 required-features = ["cli"]
+doc = false
+
+# VAL-CARGO-005: Worker binary co-installed via `cargo install leindex --features onnx`.
+# `cargo install <pkg>` only installs `[[bin]]` targets from `<pkg>`'s own
+# Cargo.toml, so the root crate mirrors the leindex-embed worker binary as a
+# thin wrapper (`src/bin/leindex-embed.rs`) around `leindex_embed::worker_main::run()`.
+# Gated by `required-features = ["onnx"]` so default installs without neural
+# support are unaffected. The subcrate at `crates/leindex-embed` retains its
+# own `[[bin]]` target for standalone workspace builds and tests.
+[[bin]]
+name = "leindex-embed"
+path = "src/bin/leindex-embed.rs"
+required-features = ["onnx"]
 doc = false
 
 [[bench]]
