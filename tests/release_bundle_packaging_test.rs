@@ -401,7 +401,12 @@ mod distribution_coverage {
     #[test]
     fn release_workflow_triggers_on_distribution_files() {
         let workflow = release_yml();
-        for path in ["crates/**", "install.sh", ".github/workflows/release.yml", "docs/**"] {
+        for path in [
+            "crates/**",
+            "install.sh",
+            ".github/workflows/release.yml",
+            "docs/**",
+        ] {
             assert!(
                 workflow.contains(path),
                 "release workflow paths must include `{}`",
