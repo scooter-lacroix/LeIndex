@@ -585,7 +585,10 @@ fn read_proc_ppid(pid: u32) -> u32 {
     let mut fields = rest.split_whitespace();
 
     fields.next(); // state
-    fields.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0)
+    fields
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 /// Sample a PID for a fixed duration, collecting full memory samples.

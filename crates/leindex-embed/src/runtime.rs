@@ -1314,7 +1314,10 @@ mod tests {
     #[test]
     fn test_runtime_config_default() {
         let config = RuntimeConfig::default();
-        assert_eq!(config.idle_timeout, Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS));
+        assert_eq!(
+            config.idle_timeout,
+            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
+        );
         assert_eq!(config.max_frame_size, 16 * 1024 * 1024);
         assert_eq!(config.max_text_size, 1024 * 1024);
         assert_eq!(config.embedding_dim, 1024);
