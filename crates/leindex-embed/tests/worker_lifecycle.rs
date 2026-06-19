@@ -367,6 +367,27 @@ fn test_startup_reporter_builds_complete_report() {
     assert_eq!(report.model_path_source, Some("bundled".to_string()));
 }
 
+#[test]
+fn test_startup_report_marks_unavailable_provider() {
+    let mut reporter = StartupReporter::new();
+    reporter.set_execution_provider("migraphx", false, Some("MIGraphX unavailable"));
+    reporter.set_model_name("qwen3-embed-0.6b");
+    reporter.set_quantization_mode("none");
+    reporter.set_warm_load_latency(Duration::from_millis(100));
+
+    let report = reporter.build();
+    assert_eq!(report.execution_provider, "migraphx");
+    assert!(!report.provider_available);
+    assert!(
+        report
+            .fallback_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("MIGraphX unavailable"),
+        "fallback_reason should contain the error message"
+    );
+}
+
 // ── VAL-CPHASE-010: Model path resolution honors precedence ─────────────
 
 #[test]

@@ -572,7 +572,7 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
                 ..
             } => {
                 println!("  -> {}.", result.status_line());
-                println!("  -> Execution provider registered: {}.", provider);
+                println!("  -> Execution provider: {} (configured; actual worker provider not captured).", provider);
                 let _ = dim; // already in status_line
             }
             SmokeTestResult { passed: true, .. } => {
@@ -2408,6 +2408,19 @@ mod tests {
         assert!(!is_ort_runtime_lib_name_for_setup(
             "libonnxruntime_providers_shared.so"
         ));
+    }
+
+    #[test]
+    fn test_setup_smoke_provider_label_is_configured_not_claimed_registered() {
+        let src = std::fs::read_to_string(file!()).expect("setup.rs should be readable");
+        // The smoke test result output must NOT claim the provider is
+        // "registered" when we only know the configured provider, not
+        // what the worker actually loaded.
+        let needle = format!("{} {}", "Execution provider", "registered");
+        assert!(
+            !src.contains(&needle),
+            "setup must not claim the provider is 'registered'; it only knows the configured EP"
+        );
     }
 
     #[test]
