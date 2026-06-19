@@ -18,7 +18,7 @@
 // VAL-SETUP-024: Idempotent re-runs
 // VAL-SETUP-034: Surfaces full configuration status
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Execution provider selected during setup.
@@ -1358,12 +1358,17 @@ pub(crate) fn discover_ort_path() -> Option<PathBuf> {
                 let capi_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 let dir = PathBuf::from(&capi_dir);
                 if dir.is_dir() {
-                    // Look for the ORT shared library
+                    // Prefer exact unversioned names (bundle/system symlinks).
                     for lib_name in ort_lib_names() {
                         let candidate = dir.join(lib_name);
                         if candidate.exists() {
                             return Some(candidate);
                         }
+                    }
+                    // Fall back to versioned pip-wheel runtime libraries
+                    // (e.g. `libonnxruntime.so.1.25.0`) without symlinks.
+                    if let Some(path) = scan_dir_for_ort_lib(&dir) {
+                        return Some(path);
                     }
                 }
             }
@@ -1372,15 +1377,39 @@ pub(crate) fn discover_ort_path() -> Option<PathBuf> {
 
     // Also check system path
     for path in &["/usr/local/lib", "/usr/lib"] {
+        let dir = PathBuf::from(path);
         for lib_name in ort_lib_names() {
-            let candidate = PathBuf::from(path).join(lib_name);
+            let candidate = dir.join(lib_name);
             if candidate.exists() {
                 return Some(candidate);
             }
         }
+        if let Some(found) = scan_dir_for_ort_lib(&dir) {
+            return Some(found);
+        }
     }
 
     None
+}
+
+/// Scan a directory for any loadable ORT runtime library, including versioned
+/// pip-wheel sonames. Returns the highest-sorted match (newest version) so
+/// setup records the same library the worker would load.
+fn scan_dir_for_ort_lib(dir: &Path) -> Option<PathBuf> {
+    let mut matches = std::fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(is_ort_runtime_lib_name_for_setup)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.pop()
 }
 
 /// Platform-specific ORT library file names.
@@ -1401,6 +1430,33 @@ fn ort_lib_names() -> &'static [&'static str] {
     {
         &["libonnxruntime.so"]
     }
+}
+
+/// Returns true when `name` is a loadable ORT runtime library filename on the
+/// current platform, including versioned pip-wheel sonames such as
+/// `libonnxruntime.so.1.25.0`. Provider helper libraries
+/// (`libonnxruntime_providers_*`) are intentionally excluded. Mirrors the
+/// worker-side matcher in `leindex-embed::ort_discovery` so setup writes an
+/// `ort_dylib_path` that the worker can actually load.
+#[cfg(target_os = "linux")]
+fn is_ort_runtime_lib_name_for_setup(name: &str) -> bool {
+    name == "libonnxruntime.so" || name.starts_with("libonnxruntime.so.")
+}
+
+#[cfg(target_os = "macos")]
+fn is_ort_runtime_lib_name_for_setup(name: &str) -> bool {
+    name == "libonnxruntime.dylib"
+        || (name.starts_with("libonnxruntime.") && name.ends_with(".dylib"))
+}
+
+#[cfg(target_os = "windows")]
+fn is_ort_runtime_lib_name_for_setup(name: &str) -> bool {
+    name.eq_ignore_ascii_case("onnxruntime.dll")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn is_ort_runtime_lib_name_for_setup(name: &str) -> bool {
+    ort_lib_names().iter().any(|candidate| candidate == &name)
 }
 
 /// Ensure model files are present, downloading from HuggingFace if needed.
@@ -1720,6 +1776,27 @@ fn copy_bundled_models(bundled_dir: &std::path::Path, dest_dir: &std::path::Path
     }
 }
 
+/// Create a symlink at `dst` pointing to `src`, using the platform-appropriate
+/// API. Cfg-gated so the function (and `try_link_model_file`) compiles on
+/// Windows, where `std::os::unix` does not exist.
+#[cfg(unix)]
+fn try_symlink_model_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+#[cfg(windows)]
+fn try_symlink_model_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(src, dst)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn try_symlink_model_file(_src: &Path, _dst: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlinks are not supported on this platform",
+    ))
+}
+
 /// Try to link a model file using symlink > hardlink > copy strategy.
 ///
 /// Returns `Ok(())` on success, or an `Err` describing why all strategies
@@ -1737,22 +1814,10 @@ fn try_link_model_file(
     // Strategy 1: Symlink (preferred, zero overhead, works cross-filesystem on Linux).
     // Symlinks are the best option because they reference the source file by path
     // without duplicating any data. They work even across filesystem boundaries.
-    match std::os::unix::fs::symlink(src, dst) {
-        Ok(()) => return Ok(()),
-        Err(e) => {
-            // Fall through to hardlink attempt.
-            let _ = e; // logged by caller if all strategies fail
-        }
-    }
-
-    // On non-Unix platforms, symlink may not be available or may require
-    // special privileges. Try the std::os::windows variant too.
-    #[cfg(windows)]
-    {
-        match std::os::windows::fs::symlink_file(src, dst) {
-            Ok(()) => return Ok(()),
-            Err(_) => {}
-        }
+    // The platform-appropriate API is selected by `try_symlink_model_file` so
+    // this compiles on Windows (no `std::os::unix`).
+    if try_symlink_model_file(src, dst).is_ok() {
+        return Ok(());
     }
 
     // Strategy 2: Hardlink (zero memory overhead, shares inodes).
@@ -2332,6 +2397,18 @@ impl std::error::Error for SetupError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_setup_ort_lib_name_accepts_versioned_linux_pip_soname() {
+        assert!(is_ort_runtime_lib_name_for_setup(
+            "libonnxruntime.so.1.25.0"
+        ));
+        assert!(is_ort_runtime_lib_name_for_setup("libonnxruntime.so"));
+        assert!(!is_ort_runtime_lib_name_for_setup(
+            "libonnxruntime_providers_shared.so"
+        ));
+    }
 
     #[test]
     fn test_resolve_neural_cpu() {
