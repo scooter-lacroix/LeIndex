@@ -65,6 +65,31 @@ fn ort_lib_names() -> &'static [&'static str] {
     }
 }
 
+/// Returns true when `name` is a loadable ORT runtime library filename on the
+/// current platform, including versioned pip-wheel sonames such as
+/// `libonnxruntime.so.1.25.0`. Provider helper libraries
+/// (`libonnxruntime_providers_*`) are intentionally excluded.
+#[cfg(any(feature = "onnx", test))]
+fn is_ort_runtime_lib_name(name: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        name == "libonnxruntime.so" || name.starts_with("libonnxruntime.so.")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        name == "libonnxruntime.dylib"
+            || (name.starts_with("libonnxruntime.") && name.ends_with(".dylib"))
+    }
+    #[cfg(target_os = "windows")]
+    {
+        name.eq_ignore_ascii_case("onnxruntime.dll")
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        ort_lib_names().iter().any(|candidate| candidate == &name)
+    }
+}
+
 /// Where a discovered ORT library came from. Used in diagnostics (VAL-ORT-022).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoverySource {
@@ -186,13 +211,30 @@ fn read_config_ort_path() -> Option<PathBuf> {
 /// Look for the first matching ORT library file in `dir`.
 #[cfg(any(feature = "onnx", test))]
 fn find_lib_in_dir(dir: &Path) -> Option<PathBuf> {
+    // Prefer exact unversioned names (provided by bundle/system symlinks).
     for name in ort_lib_names() {
         let candidate = dir.join(name);
         if candidate.is_file() {
             return Some(candidate);
         }
     }
-    None
+
+    // Fall back to versioned pip-wheel runtime libraries (e.g.
+    // `libonnxruntime.so.1.25.0`) which have no unversioned symlink.
+    let mut matches = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(is_ort_runtime_lib_name)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+
+    matches.sort();
+    matches.pop()
 }
 
 /// Discover the running worker binary's directory (siblings of `current_exe`).
@@ -583,6 +625,33 @@ mod tests {
     fn test_find_lib_in_dir_returns_none_when_empty() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(find_lib_in_dir(tmp.path()), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_find_lib_in_dir_accepts_linux_versioned_pip_soname() {
+        let temp = tempfile::tempdir().unwrap();
+        let versioned = temp.path().join("libonnxruntime.so.1.25.0");
+        std::fs::write(&versioned, b"fake").unwrap();
+
+        let found =
+            find_lib_in_dir(temp.path()).expect("versioned pip ORT library should be found");
+
+        assert_eq!(found, versioned);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_find_lib_in_dir_prefers_unversioned_link_when_present() {
+        let temp = tempfile::tempdir().unwrap();
+        let unversioned = temp.path().join("libonnxruntime.so");
+        let versioned = temp.path().join("libonnxruntime.so.1.25.0");
+        std::fs::write(&versioned, b"fake-versioned").unwrap();
+        std::fs::write(&unversioned, b"fake-unversioned").unwrap();
+
+        let found = find_lib_in_dir(temp.path()).expect("ORT library should be found");
+
+        assert_eq!(found, unversioned);
     }
 
     #[test]
