@@ -46,6 +46,7 @@ include = [
     "/leindex.jpeg",
     "/docs/MCP.md",
     "/docs/TOOL_SUPREMACY_BENCHMARKS.md",
+    "/docs/NEURAL_SETUP.md",
 ]
 
 # Note: ONNX models (models/*.onnx) are bundled in GitHub Release archives

@@ -390,3 +390,36 @@ mod ci_gates {
         );
     }
 }
+
+// ============================================================================
+// Distribution file coverage
+// ============================================================================
+
+mod distribution_coverage {
+    use super::*;
+
+    #[test]
+    fn release_workflow_triggers_on_distribution_files() {
+        let workflow = release_yml();
+        for path in ["crates/**", "install.sh", ".github/workflows/release.yml", "docs/**"] {
+            assert!(
+                workflow.contains(path),
+                "release workflow paths must include `{}`",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn release_workflow_builds_macos_x86_64_bundle() {
+        let workflow = release_yml();
+        assert!(
+            workflow.contains("x86_64-apple-darwin"),
+            "release matrix must include macOS x86_64"
+        );
+        assert!(
+            workflow.contains("macos-x86_64"),
+            "release matrix must name the macOS x86_64 asset"
+        );
+    }
+}

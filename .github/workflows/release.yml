@@ -5,11 +5,15 @@ on:
   push:
     branches: [master]
     paths:
-      # Only trigger when version-carrying or publishable files change
+      # Trigger when version-carrying, publishable, distribution, or release files change.
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'src/**'
+      - 'crates/**'
       - 'packages/**'
+      - 'install.sh'
+      - 'docs/**'
+      - '.github/workflows/release.yml'
 
 permissions:
   contents: write
@@ -187,6 +191,12 @@ jobs:
             ort_platform: manylinux_2_28_aarch64
             include_migraphx: 'false'
 
+          - target: x86_64-apple-darwin
+            os: macos-13
+            asset_name: macos-x86_64
+            ort_package: onnxruntime
+            ort_platform: macosx_13_0_x86_64
+            include_migraphx: 'false'
 
           - target: aarch64-apple-darwin
             os: macos-latest

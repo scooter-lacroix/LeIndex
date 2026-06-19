@@ -436,3 +436,20 @@ mod version_parity {
         );
     }
 }
+
+// ============================================================================
+// Neural setup docs packaging
+// ============================================================================
+
+mod docs_packaging {
+    use super::*;
+
+    #[test]
+    fn crate_package_includes_neural_setup_doc() {
+        let cargo = root_cargo_toml();
+        assert!(
+            cargo.contains("/docs/NEURAL_SETUP.md"),
+            "crate package include list must contain docs/NEURAL_SETUP.md because README points to it"
+        );
+    }
+}
