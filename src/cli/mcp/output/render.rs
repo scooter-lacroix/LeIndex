@@ -547,6 +547,17 @@ fn render_diagnostics(data: &Value, color: bool) -> String {
     if let Some(v) = data.get("embedding_model").and_then(|v| v.as_str()) {
         out.push_str(&field("Embedding model", v, color));
     }
+    // VAL-CROSS-015 / VAL-ORT-022: surface resolved ORT library info so support
+    // engineers can debug any install surface identically via `leindex diagnostics`.
+    if let Some(v) = data.get("ort_version").and_then(|v| v.as_str()) {
+        out.push_str(&field("ORT version", v, color));
+    }
+    if let Some(v) = data.get("ort_path").and_then(|v| v.as_str()) {
+        out.push_str(&field("ORT dylib path", v, color));
+    }
+    if let Some(v) = data.get("execution_provider").and_then(|v| v.as_str()) {
+        out.push_str(&field("Execution provider", v, color));
+    }
     // System health section
     if let Some(sh) = data.get("system_health") {
         out.push('\n');

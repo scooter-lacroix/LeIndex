@@ -199,6 +199,14 @@ fn trim_diagnostics(data: &Value) -> Value {
         "db_size_bytes": data.get("db_size_bytes"),
         "stale": data.get("stale"),
         "last_indexed_secs_ago": data.get("last_indexed_secs_ago"),
+        "embedding_model": data.get("embedding_model"),
+        // VAL-CROSS-015 / VAL-ORT-022: ORT info is part of the diagnostics
+        // contract surfaced by the diagnostics command. Keep these fields in
+        // the LLM-facing payload so MCP tools/call sees the same shape as
+        // `leindex diagnostics`.
+        "ort_version": data.get("ort_version"),
+        "ort_path": data.get("ort_path"),
+        "execution_provider": data.get("execution_provider"),
         "freshness": data.get("freshness"),
         "system_health": data.get("system_health"),
         "issues": data.get("issues"),

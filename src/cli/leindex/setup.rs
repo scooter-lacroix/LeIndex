@@ -1336,7 +1336,13 @@ fn find_pip() -> Option<(String, Vec<String>)> {
 }
 
 /// Discover the ORT dylib path from pip installation.
-fn discover_ort_path() -> Option<PathBuf> {
+///
+/// VAL-CROSS-015: this is exposed `pub(crate)` so the `diagnostics` command
+/// can surface the same ORT path that `setup --check` reports, keeping the
+/// two surfaces consistent. The chain mirrors
+/// `leindex_embed::ort_discovery::discover_path_only()` but uses the main
+/// binary's process context (its own current_exe sibling, its own pip).
+pub(crate) fn discover_ort_path() -> Option<PathBuf> {
     // Try to find onnxruntime's capi directory via Python
     for py in &["python3", "python"] {
         let result = Command::new(py)

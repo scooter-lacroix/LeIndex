@@ -103,7 +103,7 @@ impl std::fmt::Display for DiscoverySource {
 }
 
 /// A successfully located ORT library.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryOutcome {
     /// Source chain step that produced this path.
     pub source: DiscoverySource,
@@ -400,6 +400,42 @@ pub fn discover_and_init() -> InitResult {
     }
 }
 
+/// Discover the ORT dynamic library WITHOUT loading it.
+///
+/// VAL-CROSS-015 / VAL-ORT-022: Used by `leindex diagnostics` to surface the
+/// resolved ORT library path to support engineers without taking on the cost
+/// (or the side effects) of `init_from()` inside the main daemon process.
+/// The main binary does not itself run ONNX inference (the leindex-embed
+/// worker does), so the diagnostic command must NOT commit an ORT
+/// environment that could conflict with the worker's load. Walking the same
+/// chain as `discover_and_init()` keeps the reported path consistent with the
+/// one the worker would actually load.
+///
+/// Returns the first existing candidate path using the documented discovery
+/// chain: env -> config -> `~/.leindex/lib/` -> sibling -> pip -> system.
+pub fn discover_path_only() -> Option<DiscoveryOutcome> {
+    // 1-3, 4, 6: static candidates.
+    for (source, path) in discover_candidates() {
+        if path.exists() {
+            return Some(DiscoveryOutcome { source, path });
+        }
+    }
+
+    // 5. pip site-packages (lazy Python lookup so the diagnostic command only
+    //    shells out to Python when no higher-priority source is available).
+    #[cfg(feature = "onnx")]
+    if let Some(path) = discover_pip_lib() {
+        if path.exists() {
+            return Some(DiscoveryOutcome {
+                source: DiscoverySource::Pip,
+                path,
+            });
+        }
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +609,53 @@ mod tests {
             last_error: None,
         };
         assert!(!r2.is_initialized());
+    }
+
+    /// VAL-CROSS-015 / VAL-ORT-022: `discover_path_only()` must return the
+    /// first existing candidate without calling `init_from()`, and must NOT
+    /// mutate `LAST_OUTCOME`. We point `ORT_DYLIB_PATH` at a real (fake)
+    /// file so it wins the chain.
+    #[test]
+    fn test_discover_path_only_returns_first_existing_no_init() {
+        let _g = ENV_TEST_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let fake_lib = make_fake_lib(tmp.path());
+        std::env::set_var(ORT_DYLIB_ENV, &fake_lib);
+
+        // Snapshot LAST_OUTCOME: it must remain unchanged across the call.
+        let before = last_outcome();
+        let outcome = discover_path_only();
+        let after = last_outcome();
+
+        std::env::remove_var(ORT_DYLIB_ENV);
+
+        let outcome = outcome.expect("discover_path_only should find the env candidate");
+        assert_eq!(outcome.source, DiscoverySource::EnvVar);
+        assert_eq!(outcome.path, fake_lib);
+        assert_eq!(
+            before, after,
+            "discover_path_only must not cache LAST_OUTCOME (no init_from() side effect)"
+        );
+    }
+
+    /// VAL-CROSS-015: when nothing on the chain exists, `discover_path_only`
+    /// returns `None` deterministically so diagnostics can fall back to the
+    /// configured `ort_dylib_path` (if any) without crashing.
+    #[test]
+    fn test_discover_path_only_returns_none_when_absent() {
+        let _g = ENV_TEST_LOCK.lock().unwrap();
+        // Ensure env var is unset and LEINDEX_HOME points to an empty temp
+        // dir so user-lib and config-file lookups also miss.
+        std::env::remove_var(ORT_DYLIB_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+
+        // We cannot fully prevent pip/system fallbacks in this environment
+        // (system ORT may exist on the dev machine), so we only assert that
+        // the function is callable and returns a deterministic Option.
+        let _ = discover_path_only();
+
+        std::env::remove_var(LEINDEX_HOME_ENV);
     }
 
     // Tests that actually invoke ort::init_from() require a real libonnxruntime

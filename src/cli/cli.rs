@@ -1049,6 +1049,14 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         }
     };
 
+    // VAL-CROSS-015 / VAL-ORT-022: Report the resolved ORT dylib path, the
+    // detected ORT version, and the configured execution provider so support
+    // engineers can debug any install surface identically. The diagnostic
+    // command must NOT load ORT itself (the leindex-embed worker does), so we
+    // walk the chain via `discover_path_only()` and fall back to the config
+    // file when no candidate exists on disk.
+    let (ort_path, ort_version, execution_provider) = collect_ort_diagnostics();
+
     // Convert to JSON for formatter
     let diag_json = serde_json::json!({
         "project_path": diag.project_path,
@@ -1058,6 +1066,9 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         "stale": stale,
         "last_indexed_secs_ago": last_indexed_secs_ago,
         "embedding_model": embedding_model,
+        "ort_path": ort_path,
+        "ort_version": ort_version,
+        "execution_provider": execution_provider,
         "issues": issues,
     });
 
@@ -1069,6 +1080,60 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     );
 
     Ok(())
+}
+
+/// Collect ORT-related diagnostics for the `leindex diagnostics` command.
+///
+/// VAL-CROSS-015 / VAL-ORT-022: surfaces the same ORT info shape on every
+/// install surface (cargo, npm, PyPI, GitHub Release bundle) so support
+/// engineers can debug identically. Returns a `(ort_path, ort_version,
+/// execution_provider)` triple where:
+///
+///   * `ort_path` is the resolved ORT dylib path the discovery chain would
+///     load right now, falling back to the path recorded in the user's config
+///     if no candidate exists on disk. `None` when neither resolves.
+///   * `ort_version` is the live-detected onnxruntime version (queried via
+///     pip/python), falling back to the version recorded during setup.
+///     `None` when neither is available.
+///   * `execution_provider` is the configured provider string ("cpu",
+///     "cuda", "migraphx", or "auto"). Defaults to "auto" when no config
+///     exists, matching the setup command's default.
+///
+/// This function does NOT call `ort::init_from()` and therefore does NOT
+/// load ORT into the main daemon process. That keeps the diagnostics command
+/// cheap and side-effect-free; the leindex-embed worker performs its own
+/// discovery at spawn time.
+fn collect_ort_diagnostics() -> (Option<String>, Option<String>, String) {
+    use crate::cli::leindex::setup;
+
+    // ort_path: prefer the live discovery chain, fall back to configured path.
+    #[cfg(feature = "onnx")]
+    let live_path = leindex_embed::ort_discovery::discover_path_only()
+        .map(|outcome| outcome.path.display().to_string());
+    #[cfg(not(feature = "onnx"))]
+    let live_path: Option<String> = None;
+
+    let config_path = crate::cli::neural_config::LeIndexConfig::load()
+        .ok()
+        .and_then(|c| c.neural.ort_dylib_path);
+
+    let ort_path = live_path.or(config_path);
+
+    // ort_version: prefer the live-detected version, fall back to the recorded one.
+    let live_version = setup::get_ort_version();
+    let recorded_version = crate::cli::neural_config::LeIndexConfig::load()
+        .ok()
+        .and_then(|c| c.neural.ort_version);
+    let ort_version = live_version.or(recorded_version);
+
+    // execution_provider: from config, default to "auto" when unset.
+    let execution_provider = crate::cli::neural_config::LeIndexConfig::load()
+        .ok()
+        .map(|c| c.neural.execution_provider)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "auto".to_string());
+
+    (ort_path, ort_version, execution_provider)
 }
 
 async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> AnyhowResult<()> {
