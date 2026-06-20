@@ -53,6 +53,20 @@ function isOrtRuntimeLibraryName(name) {
   return lower === 'libonnxruntime.so' || lower.startsWith('libonnxruntime.so.');
 }
 
+function isOrtBundleLibraryName(name) {
+  const lower = name.toLowerCase();
+  if (isOrtRuntimeLibraryName(lower)) {
+    return true;
+  }
+  if (process.platform === 'win32') {
+    return lower.startsWith('onnxruntime_providers_') && lower.endsWith('.dll');
+  }
+  if (process.platform === 'darwin') {
+    return lower.startsWith('libonnxruntime_providers_') && lower.endsWith('.dylib');
+  }
+  return lower.startsWith('libonnxruntime_providers_') && (lower.endsWith('.so') || /\.so\.\d/.test(lower));
+}
+
 /**
  * Copy a single file from `src` to `dst`, preserving symlinks and the
  * executable bit. Linux/macOS ORT bundles ship versioned symlinks like
@@ -528,13 +542,26 @@ async function installFromBundle(release) {
       }
 
       const libFiles = fs.readdirSync(srcLib);
+      const bundledOrtFiles = libFiles.filter(isOrtBundleLibraryName);
+      const ignoredLibFiles = libFiles.filter((file) => !isOrtBundleLibraryName(file));
+      if (!bundledOrtFiles.some(isOrtRuntimeLibraryName)) {
+        throw new Error('bundle lib/ directory did not contain any ORT runtime libraries');
+      }
+      if (ignoredLibFiles.length > 0) {
+        console.log(`   ⚠ Ignoring non-ORT bundle library entries: ${ignoredLibFiles.join(', ')}`);
+      }
+
       let copiedCount = 0;
       let symlinkCount = 0;
-      for (const file of libFiles) {
+      let copiedRuntimeCount = 0;
+      for (const file of bundledOrtFiles) {
         const srcEntry = path.join(srcLib, file);
         const dstEntry = path.join(LIB_DIR, file);
         try {
           const kind = copyBundledEntry(srcEntry, dstEntry);
+          if (isOrtRuntimeLibraryName(file)) {
+            copiedRuntimeCount += 1;
+          }
           if (kind === 'symlink') {
             symlinkCount += 1;
           } else {
@@ -545,9 +572,8 @@ async function installFromBundle(release) {
         }
       }
       console.log(`   ✓ ORT runtime libraries installed (${copiedCount} files, ${symlinkCount} symlinks) under lib/`);
-      const installedLibs = fs.readdirSync(LIB_DIR);
-      if (!installedLibs.some(isOrtRuntimeLibraryName)) {
-        throw new Error('bundle lib/ directory did not contain any ORT runtime libraries');
+      if (copiedRuntimeCount === 0) {
+        throw new Error('failed to install any ORT runtime libraries from bundle lib/ directory');
       }
     } else {
       throw new Error('ORT libraries not found in release bundle lib/ directory');
@@ -745,6 +771,7 @@ module.exports = {
   getBundleAssetName,
   getOrtLibNames,
   getRequestedRelease,
+  isOrtBundleLibraryName,
   isOrtRuntimeLibraryName,
   parseExpectedChecksum,
   parseReleaseVersion,

@@ -70,6 +70,7 @@ console.log('  ✓ Wrapper executes with argv arrays and exposes worker/model pa
 console.log('Test 5b: ORT_DYLIB_PATH detection helpers');
 assert.strictEqual(typeof installer.getOrtLibNames, 'function', 'install.js should expose getOrtLibNames');
 assert.strictEqual(typeof installer.copyBundledEntry, 'function', 'install.js should expose copyBundledEntry');
+assert.strictEqual(typeof installer.isOrtBundleLibraryName, 'function', 'install.js should expose isOrtBundleLibraryName');
 assert.strictEqual(typeof installer.isOrtRuntimeLibraryName, 'function', 'install.js should expose isOrtRuntimeLibraryName');
 assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js LIB_DIR should point at <pkg>/lib');
 {
@@ -79,7 +80,13 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
     : 'libonnxruntime.so';
   assert(Array.isArray(names) && names.includes(expected), `getOrtLibNames() should include ${expected} on ${process.platform}`);
   assert(installer.isOrtRuntimeLibraryName(expected), `${expected} should be accepted as the ORT runtime`);
-  assert(!installer.isOrtRuntimeLibraryName('libonnxruntime_providers_shared.so'), 'provider helper libraries are not the ORT runtime');
+  const providerHelper = process.platform === 'win32' ? 'onnxruntime_providers_shared.dll'
+    : process.platform === 'darwin' ? 'libonnxruntime_providers_shared.dylib'
+    : 'libonnxruntime_providers_shared.so';
+  assert(!installer.isOrtRuntimeLibraryName(providerHelper), 'provider helper libraries are not the ORT runtime');
+  assert(installer.isOrtBundleLibraryName(expected), `${expected} should be accepted as a bundle library`);
+  assert(installer.isOrtBundleLibraryName(providerHelper), 'provider helper libraries should be accepted as bundle libraries');
+  assert(!installer.isOrtBundleLibraryName('README.txt'), 'non-library files should not be accepted as bundle libraries');
 }
 {
   // copyBundledEntry should preserve a regular file when copying.
