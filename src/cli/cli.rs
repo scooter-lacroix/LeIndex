@@ -994,17 +994,27 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     // mtime + count comparison), and only run the expensive check_freshness()
     // (which hashes ALL source files) when stale to get detailed lists.
     let stale_fast = leindex.is_stale_fast();
-    let (changed, deleted) = if stale_fast {
-        leindex.check_freshness().unwrap_or_default()
+    let (changed, deleted, stale_check_failed) = if stale_fast {
+        match leindex.check_freshness() {
+            Ok((changed, deleted)) => (changed, deleted, false),
+            Err(err) => {
+                tracing::warn!("failed to perform authoritative freshness check: {}", err);
+                (vec![], vec![], true)
+            }
+        }
     } else {
-        (vec![], vec![])
+        (vec![], vec![], false)
     };
     let is_stale = !changed.is_empty() || !deleted.is_empty();
     // When is_stale_fast() reported stale, we ran check_freshness() which
     // is authoritative (hash-based). If check_freshness found no changes,
     // the is_stale_fast positive was a false positive (e.g., same-second
     // mtime) and the index is actually fresh.
-    let stale = if stale_fast { is_stale } else { false };
+    let stale = if stale_fast {
+        is_stale || stale_check_failed
+    } else {
+        false
+    };
 
     // Estimate last_indexed_secs_ago from storage_path mtime
     let storage_path = leindex.storage_path();

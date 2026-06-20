@@ -177,35 +177,12 @@ fn leindex_home() -> Option<PathBuf> {
 }
 
 /// Read `ort_dylib_path` from `~/.leindex/config/leindex.toml` if present.
-///
-/// Parsing is intentionally minimal: the file is small and we only need the
-/// single `ort_dylib_path` string. A full TOML parser is deliberately not
-/// pulled in here (it would add a workspace-wide dependency just for this
-/// lookup). The setup command in milestone 2 will use the workspace `toml`
-/// crate to write the file; this reader scans its output.
 fn read_config_ort_path() -> Option<PathBuf> {
-    let home = leindex_home()?;
-    let cfg = home.join("config").join("leindex.toml");
-    let contents = std::fs::read_to_string(&cfg).ok()?;
-    for raw in contents.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        // Look for `ort_dylib_path = "..."` (with or without section header).
-        if let Some(rest) = line.strip_prefix("ort_dylib_path") {
-            let rest = rest.trim_start();
-            if let Some(value_part) = rest.strip_prefix('=') {
-                let value_part = value_part.trim();
-                // Trim surrounding quotes if present.
-                let trimmed = value_part.trim_matches(|c| c == '"' || c == '\'');
-                if !trimmed.is_empty() {
-                    return Some(PathBuf::from(trimmed));
-                }
-            }
-        }
-    }
-    None
+    crate::config::LeIndexConfig::load()
+        .ok()
+        .and_then(|cfg| cfg.neural.ort_dylib_path)
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
 }
 
 /// Look for the first matching ORT library file in `dir`.

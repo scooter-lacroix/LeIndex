@@ -533,8 +533,11 @@ async function installFromBundle(release) {
         }
       }
       console.log(`   ✓ ORT runtime libraries installed (${copiedCount} files, ${symlinkCount} symlinks) under lib/`);
+      if (copiedCount + symlinkCount === 0) {
+        throw new Error('bundle lib/ directory did not contain any ORT runtime libraries');
+      }
     } else {
-      console.log('   ⚠ ORT libraries not found in bundle; run `npm run setup` to install ORT');
+      throw new Error('ORT libraries not found in release bundle lib/ directory');
     }
 
     // Verify main binary works

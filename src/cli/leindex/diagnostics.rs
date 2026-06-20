@@ -58,7 +58,7 @@ impl LeIndex {
         // the on-disk files have changed since the last index, which is detected
         // separately via is_stale_fast / check_freshness.
         let is_stale = self.is_stale_fast();
-        let index_health = if !pdg_loaded || pdg_nodes == 0 {
+        let index_health = if search_index_nodes == 0 {
             "empty".to_string()
         } else if is_stale {
             "stale".to_string()

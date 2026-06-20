@@ -99,7 +99,17 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
   fs.writeFileSync(target, 'fake-ort-versioned');
   const link = path.join(tmpA, 'libonnxruntime.so');
   try {
-    fs.symlinkSync('libonnxruntime.so.1.25.0', link);
+    let symlinkCreated = false;
+    try {
+      fs.symlinkSync('libonnxruntime.so.1.25.0', link);
+      symlinkCreated = true;
+    } catch (err) {
+      const unsupported = ['EPERM', 'EACCES', 'ENOTSUP', 'EINVAL'].includes(err && err.code);
+      if (!unsupported) throw err;
+    }
+    if (!symlinkCreated) {
+      console.log('  ⚠ Symlink creation unsupported; skipped symlink preservation assertion');
+    } else {
     const dstLink = path.join(tmpB, 'libonnxruntime.so');
     const kind = installer.copyBundledEntry(link, dstLink);
     if (kind === 'symlink') {
@@ -111,8 +121,7 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
       assert.strictEqual(kind, 'file', 'copyBundledEntry fallback should report "file"');
       assert.strictEqual(fs.readFileSync(dstLink, 'utf8'), 'fake-ort-versioned', 'fallback should copy the link target content');
     }
-  } catch (_) {
-    // Symlink creation may be unsupported on the host; the test still passes.
+    }
   } finally {
     fs.rmSync(tmpA, { recursive: true, force: true });
     fs.rmSync(tmpB, { recursive: true, force: true });

@@ -389,7 +389,39 @@ pub fn download_file_with_retry(
             continue;
         }
 
-        // curl succeeded: move the temp file into place.
+        // curl succeeded: verify the temp file before moving it into place so a
+        // bad response cannot replace a previously valid canonical model.
+        let sha = match sha256_of_file(&tmp_dest) {
+            Ok(sha) => Some(sha),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_dest);
+                last_err = Some(ModelDownloadError::Io(tmp_dest.clone(), e.to_string()));
+                continue;
+            }
+        };
+
+        // Re-read the manifest in case `checksums.sha256` was a newly
+        // downloaded sibling.
+        let manifest_now = manifest_path
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|c| parse_checksums(&c))
+            .unwrap_or_default();
+
+        let verified = match (sha.as_ref(), manifest_now.get(file.local)) {
+            (Some(actual), Some(expected)) if actual == expected => true,
+            (Some(actual), Some(expected)) => {
+                let _ = std::fs::remove_file(&tmp_dest);
+                last_err = Some(ModelDownloadError::ChecksumMismatch {
+                    file: file.local.to_string(),
+                    expected: expected.clone(),
+                    actual: actual.clone(),
+                });
+                continue;
+            }
+            _ => false,
+        };
+
+        // Checksum passed or no manifest entry exists: move the temp file into place.
         if let Err(e) = std::fs::rename(&tmp_dest, &dest) {
             // rename can fail across filesystems; fall back to copy+remove.
             if let Err(copy_err) = std::fs::copy(&tmp_dest, &dest) {
@@ -401,23 +433,6 @@ pub fn download_file_with_retry(
             // copy succeeded; fall through with the rename-error discarded.
             let _ = e;
         }
-
-        // Compute the post-download checksum. We do this even before the
-        // manifest arrives so a caller asking for "did the network round-trip
-        // produce a deterministic file?" gets an answer.
-        let sha = sha256_of_file(&dest).ok();
-
-        // Re-read the manifest in case `checksums.sha256` was a newly
-        // downloaded sibling.
-        let manifest_now = manifest_path
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .map(|c| parse_checksums(&c))
-            .unwrap_or_default();
-
-        let verified = sha
-            .as_ref()
-            .and_then(|h| manifest_now.get(file.local).map(|exp| exp == h))
-            .unwrap_or(false);
 
         return Ok(DownloadOutcome {
             path: dest,
@@ -468,6 +483,12 @@ pub enum ModelDownloadError {
         exit_code: i32,
         network: bool,
     },
+    /// Downloaded bytes did not match the checksum manifest.
+    ChecksumMismatch {
+        file: String,
+        expected: String,
+        actual: String,
+    },
     /// Filesystem I/O error.
     Io(PathBuf, String),
 }
@@ -516,6 +537,16 @@ impl std::fmt::Display for ModelDownloadError {
                     )
                 }
             }
+            ModelDownloadError::ChecksumMismatch {
+                file,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "Checksum mismatch for '{}': expected {}, got {}. \
+                 The temporary download was discarded and the existing model was left unchanged.",
+                file, expected, actual
+            ),
             ModelDownloadError::Io(path, msg) => {
                 write!(
                     f,

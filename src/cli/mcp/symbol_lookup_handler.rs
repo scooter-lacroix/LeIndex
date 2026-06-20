@@ -290,7 +290,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
 
         // Callees (direct)
         let (callees, callees_truncated) = if include_callees {
-            let all_callees: Vec<Value> = pdg
+            let capped_callees: Vec<Value> = pdg
                 .neighbors(node_id)
                 .iter()
                 .filter_map(|&cid| {
@@ -302,11 +302,11 @@ For the exact source implementation use LeIndex [Read Symbol]."
                         })
                     })
                 })
+                .take(51)
                 .collect();
-            let total = all_callees.len();
-            let truncated = total > 50;
+            let truncated = capped_callees.len() > 50;
             (
-                all_callees.into_iter().take(50).collect::<Vec<_>>(),
+                capped_callees.into_iter().take(50).collect::<Vec<_>>(),
                 truncated,
             )
         } else {
@@ -315,7 +315,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
 
         // Callers (direct)
         let (callers, callers_truncated) = if include_callers {
-            let all_callers: Vec<Value> = get_direct_callers(pdg, node_id)
+            let capped_callers: Vec<Value> = get_direct_callers(pdg, node_id)
                 .iter()
                 .filter_map(|&cid| {
                     pdg.get_node(cid).map(|cn| {
@@ -326,11 +326,11 @@ For the exact source implementation use LeIndex [Read Symbol]."
                         })
                     })
                 })
+                .take(51)
                 .collect();
-            let total = all_callers.len();
-            let truncated = total > 50;
+            let truncated = capped_callers.len() > 50;
             (
-                all_callers.into_iter().take(50).collect::<Vec<_>>(),
+                capped_callers.into_iter().take(50).collect::<Vec<_>>(),
                 truncated,
             )
         } else {

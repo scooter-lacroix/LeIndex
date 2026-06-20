@@ -114,7 +114,7 @@ The `setup` wizard installs ONNX Runtime via pip and downloads the
 
 ```bash
 npm install -g @leindex/mcp
-npm run setup --prefix node_modules/@leindex/mcp
+npm run setup --prefix "$(npm root -g)/@leindex/mcp"
 ```
 
 The npm package downloads a platform-specific bundle containing the main
@@ -275,9 +275,9 @@ neural embeddings (see [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md)).
 
 ```bash
 git clone https://github.com/scooter-lacroix/LeIndex.git
-cd leindex
+cd LeIndex
 cargo build --release --features onnx
-leindex setup          # enable neural search
+./target/release/leindex setup          # enable neural search
 ```
 
 This produces both `target/release/leindex` (main binary) and `target/release/leindex-embed` (ONNX worker). The worker must be discoverable alongside the main binary or in `PATH` for local ONNX inference. The `--features onnx` flag enables the `load-dynamic` ONNX Runtime strategy: no ORT is linked at build time, and the worker discovers the runtime `.so`/`.dylib`/`.dll` at runtime via the discovery chain (see [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md)).
@@ -590,7 +590,7 @@ Build with the default features to use local Qwen3 embedding models via ONNX Run
 
 ```bash
 cargo build --release --features onnx
-leindex setup          # install ONNX Runtime + download qwen3-embed-0.6b model
+./target/release/leindex setup          # install ONNX Runtime + download qwen3-embed-0.6b model
 ```
 
 The `onnx` feature uses the `load-dynamic` ORT strategy: no ONNX Runtime is

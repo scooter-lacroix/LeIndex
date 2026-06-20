@@ -134,7 +134,7 @@ leindex setup
 
 ```bash
 npm install -g @leindex/mcp
-npm run setup --prefix node_modules/@leindex/mcp
+npm run setup --prefix "$(npm root -g)/@leindex/mcp"
 ```
 
 **Environment Variables:**
@@ -258,7 +258,7 @@ arguments to the real Rust executable.
 
 ```bash
 git clone https://github.com/scooter-lacroix/LeIndex.git
-cd leindex
+cd LeIndex
 cargo build --release
 ```
 

@@ -2,7 +2,7 @@
 
 use crate::graph::pdg::{NodeId, ProgramDependenceGraph};
 use serde::{Deserialize, Serialize};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 
 /// Configuration for gravity traversal
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +102,7 @@ impl GravityTraversal {
                     }
                     // Skip this node but continue trying others
                     visited.insert(wnode.id);
+                    self.enqueue_neighbors(pdg, &mut pq, &visited, wnode.id, wnode.distance);
                     continue;
                 }
 
@@ -110,25 +111,35 @@ impl GravityTraversal {
                 current_tokens += estimated_tokens;
 
                 // Add neighbors with decayed weight
-                for neighbor in self.get_neighbors(pdg, wnode.id) {
-                    if !visited.contains(&neighbor) {
-                        let new_distance = wnode.distance + 1;
-                        if let Some(nnode) = pdg.get_node(neighbor) {
-                            let semantic = 1.0; // Would come from embedding
-                            let weight =
-                                self.calculate_relevance(nnode, new_distance as f64, semantic);
-                            pq.push(WeightedNode {
-                                id: neighbor,
-                                weight,
-                                distance: new_distance,
-                            });
-                        }
-                    }
-                }
+                self.enqueue_neighbors(pdg, &mut pq, &visited, wnode.id, wnode.distance);
             }
         }
 
         context
+    }
+
+    fn enqueue_neighbors(
+        &self,
+        pdg: &ProgramDependenceGraph,
+        pq: &mut BinaryHeap<WeightedNode>,
+        visited: &HashSet<NodeId>,
+        node_id: NodeId,
+        distance: usize,
+    ) {
+        for neighbor in self.get_neighbors(pdg, node_id) {
+            if !visited.contains(&neighbor) {
+                let new_distance = distance + 1;
+                if let Some(nnode) = pdg.get_node(neighbor) {
+                    let semantic = 1.0; // Would come from embedding
+                    let weight = self.calculate_relevance(nnode, new_distance as f64, semantic);
+                    pq.push(WeightedNode {
+                        id: neighbor,
+                        weight,
+                        distance: new_distance,
+                    });
+                }
+            }
+        }
     }
 
     /// Calculate relevance score for a node

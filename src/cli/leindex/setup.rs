@@ -1929,6 +1929,16 @@ fn map_model_download_error(
     match e {
         Mde::CurlNotFound => SetupError::CurlNotFound,
         Mde::Io(path, msg) => SetupError::Io(format!("{}: {}", path.display(), msg)),
+        Mde::ChecksumMismatch {
+            file,
+            expected,
+            actual,
+        } => SetupError::ModelDownloadFailed {
+            file,
+            url: format!("checksum expected {}, got {}", expected, actual),
+            exit_code: -1,
+            network: false,
+        },
         Mde::DownloadFailed {
             file,
             url,

@@ -1418,6 +1418,18 @@ impl SearchEngine {
     ///
     /// Panics if total node count exceeds MAX_NODES after appending.
     pub fn append_nodes(&mut self, mut nodes: Vec<NodeInfo>) {
+        let mut seen = HashSet::new();
+        for node in &nodes {
+            let dup_in_batch = !seen.insert(node.node_id.clone());
+            let dup_existing = self.node_id_to_idx.contains_key(&node.node_id);
+            if dup_in_batch || dup_existing {
+                panic!(
+                    "append_nodes received duplicate node_id '{}'; use incremental_reindex for updates",
+                    node.node_id
+                );
+            }
+        }
+
         if self.nodes.len() + nodes.len() > MAX_NODES {
             panic!(
                 "Cannot index more than {} nodes (current: {}, appending: {})",
@@ -1426,6 +1438,9 @@ impl SearchEngine {
                 nodes.len()
             );
         }
+
+        self.search_cache.clear();
+        self.search_cache_bytes = 0;
 
         // Build node_id_to_idx for O(1) node lookups (A1 optimization)
         // Build complexity cache, inverted index, and token cache before taking ownership
@@ -1954,8 +1969,13 @@ impl SearchEngine {
 
         // Check cache first
         let cache_key = format!(
-            "{}:{}:{:?}:{}:{:?}",
-            query.query, query.top_k, query.threshold, query.semantic, query.query_type
+            "{}:{}:{:?}:{}:{:?}:neural={}",
+            query.query,
+            query.top_k,
+            query.threshold,
+            query.semantic,
+            query.query_type,
+            query.query_neural_embedding.is_some()
         );
         if let Some(cached) = self.search_cache.get(&cache_key) {
             return Ok(cached.clone());
@@ -2211,13 +2231,14 @@ impl SearchEngine {
 
         // Check staged-search cache (key includes query, top_k, threshold, semantic, coarse_multiplier, query_type)
         let cache_key = format!(
-            "staged:{}:{}:{:?}:{}:{:?}:{:?}",
+            "staged:{}:{}:{:?}:{}:{:?}:{:?}:neural={}",
             query.query,
             query.top_k,
             query.threshold,
             query.semantic,
             config.coarse_multiplier,
-            query.query_type
+            query.query_type,
+            query.query_neural_embedding.is_some()
         );
         if let Some(cached) = self.search_cache.get(&cache_key) {
             let count = cached.len();
@@ -2805,7 +2826,7 @@ impl SearchEngine {
     /// in top search results unless the query explicitly targets them.
     fn is_archive_path(file_path: &str) -> bool {
         file_path
-            .split('/')
+            .split(['/', '\\'])
             .any(|component| component == "archive" || component == ".archive")
     }
 }

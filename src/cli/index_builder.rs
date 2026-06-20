@@ -1668,14 +1668,16 @@ pub(crate) fn search_cache_key_for(
     query: &str,
     top_k: usize,
     query_type: Option<&crate::search::ranking::QueryType>,
+    neural_available: bool,
 ) -> String {
     search_cache_key(&format!(
-        "query:{}:{}:{}:{}:{:?}",
+        "query:{}:{}:{}:{}:{:?}:neural={}",
         stable_project_cache_id(project_id, project_path),
         index_fingerprint(stats),
         top_k,
         query.trim().to_lowercase(),
         query_type,
+        neural_available,
     ))
 }
 

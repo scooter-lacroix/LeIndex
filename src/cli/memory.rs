@@ -518,14 +518,24 @@ impl CacheStore {
         if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(".bin")
-                        && name.starts_with(sanitized_prefix)
-                        && std::fs::remove_file(entry.path()).is_ok()
-                    {
-                        count += 1;
+                    if name.ends_with(".bin") && name.starts_with(sanitized_prefix) {
+                        let path = entry.path();
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => count += 1,
+                            Err(err) => warn!(
+                                "failed to remove spilled cache entry {}: {}",
+                                path.display(),
+                                err
+                            ),
+                        }
                     }
                 }
             }
+        } else {
+            warn!(
+                "failed to read spilled cache directory {} for prefix cleanup",
+                self.cache_dir.display()
+            );
         }
         count
     }

@@ -233,15 +233,13 @@ pub(crate) fn is_stale_fast(
     // that the caller runs when is_stale_fast returns true.
     for indexed_path in indexed_files.keys() {
         let full_path = ctx.project_path.join(indexed_path);
-        if !full_path.exists() {
-            return true;
-        }
-        if let Ok(metadata) = std::fs::metadata(&full_path) {
-            if let Ok(modified) = metadata.modified() {
-                if modified >= db_time {
-                    return true;
-                }
-            }
+        match std::fs::metadata(&full_path) {
+            Ok(metadata) => match metadata.modified() {
+                Ok(modified) if modified >= db_time => return true,
+                Ok(_) => {}
+                Err(_) => return true,
+            },
+            Err(_) => return true,
         }
     }
 

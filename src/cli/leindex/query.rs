@@ -54,7 +54,10 @@ impl LeIndex {
             return Ok(Vec::new());
         }
 
-        let search_cache_key = self.search_cache_key_for(query, top_k, query_type.as_ref());
+        let query_neural_embedding = self.generate_query_neural_embedding(query);
+        let neural_available = query_neural_embedding.is_some();
+        let search_cache_key =
+            self.search_cache_key_for(query, top_k, query_type.as_ref(), neural_available);
         if let Some(CacheEntry::Binary {
             serialized_data, ..
         }) = self
@@ -81,7 +84,7 @@ impl LeIndex {
             semantic: true,
             expand_context: false,
             query_embedding: Some(self.generate_query_embedding(query)),
-            query_neural_embedding: self.generate_query_neural_embedding(query),
+            query_neural_embedding,
             threshold: Some(0.1), // Added default threshold for better quality
             query_type,
         };
@@ -467,6 +470,9 @@ impl LeIndex {
     /// 3. Merges and deduplicates results, prioritizing source code files
     fn analyze_search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
         // Primary search with the full query
+        let primary_neural_embedding = self.generate_query_neural_embedding(query);
+        let try_additional_neural = primary_neural_embedding.is_some();
+
         let primary_query = SearchQuery {
             query: query.to_string(),
             top_k: 15,
@@ -474,7 +480,7 @@ impl LeIndex {
             semantic: true,
             expand_context: false,
             query_embedding: Some(self.generate_query_embedding(query)),
-            query_neural_embedding: self.generate_query_neural_embedding(query),
+            query_neural_embedding: primary_neural_embedding,
             threshold: Some(0.05),
             query_type: Some(crate::search::ranking::QueryType::Semantic),
         };
@@ -498,7 +504,11 @@ impl LeIndex {
                 semantic: true,
                 expand_context: false,
                 query_embedding: Some(self.generate_query_embedding(&key_terms)),
-                query_neural_embedding: self.generate_query_neural_embedding(&key_terms),
+                query_neural_embedding: if try_additional_neural {
+                    self.generate_query_neural_embedding(&key_terms)
+                } else {
+                    None
+                },
                 threshold: Some(0.05),
                 query_type: Some(crate::search::ranking::QueryType::Semantic),
             };
@@ -521,7 +531,11 @@ impl LeIndex {
                 semantic: true,
                 expand_context: false,
                 query_embedding: Some(self.generate_query_embedding(&stemmed_terms)),
-                query_neural_embedding: self.generate_query_neural_embedding(&stemmed_terms),
+                query_neural_embedding: if try_additional_neural {
+                    self.generate_query_neural_embedding(&stemmed_terms)
+                } else {
+                    None
+                },
                 threshold: Some(0.05),
                 query_type: Some(crate::search::ranking::QueryType::Semantic),
             };
@@ -952,7 +966,7 @@ fn simple_stem(word: &str) -> String {
             let chars: Vec<char> = base.chars().collect();
             if chars[chars.len() - 1] == chars[chars.len() - 2] && !is_vowel(chars[chars.len() - 1])
             {
-                return base[..base.len() - 1].to_string();
+                return drop_last_char(base);
             }
         }
         // Try adding 'e' back (e.g., "scor" → "score", "rat" → "rate")
@@ -984,7 +998,7 @@ fn simple_stem(word: &str) -> String {
             let chars: Vec<char> = base.chars().collect();
             if chars[chars.len() - 1] == chars[chars.len() - 2] && !is_vowel(chars[chars.len() - 1])
             {
-                return base[..base.len() - 1].to_string();
+                return drop_last_char(base);
             }
         }
         return base.to_string();
@@ -1020,6 +1034,12 @@ fn simple_stem(word: &str) -> String {
     }
 
     word.to_string()
+}
+
+fn drop_last_char(s: &str) -> String {
+    let mut out = s.to_string();
+    out.pop();
+    out
 }
 
 /// Check if a character is a vowel.
@@ -1106,4 +1126,15 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::simple_stem;
+
+    #[test]
+    fn simple_stem_handles_multibyte_double_consonant() {
+        assert_eq!(simple_stem("ååing"), "å");
+        assert_eq!(simple_stem("ååed"), "å");
+    }
 }

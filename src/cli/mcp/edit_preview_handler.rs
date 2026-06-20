@@ -264,6 +264,9 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
                             // Only include symbols whose byte range overlaps
                             // with at least one edit region.
                             let overlaps = edit_ranges.iter().any(|&(es, ee)| {
+                                if es == ee {
+                                    return n.byte_range.0 <= es && es <= n.byte_range.1;
+                                }
                                 // Two ranges [s1, e1) and [s2, e2) overlap when
                                 // s1 < e2 && s2 < e1
                                 n.byte_range.0 < ee && es < n.byte_range.1

@@ -331,6 +331,7 @@ impl LeIndex {
         query: &str,
         top_k: usize,
         query_type: Option<&crate::search::ranking::QueryType>,
+        neural_available: bool,
     ) -> String {
         index_builder::search_cache_key_for(
             &self.project_id,
@@ -339,6 +340,7 @@ impl LeIndex {
             query,
             top_k,
             query_type,
+            neural_available,
         )
     }
 

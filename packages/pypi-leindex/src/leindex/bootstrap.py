@@ -466,7 +466,7 @@ def forward_signals_to(proc: "subprocess.Popen[bytes]") -> None:
             # (e.g. signals registered from a non-main thread). Skip silently;
             # the foreground-process-group delivery still covers the common
             # interactive case.
-            previous = None
+            continue
         _previous_handlers.append((signum, previous))
 
 

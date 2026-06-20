@@ -266,10 +266,11 @@ Turns a raw diff into a structural change summary with blast radius."
 
         // Build pdg_enrichment status field for transparency about PDG availability
         let pdg_enrichment = if let Some(err) = &pdg_error {
+            tracing::debug!("PDG load failed while enriching git status: {}", err);
             serde_json::json!({
                 "available": false,
                 "reason": "PDG load failed",
-                "error": err,
+                "error": "PDG enrichment unavailable; run leindex index to refresh the project graph",
             })
         } else {
             serde_json::json!({

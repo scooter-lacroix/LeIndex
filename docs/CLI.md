@@ -9,7 +9,7 @@ LeIndex provides a command-line interface for indexing, searching, and analyzing
 ```bash
 # Clone and build
 git clone https://github.com/scooter-lacroix/LeIndex.git
-cd leindex
+cd LeIndex
 cargo build --release
 
 # Binary location

@@ -64,7 +64,11 @@ TF-IDF (keyword) search works out of the box. To enable neural (semantic)
 search, run the setup wizard after install:
 
 ```bash
+# project dependency
 npm run setup --prefix node_modules/@leindex/mcp
+
+# global install
+npm run setup --prefix "$(npm root -g)/@leindex/mcp"
 ```
 
 This invokes the bundled `leindex setup` command, which installs ONNX Runtime
