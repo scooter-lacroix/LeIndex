@@ -963,7 +963,8 @@ fn extract_stemmed_keywords(query: &str) -> String {
 /// found in technical writing. It's not a full Porter stemmer, but it
 /// covers the most common cases for code search.
 fn simple_stem(word: &str) -> String {
-    if word.len() <= 3 {
+    let word_chars = word.chars().count();
+    if word_chars <= 3 {
         return word.to_string();
     }
 
@@ -973,22 +974,18 @@ fn simple_stem(word: &str) -> String {
     // But handle "ning" → "n" (e.g., "running" → "runn" → "run")
     if let Some(base) = word.strip_suffix("ing") {
         // If base ends in double consonant, remove one (e.g., "runn" → "run")
-        if base.len() > 2 {
-            let chars: Vec<char> = base.chars().collect();
-            if chars[chars.len() - 1] == chars[chars.len() - 2] && !is_vowel(chars[chars.len() - 1])
-            {
-                return drop_last_char(base);
-            }
+        let chars: Vec<char> = base.chars().collect();
+        if chars.len() >= 2
+            && chars[chars.len() - 1] == chars[chars.len() - 2]
+            && !is_vowel(chars[chars.len() - 1])
+        {
+            return drop_last_char(base);
         }
         // Try adding 'e' back (e.g., "scor" → "score", "rat" → "rate")
-        if base.len() >= 2 {
+        if chars.len() >= 2 {
             let base_with_e = format!("{}e", base);
             // Heuristic: if base ends in consonant-vowel-consonant, add 'e'
-            let chars: Vec<char> = base.chars().collect();
-            if chars.len() >= 2
-                && !is_vowel(chars[chars.len() - 1])
-                && is_vowel(chars[chars.len() - 2])
-            {
+            if !is_vowel(chars[chars.len() - 1]) && is_vowel(chars[chars.len() - 2]) {
                 return base_with_e;
             }
         }
@@ -997,7 +994,7 @@ fn simple_stem(word: &str) -> String {
 
     // -ied → -y (e.g., "applied" → "apply")
     if let Some(base) = word.strip_suffix("ied") {
-        if word.len() > 4 {
+        if word_chars > 4 {
             return format!("{}y", base);
         }
     }
@@ -1005,26 +1002,26 @@ fn simple_stem(word: &str) -> String {
     // -ed → base (e.g., "indexed" → "index", "scored" → "score")
     if let Some(base) = word.strip_suffix("ed") {
         // If base ends in double consonant, remove one
-        if base.len() > 2 {
-            let chars: Vec<char> = base.chars().collect();
-            if chars[chars.len() - 1] == chars[chars.len() - 2] && !is_vowel(chars[chars.len() - 1])
-            {
-                return drop_last_char(base);
-            }
+        let chars: Vec<char> = base.chars().collect();
+        if chars.len() >= 2
+            && chars[chars.len() - 1] == chars[chars.len() - 2]
+            && !is_vowel(chars[chars.len() - 1])
+        {
+            return drop_last_char(base);
         }
         return base.to_string();
     }
 
     // -ies → -y (e.g., "queries" → "query")
     if let Some(base) = word.strip_suffix("ies") {
-        if word.len() > 4 {
+        if word_chars > 4 {
             return format!("{}y", base);
         }
     }
 
     // -es → base (e.g., "boxes" → "box", but not "score" → "scor")
     if let Some(base) = word.strip_suffix("es") {
-        if word.len() > 4 {
+        if word_chars > 4 {
             // Only strip 'es' if base ends in 's', 'x', 'z', 'ch', 'sh'
             if base.ends_with('s')
                 || base.ends_with('x')
@@ -1039,7 +1036,7 @@ fn simple_stem(word: &str) -> String {
 
     // -s → base (e.g., "handlers" → "handler", but not "is" → "i")
     if let Some(base) = word.strip_suffix('s') {
-        if !base.ends_with('s') && word.len() > 3 {
+        if !base.ends_with('s') && word_chars > 3 {
             return base.to_string();
         }
     }
@@ -1147,5 +1144,11 @@ mod tests {
     fn simple_stem_handles_multibyte_double_consonant() {
         assert_eq!(simple_stem("ååing"), "å");
         assert_eq!(simple_stem("ååed"), "å");
+    }
+
+    #[test]
+    fn simple_stem_handles_single_multibyte_base_before_suffix() {
+        assert_eq!(simple_stem("𐍈ing"), "𐍈");
+        assert_eq!(simple_stem("𐍈ed"), "𐍈ed");
     }
 }

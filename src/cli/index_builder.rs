@@ -1835,7 +1835,6 @@ pub(crate) fn clear_query_caches(
 /// The disk cache filenames are sanitized versions of the full cache key.
 fn sanitize_for_prefix(s: &str) -> String {
     s.chars()
-        .take(20)
         .map(|c| {
             if c.is_alphanumeric() || c == '-' || c == '_' {
                 c
@@ -2030,6 +2029,16 @@ mod tests {
                 magnitude
             );
         }
+    }
+
+    #[test]
+    fn test_sanitize_for_prefix_keeps_full_project_id() {
+        let a = "aaaaaaaaaaaaaaaaaaaa_project_one";
+        let b = "aaaaaaaaaaaaaaaaaaaa_project_two";
+
+        assert_ne!(sanitize_for_prefix(a), sanitize_for_prefix(b));
+        assert!(sanitize_for_prefix(a).ends_with("project_one"));
+        assert!(sanitize_for_prefix(b).ends_with("project_two"));
     }
 
     #[test]

@@ -893,12 +893,12 @@ impl WorkerRuntime {
         // Run inference with properly shaped tensors
         // Shape: [batch_size, seq_len]
         let input_ids_tensor = ort::value::Tensor::from_array(
-            ndarray::Array2::from_shape_vec((batch_size, max_len), input_ids.clone()).map_err(
-                |e| WorkerError {
+            ndarray::Array2::from_shape_vec((batch_size, max_len), input_ids).map_err(|e| {
+                WorkerError {
                     kind: ErrorKind::Inference,
                     message: format!("failed to create input_ids array: {}", e),
-                },
-            )?,
+                }
+            })?,
         )
         .map_err(|e| WorkerError {
             kind: ErrorKind::Inference,

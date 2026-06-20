@@ -251,11 +251,12 @@ impl LeIndexConfig {
     fn parse_toml(toml_str: &str) -> Result<Self, String> {
         toml::from_str(toml_str).map_err(|e| {
             let span = e.span().unwrap_or(0..0);
+            let (line, column) = byte_offset_to_line_col(toml_str, span.start);
             format!(
                 "Failed to parse leindex.toml:\n  {}\n  Line {}, column {}",
                 e.message(),
-                span.start,
-                span.end
+                line,
+                column
             )
         })
     }
@@ -324,6 +325,26 @@ impl LeIndexConfig {
             }
         }
     }
+}
+
+fn byte_offset_to_line_col(input: &str, byte_offset: usize) -> (usize, usize) {
+    let capped = byte_offset.min(input.len());
+    let mut line = 1;
+    let mut column = 1;
+
+    for (idx, ch) in input.char_indices() {
+        if idx >= capped {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+
+    (line, column)
 }
 
 /// What happened during `load_or_recover()`.
@@ -430,6 +451,19 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.contains("Failed to parse"));
+    }
+
+    #[test]
+    fn test_parse_malformed_toml_reports_line_and_column() {
+        let bad_toml = "[neural]\nenabled = true\nexecution_provider = @\n";
+        let result = LeIndexConfig::parse_toml(bad_toml);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("Line 3, column 22"),
+            "expected real line/column in error, got: {}",
+            err
+        );
     }
 
     #[test]
