@@ -539,7 +539,7 @@ jobs:
             cp "$CAPI"/libonnxruntime.*.dylib "$BUNDLE_DIR/lib/" 2>/dev/null \
               || echo "::warning::libonnxruntime.*.dylib not found in wheel capi/"
             (cd "$BUNDLE_DIR/lib" && \
-              VER_FILE=$(ls libonnxruntime.*.dylib | sort -V | tail -1) && \
+              VER_FILE=$(ls libonnxruntime.*.dylib 2>/dev/null | LC_ALL=C sort | tail -1) && \
               [[ -n "$VER_FILE" ]] && \
               ln -sf "$VER_FILE" libonnxruntime.dylib)
             cp "$CAPI"/libonnxruntime_providers_shared.dylib "$BUNDLE_DIR/lib/" 2>/dev/null || true
@@ -657,11 +657,20 @@ jobs:
           # remains checksummed.
           (
             cd "$BUNDLE_DIR"
-            find bin lib models -type f -print0 \
-              | sort -z \
-              | xargs -0 sha256sum \
-              | grep -v '/checksums\.sha256$' \
-              > checksums.sha256
+            checksum_file() {
+              if [[ "$RUNNER_OS" == "macOS" ]]; then
+                shasum -a 256 "$1"
+              else
+                sha256sum "$1"
+              fi
+            }
+            : > checksums.sha256
+            while IFS= read -r file; do
+              if [[ "$file" == "checksums.sha256" ]]; then
+                continue
+              fi
+              checksum_file "$file" >> checksums.sha256
+            done < <(find bin lib models -type f | LC_ALL=C sort)
           )
           echo "Bundle checksums.sha256:"
           cat "$BUNDLE_DIR/checksums.sha256"

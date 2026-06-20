@@ -324,6 +324,30 @@ mod checksum_coverage {
             "release.yml must generate per-file SHA256 checksums inside the bundle, covering lib/"
         );
     }
+
+    #[test]
+    fn bundle_checksums_are_portable_on_macos() {
+        let yml = release_yml();
+        let package_section = yml
+            .split("Package release bundle")
+            .nth(1)
+            .and_then(|s| s.split("Upload artifact").next())
+            .expect("release.yml must contain a package release bundle step");
+
+        assert!(
+            package_section.contains(r#""$RUNNER_OS" == "macOS""#)
+                && package_section.contains("shasum -a 256"),
+            "macOS bundle packaging must use shasum instead of assuming GNU sha256sum"
+        );
+        assert!(
+            !package_section.contains("sort -z") && !package_section.contains("xargs -0 sha256sum"),
+            "bundle checksum generation must avoid GNU-only sort -z / sha256sum pipelines on macOS runners"
+        );
+        assert!(
+            !package_section.contains("libonnxruntime.*.dylib | sort -V"),
+            "macOS dylib selection must not use GNU sort -V on BSD macOS runners"
+        );
+    }
 }
 
 // ============================================================================

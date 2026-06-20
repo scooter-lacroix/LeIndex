@@ -892,14 +892,6 @@ try_install_from_release_bundle() {
     esac
 
     asset_name="${os_name}-${arch}"
-    if [[ "$os_name" == "macos" ]]; then
-        # Release bundles are published for macOS aarch64 (Apple Silicon) only.
-        if [[ "$arch" != "aarch64" ]]; then
-            log_info "Bundle install not available for macOS $arch (aarch64 only)"
-            return 1
-        fi
-    fi
-
     local asset_filename="leindex-${version}-${asset_name}.tar.gz"
 
     # Resolve the download URL. Use the GitHub API to find the asset in the

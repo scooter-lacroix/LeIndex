@@ -37,7 +37,11 @@ fn repo_root() -> PathBuf {
 /// Read install.sh as a string. Panics with a clear diagnostic if the file
 /// is missing so test failures point at the actual cause.
 fn install_sh() -> String {
-    let path = repo_root().join("install.sh");
+    read_repo_file("install.sh")
+}
+
+fn read_repo_file(rel: &str) -> String {
+    let path = repo_root().join(rel);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
@@ -303,7 +307,6 @@ mod version_parity {
     /// Per AGENTS.md, all published surfaces must stay in version lock-step.
     #[test]
     fn script_version_matches_cargo_toml() {
-        let sh = install_sh();
         let cargo_toml_path = repo_root().join("Cargo.toml");
         let cargo_toml = std::fs::read_to_string(&cargo_toml_path)
             .unwrap_or_else(|e| panic!("failed to read {}: {e}", cargo_toml_path.display()));
@@ -318,6 +321,7 @@ mod version_parity {
             })
             .expect("Cargo.toml must have a top-level version = \"...\" line");
 
+        let sh = install_sh();
         let script_version = sh
             .lines()
             .find_map(|line| {
@@ -332,6 +336,32 @@ mod version_parity {
         assert_eq!(
             cargo_version, script_version,
             "install.sh SCRIPT_VERSION ({script_version}) must match Cargo.toml version ({cargo_version})"
+        );
+
+        let ps1 = read_repo_file("install.ps1");
+        assert!(
+            ps1.contains(&format!(r#"$ScriptVersion = "{cargo_version}""#))
+                && ps1.contains(&format!(r#"$ExpectedVersion = "{cargo_version}""#)),
+            "install.ps1 ScriptVersion and ExpectedVersion must match Cargo.toml version ({cargo_version})"
+        );
+
+        let macos = read_repo_file("install_macos.sh");
+        assert!(
+            macos.contains(&format!(r#"readonly SCRIPT_VERSION="{cargo_version}""#)),
+            "install_macos.sh SCRIPT_VERSION must match Cargo.toml version ({cargo_version})"
+        );
+    }
+
+    #[test]
+    fn install_sh_accepts_all_published_macos_bundles() {
+        let sh = install_sh();
+        assert!(
+            !sh.contains("aarch64 only"),
+            "install.sh must not reject macOS x86_64 when release.yml publishes macos-x86_64"
+        );
+        assert!(
+            sh.contains(r#"asset_name="${os_name}-${arch}""#),
+            "install.sh should derive the bundle asset name from normalized OS and architecture"
         );
     }
 }
