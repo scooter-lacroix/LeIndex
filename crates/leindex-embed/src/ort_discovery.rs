@@ -8,7 +8,7 @@
 //   1. `ORT_DYLIB_PATH` env var (explicit user override, highest priority)
 //   2. `~/.leindex/config/leindex.toml` -> `[neural] ort_dylib_path`
 //   3. `~/.leindex/lib/` (or `$LEINDEX_HOME/lib/`) — bundled from release
-//   4. Sibling dir to the running binary — bundled from release bundle
+//   4. Sibling dir to the running binary, then sibling bundle `../lib`
 //   5. `python3`/`python` site-packages `onnxruntime/capi/`
 //   6. System paths: `/usr/local/lib`, `/usr/lib`, `/lib`
 //
@@ -99,7 +99,7 @@ pub enum DiscoverySource {
     Config,
     /// `~/.leindex/lib/` (or `$LEINDEX_HOME/lib/`).
     UserLib,
-    /// Directory containing the running worker binary.
+    /// Directory containing the running worker binary, or its bundle `../lib`.
     Sibling,
     /// `python3`'s `site-packages/onnxruntime/capi/`.
     Pip,
@@ -308,10 +308,16 @@ pub fn discover_candidates() -> Vec<(DiscoverySource, PathBuf)> {
         }
     }
 
-    // 4. sibling dir to binary
+    // 4. sibling dir to binary, then bundle lib/ next to bin/
     if let Some(bin_dir) = binary_dir() {
         for name in ort_lib_names() {
             out.push((DiscoverySource::Sibling, bin_dir.join(name)));
+        }
+        if let Some(bundle_root) = bin_dir.parent() {
+            let bundle_lib = bundle_root.join("lib");
+            for name in ort_lib_names() {
+                out.push((DiscoverySource::Sibling, bundle_lib.join(name)));
+            }
         }
     }
 
@@ -458,7 +464,7 @@ pub fn discover_and_init() -> InitResult {
 /// one the worker would actually load.
 ///
 /// Returns the first existing candidate path using the documented discovery
-/// chain: env -> config -> `~/.leindex/lib/` -> sibling -> pip -> system.
+/// chain: env -> config -> `~/.leindex/lib/` -> sibling/bundle -> pip -> system.
 pub fn discover_path_only() -> Option<DiscoveryOutcome> {
     // 1-4: high-priority static candidates (env / config / user_lib / sibling).
     for (source, path) in discover_candidates() {
@@ -543,6 +549,24 @@ mod tests {
             .any(|(s, p)| *s == DiscoverySource::UserLib && p == &expected));
 
         std::env::remove_var(LEINDEX_HOME_ENV);
+    }
+
+    #[test]
+    fn test_discover_candidates_includes_bundle_lib_next_to_bin() {
+        let _g = ENV_TEST_LOCK.lock().unwrap();
+        std::env::remove_var(ORT_DYLIB_ENV);
+        std::env::remove_var(LEINDEX_HOME_ENV);
+
+        let candidates = discover_candidates();
+
+        if let Some(bin_dir) = binary_dir() {
+            if let Some(bundle_root) = bin_dir.parent() {
+                let expected = bundle_root.join("lib").join(ort_lib_names()[0]);
+                assert!(candidates
+                    .iter()
+                    .any(|(s, p)| *s == DiscoverySource::Sibling && p == &expected));
+            }
+        }
     }
 
     #[test]

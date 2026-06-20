@@ -9,6 +9,7 @@ use crate::graph::{
 };
 use crate::search::search::{SearchQuery, SearchResult};
 use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 /// Maximum wall-clock time allowed for generating a single query neural
@@ -24,6 +25,15 @@ use tracing::{debug, warn};
 const QUERY_EMBED_TIMEOUT_SECS: u64 = 15;
 
 impl LeIndex {
+    fn resolve_indexed_file_path(&self, file_path: &str) -> PathBuf {
+        let path = Path::new(file_path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.project_path.join(path)
+        }
+    }
+
     /// Search the indexed code
     ///
     /// # Arguments
@@ -119,10 +129,10 @@ impl LeIndex {
                         let file_path_str = node.file_path.to_string();
                         let needs_line = result.line_number.is_none();
                         if needs_line {
-                            let content =
-                                file_cache.entry(file_path_str.clone()).or_insert_with(|| {
-                                    std::fs::read(&file_path_str).unwrap_or_default()
-                                });
+                            let abs_path = self.resolve_indexed_file_path(&file_path_str);
+                            let content = file_cache
+                                .entry(file_path_str.clone())
+                                .or_insert_with(|| std::fs::read(abs_path).unwrap_or_default());
 
                             if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
                                 // Compute from byte_range
@@ -346,7 +356,8 @@ impl LeIndex {
         // which returns 0 for an empty slice (byte 0) and then filtered
         // that out, producing None instead of line 1.
         let line_number = if !file_path.is_empty() {
-            std::fs::read(&file_path).ok().map(|content| {
+            let abs_path = self.resolve_indexed_file_path(&file_path);
+            std::fs::read(abs_path).ok().map(|content| {
                 let offset = byte_range.0.min(content.len());
                 content[..offset].iter().filter(|&&b| b == b'\n').count() + 1
             })
@@ -640,10 +651,10 @@ impl LeIndex {
                         let file_path_str = node.file_path.to_string();
                         let needs_line = result.line_number.is_none();
                         if needs_line {
-                            let content =
-                                file_cache.entry(file_path_str.clone()).or_insert_with(|| {
-                                    std::fs::read(&file_path_str).unwrap_or_default()
-                                });
+                            let abs_path = self.resolve_indexed_file_path(&file_path_str);
+                            let content = file_cache
+                                .entry(file_path_str.clone())
+                                .or_insert_with(|| std::fs::read(abs_path).unwrap_or_default());
 
                             if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
                                 let byte_offset = node.byte_range.0.min(content.len());

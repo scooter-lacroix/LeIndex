@@ -3,7 +3,7 @@
 // VAL-CPHASE-010: Worker model resolution uses the documented precedence:
 // 1. Explicit env override (LEINDEX_MODEL_PATH)
 // 2. Bundled models near the binary
-// 3. User cache fallback (~/.leindex/models/)
+// 3. User cache fallback (~/.leindex/models/ or $LEINDEX_HOME/models/)
 //
 // The resolver is used by the worker runtime to locate model and tokenizer
 // files without requiring the main daemon to pass paths explicitly.
@@ -48,12 +48,26 @@ impl ModelResolver {
         dirs
     }
 
+    fn user_model_dirs() -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Some(configured) = crate::config::model_dir_path() {
+            dirs.push(configured);
+        }
+        if let Some(home) = dirs::home_dir() {
+            let default_home = home.join(".leindex").join("models");
+            if !dirs.iter().any(|dir| dir == &default_home) {
+                dirs.push(default_home);
+            }
+        }
+        dirs
+    }
+
     /// Resolve the ONNX model file path for the given model name.
     ///
     /// VAL-CPHASE-010: Uses the precedence chain:
     /// 1. LEINDEX_MODEL_PATH env override
     /// 2. Bundled models directory (relative to the worker binary)
-    /// 3. User cache directory (~/.leindex/models/)
+    /// 3. User cache directory (~/.leindex/models/ or $LEINDEX_HOME/models/)
     pub fn resolve(model_name: &str) -> Result<PathBuf, ModelResolutionError> {
         let model_filename = format!("{}.onnx", model_name);
 
@@ -76,8 +90,7 @@ impl ModelResolver {
         }
 
         // 3. User cache fallback
-        if let Some(home) = dirs::home_dir() {
-            let user_models = home.join(".leindex").join("models");
+        for user_models in Self::user_model_dirs() {
             let model_path = user_models.join(&model_filename);
             if model_path.exists() {
                 tracing::debug!("model resolved via user cache: {}", model_path.display());
@@ -117,8 +130,7 @@ impl ModelResolver {
         }
 
         // 3. User cache fallback
-        if let Some(home) = dirs::home_dir() {
-            let user_models = home.join(".leindex").join("models");
+        for user_models in Self::user_model_dirs() {
             let tokenizer_path = user_models.join("tokenizer.json");
             if tokenizer_path.exists() {
                 return Ok(tokenizer_path);
@@ -172,6 +184,7 @@ mod tests {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Clear any env override
         std::env::remove_var("LEINDEX_MODEL_PATH");
+        std::env::remove_var(crate::config::LEINDEX_HOME_ENV);
 
         let result = ModelResolver::resolve("nonexistent-model-xyz");
         assert!(result.is_err());
@@ -184,6 +197,7 @@ mod tests {
     fn test_resolve_tokenizer_not_found() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("LEINDEX_MODEL_PATH");
+        std::env::remove_var(crate::config::LEINDEX_HOME_ENV);
 
         // Use a model name guaranteed not to correspond to a real model. The
         // user-cache fallback only triggers when `tokenizer.json` actually
@@ -240,6 +254,24 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_with_leindex_home_models() {
+        let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("LEINDEX_MODEL_PATH");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let models_dir = temp_dir.path().join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let model_file = models_dir.join("home-model.onnx");
+        std::fs::write(&model_file, b"fake model").unwrap();
+
+        std::env::set_var(crate::config::LEINDEX_HOME_ENV, temp_dir.path());
+
+        let result = ModelResolver::resolve("home-model");
+        assert_eq!(result.unwrap(), model_file);
+
+        std::env::remove_var(crate::config::LEINDEX_HOME_ENV);
+    }
+
+    #[test]
     fn test_resolve_tokenizer_with_env_override() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::tempdir().unwrap();
@@ -253,6 +285,7 @@ mod tests {
         assert_eq!(result.unwrap(), tokenizer_file);
 
         std::env::remove_var("LEINDEX_MODEL_PATH");
+        std::env::remove_var(crate::config::LEINDEX_HOME_ENV);
     }
 
     #[test]

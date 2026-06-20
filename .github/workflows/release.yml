@@ -455,23 +455,45 @@ jobs:
           BIN_DIR="target/${{ matrix.target }}/release"
           for bin in leindex leindex-embed; do
             echo "Inspecting $BIN_DIR/$bin ..."
-            # 1. No NEEDED entry for libonnxruntime (ORT is dlopen'd).
-            if readelf -d "$BIN_DIR/$bin" | grep -E 'NEEDED' | grep -i onnxruntime; then
-              echo "::error::$bin has a NEEDED entry for libonnxruntime (expected load-dynamic)"
-              readelf -d "$BIN_DIR/$bin" | grep -i onnxruntime || true
-              exit 1
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              LOAD_DEPS=$(otool -L "$BIN_DIR/$bin")
+              # 1. No linked ONNX Runtime dylib (ORT is dlopen'd).
+              if echo "$LOAD_DEPS" | grep -i onnxruntime; then
+                echo "::error::$bin links libonnxruntime (expected load-dynamic)"
+                exit 1
+              fi
+              echo "  OK: no linked libonnxruntime in $bin"
+              # 2. No loader-relative rpath standing in for bundle lookup.
+              LOAD_COMMANDS=$(otool -l "$BIN_DIR/$bin")
+              RPATH_ENTRIES=$(echo "$LOAD_COMMANDS" | awk '/LC_RPATH/{flag=1} flag && /path /{print; flag=0}')
+              if echo "$RPATH_ENTRIES" | grep -Eq '\$ORIGIN|@loader_path'; then
+                echo "::error::$bin carries a loader-relative rpath entry: $RPATH_ENTRIES"
+                exit 1
+              fi
+              if [[ -n "$RPATH_ENTRIES" ]]; then
+                echo "  (non-loader-relative rpath entries are allowed): $RPATH_ENTRIES"
+              fi
+              echo "  OK: no loader-relative rpath in $bin"
+            else
+              DYNAMIC_SECTION=$(readelf -d "$BIN_DIR/$bin")
+              # 1. No NEEDED entry for libonnxruntime (ORT is dlopen'd).
+              if echo "$DYNAMIC_SECTION" | grep -E 'NEEDED' | grep -i onnxruntime; then
+                echo "::error::$bin has a NEEDED entry for libonnxruntime (expected load-dynamic)"
+                echo "$DYNAMIC_SECTION" | grep -i onnxruntime || true
+                exit 1
+              fi
+              echo "  OK: no NEEDED libonnxruntime in $bin"
+              # 2. No $ORIGIN rpath (load-dynamic discovery chain replaces it).
+              RPATH_ENTRIES=$(echo "$DYNAMIC_SECTION" | grep -Ei 'rpath|runpath' || true)
+              if echo "$RPATH_ENTRIES" | grep -q '\$ORIGIN'; then
+                echo "::error::$bin carries a \$ORIGIN rpath entry: $RPATH_ENTRIES"
+                exit 1
+              fi
+              if [[ -n "$RPATH_ENTRIES" ]]; then
+                echo "  (non-\$ORIGIN rpath entries are allowed): $RPATH_ENTRIES"
+              fi
+              echo "  OK: no \$ORIGIN rpath in $bin"
             fi
-            echo "  OK: no NEEDED libonnxruntime in $bin"
-            # 2. No $ORIGIN rpath (load-dynamic discovery chain replaces it).
-            RPATH_ENTRIES=$(readelf -d "$BIN_DIR/$bin" | grep -Ei 'rpath|runpath' || true)
-            if echo "$RPATH_ENTRIES" | grep -q '\$ORIGIN'; then
-              echo "::error::$bin carries a \$ORIGIN rpath entry: $RPATH_ENTRIES"
-              exit 1
-            fi
-            if [[ -n "$RPATH_ENTRIES" ]]; then
-              echo "  (non-\$ORIGIN rpath entries are allowed): $RPATH_ENTRIES"
-            fi
-            echo "  OK: no \$ORIGIN rpath in $bin"
           done
 
       - name: Package release bundle
@@ -491,8 +513,8 @@ jobs:
           # ── Copy ORT runtime libraries into lib/ ──
           # VAL-RELEASE-005/011: ORT is extracted from the pip wheel (above)
           # and bundled so users get a working neural path without a separate
-          # pip install. The worker discovers these via the sibling-lib
-          # discovery source (the directory next to the binary).
+          # pip install. The worker discovers these via the sibling bundle
+          # lib/ path (`bin/../lib`).
           #
           # The pip wheels only ship the versioned file
           # (libonnxruntime.so.1.25.0 / libonnxruntime.1.25.0.dylib). We

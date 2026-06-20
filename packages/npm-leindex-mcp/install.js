@@ -41,6 +41,18 @@ function getOrtLibNames() {
   return ['libonnxruntime.so'];
 }
 
+function isOrtRuntimeLibraryName(name) {
+  const lower = name.toLowerCase();
+  if (process.platform === 'win32') {
+    return lower === 'onnxruntime.dll';
+  }
+  if (process.platform === 'darwin') {
+    return lower === 'libonnxruntime.dylib'
+      || (lower.startsWith('libonnxruntime.') && lower.endsWith('.dylib'));
+  }
+  return lower === 'libonnxruntime.so' || lower.startsWith('libonnxruntime.so.');
+}
+
 /**
  * Copy a single file from `src` to `dst`, preserving symlinks and the
  * executable bit. Linux/macOS ORT bundles ship versioned symlinks like
@@ -533,7 +545,8 @@ async function installFromBundle(release) {
         }
       }
       console.log(`   ✓ ORT runtime libraries installed (${copiedCount} files, ${symlinkCount} symlinks) under lib/`);
-      if (copiedCount + symlinkCount === 0) {
+      const installedLibs = fs.readdirSync(LIB_DIR);
+      if (!installedLibs.some(isOrtRuntimeLibraryName)) {
         throw new Error('bundle lib/ directory did not contain any ORT runtime libraries');
       }
     } else {
@@ -732,6 +745,7 @@ module.exports = {
   getBundleAssetName,
   getOrtLibNames,
   getRequestedRelease,
+  isOrtRuntimeLibraryName,
   parseExpectedChecksum,
   parseReleaseVersion,
   resolveReleaseConfig,

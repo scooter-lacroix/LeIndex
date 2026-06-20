@@ -113,6 +113,16 @@ impl Provider {
 pub struct ExecutionProviderSelector;
 
 impl ExecutionProviderSelector {
+    fn rocm_path_has_migraphx() -> bool {
+        std::env::var("ROCM_PATH")
+            .map(|p| {
+                let rocm = std::path::Path::new(&p);
+                rocm.join("lib/libmigraphx_c.so").exists()
+                    || rocm.join("bin/migraphx-driver").exists()
+            })
+            .unwrap_or(false)
+    }
+
     /// Select an execution provider based on the requested name.
     ///
     /// VAL-CPHASE-011: Honors configured selection and reports fallback.
@@ -292,6 +302,7 @@ impl ExecutionProviderSelector {
             // MIGraphX when it's loaded as a shared provider plugin.
             if std::path::Path::new("/opt/rocm/lib/libmigraphx_c.so").exists()
                 || std::path::Path::new("/opt/rocm/bin/migraphx-driver").exists()
+                || Self::rocm_path_has_migraphx()
             {
                 tracing::debug!(
                     "MIGraphX not in GetAvailableProviders() but ROCm/MIGraphX \
@@ -306,13 +317,7 @@ impl ExecutionProviderSelector {
             // Conservative fallback: check for MIGraphX binary presence
             std::path::Path::new("/opt/rocm/bin/migraphx-driver").exists()
                 || std::path::Path::new("/opt/rocm/lib/libmigraphx_c.so").exists()
-                || std::env::var("ROCM_PATH")
-                    .map(|p| {
-                        std::path::Path::new(&p)
-                            .join("bin/migraphx-driver")
-                            .exists()
-                    })
-                    .unwrap_or(false)
+                || Self::rocm_path_has_migraphx()
         }
     }
 
@@ -544,6 +549,25 @@ mod tests {
         assert_eq!(sel.name(), "cpu");
         assert!(sel.is_requested_provider());
         assert_eq!(sel.reason(), "no fallback");
+    }
+
+    #[test]
+    fn test_rocm_path_migraphx_detection_checks_lib_and_bin() {
+        let temp = tempfile::tempdir().unwrap();
+        let rocm_lib = temp.path().join("lib");
+        std::fs::create_dir_all(&rocm_lib).unwrap();
+        std::fs::write(rocm_lib.join("libmigraphx_c.so"), b"fake").unwrap();
+
+        let old_rocm = std::env::var("ROCM_PATH").ok();
+        std::env::set_var("ROCM_PATH", temp.path());
+
+        assert!(ExecutionProviderSelector::rocm_path_has_migraphx());
+
+        if let Some(value) = old_rocm {
+            std::env::set_var("ROCM_PATH", value);
+        } else {
+            std::env::remove_var("ROCM_PATH");
+        }
     }
 
     // ── VAL-ORT-015 / VAL-ORT-016: dynamic-load compatibility helpers ────

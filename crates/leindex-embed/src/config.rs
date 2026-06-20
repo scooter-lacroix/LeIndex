@@ -289,16 +289,38 @@ impl LeIndexConfig {
             Err(parse_err) => {
                 // VAL-SETUP-029: Back up the corrupt config before overwriting
                 let backup_path = config_path.with_extension("toml.bak");
-                let _ = std::fs::rename(&config_path, &backup_path);
-                tracing::warn!(
-                    "Config file was corrupted: {}. Backed up to {}",
-                    parse_err,
-                    backup_path.display()
-                );
-                Ok((
-                    Self::default(),
-                    RecoveryAction::RecoveredFromCorrupt(backup_path),
-                ))
+                match std::fs::rename(&config_path, &backup_path) {
+                    Ok(()) => {
+                        tracing::warn!(
+                            "Config file was corrupted: {}. Backed up to {}",
+                            parse_err,
+                            backup_path.display()
+                        );
+                        Ok((
+                            Self::default(),
+                            RecoveryAction::RecoveredFromCorrupt(backup_path),
+                        ))
+                    }
+                    Err(rename_err) => {
+                        tracing::warn!(
+                            "Config file was corrupted: {}; failed to back up {} to {}: {}",
+                            parse_err,
+                            config_path.display(),
+                            backup_path.display(),
+                            rename_err
+                        );
+                        std::fs::remove_file(&config_path).map_err(|remove_err| {
+                            ConfigError::Io(
+                                config_path.clone(),
+                                format!(
+                                    "Failed to back up corrupt config ({}) and failed to remove it ({})",
+                                    rename_err, remove_err
+                                ),
+                            )
+                        })?;
+                        Ok((Self::default(), RecoveryAction::CreatedDefault))
+                    }
+                }
             }
         }
     }

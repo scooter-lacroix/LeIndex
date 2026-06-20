@@ -170,22 +170,14 @@ impl LeIndex {
         // so neural embeddings are available during incremental reindex.
         #[cfg(feature = "onnx")]
         let embedder = {
-            match index_builder::HybridEmbedder::hybrid_local(tfidf_embedder, None) {
+            match index_builder::HybridEmbedder::hybrid_local(tfidf_embedder.clone(), None) {
                 Ok(hybrid) => hybrid,
                 Err(e) => {
                     tracing::warn!(
                         "Failed to create hybrid_local embedder for incremental reindex (ONNX), falling back to tfidf_only: {}",
                         e
                     );
-                    // Rebuild tfidf_embedder since it was consumed by hybrid_local attempt
-                    let fallback =
-                        index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(
-                                || index_builder::TfIdfEmbedder::build_from_tokens(&[]),
-                            );
-                    index_builder::HybridEmbedder::tfidf_only(fallback)
+                    index_builder::HybridEmbedder::tfidf_only(tfidf_embedder)
                 }
             }
         };
@@ -716,18 +708,11 @@ impl LeIndex {
                 // VAL-ONNX-001: Wrap as hybrid_local when onnx feature is enabled
                 #[cfg(feature = "onnx")]
                 let hybrid_embedder = {
-                    match index_builder::HybridEmbedder::hybrid_local(embedder, None) {
+                    match index_builder::HybridEmbedder::hybrid_local(embedder.clone(), None) {
                         Ok(h) => h,
                         Err(e) => {
                             warn!("Failed to create hybrid_local from persisted embedder (ONNX), falling back to tfidf_only: {}", e);
-                            let fallback =
-                                index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
-                                    .ok()
-                                    .flatten()
-                                    .unwrap_or_else(|| {
-                                        index_builder::TfIdfEmbedder::build_from_tokens(&[])
-                                    });
-                            index_builder::HybridEmbedder::tfidf_only(fallback)
+                            index_builder::HybridEmbedder::tfidf_only(embedder)
                         }
                     }
                 };

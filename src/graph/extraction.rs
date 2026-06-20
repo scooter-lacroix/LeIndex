@@ -1054,7 +1054,7 @@ pub fn resolve_cross_file_call_edges(
     // Build lookup maps from the merged PDG nodes.
     // Node ids are formatted as "file_path:qualified_name".
     // We build maps keyed by various forms of the qualified name for resolution.
-    let mut qname_to_node: HashMap<String, NodeId> = HashMap::new();
+    let mut qname_to_node: HashMap<String, Vec<NodeId>> = HashMap::new();
     let mut exact_map: HashMap<String, Vec<NodeId>> = HashMap::new();
     let mut last_map: HashMap<String, Vec<NodeId>> = HashMap::new();
     let mut suffix_map: HashMap<String, Vec<NodeId>> = HashMap::new();
@@ -1075,17 +1075,17 @@ pub fn resolve_cross_file_call_edges(
                 .map(|(_, qn)| qn)
                 .unwrap_or(&node.id);
 
-            // Prefer non-module nodes for qname_to_node (don't overwrite
-            // a function/method node with a module node)
+            // Preserve all definitions for a qualified name. Cross-file
+            // extraction sees signatures without file ownership, so collapsing
+            // duplicate qnames here can attach calls to an arbitrary file.
             let is_module = node.node_type == crate::graph::pdg::NodeType::Module;
-            let should_insert = if is_module {
-                !qname_to_node.contains_key(qname)
+            if !is_module {
+                qname_to_node
+                    .entry(qname.to_string())
+                    .or_default()
+                    .push(nid);
             } else {
-                true
-            };
-
-            if should_insert {
-                qname_to_node.insert(qname.to_string(), nid);
+                qname_to_node.entry(qname.to_string()).or_default();
             }
 
             let normalized = normalize_symbol(qname);
@@ -1145,309 +1145,319 @@ pub fn resolve_cross_file_call_edges(
     let mut new_edges = Vec::new();
 
     for sig in all_signatures {
-        // Find the caller's node in the PDG
-        let caller_id = qname_to_node.get(&sig.qualified_name).copied();
-        let caller_id = match caller_id {
-            Some(id) => id,
+        // Find every matching caller node in the PDG. The signature payload
+        // does not retain file path, so duplicate qualified names must not be
+        // collapsed to a single overwritten NodeId.
+        let caller_ids = match qname_to_node.get(&sig.qualified_name) {
+            Some(ids) if !ids.is_empty() => ids.clone(),
             None => continue,
+            _ => continue,
         };
 
-        let caller_ns = {
-            let norm = normalize_symbol(&sig.qualified_name);
-            let segs: Vec<&str> = norm.split('.').collect();
-            if segs.len() > 1 {
-                Some(segs[..segs.len() - 1].join("."))
-            } else {
-                None
-            }
-        };
-
-        for call_target in &sig.calls {
-            let mut candidates = vec![call_target.clone()];
-
-            let call_segs: Vec<String> = normalize_symbol(call_target)
-                .split('.')
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect();
-
-            // Resolve via import aliases
-            if let Some(first) = call_segs.first() {
-                if let Some(import_path) = alias_map.get(first) {
-                    if call_segs.len() == 1 {
-                        candidates.push(import_path.clone());
-                    } else {
-                        candidates.push(format!("{}.{}", import_path, call_segs[1..].join(".")));
-                    }
+        for caller_id in caller_ids {
+            let caller_ns = {
+                let norm = normalize_symbol(&sig.qualified_name);
+                let segs: Vec<&str> = norm.split('.').collect();
+                if segs.len() > 1 {
+                    Some(segs[..segs.len() - 1].join("."))
+                } else {
+                    None
                 }
-            }
+            };
 
-            // Resolve via caller namespace (self.method, super::method, etc.)
-            if let Some(ns) = &caller_ns {
-                if let Some(first) = call_segs.first() {
-                    if matches!(
-                        first.as_str(),
-                        "self" | "this" | "super" | "Self" | "crate" | "base"
-                    ) {
-                        let rest = call_segs[1..].join(".");
-                        if !rest.is_empty() {
-                            candidates.push(format!("{}.{}", ns, rest));
-                        }
-                    } else if call_segs.len() == 1 {
-                        // Bare function call - try resolving in caller's namespace
-                        candidates.push(format!("{}.{}", ns, first));
-                    }
-                }
-            }
+            for call_target in &sig.calls {
+                let mut candidates = vec![call_target.clone()];
 
-            // Try to resolve each candidate against the global maps
-            let mut targets: Vec<NodeId> = Vec::new();
-            let mut last_segment_fallback: Option<String> = None;
-            for candidate in &candidates {
-                let norm = normalize_symbol(candidate);
-                let segs: Vec<String> = norm
+                let call_segs: Vec<String> = normalize_symbol(call_target)
                     .split('.')
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string())
                     .collect();
 
-                // 1. Try exact match first (highest confidence)
-                if let Some(ids) = exact_map.get(&norm) {
-                    targets.extend(ids.iter().copied());
-                }
-
-                // 2. Try suffix matching (2-3 segments from the end)
-                // This handles cases like `module.function_name` or `class.method_name`
-                for len in 2..=3_usize.min(segs.len()) {
-                    let start = segs.len() - len;
-                    let key = segs[start..].join(".");
-                    if let Some(ids) = suffix_map.get(&key) {
-                        targets.extend(ids.iter().copied());
-                    }
-                }
-
-                // 3. For bare names (single segment), use last_map
-                if segs.len() == 1 {
-                    if let Some(ids) = last_map.get(&norm) {
-                        targets.extend(ids.iter().copied());
-                    }
-                }
-
-                // 4. Track last segment for fallback (see below)
-                if last_segment_fallback.is_none() {
-                    if let Some(last) = segs.last() {
-                        last_segment_fallback = Some(last.clone());
-                    }
-                }
-            }
-
-            // 5. Fallback: if no targets found via exact/suffix matching,
-            // try matching the last segment of the call target against
-            // node names. This handles fully-qualified calls like
-            // `crate::module::function_name` where the PDG node only has
-            // the bare name `function_name`.
-            if targets.is_empty() {
-                if let Some(last_seg) = last_segment_fallback {
-                    // Only do this for non-trivial names (avoid matching
-                    // common method names like `clone`, `name`, `new`, etc.)
-                    const COMMON_NAMES: &[&str] = &[
-                        "new",
-                        "clone",
-                        "name",
-                        "len",
-                        "get",
-                        "set",
-                        "add",
-                        "remove",
-                        "push",
-                        "pop",
-                        "iter",
-                        "next",
-                        "send",
-                        "recv",
-                        "read",
-                        "write",
-                        "open",
-                        "close",
-                        "start",
-                        "stop",
-                        "run",
-                        "exec",
-                        "call",
-                        "apply",
-                        "map",
-                        "filter",
-                        "fold",
-                        "collect",
-                        "into",
-                        "from",
-                        "to",
-                        "as",
-                        "is",
-                        "has",
-                        "can",
-                        "should",
-                        "will",
-                        "do",
-                        "done",
-                        "ok",
-                        "err",
-                        "some",
-                        "none",
-                        "true",
-                        "false",
-                        "nil",
-                        "null",
-                        "self",
-                        "super",
-                        "init",
-                        "free",
-                        "drop",
-                        "copy",
-                        "dup",
-                        "swap",
-                        "cmp",
-                        "eq",
-                        "ne",
-                        "lt",
-                        "le",
-                        "gt",
-                        "ge",
-                        "hash",
-                        "fmt",
-                        "dbg",
-                        "print",
-                        "println",
-                        "format",
-                        "parse",
-                        "unwrap",
-                        "expect",
-                        "ok_or",
-                        "ok_or_else",
-                        "map_err",
-                        "and_then",
-                        "or_else",
-                        "unwrap_or",
-                        "unwrap_or_else",
-                        "unwrap_or_default",
-                        "is_some",
-                        "is_none",
-                        "is_ok",
-                        "is_err",
-                        "as_ref",
-                        "as_mut",
-                        "as_str",
-                        "as_bytes",
-                        "trim",
-                        "split",
-                        "join",
-                        "replace",
-                        "contains",
-                        "starts_with",
-                        "ends_with",
-                        "find",
-                        "rfind",
-                        "matches",
-                        "parse",
-                        "to_string",
-                        "to_owned",
-                        "to_vec",
-                        "into_string",
-                        "into_bytes",
-                        "into_vec",
-                        "iter",
-                        "into_iter",
-                        "keys",
-                        "values",
-                        "entries",
-                        // Additional common names that produce false positives
-                        "execute",
-                        "handle",
-                        "process",
-                        "update",
-                        "create",
-                        "delete",
-                        "save",
-                        "load",
-                        "fetch",
-                        "build",
-                        "make",
-                        "spawn",
-                        "fork",
-                        "warn",
-                        "info",
-                        "error",
-                        "trace",
-                        "debug",
-                        "log",
-                        "json",
-                        "yaml",
-                        "toml",
-                        "xml",
-                        "html",
-                        "csv",
-                        "Ok",
-                        "Err",
-                        "Some",
-                        "None",
-                        "Result",
-                        "Option",
-                        "Vec",
-                        "Box",
-                        "Rc",
-                        "Arc",
-                        "Cell",
-                        "RefCell",
-                        "Mutex",
-                        "RwLock",
-                        "String",
-                        "str",
-                        "Vec",
-                        "HashMap",
-                        "HashSet",
-                        "BTreeMap",
-                        "BTreeSet",
-                        "VecDeque",
-                        "LinkedList",
-                        "JsonRpcError",
-                        "Error",
-                        "Result",
-                        "Response",
-                        "Request",
-                        "Value",
-                        "serde",
-                        "serde_json",
-                        "display",
-                        "render",
-                    ];
-                    if !COMMON_NAMES.contains(&last_seg.as_str()) && last_seg.len() > 2 {
-                        if let Some(ids) = last_map.get(&last_seg) {
-                            targets.extend(ids.iter().copied());
+                // Resolve via import aliases
+                if let Some(first) = call_segs.first() {
+                    if let Some(import_path) = alias_map.get(first) {
+                        if call_segs.len() == 1 {
+                            candidates.push(import_path.clone());
+                        } else {
+                            candidates.push(format!(
+                                "{}.{}",
+                                import_path,
+                                call_segs[1..].join(".")
+                            ));
                         }
                     }
                 }
-            }
 
-            for target_id in targets {
-                if caller_id != target_id && !existing_edges.contains(&(caller_id, target_id)) {
-                    existing_edges.insert((caller_id, target_id));
-                    new_edges.push((caller_id, target_id));
+                // Resolve via caller namespace (self.method, super::method, etc.)
+                if let Some(ns) = &caller_ns {
+                    if let Some(first) = call_segs.first() {
+                        if matches!(
+                            first.as_str(),
+                            "self" | "this" | "super" | "Self" | "crate" | "base"
+                        ) {
+                            let rest = call_segs[1..].join(".");
+                            if !rest.is_empty() {
+                                candidates.push(format!("{}.{}", ns, rest));
+                            }
+                        } else if call_segs.len() == 1 {
+                            // Bare function call - try resolving in caller's namespace
+                            candidates.push(format!("{}.{}", ns, first));
+                        }
+                    }
                 }
-            }
-            let callee_name = normalize_symbol(call_target);
-            if let Some((scoped_prefix, _member)) = callee_name.rsplit_once('.') {
-                let bare_type = scoped_prefix.rsplit('.').next().unwrap_or(scoped_prefix);
-                let looks_like_type = bare_type.chars().next().is_some_and(|c| c.is_uppercase());
-                if looks_like_type {
-                    let struct_nid = qname_to_node
-                        .get(scoped_prefix)
-                        .or_else(|| last_map.get(bare_type).and_then(|v| v.first()))
-                        .copied();
-                    if let Some(snid) = struct_nid {
-                        let pair = (caller_id, snid);
-                        if !existing_edges.contains(&pair) {
-                            existing_edges.insert(pair);
-                            new_edges.push(pair);
+
+                // Try to resolve each candidate against the global maps
+                let mut targets: Vec<NodeId> = Vec::new();
+                let mut last_segment_fallback: Option<String> = None;
+                for candidate in &candidates {
+                    let norm = normalize_symbol(candidate);
+                    let segs: Vec<String> = norm
+                        .split('.')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect();
+
+                    // 1. Try exact match first (highest confidence)
+                    if let Some(ids) = exact_map.get(&norm) {
+                        targets.extend(ids.iter().copied());
+                    }
+
+                    // 2. Try suffix matching (2-3 segments from the end)
+                    // This handles cases like `module.function_name` or `class.method_name`
+                    for len in 2..=3_usize.min(segs.len()) {
+                        let start = segs.len() - len;
+                        let key = segs[start..].join(".");
+                        if let Some(ids) = suffix_map.get(&key) {
+                            targets.extend(ids.iter().copied());
+                        }
+                    }
+
+                    // 3. For bare names (single segment), use last_map
+                    if segs.len() == 1 {
+                        if let Some(ids) = last_map.get(&norm) {
+                            targets.extend(ids.iter().copied());
+                        }
+                    }
+
+                    // 4. Track last segment for fallback (see below)
+                    if last_segment_fallback.is_none() {
+                        if let Some(last) = segs.last() {
+                            last_segment_fallback = Some(last.clone());
+                        }
+                    }
+                }
+
+                // 5. Fallback: if no targets found via exact/suffix matching,
+                // try matching the last segment of the call target against
+                // node names. This handles fully-qualified calls like
+                // `crate::module::function_name` where the PDG node only has
+                // the bare name `function_name`.
+                if targets.is_empty() {
+                    if let Some(last_seg) = last_segment_fallback {
+                        // Only do this for non-trivial names (avoid matching
+                        // common method names like `clone`, `name`, `new`, etc.)
+                        const COMMON_NAMES: &[&str] = &[
+                            "new",
+                            "clone",
+                            "name",
+                            "len",
+                            "get",
+                            "set",
+                            "add",
+                            "remove",
+                            "push",
+                            "pop",
+                            "iter",
+                            "next",
+                            "send",
+                            "recv",
+                            "read",
+                            "write",
+                            "open",
+                            "close",
+                            "start",
+                            "stop",
+                            "run",
+                            "exec",
+                            "call",
+                            "apply",
+                            "map",
+                            "filter",
+                            "fold",
+                            "collect",
+                            "into",
+                            "from",
+                            "to",
+                            "as",
+                            "is",
+                            "has",
+                            "can",
+                            "should",
+                            "will",
+                            "do",
+                            "done",
+                            "ok",
+                            "err",
+                            "some",
+                            "none",
+                            "true",
+                            "false",
+                            "nil",
+                            "null",
+                            "self",
+                            "super",
+                            "init",
+                            "free",
+                            "drop",
+                            "copy",
+                            "dup",
+                            "swap",
+                            "cmp",
+                            "eq",
+                            "ne",
+                            "lt",
+                            "le",
+                            "gt",
+                            "ge",
+                            "hash",
+                            "fmt",
+                            "dbg",
+                            "print",
+                            "println",
+                            "format",
+                            "parse",
+                            "unwrap",
+                            "expect",
+                            "ok_or",
+                            "ok_or_else",
+                            "map_err",
+                            "and_then",
+                            "or_else",
+                            "unwrap_or",
+                            "unwrap_or_else",
+                            "unwrap_or_default",
+                            "is_some",
+                            "is_none",
+                            "is_ok",
+                            "is_err",
+                            "as_ref",
+                            "as_mut",
+                            "as_str",
+                            "as_bytes",
+                            "trim",
+                            "split",
+                            "join",
+                            "replace",
+                            "contains",
+                            "starts_with",
+                            "ends_with",
+                            "find",
+                            "rfind",
+                            "matches",
+                            "parse",
+                            "to_string",
+                            "to_owned",
+                            "to_vec",
+                            "into_string",
+                            "into_bytes",
+                            "into_vec",
+                            "iter",
+                            "into_iter",
+                            "keys",
+                            "values",
+                            "entries",
+                            // Additional common names that produce false positives
+                            "execute",
+                            "handle",
+                            "process",
+                            "update",
+                            "create",
+                            "delete",
+                            "save",
+                            "load",
+                            "fetch",
+                            "build",
+                            "make",
+                            "spawn",
+                            "fork",
+                            "warn",
+                            "info",
+                            "error",
+                            "trace",
+                            "debug",
+                            "log",
+                            "json",
+                            "yaml",
+                            "toml",
+                            "xml",
+                            "html",
+                            "csv",
+                            "Ok",
+                            "Err",
+                            "Some",
+                            "None",
+                            "Result",
+                            "Option",
+                            "Vec",
+                            "Box",
+                            "Rc",
+                            "Arc",
+                            "Cell",
+                            "RefCell",
+                            "Mutex",
+                            "RwLock",
+                            "String",
+                            "str",
+                            "Vec",
+                            "HashMap",
+                            "HashSet",
+                            "BTreeMap",
+                            "BTreeSet",
+                            "VecDeque",
+                            "LinkedList",
+                            "JsonRpcError",
+                            "Error",
+                            "Result",
+                            "Response",
+                            "Request",
+                            "Value",
+                            "serde",
+                            "serde_json",
+                            "display",
+                            "render",
+                        ];
+                        if !COMMON_NAMES.contains(&last_seg.as_str()) && last_seg.len() > 2 {
+                            if let Some(ids) = last_map.get(&last_seg) {
+                                targets.extend(ids.iter().copied());
+                            }
+                        }
+                    }
+                }
+
+                for target_id in targets {
+                    if caller_id != target_id && !existing_edges.contains(&(caller_id, target_id)) {
+                        existing_edges.insert((caller_id, target_id));
+                        new_edges.push((caller_id, target_id));
+                    }
+                }
+                let callee_name = normalize_symbol(call_target);
+                if let Some((scoped_prefix, _member)) = callee_name.rsplit_once('.') {
+                    let bare_type = scoped_prefix.rsplit('.').next().unwrap_or(scoped_prefix);
+                    let looks_like_type =
+                        bare_type.chars().next().is_some_and(|c| c.is_uppercase());
+                    if looks_like_type {
+                        let struct_nid = qname_to_node
+                            .get(scoped_prefix)
+                            .and_then(|v| v.first())
+                            .or_else(|| last_map.get(bare_type).and_then(|v| v.first()))
+                            .copied();
+                        if let Some(snid) = struct_nid {
+                            let pair = (caller_id, snid);
+                            if !existing_edges.contains(&pair) {
+                                existing_edges.insert(pair);
+                                new_edges.push(pair);
+                            }
                         }
                     }
                 }
@@ -2327,6 +2337,29 @@ mod tests {
         }
     }
 
+    fn has_call_edge_from_file(
+        pdg: &ProgramDependenceGraph,
+        caller_file: &str,
+        caller_name: &str,
+        callee_name: &str,
+    ) -> bool {
+        let caller_nid = pdg.node_indices().find(|&n| {
+            pdg.get_node(n)
+                .map(|node| node.file_path.as_ref() == caller_file && &*node.name == caller_name)
+                .unwrap_or(false)
+        });
+        let callee_nid = pdg.node_indices().find(|&n| {
+            pdg.get_node(n)
+                .map(|node| &*node.name == callee_name)
+                .unwrap_or(false)
+        });
+
+        match (caller_nid, callee_nid) {
+            (Some(c), Some(d)) => pdg.neighbors(c).contains(&d),
+            _ => false,
+        }
+    }
+
     /// Tier 1: Exact match - caller references callee by exact qualified name
     #[test]
     fn cross_file_exact_match() {
@@ -2595,5 +2628,32 @@ mod tests {
             edges_before, edges_after,
             "Short name 'fn' (len=2) should NOT be resolved via last-segment fallback"
         );
+    }
+
+    #[test]
+    fn cross_file_duplicate_qnames_do_not_overwrite_callers() {
+        let mut caller_a = sig("caller", "caller", false);
+        caller_a.calls.push("target".to_string());
+        let mut caller_b = sig("caller", "caller", false);
+        caller_b.calls.push("target".to_string());
+        let callee = sig("target", "target", false);
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller_a.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![caller_b.clone()], b"", "b.rs", "rust");
+        let pdg_c = extract_pdg_from_signatures(vec![callee.clone()], b"", "c.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for source in [&pdg_a, &pdg_b, &pdg_c] {
+            for nid in source.node_indices() {
+                if let Some(node) = source.get_node(nid) {
+                    merged.add_node(node.clone());
+                }
+            }
+        }
+
+        resolve_cross_file_call_edges(&mut merged, &[caller_a, caller_b, callee]);
+
+        assert!(has_call_edge_from_file(&merged, "a.rs", "caller", "target"));
+        assert!(has_call_edge_from_file(&merged, "b.rs", "caller", "target"));
     }
 }

@@ -70,6 +70,7 @@ console.log('  ✓ Wrapper executes with argv arrays and exposes worker/model pa
 console.log('Test 5b: ORT_DYLIB_PATH detection helpers');
 assert.strictEqual(typeof installer.getOrtLibNames, 'function', 'install.js should expose getOrtLibNames');
 assert.strictEqual(typeof installer.copyBundledEntry, 'function', 'install.js should expose copyBundledEntry');
+assert.strictEqual(typeof installer.isOrtRuntimeLibraryName, 'function', 'install.js should expose isOrtRuntimeLibraryName');
 assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js LIB_DIR should point at <pkg>/lib');
 {
   const names = installer.getOrtLibNames();
@@ -77,6 +78,8 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
     : process.platform === 'darwin' ? 'libonnxruntime.dylib'
     : 'libonnxruntime.so';
   assert(Array.isArray(names) && names.includes(expected), `getOrtLibNames() should include ${expected} on ${process.platform}`);
+  assert(installer.isOrtRuntimeLibraryName(expected), `${expected} should be accepted as the ORT runtime`);
+  assert(!installer.isOrtRuntimeLibraryName('libonnxruntime_providers_shared.so'), 'provider helper libraries are not the ORT runtime');
 }
 {
   // copyBundledEntry should preserve a regular file when copying.
