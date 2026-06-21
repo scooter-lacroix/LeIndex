@@ -529,8 +529,8 @@ impl ExternalDependencyRegistry {
     /// element is `"name@version"`.  The `workspaces` section contains
     /// `dependencies` and `devDependencies` maps with version constraints.
     fn parse_bun_lock(&mut self, content: &str) {
-        // bun.lock uses JSONC (trailing commas). Strip them before parsing.
-        let cleaned = strip_trailing_commas(content);
+        // bun.lock uses JSONC comments and trailing commas. Normalize it before parsing.
+        let cleaned = strip_trailing_commas(&strip_jsonc_comments(content));
         let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&cleaned) else {
             return;
         };
@@ -914,6 +914,69 @@ fn normalise_import(raw: &str) -> String {
 /// Remove surrounding quotes from a TOML/YAML/JSON-like value.
 fn unquote(s: &str) -> String {
     s.trim().trim_matches('"').trim_matches('\'').to_string()
+}
+
+fn strip_jsonc_comments(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut chars = content.chars().peekable();
+    let mut in_string = false;
+
+    while let Some(c) = chars.next() {
+        if in_string {
+            result.push(c);
+            if c == '"' {
+                let mut backslashes = 0usize;
+                for prev in result[..result.len() - c.len_utf8()].chars().rev() {
+                    if prev == '\\' {
+                        backslashes += 1;
+                    } else {
+                        break;
+                    }
+                }
+                if backslashes % 2 == 0 {
+                    in_string = false;
+                }
+            }
+            continue;
+        }
+
+        if c == '"' {
+            in_string = true;
+            result.push(c);
+            continue;
+        }
+
+        if c == '/' {
+            match chars.peek().copied() {
+                Some('/') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            result.push('\n');
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut prev = '\0';
+                    for next in chars.by_ref() {
+                        if prev == '*' && next == '/' {
+                            break;
+                        }
+                        prev = next;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        result.push(c);
+    }
+
+    result
 }
 
 /// Strip trailing commas from JSONC content to make it valid JSON.
@@ -2041,6 +2104,22 @@ PLATFORMS
         // Workspace deps that aren't in packages should be included as fallback
         let ts = registry.resolve("typescript").unwrap();
         assert_eq!(ts.version, "^5.4.0");
+    }
+
+    #[test]
+    fn parse_bun_lock_with_jsonc_comments() {
+        let content = r#"{
+  // top-level comment
+  "packages": {
+    "react": ["react@18.2.0", "", {}, "sha512-abc="], /* inline block comment */
+    "urlish": ["urlish@1.0.0", "", {"homepage": "https://example.com/a//b"}, "sha512-def="],
+  },
+}"#;
+        let mut registry = ExternalDependencyRegistry::new();
+        registry.parse_bun_lock(content);
+
+        assert_eq!(registry.resolve("react").unwrap().version, "18.2.0");
+        assert_eq!(registry.resolve("urlish").unwrap().version, "1.0.0");
     }
 
     #[test]

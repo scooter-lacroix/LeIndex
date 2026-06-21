@@ -67,6 +67,46 @@ function isOrtBundleLibraryName(name) {
   return lower.startsWith('libonnxruntime_providers_') && (lower.endsWith('.so') || /\.so\.\d/.test(lower));
 }
 
+function isPathInside(parent, child) {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function assertSafeArchiveFileName(name) {
+  if (!name || name !== path.basename(name) || name !== path.win32.basename(name) || name.includes('..')) {
+    throw new Error(`Unsafe release asset name: ${name}`);
+  }
+  return name;
+}
+
+function isSafeArchiveMemberName(name) {
+  if (!name || name.includes('\0') || path.isAbsolute(name) || path.win32.isAbsolute(name)) {
+    return false;
+  }
+  const normalized = path.posix.normalize(name.replace(/\\/g, '/'));
+  return normalized !== '..' && !normalized.startsWith('../') && !normalized.includes('/../');
+}
+
+function validateArchiveMemberNames(names) {
+  for (const name of names) {
+    if (!isSafeArchiveMemberName(name)) {
+      throw new Error(`Unsafe archive member path: ${name}`);
+    }
+  }
+}
+
+function assertSafeSymlinkTarget(src, target) {
+  if (!target || target.includes('\0') || path.isAbsolute(target) || path.win32.isAbsolute(target)) {
+    throw new Error(`Unsafe symlink target for ${path.basename(src)}: ${target}`);
+  }
+  const srcDir = path.dirname(src);
+  const resolvedTarget = path.resolve(srcDir, target);
+  if (!isPathInside(srcDir, resolvedTarget)) {
+    throw new Error(`Unsafe symlink target for ${path.basename(src)}: ${target}`);
+  }
+  return resolvedTarget;
+}
+
 /**
  * Copy a single file from `src` to `dst`, preserving symlinks and the
  * executable bit. Linux/macOS ORT bundles ship versioned symlinks like
@@ -82,14 +122,16 @@ function copyBundledEntry(src, dst) {
 
   if (stat.isSymbolicLink()) {
     const target = fs.readlinkSync(src);
+    const resolvedTarget = assertSafeSymlinkTarget(src, target);
     try {
       fs.symlinkSync(target, dst);
+      return 'symlink';
     } catch (err) {
       // Some filesystems / Windows without dev mode reject symlinks;
       // fall back to copying the link target so the file still exists.
-      fs.copyFileSync(src, dst);
+      fs.copyFileSync(resolvedTarget, dst);
     }
-    return 'symlink';
+    return 'file';
   }
 
   fs.copyFileSync(src, dst);
@@ -417,20 +459,40 @@ function verifyChecksum(filePath, expectedChecksum) {
  * Places bin/ contents into BIN_DIR and models/ contents into MODELS_DIR.
  */
 function extractTarGz(archivePath, destDir) {
-  const tar = require('child_process');
-  // Use system tar for reliable extraction
-  tar.execSync(`tar xzf "${archivePath}" -C "${destDir}"`, { stdio: 'pipe' });
+  const members = execFileSync('tar', ['tzf', archivePath], { encoding: 'utf8' })
+    .split(/\r?\n/)
+    .filter(Boolean);
+  validateArchiveMemberNames(members);
+  execFileSync('tar', ['xzf', archivePath, '-C', destDir], { stdio: 'pipe' });
 }
 
 /**
  * Extract a zip bundle using PowerShell (Windows) or unzip.
  */
 function extractZip(archivePath, destDir) {
-  const tar = require('child_process');
   if (process.platform === 'win32') {
-    tar.execSync(`powershell -Command "Expand-Archive -Path '${archivePath}' -DestinationPath '${destDir}' -Force"`, { stdio: 'pipe' });
+    const members = execFileSync('powershell', [
+      '-NoProfile',
+      '-Command',
+      'Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::OpenRead($args[0]).Entries | ForEach-Object { $_.FullName }',
+      archivePath
+    ], { encoding: 'utf8' })
+      .split(/\r?\n/)
+      .filter(Boolean);
+    validateArchiveMemberNames(members);
+    execFileSync('powershell', [
+      '-NoProfile',
+      '-Command',
+      'Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force',
+      archivePath,
+      destDir
+    ], { stdio: 'pipe' });
   } else {
-    tar.execSync(`unzip -o "${archivePath}" -d "${destDir}"`, { stdio: 'pipe' });
+    const members = execFileSync('unzip', ['-Z', '-1', archivePath], { encoding: 'utf8' })
+      .split(/\r?\n/)
+      .filter(Boolean);
+    validateArchiveMemberNames(members);
+    execFileSync('unzip', ['-o', archivePath, '-d', destDir], { stdio: 'pipe' });
   }
 }
 
@@ -440,7 +502,8 @@ function extractZip(archivePath, destDir) {
 async function installFromBundle(release) {
   const tempDir = path.join(BIN_DIR, '.bundle-tmp');
   const archiveExt = release.assetName.endsWith('.zip') ? '.zip' : '.tar.gz';
-  const archivePath = path.join(tempDir, release.assetName);
+  const safeAssetName = assertSafeArchiveFileName(release.assetName);
+  const archivePath = path.join(tempDir, safeAssetName);
 
   // Clean up any previous attempt
   if (fs.existsSync(tempDir)) {
@@ -771,6 +834,9 @@ module.exports = {
   getBundleAssetName,
   getOrtLibNames,
   getRequestedRelease,
+  assertSafeArchiveFileName,
+  assertSafeSymlinkTarget,
+  isSafeArchiveMemberName,
   isOrtBundleLibraryName,
   isOrtRuntimeLibraryName,
   parseExpectedChecksum,

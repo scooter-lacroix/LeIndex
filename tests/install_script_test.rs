@@ -258,6 +258,21 @@ mod bundle_consumption {
             "install.sh should attempt to download the pre-built release bundle"
         );
     }
+
+    #[test]
+    fn release_bundle_path_runs_before_rust_gate() {
+        let sh = install_sh();
+        let bundle_idx = sh
+            .find("try_install_from_release_bundle")
+            .expect("install.sh must try release bundle install");
+        let rust_idx = sh
+            .find("Rust is not installed or is too old")
+            .expect("install.sh must still validate Rust before source build fallback");
+        assert!(
+            bundle_idx < rust_idx,
+            "pre-built bundle install must be attempted before prompting for Rust"
+        );
+    }
 }
 
 // ============================================================================
@@ -387,6 +402,16 @@ mod exit_handling {
         assert!(
             script.contains("setup_exit=$?"),
             "run_setup_check must capture setup --check exit status"
+        );
+    }
+
+    #[test]
+    fn verify_installation_does_not_require_repo_cargo_toml() {
+        let script = install_sh();
+        assert!(
+            script.contains(r#"if [[ -f "Cargo.toml" ]]"#)
+                && script.contains(r#"expected_version="$SCRIPT_VERSION""#),
+            "verify_installation must fall back to SCRIPT_VERSION when install.sh runs outside a repo checkout"
         );
     }
 

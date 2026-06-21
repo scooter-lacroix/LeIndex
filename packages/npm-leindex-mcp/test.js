@@ -70,6 +70,9 @@ console.log('  ✓ Wrapper executes with argv arrays and exposes worker/model pa
 console.log('Test 5b: ORT_DYLIB_PATH detection helpers');
 assert.strictEqual(typeof installer.getOrtLibNames, 'function', 'install.js should expose getOrtLibNames');
 assert.strictEqual(typeof installer.copyBundledEntry, 'function', 'install.js should expose copyBundledEntry');
+assert.strictEqual(typeof installer.assertSafeArchiveFileName, 'function', 'install.js should expose assertSafeArchiveFileName');
+assert.strictEqual(typeof installer.assertSafeSymlinkTarget, 'function', 'install.js should expose assertSafeSymlinkTarget');
+assert.strictEqual(typeof installer.isSafeArchiveMemberName, 'function', 'install.js should expose isSafeArchiveMemberName');
 assert.strictEqual(typeof installer.isOrtBundleLibraryName, 'function', 'install.js should expose isOrtBundleLibraryName');
 assert.strictEqual(typeof installer.isOrtRuntimeLibraryName, 'function', 'install.js should expose isOrtRuntimeLibraryName');
 assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js LIB_DIR should point at <pkg>/lib');
@@ -87,6 +90,13 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
   assert(installer.isOrtBundleLibraryName(expected), `${expected} should be accepted as a bundle library`);
   assert(installer.isOrtBundleLibraryName(providerHelper), 'provider helper libraries should be accepted as bundle libraries');
   assert(!installer.isOrtBundleLibraryName('README.txt'), 'non-library files should not be accepted as bundle libraries');
+  assert.strictEqual(installer.assertSafeArchiveFileName('leindex-1.8.3-linux-x86_64.tar.gz'), 'leindex-1.8.3-linux-x86_64.tar.gz');
+  assert.throws(() => installer.assertSafeArchiveFileName('../leindex.tar.gz'), /Unsafe release asset name/);
+  assert.throws(() => installer.assertSafeArchiveFileName('..\\leindex.zip'), /Unsafe release asset name/);
+  assert(installer.isSafeArchiveMemberName('leindex-1.8.3-linux-x86_64/bin/leindex'));
+  assert(!installer.isSafeArchiveMemberName('../../etc/passwd'));
+  assert(!installer.isSafeArchiveMemberName('/tmp/pwned'));
+  assert(!installer.isSafeArchiveMemberName('C:\\temp\\pwned'));
 }
 {
   // copyBundledEntry should preserve a regular file when copying.
@@ -131,6 +141,32 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
       assert.strictEqual(kind, 'file', 'copyBundledEntry fallback should report "file"');
       assert.strictEqual(fs.readFileSync(dstLink, 'utf8'), 'fake-ort-versioned', 'fallback should copy the link target content');
     }
+    }
+  } finally {
+    fs.rmSync(tmpA, { recursive: true, force: true });
+    fs.rmSync(tmpB, { recursive: true, force: true });
+  }
+}
+{
+  // copyBundledEntry must reject symlinks that escape the bundle lib directory.
+  const tmpA = fs.mkdtempSync(path.join(os.tmpdir(), 'leindex-mcp-lib-'));
+  const tmpB = fs.mkdtempSync(path.join(os.tmpdir(), 'leindex-mcp-lib-'));
+  const link = path.join(tmpA, 'libonnxruntime.so');
+  try {
+    let symlinkCreated = false;
+    try {
+      fs.symlinkSync('../../etc/passwd', link);
+      symlinkCreated = true;
+    } catch (err) {
+      const unsupported = ['EPERM', 'EACCES', 'ENOTSUP', 'EINVAL'].includes(err && err.code);
+      if (!unsupported) throw err;
+    }
+    if (symlinkCreated) {
+      assert.throws(
+        () => installer.copyBundledEntry(link, path.join(tmpB, 'libonnxruntime.so')),
+        /Unsafe symlink target/,
+        'copyBundledEntry should reject symlinks that traverse outside the source directory'
+      );
     }
   } finally {
     fs.rmSync(tmpA, { recursive: true, force: true });

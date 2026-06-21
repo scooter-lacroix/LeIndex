@@ -1884,7 +1884,7 @@ async fn cmd_setup_impl(
         let result = setup::run_check().map_err(|e| anyhow::anyhow!("{}", e))?;
         // Exit code reflects completeness
         if !result.fully_configured {
-            std::process::exit(1);
+            anyhow::bail!("setup check incomplete");
         }
         return Ok(());
     }
@@ -1936,7 +1936,7 @@ async fn cmd_setup_impl(
     // the user has actionable diagnostics.
     if let Some(ref smoke) = result.smoke_test {
         if !smoke.passed {
-            std::process::exit(1);
+            anyhow::bail!("setup smoke test failed");
         }
     }
 

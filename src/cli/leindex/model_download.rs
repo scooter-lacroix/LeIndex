@@ -351,8 +351,6 @@ pub fn download_file_with_retry(
                 "3",
                 "--retry-delay",
                 "5",
-                "--retry-connrefused",
-                "--retry-all-errors",
                 "-o",
             ])
             .arg(&tmp_dest)

@@ -565,6 +565,27 @@ install_leindex() {
         log_info "Proceeding with build from source..."
     fi
 
+    if ! detect_rust; then
+        echo ""
+        log_warn "Rust is not installed or is too old"
+        echo ""
+        if [[ "$NONINTERACTIVE" == true ]]; then
+            log_info "Non-interactive mode: Installing Rust automatically..."
+            install_rust
+        else
+            read -p "Would you like to install Rust now? [y/N] " -n 1 -r
+            echo ""
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                install_rust
+            else
+                log_error "Rust is required to build LeIndex from source"
+                exit 1
+            fi
+        fi
+    fi
+
+    ensure_cargo_home_ready
+
     # Check if we're in the unified LeIndex repository (local development)
     if [[ -f "Cargo.toml" ]] && grep -q 'name = "'"$PROJECT_SLUG"'"' Cargo.toml 2>/dev/null; then
         log_info "Building from local LeIndex repository..."
@@ -1101,7 +1122,11 @@ verify_installation() {
 
     local version expected_version
     version=$($binary --version 2>&1 || echo "unknown")
-    expected_version="$(grep -E '^version = ' Cargo.toml | head -1 | cut -d '"' -f2)"
+    if [[ -f "Cargo.toml" ]]; then
+        expected_version="$(grep -E '^version = ' Cargo.toml | head -1 | cut -d '"' -f2)"
+    else
+        expected_version="$SCRIPT_VERSION"
+    fi
     log_success "Binary check passed: $version"
 
     if [[ -n "$expected_version" ]] && [[ "$version" != *"$expected_version"* ]]; then
@@ -2770,31 +2795,8 @@ main() {
     print_step 3 8 "Preparing Existing Installation"
     purge_existing_installation
 
-    # Step 4: Check Rust
-    print_step 4 8 "Checking Rust Toolchain"
-
-    if ! detect_rust; then
-        echo ""
-        log_warn "Rust is not installed or is too old"
-        echo ""
-        if [[ "$NONINTERACTIVE" == true ]]; then
-            log_info "Non-interactive mode: Installing Rust automatically..."
-            install_rust
-        else
-            read -p "Would you like to install Rust now? [y/N] " -n 1 -r
-            echo ""
-            if [[ $REPLY =~ ^[Yy]$ ]]; then
-                install_rust
-            else
-                log_error "Rust is required to build LeIndex"
-                exit 1
-            fi
-        fi
-    fi
-
-    ensure_cargo_home_ready
-
-    # Step 5: Build LeIndex
+    # Step 4/5: Install LeIndex. This tries the pre-built release bundle
+    # before requiring Rust, then falls back to a source build.
     install_leindex
 
     # Step 6: Verify

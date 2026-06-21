@@ -1736,10 +1736,19 @@ pub(crate) fn persist_neural_embeddings_to_mmap(
     project_path: &Path,
 ) -> Result<()> {
     let embeddings = search_engine.collect_neural_embeddings();
+    let path = neural_mmap_embeddings_path(project_path);
     if embeddings.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| {
+                anyhow::anyhow!("Failed to remove stale neural mmap embeddings: {e}")
+            })?;
+            info!(
+                path = %path.display(),
+                "Removed stale neural embeddings mmap file"
+            );
+        }
         return Ok(());
     }
-    let path = neural_mmap_embeddings_path(project_path);
     crate::search::vector::write_mmap_embeddings(&path, &embeddings)
         .map_err(|e| anyhow::anyhow!("Failed to write neural mmap embeddings: {e}"))?;
     info!(
@@ -2536,6 +2545,25 @@ mod tests {
         assert_eq!(tfidf_small.vocab, tfidf_large.vocab);
         assert_eq!(tfidf_small.idf, tfidf_large.idf);
         assert_eq!(tfidf_small.dimension, tfidf_large.dimension);
+    }
+
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    #[test]
+    fn test_empty_neural_persist_removes_stale_mmap() {
+        use crate::search::search::SearchEngine;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let stale_path = neural_mmap_embeddings_path(temp.path());
+        std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+        std::fs::write(&stale_path, b"stale neural data").unwrap();
+
+        let engine = SearchEngine::new();
+        persist_neural_embeddings_to_mmap(&engine, temp.path()).unwrap();
+
+        assert!(
+            !stale_path.exists(),
+            "empty neural persistence should remove stale neural mmap file"
+        );
     }
 
     #[test]

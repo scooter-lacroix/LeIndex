@@ -739,7 +739,8 @@ impl LeIndex {
                 // Compute line number from byte range.
                 // byte_range.0 == 0 is valid (file start, line 1) so we
                 // must not use `> 0` as the guard.
-                if let Ok(content) = std::fs::read(&*node.file_path) {
+                let abs_path = self.resolve_indexed_file_path(&node.file_path);
+                if let Ok(content) = std::fs::read(&abs_path) {
                     let start = node.byte_range.0;
                     let end = node.byte_range.1.min(content.len());
 

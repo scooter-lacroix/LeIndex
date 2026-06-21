@@ -777,12 +777,22 @@ impl ProgramDependenceGraph {
             self.embedding_store.remove(&node.id);
             if let Some(v) = self.file_index.get_mut(&*node.file_path) {
                 v.retain(|&id| id != node_id);
+                if v.is_empty() {
+                    self.file_index.remove(&*node.file_path);
+                }
             }
             if let Some(v) = self.name_index.get_mut(&node.name) {
                 v.retain(|&id| id != node_id);
+                if v.is_empty() {
+                    self.name_index.remove(&node.name);
+                }
             }
-            if let Some(v) = self.name_lower_index.get_mut(&node.name.to_lowercase()) {
+            let lower_name = node.name.to_lowercase();
+            if let Some(v) = self.name_lower_index.get_mut(&lower_name) {
                 v.retain(|&id| id != node_id);
+                if v.is_empty() {
+                    self.name_lower_index.remove(&lower_name);
+                }
             }
             self.name_file_index
                 .remove(&(node.name.clone(), node.file_path.to_string()));
@@ -1623,8 +1633,14 @@ mod tests {
 
         // name_file_index should no longer find removed node
         assert_eq!(pdg.find_by_name_in_file("foo", Some("a.rs")), None);
+        assert!(!pdg.file_index.contains_key("a.rs"));
+        assert!(!pdg.name_index.contains_key("foo"));
+        assert!(!pdg.name_lower_index.contains_key("foo"));
         // b should still be found
         assert_eq!(pdg.find_by_name_in_file("bar", Some("b.rs")), Some(b));
+        assert!(pdg.file_index.contains_key("b.rs"));
+        assert!(pdg.name_index.contains_key("bar"));
+        assert!(pdg.name_lower_index.contains_key("bar"));
     }
 
     #[test]

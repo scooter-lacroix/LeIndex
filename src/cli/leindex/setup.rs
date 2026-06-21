@@ -118,10 +118,10 @@ impl SmokeTestResult {
     /// One-line status string for terminal output.
     pub fn status_line(&self) -> String {
         if self.passed {
-            format!(
-                "embedding test: PASS ({}-dim vector)",
-                self.dimension.unwrap_or(0)
-            )
+            match self.dimension {
+                Some(dim) => format!("embedding test: PASS ({}-dim vector)", dim),
+                None => "embedding test: PASS (dimension unavailable)".to_string(),
+            }
         } else {
             "embedding test: FAIL".to_string()
         }
@@ -248,7 +248,8 @@ pub fn run_interactive_flow() -> Result<SetupChoices, SetupError> {
     // NVIDIA tooling is visible. The user can still pick any option; we do
     // not prevent them, but the guidance for an unknown-vendor system helps
     // them avoid dead-ending on a GPU choice they cannot satisfy.
-    match detect_gpu_vendor() {
+    let detected_vendor = detect_gpu_vendor();
+    match detected_vendor {
         DetectedGpu::Amd => {
             println!("  (Detected AMD GPU / ROCm tooling.)");
         }
@@ -266,7 +267,7 @@ pub fn run_interactive_flow() -> Result<SetupChoices, SetupError> {
     let vendor_choice = Select::new()
         .with_prompt("Which GPU vendor?")
         .items(&vendor_items)
-        .default(0)
+        .default(default_gpu_vendor_index(detected_vendor))
         .interact()
         .map_err(|e| SetupError::Interactive(e.to_string()))?;
 
@@ -315,6 +316,14 @@ pub fn detect_gpu_vendor() -> DetectedGpu {
         DetectedGpu::Nvidia
     } else {
         DetectedGpu::Unknown
+    }
+}
+
+fn default_gpu_vendor_index(detected: DetectedGpu) -> usize {
+    match detected {
+        DetectedGpu::Amd => 0,
+        DetectedGpu::Nvidia => 1,
+        DetectedGpu::Unknown => 2,
     }
 }
 
@@ -1279,14 +1288,8 @@ fn find_pip() -> Option<(String, Vec<String>)> {
     // VAL-SETUP-021: Honor PIP_BIN first so users can point at a non-default pip.
     if let Ok(value) = std::env::var("PIP_BIN") {
         if !value.trim().is_empty() {
-            // Split into program + leading args so the caller can append
-            // "install <package>" to it. If PIP_BIN is a single token, we
-            // treat it as the pip binary directly. If it contains spaces
-            // (e.g., "/usr/bin/python3 -m pip"), we split program from args.
-            let mut parts = value.split_whitespace();
-            if let Some(program) = parts.next() {
-                let prefix: Vec<String> = parts.map(|s| s.to_string()).collect();
-                if Command::new(program)
+            if let Some((program, prefix)) = parse_pip_bin_override(&value) {
+                if Command::new(&program)
                     .args(&prefix)
                     .arg("--version")
                     .stdin(std::process::Stdio::null())
@@ -1296,13 +1299,17 @@ fn find_pip() -> Option<(String, Vec<String>)> {
                     .map(|s| s.success())
                     .unwrap_or(false)
                 {
-                    return Some((program.to_string(), prefix));
+                    return Some((program, prefix));
                 }
                 // PIP_BIN was set but the binary it points at is broken/missing.
                 // Fall through to discovery but log a hint to stderr.
                 eprintln!(
                     "warning: PIP_BIN is set to '{}' but invoking it failed; falling back to PATH discovery.",
                     value
+                );
+            } else {
+                eprintln!(
+                    "warning: PIP_BIN is set to an unsupported command shape; use /path/to/pip or \"python3 -m pip\". Falling back to PATH discovery."
                 );
             }
         }
@@ -1341,6 +1348,55 @@ fn find_pip() -> Option<(String, Vec<String>)> {
     }
 
     None
+}
+
+fn parse_pip_bin_override(value: &str) -> Option<(String, Vec<String>)> {
+    let parts = split_pip_bin_override(value)?;
+    let program = parts.first()?.clone();
+    let args = &parts[1..];
+
+    if args.is_empty() {
+        return Some((program, Vec::new()));
+    }
+
+    if args == ["-m", "pip"] {
+        return Some((program, vec!["-m".to_string(), "pip".to_string()]));
+    }
+
+    None
+}
+
+fn split_pip_bin_override(value: &str) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+
+    for ch in value.trim().chars() {
+        match quote {
+            Some(q) if ch == q => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    parts.push(std::mem::take(&mut current));
+                }
+            }
+            None if matches!(ch, '|' | '&' | ';' | '<' | '>' | '`' | '\n' | '\r') => return None,
+            None => current.push(ch),
+        }
+    }
+
+    if quote.is_some() {
+        return None;
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts)
+    }
 }
 
 /// Discover the ORT dylib path from pip installation.
@@ -2955,6 +3011,12 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_pip_bin_rejects_arbitrary_multi_arg_command() {
+        assert!(parse_pip_bin_override("/usr/bin/curl https://evil.example").is_none());
+        assert!(parse_pip_bin_override("python3 -m pip").is_some());
+    }
+
+    #[test]
     fn test_find_pip_honors_pip_bin_single_token() {
         let _g = PIPE_ENV_LOCK.lock().unwrap();
         std::env::set_var("PIP_BIN", "/bin/true");
@@ -2989,6 +3051,21 @@ mod tests {
         let line = result.status_line();
         assert!(line.contains("PASS"), "{}", line);
         assert!(line.contains("1024"), "{}", line);
+    }
+
+    #[test]
+    fn test_smoke_test_result_pass_without_dimension_is_not_zero_dim() {
+        let result = SmokeTestResult {
+            passed: true,
+            dimension: None,
+            execution_provider: None,
+            configured_provider_label: Some("cpu".to_string()),
+            error: None,
+        };
+        let line = result.status_line();
+        assert!(line.contains("PASS"), "{}", line);
+        assert!(!line.contains("0-dim"), "{}", line);
+        assert!(line.contains("dimension unavailable"), "{}", line);
     }
 
     #[test]
@@ -3059,6 +3136,13 @@ mod tests {
         // system. We don't assert the specific variant because CI/dev hosts
         // have different hardware.
         let _ = detect_gpu_vendor();
+    }
+
+    #[test]
+    fn test_default_gpu_vendor_index_matches_detection() {
+        assert_eq!(default_gpu_vendor_index(DetectedGpu::Amd), 0);
+        assert_eq!(default_gpu_vendor_index(DetectedGpu::Nvidia), 1);
+        assert_eq!(default_gpu_vendor_index(DetectedGpu::Unknown), 2);
     }
 
     #[test]
