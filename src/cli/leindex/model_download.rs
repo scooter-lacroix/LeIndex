@@ -275,6 +275,23 @@ pub fn is_curl_network_error(exit_code: i32, stderr: &str) -> bool {
     }
 }
 
+fn curl_download_args() -> [&'static str; 12] {
+    [
+        "--fail",
+        "--location",
+        "--progress-bar",
+        "--connect-timeout",
+        "30",
+        "--max-time",
+        "600",
+        "--retry",
+        "3",
+        "--retry-delay",
+        "5",
+        "-o",
+    ]
+}
+
 /// Outcome of a single file download.
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields are surfaced via the public API for callers/tests.
@@ -339,20 +356,7 @@ pub fn download_file_with_retry(
         );
 
         let status = Command::new(curl)
-            .args([
-                "--fail",
-                "--location",
-                "--progress-bar",
-                "--connect-timeout",
-                "30",
-                "--max-time",
-                "600",
-                "--retry",
-                "3",
-                "--retry-delay",
-                "5",
-                "-o",
-            ])
+            .args(curl_download_args())
             .arg(&tmp_dest)
             .arg(&url)
             .stdin(std::process::Stdio::null())
@@ -848,6 +852,15 @@ mod tests {
         // because it usually means the URL is genuinely wrong (repo moved).
         assert!(!is_curl_network_error(22, ""));
         assert!(!is_curl_network_error(0, ""));
+    }
+
+    #[test]
+    fn test_curl_download_args_avoid_modern_retry_flags() {
+        let args = curl_download_args();
+        assert!(args.contains(&"--retry"));
+        assert!(args.contains(&"--retry-delay"));
+        assert!(!args.contains(&"--retry-connrefused"));
+        assert!(!args.contains(&"--retry-all-errors"));
     }
 
     #[test]

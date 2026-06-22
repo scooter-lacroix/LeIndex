@@ -97,7 +97,7 @@ function validateArchiveMemberNames(names) {
 
 function assertNoUnsafeExtractedSymlinks(rootDir) {
   const root = fs.realpathSync(rootDir);
-  const stack = [rootDir];
+  const stack = [root];
 
   while (stack.length > 0) {
     const current = stack.pop();
@@ -120,6 +120,29 @@ function assertNoUnsafeExtractedSymlinks(rootDir) {
         stack.push(fullPath);
       }
     }
+  }
+}
+
+function copyRegularFileNoFollow(src, dst, mode) {
+  const noFollow = fs.constants.O_NOFOLLOW || 0;
+  const srcFd = fs.openSync(src, fs.constants.O_RDONLY | noFollow);
+  let dstFd = null;
+  try {
+    const opened = fs.fstatSync(srcFd);
+    if (!opened.isFile()) {
+      throw new Error(`Source is not a regular file: ${path.basename(src)}`);
+    }
+    dstFd = fs.openSync(dst, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC, mode & 0o777);
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let bytesRead;
+    while ((bytesRead = fs.readSync(srcFd, buffer, 0, buffer.length, null)) > 0) {
+      fs.writeSync(dstFd, buffer, 0, bytesRead);
+    }
+  } finally {
+    if (dstFd !== null) {
+      fs.closeSync(dstFd);
+    }
+    fs.closeSync(srcFd);
   }
 }
 
@@ -183,7 +206,7 @@ function copyRegularBundledFile(src, dst, label) {
     throw new Error(`Invalid ${label} entry is not a file: ${path.basename(src)}`);
   }
 
-  fs.copyFileSync(src, dst);
+  copyRegularFileNoFollow(src, dst, stat.mode);
   if (process.platform !== 'win32') {
     try {
       fs.chmodSync(dst, stat.mode);
@@ -881,6 +904,7 @@ module.exports = {
   computeFileSha256,
   copyBundledEntry,
   copyRegularBundledFile,
+  copyRegularFileNoFollow,
   getAssetName,
   getBundleAssetName,
   getOrtLibNames,

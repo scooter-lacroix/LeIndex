@@ -71,6 +71,7 @@ console.log('Test 5b: ORT_DYLIB_PATH detection helpers');
 assert.strictEqual(typeof installer.getOrtLibNames, 'function', 'install.js should expose getOrtLibNames');
 assert.strictEqual(typeof installer.copyBundledEntry, 'function', 'install.js should expose copyBundledEntry');
 assert.strictEqual(typeof installer.copyRegularBundledFile, 'function', 'install.js should expose copyRegularBundledFile');
+assert.strictEqual(typeof installer.copyRegularFileNoFollow, 'function', 'install.js should expose copyRegularFileNoFollow');
 assert.strictEqual(typeof installer.assertSafeArchiveFileName, 'function', 'install.js should expose assertSafeArchiveFileName');
 assert.strictEqual(typeof installer.assertNoUnsafeExtractedSymlinks, 'function', 'install.js should expose assertNoUnsafeExtractedSymlinks');
 assert.strictEqual(typeof installer.assertSafeSymlinkTarget, 'function', 'install.js should expose assertSafeSymlinkTarget');
@@ -169,6 +170,16 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
     }
     if (safeSymlinkCreated) {
       installer.assertNoUnsafeExtractedSymlinks(tmpA);
+      const rootLink = `${tmpA}-link`;
+      try {
+        fs.symlinkSync(tmpA, rootLink, 'dir');
+        installer.assertNoUnsafeExtractedSymlinks(rootLink);
+      } catch (err) {
+        const unsupported = ['EPERM', 'EACCES', 'ENOTSUP', 'EINVAL'].includes(err && err.code);
+        if (!unsupported) throw err;
+      } finally {
+        fs.rmSync(rootLink, { force: true });
+      }
     }
     try {
       fs.symlinkSync('../outside-target', unsafeLink);
@@ -186,6 +197,35 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
     }
   } finally {
     fs.rmSync(tmpA, { recursive: true, force: true });
+  }
+}
+{
+  // copyRegularBundledFile should not follow a symlink swapped into the source
+  // path; on platforms with O_NOFOLLOW this rejects at open time.
+  const tmpA = fs.mkdtempSync(path.join(os.tmpdir(), 'leindex-mcp-nofollow-'));
+  const tmpB = fs.mkdtempSync(path.join(os.tmpdir(), 'leindex-mcp-nofollow-'));
+  const target = path.join(tmpA, 'target');
+  const link = path.join(tmpA, 'payload');
+  try {
+    fs.writeFileSync(target, 'target data');
+    let symlinkCreated = false;
+    try {
+      fs.symlinkSync('target', link);
+      symlinkCreated = true;
+    } catch (err) {
+      const unsupported = ['EPERM', 'EACCES', 'ENOTSUP', 'EINVAL'].includes(err && err.code);
+      if (!unsupported) throw err;
+    }
+    if (symlinkCreated && fs.constants.O_NOFOLLOW) {
+      assert.throws(
+        () => installer.copyRegularFileNoFollow(link, path.join(tmpB, 'payload'), 0o644),
+        /ELOOP|too many symbolic links|Source is not a regular file/i,
+        'copyRegularFileNoFollow should reject symlink sources'
+      );
+    }
+  } finally {
+    fs.rmSync(tmpA, { recursive: true, force: true });
+    fs.rmSync(tmpB, { recursive: true, force: true });
   }
 }
 {

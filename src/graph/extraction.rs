@@ -1093,7 +1093,14 @@ fn resolve_cross_file_call_edges_inner(
                 continue;
             }
 
-            let qname = qualified_name_from_node(node);
+            let Some(qname) = qualified_name_from_node(node) else {
+                tracing::debug!(
+                    node_id = %node.id,
+                    file_path = %node.file_path,
+                    "Skipping node whose id does not start with its file_path prefix"
+                );
+                continue;
+            };
 
             // Preserve all definitions for a qualified name. Cross-file
             // extraction sees signatures without file ownership, so collapsing
@@ -1505,11 +1512,10 @@ fn resolve_cross_file_call_edges_inner(
     }
 }
 
-fn qualified_name_from_node(node: &Node) -> &str {
+fn qualified_name_from_node(node: &Node) -> Option<&str> {
     node.id
         .strip_prefix(node.file_path.as_ref())
         .and_then(|rest| rest.strip_prefix(':'))
-        .unwrap_or(&node.id)
 }
 
 // ---------------------------------------------------------------------------
@@ -2810,5 +2816,20 @@ mod tests {
         assert!(has_call_edge_between_files(
             &merged, "a.rs", "handler", "b.rs", "target"
         ));
+    }
+
+    #[test]
+    fn qualified_name_from_node_returns_none_on_path_mismatch() {
+        let node = Node {
+            id: "relative.rs:my_mod::handler".to_string(),
+            node_type: NodeType::Function,
+            name: "handler".to_string(),
+            file_path: Arc::from("/abs/relative.rs"),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "rust".to_string(),
+        };
+
+        assert_eq!(qualified_name_from_node(&node), None);
     }
 }

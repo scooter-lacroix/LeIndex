@@ -117,8 +117,14 @@ fn resolve_worker_binary() -> Result<std::path::PathBuf, std::io::Error> {
     })
 }
 
-/// Read `ort_dylib_path` from the user-level `~/.leindex/config/leindex.toml`
-/// (honoring `$LEINDEX_HOME`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct WorkerConfigEnv {
+    ort_dylib_path: Option<String>,
+    execution_provider: Option<String>,
+}
+
+/// Read worker-relevant values from the user-level
+/// `~/.leindex/config/leindex.toml` (honoring `$LEINDEX_HOME`).
 ///
 /// VAL-SETUP-020/VAL-ORT-006: when the worker is spawned from the daemon we
 /// surface the dylib path chosen during `leindex setup` so the worker's ORT
@@ -127,29 +133,48 @@ fn resolve_worker_binary() -> Result<std::path::PathBuf, std::io::Error> {
 /// because the file is tiny and pulling a full TOML parser into the search
 /// crate is not worth it.
 ///
-/// Returns `None` when the config file is absent or the key is missing.
-fn read_ort_dylib_path_from_config() -> Option<String> {
-    let home = leindex_home_dir()?;
+fn read_worker_config_env_from_config() -> WorkerConfigEnv {
+    let Some(home) = leindex_home_dir() else {
+        return WorkerConfigEnv::default();
+    };
     let cfg = home.join("config").join("leindex.toml");
-    let contents = std::fs::read_to_string(&cfg).ok()?;
+    let Ok(contents) = std::fs::read_to_string(&cfg) else {
+        return WorkerConfigEnv::default();
+    };
+    let mut parsed = WorkerConfigEnv::default();
     for raw in contents.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("ort_dylib_path") {
-            let rest = rest.trim_start();
-            if let Some(value_part) = rest.strip_prefix('=') {
-                let value_part = value_part.trim();
-                // Trim surrounding quotes if present.
-                let trimmed = value_part.trim_matches(|c| c == '"' || c == '\'');
-                if !trimmed.is_empty() {
-                    return Some(trimmed.to_string());
-                }
+        if let Some(value) = parse_config_assignment(line, "ort_dylib_path") {
+            parsed.ort_dylib_path = Some(value);
+        } else if let Some(value) = parse_config_assignment(line, "execution_provider") {
+            if !value.eq_ignore_ascii_case("auto") {
+                parsed.execution_provider = Some(value);
             }
         }
     }
-    None
+    parsed
+}
+
+fn read_ort_dylib_path_from_config() -> Option<String> {
+    read_worker_config_env_from_config().ort_dylib_path
+}
+
+fn read_execution_provider_from_config() -> Option<String> {
+    read_worker_config_env_from_config().execution_provider
+}
+
+fn parse_config_assignment(line: &str, key: &str) -> Option<String> {
+    let rest = line.strip_prefix(key)?.trim_start();
+    let value_part = rest.strip_prefix('=')?.trim();
+    let trimmed = value_part.trim_matches(|c| c == '"' || c == '\'').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Resolve the LeIndex home directory (`~/.leindex` or `$LEINDEX_HOME`).
@@ -355,6 +380,8 @@ impl EmbeddingClient {
             cmd.env("LEINDEX_MODEL_PATH", &model_path);
         }
         if let Ok(provider) = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER") {
+            cmd.env("LEINDEX_WORKER_EXECUTION_PROVIDER", &provider);
+        } else if let Some(provider) = read_execution_provider_from_config() {
             cmd.env("LEINDEX_WORKER_EXECUTION_PROVIDER", &provider);
         }
         // VAL-SETUP-020/VAL-ORT-006: When ORT_DYLIB_PATH is not already in the
@@ -997,6 +1024,38 @@ mod tests {
         assert_eq!(
             parsed.as_deref(),
             Some("/opt/onnxruntime/libonnxruntime.so")
+        );
+        assert_eq!(
+            read_execution_provider_from_config().as_deref(),
+            Some("cpu")
+        );
+
+        std::env::remove_var("LEINDEX_HOME");
+    }
+
+    #[test]
+    fn test_read_execution_provider_from_config_skips_auto() {
+        let _g = TEST_ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("LEINDEX_HOME", tmp.path());
+
+        let cfg_dir = tmp.path().join("config");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(
+            cfg_dir.join("leindex.toml"),
+            "[neural]\nenabled = true\nexecution_provider = \"auto\"\n",
+        )
+        .unwrap();
+        assert_eq!(read_execution_provider_from_config(), None);
+
+        std::fs::write(
+            cfg_dir.join("leindex.toml"),
+            "[neural]\nenabled = true\nexecution_provider = \"migraphx\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_execution_provider_from_config().as_deref(),
+            Some("migraphx")
         );
 
         std::env::remove_var("LEINDEX_HOME");

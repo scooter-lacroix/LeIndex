@@ -532,7 +532,7 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
     // Recompute ORT installed flag after the install/maintain step so the
     // smoke-test branch and the SetupResult reflect the actual end state
     // (VAL-SETUP-027: install_ort may have just brought ORT online).
-    let ort_installed_final = choices.neural_enabled || check_ort_installed();
+    let ort_installed_final = check_ort_installed();
 
     // Validate models whenever neural is enabled. We deliberately do NOT
     // short-circuit on `check_model_present()` returning true because:
@@ -1187,8 +1187,9 @@ pub fn model_checksum_status() -> ModelChecksumStatus {
 /// generic exit-code-only failure.
 fn install_ort(provider: ExecutionProvider) -> Result<(), SetupError> {
     let package = provider.pip_package();
+    let package_spec = pip_ort_package_spec(provider);
 
-    println!("Installing {} via pip...", package);
+    println!("Installing {} via pip...", package_spec);
 
     // VAL-SETUP-021: find_pip knows about PIP_BIN, python -m pip, pip3, pip.
     let pip_cmd = find_pip().ok_or(SetupError::PipNotFound)?;
@@ -1202,7 +1203,7 @@ fn install_ort(provider: ExecutionProvider) -> Result<(), SetupError> {
     let result = Command::new(&pip_cmd.0)
         .args(&pip_cmd.1)
         .arg("install")
-        .arg(package)
+        .arg(&package_spec)
         .arg("--upgrade")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1257,6 +1258,17 @@ fn install_ort(provider: ExecutionProvider) -> Result<(), SetupError> {
         }
         Err(e) => Err(SetupError::Io(format!("Failed to run pip: {}", e))),
     }
+}
+
+fn pip_ort_package_spec(provider: ExecutionProvider) -> String {
+    format!(
+        "{}>={}.{}.{},<{}",
+        provider.pip_package(),
+        MIN_ORT_VERSION.0,
+        MIN_ORT_VERSION.1,
+        MIN_ORT_VERSION.2,
+        MAX_ORT_MAJOR + 1
+    )
 }
 
 /// Heuristic for detecting pip network/download errors in captured output.
@@ -2687,6 +2699,18 @@ mod tests {
         assert_eq!(
             ExecutionProvider::Migraphx.pip_package(),
             "onnxruntime-migraphx"
+        );
+    }
+
+    #[test]
+    fn test_pip_ort_package_spec_is_bounded_to_supported_major() {
+        assert_eq!(
+            pip_ort_package_spec(ExecutionProvider::Cpu),
+            "onnxruntime>=1.20.0,<2"
+        );
+        assert_eq!(
+            pip_ort_package_spec(ExecutionProvider::Migraphx),
+            "onnxruntime-migraphx>=1.20.0,<2"
         );
     }
 
