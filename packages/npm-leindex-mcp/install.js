@@ -95,6 +95,34 @@ function validateArchiveMemberNames(names) {
   }
 }
 
+function assertNoUnsafeExtractedSymlinks(rootDir) {
+  const root = fs.realpathSync(rootDir);
+  const stack = [rootDir];
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    const entries = fs.readdirSync(current);
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry);
+      const stat = fs.lstatSync(fullPath);
+      if (stat.isSymbolicLink()) {
+        const target = fs.readlinkSync(fullPath);
+        if (!target || target.includes('\0')) {
+          throw new Error(`Unsafe extracted symlink target: ${fullPath}`);
+        }
+        const resolvedTarget = path.resolve(path.dirname(fullPath), target);
+        if (!isPathInside(root, resolvedTarget)) {
+          throw new Error(`Unsafe extracted symlink escapes bundle: ${fullPath} -> ${target}`);
+        }
+        continue;
+      }
+      if (stat.isDirectory()) {
+        stack.push(fullPath);
+      }
+    }
+  }
+}
+
 function assertSafeSymlinkTarget(src, target) {
   if (!target || target.includes('\0') || path.isAbsolute(target) || path.win32.isAbsolute(target)) {
     throw new Error(`Unsafe symlink target for ${path.basename(src)}: ${target}`);
@@ -144,6 +172,25 @@ function copyBundledEntry(src, dst) {
     }
   }
   return 'file';
+}
+
+function copyRegularBundledFile(src, dst, label) {
+  const stat = fs.lstatSync(src);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Unsafe ${label} entry is a symlink: ${path.basename(src)}`);
+  }
+  if (!stat.isFile()) {
+    throw new Error(`Invalid ${label} entry is not a file: ${path.basename(src)}`);
+  }
+
+  fs.copyFileSync(src, dst);
+  if (process.platform !== 'win32') {
+    try {
+      fs.chmodSync(dst, stat.mode);
+    } catch (_) {
+      // Permissions may fail on exotic filesystems; non-fatal.
+    }
+  }
 }
 
 // Platform mapping
@@ -464,6 +511,7 @@ function extractTarGz(archivePath, destDir) {
     .filter(Boolean);
   validateArchiveMemberNames(members);
   execFileSync('tar', ['xzf', archivePath, '-C', destDir], { stdio: 'pipe' });
+  assertNoUnsafeExtractedSymlinks(destDir);
 }
 
 /**
@@ -487,12 +535,14 @@ function extractZip(archivePath, destDir) {
       archivePath,
       destDir
     ], { stdio: 'pipe' });
+    assertNoUnsafeExtractedSymlinks(destDir);
   } else {
     const members = execFileSync('unzip', ['-Z', '-1', archivePath], { encoding: 'utf8' })
       .split(/\r?\n/)
       .filter(Boolean);
     validateArchiveMemberNames(members);
     execFileSync('unzip', ['-o', archivePath, '-d', destDir], { stdio: 'pipe' });
+    assertNoUnsafeExtractedSymlinks(destDir);
   }
 }
 
@@ -550,7 +600,7 @@ async function installFromBundle(release) {
     const srcWorker = path.join(bundleDir, 'bin', workerName);
 
     if (fs.existsSync(srcBinary)) {
-      fs.copyFileSync(srcBinary, path.join(BIN_DIR, binaryName));
+      copyRegularBundledFile(srcBinary, path.join(BIN_DIR, binaryName), 'binary');
       if (process.platform !== 'win32') {
         fs.chmodSync(path.join(BIN_DIR, binaryName), 0o755);
       }
@@ -560,7 +610,7 @@ async function installFromBundle(release) {
     }
 
     if (fs.existsSync(srcWorker)) {
-      fs.copyFileSync(srcWorker, path.join(BIN_DIR, workerName));
+      copyRegularBundledFile(srcWorker, path.join(BIN_DIR, workerName), 'worker binary');
       if (process.platform !== 'win32') {
         fs.chmodSync(path.join(BIN_DIR, workerName), 0o755);
       }
@@ -577,7 +627,7 @@ async function installFromBundle(release) {
       }
       const modelFiles = fs.readdirSync(srcModels);
       for (const file of modelFiles) {
-        fs.copyFileSync(path.join(srcModels, file), path.join(MODELS_DIR, file));
+        copyRegularBundledFile(path.join(srcModels, file), path.join(MODELS_DIR, file), 'model');
       }
       console.log(`   ✓ Model assets installed (${modelFiles.length} files)`);
     } else {
@@ -830,10 +880,12 @@ module.exports = {
   LIB_DIR,
   computeFileSha256,
   copyBundledEntry,
+  copyRegularBundledFile,
   getAssetName,
   getBundleAssetName,
   getOrtLibNames,
   getRequestedRelease,
+  assertNoUnsafeExtractedSymlinks,
   assertSafeArchiveFileName,
   assertSafeSymlinkTarget,
   isSafeArchiveMemberName,

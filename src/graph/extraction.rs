@@ -1049,12 +1049,38 @@ pub fn resolve_cross_file_call_edges(
     pdg: &mut ProgramDependenceGraph,
     all_signatures: &[SignatureInfo],
 ) {
+    let owned: Vec<(Option<&str>, &SignatureInfo)> =
+        all_signatures.iter().map(|sig| (None, sig)).collect();
+    resolve_cross_file_call_edges_inner(pdg, &owned);
+}
+
+/// Resolve cross-file call edges with each signature bound to its source file.
+///
+/// Real indexing still knows which parse result produced each signature. Keeping
+/// that ownership here prevents duplicate `qualified_name` definitions in
+/// different files from receiving each other's calls.
+pub fn resolve_cross_file_call_edges_for_files(
+    pdg: &mut ProgramDependenceGraph,
+    all_signatures: &[(String, SignatureInfo)],
+) {
+    let owned: Vec<(Option<&str>, &SignatureInfo)> = all_signatures
+        .iter()
+        .map(|(file_path, sig)| (Some(file_path.as_str()), sig))
+        .collect();
+    resolve_cross_file_call_edges_inner(pdg, &owned);
+}
+
+fn resolve_cross_file_call_edges_inner(
+    pdg: &mut ProgramDependenceGraph,
+    all_signatures: &[(Option<&str>, &SignatureInfo)],
+) {
     use crate::graph::pdg::{EdgeType, NodeId};
 
     // Build lookup maps from the merged PDG nodes.
     // Node ids are formatted as "file_path:qualified_name".
     // We build maps keyed by various forms of the qualified name for resolution.
     let mut qname_to_node: HashMap<String, Vec<NodeId>> = HashMap::new();
+    let mut qname_file_to_node: HashMap<(String, String), Vec<NodeId>> = HashMap::new();
     let mut exact_map: HashMap<String, Vec<NodeId>> = HashMap::new();
     let mut last_map: HashMap<String, Vec<NodeId>> = HashMap::new();
     let mut suffix_map: HashMap<String, Vec<NodeId>> = HashMap::new();
@@ -1067,13 +1093,7 @@ pub fn resolve_cross_file_call_edges(
                 continue;
             }
 
-            // Extract the qualified_name from the node id
-            // Node id format: "file_path:qualified_name"
-            let qname = node
-                .id
-                .rsplit_once(':')
-                .map(|(_, qn)| qn)
-                .unwrap_or(&node.id);
+            let qname = qualified_name_from_node(node);
 
             // Preserve all definitions for a qualified name. Cross-file
             // extraction sees signatures without file ownership, so collapsing
@@ -1082,6 +1102,10 @@ pub fn resolve_cross_file_call_edges(
             if !is_module {
                 qname_to_node
                     .entry(qname.to_string())
+                    .or_default()
+                    .push(nid);
+                qname_file_to_node
+                    .entry((qname.to_string(), node.file_path.to_string()))
                     .or_default()
                     .push(nid);
             } else {
@@ -1113,7 +1137,7 @@ pub fn resolve_cross_file_call_edges(
 
     // Build alias map from all imports
     let mut alias_map: HashMap<String, String> = HashMap::new();
-    for sig in all_signatures {
+    for (_, sig) in all_signatures {
         for import in &sig.imports {
             let alias = import.alias.clone().or_else(|| {
                 import
@@ -1144,14 +1168,21 @@ pub fn resolve_cross_file_call_edges(
 
     let mut new_edges = Vec::new();
 
-    for sig in all_signatures {
-        // Find every matching caller node in the PDG. The signature payload
-        // does not retain file path, so duplicate qualified names must not be
-        // collapsed to a single overwritten NodeId.
-        let caller_ids = match qname_to_node.get(&sig.qualified_name) {
-            Some(ids) if !ids.is_empty() => ids.clone(),
-            None => continue,
-            _ => continue,
+    for (source_file, sig) in all_signatures {
+        // Real indexing passes the source file for each signature. Use it to
+        // bind duplicate qualified names to their owning PDG node; the legacy
+        // no-file API falls back to all matching definitions.
+        let caller_ids = if let Some(source_file) = source_file {
+            match qname_file_to_node.get(&(sig.qualified_name.clone(), (*source_file).to_string()))
+            {
+                Some(ids) if !ids.is_empty() => ids.clone(),
+                _ => continue,
+            }
+        } else {
+            match qname_to_node.get(&sig.qualified_name) {
+                Some(ids) if !ids.is_empty() => ids.clone(),
+                _ => continue,
+            }
         };
 
         for caller_id in caller_ids {
@@ -1472,6 +1503,13 @@ pub fn resolve_cross_file_call_edges(
         );
         pdg.add_call_edges(new_edges);
     }
+}
+
+fn qualified_name_from_node(node: &Node) -> &str {
+    node.id
+        .strip_prefix(node.file_path.as_ref())
+        .and_then(|rest| rest.strip_prefix(':'))
+        .unwrap_or(&node.id)
 }
 
 // ---------------------------------------------------------------------------
@@ -2360,6 +2398,30 @@ mod tests {
         }
     }
 
+    fn has_call_edge_between_files(
+        pdg: &ProgramDependenceGraph,
+        caller_file: &str,
+        caller_name: &str,
+        callee_file: &str,
+        callee_name: &str,
+    ) -> bool {
+        let caller_nid = pdg.node_indices().find(|&n| {
+            pdg.get_node(n)
+                .map(|node| node.file_path.as_ref() == caller_file && &*node.name == caller_name)
+                .unwrap_or(false)
+        });
+        let callee_nid = pdg.node_indices().find(|&n| {
+            pdg.get_node(n)
+                .map(|node| node.file_path.as_ref() == callee_file && &*node.name == callee_name)
+                .unwrap_or(false)
+        });
+
+        match (caller_nid, callee_nid) {
+            (Some(c), Some(d)) => pdg.neighbors(c).contains(&d),
+            _ => false,
+        }
+    }
+
     /// Tier 1: Exact match - caller references callee by exact qualified name
     #[test]
     fn cross_file_exact_match() {
@@ -2655,5 +2717,98 @@ mod tests {
 
         assert!(has_call_edge_from_file(&merged, "a.rs", "caller", "target"));
         assert!(has_call_edge_from_file(&merged, "b.rs", "caller", "target"));
+    }
+
+    #[test]
+    fn cross_file_file_owned_signatures_do_not_cross_apply_duplicate_qnames() {
+        let mut caller_a = sig("handler", "handler", false);
+        caller_a.calls.push("target_a".to_string());
+        let mut caller_b = sig("handler", "handler", false);
+        caller_b.calls.push("target_b".to_string());
+        let target_a = sig("target_a", "target_a", false);
+        let target_b = sig("target_b", "target_b", false);
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller_a.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![caller_b.clone()], b"", "b.rs", "rust");
+        let pdg_ta =
+            extract_pdg_from_signatures(vec![target_a.clone()], b"", "target_a.rs", "rust");
+        let pdg_tb =
+            extract_pdg_from_signatures(vec![target_b.clone()], b"", "target_b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for source in [&pdg_a, &pdg_b, &pdg_ta, &pdg_tb] {
+            for nid in source.node_indices() {
+                if let Some(node) = source.get_node(nid) {
+                    merged.add_node(node.clone());
+                }
+            }
+        }
+
+        resolve_cross_file_call_edges_for_files(
+            &mut merged,
+            &[
+                ("a.rs".to_string(), caller_a),
+                ("b.rs".to_string(), caller_b),
+                ("target_a.rs".to_string(), target_a),
+                ("target_b.rs".to_string(), target_b),
+            ],
+        );
+
+        assert!(has_call_edge_between_files(
+            &merged,
+            "a.rs",
+            "handler",
+            "target_a.rs",
+            "target_a"
+        ));
+        assert!(has_call_edge_between_files(
+            &merged,
+            "b.rs",
+            "handler",
+            "target_b.rs",
+            "target_b"
+        ));
+        assert!(!has_call_edge_between_files(
+            &merged,
+            "a.rs",
+            "handler",
+            "target_b.rs",
+            "target_b"
+        ));
+        assert!(!has_call_edge_between_files(
+            &merged,
+            "b.rs",
+            "handler",
+            "target_a.rs",
+            "target_a"
+        ));
+    }
+
+    #[test]
+    fn cross_file_rust_qualified_names_preserve_colon_segments() {
+        let mut caller = sig("handler", "my_mod::handler", false);
+        caller.calls.push("other_mod::target".to_string());
+        let callee = sig("target", "other_mod::target", false);
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee.clone()], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for source in [&pdg_a, &pdg_b] {
+            for nid in source.node_indices() {
+                if let Some(node) = source.get_node(nid) {
+                    merged.add_node(node.clone());
+                }
+            }
+        }
+
+        resolve_cross_file_call_edges_for_files(
+            &mut merged,
+            &[("a.rs".to_string(), caller), ("b.rs".to_string(), callee)],
+        );
+
+        assert!(has_call_edge_between_files(
+            &merged, "a.rs", "handler", "b.rs", "target"
+        ));
     }
 }

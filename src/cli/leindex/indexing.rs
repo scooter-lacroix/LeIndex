@@ -596,10 +596,16 @@ impl LeIndex {
         // Collect all signatures from successful parse results for cross-file
         // call edge resolution. We clone the signatures here because they are
         // moved into extract_pdg_from_signatures below.
-        let all_signatures: Vec<crate::parse::prelude::SignatureInfo> = parsing_results
+        let all_signatures: Vec<(String, crate::parse::prelude::SignatureInfo)> = parsing_results
             .iter()
             .filter(|r| r.is_success())
-            .flat_map(|r| r.signatures.iter().cloned())
+            .flat_map(|r| {
+                let file_path = r.file_path.display().to_string();
+                r.signatures
+                    .iter()
+                    .cloned()
+                    .map(move |sig| (file_path.clone(), sig))
+            })
             .collect();
 
         // Iterate over parsing_results directly, avoiding intermediate HashMap construction
@@ -644,7 +650,7 @@ impl LeIndex {
         // Per-file PDG extraction can only resolve calls within the same file.
         // This pass uses all signatures to resolve cross-file call relationships.
         if !all_signatures.is_empty() {
-            crate::graph::resolve_cross_file_call_edges(&mut pdg, &all_signatures);
+            crate::graph::resolve_cross_file_call_edges_for_files(&mut pdg, &all_signatures);
         }
 
         // Step 5b: Resolve external dependencies via lock files

@@ -70,7 +70,9 @@ console.log('  ✓ Wrapper executes with argv arrays and exposes worker/model pa
 console.log('Test 5b: ORT_DYLIB_PATH detection helpers');
 assert.strictEqual(typeof installer.getOrtLibNames, 'function', 'install.js should expose getOrtLibNames');
 assert.strictEqual(typeof installer.copyBundledEntry, 'function', 'install.js should expose copyBundledEntry');
+assert.strictEqual(typeof installer.copyRegularBundledFile, 'function', 'install.js should expose copyRegularBundledFile');
 assert.strictEqual(typeof installer.assertSafeArchiveFileName, 'function', 'install.js should expose assertSafeArchiveFileName');
+assert.strictEqual(typeof installer.assertNoUnsafeExtractedSymlinks, 'function', 'install.js should expose assertNoUnsafeExtractedSymlinks');
 assert.strictEqual(typeof installer.assertSafeSymlinkTarget, 'function', 'install.js should expose assertSafeSymlinkTarget');
 assert.strictEqual(typeof installer.isSafeArchiveMemberName, 'function', 'install.js should expose isSafeArchiveMemberName');
 assert.strictEqual(typeof installer.isOrtBundleLibraryName, 'function', 'install.js should expose isOrtBundleLibraryName');
@@ -145,6 +147,76 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
   } finally {
     fs.rmSync(tmpA, { recursive: true, force: true });
     fs.rmSync(tmpB, { recursive: true, force: true });
+  }
+}
+{
+  // Extraction boundary audit should reject symlinks that escape the extracted
+  // bundle, before any later copy step can dereference them.
+  const tmpA = fs.mkdtempSync(path.join(os.tmpdir(), 'leindex-mcp-extract-'));
+  const safeTarget = path.join(tmpA, 'inside-target');
+  const safeLink = path.join(tmpA, 'inside-link');
+  const unsafeLink = path.join(tmpA, 'outside-link');
+  try {
+    fs.writeFileSync(safeTarget, 'inside bundle');
+    let safeSymlinkCreated = false;
+    let unsafeSymlinkCreated = false;
+    try {
+      fs.symlinkSync('inside-target', safeLink);
+      safeSymlinkCreated = true;
+    } catch (err) {
+      const unsupported = ['EPERM', 'EACCES', 'ENOTSUP', 'EINVAL'].includes(err && err.code);
+      if (!unsupported) throw err;
+    }
+    if (safeSymlinkCreated) {
+      installer.assertNoUnsafeExtractedSymlinks(tmpA);
+    }
+    try {
+      fs.symlinkSync('../outside-target', unsafeLink);
+      unsafeSymlinkCreated = true;
+    } catch (err) {
+      const unsupported = ['EPERM', 'EACCES', 'ENOTSUP', 'EINVAL'].includes(err && err.code);
+      if (!unsupported) throw err;
+    }
+    if (unsafeSymlinkCreated) {
+      assert.throws(
+        () => installer.assertNoUnsafeExtractedSymlinks(tmpA),
+        /Unsafe extracted symlink escapes bundle/,
+        'post-extract audit should reject symlinks that escape the extraction root'
+      );
+    }
+  } finally {
+    fs.rmSync(tmpA, { recursive: true, force: true });
+  }
+}
+{
+  // Binary/model payloads must be regular files. Unlike ORT lib entries, they
+  // never need symlink preservation, and dereferencing bundle symlinks can read
+  // outside the extracted archive.
+  const tmpA = fs.mkdtempSync(path.join(os.tmpdir(), 'leindex-mcp-payload-'));
+  const tmpB = fs.mkdtempSync(path.join(os.tmpdir(), 'leindex-mcp-payload-'));
+  const outside = path.join(tmpA, '..', `leindex-outside-${process.pid}`);
+  const link = path.join(tmpA, 'qwen3-embed-0.6b.onnx');
+  try {
+    fs.writeFileSync(outside, 'outside bundle');
+    let symlinkCreated = false;
+    try {
+      fs.symlinkSync(outside, link);
+      symlinkCreated = true;
+    } catch (err) {
+      const unsupported = ['EPERM', 'EACCES', 'ENOTSUP', 'EINVAL'].includes(err && err.code);
+      if (!unsupported) throw err;
+    }
+    if (symlinkCreated) {
+      assert.throws(
+        () => installer.copyRegularBundledFile(link, path.join(tmpB, 'qwen3-embed-0.6b.onnx'), 'model'),
+        /Unsafe model entry is a symlink/,
+        'copyRegularBundledFile should reject model symlinks instead of dereferencing them'
+      );
+    }
+  } finally {
+    fs.rmSync(tmpA, { recursive: true, force: true });
+    fs.rmSync(tmpB, { recursive: true, force: true });
+    fs.rmSync(outside, { force: true });
   }
 }
 {

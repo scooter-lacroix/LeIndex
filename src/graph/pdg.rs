@@ -775,24 +775,36 @@ impl ProgramDependenceGraph {
         if let Some(node) = self.graph.remove_node(node_id) {
             self.symbol_index.remove(&node.id);
             self.embedding_store.remove(&node.id);
-            if let Some(v) = self.file_index.get_mut(&*node.file_path) {
+            let remove_file_entry = if let Some(v) = self.file_index.get_mut(&*node.file_path) {
                 v.retain(|&id| id != node_id);
-                if v.is_empty() {
-                    self.file_index.remove(&*node.file_path);
-                }
+                v.is_empty()
+            } else {
+                false
+            };
+            if remove_file_entry {
+                self.file_index.remove(&*node.file_path);
             }
-            if let Some(v) = self.name_index.get_mut(&node.name) {
+
+            let remove_name_entry = if let Some(v) = self.name_index.get_mut(&node.name) {
                 v.retain(|&id| id != node_id);
-                if v.is_empty() {
-                    self.name_index.remove(&node.name);
-                }
+                v.is_empty()
+            } else {
+                false
+            };
+            if remove_name_entry {
+                self.name_index.remove(&node.name);
             }
+
             let lower_name = node.name.to_lowercase();
-            if let Some(v) = self.name_lower_index.get_mut(&lower_name) {
-                v.retain(|&id| id != node_id);
-                if v.is_empty() {
-                    self.name_lower_index.remove(&lower_name);
-                }
+            let remove_lower_name_entry =
+                if let Some(v) = self.name_lower_index.get_mut(&lower_name) {
+                    v.retain(|&id| id != node_id);
+                    v.is_empty()
+                } else {
+                    false
+                };
+            if remove_lower_name_entry {
+                self.name_lower_index.remove(&lower_name);
             }
             self.name_file_index
                 .remove(&(node.name.clone(), node.file_path.to_string()));

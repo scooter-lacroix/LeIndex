@@ -461,6 +461,7 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
         // too new). This must run before install so we don't silently proceed
         // with a known-bad version.
         let pre_existing_version = get_ort_version();
+        let mut upgrade_unsupported_ort = false;
         if let Some(ref detected) = pre_existing_version {
             match check_ort_version_compatibility(detected) {
                 VersionCompatibility::Unsupported {
@@ -472,7 +473,7 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
                         detected, required_min, reason
                     );
                     println!("     Upgrading to a supported version...");
-                    // Fall through to install/upgrade below.
+                    upgrade_unsupported_ort = true;
                 }
                 VersionCompatibility::TooNew {
                     supported_max,
@@ -493,8 +494,9 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
         }
 
         // VAL-SETUP-006/007/008/010/011/012: Install/maintain ORT for the provider
-        if !ort_installed {
-            // No ORT at all - install the appropriate package
+        if !ort_installed || upgrade_unsupported_ort {
+            // No ORT at all, or an installed ORT is too old for the worker API:
+            // install/upgrade the appropriate package.
             install_ort(provider)?;
         } else if provider != ExecutionProvider::Cpu {
             // ORT is installed but we want GPU. Check if the GPU variant
@@ -633,6 +635,33 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
         ort_installed: ort_installed_final,
         smoke_test,
     })
+}
+
+#[cfg(test)]
+fn should_install_ort_for_existing_state(
+    ort_installed: bool,
+    provider: ExecutionProvider,
+    pre_existing_version: Option<&str>,
+    provider_available: bool,
+) -> bool {
+    if !ort_installed {
+        return true;
+    }
+    if pre_existing_version
+        .map(|version| {
+            matches!(
+                check_ort_version_compatibility(version),
+                VersionCompatibility::Unsupported { .. }
+            )
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    if provider != ExecutionProvider::Cpu && !provider_available {
+        return true;
+    }
+    provider == ExecutionProvider::Cpu && pre_existing_version.is_none()
 }
 
 /// Truncate a string for terminal display, appending an ellipsis if truncated.
@@ -2842,6 +2871,22 @@ mod tests {
             check_ort_version_compatibility("1.99.99"),
             VersionCompatibility::Supported
         );
+    }
+
+    #[test]
+    fn test_unsupported_cpu_ort_requests_upgrade() {
+        assert!(should_install_ort_for_existing_state(
+            true,
+            ExecutionProvider::Cpu,
+            Some("1.19.2"),
+            true
+        ));
+        assert!(!should_install_ort_for_existing_state(
+            true,
+            ExecutionProvider::Cpu,
+            Some("1.25.0"),
+            true
+        ));
     }
 
     #[test]
