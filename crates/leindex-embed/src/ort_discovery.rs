@@ -26,7 +26,7 @@
 // VAL-ORT-022: `last_outcome()` exposes the resolved path for diagnostics
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 /// Environment variable name for explicit ORT dylib override.
 pub const ORT_DYLIB_ENV: &str = "ORT_DYLIB_PATH";
@@ -41,7 +41,7 @@ const LEINDEX_PYTHON_ENV: &str = "LEINDEX_PYTHON";
 
 /// The resolved discovery outcome, cached for diagnostics across the process
 /// lifetime. `None` means discovery has not yet run or no library was found.
-static LAST_OUTCOME: OnceLock<Option<DiscoveryOutcome>> = OnceLock::new();
+static LAST_OUTCOME: RwLock<Option<DiscoveryOutcome>> = RwLock::new(None);
 
 /// Returns the shared-library file names searched on the current platform.
 ///
@@ -162,7 +162,13 @@ impl InitResult {
 /// this accessor. `None` means either discovery has not run or no library was
 /// found.
 pub fn last_outcome() -> Option<DiscoveryOutcome> {
-    LAST_OUTCOME.get().and_then(|o| o.clone())
+    LAST_OUTCOME.read().ok().and_then(|outcome| outcome.clone())
+}
+
+fn record_last_outcome(outcome: Option<DiscoveryOutcome>) {
+    if let Ok(mut cached) = LAST_OUTCOME.write() {
+        *cached = outcome;
+    }
 }
 
 /// Resolve the user LeIndex home (`~/.leindex` by default, or `$LEINDEX_HOME`).
@@ -210,8 +216,26 @@ fn find_lib_in_dir(dir: &Path) -> Option<PathBuf> {
         })
         .collect::<Vec<_>>();
 
-    matches.sort();
+    matches.sort_by(|a, b| {
+        let a_name = a
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let b_name = b
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        ort_runtime_version_key(a_name).cmp(&ort_runtime_version_key(b_name))
+    });
     matches.pop()
+}
+
+#[cfg(any(feature = "onnx", test))]
+fn ort_runtime_version_key(name: &str) -> Vec<u64> {
+    name.split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
 }
 
 /// Discover the running worker binary's directory (siblings of `current_exe`).
@@ -383,7 +407,7 @@ pub fn discover_and_init() -> InitResult {
                 // in fact loaded).
                 let _ = builder.commit();
                 let outcome = DiscoveryOutcome { source, path };
-                let _ = LAST_OUTCOME.set(Some(outcome.clone()));
+                record_last_outcome(Some(outcome.clone()));
                 tracing::info!(
                     "loaded ONNX Runtime dylib from {} [{}]",
                     outcome.path.display(),
@@ -434,7 +458,7 @@ pub fn discover_and_init() -> InitResult {
         return InitResult::Initialized(outcome);
     }
 
-    let _ = LAST_OUTCOME.set(None);
+    record_last_outcome(None);
     InitResult::NotFound {
         searched,
         last_error,
@@ -676,6 +700,19 @@ mod tests {
             find_lib_in_dir(temp.path()).expect("versioned pip ORT library should be found");
 
         assert_eq!(found, versioned);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_find_lib_in_dir_uses_numeric_version_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let older = temp.path().join("libonnxruntime.so.1.9.0");
+        let newer = temp.path().join("libonnxruntime.so.1.10.0");
+        std::fs::write(&older, b"fake-older").unwrap();
+        std::fs::write(&newer, b"fake-newer").unwrap();
+
+        let found = find_lib_in_dir(temp.path()).expect("ORT library should be found");
+        assert_eq!(found, newer);
     }
 
     #[cfg(target_os = "linux")]

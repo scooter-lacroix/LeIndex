@@ -25,6 +25,11 @@ const LIB_DIR = path.join(__dirname, 'lib');
 const GITHUB_API_BASE = 'https://api.github.com/repos/scooter-lacroix/LeIndex';
 const DEFAULT_RELEASE_SELECTOR = 'latest';
 const MAX_REDIRECTS = 5;
+const REQUIRED_MODEL_FILES = [
+  'qwen3-embed-0.6b.onnx',
+  'tokenizer.json',
+  'config.json',
+];
 
 /**
  * The unversioned ONNX Runtime shared library name on the current platform.
@@ -65,6 +70,30 @@ function isOrtBundleLibraryName(name) {
     return lower.startsWith('libonnxruntime_providers_') && lower.endsWith('.dylib');
   }
   return lower.startsWith('libonnxruntime_providers_') && (lower.endsWith('.so') || /\.so\.\d/.test(lower));
+}
+
+function hasBundledOrtRuntime(libDir = LIB_DIR) {
+  try {
+    return fs.existsSync(libDir)
+      && fs.readdirSync(libDir).some(isOrtRuntimeLibraryName);
+  } catch (_) {
+    return false;
+  }
+}
+
+function hasRequiredModelAssets(modelsDir = MODELS_DIR) {
+  try {
+    return REQUIRED_MODEL_FILES.every((file) => {
+      const filePath = path.join(modelsDir, file);
+      return fs.existsSync(filePath) && fs.statSync(filePath).isFile();
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
+function bundledAssetsComplete(libDir = LIB_DIR, modelsDir = MODELS_DIR) {
+  return hasBundledOrtRuntime(libDir) && hasRequiredModelAssets(modelsDir);
 }
 
 function isPathInside(parent, child) {
@@ -806,9 +835,12 @@ async function install() {
     const existing = existingBinaryMatchesPackage(binaryPath);
     const hasWorker = fs.existsSync(workerPath);
 
-    if (existing.ok && hasWorker) {
+    const hasAssets = bundledAssetsComplete();
+
+    if (existing.ok && hasWorker && hasAssets) {
       console.log(`   ✓ LeIndex already installed: ${existing.output}`);
       console.log('   ✓ Worker binary present');
+      console.log('   ✓ Bundled ORT and model assets present');
       console.log('\n📦 Installation complete!');
       console.log('   Add this package to your MCP configuration to use LeIndex.');
       return;
@@ -821,6 +853,8 @@ async function install() {
       console.log(`   Reinstalling binary for package version ${pkg.version}...`);
     } else if (!hasWorker) {
       console.log('   ⚠ Worker binary missing; reinstalling bundled worker...');
+    } else if (!hasAssets) {
+      console.log('   ⚠ Bundled ORT/model assets missing; reinstalling release bundle...');
     }
 
     try { fs.unlinkSync(binaryPath); } catch (_) {}
@@ -909,6 +943,9 @@ module.exports = {
   getBundleAssetName,
   getOrtLibNames,
   getRequestedRelease,
+  hasBundledOrtRuntime,
+  hasRequiredModelAssets,
+  bundledAssetsComplete,
   assertNoUnsafeExtractedSymlinks,
   assertSafeArchiveFileName,
   assertSafeSymlinkTarget,

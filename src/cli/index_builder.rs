@@ -1816,12 +1816,13 @@ pub(crate) fn clear_query_caches(
     // Build the sanitized prefix for search query cache keys.
     // The key format is: search:query:{project_id}:{fingerprint}:{top_k}:{query:?}
     // After sanitization, colons become underscores.
-    let search_prefix = format!("search_query_{}", sanitize_for_prefix(project_id));
-    let analysis_prefix = format!("analysis_analyze_{}", sanitize_for_prefix(project_id));
+    let sanitized_project = sanitize_for_prefix(project_id);
+    let search_prefix = format!("search_query_{}_", sanitized_project);
+    let analysis_prefix = format!("analysis_analyze_{}_", sanitized_project);
 
     // Remove from in-memory cache
-    let mem_search = store.remove_prefix("search:query:");
-    let mem_analysis = store.remove_prefix("analysis:analyze:");
+    let mem_search = store.remove_prefix(&format!("search:query:{}:", project_id));
+    let mem_analysis = store.remove_prefix(&format!("analysis:analyze:{}:", project_id));
 
     // Remove from disk
     let disk_search = store.remove_spilled_prefix(&search_prefix);
@@ -2304,6 +2305,64 @@ mod tests {
             changed.is_empty(),
             "cold start should NOT produce false-positive manifest changes, got: {:?}",
             changed
+        );
+    }
+
+    #[test]
+    fn test_clear_query_caches_keeps_project_id_prefix_siblings() {
+        use crate::cli::memory::{CacheEntry, CacheSpiller, MemoryConfig};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = MemoryConfig {
+            cache_dir: temp_dir.path().join("cache"),
+            max_cache_bytes: 10_000_000,
+            ..Default::default()
+        };
+        let mut spiller = CacheSpiller::new(config).unwrap();
+
+        let project_1_key = "search:query:project_1:fingerprint:10:auth".to_string();
+        let project_10_key = "search:query:project_10:fingerprint:10:auth".to_string();
+        let analysis_1_key = "analysis:analyze:project_1:fingerprint:10:auth".to_string();
+        let analysis_10_key = "analysis:analyze:project_10:fingerprint:10:auth".to_string();
+        let entry = CacheEntry::Binary {
+            metadata: std::collections::HashMap::new(),
+            serialized_data: b"cached".to_vec(),
+        };
+
+        for key in [
+            &project_1_key,
+            &project_10_key,
+            &analysis_1_key,
+            &analysis_10_key,
+        ] {
+            spiller
+                .store_mut()
+                .insert(key.clone(), entry.clone())
+                .unwrap();
+            spiller.store_mut().persist_key(key).unwrap();
+        }
+
+        clear_query_caches(&mut spiller, "project_1");
+
+        assert!(spiller.store().peek(&project_1_key).is_none());
+        assert!(spiller.store().peek(&analysis_1_key).is_none());
+        assert!(spiller.store().peek(&project_10_key).is_some());
+        assert!(spiller.store().peek(&analysis_10_key).is_some());
+        assert!(
+            spiller
+                .store_mut()
+                .get_or_load(&project_10_key)
+                .unwrap()
+                .is_some(),
+            "disk cache for project_10 must not be deleted by project_1 prefix cleanup"
+        );
+        assert!(
+            spiller
+                .store_mut()
+                .get_or_load(&analysis_10_key)
+                .unwrap()
+                .is_some(),
+            "analysis disk cache for project_10 must not be deleted by project_1 prefix cleanup"
         );
     }
 

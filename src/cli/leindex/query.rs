@@ -96,7 +96,7 @@ impl LeIndex {
         // These require the in-memory PDG which is available here but not in lerecherche.
         if let Some(pdg) = &self.pdg {
             // Cache file contents to avoid re-reading the same file for multiple results
-            let mut file_cache: std::collections::HashMap<String, Vec<u8>> =
+            let mut file_cache: std::collections::HashMap<String, Option<Vec<u8>>> =
                 std::collections::HashMap::new();
 
             for result in &mut results {
@@ -120,24 +120,26 @@ impl LeIndex {
                             let abs_path = self.resolve_indexed_file_path(&file_path_str);
                             let content = file_cache
                                 .entry(file_path_str.clone())
-                                .or_insert_with(|| std::fs::read(abs_path).unwrap_or_default());
-
-                            if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
-                                // Compute from byte_range
-                                let byte_offset = node.byte_range.0.min(content.len());
-                                let line_num = content[..byte_offset]
-                                    .iter()
-                                    .filter(|&&b| b == b'\n')
-                                    .count()
-                                    + 1;
-                                result.line_number = Some(line_num);
-                            } else if !node.name.is_empty() {
-                                // Fallback: find the symbol name in the file content
-                                let name_bytes = node.name.as_bytes();
-                                if let Some(pos) = find_subsequence(content, name_bytes) {
-                                    let line_num =
-                                        content[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
+                                .or_insert_with(|| std::fs::read(abs_path).ok());
+                            if let Some(content) = content.as_ref() {
+                                if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
+                                    // Compute from byte_range
+                                    let byte_offset = node.byte_range.0.min(content.len());
+                                    let line_num = content[..byte_offset]
+                                        .iter()
+                                        .filter(|&&b| b == b'\n')
+                                        .count()
+                                        + 1;
                                     result.line_number = Some(line_num);
+                                } else if !node.name.is_empty() {
+                                    // Fallback: find the symbol name in the file content
+                                    let name_bytes = node.name.as_bytes();
+                                    if let Some(pos) = find_subsequence(content, name_bytes) {
+                                        let line_num =
+                                            content[..pos].iter().filter(|&&b| b == b'\n').count()
+                                                + 1;
+                                        result.line_number = Some(line_num);
+                                    }
                                 }
                             }
                         }
@@ -656,7 +658,7 @@ impl LeIndex {
 
         // Enrich with PDG metadata (same as regular search)
         if let Some(pdg) = &self.pdg {
-            let mut file_cache: std::collections::HashMap<String, Vec<u8>> =
+            let mut file_cache: std::collections::HashMap<String, Option<Vec<u8>>> =
                 std::collections::HashMap::new();
 
             for result in &mut final_results {
@@ -679,22 +681,25 @@ impl LeIndex {
                             let abs_path = self.resolve_indexed_file_path(&file_path_str);
                             let content = file_cache
                                 .entry(file_path_str.clone())
-                                .or_insert_with(|| std::fs::read(abs_path).unwrap_or_default());
+                                .or_insert_with(|| std::fs::read(abs_path).ok());
 
-                            if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
-                                let byte_offset = node.byte_range.0.min(content.len());
-                                let line_num = content[..byte_offset]
-                                    .iter()
-                                    .filter(|&&b| b == b'\n')
-                                    .count()
-                                    + 1;
-                                result.line_number = Some(line_num);
-                            } else if !node.name.is_empty() {
-                                let name_bytes = node.name.as_bytes();
-                                if let Some(pos) = find_subsequence(content, name_bytes) {
-                                    let line_num =
-                                        content[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
+                            if let Some(content) = content.as_ref() {
+                                if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
+                                    let byte_offset = node.byte_range.0.min(content.len());
+                                    let line_num = content[..byte_offset]
+                                        .iter()
+                                        .filter(|&&b| b == b'\n')
+                                        .count()
+                                        + 1;
                                     result.line_number = Some(line_num);
+                                } else if !node.name.is_empty() {
+                                    let name_bytes = node.name.as_bytes();
+                                    if let Some(pos) = find_subsequence(content, name_bytes) {
+                                        let line_num =
+                                            content[..pos].iter().filter(|&&b| b == b'\n').count()
+                                                + 1;
+                                        result.line_number = Some(line_num);
+                                    }
                                 }
                             }
                         }

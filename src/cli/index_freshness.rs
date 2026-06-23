@@ -9,6 +9,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+const MAX_FAST_INDEXED_FILE_STATS: usize = 10_000;
+
+fn should_skip_fast_file_stat_scan(indexed_file_count: usize) -> bool {
+    indexed_file_count > MAX_FAST_INDEXED_FILE_STATS
+}
+
 /// Read-only context passed to freshness functions to avoid borrow conflicts.
 pub(crate) struct FreshnessContext<'a> {
     pub project_path: &'a Path,
@@ -223,9 +229,14 @@ pub(crate) fn is_stale_fast(
         }
     }
 
-    // Check ALL indexed source files for deletion or modification.
-    // This is O(N) stat() calls but each stat is ~0.01ms, so even for
-    // 1000 files the total cost is ~10ms — well within the 1000ms budget.
+    // Check indexed source files for deletion or modification. Keep the fast
+    // path bounded: on very large projects or slow filesystems, stat()ing every
+    // file here can dominate every tool call. Returning stale is conservative;
+    // the caller can run the authoritative hash-based freshness check.
+    if should_skip_fast_file_stat_scan(indexed_files.len()) {
+        return true;
+    }
+
     // Using >= instead of > catches same-second modifications (where the
     // file mtime equals the DB mtime). This may produce false positives
     // (files indexed in the same second as the DB write), but those are
@@ -931,5 +942,15 @@ mod tests {
             fallback_set.contains(&canon),
             "fallback must still resolve the manifest to its canonical form"
         );
+    }
+
+    #[test]
+    fn fast_file_stat_scan_is_bounded() {
+        assert!(!should_skip_fast_file_stat_scan(
+            MAX_FAST_INDEXED_FILE_STATS
+        ));
+        assert!(should_skip_fast_file_stat_scan(
+            MAX_FAST_INDEXED_FILE_STATS + 1
+        ));
     }
 }

@@ -10,9 +10,10 @@
 #![warn(missing_docs)]
 
 use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
-use crate::parse::prelude::SignatureInfo;
+use crate::parse::prelude::{ImportInfo, SignatureInfo};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -904,29 +905,11 @@ pub fn extract_call_edges(
         }
     }
 
-    // Build alias map from all imports across all signatures
-    let mut alias_map: HashMap<String, String> = HashMap::new();
-    for sig in signatures {
-        for import in &sig.imports {
-            let alias = import.alias.clone().or_else(|| {
-                import
-                    .path
-                    .split(['.', ':', '/', '\\'])
-                    .next_back()
-                    .map(|s| s.to_string())
-            });
-            if let Some(alias) = alias {
-                alias_map
-                    .entry(alias)
-                    .or_insert_with(|| import.path.clone());
-            }
-        }
-    }
-
     for sig in signatures {
         let Some(&caller_id) = node_ids.get(&sig.qualified_name) else {
             continue;
         };
+        let alias_map = import_alias_map(&sig.imports);
         let caller_ns = {
             let norm = normalize_symbol(&sig.qualified_name);
             let segs: Vec<&str> = norm.split('.').collect();
@@ -1142,25 +1125,6 @@ fn resolve_cross_file_call_edges_inner(
         }
     }
 
-    // Build alias map from all imports
-    let mut alias_map: HashMap<String, String> = HashMap::new();
-    for (_, sig) in all_signatures {
-        for import in &sig.imports {
-            let alias = import.alias.clone().or_else(|| {
-                import
-                    .path
-                    .split(['.', ':', '/', '\\'])
-                    .next_back()
-                    .map(|s| s.to_string())
-            });
-            if let Some(alias) = alias {
-                alias_map
-                    .entry(alias)
-                    .or_insert_with(|| import.path.clone());
-            }
-        }
-    }
-
     // Track existing call edges to avoid duplicates
     let mut existing_edges: HashSet<(NodeId, NodeId)> = HashSet::new();
     for edge_idx in pdg.edge_indices() {
@@ -1176,6 +1140,7 @@ fn resolve_cross_file_call_edges_inner(
     let mut new_edges = Vec::new();
 
     for (source_file, sig) in all_signatures {
+        let alias_map = import_alias_map(&sig.imports);
         // Real indexing passes the source file for each signature. Use it to
         // bind duplicate qualified names to their owning PDG node; the legacy
         // no-file API falls back to all matching definitions.
@@ -1513,9 +1478,46 @@ fn resolve_cross_file_call_edges_inner(
 }
 
 fn qualified_name_from_node(node: &Node) -> Option<&str> {
-    node.id
+    if let Some(qname) = node
+        .id
         .strip_prefix(node.file_path.as_ref())
         .and_then(|rest| rest.strip_prefix(':'))
+    {
+        return Some(qname);
+    }
+
+    let expected_file_name = Path::new(node.file_path.as_ref()).file_name()?.to_str()?;
+    node.id.char_indices().find_map(|(idx, ch)| {
+        if ch != ':' {
+            return None;
+        }
+        let (id_path, rest) = node.id.split_at(idx);
+        let rest = rest.strip_prefix(':')?;
+        if rest.is_empty() {
+            return None;
+        }
+        let id_file_name = Path::new(id_path).file_name()?.to_str()?;
+        (id_file_name == expected_file_name).then_some(rest)
+    })
+}
+
+fn import_alias_map(imports: &[ImportInfo]) -> HashMap<String, String> {
+    let mut alias_map = HashMap::new();
+    for import in imports {
+        let alias = import.alias.clone().or_else(|| {
+            import
+                .path
+                .split(['.', ':', '/', '\\'])
+                .next_back()
+                .map(|s| s.to_string())
+        });
+        if let Some(alias) = alias {
+            alias_map
+                .entry(alias)
+                .or_insert_with(|| import.path.clone());
+        }
+    }
+    alias_map
 }
 
 // ---------------------------------------------------------------------------
@@ -2104,7 +2106,7 @@ fn signature_to_node(sig: &SignatureInfo, file_path: &str, language: &str) -> No
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::prelude::{Parameter, SignatureInfo, Visibility};
+    use crate::parse::prelude::{ImportInfo, Parameter, SignatureInfo, Visibility};
 
     fn sig(name: &str, qualified: &str, is_method: bool) -> SignatureInfo {
         SignatureInfo {
@@ -2819,9 +2821,76 @@ mod tests {
     }
 
     #[test]
-    fn qualified_name_from_node_returns_none_on_path_mismatch() {
+    fn cross_file_import_aliases_are_scoped_to_the_calling_signature() {
+        let mut caller_a = sig("handler_a", "handler_a", false);
+        caller_a.imports.push(ImportInfo {
+            path: "real.module.target".to_string(),
+            alias: Some("alias".to_string()),
+        });
+        caller_a.calls.push("alias".to_string());
+
+        let mut caller_b = sig("handler_b", "handler_b", false);
+        caller_b.calls.push("alias".to_string());
+
+        let callee = sig("target", "real.module.target", false);
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller_a.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![caller_b.clone()], b"", "b.rs", "rust");
+        let pdg_c = extract_pdg_from_signatures(vec![callee.clone()], b"", "c.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for source in [&pdg_a, &pdg_b, &pdg_c] {
+            for nid in source.node_indices() {
+                if let Some(node) = source.get_node(nid) {
+                    merged.add_node(node.clone());
+                }
+            }
+        }
+
+        resolve_cross_file_call_edges_for_files(
+            &mut merged,
+            &[
+                ("a.rs".to_string(), caller_a),
+                ("b.rs".to_string(), caller_b),
+                ("c.rs".to_string(), callee),
+            ],
+        );
+
+        assert!(has_call_edge_between_files(
+            &merged,
+            "a.rs",
+            "handler_a",
+            "c.rs",
+            "target"
+        ));
+        assert!(!has_call_edge_between_files(
+            &merged,
+            "b.rs",
+            "handler_b",
+            "c.rs",
+            "target"
+        ));
+    }
+
+    #[test]
+    fn qualified_name_from_node_handles_equivalent_path_suffixes() {
         let node = Node {
             id: "relative.rs:my_mod::handler".to_string(),
+            node_type: NodeType::Function,
+            name: "handler".to_string(),
+            file_path: Arc::from("/abs/relative.rs"),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "rust".to_string(),
+        };
+
+        assert_eq!(qualified_name_from_node(&node), Some("my_mod::handler"));
+    }
+
+    #[test]
+    fn qualified_name_from_node_rejects_different_path_suffixes() {
+        let node = Node {
+            id: "other.rs:my_mod::handler".to_string(),
             node_type: NodeType::Function,
             name: "handler".to_string(),
             file_path: Arc::from("/abs/relative.rs"),

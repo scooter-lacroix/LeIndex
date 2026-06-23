@@ -35,7 +35,7 @@ dependencies = []
 # migraphx) into the user environment on demand. Users who want neural
 # support up front may opt into the optional `neural` extra.
 [project.optional-dependencies]
-neural = ["onnxruntime>=1.20"]
+neural = ["onnxruntime>=1.20,<2"]
 
 [project.urls]
 Homepage = "https://github.com/scooter-lacroix/LeIndex"

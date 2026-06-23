@@ -78,6 +78,9 @@ assert.strictEqual(typeof installer.assertSafeSymlinkTarget, 'function', 'instal
 assert.strictEqual(typeof installer.isSafeArchiveMemberName, 'function', 'install.js should expose isSafeArchiveMemberName');
 assert.strictEqual(typeof installer.isOrtBundleLibraryName, 'function', 'install.js should expose isOrtBundleLibraryName');
 assert.strictEqual(typeof installer.isOrtRuntimeLibraryName, 'function', 'install.js should expose isOrtRuntimeLibraryName');
+assert.strictEqual(typeof installer.hasBundledOrtRuntime, 'function', 'install.js should expose hasBundledOrtRuntime');
+assert.strictEqual(typeof installer.hasRequiredModelAssets, 'function', 'install.js should expose hasRequiredModelAssets');
+assert.strictEqual(typeof installer.bundledAssetsComplete, 'function', 'install.js should expose bundledAssetsComplete');
 assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js LIB_DIR should point at <pkg>/lib');
 {
   const names = installer.getOrtLibNames();
@@ -100,6 +103,31 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
   assert(!installer.isSafeArchiveMemberName('../../etc/passwd'));
   assert(!installer.isSafeArchiveMemberName('/tmp/pwned'));
   assert(!installer.isSafeArchiveMemberName('C:\\temp\\pwned'));
+}
+{
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'leindex-mcp-assets-'));
+  const libDir = path.join(tmpRoot, 'lib');
+  const modelsDir = path.join(tmpRoot, 'models');
+  try {
+    fs.mkdirSync(libDir, { recursive: true });
+    fs.mkdirSync(modelsDir, { recursive: true });
+    assert.strictEqual(installer.bundledAssetsComplete(libDir, modelsDir), false, 'empty bundle assets should not satisfy installer fast path');
+
+    const runtimeName = process.platform === 'win32' ? 'onnxruntime.dll'
+      : process.platform === 'darwin' ? 'libonnxruntime.dylib'
+      : 'libonnxruntime.so';
+    fs.writeFileSync(path.join(libDir, runtimeName), 'fake-ort-runtime');
+    assert.strictEqual(installer.hasBundledOrtRuntime(libDir), true, 'ORT runtime library should be detected');
+    assert.strictEqual(installer.bundledAssetsComplete(libDir, modelsDir), false, 'missing model assets should prevent installer fast path');
+
+    for (const file of ['qwen3-embed-0.6b.onnx', 'tokenizer.json', 'config.json']) {
+      fs.writeFileSync(path.join(modelsDir, file), 'fake-model-asset');
+    }
+    assert.strictEqual(installer.hasRequiredModelAssets(modelsDir), true, 'required model assets should be detected');
+    assert.strictEqual(installer.bundledAssetsComplete(libDir, modelsDir), true, 'complete ORT and model assets should satisfy installer fast path');
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
 }
 {
   // copyBundledEntry should preserve a regular file when copying.
