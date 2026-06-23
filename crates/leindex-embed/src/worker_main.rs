@@ -79,7 +79,13 @@ pub fn run() -> ! {
         // argument is the signal number (SIGKILL). The remaining arguments
         // are unused for this option and passed as 0.
         unsafe {
-            let rc = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+            let rc = libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as libc::c_ulong,
+                0,
+                0,
+                0,
+            );
             if rc != 0 {
                 // prctl failures are extremely rare (kernel would have to
                 // be out of memory for the syscall stub). We log to stderr

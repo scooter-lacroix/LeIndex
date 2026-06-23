@@ -1093,7 +1093,7 @@ fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
                 .unwrap_or(false)
             {
                 out.push_str(&format!(
-                    "    {}... (showing 50 of more){}\n",
+                    "    {}... (showing 50 or more){}\n",
                     if color { DIM } else { "" },
                     if color { RESET } else { "" },
                 ));
@@ -1129,7 +1129,7 @@ fn render_symbol_lookup_single(data: &Value, color: bool) -> String {
                 .unwrap_or(false)
             {
                 out.push_str(&format!(
-                    "    {}... (showing 50 of more){}\n",
+                    "    {}... (showing 50 or more){}\n",
                     if color { DIM } else { "" },
                     if color { RESET } else { "" },
                 ));

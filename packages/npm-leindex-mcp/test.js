@@ -30,7 +30,15 @@ assert(pkg.bin && pkg.bin['leindex-mcp'], 'Should have leindex-mcp bin entry');
 assert(pkg.scripts && pkg.scripts.postinstall, 'Should have postinstall script');
 assert(pkg.files && pkg.files.includes('bin/mcp-wrapper.js'), 'Published package should include only the MCP wrapper entrypoint');
 assert(pkg.files && pkg.files.includes('bin/setup-wrapper.js'), 'Published package should include the setup wrapper entrypoint (VAL-NPM-005)');
-assert(!pkg.files.includes('bin/'), 'Published package should not ship downloaded runtime binaries');
+const allowedBinEntries = new Set(['bin/mcp-wrapper.js', 'bin/setup-wrapper.js']);
+const unexpectedBinEntries = (pkg.files || []).filter(
+  (entry) => entry.startsWith('bin/') && !allowedBinEntries.has(entry)
+);
+assert.strictEqual(
+  unexpectedBinEntries.length,
+  0,
+  `Published package should not ship downloaded runtime binaries: ${unexpectedBinEntries.join(', ')}`
+);
 assert(pkg.scripts.setup, 'VAL-NPM-005: package.json should expose a setup script');
 assert(/leindex setup|setup-wrapper|bin\/setup/.test(pkg.scripts.setup), 'VAL-NPM-005: setup script should invoke the leindex setup flow');
 console.log('  ✓ Package.json is valid\n');
@@ -335,13 +343,14 @@ if (fs.existsSync(binaryPath)) {
       }
       const version = execFileSync(binaryPath, ['--version'], { encoding: 'utf8' }).trim();
       const expectedVersion = pkg.version;
-      const match = version.match(/leindex\s+([0-9]+\.[0-9]+\.[0-9]+)/);
-      if (!match) {
+      const prefix = 'leindex ';
+      if (!version.startsWith(prefix)) {
         console.error(`  ❌ Binary version output is not parseable: ${version}`);
         process.exit(1);
       }
-      if (match[1] !== expectedVersion) {
-        console.error(`  ❌ Binary version ${match[1]} does not match package version ${expectedVersion}`);
+      const actualVersion = version.slice(prefix.length).trim();
+      if (actualVersion !== expectedVersion) {
+        console.error(`  ❌ Binary version ${actualVersion} does not match package version ${expectedVersion}`);
         process.exit(1);
       }
       console.log(`  ✓ Binary version matches package: ${version}`);
