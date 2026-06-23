@@ -64,28 +64,16 @@ impl LeIndex {
             return Ok(Vec::new());
         }
 
+        if let Some(cached_results) =
+            self.cached_search_results(query, top_k, query_type.as_ref())?
+        {
+            return Ok(cached_results);
+        }
+
         let query_neural_embedding = self.generate_query_neural_embedding(query);
         let neural_available = query_neural_embedding.is_some();
         let search_cache_key =
             self.search_cache_key_for(query, top_k, query_type.as_ref(), neural_available);
-        if let Some(CacheEntry::Binary {
-            serialized_data, ..
-        }) = self
-            .cache
-            .cache_spiller
-            .store_mut()
-            .get_or_load(&search_cache_key)?
-        {
-            if let Ok(cached_results) = bincode::deserialize::<Vec<SearchResult>>(&serialized_data)
-            {
-                debug!(
-                    "Search cache hit for '{}' ({} results)",
-                    query,
-                    cached_results.len()
-                );
-                return Ok(cached_results);
-            }
-        }
 
         let search_query = SearchQuery {
             query: query.to_string(),
@@ -186,6 +174,43 @@ impl LeIndex {
         }
 
         Ok(results)
+    }
+
+    fn cached_search_results(
+        &mut self,
+        query: &str,
+        top_k: usize,
+        query_type: Option<&crate::search::ranking::QueryType>,
+    ) -> Result<Option<Vec<SearchResult>>> {
+        // Neural availability is part of the persisted cache key. Probe both
+        // variants before generating the query neural embedding so repeated
+        // searches can return immediately even when ONNX would otherwise hit
+        // the 15s query-embedding timeout.
+        for neural_available in [true, false] {
+            let search_cache_key =
+                self.search_cache_key_for(query, top_k, query_type, neural_available);
+            if let Some(CacheEntry::Binary {
+                serialized_data, ..
+            }) = self
+                .cache
+                .cache_spiller
+                .store_mut()
+                .get_or_load(&search_cache_key)?
+            {
+                if let Ok(cached_results) =
+                    bincode::deserialize::<Vec<SearchResult>>(&serialized_data)
+                {
+                    debug!(
+                        "Search cache hit for '{}' ({} results)",
+                        query,
+                        cached_results.len()
+                    );
+                    return Ok(Some(cached_results));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Perform deep analysis with context expansion
@@ -1139,7 +1164,77 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::simple_stem;
+    use super::{simple_stem, LeIndex};
+    use crate::cli::memory::CacheEntry;
+    use crate::search::{ranking::Score, search::SearchResult};
+
+    fn cached_result(node_id: &str) -> SearchResult {
+        SearchResult {
+            rank: 1,
+            node_id: node_id.to_string(),
+            file_path: "src/lib.rs".to_string(),
+            symbol_name: "cached_symbol".to_string(),
+            symbol_type: Some("function".to_string()),
+            signature: Some("fn cached_symbol() {}".to_string()),
+            complexity: 1,
+            caller_count: Some(0),
+            dependency_count: Some(0),
+            language: "rust".to_string(),
+            score: Score::default(),
+            context: Some(String::new()),
+            byte_range: (0, 0),
+            line_number: Some(1),
+        }
+    }
+
+    #[test]
+    fn cached_search_results_probe_fallback_key_before_embedding_is_needed() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let project_path = temp_dir.path().join("project");
+        std::fs::create_dir_all(&project_path).unwrap();
+        std::fs::write(project_path.join("lib.rs"), "fn cached_symbol() {}\n").unwrap();
+
+        let mut leindex = LeIndex::new(&project_path).unwrap();
+        let results = vec![cached_result("fallback-cache-hit")];
+        let serialized = bincode::serialize(&results).unwrap();
+        assert!(!serialized.is_empty());
+        let fallback_key = leindex.search_cache_key_for("cached_symbol", 5, None, false);
+        leindex
+            .cache
+            .cache_spiller
+            .store_mut()
+            .insert(
+                fallback_key.clone(),
+                CacheEntry::Binary {
+                    metadata: std::collections::HashMap::from([(
+                        "type".to_string(),
+                        "search_results".to_string(),
+                    )]),
+                    serialized_data: serialized,
+                },
+            )
+            .unwrap();
+        let direct = leindex
+            .cache
+            .cache_spiller
+            .store_mut()
+            .get(&fallback_key)
+            .expect("seeded fallback cache entry should be readable");
+        let CacheEntry::Binary {
+            serialized_data, ..
+        } = direct
+        else {
+            panic!("seeded fallback cache entry should be binary");
+        };
+        let direct_results: Vec<SearchResult> = bincode::deserialize(&serialized_data).unwrap();
+        assert_eq!(direct_results[0].node_id, "fallback-cache-hit");
+
+        let cached = leindex
+            .cached_search_results("cached_symbol", 5, None)
+            .unwrap()
+            .expect("fallback cache entry should be returned without neural probing");
+        assert_eq!(cached[0].node_id, "fallback-cache-hit");
+    }
 
     #[test]
     fn simple_stem_handles_multibyte_double_consonant() {
