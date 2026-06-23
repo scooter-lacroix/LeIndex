@@ -1325,6 +1325,30 @@ pub(crate) fn index_nodes_with_embedder(
             pdg_edges: pdg.edge_count(),
         };
 
+        // VAL-ONNX-001: When onnx feature is enabled, create a hybrid_local
+        // embedder so neural embeddings are used during indexing and search.
+        // Falls back to tfidf_only if the ONNX worker cannot be initialized.
+        // Callers who want tfidf_only should pass an explicit tfidf_only embedder.
+        #[cfg(feature = "onnx")]
+        {
+            match HybridEmbedder::hybrid_local(tfidf_embedder, None) {
+                Ok(hybrid) => hybrid,
+                Err(e) => {
+                    warn!(
+                        "Failed to create hybrid_local embedder (ONNX), falling back to tfidf_only: {}",
+                        e
+                    );
+                    HybridEmbedder::tfidf_only(TfIdfEmbedder {
+                        vocab: final_scores.iter().map(|(t, _)| t.clone()).collect(),
+                        idf: final_scores.iter().map(|(_, s)| *s).collect(),
+                        dimension: crate::search::search::DEFAULT_EMBEDDING_DIMENSION,
+                        pdg_nodes: pdg.node_count(),
+                        pdg_edges: pdg.edge_count(),
+                    })
+                }
+            }
+        }
+        #[cfg(not(feature = "onnx"))]
         HybridEmbedder::tfidf_only(tfidf_embedder)
     };
 
@@ -1335,6 +1359,10 @@ pub(crate) fn index_nodes_with_embedder(
     let mut pruned_count: usize = 0;
     let mut shed_count: usize = 0;
     let mut hoisted_count: usize = 0;
+
+    // Clear the search engine once before batch processing begins.
+    // Each batch will append nodes incrementally via append_nodes().
+    search_engine.clear_index();
 
     let mut nodes: Vec<NodeInfo> = Vec::with_capacity(batch_size);
 
@@ -1371,15 +1399,16 @@ pub(crate) fn index_nodes_with_embedder(
                 // if we've already computed one for identical content.
                 // Both TF-IDF and neural embeddings are cached to avoid redundant
                 // ONNX inference on cache hits.
-                let (tfidf_embedding, cached_neural) = if let Some((tfidf, neural)) = work_hoister.lookup(&node_content) {
-                    hoisted_count += 1;
-                    (tfidf, neural)
-                } else {
-                    let embedding = embedder.embed_tfidf(&tokens);
-                    // Don't store yet — we'll store after computing neural embedding
-                    // so both are cached together.
-                    (embedding, None)
-                };
+                let (tfidf_embedding, cached_neural) =
+                    if let Some((tfidf, neural)) = work_hoister.lookup(&node_content) {
+                        hoisted_count += 1;
+                        (tfidf, neural)
+                    } else {
+                        let embedding = embedder.embed_tfidf(&tokens);
+                        // Don't store yet — we'll store after computing neural embedding
+                        // so both are cached together.
+                        (embedding, None)
+                    };
 
                 // Determine neural embedding: use cache hit, or defer to batch call.
                 let neural_embedding;
@@ -1432,29 +1461,41 @@ pub(crate) fn index_nodes_with_embedder(
             }
         }
 
-        // Batch neural embedding: one IPC call for all pending nodes in this chunk.
+        // Batch neural embedding: process pending nodes in sub-chunks to cap
+        // IPC payload size and ONNX worker memory usage.
         if !neural_pending.is_empty() {
-            #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-            let batch_results = {
-                let texts: Vec<String> = neural_pending.iter().map(|&idx| nodes[idx].content.clone()).collect();
-                embedder.embed_neural_batch_blocking(&texts)
-            };
-            #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
-            let batch_results: Vec<Option<Vec<f32>>> = vec![None; neural_pending.len()];
-
-            for (i, &node_vec_idx) in neural_pending.iter().enumerate() {
-                let neural = batch_results.get(i).and_then(|r| r.clone());
-                // Store in work hoister so future cache hits avoid re-computation
-                work_hoister.store(
-                    &nodes[node_vec_idx].content,
-                    nodes[node_vec_idx].tfidf_embedding.clone(),
-                    neural.clone(),
-                );
-                nodes[node_vec_idx].neural_embedding = neural;
+            const NEURAL_IPC_BATCH: usize = 256;
+            for ipc_chunk in neural_pending.chunks(NEURAL_IPC_BATCH) {
+                #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+                {
+                    let texts: Vec<String> = ipc_chunk
+                        .iter()
+                        .map(|&idx| nodes[idx].content.clone())
+                        .collect();
+                    let batch_results = embedder.embed_neural_batch_blocking(&texts);
+                    for (i, &node_vec_idx) in ipc_chunk.iter().enumerate() {
+                        let neural = batch_results.get(i).and_then(|r| r.clone());
+                        work_hoister.store(
+                            &nodes[node_vec_idx].content,
+                            nodes[node_vec_idx].tfidf_embedding.clone(),
+                            neural.clone(),
+                        );
+                        nodes[node_vec_idx].neural_embedding = neural;
+                    }
+                }
+                #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+                {
+                    for &node_vec_idx in ipc_chunk {
+                        nodes[node_vec_idx].neural_embedding = None;
+                    }
+                }
             }
         }
 
-        search_engine.index_nodes(std::mem::replace(&mut nodes, Vec::with_capacity(batch_size)));
+        search_engine.append_nodes(std::mem::replace(
+            &mut nodes,
+            Vec::with_capacity(batch_size),
+        ));
     }
 
     // A+ logging: per-batch stats at info! level (invisible under default WARN).
@@ -1597,9 +1638,20 @@ pub(crate) fn files_importing_from_manifests(
 // ============================================================================
 
 pub(crate) fn index_fingerprint(stats: &IndexStats) -> String {
+    // Include all numeric stats so that any content change invalidates
+    // the search cache. Previously only pdg_nodes/pdg_edges/indexed_nodes
+    // were used, which meant modifying a file (replacing one function with
+    // another) produced the same fingerprint and stale cached search
+    // results were returned (VAL-INDEX-005).
     format!(
-        "{}:{}:{}",
-        stats.pdg_nodes, stats.pdg_edges, stats.indexed_nodes
+        "{}:{}:{}:{}:{}:{}:{}",
+        stats.total_files,
+        stats.files_parsed,
+        stats.total_signatures,
+        stats.pdg_nodes,
+        stats.pdg_edges,
+        stats.indexed_nodes,
+        stats.indexing_time_ms,
     )
 }
 
@@ -1616,14 +1668,16 @@ pub(crate) fn search_cache_key_for(
     query: &str,
     top_k: usize,
     query_type: Option<&crate::search::ranking::QueryType>,
+    neural_available: bool,
 ) -> String {
     search_cache_key(&format!(
-        "query:{}:{}:{}:{}:{:?}",
+        "query:{}:{}:{}:{}:{:?}:neural={}",
         stable_project_cache_id(project_id, project_path),
         index_fingerprint(stats),
         top_k,
         query.trim().to_lowercase(),
         query_type,
+        neural_available,
     ))
 }
 
@@ -1671,6 +1725,136 @@ pub(crate) fn persist_embeddings_to_mmap(
     Ok(())
 }
 
+/// Persist neural embeddings to a separate mmap file for fast load_from_storage.
+///
+/// This stores the ONNX neural embeddings (1024-dim) separately from the
+/// TF-IDF embeddings (768-dim) so they can be restored without re-computing
+/// ONNX inference for all nodes.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+pub(crate) fn persist_neural_embeddings_to_mmap(
+    search_engine: &SearchEngine,
+    project_path: &Path,
+) -> Result<()> {
+    let embeddings = search_engine.collect_neural_embeddings();
+    let path = neural_mmap_embeddings_path(project_path);
+    if embeddings.is_empty() {
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| {
+                anyhow::anyhow!("Failed to remove stale neural mmap embeddings: {e}")
+            })?;
+            info!(
+                path = %path.display(),
+                "Removed stale neural embeddings mmap file"
+            );
+        }
+        return Ok(());
+    }
+    crate::search::vector::write_mmap_embeddings(&path, &embeddings)
+        .map_err(|e| anyhow::anyhow!("Failed to write neural mmap embeddings: {e}"))?;
+    info!(
+        count = embeddings.len(),
+        path = %path.display(),
+        "Persisted neural embeddings to mmap file"
+    );
+    Ok(())
+}
+
+/// Path for the neural embeddings mmap file.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+fn neural_mmap_embeddings_path(project_path: &Path) -> PathBuf {
+    project_path.join(".leindex").join("neural_embeddings.bin")
+}
+
+/// Try to load previously persisted neural embeddings from mmap file.
+///
+/// Returns `None` if the file does not exist or is corrupt.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+pub(crate) fn try_load_neural_mmap_embeddings(
+    project_path: &Path,
+) -> Option<crate::search::vector::MmapEmbeddingIndex> {
+    let path = neural_mmap_embeddings_path(project_path);
+    if !path.exists() {
+        return None;
+    }
+    match crate::search::vector::MmapEmbeddingIndex::open(&path) {
+        Ok(index) => {
+            info!(
+                nodes = index.len(),
+                dim = index.dimension(),
+                path = %path.display(),
+                "Loaded neural mmap embedding index"
+            );
+            Some(index)
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "Failed to load neural mmap embedding index"
+            );
+            None
+        }
+    }
+}
+
+/// Clear persisted search query and analysis cache entries for a project.
+///
+/// After indexing (full or incremental), previously cached search results
+/// may be stale. This function removes all `search:query:` and `analysis:`
+/// cache entries from both the in-memory store and the disk cache directory.
+///
+/// This is critical for VAL-INDEX-005: without cache invalidation, modifying
+/// a source file and running `leindex.index` (force_reindex=false) would
+/// produce a fresh PDG but stale search results would still be served from
+/// the disk cache.
+pub(crate) fn clear_query_caches(
+    cache_spiller: &mut crate::cli::memory::CacheSpiller,
+    project_id: &str,
+) {
+    let store = cache_spiller.store_mut();
+
+    // Build the sanitized prefix for search query cache keys.
+    // The key format is: search:query:{project_id}:{fingerprint}:{top_k}:{query:?}
+    // After sanitization, colons become underscores.
+    let sanitized_project = sanitize_for_prefix(project_id);
+    let search_prefix = format!("search_query_{}_", sanitized_project);
+    let analysis_prefix = format!("analysis_analyze_{}_", sanitized_project);
+
+    // Remove from in-memory cache
+    let mem_search = store.remove_prefix(&format!("search:query:{}:", project_id));
+    let mem_analysis = store.remove_prefix(&format!("analysis:analyze:{}:", project_id));
+
+    // Remove from disk
+    let disk_search = store.remove_spilled_prefix(&search_prefix);
+    let disk_analysis = store.remove_spilled_prefix(&analysis_prefix);
+
+    if mem_search + mem_analysis + disk_search + disk_analysis > 0 {
+        info!(
+            "Cleared query caches: {} search (mem:{} disk:{}), {} analysis (mem:{} disk:{})",
+            mem_search + disk_search,
+            mem_search,
+            disk_search,
+            mem_analysis + disk_analysis,
+            mem_analysis,
+            disk_analysis,
+        );
+    }
+}
+
+/// Sanitize a project ID for use as a disk cache filename prefix.
+/// The disk cache filenames are sanitized versions of the full cache key.
+fn sanitize_for_prefix(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Try to load a previously persisted mmap embedding index.
 ///
 /// Returns `None` if the file does not exist or is corrupt.
@@ -1708,6 +1892,7 @@ pub(crate) fn try_load_mmap_embeddings(
 // ============================================================================
 
 #[cfg(test)]
+#[allow(clippy::infallible_destructuring_match)]
 mod tests {
     use super::*;
 
@@ -1854,6 +2039,16 @@ mod tests {
                 magnitude
             );
         }
+    }
+
+    #[test]
+    fn test_sanitize_for_prefix_keeps_full_project_id() {
+        let a = "aaaaaaaaaaaaaaaaaaaa_project_one";
+        let b = "aaaaaaaaaaaaaaaaaaaa_project_two";
+
+        assert_ne!(sanitize_for_prefix(a), sanitize_for_prefix(b));
+        assert!(sanitize_for_prefix(a).ends_with("project_one"));
+        assert!(sanitize_for_prefix(b).ends_with("project_two"));
     }
 
     #[test]
@@ -2114,6 +2309,64 @@ mod tests {
     }
 
     #[test]
+    fn test_clear_query_caches_keeps_project_id_prefix_siblings() {
+        use crate::cli::memory::{CacheEntry, CacheSpiller, MemoryConfig};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config = MemoryConfig {
+            cache_dir: temp_dir.path().join("cache"),
+            max_cache_bytes: 10_000_000,
+            ..Default::default()
+        };
+        let mut spiller = CacheSpiller::new(config).unwrap();
+
+        let project_1_key = "search:query:project_1:fingerprint:10:auth".to_string();
+        let project_10_key = "search:query:project_10:fingerprint:10:auth".to_string();
+        let analysis_1_key = "analysis:analyze:project_1:fingerprint:10:auth".to_string();
+        let analysis_10_key = "analysis:analyze:project_10:fingerprint:10:auth".to_string();
+        let entry = CacheEntry::Binary {
+            metadata: std::collections::HashMap::new(),
+            serialized_data: b"cached".to_vec(),
+        };
+
+        for key in [
+            &project_1_key,
+            &project_10_key,
+            &analysis_1_key,
+            &analysis_10_key,
+        ] {
+            spiller
+                .store_mut()
+                .insert(key.clone(), entry.clone())
+                .unwrap();
+            spiller.store_mut().persist_key(key).unwrap();
+        }
+
+        clear_query_caches(&mut spiller, "project_1");
+
+        assert!(spiller.store().peek(&project_1_key).is_none());
+        assert!(spiller.store().peek(&analysis_1_key).is_none());
+        assert!(spiller.store().peek(&project_10_key).is_some());
+        assert!(spiller.store().peek(&analysis_10_key).is_some());
+        assert!(
+            spiller
+                .store_mut()
+                .get_or_load(&project_10_key)
+                .unwrap()
+                .is_some(),
+            "disk cache for project_10 must not be deleted by project_1 prefix cleanup"
+        );
+        assert!(
+            spiller
+                .store_mut()
+                .get_or_load(&analysis_10_key)
+                .unwrap()
+                .is_some(),
+            "analysis disk cache for project_10 must not be deleted by project_1 prefix cleanup"
+        );
+    }
+
+    #[test]
     fn test_detect_changed_manifests_detects_real_change() {
         // Verifies that a real manifest change is still detected even on cold start.
         use crate::cli::memory::{CacheSpiller, MemoryConfig};
@@ -2353,6 +2606,25 @@ mod tests {
         assert_eq!(tfidf_small.dimension, tfidf_large.dimension);
     }
 
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    #[test]
+    fn test_empty_neural_persist_removes_stale_mmap() {
+        use crate::search::search::SearchEngine;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let stale_path = neural_mmap_embeddings_path(temp.path());
+        std::fs::create_dir_all(stale_path.parent().unwrap()).unwrap();
+        std::fs::write(&stale_path, b"stale neural data").unwrap();
+
+        let engine = SearchEngine::new();
+        persist_neural_embeddings_to_mmap(&engine, temp.path()).unwrap();
+
+        assert!(
+            !stale_path.exists(),
+            "empty neural persistence should remove stale neural mmap file"
+        );
+    }
+
     #[test]
     fn test_index_nodes_accumulates_df_across_passes() {
         use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
@@ -2390,7 +2662,8 @@ mod tests {
             tfidf_embedder.dimension,
             crate::search::search::DEFAULT_EMBEDDING_DIMENSION
         );
-        assert_eq!(engine.node_count(), 3);
+        // All 6 nodes should be indexed (append_nodes accumulates across batches)
+        assert_eq!(engine.node_count(), 6);
     }
 
     #[test]
@@ -2655,7 +2928,7 @@ mod tests {
             let text = "test code embedding";
             if let Some(Ok(neural_embedding)) = embedder.embed_neural_blocking(text) {
                 assert!(
-                    neural_embedding.len() > 0,
+                    !neural_embedding.is_empty(),
                     "neural embedding should have non-zero dimension"
                 );
                 // Real embeddings should have non-zero values

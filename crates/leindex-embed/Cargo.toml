@@ -1,6 +1,6 @@
 [package]
 name = "leindex-embed"
-version = "1.8.1"
+version = "1.8.3"
 edition = "2021"
 rust-version = "1.75"
 authors = ["LeIndex Contributors"]
@@ -8,13 +8,22 @@ description = "ONNX embedding worker for LeIndex — runs neural embedding and r
 license = "MIT"
 repository = "https://github.com/scooter-lacroix/LeIndex"
 homepage = "https://github.com/scooter-lacroix/LeIndex#readme"
+build = "build.rs"
 
 [features]
 default = []
 
 # Neural embeddings with ONNX Runtime and tokenizers
 # Only needed for the worker binary, not for the main crate.
+# The `migraphx` feature enables AMD GPU acceleration via MIGraphX,
+# which is the modern replacement for the deprecated ROCmExecutionProvider.
+#
+# We use `load-dynamic` so NO ONNX Runtime is required at build time.
+# The worker discovers and dlopens libonnxruntime at runtime via the
+# ort_discovery module (env var, config, ~/.leindex/lib, sibling dir,
+# pip site-packages, system paths). See `ort_discovery.rs`.
 onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+onnx-migraphx = ["onnx", "ort/migraphx"]
 
 [dependencies]
 # Protocol serialization
@@ -27,13 +36,29 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # ONNX Runtime dependencies — owned exclusively by the worker crate
-ort = { version = "2.0.0-rc.12", optional = true, features = ["ndarray"] }
+# Use api-24 to match the struct layout of ORT 1.25.0 (onnxruntime-migraphx 1.25.0).
+# ORT 1.25.0 has the 13-field OrtApi struct that ort-sys 2.0.0-rc.12 expects.
+# The previous api-23 caused a struct layout mismatch segfault with ORT 1.23.2.
+#
+# `load-dynamic` replaces `download-binaries` + `copy-dylibs` + `tls-native`:
+# the ort crate no longer downloads, links, or vendor-copies any ORT library at
+# build time. The worker dlopens libonnxruntime at runtime via ort::init_from().
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["ndarray", "std", "tracing", "load-dynamic", "api-24"] }
 tokenizers = { version = "0.20", optional = true }
 ndarray = { version = "0.17", optional = true }
 dirs = { version = "5" }
+toml = { version = "0.8" }
+# Used by the worker binary to set PR_SET_PDEATHSIG on Linux so the worker
+# is auto-SIGKILLed when its parent dies (prevents orphaned worker leaks).
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.13"
+
+# Inherits workspace lint policy from the root Cargo.toml
+# `[workspace.lints.clippy]` table (replaces the legacy clippy.toml arrays).
+[lints]
+workspace = true
 
 [[bin]]
 name = "leindex-embed"

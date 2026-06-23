@@ -54,7 +54,16 @@ impl DiagnosticsHandler {
             JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e))
         })?;
 
-        let (changed, deleted) = guard.check_freshness().unwrap_or_else(|_| (vec![], vec![]));
+        // Use is_stale_fast() for the boolean staleness check (fast: mtime +
+        // count comparison). Only run the expensive check_freshness() (which
+        // hashes ALL source files) when the index is actually stale, to
+        // provide detailed changed/deleted file lists.
+        let stale_fast = guard.is_stale_fast();
+        let (changed, deleted) = if stale_fast {
+            guard.check_freshness().unwrap_or_else(|_| (vec![], vec![]))
+        } else {
+            (vec![], vec![])
+        };
         let storage_path = guard.storage_path().display().to_string();
         let db_size = std::fs::metadata(guard.storage_path().join("leindex.db"))
             .map(|m| m.len())
@@ -67,24 +76,84 @@ impl DiagnosticsHandler {
             .map(|c| c.indexed_files)
             .unwrap_or(diagnostics.stats.files_parsed);
         let symbol_count = diagnostics.stats.indexed_nodes;
+        let memory_rss_mb =
+            (diagnostics.memory_usage_bytes as f64 / 1024.0 / 1024.0 * 100.0).round() / 100.0;
         let size_mb = diagnostics.memory_usage_bytes as f64 / 1024.0 / 1024.0;
         let failed_parses = diagnostics.stats.failed_parses;
         let index_health = diagnostics.index_health.clone();
         let is_stale = !changed.is_empty() || !deleted.is_empty();
-        let stale_bool = is_stale || index_health == "stale";
+        // When is_stale_fast() reported stale, we ran check_freshness() which
+        // is authoritative (hash-based). If check_freshness found no changes,
+        // the is_stale_fast positive was a false positive (e.g., same-second
+        // mtime) and the index is actually fresh.
+        let stale_bool = if stale_fast { is_stale } else { false };
+        // Live PDG counts from the in-memory graph (pdg.node_count() /
+        // pdg.edge_count()). These reflect the current state of the loaded
+        // PDG and may differ from the index-time snapshot in stats.pdg_nodes
+        // / stats.pdg_edges if the PDG was partially loaded or modified.
+        let pdg_nodes = diagnostics.pdg_nodes;
+        let pdg_edges = diagnostics.pdg_edges;
+        let embedding_model = diagnostics.embedding_model.clone();
+        let pdg_loaded = diagnostics.pdg_loaded;
+        let search_index_nodes = diagnostics.search_index_nodes;
+        let total_signatures = diagnostics.stats.total_signatures;
+        let indexed_nodes = diagnostics.stats.indexed_nodes;
+        let files_parsed = diagnostics.stats.files_parsed;
+        let indexing_time_ms = diagnostics.stats.indexing_time_ms;
 
         let mut diag_json = serde_json::to_value(diagnostics)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))?;
 
+        // ORT diagnostics: share the exact same collection used by the
+        // `leindex diagnostics` CLI so MCP output has parity (ort_path,
+        // ort_version, execution_provider).
+        let (ort_path, ort_version, execution_provider) =
+            crate::cli::cli::collect_ort_diagnostics();
+
         if let Value::Object(ref mut map) = diag_json {
             map.insert("storage_path".to_string(), serde_json::json!(storage_path));
             map.insert("db_size_bytes".to_string(), serde_json::json!(db_size));
+            map.insert("ort_path".to_string(), serde_json::json!(ort_path));
+            map.insert("ort_version".to_string(), serde_json::json!(ort_version));
+            map.insert(
+                "execution_provider".to_string(),
+                serde_json::json!(execution_provider),
+            );
+            map.insert(
+                "memory_rss_mb".to_string(),
+                serde_json::json!(memory_rss_mb),
+            );
 
             // Flat fields expected by trim_diagnostics / render_diagnostics
-            map.insert("indexed_files".to_string(), serde_json::json!(indexed_files_ct));
+            map.insert(
+                "indexed_files".to_string(),
+                serde_json::json!(indexed_files_ct),
+            );
             map.insert("symbol_count".to_string(), serde_json::json!(symbol_count));
             map.insert("index_size_mb".to_string(), serde_json::json!(size_mb));
             map.insert("stale".to_string(), serde_json::json!(stale_bool));
+
+            // System health metrics: index freshness, live PDG node/edge
+            // counts (from the in-memory graph), embedding model status,
+            // search index size. Note: pdg_nodes/pdg_edges here are live
+            // counts from the loaded PDG, while the same fields under
+            // `stats` are index-time snapshots persisted to storage.
+            map.insert(
+                "system_health".to_string(),
+                serde_json::json!({
+                    "index_health": index_health,
+                    "pdg_loaded": pdg_loaded,
+                    "pdg_nodes": pdg_nodes,
+                    "pdg_edges": pdg_edges,
+                    "search_index_nodes": search_index_nodes,
+                    "embedding_model": embedding_model,
+                    "total_signatures": total_signatures,
+                    "indexed_nodes": indexed_nodes,
+                    "files_parsed": files_parsed,
+                    "failed_parses": failed_parses,
+                    "indexing_time_ms": indexing_time_ms,
+                }),
+            );
 
             // last_indexed_secs_ago: rough estimate from storage_path mtime
             let lm = std::fs::metadata(guard.storage_path().join("leindex.db"))

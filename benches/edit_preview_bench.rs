@@ -12,19 +12,19 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use leindex::edit::ResolvedEditChange;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Simulate the OLD (redundant) approach: create N identical ResolvedEditChange objects.
 fn create_redundant_changes_old(
     n: usize,
-    file_path: &PathBuf,
+    file_path: &Path,
     original: &str,
     modified: &str,
 ) -> Vec<ResolvedEditChange> {
     (0..n)
         .map(|_| {
             ResolvedEditChange::new(
-                file_path.clone(),
+                file_path.to_path_buf(),
                 original.to_string(),
                 modified.to_string(),
             )
@@ -34,12 +34,12 @@ fn create_redundant_changes_old(
 
 /// Simulate the NEW (optimized) approach: create a single ResolvedEditChange.
 fn create_single_change_optimized(
-    file_path: &PathBuf,
+    file_path: &Path,
     original: &str,
     modified: &str,
 ) -> ResolvedEditChange {
     ResolvedEditChange::new(
-        file_path.clone(),
+        file_path.to_path_buf(),
         original.to_string(),
         modified.to_string(),
     )

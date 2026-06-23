@@ -90,10 +90,7 @@ pub struct EditCache {
 impl Default for EditCache {
     fn default() -> Self {
         Self {
-            entries: Mutex::new((
-                LruCache::new(NonZeroUsize::new(10_000).unwrap()),
-                0,
-            )),
+            entries: Mutex::new((LruCache::new(NonZeroUsize::new(10_000).unwrap()), 0)),
         }
     }
 }

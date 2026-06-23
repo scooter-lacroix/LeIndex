@@ -18,9 +18,232 @@ const pkg = require('./package.json');
 
 const BIN_DIR = path.join(__dirname, 'bin');
 const MODELS_DIR = path.join(__dirname, 'models');
+// VAL-NPM-002: bundled ORT shared libraries are extracted here so the
+// worker discovers ORT via its bundled/sibling-library path without
+// requiring the user to run `leindex setup`.
+const LIB_DIR = path.join(__dirname, 'lib');
 const GITHUB_API_BASE = 'https://api.github.com/repos/scooter-lacroix/LeIndex';
 const DEFAULT_RELEASE_SELECTOR = 'latest';
 const MAX_REDIRECTS = 5;
+const REQUIRED_MODEL_FILES = [
+  'qwen3-embed-0.6b.onnx',
+  'tokenizer.json',
+  'config.json',
+];
+
+/**
+ * The unversioned ONNX Runtime shared library name on the current platform.
+ * The discovery chain in `crates/leindex-embed/src/ort_discovery.rs` looks for
+ * exactly these filenames at each candidate directory.
+ */
+function getOrtLibNames() {
+  if (process.platform === 'win32') {
+    return ['onnxruntime.dll'];
+  }
+  if (process.platform === 'darwin') {
+    return ['libonnxruntime.dylib'];
+  }
+  return ['libonnxruntime.so'];
+}
+
+function isOrtRuntimeLibraryName(name) {
+  const lower = name.toLowerCase();
+  if (process.platform === 'win32') {
+    return lower === 'onnxruntime.dll';
+  }
+  if (process.platform === 'darwin') {
+    return lower === 'libonnxruntime.dylib'
+      || (lower.startsWith('libonnxruntime.') && lower.endsWith('.dylib'));
+  }
+  return lower === 'libonnxruntime.so' || lower.startsWith('libonnxruntime.so.');
+}
+
+function isOrtBundleLibraryName(name) {
+  const lower = name.toLowerCase();
+  if (isOrtRuntimeLibraryName(lower)) {
+    return true;
+  }
+  if (process.platform === 'win32') {
+    return lower.startsWith('onnxruntime_providers_') && lower.endsWith('.dll');
+  }
+  if (process.platform === 'darwin') {
+    return lower.startsWith('libonnxruntime_providers_') && lower.endsWith('.dylib');
+  }
+  return lower.startsWith('libonnxruntime_providers_') && (lower.endsWith('.so') || /\.so\.\d/.test(lower));
+}
+
+function hasBundledOrtRuntime(libDir = LIB_DIR) {
+  try {
+    return fs.existsSync(libDir)
+      && fs.readdirSync(libDir).some(isOrtRuntimeLibraryName);
+  } catch (_) {
+    return false;
+  }
+}
+
+function hasRequiredModelAssets(modelsDir = MODELS_DIR) {
+  try {
+    return REQUIRED_MODEL_FILES.every((file) => {
+      const filePath = path.join(modelsDir, file);
+      return fs.existsSync(filePath) && fs.statSync(filePath).isFile();
+    });
+  } catch (_) {
+    return false;
+  }
+}
+
+function bundledAssetsComplete(libDir = LIB_DIR, modelsDir = MODELS_DIR) {
+  return hasBundledOrtRuntime(libDir) && hasRequiredModelAssets(modelsDir);
+}
+
+function isPathInside(parent, child) {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!!relative && !relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function assertSafeArchiveFileName(name) {
+  if (!name || name !== path.basename(name) || name !== path.win32.basename(name) || name.includes('..')) {
+    throw new Error(`Unsafe release asset name: ${name}`);
+  }
+  return name;
+}
+
+function isSafeArchiveMemberName(name) {
+  if (!name || name.includes('\0') || path.isAbsolute(name) || path.win32.isAbsolute(name)) {
+    return false;
+  }
+  const normalized = path.posix.normalize(name.replace(/\\/g, '/'));
+  return normalized !== '..' && !normalized.startsWith('../') && !normalized.includes('/../');
+}
+
+function validateArchiveMemberNames(names) {
+  for (const name of names) {
+    if (!isSafeArchiveMemberName(name)) {
+      throw new Error(`Unsafe archive member path: ${name}`);
+    }
+  }
+}
+
+function assertNoUnsafeExtractedSymlinks(rootDir) {
+  const root = fs.realpathSync(rootDir);
+  const stack = [root];
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    const entries = fs.readdirSync(current);
+    for (const entry of entries) {
+      const fullPath = path.join(current, entry);
+      const stat = fs.lstatSync(fullPath);
+      if (stat.isSymbolicLink()) {
+        const target = fs.readlinkSync(fullPath);
+        if (!target || target.includes('\0')) {
+          throw new Error(`Unsafe extracted symlink target: ${fullPath}`);
+        }
+        const resolvedTarget = path.resolve(path.dirname(fullPath), target);
+        if (!isPathInside(root, resolvedTarget)) {
+          throw new Error(`Unsafe extracted symlink escapes bundle: ${fullPath} -> ${target}`);
+        }
+        continue;
+      }
+      if (stat.isDirectory()) {
+        stack.push(fullPath);
+      }
+    }
+  }
+}
+
+function copyRegularFileNoFollow(src, dst, mode) {
+  const noFollow = fs.constants.O_NOFOLLOW || 0;
+  const srcFd = fs.openSync(src, fs.constants.O_RDONLY | noFollow);
+  let dstFd = null;
+  try {
+    const opened = fs.fstatSync(srcFd);
+    if (!opened.isFile()) {
+      throw new Error(`Source is not a regular file: ${path.basename(src)}`);
+    }
+    dstFd = fs.openSync(dst, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC, mode & 0o777);
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    let bytesRead;
+    while ((bytesRead = fs.readSync(srcFd, buffer, 0, buffer.length, null)) > 0) {
+      fs.writeSync(dstFd, buffer, 0, bytesRead);
+    }
+  } finally {
+    if (dstFd !== null) {
+      fs.closeSync(dstFd);
+    }
+    fs.closeSync(srcFd);
+  }
+}
+
+function assertSafeSymlinkTarget(src, target) {
+  if (!target || target.includes('\0') || path.isAbsolute(target) || path.win32.isAbsolute(target)) {
+    throw new Error(`Unsafe symlink target for ${path.basename(src)}: ${target}`);
+  }
+  const srcDir = path.dirname(src);
+  const resolvedTarget = path.resolve(srcDir, target);
+  if (!isPathInside(srcDir, resolvedTarget)) {
+    throw new Error(`Unsafe symlink target for ${path.basename(src)}: ${target}`);
+  }
+  return resolvedTarget;
+}
+
+/**
+ * Copy a single file from `src` to `dst`, preserving symlinks and the
+ * executable bit. Linux/macOS ORT bundles ship versioned symlinks like
+ * `libonnxruntime.so.1 -> libonnxruntime.so.1.25.0` and the worker's
+ * sibling-library discovery expects the unversioned `libonnxruntime.so`
+ * entry to remain a symlink (or a real file) at the same path, so we
+ * faithfully reproduce the source's file type instead of dereferencing.
+ *
+ * Returns a short label describing what was copied, for logging.
+ */
+function copyBundledEntry(src, dst) {
+  const stat = fs.lstatSync(src);
+
+  if (stat.isSymbolicLink()) {
+    const target = fs.readlinkSync(src);
+    const resolvedTarget = assertSafeSymlinkTarget(src, target);
+    try {
+      fs.symlinkSync(target, dst);
+      return 'symlink';
+    } catch (err) {
+      // Some filesystems / Windows without dev mode reject symlinks;
+      // fall back to copying the link target so the file still exists.
+      fs.copyFileSync(resolvedTarget, dst);
+    }
+    return 'file';
+  }
+
+  fs.copyFileSync(src, dst);
+  if (process.platform !== 'win32') {
+    // Preserve executable bit for shared libraries on Unix.
+    try {
+      fs.chmodSync(dst, stat.mode);
+    } catch (_) {
+      // Permissions may fail on exotic filesystems; non-fatal.
+    }
+  }
+  return 'file';
+}
+
+function copyRegularBundledFile(src, dst, label) {
+  const stat = fs.lstatSync(src);
+  if (stat.isSymbolicLink()) {
+    throw new Error(`Unsafe ${label} entry is a symlink: ${path.basename(src)}`);
+  }
+  if (!stat.isFile()) {
+    throw new Error(`Invalid ${label} entry is not a file: ${path.basename(src)}`);
+  }
+
+  copyRegularFileNoFollow(src, dst, stat.mode);
+  if (process.platform !== 'win32') {
+    try {
+      fs.chmodSync(dst, stat.mode);
+    } catch (_) {
+      // Permissions may fail on exotic filesystems; non-fatal.
+    }
+  }
+}
 
 // Platform mapping
 const platforms = {
@@ -335,20 +558,43 @@ function verifyChecksum(filePath, expectedChecksum) {
  * Places bin/ contents into BIN_DIR and models/ contents into MODELS_DIR.
  */
 function extractTarGz(archivePath, destDir) {
-  const tar = require('child_process');
-  // Use system tar for reliable extraction
-  tar.execSync(`tar xzf "${archivePath}" -C "${destDir}"`, { stdio: 'pipe' });
+  const members = execFileSync('tar', ['tzf', archivePath], { encoding: 'utf8' })
+    .split(/\r?\n/)
+    .filter(Boolean);
+  validateArchiveMemberNames(members);
+  execFileSync('tar', ['xzf', archivePath, '-C', destDir], { stdio: 'pipe' });
+  assertNoUnsafeExtractedSymlinks(destDir);
 }
 
 /**
  * Extract a zip bundle using PowerShell (Windows) or unzip.
  */
 function extractZip(archivePath, destDir) {
-  const tar = require('child_process');
   if (process.platform === 'win32') {
-    tar.execSync(`powershell -Command "Expand-Archive -Path '${archivePath}' -DestinationPath '${destDir}' -Force"`, { stdio: 'pipe' });
+    const members = execFileSync('powershell', [
+      '-NoProfile',
+      '-Command',
+      'Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::OpenRead($args[0]).Entries | ForEach-Object { $_.FullName }',
+      archivePath
+    ], { encoding: 'utf8' })
+      .split(/\r?\n/)
+      .filter(Boolean);
+    validateArchiveMemberNames(members);
+    execFileSync('powershell', [
+      '-NoProfile',
+      '-Command',
+      'Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force',
+      archivePath,
+      destDir
+    ], { stdio: 'pipe' });
+    assertNoUnsafeExtractedSymlinks(destDir);
   } else {
-    tar.execSync(`unzip -o "${archivePath}" -d "${destDir}"`, { stdio: 'pipe' });
+    const members = execFileSync('unzip', ['-Z', '-1', archivePath], { encoding: 'utf8' })
+      .split(/\r?\n/)
+      .filter(Boolean);
+    validateArchiveMemberNames(members);
+    execFileSync('unzip', ['-o', archivePath, '-d', destDir], { stdio: 'pipe' });
+    assertNoUnsafeExtractedSymlinks(destDir);
   }
 }
 
@@ -358,7 +604,8 @@ function extractZip(archivePath, destDir) {
 async function installFromBundle(release) {
   const tempDir = path.join(BIN_DIR, '.bundle-tmp');
   const archiveExt = release.assetName.endsWith('.zip') ? '.zip' : '.tar.gz';
-  const archivePath = path.join(tempDir, release.assetName);
+  const safeAssetName = assertSafeArchiveFileName(release.assetName);
+  const archivePath = path.join(tempDir, safeAssetName);
 
   // Clean up any previous attempt
   if (fs.existsSync(tempDir)) {
@@ -405,7 +652,7 @@ async function installFromBundle(release) {
     const srcWorker = path.join(bundleDir, 'bin', workerName);
 
     if (fs.existsSync(srcBinary)) {
-      fs.copyFileSync(srcBinary, path.join(BIN_DIR, binaryName));
+      copyRegularBundledFile(srcBinary, path.join(BIN_DIR, binaryName), 'binary');
       if (process.platform !== 'win32') {
         fs.chmodSync(path.join(BIN_DIR, binaryName), 0o755);
       }
@@ -415,7 +662,7 @@ async function installFromBundle(release) {
     }
 
     if (fs.existsSync(srcWorker)) {
-      fs.copyFileSync(srcWorker, path.join(BIN_DIR, workerName));
+      copyRegularBundledFile(srcWorker, path.join(BIN_DIR, workerName), 'worker binary');
       if (process.platform !== 'win32') {
         fs.chmodSync(path.join(BIN_DIR, workerName), 0o755);
       }
@@ -432,11 +679,69 @@ async function installFromBundle(release) {
       }
       const modelFiles = fs.readdirSync(srcModels);
       for (const file of modelFiles) {
-        fs.copyFileSync(path.join(srcModels, file), path.join(MODELS_DIR, file));
+        copyRegularBundledFile(path.join(srcModels, file), path.join(MODELS_DIR, file), 'model');
       }
       console.log(`   ✓ Model assets installed (${modelFiles.length} files)`);
     } else {
       console.log('   ⚠ Model assets not found in bundle');
+    }
+
+    // VAL-NPM-002: Install bundled ORT shared libraries under `lib/`.
+    // The worker's sibling-directory discovery path looks for
+    // `libonnxruntime.{so,dylib,dll}` here, so the package works with
+    // neural embeddings enabled without requiring `npm run setup` first.
+    const srcLib = path.join(bundleDir, 'lib');
+    if (fs.existsSync(srcLib)) {
+      if (!fs.existsSync(LIB_DIR)) {
+        fs.mkdirSync(LIB_DIR, { recursive: true });
+      }
+      // Clean any stale lib/ entries from a previous (or upgraded) bundle
+      // before copying the new ones, so renamed files don't linger.
+      for (const stale of fs.readdirSync(LIB_DIR)) {
+        const stalePath = path.join(LIB_DIR, stale);
+        try {
+          fs.rmSync(stalePath, { recursive: true, force: true });
+        } catch (_) {
+          // Non-fatal: leave the stale entry in place if we can't remove it.
+        }
+      }
+
+      const libFiles = fs.readdirSync(srcLib);
+      const bundledOrtFiles = libFiles.filter(isOrtBundleLibraryName);
+      const ignoredLibFiles = libFiles.filter((file) => !isOrtBundleLibraryName(file));
+      if (!bundledOrtFiles.some(isOrtRuntimeLibraryName)) {
+        throw new Error('bundle lib/ directory did not contain any ORT runtime libraries');
+      }
+      if (ignoredLibFiles.length > 0) {
+        console.log(`   ⚠ Ignoring non-ORT bundle library entries: ${ignoredLibFiles.join(', ')}`);
+      }
+
+      let copiedCount = 0;
+      let symlinkCount = 0;
+      let copiedRuntimeCount = 0;
+      for (const file of bundledOrtFiles) {
+        const srcEntry = path.join(srcLib, file);
+        const dstEntry = path.join(LIB_DIR, file);
+        try {
+          const kind = copyBundledEntry(srcEntry, dstEntry);
+          if (isOrtRuntimeLibraryName(file)) {
+            copiedRuntimeCount += 1;
+          }
+          if (kind === 'symlink') {
+            symlinkCount += 1;
+          } else {
+            copiedCount += 1;
+          }
+        } catch (err) {
+          console.log(`   ⚠ Failed to copy bundled library entry ${file}: ${err.message}`);
+        }
+      }
+      console.log(`   ✓ ORT runtime libraries installed (${copiedCount} files, ${symlinkCount} symlinks) under lib/`);
+      if (copiedRuntimeCount === 0) {
+        throw new Error('failed to install any ORT runtime libraries from bundle lib/ directory');
+      }
+    } else {
+      throw new Error('ORT libraries not found in release bundle lib/ directory');
     }
 
     // Verify main binary works
@@ -485,10 +790,32 @@ async function installFromBinary(release) {
   console.log('   Add this package to your MCP configuration to use LeIndex.');
 }
 
+function parseLeindexVersion(output) {
+  const match = String(output).match(/leindex\s+([0-9]+\.[0-9]+\.[0-9]+)/);
+  return match ? match[1] : null;
+}
+
+function existingBinaryMatchesPackage(binaryPath) {
+  try {
+    const output = execFileSync(binaryPath, ['--version'], { encoding: 'utf8' }).trim();
+    const version = parseLeindexVersion(output);
+    return {
+      ok: version === pkg.version,
+      version,
+      output,
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      version: null,
+      output: error.message,
+    };
+  }
+}
+
 async function install() {
   console.log('🔧 LeIndex MCP Installer');
   console.log(`   Wrapper version: ${pkg.version}`);
-  
   const { platform, arch } = getPlatform();
   console.log(`   Platform: ${platform} (${arch})`);
   console.log(`   Binary selector: ${getRequestedRelease()}\n`);
@@ -505,21 +832,33 @@ async function install() {
   
   // Check if already installed (both main and worker)
   if (fs.existsSync(binaryPath)) {
-    try {
-      const version = execFileSync(binaryPath, ['--version'], { encoding: 'utf8' }).trim();
-      const hasWorker = fs.existsSync(workerPath);
-      console.log(`   ✓ LeIndex already installed: ${version}`);
-      if (hasWorker) {
-        console.log('   ✓ Worker binary present');
-        console.log('\n📦 Installation complete!');
-        console.log('   Add this package to your MCP configuration to use LeIndex.');
-        return;
-      }
-      console.log('   ⚠ Worker binary missing; downloading bundled worker...');
-    } catch (e) {
-      // Version check failed, continue with download
-      try { fs.unlinkSync(binaryPath); } catch (_) {}
+    const existing = existingBinaryMatchesPackage(binaryPath);
+    const hasWorker = fs.existsSync(workerPath);
+
+    const hasAssets = bundledAssetsComplete();
+
+    if (existing.ok && hasWorker && hasAssets) {
+      console.log(`   ✓ LeIndex already installed: ${existing.output}`);
+      console.log('   ✓ Worker binary present');
+      console.log('   ✓ Bundled ORT and model assets present');
+      console.log('\n📦 Installation complete!');
+      console.log('   Add this package to your MCP configuration to use LeIndex.');
+      return;
     }
+
+    if (!existing.ok) {
+      console.log(
+        `   ⚠ Existing LeIndex binary is stale or unreadable: ${existing.version || existing.output}`
+      );
+      console.log(`   Reinstalling binary for package version ${pkg.version}...`);
+    } else if (!hasWorker) {
+      console.log('   ⚠ Worker binary missing; reinstalling bundled worker...');
+    } else if (!hasAssets) {
+      console.log('   ⚠ Bundled ORT/model assets missing; reinstalling release bundle...');
+    }
+
+    try { fs.unlinkSync(binaryPath); } catch (_) {}
+    try { fs.unlinkSync(workerPath); } catch (_) {}
   }
   
   try {
@@ -593,10 +932,26 @@ async function install() {
 }
 
 module.exports = {
+  BIN_DIR,
+  MODELS_DIR,
+  LIB_DIR,
   computeFileSha256,
+  copyBundledEntry,
+  copyRegularBundledFile,
+  copyRegularFileNoFollow,
   getAssetName,
   getBundleAssetName,
+  getOrtLibNames,
   getRequestedRelease,
+  hasBundledOrtRuntime,
+  hasRequiredModelAssets,
+  bundledAssetsComplete,
+  assertNoUnsafeExtractedSymlinks,
+  assertSafeArchiveFileName,
+  assertSafeSymlinkTarget,
+  isSafeArchiveMemberName,
+  isOrtBundleLibraryName,
+  isOrtRuntimeLibraryName,
   parseExpectedChecksum,
   parseReleaseVersion,
   resolveReleaseConfig,

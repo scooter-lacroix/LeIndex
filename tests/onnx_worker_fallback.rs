@@ -345,7 +345,7 @@ fn test_main_daemon_survives_worker_failure() {
 
     // Simulate: embed request fails, fallback to TF-IDF, daemon continues
     let dim = 4;
-    let _texts = vec!["test text".to_string()];
+    let _texts = ["test text".to_string()];
 
     // Step 1: Worker fails
     let _worker_error = WorkerError {
@@ -360,7 +360,7 @@ fn test_main_daemon_survives_worker_failure() {
     assert_eq!(fallback_result.len(), dim);
 
     // The daemon can accept new requests after the fallback
-    let new_texts = vec!["another request".to_string()];
+    let new_texts = ["another request".to_string()];
     assert_eq!(new_texts.len(), 1);
     // If a new worker is spawned, it would succeed
 }
@@ -396,7 +396,7 @@ fn test_fresh_worker_after_fallback_episode() {
     assert_eq!(resp1b.header.msg_type, MsgType::Error);
 
     // Fallback to TF-IDF for this batch (simulated)
-    let _fallback_embedding = vec![0.0f32; 4];
+    let _fallback_embedding = [0.0f32; 4];
 
     // Episode 2: Fresh worker spawned for a new request
     let mock2 = MockWorker::new(0, 4); // Always succeeds

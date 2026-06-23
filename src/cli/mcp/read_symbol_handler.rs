@@ -232,6 +232,15 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
             byte_range_to_line_range(&file_content, node.byte_range)
         };
 
+        // Determine whether the source was truncated by the char_budget.
+        // This flag is accurate: it compares the full source length against
+        // the budget actually applied. The trimmer reads this to set
+        // source_truncated correctly instead of using a fixed 2000-char cap.
+        let full_source_len = read_source_snippet(&node.file_path, node.byte_range)
+            .map(|s| s.chars().count())
+            .unwrap_or(0);
+        let source_truncated = full_source_len > char_budget;
+
         Ok(wrap_with_meta(
             serde_json::json!({
                 "symbol": node.name,
@@ -243,6 +252,8 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
                 "line_end": line_end,
                 "doc_comment": doc_comment,
                 "source": source,
+                "source_truncated": source_truncated,
+                "_source_char_budget": char_budget,
                 "callers": callers,
                 "callees": callees,
                 "dependencies": dep_signatures

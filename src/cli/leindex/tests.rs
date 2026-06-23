@@ -72,6 +72,8 @@ fn test_stats_serialization() {
         external_deps_in_lockfile: 0,
         external_deps_resolved: 0,
         external_deps_unresolved: 0,
+        external_deps_total: 0,
+        external_deps_builtin: 0,
     };
 
     let json = serde_json::to_string(&stats).unwrap();
@@ -118,6 +120,8 @@ fn test_diagnostics_serialization() {
             external_deps_in_lockfile: 0,
             external_deps_resolved: 0,
             external_deps_unresolved: 0,
+            external_deps_total: 0,
+            external_deps_builtin: 0,
         },
         memory_usage_bytes: 1024,
         total_memory_bytes: 8192,
@@ -140,6 +144,9 @@ fn test_diagnostics_serialization() {
         pdg_estimated_bytes: 60000,
         search_index_nodes: 100,
         index_health: "healthy".to_string(),
+        pdg_nodes: 500,
+        pdg_edges: 800,
+        embedding_model: "tfidf_only".to_string(),
     };
 
     let json = serde_json::to_string(&diagnostics).unwrap();

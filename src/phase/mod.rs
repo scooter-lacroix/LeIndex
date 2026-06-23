@@ -314,10 +314,19 @@ fn format_report(
                 / p1.parser_completeness.len() as f32
         };
 
-        lines.push(format!(
-            "phase1: files={} parsed={} failures={} signatures={} parser_completeness_avg={:.2}",
-            p1.total_files, p1.parsed_files, p1.parse_failures, p1.signatures, avg_completeness
-        ));
+        if p1.cache_hit {
+            lines.push(format!(
+                "phase1: files={} cache_hit=true (incremental: no files changed, PDG loaded from cache) signatures_from_pdg={} parser_completeness_avg={:.2}",
+                p1.total_files,
+                p1.signatures,
+                avg_completeness
+            ));
+        } else {
+            lines.push(format!(
+                "phase1: files={} parsed={} failures={} signatures={} parser_completeness_avg={:.2}",
+                p1.total_files, p1.parsed_files, p1.parse_failures, p1.signatures, avg_completeness
+            ));
+        }
     }
 
     if let Some(p2) = phase2 {

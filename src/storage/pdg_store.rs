@@ -502,7 +502,10 @@ pub fn delete_pdg(storage: &mut Storage, project_id: &str) -> SqliteResult<()> {
 
     // Delete trigram index
     if let Err(e) = delete_trigram_index(storage, project_id) {
-        tracing::warn!("Failed to delete trigram index for project {}: {e}", project_id);
+        tracing::warn!(
+            "Failed to delete trigram index for project {}: {e}",
+            project_id
+        );
     }
 
     Ok(())
@@ -625,10 +628,7 @@ pub fn save_trigram_index(
 ///
 /// Returns `Ok(Some(TrigramIndex))` if a persisted index exists,
 /// `Ok(None)` if no index has been saved yet.
-pub fn load_trigram_index(
-    storage: &Storage,
-    project_id: &str,
-) -> Result<Option<TrigramIndex>> {
+pub fn load_trigram_index(storage: &Storage, project_id: &str) -> Result<Option<TrigramIndex>> {
     let result = storage.conn().query_row(
         "SELECT index_data FROM trigram_index WHERE project_id = ?1",
         params![project_id],
@@ -638,9 +638,7 @@ pub fn load_trigram_index(
     match result {
         Ok(data) => {
             let index = TrigramIndex::deserialize(&data).ok_or_else(|| {
-                PdgStoreError::Deserialization(
-                    "Failed to deserialize trigram index".to_string(),
-                )
+                PdgStoreError::Deserialization("Failed to deserialize trigram index".to_string())
             })?;
             Ok(Some(index))
         }

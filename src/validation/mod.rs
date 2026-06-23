@@ -215,6 +215,83 @@ impl LogicValidator {
     }
 }
 
+/// Convert a [`ValidationResult`] into a structured JSON value suitable for
+/// inclusion in MCP edit responses.
+///
+/// The returned object always contains the following fields:
+/// - `is_valid: bool`
+/// - `has_errors: bool`
+/// - `syntax_errors: []`
+/// - `reference_issues: []`
+/// - `semantic_drift: []`
+/// - `impact_report: null | { risk_level, affected_symbols, affected_files }`
+///
+/// Empty arrays are produced for clean validations, ensuring a consistent
+/// response shape that MCP consumers can rely on.
+pub fn validation_to_json(result: &ValidationResult) -> serde_json::Value {
+    let syntax_errors: Vec<serde_json::Value> = result
+        .syntax_errors
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "file": e.file_path.display().to_string(),
+                "line": e.line,
+                "column": e.column,
+                "message": e.message,
+                "severity": format!("{:?}", e.severity),
+            })
+        })
+        .collect();
+
+    let reference_issues: Vec<serde_json::Value> = result
+        .reference_issues
+        .iter()
+        .map(|i| {
+            serde_json::json!({
+                "type": format!("{:?}", i.issue_type),
+                "file": i.file_path.display().to_string(),
+                "location": format!("{}:{}", i.location.line, i.location.column),
+                "description": i.description,
+            })
+        })
+        .collect();
+
+    let semantic_drift: Vec<serde_json::Value> = result
+        .semantic_drift
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "symbol": d.symbol_name,
+                "drift_type": format!("{:?}", d.drift_type),
+                "location": format!("{}:{}", d.location.line, d.location.column),
+                "impact": d.impact_description,
+            })
+        })
+        .collect();
+
+    let impact_report = result.impact_report.as_ref().map(|r| {
+        serde_json::json!({
+            "risk_level": format!("{:?}", r.risk_level),
+            "affected_symbols": r.affected_nodes,
+            "affected_files": r.affected_files.len(),
+        })
+    });
+
+    serde_json::json!({
+        "is_valid": result.is_valid,
+        "has_errors": result.has_errors(),
+        "syntax_errors": syntax_errors,
+        "reference_issues": reference_issues,
+        "semantic_drift": semantic_drift,
+        "impact_report": impact_report,
+    })
+}
+
+/// Library initialization
+pub fn init() {
+    let _ = tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,81 +492,4 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0]["severity"], "Warning");
     }
-}
-
-/// Convert a [`ValidationResult`] into a structured JSON value suitable for
-/// inclusion in MCP edit responses.
-///
-/// The returned object always contains the following fields:
-/// - `is_valid: bool`
-/// - `has_errors: bool`
-/// - `syntax_errors: []`
-/// - `reference_issues: []`
-/// - `semantic_drift: []`
-/// - `impact_report: null | { risk_level, affected_symbols, affected_files }`
-///
-/// Empty arrays are produced for clean validations, ensuring a consistent
-/// response shape that MCP consumers can rely on.
-pub fn validation_to_json(result: &ValidationResult) -> serde_json::Value {
-    let syntax_errors: Vec<serde_json::Value> = result
-        .syntax_errors
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "file": e.file_path.display().to_string(),
-                "line": e.line,
-                "column": e.column,
-                "message": e.message,
-                "severity": format!("{:?}", e.severity),
-            })
-        })
-        .collect();
-
-    let reference_issues: Vec<serde_json::Value> = result
-        .reference_issues
-        .iter()
-        .map(|i| {
-            serde_json::json!({
-                "type": format!("{:?}", i.issue_type),
-                "file": i.file_path.display().to_string(),
-                "location": format!("{}:{}", i.location.line, i.location.column),
-                "description": i.description,
-            })
-        })
-        .collect();
-
-    let semantic_drift: Vec<serde_json::Value> = result
-        .semantic_drift
-        .iter()
-        .map(|d| {
-            serde_json::json!({
-                "symbol": d.symbol_name,
-                "drift_type": format!("{:?}", d.drift_type),
-                "location": format!("{}:{}", d.location.line, d.location.column),
-                "impact": d.impact_description,
-            })
-        })
-        .collect();
-
-    let impact_report = result.impact_report.as_ref().map(|r| {
-        serde_json::json!({
-            "risk_level": format!("{:?}", r.risk_level),
-            "affected_symbols": r.affected_nodes,
-            "affected_files": r.affected_files.len(),
-        })
-    });
-
-    serde_json::json!({
-        "is_valid": result.is_valid,
-        "has_errors": result.has_errors(),
-        "syntax_errors": syntax_errors,
-        "reference_issues": reference_issues,
-        "semantic_drift": semantic_drift,
-        "impact_report": impact_report,
-    })
-}
-
-/// Library initialization
-pub fn init() {
-    let _ = tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
 }

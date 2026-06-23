@@ -216,6 +216,16 @@ impl HybridScorer {
                         + result.score.text_match * self.text_weight;
                 }
             }
+            QueryType::Exact => {
+                // Boost text match scores even more aggressively for exact mode
+                for result in &mut ranked {
+                    result.score.text_match *= 1.5;
+                    result.score.overall = result.score.tfidf * self.tfidf_weight
+                        + result.score.neural * self.neural_weight
+                        + result.score.structural * self.structural_weight
+                        + result.score.text_match * self.text_weight;
+                }
+            }
         }
 
         ranked.sort_by(|a, b| {
@@ -232,7 +242,7 @@ impl HybridScorer {
 /// Query type for adaptive ranking
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QueryType {
-    /// Semantic-heavy query
+    /// Semantic-heavy query (conceptual relevance, TF-IDF focused)
     Semantic,
 
     /// Structural-heavy query
@@ -240,6 +250,9 @@ pub enum QueryType {
 
     /// Text-heavy query
     Text,
+
+    /// Exact-match query (prioritize exact symbol name matches)
+    Exact,
 }
 
 /// Score result with metadata

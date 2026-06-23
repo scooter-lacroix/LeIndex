@@ -9,6 +9,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+const MAX_FAST_INDEXED_FILE_STATS: usize = 10_000;
+
+fn should_skip_fast_file_stat_scan(indexed_file_count: usize) -> bool {
+    indexed_file_count > MAX_FAST_INDEXED_FILE_STATS
+}
+
 /// Read-only context passed to freshness functions to avoid borrow conflicts.
 pub(crate) struct FreshnessContext<'a> {
     pub project_path: &'a Path,
@@ -107,13 +113,15 @@ pub(crate) fn check_manifest_stale(
     false
 }
 
-/// Fast-path freshness check: O(1) for indexed files, O(D) for source
-/// directories (typically 10-20), and O(M) for manifest files.
+/// Fast-path freshness check: O(1) for source count, O(N) for indexed
+/// files (full stat() scan of every indexed file), and O(M) for manifest
+/// files.
 ///
 /// Detection layers (in order):
 /// 1. Source count mismatch (cached vs indexed)
 /// 2. Directory mtime sentinel — detects new file additions in <1ms
-/// 3. Mtime sampling of 50-500 indexed files
+/// 3. Full O(N) mtime scan of all indexed source files — detects
+///    modifications and deletions by stat()'ing every indexed file
 /// 4. Root-manifest stat (O(14) — catches `Cargo.toml` /
 ///    `package.json` / `pyproject.toml` at the project root)
 /// 5. Bounded-depth nested-manifest walkdir (`max_depth(5)`,
@@ -221,22 +229,28 @@ pub(crate) fn is_stale_fast(
         }
     }
 
-    // Quick spot-check: sample indexed files for deletion or modification
-    let sample_size = (indexed_files.len() / 20).clamp(50, 500);
-    for (checked, indexed_path) in indexed_files.keys().enumerate() {
-        if checked >= sample_size {
-            break;
-        }
+    // Check indexed source files for deletion or modification. Keep the fast
+    // path bounded: on very large projects or slow filesystems, stat()ing every
+    // file here can dominate every tool call. Returning stale is conservative;
+    // the caller can run the authoritative hash-based freshness check.
+    if should_skip_fast_file_stat_scan(indexed_files.len()) {
+        return true;
+    }
+
+    // Using >= instead of > catches same-second modifications (where the
+    // file mtime equals the DB mtime). This may produce false positives
+    // (files indexed in the same second as the DB write), but those are
+    // resolved by the authoritative check_freshness() hash comparison
+    // that the caller runs when is_stale_fast returns true.
+    for indexed_path in indexed_files.keys() {
         let full_path = ctx.project_path.join(indexed_path);
-        if !full_path.exists() {
-            return true;
-        }
-        if let Ok(metadata) = std::fs::metadata(&full_path) {
-            if let Ok(modified) = metadata.modified() {
-                if modified > db_time {
-                    return true;
-                }
-            }
+        match std::fs::metadata(&full_path) {
+            Ok(metadata) => match metadata.modified() {
+                Ok(modified) if modified >= db_time => return true,
+                Ok(_) => {}
+                Err(_) => return true,
+            },
+            Err(_) => return true,
         }
     }
 
@@ -291,16 +305,15 @@ pub(crate) fn is_stale_fast(
     // monorepo with hundreds of package manifests this was the
     // dominant fixed cost of the freshness fast path before
     // the round-18 optimization.
-    let already_listed: std::collections::HashSet<PathBuf> =
-        if let Some(scan) = ctx.project_scan {
-            if !scan.manifest_paths_canonical.is_empty() {
-                scan.manifest_paths_canonical.iter().cloned().collect()
-            } else {
-                build_already_listed(ctx.project_path, &scan.manifest_paths)
-            }
+    let already_listed: std::collections::HashSet<PathBuf> = if let Some(scan) = ctx.project_scan {
+        if !scan.manifest_paths_canonical.is_empty() {
+            scan.manifest_paths_canonical.iter().cloned().collect()
         } else {
-            build_already_listed(ctx.project_path, &manifest_paths)
-        };
+            build_already_listed(ctx.project_path, &scan.manifest_paths)
+        }
+    } else {
+        build_already_listed(ctx.project_path, &manifest_paths)
+    };
     // Root-level fast path: O(N) stat, no walkdir. Common case
     // for single-package projects.
     //
@@ -598,7 +611,11 @@ mod tests {
         let (tmp, listed) = make_fixture();
         let root = tmp.path();
         fs::create_dir_all(root.join("target/some-build/src")).unwrap();
-        fs::write(root.join("target/some-build/Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        fs::write(
+            root.join("target/some-build/Cargo.toml"),
+            "[package]\nname=\"x\"\n",
+        )
+        .unwrap();
         assert!(
             !find_new_nested_manifest(root, &listed),
             "target/Cargo.toml must be skipped"
@@ -809,7 +826,7 @@ mod tests {
         let manifest = root.join("package.json");
         fs::write(&manifest, "{}").unwrap();
         let abs = manifest.canonicalize().unwrap();
-        let listed = build_already_listed(root, &[abs.clone()]);
+        let listed = build_already_listed(root, std::slice::from_ref(&abs));
         assert!(
             listed.contains(&abs),
             "absolute scanner output must round-trip through join+canonicalize"
@@ -925,5 +942,15 @@ mod tests {
             fallback_set.contains(&canon),
             "fallback must still resolve the manifest to its canonical form"
         );
+    }
+
+    #[test]
+    fn fast_file_stat_scan_is_bounded() {
+        assert!(!should_skip_fast_file_stat_scan(
+            MAX_FAST_INDEXED_FILE_STATS
+        ));
+        assert!(should_skip_fast_file_stat_scan(
+            MAX_FAST_INDEXED_FILE_STATS + 1
+        ));
     }
 }

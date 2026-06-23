@@ -22,8 +22,8 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
         "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Systems languages
         "cs",  // C#
         "rb", "php", "lua", "scala", "sc", // Scripting languages
-        "sh", "bash",  // Shell
-        "json",  // Data
+        "sh", "bash", // Shell
+        "json", // Data
     ];
 
     // File suffixes that extension() can't match (e.g., ".rs.in" returns "in").
@@ -52,7 +52,10 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
             }
 
             // Check for multi-dot suffixes that extension() can't match (e.g., .rs.in)
-            if code_suffixes.iter().any(|s| candidate.to_string_lossy().ends_with(s)) {
+            if code_suffixes
+                .iter()
+                .any(|s| candidate.to_string_lossy().ends_with(s))
+            {
                 collected.code_files.push(candidate.clone());
             }
 
@@ -109,7 +112,10 @@ pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFil
         }
 
         // Check for multi-dot suffixes that extension() can't match (e.g., .rs.in)
-        if code_suffixes.iter().any(|s| path.to_string_lossy().ends_with(s)) {
+        if code_suffixes
+            .iter()
+            .any(|s| path.to_string_lossy().ends_with(s))
+        {
             collected.code_files.push(path.to_path_buf());
             if collected.code_files.len() >= options.max_files {
                 break;
@@ -149,8 +155,10 @@ fn should_skip_dir(file_name: &str) -> bool {
     // and config::ExclusionConfig defaults.
     matches!(
         file_name,
+        // Archived / deprecated code
+        ".archive" | "archive"
         // Version control
-        ".git" | ".hg" | ".svn"
+        | ".git" | ".hg" | ".svn"
         // Build outputs
         | "target" | "build" | "dist" | "out" | ".next" | "coverage"
         // Package managers / dependencies
@@ -223,7 +231,7 @@ mod tests {
         std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
         std::fs::write(&file, "pub fn f(){}\n").expect("write");
 
-        let inventory = hash_inventory(&[file.clone()]).expect("inventory");
+        let inventory = hash_inventory(std::slice::from_ref(&file)).expect("inventory");
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory[0].0, file);
         assert!(!inventory[0].1.is_empty());
@@ -339,6 +347,9 @@ mod tests {
         assert!(should_skip_dir(".vscode"));
         // Misc generated
         assert!(should_skip_dir(".leindex"));
+        // Archived / deprecated code
+        assert!(should_skip_dir("archive"));
+        assert!(should_skip_dir(".archive"));
         // Ensure normal dirs are NOT skipped
         assert!(!should_skip_dir("src"));
         assert!(!should_skip_dir("lib"));

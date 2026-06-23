@@ -92,11 +92,16 @@ impl LeIndex {
                     .map(|node| node.id.clone()),
             );
             index_builder::remove_file_from_pdg(&mut pdg, path)?;
-            let _ = crate::storage::pdg_store::delete_file_data(
+            if let Err(e) = crate::storage::pdg_store::delete_file_data(
                 &mut self.storage,
                 &self.project_id,
                 path,
-            );
+            ) {
+                warn!(
+                    "Failed to delete file data from storage for '{}' during incremental reindex: {}",
+                    path, e
+                );
+            }
         }
 
         for result in parsing_results.into_iter() {
@@ -116,12 +121,17 @@ impl LeIndex {
             );
             index_builder::merge_pdgs(&mut pdg, file_pdg);
             if let Some(hash) = source_file_hashes.get(&file_path) {
-                let _ = crate::storage::pdg_store::update_indexed_file(
+                if let Err(e) = crate::storage::pdg_store::update_indexed_file(
                     &mut self.storage,
                     &self.project_id,
                     &file_path,
                     hash,
-                );
+                ) {
+                    warn!(
+                        "Failed to update indexed file record for '{}' during incremental reindex: {}",
+                        file_path, e
+                    );
+                }
             }
         }
 
@@ -156,6 +166,22 @@ impl LeIndex {
             });
 
         // Wrap in HybridEmbedder for compatibility
+        // VAL-ONNX-001: When onnx feature is enabled, wrap as hybrid_local
+        // so neural embeddings are available during incremental reindex.
+        #[cfg(feature = "onnx")]
+        let embedder = {
+            match index_builder::HybridEmbedder::hybrid_local(tfidf_embedder.clone(), None) {
+                Ok(hybrid) => hybrid,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to create hybrid_local embedder for incremental reindex (ONNX), falling back to tfidf_only: {}",
+                        e
+                    );
+                    index_builder::HybridEmbedder::tfidf_only(tfidf_embedder)
+                }
+            }
+        };
+        #[cfg(not(feature = "onnx"))]
         let embedder = index_builder::HybridEmbedder::tfidf_only(tfidf_embedder);
 
         // Read actual file content for changed files to populate NodeInfo
@@ -239,9 +265,8 @@ impl LeIndex {
 
             let tokens = index_builder::tokenize_code(&node_content);
 
-            let signature = crate::search::search::SearchEngine::extract_signature_from_content(
-                &node_content,
-            );
+            let signature =
+                crate::search::search::SearchEngine::extract_signature_from_content(&node_content);
             let tfidf_embedding = embedder.embed_tfidf(&tokens);
 
             // Defer neural embedding to batch call below
@@ -269,7 +294,10 @@ impl LeIndex {
         if !neural_pending.is_empty() {
             #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
             let batch_results = {
-                let texts: Vec<String> = neural_pending.iter().map(|&idx| updated_nodes[idx].content.clone()).collect();
+                let texts: Vec<String> = neural_pending
+                    .iter()
+                    .map(|&idx| updated_nodes[idx].content.clone())
+                    .collect();
                 embedder.embed_neural_batch_blocking(&texts)
             };
             #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
@@ -309,6 +337,20 @@ impl LeIndex {
         {
             warn!("Failed to persist mmap embeddings: {err:#}");
         }
+        // Persist neural embeddings separately for fast load_from_storage
+        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+        {
+            if let Err(err) = index_builder::persist_neural_embeddings_to_mmap(
+                &self.search_engine,
+                &self.project_path,
+            ) {
+                warn!("Failed to persist neural mmap embeddings: {err:#}");
+            }
+        }
+
+        // Clear search query and analysis caches so stale results are not
+        // served after an incremental reindex (VAL-INDEX-005).
+        index_builder::clear_query_caches(&mut self.cache.cache_spiller, &self.project_id);
 
         info!(
             "Watcher incremental reindex completed in {}ms",
@@ -486,7 +528,10 @@ impl LeIndex {
         }
 
         // Step 4: Parse changed files
-        progress_stderr(&format!("Indexing: parsing {} files...", files_to_parse.len()));
+        progress_stderr(&format!(
+            "Indexing: parsing {} files...",
+            files_to_parse.len()
+        ));
         let parsing_results = if !files_to_parse.is_empty() {
             let parser = crate::parse::parallel::ParallelParser::new();
             parser.parse_files(files_to_parse)
@@ -513,14 +558,55 @@ impl LeIndex {
         let failed = parsing_results.iter().filter(|r| r.is_failure()).count();
         let total_sigs: usize = parsing_results.iter().map(|r| r.signatures.len()).sum();
 
+        // Log individual parse failures with file path context
+        for result in parsing_results.iter().filter(|r| r.is_failure()) {
+            warn!(
+                "Parse failure for '{}' during indexing: {}",
+                result.file_path.display(),
+                result
+                    .error
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("unknown error")
+            );
+        }
+
+        if failed > 0 {
+            warn!(
+                "Indexing completed with {} parse failure(s) out of {} file(s)",
+                failed,
+                successful + failed
+            );
+        }
+
         for path in &deleted_files {
             index_builder::remove_file_from_pdg(&mut pdg, path)?;
-            let _ = crate::storage::pdg_store::delete_file_data(
+            if let Err(e) = crate::storage::pdg_store::delete_file_data(
                 &mut self.storage,
                 &self.project_id,
                 path,
-            );
+            ) {
+                warn!(
+                    "Failed to delete file data from storage for '{}' during indexing: {}",
+                    path, e
+                );
+            }
         }
+
+        // Collect all signatures from successful parse results for cross-file
+        // call edge resolution. We clone the signatures here because they are
+        // moved into extract_pdg_from_signatures below.
+        let all_signatures: Vec<(String, crate::parse::prelude::SignatureInfo)> = parsing_results
+            .iter()
+            .filter(|r| r.is_success())
+            .flat_map(|r| {
+                let file_path = r.file_path.display().to_string();
+                r.signatures
+                    .iter()
+                    .cloned()
+                    .map(move |sig| (file_path.clone(), sig))
+            })
+            .collect();
 
         // Iterate over parsing_results directly, avoiding intermediate HashMap construction
         // and the associated cloning of source_bytes, language, and signatures.
@@ -546,13 +632,25 @@ impl LeIndex {
             index_builder::merge_pdgs(&mut pdg, file_pdg);
 
             if let Some(hash) = source_file_hashes.get(&file_path) {
-                let _ = crate::storage::pdg_store::update_indexed_file(
+                if let Err(e) = crate::storage::pdg_store::update_indexed_file(
                     &mut self.storage,
                     &self.project_id,
                     &file_path,
                     hash,
-                );
+                ) {
+                    warn!(
+                        "Failed to update indexed file record for '{}' during indexing: {}",
+                        file_path, e
+                    );
+                }
             }
+        }
+
+        // Step 5a: Resolve cross-file call edges
+        // Per-file PDG extraction can only resolve calls within the same file.
+        // This pass uses all signatures to resolve cross-file call relationships.
+        if !all_signatures.is_empty() {
+            crate::graph::resolve_cross_file_call_edges_for_files(&mut pdg, &all_signatures);
         }
 
         // Step 5b: Resolve external dependencies via lock files
@@ -582,10 +680,12 @@ impl LeIndex {
                 annotation_stats.unresolved
             );
         }
-        let (ext_in_lockfile, ext_resolved, ext_unresolved) = (
+        let (ext_in_lockfile, ext_resolved, ext_unresolved, ext_total, ext_builtin) = (
             ext_registry.len(),
             annotation_stats.resolved,
             annotation_stats.unresolved,
+            annotation_stats.total_external,
+            annotation_stats.builtin,
         );
 
         let pdg_node_count = pdg.node_count();
@@ -611,6 +711,18 @@ impl LeIndex {
         let embedder = if let Some(embedder) = persisted_embedder {
             if embedder.is_fresh(pdg_node_count, pdg_edge_count) {
                 info!("Loaded persisted embedder from storage");
+                // VAL-ONNX-001: Wrap as hybrid_local when onnx feature is enabled
+                #[cfg(feature = "onnx")]
+                let hybrid_embedder = {
+                    match index_builder::HybridEmbedder::hybrid_local(embedder.clone(), None) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            warn!("Failed to create hybrid_local from persisted embedder (ONNX), falling back to tfidf_only: {}", e);
+                            index_builder::HybridEmbedder::tfidf_only(embedder)
+                        }
+                    }
+                };
+                #[cfg(not(feature = "onnx"))]
                 let hybrid_embedder = index_builder::HybridEmbedder::tfidf_only(embedder);
                 index_builder::index_nodes_with_embedder(
                     &pdg,
@@ -670,6 +782,8 @@ impl LeIndex {
             external_deps_in_lockfile: ext_in_lockfile,
             external_deps_resolved: ext_resolved,
             external_deps_unresolved: ext_unresolved,
+            external_deps_total: ext_total,
+            external_deps_builtin: ext_builtin,
         };
 
         // Normalize external nodes (legacy compat)
@@ -687,11 +801,32 @@ impl LeIndex {
         {
             warn!("Failed to persist mmap embeddings: {err:#}");
         }
+        // Persist neural embeddings separately for fast load_from_storage
+        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+        {
+            if let Err(err) = index_builder::persist_neural_embeddings_to_mmap(
+                &self.search_engine,
+                &self.project_path,
+            ) {
+                warn!("Failed to persist neural mmap embeddings: {err:#}");
+            }
+        }
 
         // Update last_indexed timestamp in project_metadata
         if let Err(err) = self.update_last_indexed_timestamp() {
             warn!("Failed to update last_indexed timestamp: {err:#}");
         }
+        // Persist IndexStats so diagnostics can report accurate totals
+        // after loading from storage (without a full re-index).
+        if let Err(err) = self.save_stats_to_storage() {
+            warn!("Failed to persist index stats: {err:#}");
+        }
+
+        // Clear search query and analysis caches so stale results are not
+        // served after a reindex (VAL-INDEX-005). The cache key fingerprint
+        // now includes more stats fields, but we also proactively remove
+        // old cached entries to handle edge cases and keep the cache dir clean.
+        index_builder::clear_query_caches(&mut self.cache.cache_spiller, &self.project_id);
 
         // Note: ONNX worker idle-unload is handled by the worker's own idle
         // timeout (see leindex-embed runtime.rs). We do NOT call
@@ -772,27 +907,38 @@ impl LeIndex {
         let embedder = if let Some(embedder) = persisted_embedder {
             if embedder.is_fresh(pdg_node_count, pdg_edge_count) {
                 info!("Loaded persisted embedder from storage");
-                let hybrid_embedder = index_builder::HybridEmbedder::tfidf_only(embedder);
+                // Use tfidf_only during load_from_storage to avoid expensive
+                // batch neural embedding of all nodes. Neural embeddings are
+                // restored from the persisted mmap file below.
+                let tfidf_embedder = index_builder::HybridEmbedder::tfidf_only(embedder);
                 index_builder::index_nodes_with_embedder(
                     &pdg,
                     &mut self.search_engine,
                     &mut self.cache.file_stats_cache,
                     batch_size,
-                    Some(hybrid_embedder),
+                    Some(tfidf_embedder),
                     None,
                 )?
             } else {
                 info!("Persisted embedder is stale; rebuilding TF-IDF index");
+                // Pass the stale embedder wrapped as tfidf_only to avoid
+                // triggering batch neural embedding during search-time index
+                // reconstruction. Neural embeddings are restored from the
+                // persisted mmap file below.
+                let stale_tfidf = index_builder::HybridEmbedder::tfidf_only(embedder);
                 index_builder::index_nodes_with_embedder(
                     &pdg,
                     &mut self.search_engine,
                     &mut self.cache.file_stats_cache,
                     batch_size,
-                    None,
+                    Some(stale_tfidf),
                     None,
                 )?
             }
         } else {
+            // No persisted embedder at all; pass None to let the function
+            // build a fresh vocab. This will create a hybrid_local embedder
+            // when onnx is enabled, but only on first run (no existing index).
             index_builder::index_nodes_with_embedder(
                 &pdg,
                 &mut self.search_engine,
@@ -802,7 +948,60 @@ impl LeIndex {
                 None,
             )?
         };
-        self.embedder = Some(embedder);
+
+        // Restore neural embeddings from persisted neural mmap file (if available).
+        // This avoids re-computing neural embeddings for all nodes during search.
+        // Neural embeddings are generated during a full `leindex index` run and
+        // persisted to .leindex/neural_embeddings.bin. If the file is missing
+        // (e.g., first run, or index was built without onnx feature), neural
+        // scores will be 0 until a full reindex with ONNX is performed.
+        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+        {
+            if let Some(neural_mmap) =
+                index_builder::try_load_neural_mmap_embeddings(&self.project_path)
+            {
+                let restored = self.search_engine.restore_neural_embeddings(&neural_mmap);
+                if restored > 0 {
+                    info!(
+                        "Restored {} neural embeddings from persisted neural mmap file",
+                        restored
+                    );
+                } else {
+                    info!("Neural mmap file loaded but no matching node IDs found; neural scores will be 0");
+                }
+            } else {
+                info!("No persisted neural embeddings found; run 'leindex index --force' with onnx feature to generate them");
+            }
+        }
+
+        // VAL-ONNX-001: After indexing with tfidf_only, upgrade the embedder
+        // to hybrid_local for query-time neural embedding (single query, not batch).
+        #[cfg(feature = "onnx")]
+        {
+            if let Some(tfidf) = index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
+                .ok()
+                .flatten()
+            {
+                match index_builder::HybridEmbedder::hybrid_local(tfidf, None) {
+                    Ok(hybrid) => {
+                        self.embedder = Some(hybrid);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to create hybrid_local embedder for query embedding: {}",
+                            e
+                        );
+                        self.embedder = Some(embedder);
+                    }
+                }
+            } else {
+                self.embedder = Some(embedder);
+            }
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            self.embedder = Some(embedder);
+        }
         if let Some(embedder) = &self.embedder {
             if let Err(err) = embedder.persist_to_storage(&self.project_path, &pdg) {
                 warn!("Failed to persist embedder: {err:#}");
@@ -812,6 +1011,11 @@ impl LeIndex {
 
         info!("Rebuilt search index with {} nodes", indexed_count);
 
+        // Load persisted stats first (to restore total_signatures, total_files, etc.),
+        // then overwrite the live PDG/search counts with freshly computed values.
+        if let Err(err) = self.load_stats_from_storage() {
+            warn!("Failed to load persisted index stats: {err:#}");
+        }
         self.stats.pdg_nodes = pdg_node_count;
         self.stats.pdg_edges = pdg_edge_count;
         self.stats.indexed_nodes = indexed_count;
@@ -825,6 +1029,16 @@ impl LeIndex {
             index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)
         {
             warn!("Failed to persist mmap embeddings: {err:#}");
+        }
+        // Persist neural embeddings separately for fast load_from_storage
+        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+        {
+            if let Err(err) = index_builder::persist_neural_embeddings_to_mmap(
+                &self.search_engine,
+                &self.project_path,
+            ) {
+                warn!("Failed to persist neural mmap embeddings: {err:#}");
+            }
         }
 
         Ok(())

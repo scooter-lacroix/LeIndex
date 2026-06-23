@@ -99,12 +99,23 @@ Turns a raw diff into a structural change summary with blast radius."
 
         let status_text = String::from_utf8_lossy(&status_output.stdout);
 
-        let pdg = match guard.ensure_pdg_loaded() {
-            Ok(()) => guard.pdg(),
-            Err(e) => {
-                tracing::warn!("PDG load failed for git status enrichment: {}", e);
-                None
+        let pdg_error: Option<String> = {
+            match guard.ensure_pdg_loaded() {
+                Ok(()) => None,
+                Err(e) => {
+                    tracing::warn!(
+                        "PDG load failed for git status enrichment in {}: {}",
+                        project_root.display(),
+                        e
+                    );
+                    Some(e.to_string())
+                }
             }
+        };
+        let pdg = if pdg_error.is_none() {
+            guard.pdg()
+        } else {
+            None
         };
 
         // Parse git status output
@@ -253,6 +264,20 @@ Turns a raw diff into a structural change summary with blast radius."
 
         let affected_files: Vec<String> = affected_files_set.into_iter().collect();
 
+        // Build pdg_enrichment status field for transparency about PDG availability
+        let pdg_enrichment = if let Some(err) = &pdg_error {
+            tracing::debug!("PDG load failed while enriching git status: {}", err);
+            serde_json::json!({
+                "available": false,
+                "reason": "PDG load failed",
+                "error": "PDG enrichment unavailable; run leindex index to refresh the project graph",
+            })
+        } else {
+            serde_json::json!({
+                "available": true,
+            })
+        };
+
         Ok(wrap_with_meta(
             serde_json::json!({
                 "is_git_repo": true,
@@ -266,6 +291,7 @@ Turns a raw diff into a structural change summary with blast radius."
                 "staged_files": staged_files,
                 "untracked_files": untracked_files,
                 "changed_symbols": changed_symbols,
+                "pdg_enrichment": pdg_enrichment,
                 "impact_summary": {
                     "total_affected_symbols": total_affected_symbols,
                     "affected_files": affected_files,

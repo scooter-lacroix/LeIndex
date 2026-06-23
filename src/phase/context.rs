@@ -14,6 +14,7 @@ use crate::storage::{
 use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 /// Shared runtime context reused across all five phases.
 pub struct PhaseExecutionContext {
@@ -101,7 +102,12 @@ impl PhaseExecutionContext {
             for path in &freshness.deleted_files {
                 for key in equivalent_file_keys(&self.root, path) {
                     pdg.remove_file(&key);
-                    let _ = delete_file_data(&mut self.storage, &self.project_id, &key);
+                    if let Err(e) = delete_file_data(&mut self.storage, &self.project_id, &key) {
+                        warn!(
+                            "Phase context: failed to delete file data for '{}' (deleted file): {}",
+                            key, e
+                        );
+                    }
                 }
             }
 
@@ -126,7 +132,13 @@ impl PhaseExecutionContext {
                     // Parse succeeded: now safe to replace stale file graph/state.
                     for key in equivalent_file_keys(&self.root, file_path) {
                         pdg.remove_file(&key);
-                        let _ = delete_file_data(&mut self.storage, &self.project_id, &key);
+                        if let Err(e) = delete_file_data(&mut self.storage, &self.project_id, &key)
+                        {
+                            warn!(
+                                "Phase context: failed to delete file data for '{}' (changed file): {}",
+                                key, e
+                            );
+                        }
                     }
 
                     // Use source_bytes from ParsingResult when available, fall back to disk read
@@ -145,12 +157,17 @@ impl PhaseExecutionContext {
 
                     let normalized = normalize_file_key(&self.root, file_path);
                     if let Some(hash) = inventory_hashes.get(&normalized) {
-                        let _ = update_indexed_file(
+                        if let Err(e) = update_indexed_file(
                             &mut self.storage,
                             &self.project_id,
                             &normalized,
                             hash,
-                        );
+                        ) {
+                            warn!(
+                                "Phase context: failed to update indexed file record for '{}' (incremental): {}",
+                                normalized, e
+                            );
+                        }
                     }
                 }
             }
@@ -213,7 +230,14 @@ impl PhaseExecutionContext {
         for file_path in self.signatures_by_file.keys() {
             let normalized = normalize_file_key(&self.root, file_path);
             if let Some(hash) = inventory_hashes.get(&normalized) {
-                let _ = update_indexed_file(&mut self.storage, &self.project_id, &normalized, hash);
+                if let Err(e) =
+                    update_indexed_file(&mut self.storage, &self.project_id, &normalized, hash)
+                {
+                    warn!(
+                        "Phase context: failed to update indexed file record for '{}' (cold path): {}",
+                        normalized, e
+                    );
+                }
             }
         }
 

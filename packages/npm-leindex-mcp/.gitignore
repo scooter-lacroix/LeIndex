@@ -1,6 +1,15 @@
-# Binaries
+# Binaries (downloaded by install.js postinstall)
 bin/leindex
 bin/leindex.exe
+bin/leindex-embed
+bin/leindex-embed.exe
+bin/.bundle-tmp/
+
+# Bundled ORT shared libraries (downloaded inside the platform bundle)
+lib/
+
+# Bundled model assets (downloaded inside the platform bundle)
+models/
 
 # Node
 node_modules/

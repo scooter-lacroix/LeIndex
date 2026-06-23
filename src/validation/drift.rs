@@ -509,8 +509,6 @@ mod tests {
     fn test_semantic_drift_analyzer_new() {
         let pdg = Arc::new(ProgramDependenceGraph::new());
         let _analyzer = SemanticDriftAnalyzer::new(pdg);
-        // Just verify it was created
-        assert!(true);
     }
 
     #[test]

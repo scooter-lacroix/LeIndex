@@ -95,40 +95,61 @@ Every tool call is **context-aware** — not atomic. When you look up a symbol, 
 
 ### Install
 
-**Via cargo (recommended):**
+LeIndex ships three first-class install paths. Pick one, then run `leindex setup`
+to enable neural (semantic) search. TF-IDF (keyword) search works immediately
+without setup.
+
+**Option 1: cargo (recommended for Rust users)**
 
 ```bash
 cargo install leindex
+leindex setup
 ```
 
-**Via install script:**
+`cargo install` places both `leindex` and `leindex-embed` in `~/.cargo/bin/`.
+The `setup` wizard installs ONNX Runtime via pip and downloads the
+`qwen3-embed-0.6b.onnx` model to `~/.leindex/models/`.
+
+**Option 2: npm (recommended for AI tools like Cursor, Claude Code, VS Code)**
+
+```bash
+npm install -g @leindex/mcp
+npm run setup --prefix "$(npm root -g)/@leindex/mcp"
+```
+
+The npm package downloads a platform-specific bundle containing the main
+binary, the ONNX worker (`leindex-embed`), bundled ORT libraries, and model
+assets. `npm run setup` invokes the bundled `leindex setup` wizard.
+
+**Option 3: PyPI (recommended for Python users)**
+
+```bash
+pip install leindex
+leindex setup
+```
+
+The PyPI package installs a small Python launcher that bootstraps the real Rust
+`leindex` binary into `~/.cargo/bin` via `cargo install` on first run, then runs
+`leindex setup` to configure neural search. If Cargo is missing, the launcher
+explains the requirement and points to https://rustup.rs.
+
+**Alternative: install script (GitHub Release bundle with zero-build install)**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/install.sh -o install-leindex.sh
 bash install-leindex.sh
+leindex setup
 ```
 
-The install script builds and installs both `leindex` and `leindex-embed` (ONNX worker), plus bundled model assets.
+The install script downloads a pre-built release bundle (binaries + bundled ORT
+`lib/` + model assets), copies them into `~/.leindex/` and `~/.cargo/bin/`, then
+runs `leindex setup --check` to report status. No Rust toolchain required.
 
-**Via PyPI bootstrap wrapper:**
-
-```bash
-pip install leindex
-leindex --version
-```
-
-The PyPI package installs a small Python launcher. On first run it installs or updates
-the real Rust `leindex` binary in `~/.cargo/bin` via `cargo install leindex`. If Cargo
-is missing, the launcher explains the requirement and prompts to install Rust/Cargo when
-automatic setup is supported on the current platform.
-
-**Via npm MCP wrapper (recommended for AI tools):**
-
-```bash
-npm install -g @leindex/mcp
-```
-
-The npm package downloads a platform-specific bundle containing the main binary, the ONNX worker (`leindex-embed`), and model assets.
+> **Neural vs. TF-IDF**: TF-IDF (keyword) search works out of the box with no
+> setup. `leindex setup` enables neural (semantic) search by installing ONNX
+> Runtime and downloading the embedding model. See
+> [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md) for CPU/GPU/AMD/NVIDIA paths and
+> troubleshooting.
 
 **Environment Variables:**
 
@@ -136,6 +157,7 @@ The npm package downloads a platform-specific bundle containing the main binary,
 |------|----------|-------------|---------|
 | `LEINDEX_HOME` | No | Override storage/index home directory | `~/.leindex` |
 | `LEINDEX_PORT` | No | Override HTTP server port | `47500` |
+| `ORT_DYLIB_PATH` | No | Override ONNX Runtime library path | (discovered) |
 
 ### Index and search
 
@@ -219,12 +241,12 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 - **PDG analysis** — program dependence graph for structural understanding
 - **5-phase analysis** — additive multi-pass codebase analysis pipeline
 - **Cross-project indexing** — search across multiple repos at once
-- **16 MCP tools** — read, analyze, edit preview/apply, rename, impact analysis
+- **20 MCP tools** — read, analyze, edit preview/apply, rename, impact analysis
 - **HTTP + WebSocket server** — available through the unified `leindex` server modules and commands
 - **Dashboard** — Bun + React operational UI with project metrics and graph telemetry
 - **Low resource mode** — works on constrained hardware
 - **Built in Rust** — fast indexing, low memory, safe concurrency
-- **Flexible embedding backends** — choose between TF-IDF, local ONNX models, or remote cloud providers (OpenAI, Cohere)
+- **Flexible embedding backends** — choose between TF-IDF, local ONNX models (`qwen3-embed-0.6b`), or remote cloud providers (OpenAI, Cohere)
 
 ---
 
@@ -234,27 +256,31 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 
 ```bash
 cargo install leindex
+leindex setup          # enable neural search
 ```
 
 ### PyPI
 
 ```bash
 pip install leindex
+leindex setup          # enable neural search
 ```
 
 This package is a bootstrap wrapper for the Rust release. It keeps using the unified
 `leindex` command, installs the binary into `~/.cargo/bin`, and then forwards all CLI
-arguments to the real Rust executable.
+arguments to the real Rust executable. Run `leindex setup` after install to configure
+neural embeddings (see [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md)).
 
 ### From source
 
 ```bash
 git clone https://github.com/scooter-lacroix/LeIndex.git
-cd leindex
-cargo build --release
+cd LeIndex
+cargo build --release --features onnx
+./target/release/leindex setup          # enable neural search
 ```
 
-This produces both `target/release/leindex` (main binary) and `target/release/leindex-embed` (ONNX worker). The worker must be discoverable alongside the main binary or in `PATH` for local ONNX inference.
+This produces both `target/release/leindex` (main binary) and `target/release/leindex-embed` (ONNX worker). The worker must be discoverable alongside the main binary or in `PATH` for local ONNX inference. The `--features onnx` flag enables the `load-dynamic` ONNX Runtime strategy: no ORT is linked at build time, and the worker discovers the runtime `.so`/`.dylib`/`.dll` at runtime via the discovery chain (see [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md)).
 
 **Feature flags:** Use `--features` to customize the build:
 - `full` (default) — Full library plus the `leindex` CLI binary
@@ -563,17 +589,27 @@ LeIndex supports multiple embedding backends for semantic search:
 Build with the default features to use local Qwen3 embedding models via ONNX Runtime. LeIndex uses a **worker-sidecar architecture** — the main `leindex` process delegates ONNX inference to a separate `leindex-embed` worker process, keeping the main daemon lightweight.
 
 ```bash
-cargo build --release
+cargo build --release --features onnx
+./target/release/leindex setup          # install ONNX Runtime + download qwen3-embed-0.6b model
 ```
+
+The `onnx` feature uses the `load-dynamic` ORT strategy: no ONNX Runtime is
+linked at build time, and the worker discovers the runtime shared library at
+startup via a discovery chain (`ORT_DYLIB_PATH` env, config, `~/.leindex/lib/`,
+sibling-to-binary, pip site-packages, system paths). See
+[docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md) for the full chain and
+troubleshooting.
 
 Local models provide:
 - Privacy (data never leaves your machine)
 - No API costs
 - Zero network latency
-- Support for Qwen3-Embedding-0.6B and optional Qwen3-Reranker-0.6B
+- Support for `qwen3-embed-0.6b` (default) and optional Qwen3-Reranker-0.6B
 - Worker-sidecar ONNX inference keeps main process memory low
 
-The worker binary (`leindex-embed`) is built alongside the main binary and is discovered automatically at runtime. Bundled model assets are shipped in the `models/` directory next to the binaries.
+The worker binary (`leindex-embed`) is built alongside the main binary and is
+discovered automatically at runtime. `leindex setup` installs the ONNX Runtime
+pip package and downloads model assets to `~/.leindex/models/`.
 
 ### Remote Cloud Providers
 
@@ -616,7 +652,10 @@ Remote embeddings offer:
 
 ### TF-IDF Fallback
 
-If no embedding backend is configured, LeIndex falls back to TF-IDF for keyword-based search. This is lightweight and works offline but lacks semantic understanding.
+If no embedding backend is configured (i.e. `leindex setup` has not been run),
+LeIndex falls back to TF-IDF for keyword-based search. This works offline with
+zero setup but lacks semantic understanding. A one-time notice points to
+`leindex setup` to enable neural search.
 
 ---
 
@@ -706,6 +745,7 @@ Database discovery (`LEINDEX_DISCOVERY_ROOTS`) is **opt-in only**. Sensitive dir
 - [ARCHITECTURE.md](ARCHITECTURE.md) — system design and internals
 - [API.md](API.md) — HTTP API reference
 - [docs/MCP.md](docs/MCP.md) — MCP server documentation
+- [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md) — neural search setup and troubleshooting (CPU/GPU/AMD/NVIDIA)
 - [dashboard/README.md](dashboard/README.md) — dashboard setup
 
 ---

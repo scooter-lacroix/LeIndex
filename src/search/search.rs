@@ -310,16 +310,23 @@ impl WorkHoister {
     /// Returns `Some((tfidf_embedding, neural_embedding))` if found, `None` otherwise.
     pub fn lookup(&mut self, content: &str) -> Option<(Vec<f32>, Option<Vec<f32>>)> {
         let hash = blake3::hash(content.as_bytes());
-        self.cache.get(&hash).map(|entry| {
-            (entry.embedding.clone(), entry.neural_embedding.clone())
-        })
+        self.cache
+            .get(&hash)
+            .map(|entry| (entry.embedding.clone(), entry.neural_embedding.clone()))
     }
 
     /// Store a computed embedding for the given content.
     /// If the cache is full, evicts the least-recently-used entry first.
-    pub fn store(&mut self, content: &str, embedding: Vec<f32>, neural_embedding: Option<Vec<f32>>) {
+    pub fn store(
+        &mut self,
+        content: &str,
+        embedding: Vec<f32>,
+        neural_embedding: Option<Vec<f32>>,
+    ) {
         let hash = blake3::hash(content.as_bytes());
-        let neural_byte_size = neural_embedding.as_ref().map_or(0, |v| v.len() * std::mem::size_of::<f32>());
+        let neural_byte_size = neural_embedding
+            .as_ref()
+            .map_or(0, |v| v.len() * std::mem::size_of::<f32>());
         let byte_size = 32 + embedding.len() * std::mem::size_of::<f32>() + neural_byte_size;
         let entry = HoistedWork {
             embedding,
@@ -728,8 +735,14 @@ pub struct SearchQuery {
     /// Whether to expand context using graph traversal
     pub expand_context: bool,
 
-    /// Optional query embedding for semantic search
+    /// Optional query embedding for semantic search (TF-IDF)
     pub query_embedding: Option<Vec<f32>>,
+
+    /// Optional neural query embedding for deep semantic search.
+    ///
+    /// Populated when ONNX (or remote) embeddings are available.
+    /// When `None`, neural scoring is skipped and TF-IDF fallback is used.
+    pub query_neural_embedding: Option<Vec<f32>>,
 
     /// Minimum relevance threshold (0.0-1.0)
     pub threshold: Option<f32>,
@@ -799,6 +812,13 @@ pub struct SearchResult {
 
     /// Byte range in source
     pub byte_range: (usize, usize),
+
+    /// 1-based line number of the symbol's definition in the source file.
+    ///
+    /// Populated by `LeIndex::search()` from the PDG node's byte_range.
+    /// `None` when the line number cannot be determined (e.g., no PDG).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_number: Option<usize>,
 }
 
 // ============================================================================
@@ -1358,7 +1378,7 @@ impl SearchEngine {
     /// # Panics
     ///
     /// Panics if node count exceeds MAX_NODES (prevents memory exhaustion).
-    pub fn index_nodes(&mut self, mut nodes: Vec<NodeInfo>) {
+    pub fn index_nodes(&mut self, nodes: Vec<NodeInfo>) {
         if nodes.len() > MAX_NODES {
             panic!(
                 "Cannot index more than {} nodes (provided: {})",
@@ -1367,7 +1387,17 @@ impl SearchEngine {
             );
         }
 
-        // Clear cache when re-indexing
+        // Clear all state for a full reindex
+        self.clear_index();
+        // Append nodes incrementally
+        self.append_nodes(nodes);
+    }
+
+    /// Clear all indexed nodes and internal data structures.
+    ///
+    /// Called before a full reindex to reset the search engine state.
+    pub fn clear_index(&mut self) {
+        self.nodes.clear();
         self.complexity_cache.clear();
         self.text_index.clear();
         self.search_cache.clear();
@@ -1375,11 +1405,48 @@ impl SearchEngine {
         self.node_id_to_idx.clear();
         self.node_tokens.clear();
         self.vector_index.clear();
+    }
+
+    /// Append nodes to the existing index without clearing.
+    ///
+    /// This supports incremental/batch indexing where nodes are processed
+    /// in chunks and appended to the search engine across multiple calls.
+    /// Internal data structures (inverted index, vector index, caches) are
+    /// updated incrementally.
+    ///
+    /// # Panics
+    ///
+    /// Panics if total node count exceeds MAX_NODES after appending.
+    pub fn append_nodes(&mut self, mut nodes: Vec<NodeInfo>) {
+        let mut seen = HashSet::new();
+        for node in &nodes {
+            let dup_in_batch = !seen.insert(node.node_id.clone());
+            let dup_existing = self.node_id_to_idx.contains_key(&node.node_id);
+            if dup_in_batch || dup_existing {
+                panic!(
+                    "append_nodes received duplicate node_id '{}'; use incremental_reindex for updates",
+                    node.node_id
+                );
+            }
+        }
+
+        if self.nodes.len() + nodes.len() > MAX_NODES {
+            panic!(
+                "Cannot index more than {} nodes (current: {}, appending: {})",
+                MAX_NODES,
+                self.nodes.len(),
+                nodes.len()
+            );
+        }
+
+        self.search_cache.clear();
+        self.search_cache_bytes = 0;
 
         // Build node_id_to_idx for O(1) node lookups (A1 optimization)
         // Build complexity cache, inverted index, and token cache before taking ownership
         for (idx, node) in nodes.iter().enumerate() {
-            self.node_id_to_idx.insert(node.node_id.clone(), idx);
+            let global_idx = self.nodes.len() + idx;
+            self.node_id_to_idx.insert(node.node_id.clone(), global_idx);
             self.complexity_cache
                 .insert(node.node_id.clone(), node.complexity);
 
@@ -1433,12 +1500,9 @@ impl SearchEngine {
             }
         }
 
-        // Move nodes into storage — no clone needed since indexes are already built
-        self.nodes = nodes;
-
         // Extract signatures before clearing content (for search results)
         // This must happen before T13 optimization clears the content
-        for node in &mut self.nodes {
+        for node in &mut nodes {
             node.signature = Self::extract_signature_from_content(&node.content);
         }
 
@@ -1446,9 +1510,40 @@ impl SearchEngine {
         // The inverted index (text_index) already captures all tokens,
         // and the Storage layer retains original source files on disk.
         // This reduces memory by ~15MB at 5K nodes.
-        for node in &mut self.nodes {
+        for node in &mut nodes {
             node.content.clear();
         }
+
+        // Append nodes to storage
+        self.nodes.extend(nodes);
+    }
+
+    /// Restore neural embeddings from a persisted mmap embedding index.
+    ///
+    /// This updates the `neural_embedding` field on each node that has a
+    /// matching entry in the mmap index. Nodes without a matching entry
+    /// retain their existing neural embedding (typically `None`).
+    ///
+    /// Returns the number of nodes that were updated.
+    pub fn restore_neural_embeddings(
+        &mut self,
+        mmap_index: &crate::search::vector::MmapEmbeddingIndex,
+    ) -> usize {
+        let mut updated = 0;
+        for node in &mut self.nodes {
+            if let Some(embedding) = mmap_index.get_embedding(&node.node_id) {
+                if !embedding.is_empty() {
+                    node.neural_embedding = Some(embedding);
+                    updated += 1;
+                }
+            }
+        }
+        tracing::info!(
+            "Restored {} neural embeddings from mmap ({} total nodes)",
+            updated,
+            self.nodes.len()
+        );
+        updated
     }
 
     /// Extract signature from node content.
@@ -1646,6 +1741,22 @@ impl SearchEngine {
             .iter()
             .filter(|n| !n.tfidf_embedding.is_empty())
             .map(|n| (n.node_id.clone(), n.tfidf_embedding.clone()))
+            .collect()
+    }
+
+    /// Collect neural embeddings for persistence.
+    ///
+    /// Returns `(node_id, neural_embedding)` pairs for all nodes that have
+    /// non-empty neural embeddings.
+    pub fn collect_neural_embeddings(&self) -> Vec<(String, Vec<f32>)> {
+        self.nodes
+            .iter()
+            .filter_map(|n| {
+                n.neural_embedding
+                    .as_ref()
+                    .filter(|e| !e.is_empty())
+                    .map(|e| (n.node_id.clone(), e.clone()))
+            })
             .collect()
     }
 
@@ -1858,8 +1969,13 @@ impl SearchEngine {
 
         // Check cache first
         let cache_key = format!(
-            "{}:{}:{:?}:{}",
-            query.query, query.top_k, query.threshold, query.semantic
+            "{}:{}:{:?}:{}:{:?}:neural={}",
+            query.query,
+            query.top_k,
+            query.threshold,
+            query.semantic,
+            query.query_type,
+            query.query_neural_embedding.is_some()
         );
         if let Some(cached) = self.search_cache.get(&cache_key) {
             return Ok(cached.clone());
@@ -1869,9 +1985,11 @@ impl SearchEngine {
 
         // Pre-compute vector search if semantic search is requested
         let vector_results: std::collections::HashMap<String, f32> = if query.semantic {
-            // Use provided query embedding if available
-            let embedding = if let Some(emb) = query.query_embedding {
-                Some(emb)
+            // Use provided query embedding if available.
+            // Note: we take a reference (not move) so that `query` remains
+            // borrowable for `compute_score` later in the loop.
+            let embedding = if let Some(ref emb) = query.query_embedding {
+                Some(emb.clone())
             } else {
                 // Fallback: find if there's a node with a TF-IDF embedding we can use
                 // This is legacy behavior, should be avoided
@@ -1888,8 +2006,12 @@ impl SearchEngine {
             };
 
             if let Some(emb) = embedding {
+                // Search for more vector results than top_k to ensure good
+                // coverage of relevant nodes. Text index matches may not
+                // overlap with top vector results, so we need a larger pool.
+                let vector_search_k = (query.top_k * 10).max(100);
                 self.vector_index
-                    .search(&emb, query.top_k)
+                    .search(&emb, vector_search_k)
                     .into_iter()
                     .collect()
             } else {
@@ -1971,39 +2093,9 @@ impl SearchEngine {
                 continue;
             }
 
-            // Normalize complexity to 0-1 range (divide by 100, not 10)
-            let structural_score = (node.complexity as f32 / 100.0).min(1.0);
-
-            // Neural score is 0.0 in this context (vector index only has TF-IDF embeddings)
-            let neural_score = 0.0;
-
-            // Use custom weights based on query type if provided
-            let score = if let Some(qt) = query.query_type {
-                match qt {
-                    crate::search::ranking::QueryType::Text => {
-                        // Prose/Text mode: heavily favor keyword overlap
-                        self.scorer
-                            .with_weights_hybrid(0.2, 0.05, 0.05, 0.7)
-                            .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
-                    }
-                    crate::search::ranking::QueryType::Semantic => {
-                        // Semantic-heavy mode
-                        self.scorer
-                            .with_weights_hybrid(0.7, 0.1, 0.1, 0.1)
-                            .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
-                    }
-                    crate::search::ranking::QueryType::Structural => {
-                        // Structural-heavy mode
-                        self.scorer
-                            .with_weights_hybrid(0.3, 0.0, 0.5, 0.2)
-                            .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
-                    }
-                }
-            } else {
-                // Default hybrid scoring
-                self.scorer
-                    .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
-            };
+            // Compute composite score using the shared scoring logic
+            // (single source of truth — VAL-QUALITY-005).
+            let score = self.compute_score(&query, &text_query, node, text_score, tfidf_score);
 
             if score.overall > 0.0 {
                 // Apply relevance threshold if specified
@@ -2030,6 +2122,7 @@ impl SearchEngine {
                     score,
                     context: None,
                     byte_range: node.byte_range,
+                    line_number: None, // enriched by LeIndex::search()
                 });
             }
         }
@@ -2138,8 +2231,14 @@ impl SearchEngine {
 
         // Check staged-search cache (key includes query, top_k, threshold, semantic, coarse_multiplier, query_type)
         let cache_key = format!(
-            "staged:{}:{}:{:?}:{}:{:?}:{:?}",
-            query.query, query.top_k, query.threshold, query.semantic, config.coarse_multiplier, query.query_type
+            "staged:{}:{}:{:?}:{}:{:?}:{:?}:neural={}",
+            query.query,
+            query.top_k,
+            query.threshold,
+            query.semantic,
+            config.coarse_multiplier,
+            query.query_type,
+            query.query_neural_embedding.is_some()
         );
         if let Some(cached) = self.search_cache.get(&cache_key) {
             let count = cached.len();
@@ -2238,28 +2337,9 @@ impl SearchEngine {
                 continue;
             }
 
-            let structural_score = (node.complexity as f32 / 100.0).min(1.0);
-            let neural_score = 0.0;
-
-            let score = if let Some(qt) = query.query_type {
-                match qt {
-                    crate::search::ranking::QueryType::Text => self
-                        .scorer
-                        .with_weights_hybrid(0.2, 0.05, 0.05, 0.7)
-                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score),
-                    crate::search::ranking::QueryType::Semantic => self
-                        .scorer
-                        .with_weights_hybrid(0.7, 0.1, 0.1, 0.1)
-                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score),
-                    crate::search::ranking::QueryType::Structural => self
-                        .scorer
-                        .with_weights_hybrid(0.3, 0.0, 0.5, 0.2)
-                        .score_hybrid(tfidf_score, neural_score, structural_score, text_score),
-                }
-            } else {
-                self.scorer
-                    .score_hybrid(tfidf_score, neural_score, structural_score, text_score)
-            };
+            // Compute composite score using the shared scoring logic
+            // (single source of truth — VAL-QUALITY-005).
+            let score = self.compute_score(&query, &text_query, node, text_score, tfidf_score);
 
             if score.overall > 0.0 {
                 if let Some(threshold) = query.threshold {
@@ -2283,6 +2363,7 @@ impl SearchEngine {
                     score,
                     context: None,
                     byte_range: node.byte_range,
+                    line_number: None,
                 });
             }
         }
@@ -2332,6 +2413,114 @@ impl SearchEngine {
         Ok((final_results, metrics))
     }
 
+    // ----------------------------------------------------------------
+    // Shared scoring weights (VAL-QUALITY-005)
+    //
+    // Both `search()` and `search_staged()` delegate to `compute_score()`
+    // so that the weight distribution lives in exactly one place.
+    // ----------------------------------------------------------------
+
+    /// Compute the composite [`Score`] for a single candidate node.
+    ///
+    /// This is the single source of truth for scoring weight selection.
+    /// Both [`search`](Self::search) and [`search_staged`](Self::search_staged)
+    /// call this method, ensuring the weight distributions cannot drift apart.
+    ///
+    /// The weight tuple `(tfidf, neural, structural, text)` is chosen based on:
+    /// - `query.query_type` (Text, Exact, Semantic, Structural, or None)
+    /// - Whether neural embeddings are available
+    /// - Whether semantic (TF-IDF vector) search is enabled
+    ///
+    /// After computing the base composite score, the method applies:
+    /// - Qualified-reference penalty (0.7x for `::` or `.` in symbol name)
+    /// - Exact-name-match boost (stronger in Exact mode)
+    /// - Partial-name-match boost (stronger in Exact mode)
+    /// - Archive directory penalty (0.1x for archive paths)
+    fn compute_score(
+        &self,
+        query: &SearchQuery,
+        text_query: &TextQueryPreprocessed,
+        node: &NodeInfo,
+        text_score: f32,
+        tfidf_score: f32,
+    ) -> Score {
+        let structural_score = (node.complexity as f32 / 100.0).min(1.0);
+
+        let neural_score = match (&query.query_neural_embedding, &node.neural_embedding) {
+            (Some(q_emb), Some(n_emb)) => crate::search::vector::cosine_similarity(q_emb, n_emb),
+            _ => 0.0,
+        };
+
+        let neural_available = query.query_neural_embedding.is_some();
+        let is_exact_mode = query
+            .query_type
+            .map(|qt| qt == crate::search::ranking::QueryType::Exact)
+            .unwrap_or(false);
+
+        // --- Weight selection (single source of truth) ---
+        let (w_tfidf, w_neural, w_structural, w_text) = match query.query_type {
+            Some(crate::search::ranking::QueryType::Text) => (0.2, 0.05, 0.05, 0.7),
+            Some(crate::search::ranking::QueryType::Exact) => {
+                if neural_available {
+                    (0.15, 0.15, 0.25, 0.45)
+                } else {
+                    (0.15, 0.0, 0.30, 0.55)
+                }
+            }
+            Some(crate::search::ranking::QueryType::Semantic) => {
+                if neural_available {
+                    (0.3, 0.3, 0.1, 0.3)
+                } else {
+                    (0.55, 0.0, 0.15, 0.30)
+                }
+            }
+            Some(crate::search::ranking::QueryType::Structural) => (0.3, 0.0, 0.5, 0.2),
+            None => {
+                if neural_available {
+                    // Default scorer weights (HybridScorer::for_code):
+                    // tfidf=0.30, neural=0.40, structural=0.15, text=0.15
+                    (0.30, 0.40, 0.15, 0.15)
+                } else if query.semantic {
+                    (0.40, 0.0, 0.20, 0.40)
+                } else {
+                    (0.0, 0.0, 0.15, 0.85)
+                }
+            }
+        };
+
+        let mut score = self
+            .scorer
+            .with_weights_hybrid(w_tfidf, w_neural, w_structural, w_text)
+            .score_hybrid(tfidf_score, neural_score, structural_score, text_score);
+
+        // --- Post-scoring adjustments (shared logic) ---
+
+        // Penalize fully-qualified external references
+        let symbol_lower = node.symbol_name.to_ascii_lowercase();
+        let is_qualified_ref = symbol_lower.contains("::") || symbol_lower.contains('.');
+        if is_qualified_ref {
+            score.overall *= 0.7;
+        }
+
+        // Boost exact and partial symbol name matches
+        if !is_qualified_ref {
+            if symbol_lower == text_query.query_lower {
+                let boost = if is_exact_mode { 2.2 } else { 1.8 };
+                score.overall = (score.overall * boost).min(1.0);
+            } else if !symbol_lower.is_empty() && text_query.query_lower.contains(&symbol_lower) {
+                let boost = if is_exact_mode { 1.5 } else { 1.3 };
+                score.overall = (score.overall * boost).min(1.0);
+            }
+        }
+
+        // Archive directory penalty
+        if Self::is_archive_path(&node.file_path) {
+            score.overall *= 0.1;
+        }
+
+        score
+    }
+
     /// Optimized text score calculation using cached node tokens and pre-computed query data
     ///
     /// Uses the node_tokens HashMap for O(1) token overlap calculation instead of
@@ -2349,24 +2538,37 @@ impl SearchEngine {
         symbol_name: &str,
         file_path: &str,
     ) -> f32 {
-        // Boost matches in symbol name
-        let symbol_boost = if symbol_name
-            .to_ascii_lowercase()
-            .contains(&precomputed.query_lower)
-        {
-            0.5
+        let symbol_lower = symbol_name.to_ascii_lowercase();
+
+        // Detect fully-qualified external references (e.g., "crate::module::function_name").
+        // These should rank lower than actual definitions.
+        let is_qualified_ref = symbol_lower.contains("::") || symbol_lower.contains('.');
+
+        // Exact symbol name match: maximum boost
+        let symbol_boost = if symbol_lower == precomputed.query_lower {
+            1.0
+        } else if symbol_lower.contains(&precomputed.query_lower) {
+            // Query is a substring of symbol name (e.g., query "tool_call" in "handle_tool_call")
+            if is_qualified_ref {
+                // Lower boost for qualified references (e.g., "crate.module.handle_tool_call")
+                0.3
+            } else {
+                0.7
+            }
+        } else if precomputed.query_lower.contains(&symbol_lower) && !symbol_lower.is_empty() {
+            // Symbol name is a substring of query (e.g., query "handle_tool_call" in "tool_call")
+            0.4
         } else {
             0.0
         };
 
         // Penalty for test-related files to address Limitation 4
-        let test_penalty = if file_path.to_ascii_lowercase().contains("test")
-            || symbol_name.to_ascii_lowercase().contains("test")
-        {
-            0.3
-        } else {
-            0.0
-        };
+        let test_penalty =
+            if file_path.to_ascii_lowercase().contains("test") || symbol_lower.contains("test") {
+                0.3
+            } else {
+                0.0
+            };
 
         // Use cached node tokens for overlap calculation (T14 optimization)
         // Tokens were cached during index_nodes() — no re-tokenization needed.
@@ -2610,6 +2812,23 @@ impl SearchEngine {
             })
             .sum()
     }
+
+    /// Check if a file path is inside an archive directory.
+    ///
+    /// Returns `true` if any path component is `archive` or `.archive`.
+    /// This catches paths like:
+    /// - `archive/src/foo.rs`
+    /// - `.archive/old_code.rs`
+    /// - `docs/archive/leindex_pre_step5.rs`
+    /// - `src/.archive/backup.rs`
+    ///
+    /// Used to apply a ranking penalty so archived files don't appear
+    /// in top search results unless the query explicitly targets them.
+    fn is_archive_path(file_path: &str) -> bool {
+        file_path
+            .split(['/', '\\'])
+            .any(|component| component == "archive" || component == ".archive")
+    }
 }
 
 /// Delta update for the text index.
@@ -2752,6 +2971,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -2779,6 +2999,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -2836,6 +3057,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -2856,6 +3078,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: Some(0.5),
             query_type: None,
         };
@@ -2948,6 +3171,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3048,6 +3272,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3105,6 +3330,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3158,6 +3384,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3211,6 +3438,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3277,6 +3505,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3435,6 +3664,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3651,6 +3881,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3692,6 +3923,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3809,6 +4041,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -3849,6 +4082,7 @@ mod tests {
                 semantic: false,
                 expand_context: false,
                 query_embedding: None,
+                query_neural_embedding: None,
                 threshold: None,
                 query_type: None,
             };
@@ -3879,6 +4113,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -4562,6 +4797,7 @@ mod tests {
             semantic: true,
             expand_context: false,
             query_embedding: Some(vec![0.9, 0.1, 0.0]),
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -4606,6 +4842,7 @@ mod tests {
             semantic: true,
             expand_context: false,
             query_embedding: Some(vec![0.0, 0.9, 0.1]),
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -4677,6 +4914,7 @@ mod tests {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -4685,6 +4923,235 @@ mod tests {
         assert!(
             !results.is_empty(),
             "Search should still find results via inverted index after content cleared"
+        );
+    }
+
+    #[test]
+    fn test_is_archive_path_detection() {
+        // Root-level archive directories
+        assert!(SearchEngine::is_archive_path("archive/src/main.rs"));
+        assert!(SearchEngine::is_archive_path(".archive/old_code.rs"));
+
+        // Nested archive directories
+        assert!(SearchEngine::is_archive_path(
+            "docs/archive/leindex_pre_step5.rs"
+        ));
+        assert!(SearchEngine::is_archive_path("src/.archive/backup.rs"));
+        assert!(SearchEngine::is_archive_path("maestro/archive/config.yaml"));
+
+        // Deeply nested
+        assert!(SearchEngine::is_archive_path(
+            "project/.archive/sub/deep/file.rs"
+        ));
+        assert!(SearchEngine::is_archive_path("a/b/c/archive/d/e/f.rs"));
+
+        // Non-archive paths should NOT match
+        assert!(!SearchEngine::is_archive_path("src/main.rs"));
+        assert!(!SearchEngine::is_archive_path("src/search/search.rs"));
+        assert!(!SearchEngine::is_archive_path("docs/README.md"));
+        assert!(!SearchEngine::is_archive_path("tests/archived_test.rs"));
+        assert!(!SearchEngine::is_archive_path("my_archive_helper.rs"));
+        assert!(!SearchEngine::is_archive_path("src/archive_helper.rs"));
+    }
+
+    #[test]
+    fn test_archive_files_deprioritized_in_search() {
+        // Create nodes with the same symbol name in both src/ and archive/
+        let src_node = NodeInfo {
+            node_id: "src_index_project".to_string(),
+            file_path: "src/cli/leindex/indexing.rs".to_string(),
+            symbol_name: "index_project".to_string(),
+            language: "rust".to_string(),
+            content: "pub fn index_project() {}".to_string(),
+            byte_range: (0, 30),
+            tfidf_embedding: vec![1.0, 0.0, 0.0],
+            neural_embedding: None,
+            complexity: 5,
+            signature: None,
+            pre_tokenized: None,
+        };
+
+        let archive_node = NodeInfo {
+            node_id: "archive_index_project".to_string(),
+            file_path: "docs/archive/leindex_pre_step5.rs".to_string(),
+            symbol_name: "index_project".to_string(),
+            language: "rust".to_string(),
+            content: "pub fn index_project() {}".to_string(),
+            byte_range: (0, 30),
+            tfidf_embedding: vec![1.0, 0.0, 0.0],
+            neural_embedding: None,
+            complexity: 5,
+            signature: None,
+            pre_tokenized: None,
+        };
+
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(vec![src_node, archive_node]);
+
+        let query = SearchQuery {
+            query: "index_project".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(vec![1.0, 0.0, 0.0]),
+            query_neural_embedding: None,
+            threshold: None,
+            query_type: None,
+        };
+
+        let results = engine.search(query).unwrap();
+        assert!(!results.is_empty(), "Should have results");
+
+        // The src/ result must rank higher than the archive/ result
+        let src_rank = results
+            .iter()
+            .position(|r| r.file_path.starts_with("src/"))
+            .expect("src/ result should exist");
+        let archive_rank = results
+            .iter()
+            .position(|r| SearchEngine::is_archive_path(&r.file_path));
+
+        if let Some(arch_rank) = archive_rank {
+            assert!(
+                src_rank < arch_rank,
+                "src/ result (rank {}) must appear before archive/ result (rank {})",
+                src_rank + 1,
+                arch_rank + 1
+            );
+        }
+
+        // Verify the archive result has a lower score
+        if let Some(arch_result) = results
+            .iter()
+            .find(|r| SearchEngine::is_archive_path(&r.file_path))
+        {
+            let src_result = results
+                .iter()
+                .find(|r| r.file_path.starts_with("src/"))
+                .expect("src/ result should exist");
+            assert!(
+                src_result.score.overall > arch_result.score.overall,
+                "src/ score ({:.4}) must be higher than archive/ score ({:.4})",
+                src_result.score.overall,
+                arch_result.score.overall
+            );
+        }
+    }
+
+    #[test]
+    fn test_search_mode_exact_vs_semantic_different_rankings() {
+        // VAL-SEARCH-010: search_mode=exact must produce different rankings
+        // than search_mode=semantic for the same query.
+        //
+        // Setup: two nodes where one has an exact name match but low TF-IDF,
+        // and the other has high TF-IDF (conceptual match) but no exact name.
+        // Exact mode should rank the exact-name match higher relative to semantic mode.
+        let nodes = vec![
+            NodeInfo {
+                node_id: "exact_match".to_string(),
+                file_path: "lib.rs".to_string(),
+                symbol_name: "exact_match".to_string(),
+                language: "rust".to_string(),
+                // Content has some overlap but not a lot
+                content: "fn exact_match() { let x = 1; }".to_string(),
+                byte_range: (0, 30),
+                tfidf_embedding: vec![0.5, 0.3, 0.0],
+                neural_embedding: None,
+                complexity: 5,
+                signature: None,
+                pre_tokenized: None,
+            },
+            NodeInfo {
+                node_id: "conceptual_match".to_string(),
+                file_path: "lib.rs".to_string(),
+                symbol_name: "conceptual_match".to_string(),
+                language: "rust".to_string(),
+                // Content has strong TF-IDF overlap with query terms
+                content: "fn conceptual_match() { exact match logic here }".to_string(),
+                byte_range: (31, 70),
+                tfidf_embedding: vec![0.9, 0.8, 0.0],
+                neural_embedding: None,
+                complexity: 10,
+                signature: None,
+                pre_tokenized: None,
+            },
+        ];
+
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(nodes);
+
+        // Search with exact mode
+        let exact_query = SearchQuery {
+            query: "exact_match".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(vec![0.5, 0.3, 0.0]),
+            query_neural_embedding: None,
+            threshold: None,
+            query_type: Some(crate::search::ranking::QueryType::Exact),
+        };
+        let exact_results = engine.search(exact_query).unwrap();
+
+        // Search with semantic mode
+        let semantic_query = SearchQuery {
+            query: "exact_match".to_string(),
+            top_k: 10,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(vec![0.5, 0.3, 0.0]),
+            query_neural_embedding: None,
+            threshold: None,
+            query_type: Some(crate::search::ranking::QueryType::Semantic),
+        };
+        let semantic_results = engine.search(semantic_query).unwrap();
+
+        // Both should return results
+        assert!(
+            !exact_results.is_empty(),
+            "exact mode should return results"
+        );
+        assert!(
+            !semantic_results.is_empty(),
+            "semantic mode should return results"
+        );
+
+        // In exact mode, the exact name match should be ranked #1
+        assert_eq!(
+            exact_results[0].node_id, "exact_match",
+            "exact mode should rank exact name match first"
+        );
+
+        // The score distributions should differ between modes
+        // (different weight distributions produce different scores)
+        let exact_top_score = exact_results[0].score.overall;
+        let semantic_top_score = semantic_results[0].score.overall;
+        assert!(
+            exact_top_score != semantic_top_score
+                || exact_results[0].node_id != semantic_results[0].node_id,
+            "exact and semantic modes should produce different top scores or orderings"
+        );
+
+        // Verify that exact mode gives a higher score to the exact name match
+        // compared to semantic mode (due to stronger boost)
+        let exact_match_exact_score = exact_results
+            .iter()
+            .find(|r| r.node_id == "exact_match")
+            .map(|r| r.score.overall)
+            .unwrap_or(0.0);
+        let exact_match_semantic_score = semantic_results
+            .iter()
+            .find(|r| r.node_id == "exact_match")
+            .map(|r| r.score.overall)
+            .unwrap_or(0.0);
+        assert!(
+            exact_match_exact_score > exact_match_semantic_score,
+            "exact mode ({:.4}) should give higher score to exact name match than semantic mode ({:.4})",
+            exact_match_exact_score,
+            exact_match_semantic_score
         );
     }
 }

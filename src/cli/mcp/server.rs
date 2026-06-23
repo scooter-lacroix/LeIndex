@@ -17,10 +17,10 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use dashmap::DashMap;
 use futures_util::stream::{Stream, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
-use dashmap::DashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{
@@ -460,9 +460,7 @@ impl McpServer {
         // preferred address only when the kernel query fails
         // (which would itself be a startup error worth surfacing
         // via the log).
-        let bind_address = listener
-            .local_addr()
-            .unwrap_or(self.config.bind_address);
+        let bind_address = listener.local_addr().unwrap_or(self.config.bind_address);
         let router = Self::router();
 
         // Spawn background task to clean up stale sessions periodically.
@@ -527,9 +525,7 @@ pub(crate) async fn bind_with_fallback(
     if preferred.port() == 0 {
         return tokio::net::TcpListener::bind(preferred)
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("failed to bind to ephemeral port {}: {}", preferred, e)
-            });
+            .map_err(|e| anyhow::anyhow!("failed to bind to ephemeral port {}: {}", preferred, e));
     }
     let mut last_err: Option<std::io::Error> = None;
     for offset in 0..=BIND_FALLBACK_PORT_RANGE {
@@ -766,9 +762,10 @@ fn handle_initialize(server: &McpServer) -> (Value, Option<String>) {
                 server.session_handshakes.remove(id.as_ref());
             }
         }
-        server
-            .session_handshakes
-            .insert(Arc::<str>::from(session_id.as_str()), (true, Instant::now()));
+        server.session_handshakes.insert(
+            Arc::<str>::from(session_id.as_str()),
+            (true, Instant::now()),
+        );
     }
 
     let result = serde_json::json!({
@@ -967,11 +964,8 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
             let _guard = incoming_session_id
                 .as_ref()
                 .map(|sid| McpServer::in_flight_guard(server_instance, sid));
-            let tool_result = tokio::time::timeout(
-                timeout,
-                handle_tool_call(&state, handlers, &json_req),
-            )
-            .await;
+            let tool_result =
+                tokio::time::timeout(timeout, handle_tool_call(&state, handlers, &json_req)).await;
             match tool_result {
                 Ok(result) => result,
                 Err(_) => Err(JsonRpcError::internal_error(format!(
@@ -1035,13 +1029,9 @@ pub async fn handle_tool_call(
             // The CLI surface uses `render_tool_output` (colored); the
             // MCP transport uses the same render functions but without
             // ANSI codes so the LLM sees clean text.
-            let rendered = crate::cli::mcp::output::render_tool_output_plain(
-                &call_name,
-                &trimmed,
-                &call_args,
-            );
-            let is_substantive = rendered.trim().lines().count() > 1
-                || rendered.trim().len() > 80;
+            let rendered =
+                crate::cli::mcp::output::render_tool_output_plain(&call_name, &trimmed, &call_args);
+            let is_substantive = rendered.trim().lines().count() > 1 || rendered.trim().len() > 80;
             let payload = if is_substantive {
                 rendered
             } else {
@@ -1284,8 +1274,10 @@ impl McpServer {
                 .context("Failed to accept connection")?;
 
             let session_id = generate_session_id();
-            self.session_handshakes
-                .insert(Arc::<str>::from(session_id.as_str()), (false, Instant::now()));
+            self.session_handshakes.insert(
+                Arc::<str>::from(session_id.as_str()),
+                (false, Instant::now()),
+            );
 
             let session_id_clone = session_id.clone();
             let session_handshakes = self.session_handshakes.clone();
@@ -1492,14 +1484,13 @@ async fn handle_socket_message(
 
             // Check handshake state for this session (allow initialize and ping before handshake)
             if method_name != "initialize" && method_name != "ping" {
-                let handshaked =
-                    if let Some(mut entry) = session_handshakes.get_mut(session_id) {
-                        // Update last access time to prevent eviction
-                        entry.1 = Instant::now();
-                        entry.0
-                    } else {
-                        false
-                    };
+                let handshaked = if let Some(mut entry) = session_handshakes.get_mut(session_id) {
+                    // Update last access time to prevent eviction
+                    entry.1 = Instant::now();
+                    entry.0
+                } else {
+                    false
+                };
                 if !handshaked {
                     let resp = JsonRpcResponse::error(
                         request_id,
@@ -1516,10 +1507,7 @@ async fn handle_socket_message(
                 "initialize" => {
                     // Mark session as handshaked
                     handshake_complete.store(true, Ordering::SeqCst);
-                    session_handshakes.insert(
-                        Arc::<str>::from(session_id),
-                        (true, Instant::now()),
-                    );
+                    session_handshakes.insert(Arc::<str>::from(session_id), (true, Instant::now()));
 
                     let result = serde_json::json!({
                         "protocolVersion": "2024-11-05",
@@ -1782,7 +1770,9 @@ mod tests {
 
         // The in-flight session must still be present.
         assert!(
-            server.session_handshakes.contains_key(in_flight_sid.as_str()),
+            server
+                .session_handshakes
+                .contains_key(in_flight_sid.as_str()),
             "in_flight session {} was evicted during initialize",
             in_flight_sid,
         );
@@ -1858,7 +1848,9 @@ mod tests {
         // can compare against.
         let sid = Arc::<str>::from("sess-arc-key");
         let cached: Arc<str> = sid.clone();
-        server.session_handshakes.insert(sid, (true, Instant::now()));
+        server
+            .session_handshakes
+            .insert(sid, (true, Instant::now()));
 
         // `begin_request` should clone the cached `Arc<str>` rather
         // than allocating a new one.

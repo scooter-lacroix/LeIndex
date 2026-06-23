@@ -625,8 +625,8 @@ mod tests {
     #[test]
     fn test_extract_bool_native_bool() {
         let args = serde_json::json!({"flag": true, "off": false});
-        assert_eq!(extract_bool(&args, "flag", false), true);
-        assert_eq!(extract_bool(&args, "off", true), false);
+        assert!(extract_bool(&args, "flag", false));
+        assert!(!extract_bool(&args, "off", true));
     }
 
     #[test]
@@ -635,29 +635,29 @@ mod tests {
             "a": "true", "b": "false", "c": "1", "d": "0", "e": "yes", "f": "no",
             "g": "TRUE", "h": "False"
         });
-        assert_eq!(extract_bool(&args, "a", false), true);
-        assert_eq!(extract_bool(&args, "b", true), false);
-        assert_eq!(extract_bool(&args, "c", false), true);
-        assert_eq!(extract_bool(&args, "d", true), false);
-        assert_eq!(extract_bool(&args, "e", false), true);
-        assert_eq!(extract_bool(&args, "f", true), false);
-        assert_eq!(extract_bool(&args, "g", false), true);
-        assert_eq!(extract_bool(&args, "h", true), false);
+        assert!(extract_bool(&args, "a", false));
+        assert!(!extract_bool(&args, "b", true));
+        assert!(extract_bool(&args, "c", false));
+        assert!(!extract_bool(&args, "d", true));
+        assert!(extract_bool(&args, "e", false));
+        assert!(!extract_bool(&args, "f", true));
+        assert!(extract_bool(&args, "g", false));
+        assert!(!extract_bool(&args, "h", true));
     }
 
     #[test]
     fn test_extract_bool_number_coercion() {
         let args = serde_json::json!({"one": 1, "zero": 0, "big": 42});
-        assert_eq!(extract_bool(&args, "one", false), true);
-        assert_eq!(extract_bool(&args, "zero", true), false);
-        assert_eq!(extract_bool(&args, "big", false), true);
+        assert!(extract_bool(&args, "one", false));
+        assert!(!extract_bool(&args, "zero", true));
+        assert!(extract_bool(&args, "big", false));
     }
 
     #[test]
     fn test_extract_bool_missing_uses_default() {
         let args = serde_json::json!({});
-        assert_eq!(extract_bool(&args, "absent", true), true);
-        assert_eq!(extract_bool(&args, "absent", false), false);
+        assert!(extract_bool(&args, "absent", true));
+        assert!(!extract_bool(&args, "absent", false));
     }
 
     #[test]

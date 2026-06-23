@@ -2,7 +2,7 @@
 
 use crate::graph::pdg::{NodeId, ProgramDependenceGraph};
 use serde::{Deserialize, Serialize};
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 
 /// Configuration for gravity traversal
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,8 +83,27 @@ impl GravityTraversal {
 
             if let Some(node) = pdg.get_node(wnode.id) {
                 let estimated_tokens = self.estimate_tokens(node);
+
+                // If this node alone exceeds the budget, skip it and try
+                // smaller nodes instead of breaking entirely. This ensures
+                // that large functions don't prevent smaller relevant nodes
+                // from being included in the context.
+                // Exception: always include at least the first entry point
+                // so the user gets meaningful context even when the top
+                // result is a very large function.
                 if current_tokens + estimated_tokens > self.config.max_tokens {
-                    break;
+                    if context.is_empty() && wnode.distance == 0 {
+                        // Force-include the first entry point even if it
+                        // exceeds the budget, so context is never empty.
+                        visited.insert(wnode.id);
+                        context.push(wnode.id);
+                        current_tokens += estimated_tokens;
+                        continue;
+                    }
+                    // Skip this node but continue trying others
+                    visited.insert(wnode.id);
+                    self.enqueue_neighbors(pdg, &mut pq, &visited, wnode.id, wnode.distance);
+                    continue;
                 }
 
                 visited.insert(wnode.id);
@@ -92,25 +111,35 @@ impl GravityTraversal {
                 current_tokens += estimated_tokens;
 
                 // Add neighbors with decayed weight
-                for neighbor in self.get_neighbors(pdg, wnode.id) {
-                    if !visited.contains(&neighbor) {
-                        let new_distance = wnode.distance + 1;
-                        if let Some(nnode) = pdg.get_node(neighbor) {
-                            let semantic = 1.0; // Would come from embedding
-                            let weight =
-                                self.calculate_relevance(nnode, new_distance as f64, semantic);
-                            pq.push(WeightedNode {
-                                id: neighbor,
-                                weight,
-                                distance: new_distance,
-                            });
-                        }
-                    }
-                }
+                self.enqueue_neighbors(pdg, &mut pq, &visited, wnode.id, wnode.distance);
             }
         }
 
         context
+    }
+
+    fn enqueue_neighbors(
+        &self,
+        pdg: &ProgramDependenceGraph,
+        pq: &mut BinaryHeap<WeightedNode>,
+        visited: &HashSet<NodeId>,
+        node_id: NodeId,
+        distance: usize,
+    ) {
+        for neighbor in self.get_neighbors(pdg, node_id) {
+            if !visited.contains(&neighbor) {
+                let new_distance = distance + 1;
+                if let Some(nnode) = pdg.get_node(neighbor) {
+                    let semantic = 1.0; // Would come from embedding
+                    let weight = self.calculate_relevance(nnode, new_distance as f64, semantic);
+                    pq.push(WeightedNode {
+                        id: neighbor,
+                        weight,
+                        distance: new_distance,
+                    });
+                }
+            }
+        }
     }
 
     /// Calculate relevance score for a node

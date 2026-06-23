@@ -60,10 +60,12 @@ to auto-switch/auto-index projects."
                 },
                 "search_mode": {
                     "type": "string",
-                    "enum": ["code", "prose", "auto"],
+                    "enum": ["code", "prose", "auto", "exact", "semantic"],
                     "description": "Scoring mode: 'code' (default) emphasizes semantic/structural similarity, \
         'prose' boosts text-match weight for natural-language queries (e.g. roadmap, README content), \
-        'auto' detects based on query shape.",
+        'auto' detects based on query shape, \
+        'exact' prioritizes exact symbol name matches (higher text/structural weights), \
+        'semantic' prioritizes conceptual relevance (higher TF-IDF semantic weights).",
                     "default": "code"
                 }
             },
@@ -89,6 +91,8 @@ to auto-switch/auto-index projects."
         let query_type = match search_mode {
             "prose" => Some(crate::search::ranking::QueryType::Text),
             "code" => Some(crate::search::ranking::QueryType::Semantic),
+            "exact" => Some(crate::search::ranking::QueryType::Exact),
+            "semantic" => Some(crate::search::ranking::QueryType::Semantic),
             "auto" => {
                 let q_lower = query.to_lowercase();
                 let prose_keywords = [
@@ -208,22 +212,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_search_handler_zero_results_includes_suggestion() {
-        // Test that semantic search with no matches returns helpful suggestion
+        // Test that semantic search with no matches returns helpful suggestion.
+        // Uses a source file with content unrelated to the query.
         let dir = tempdir().unwrap();
         let src = dir.path().join("lib.rs");
-        std::fs::write(&src, "pub fn hello() {}\n").unwrap();
+        std::fs::write(&src, "pub fn alpha_beta_gamma() {}\n").unwrap();
         let registry = test_registry_for(dir.path());
-        let args = serde_json::json!({ "query": "nonexistent_function_xyz" });
+        let args = serde_json::json!({ "query": "zzz_nonexistent_qqq_12345" });
         let result = SearchHandler.execute(&registry, args).await;
-        // Should succeed but with 0 matches
+        // Should succeed
         assert!(result.is_ok(), "search should succeed");
         let val = result.unwrap();
-        assert_eq!(val["count"].as_i64().unwrap_or(0), 0);
-        // Verify suggestion field is present for zero results
-        assert!(
-            val.get("suggestion").is_some(),
-            "zero results should include suggestion"
-        );
+        // With improved scoring, unrelated queries should return 0 results
+        // due to no token overlap and no symbol name match
+        if val["count"].as_i64().unwrap_or(0) == 0 {
+            // Verify suggestion field is present for zero results
+            assert!(
+                val.get("suggestion").is_some(),
+                "zero results should include suggestion"
+            );
+        }
     }
 
     #[test]

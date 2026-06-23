@@ -533,6 +533,7 @@ impl QueryParser {
             semantic: matches!(parsed.query_type, QueryType::Semantic),
             expand_context: parsed.expand_context,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: Some(parsed.query_type),
         }

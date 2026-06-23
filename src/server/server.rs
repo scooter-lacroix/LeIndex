@@ -171,26 +171,6 @@ impl LeIndexServer {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_server_default_config() {
-        // Use a temporary database path to avoid conflicts
-        let temp_dir = std::env::temp_dir();
-        let db_path = temp_dir.join(format!("leindex_test_{}.db", std::process::id()));
-        let mut config = ServerConfig::default();
-        config.db_path = db_path.to_string_lossy().to_string();
-
-        let server = LeIndexServer::new(config);
-        assert!(server.is_ok());
-
-        // Clean up the test database
-        let _ = std::fs::remove_file(db_path);
-    }
-}
-
 /// Search the filesystem for `.leindex/leindex.db` project databases.
 /// Roots are taken from `LEINDEX_DISCOVERY_ROOTS` (comma-separated) when set;
 /// otherwise defaults to `$HOME` and the current working directory.
@@ -273,4 +253,26 @@ fn ingest_project_db(target: &mut Storage, project_db: &Path) -> Result<(), ApiE
         .map_err(|e| ApiError::internal(format!("Ingest failed: {}", e)))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_server_default_config() {
+        // Use a temporary database path to avoid conflicts
+        let temp_dir = std::env::temp_dir();
+        let db_path = temp_dir.join(format!("leindex_test_{}.db", std::process::id()));
+        let config = ServerConfig {
+            db_path: db_path.to_string_lossy().to_string(),
+            ..Default::default()
+        };
+
+        let server = LeIndexServer::new(config);
+        assert!(server.is_ok());
+
+        // Clean up the test database
+        let _ = std::fs::remove_file(db_path);
+    }
 }

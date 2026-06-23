@@ -351,12 +351,15 @@ mod tests {
     ///
     /// The full Watcher::run path is async + requires a tokio runtime
     /// + a real project handle, so we exercise the *enum contract*:
+    ///
     /// the `Failed` variant exists, carries a reason, and matches a
     /// `dirty = true` arm in the consumer. The full e2e path is
     /// covered by integration tests in `tests/watcher_retry.rs`.
     #[test]
     fn test_watcher_failed_outcome_carries_reason() {
-        let outcome: ReindexOutcome = ReindexOutcome::Failed("incremental_reindex_from_watcher panicked: db corrupt".to_string());
+        let outcome: ReindexOutcome = ReindexOutcome::Failed(
+            "incremental_reindex_from_watcher panicked: db corrupt".to_string(),
+        );
         match outcome {
             ReindexOutcome::Completed => {
                 panic!("panic path must NOT surface as Completed")

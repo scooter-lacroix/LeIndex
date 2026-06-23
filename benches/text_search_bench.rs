@@ -125,21 +125,21 @@ fn find_normalised_whitespace_old(haystack: &str, needle: &str) -> Option<(usize
                     s
                 } else {
                     let mut offset = 0;
-                    for l in 0..start_line {
-                        offset += lines[l].len() + 1;
+                    for line in lines.iter().take(start_line) {
+                        offset += line.len() + 1;
                     }
                     offset
                 };
                 let mut byte_end = byte_start;
-                for l in start_line..=end_line {
-                    byte_end += lines[l].len() + 1;
+                for line in lines.iter().take(end_line + 1).skip(start_line) {
+                    byte_end += line.len() + 1;
                 }
                 return Some((byte_start, byte_end.min(haystack.len()) - byte_start));
             }
             if raw_start_byte.is_none() {
                 let mut offset = 0;
-                for l in 0..start_line {
-                    offset += lines[l].len() + 1;
+                for line in lines.iter().take(start_line) {
+                    offset += line.len() + 1;
                 }
                 raw_start_byte = Some(offset);
             }

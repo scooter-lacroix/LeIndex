@@ -43,6 +43,7 @@ fn search_ids(engine: &mut SearchEngine, query: &str) -> Vec<String> {
         semantic: false,
         expand_context: false,
         query_embedding: None,
+        query_neural_embedding: None,
         threshold: None,
         query_type: None,
     };

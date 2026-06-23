@@ -25,6 +25,8 @@ pub(crate) const DEPENDENCY_MANIFEST_NAMES: &[&str] = &[
     "npm-shrinkwrap.json",
     "yarn.lock",
     "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
     "requirements.txt",
     "Pipfile.lock",
     "pyproject.toml",
@@ -106,10 +108,16 @@ pub struct IndexStats {
     /// Total number of code signatures extracted across all files
     pub total_signatures: usize,
 
-    /// Total number of nodes created in the Program Dependence Graph
+    /// Number of PDG nodes recorded at indexing time (persisted to storage).
+    /// This is a snapshot from the last `index_project` run and may differ
+    /// from the live PDG counts in `Diagnostics.pdg_nodes` if the PDG was
+    /// modified or partially loaded after indexing.
     pub pdg_nodes: usize,
 
-    /// Total number of edges created in the Program Dependence Graph
+    /// Number of PDG edges recorded at indexing time (persisted to storage).
+    /// This is a snapshot from the last `index_project` run and may differ
+    /// from the live PDG counts in `Diagnostics.pdg_edges` if the PDG was
+    /// modified or partially loaded after indexing.
     pub pdg_edges: usize,
 
     /// Total number of nodes successfully indexed for semantic search
@@ -129,6 +137,14 @@ pub struct IndexStats {
     /// Number of unique external imports still unresolved after manifest matching
     #[serde(default)]
     pub external_deps_unresolved: usize,
+
+    /// Total number of external module nodes in the PDG
+    #[serde(default)]
+    pub external_deps_total: usize,
+
+    /// Number of external nodes recognized as builtin/system modules
+    #[serde(default)]
+    pub external_deps_builtin: usize,
 }
 
 /// Result from a deep analysis operation
@@ -214,6 +230,23 @@ pub struct Diagnostics {
     pub search_index_nodes: usize,
     /// Overall index health: "healthy", "stale", or "empty"
     pub index_health: String,
+    /// Live PDG node count from the in-memory Program Dependence Graph
+    /// (`pdg.node_count()` at diagnostics time). This reflects the current
+    /// state of the loaded PDG, which may differ from the index-time snapshot
+    /// in `stats.pdg_nodes` if the PDG was partially loaded or modified after
+    /// indexing. When no PDG is loaded, this is 0.
+    #[serde(default)]
+    pub pdg_nodes: usize,
+    /// Live PDG edge count from the in-memory Program Dependence Graph
+    /// (`pdg.edge_count()` at diagnostics time). This reflects the current
+    /// state of the loaded PDG, which may differ from the index-time snapshot
+    /// in `stats.pdg_edges` if the PDG was partially loaded or modified after
+    /// indexing. When no PDG is loaded, this is 0.
+    #[serde(default)]
+    pub pdg_edges: usize,
+    /// Embedding model status: "tfidf_only", "onnx_hybrid", "remote_hybrid", or "unknown"
+    #[serde(default)]
+    pub embedding_model: String,
 }
 
 /// Coverage report of indexed vs source files.

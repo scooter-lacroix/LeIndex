@@ -112,11 +112,7 @@ pub(crate) fn trim_search(data: &Value) -> Value {
                     .and_then(|v| v.get("overall"))
                     .filter(|v| !v.is_null())
                     .cloned()
-                    .or_else(|| {
-                        r.get("score")
-                            .filter(|v| !v.is_null())
-                            .cloned()
-                    })
+                    .or_else(|| r.get("score").filter(|v| !v.is_null()).cloned())
                     .unwrap_or(Value::Null);
                 serde_json::json!({
                     "file_path": r.get("file_path").cloned().unwrap_or(Value::Null),
@@ -138,6 +134,7 @@ pub(crate) fn trim_search(data: &Value) -> Value {
                         .cloned()
                         .unwrap_or(Value::Null),
                     "symbol_type": r.get("symbol_type").cloned().unwrap_or(Value::Null),
+                    "line_number": r.get("line_number").cloned().unwrap_or(Value::Null),
                     "score": score,
                     "snippet": snippet,
                 })
@@ -198,45 +195,35 @@ fn trim_diagnostics(data: &Value) -> Value {
         "indexed_files": data.get("indexed_files"),
         "symbol_count": data.get("symbol_count"),
         "index_size_mb": data.get("index_size_mb"),
+        "memory_rss_mb": data.get("memory_rss_mb"),
+        "db_size_bytes": data.get("db_size_bytes"),
         "stale": data.get("stale"),
         "last_indexed_secs_ago": data.get("last_indexed_secs_ago"),
+        "embedding_model": data.get("embedding_model"),
+        // VAL-CROSS-015 / VAL-ORT-022: ORT info is part of the diagnostics
+        // contract surfaced by the diagnostics command. Keep these fields in
+        // the LLM-facing payload so MCP tools/call sees the same shape as
+        // `leindex diagnostics`.
+        "ort_version": data.get("ort_version"),
+        "ort_path": data.get("ort_path"),
+        "execution_provider": data.get("execution_provider"),
+        "freshness": data.get("freshness"),
+        "system_health": data.get("system_health"),
         "issues": data.get("issues"),
     })
 }
 
 fn trim_impact(data: &Value) -> Value {
-    fn trim_side(v: &Value) -> Value {
-        // Borrow the array and only clone the whitelisted
-        // fields we actually keep. The previous
-        // `as_array().cloned().unwrap_or_default()` allocated a
-        // fresh `Value` for every element in the array (a deep
-        // copy including `serde_json::Map` nodes, strings,
-        // numbers) just to throw most of the data away in the
-        // subsequent mapping. The borrowing form skips those
-        // deep copies and only allocates the small output
-        // object — same shape on the wire, but O(1) element
-        // allocations instead of O(N).
-        let trimmed: Vec<Value> = v
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .map(|s| {
-                        serde_json::json!({
-                            "name": s.get("name"),
-                            "file": s.get("file"),
-                            "line": s.get("line"),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        Value::Array(trimmed)
-    }
     serde_json::json!({
         "symbol": data.get("symbol"),
+        "file": data.get("file"),
+        "change_type": data.get("change_type"),
+        "direct_callers": data.get("direct_callers"),
+        "transitive_affected_symbols": data.get("transitive_affected_symbols"),
+        "transitive_affected_files": data.get("transitive_affected_files"),
+        "transitive_callers": data.get("transitive_callers"),
         "risk_level": data.get("risk_level"),
-        "forward_impact": data.get("forward_impact").map(trim_side),
-        "backward_impact": data.get("backward_impact").map(trim_side),
+        "summary": data.get("summary"),
     })
 }
 
@@ -260,7 +247,9 @@ fn trim_symbol_lookup(data: &Value) -> Value {
             out.insert("batch".to_string(), Value::Bool(true));
             out.insert(
                 "count".to_string(),
-                data.get("count").cloned().unwrap_or(Value::from(trimmed_results.len())),
+                data.get("count")
+                    .cloned()
+                    .unwrap_or(Value::from(trimmed_results.len())),
             );
             out.insert("results".to_string(), Value::Array(trimmed_results));
             return Value::Object(out);
@@ -305,9 +294,12 @@ fn trim_file_summary(data: &Value) -> Value {
     serde_json::json!({
         "file_path": data.get("file_path"),
         "language": data.get("language"),
-        "size": data.get("size"),
-        "complexity": data.get("complexity"),
+        "line_count": data.get("line_count"),
+        "symbol_count": data.get("symbol_count"),
+        "symbols_shown": data.get("symbols_shown"),
+        "symbols_truncated": data.get("symbols_truncated"),
         "symbols": data.get("symbols"),
+        "module_role": data.get("module_role"),
     })
 }
 
@@ -328,10 +320,10 @@ fn trim_phase(data: &Value) -> Value {
     if let Some(df) = data.get("deleted_files") {
         out.insert("deleted_files".to_string(), df.clone());
     }
-    // Pass through fields that render_phase reads for metadata display.
-    // mode, phases, and summary are not currently emitted by the upstream
-    // PhaseAnalysisReport, but the pass-through is defensive so the
-    // renderer will show them if they ever appear.
+    // Legacy fields (mode, phases, summary) from the original PhaseAnalysisReport.
+    // render_phase no longer reads these; it now uses executed_phases, cache_hit,
+    // generation, phase1-5, and formatted_output. The pass-through is kept for
+    // backward compatibility in case upstream emits them.
     if let Some(v) = data.get("mode") {
         out.insert("mode".to_string(), v.clone());
     }
@@ -363,7 +355,10 @@ fn trim_phase(data: &Value) -> Value {
                 Some((idx, _)) => &s[..idx],
                 None => s,
             };
-            out.insert("formatted_output".to_string(), Value::String(capped.to_string()));
+            out.insert(
+                "formatted_output".to_string(),
+                Value::String(capped.to_string()),
+            );
         } else {
             out.insert("formatted_output".to_string(), v.clone());
         }
@@ -380,13 +375,15 @@ fn trim_git_status(data: &Value) -> Value {
     let changed_symbols = data.get("changed_symbols").and_then(|v| {
         let arr = v.as_array()?;
         Some(serde_json::Value::Array(
-            arr.iter().map(|entry| {
-                serde_json::json!({
-                    "file": entry.get("file"),
-                    "status": entry.get("status"),
-                    "symbols": take_n(entry.get("symbols").unwrap_or(&Value::Null), 5),
+            arr.iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "file": entry.get("file"),
+                        "status": entry.get("status"),
+                        "symbols": take_n(entry.get("symbols").unwrap_or(&Value::Null), 5),
+                    })
                 })
-            }).collect(),
+                .collect(),
         ))
     });
     serde_json::json!({
@@ -396,6 +393,8 @@ fn trim_git_status(data: &Value) -> Value {
         "staged_files": take_n(staged_files.unwrap_or(&Value::Null), 50),
         "untracked_files": take_n(untracked_files.unwrap_or(&Value::Null), 50),
         "changed_symbols": changed_symbols,
+        "pdg_enrichment": data.get("pdg_enrichment").unwrap_or(&Value::Null),
+        "impact_summary": data.get("impact_summary").unwrap_or(&Value::Null),
     })
 }
 
@@ -405,12 +404,30 @@ fn trim_read_file(data: &Value) -> Value {
     // the handler populated it; the per-entry callers/callees arrays
     // can also be capped.
     let mut out = serde_json::Map::new();
-    out.insert("file_path".to_string(), data.get("file_path").cloned().unwrap_or(Value::Null));
-    out.insert("language".to_string(), data.get("language").cloned().unwrap_or(Value::Null));
-    out.insert("total_lines".to_string(), data.get("total_lines").cloned().unwrap_or(Value::Null));
-    out.insert("start_line".to_string(), data.get("start_line").cloned().unwrap_or(Value::Null));
-    out.insert("end_line".to_string(), data.get("end_line").cloned().unwrap_or(Value::Null));
-    out.insert("content".to_string(), data.get("content").cloned().unwrap_or(Value::Null));
+    out.insert(
+        "file_path".to_string(),
+        data.get("file_path").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "language".to_string(),
+        data.get("language").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "total_lines".to_string(),
+        data.get("total_lines").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "start_line".to_string(),
+        data.get("start_line").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "end_line".to_string(),
+        data.get("end_line").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "content".to_string(),
+        data.get("content").cloned().unwrap_or(Value::Null),
+    );
     if let Some(ctx) = data.get("context") {
         if let Some(obj) = ctx.as_object() {
             let mut trimmed_ctx = serde_json::Map::new();
@@ -487,27 +504,42 @@ fn trim_read_symbol(data: &Value) -> Value {
             out.insert(k.to_string(), v.clone());
         }
     }
-    // The source body is the dominant token cost. Truncate to 2k chars
-    // and expose a flag so the LLM knows to call again with a wider
-    // budget if it really needs the full body. Truncate on character
-    // boundaries directly from the source `&str` — slicing at a fixed
-    // byte offset can panic when the offset lands inside a multi-byte
-    // UTF-8 sequence (e.g. emoji, identifiers in non-ASCII source).
+    // The source body is the dominant token cost. The handler already
+    // caps it at `token_budget * 4` chars. If the handler provided
+    // `source_truncated` and `_source_char_budget`, trust those values
+    // and only apply a secondary trim if the budget exceeds a safety
+    // ceiling (32k chars = ~8k tokens). This ensures the LLM gets the
+    // full source it requested (up to its token_budget) rather than
+    // an arbitrary 2000-char truncation.
     //
-    // `char_indices().nth(2000)` is a single pass: it walks the UTF-8
-    // string once and stops at the (n+1)-th character, returning the
-    // byte offset of the truncation boundary. We then append the
-    // standard `...` ellipsis so the LLM sees a 2003-char preview.
-    // The previous `chars().count() > 2000` + `truncate_chars(...)`
-    // path scanned the entire string twice on every call, which
-    // dominated trim cost for very large sources.
+    // Truncate on character boundaries directly from the source `&str`
+    // — slicing at a fixed byte offset can panic when the offset lands
+    // inside a multi-byte UTF-8 sequence.
+    let safety_cap = 32_000usize;
+    let budget = data
+        .get("_source_char_budget")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(2000);
+    let trim_cap = budget.min(safety_cap);
+
     if let Some(src) = data.get("source").and_then(|v| v.as_str()) {
-        let (head, truncated) = match src.char_indices().nth(2000) {
+        let (head, truncated) = match src.char_indices().nth(trim_cap) {
             Some((idx, _)) => (format!("{}...", &src[..idx]), true),
             None => (src.to_string(), false),
         };
         out.insert("source".to_string(), Value::String(head));
-        out.insert("source_truncated".to_string(), Value::Bool(truncated));
+        // Use the handler's source_truncated flag when available (it's
+        // accurate: it compares full source length against the actual
+        // budget). Fall back to the trim-based calculation.
+        let handler_truncated = data
+            .get("source_truncated")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(truncated);
+        out.insert(
+            "source_truncated".to_string(),
+            Value::Bool(handler_truncated),
+        );
     }
     // callers/callees: keep 5 by default, expose `*_more` flag.
     // The length check uses `as_array().map(|a| a.len())` rather
@@ -578,8 +610,10 @@ fn trim_grep_symbols(data: &Value) -> Value {
 }
 
 fn trim_text_search(data: &Value) -> Value {
-    // Drop the `before`/`after` context windows — the LLM already has
-    // the matched line and can call read_file for context.
+    // Keep before/after context windows when present — the caller
+    // explicitly requested context via context_lines and the handler
+    // already caps at 10 lines per side. Dropping them silently would
+    // make the tool useless for the "understand match context" use case.
     let arr = data
         .get("results")
         .and_then(|v| v.as_array())
@@ -589,7 +623,15 @@ fn trim_text_search(data: &Value) -> Value {
         .into_iter()
         .map(|r| {
             let mut obj = serde_json::Map::new();
-            for k in ["file", "line", "content", "in_symbol", "symbol_type"] {
+            for k in [
+                "file",
+                "line",
+                "content",
+                "before",
+                "after",
+                "in_symbol",
+                "symbol_type",
+            ] {
                 if let Some(v) = r.get(k) {
                     obj.insert(k.to_string(), v.clone());
                 }
@@ -598,10 +640,22 @@ fn trim_text_search(data: &Value) -> Value {
         })
         .collect();
     let mut out = serde_json::Map::new();
-    out.insert("count".to_string(), data.get("count").cloned().unwrap_or(Value::Null));
-    out.insert("total_matched".to_string(), data.get("total_matched").cloned().unwrap_or(Value::Null));
-    out.insert("has_more".to_string(), data.get("has_more").cloned().unwrap_or(Value::Null));
-    out.insert("offset".to_string(), data.get("offset").cloned().unwrap_or(Value::Null));
+    out.insert(
+        "count".to_string(),
+        data.get("count").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "total_matched".to_string(),
+        data.get("total_matched").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "has_more".to_string(),
+        data.get("has_more").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "offset".to_string(),
+        data.get("offset").cloned().unwrap_or(Value::Null),
+    );
     out.insert("results".to_string(), Value::Array(trimmed));
     Value::Object(out)
 }
@@ -631,7 +685,13 @@ fn trim_deep_analyze(data: &Value) -> Value {
                 .take(10)
                 .map(|r| {
                     let mut obj = serde_json::Map::new();
-                    for k in ["rank", "file_path", "symbol_name", "symbol_type", "signature"] {
+                    for k in [
+                        "rank",
+                        "file_path",
+                        "symbol_name",
+                        "symbol_type",
+                        "signature",
+                    ] {
                         if let Some(v) = r.get(k) {
                             obj.insert(k.to_string(), v.clone());
                         }
@@ -702,8 +762,8 @@ fn trim_index(data: &Value) -> Value {
 fn trim_edit(data: &Value) -> Value {
     // The edit handlers return different shapes for `preview` vs
     // `apply`:
-    //   * `edit_preview` → `preview_token`, `diff`, `affected_*`,
-    //     `risk_level`, `change_count`, `validation`
+    //   * `edit_preview` → `preview_token`, `diff`, `diff_text`,
+    //     `affected_*`, `risk_level`, `change_count`, `validation`
     //   * `edit_apply`   → `success`, `changes_applied`, `file_path`,
     //     `edit_region`, `message` (a no-op confirmation), plus the
     //     same diff/affected_* fields
@@ -711,14 +771,16 @@ fn trim_edit(data: &Value) -> Value {
     // We want to keep the union of both shapes so an MCP `edit_apply`
     // call still surfaces the success confirmation and verification
     // context, and an `edit_preview` call still gets the diff. The
-    // `diff_text` echo and the internal `validation` subtree are
-    // dropped (the model doesn't need a second copy of the diff or
-    // the full validator report).
+    // `diff_text` is kept so the LLM can see the unified diff without
+    // parsing the structured `diff` object. The internal `validation`
+    // subtree is dropped (the model doesn't need the full validator
+    // report).
     let mut out = serde_json::Map::new();
     for k in [
         // shared / preview-shaped
         "preview_token",
         "diff",
+        "diff_text",
         "affected_symbols",
         "affected_files",
         "breaking_changes",
@@ -764,12 +826,40 @@ fn trim_rename_symbol(data: &Value) -> Value {
                 .collect()
         })
         .unwrap_or_default();
-    serde_json::json!({
-        "diffs": shown,
-        "diffs_more": total.saturating_sub(25),
-        "old_name": data.get("old_name"),
-        "new_name": data.get("new_name"),
-    })
+    // files_affected reflects the TOTAL number of affected files (from
+    // the handler), not the trimmed diffs count. This matches the
+    // assertion that files_affected equals the original diffs length.
+    let files_affected = data
+        .get("files_affected")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(total);
+    let mut out = serde_json::Map::new();
+    out.insert("diffs".to_string(), Value::Array(shown));
+    out.insert(
+        "diffs_more".to_string(),
+        Value::from(total.saturating_sub(25)),
+    );
+    out.insert(
+        "old_name".to_string(),
+        data.get("old_name").cloned().unwrap_or(Value::Null),
+    );
+    out.insert(
+        "new_name".to_string(),
+        data.get("new_name").cloned().unwrap_or(Value::Null),
+    );
+    out.insert("files_affected".to_string(), Value::from(files_affected));
+    out.insert(
+        "preview_only".to_string(),
+        data.get("preview_only")
+            .cloned()
+            .unwrap_or(Value::Bool(true)),
+    );
+    out.insert(
+        "applied".to_string(),
+        data.get("applied").cloned().unwrap_or(Value::Bool(false)),
+    );
+    Value::Object(out)
 }
 
 // =============================================================================
@@ -832,11 +922,14 @@ mod tests {
         assert_eq!(t["processing_time_ms"], 5);
         // The stale-index `_warning` is preserved by `merge_meta`
         // after the trim, not by the trim function itself.
-        let merged = trim_llm_payload("leindex.context", &v(r#"{
+        let merged = trim_llm_payload(
+            "leindex.context",
+            &v(r#"{
             "query": "q", "results": [], "context": "c",
             "tokens_used": 0, "processing_time_ms": 0,
             "_warning": "stale"
-        }"#));
+        }"#),
+        );
         assert_eq!(merged["_warning"], "stale");
     }
 
@@ -890,6 +983,7 @@ mod tests {
                     "symbol_type": "function",
                     "language": "rust",
                     "byte_range": [0, 100],
+                    "line_number": 42,
                     "complexity": 3,
                     "caller_count": 5,
                     "dependency_count": 2,
@@ -907,6 +1001,7 @@ mod tests {
         assert_eq!(r["file_path"], "/p/src/foo.rs");
         assert_eq!(r["symbol"], "main");
         assert_eq!(r["symbol_type"], "function");
+        assert_eq!(r["line_number"], 42);
         assert_eq!(r["score"], 0.85);
         assert_eq!(r["snippet"], "// first line");
         // Verbose fields the LLM doesn't need
@@ -980,8 +1075,11 @@ mod tests {
         assert_eq!(t["preview_token"], "tok");
         assert!(t["diff"].is_object());
         assert_eq!(t["risk_level"], "low");
-        // diff_text echo + validation subtree are dropped
-        assert!(t.get("diff_text").is_none());
+        assert_eq!(t["change_count"], 1);
+        assert_eq!(t["affected_symbols"][0], "main");
+        // diff_text is now preserved so the LLM can see the unified diff
+        assert!(t.get("diff_text").is_some());
+        // validation subtree is dropped (internal detail)
         assert!(t.get("validation").is_none());
     }
 
@@ -1009,8 +1107,11 @@ mod tests {
 
     #[test]
     fn test_trim_read_symbol_caps_callers() {
-        let callers: Vec<Value> = (0..20).map(|i| serde_json::json!({"name": format!("c{}", i), "file": "a.rs", "line": i})).collect();
-        let input = v(&format!(r#"{{
+        let callers: Vec<Value> = (0..20)
+            .map(|i| serde_json::json!({"name": format!("c{}", i), "file": "a.rs", "line": i}))
+            .collect();
+        let input = v(&format!(
+            r#"{{
             "symbol": "main",
             "type": "function",
             "file": "src/main.rs",
@@ -1022,14 +1123,21 @@ mod tests {
             "source": "{}",
             "callers": {},
             "callees": []
-        }}"#, "x".repeat(3000), serde_json::to_string(&callers).unwrap()));
+        }}"#,
+            "x".repeat(3000),
+            serde_json::to_string(&callers).unwrap()
+        ));
         let t = trim_read_symbol(&input);
         // Source is truncated to 2000 chars + 3-char "..." ellipsis.
         // The previous byte-slice version could panic on multi-byte
         // UTF-8 sequences; the new char-boundary truncation cannot.
         let src = t["source"].as_str().unwrap();
         assert!(src.chars().count() <= 2003, "got {}", src.chars().count());
-        assert!(src.ends_with("..."), "missing ellipsis: {:?}", &src[src.len() - 10..]);
+        assert!(
+            src.ends_with("..."),
+            "missing ellipsis: {:?}",
+            &src[src.len() - 10..]
+        );
         assert_eq!(t["source_truncated"], true);
         // Callers capped at 5
         assert_eq!(t["callers"].as_array().unwrap().len(), 5);
@@ -1063,12 +1171,12 @@ mod tests {
         assert!(r.get("language").is_none());
         assert_eq!(r["callers"].as_array().unwrap().len(), 5);
         assert_eq!(r["callee_count"], Value::Null); // not present in input
-        // caller_count (kept) reflects blast radius even when callers list is capped
+                                                    // caller_count (kept) reflects blast radius even when callers list is capped
         assert_eq!(r["caller_count"], 10);
     }
 
     #[test]
-    fn test_trim_text_search_drops_context_windows() {
+    fn test_trim_text_search_preserves_context_windows() {
         let input = v(r#"{
             "count": 1,
             "total_matched": 1,
@@ -1088,8 +1196,10 @@ mod tests {
         }"#);
         let t = trim_text_search(&input);
         let r = &t["results"][0];
-        assert!(r.get("before").is_none());
-        assert!(r.get("after").is_none());
+        // before/after context windows are now preserved so the LLM
+        // can understand match context without a follow-up read_file.
+        assert!(r.get("before").is_some());
+        assert!(r.get("after").is_some());
         assert_eq!(r["file"], "src/foo.rs");
         assert_eq!(r["line"], 42);
     }
@@ -1111,13 +1221,16 @@ mod tests {
                 })
             })
             .collect();
-        let input = v(&format!(r#"{{
+        let input = v(&format!(
+            r#"{{
             "query": "what is X",
             "tokens_used": 1500,
             "processing_time_ms": 250,
             "context": "expanded prose here",
             "results": {}
-        }}"#, serde_json::to_string(&results).unwrap()));
+        }}"#,
+            serde_json::to_string(&results).unwrap()
+        ));
         let t = trim_deep_analyze(&input);
         // Capped at 10
         assert_eq!(t["results"].as_array().unwrap().len(), 10);
@@ -1180,11 +1293,13 @@ mod tests {
         assert!(out.get("results").is_some());
         assert!(out.get("count").is_some());
 
-        // Edit payload keeps the structured diff
-        let edit_data = v(r#"{"preview_token": "x", "diff": {"file_path": "a.rs", "hunks": []}, "diff_text": "unified", "validation": {}}"#);
+        // Edit payload keeps the structured diff and diff_text
+        let edit_data = v(
+            r#"{"preview_token": "x", "diff": {"file_path": "a.rs", "hunks": []}, "diff_text": "unified", "validation": {}}"#,
+        );
         let out = trim_llm_payload("leindex.edit_preview", &edit_data);
         assert!(out.get("diff").is_some());
-        assert!(out.get("diff_text").is_none());
+        assert!(out.get("diff_text").is_some());
         assert!(out.get("validation").is_none());
 
         // Unknown tool passes through unchanged
@@ -1333,7 +1448,9 @@ mod tests {
         }"#);
         let out = trim_llm_payload("leindex.read-symbol", &data);
         assert_eq!(out["symbol"], "compute");
-        let deps = out["dependencies"].as_array().expect("dependencies must be an array");
+        let deps = out["dependencies"]
+            .as_array()
+            .expect("dependencies must be an array");
         assert_eq!(deps.len(), 2);
         assert_eq!(deps[0], "fn helper_a()");
         assert_eq!(deps[1], "fn helper_b()");
@@ -1371,8 +1488,14 @@ mod tests {
         // trim path's snippet transform takes the first line
         // and truncates to 240 chars. Assert the body text is
         // present (not the literal `null`).
-        let s = snippet.as_str().expect("snippet must be a string, not null");
-        assert!(s.contains("fn compute()"), "snippet should contain content body: {}", s);
+        let s = snippet
+            .as_str()
+            .expect("snippet must be a string, not null");
+        assert!(
+            s.contains("fn compute()"),
+            "snippet should contain content body: {}",
+            s
+        );
     }
 
     #[test]
@@ -1446,7 +1569,10 @@ mod tests {
         assert_eq!(out["count"], 1);
         assert_eq!(out["offset"], 0);
         assert_eq!(out["has_more"], false);
-        assert!(out.get("suggestion").is_none(), "no suggestion key when absent");
+        assert!(
+            out.get("suggestion").is_none(),
+            "no suggestion key when absent"
+        );
     }
 
     /// Regression for HIGH round 12: `trim_search` used to clone the
@@ -1503,7 +1629,11 @@ mod tests {
         // (243 chars total — `truncate_chars(s, 240)` preserves
         // 240 input chars and appends "...").
         let snippet0 = results[0]["snippet"].as_str().unwrap();
-        assert_eq!(snippet0.len(), 243, "snippet must be 240 chars + '...' ellipsis");
+        assert_eq!(
+            snippet0.len(),
+            243,
+            "snippet must be 240 chars + '...' ellipsis"
+        );
         assert!(snippet0.ends_with("..."));
         assert!(snippet0[..240].chars().all(|c| c == 'x'));
         assert_eq!(results[0]["symbol"], "alpha");
@@ -1535,7 +1665,8 @@ mod tests {
         // be passed through.
         let mut callers = Vec::new();
         for i in 0..7 {
-            callers.push(serde_json::json!({"name": format!("c{}", i), "file": "x.rs", "type": "fn"}));
+            callers
+                .push(serde_json::json!({"name": format!("c{}", i), "file": "x.rs", "type": "fn"}));
         }
         let data = v(&format!(
             r#"{{
@@ -1550,8 +1681,15 @@ mod tests {
             serde_json::to_string(&callers).unwrap()
         ));
         let out = trim_llm_payload("leindex.read-symbol", &data);
-        assert_eq!(out["callers"].as_array().unwrap().len(), 5, "first 5 callers passed through");
-        assert_eq!(out["callers_more"], true, "more than 5 callers => callers_more true");
+        assert_eq!(
+            out["callers"].as_array().unwrap().len(),
+            5,
+            "first 5 callers passed through"
+        );
+        assert_eq!(
+            out["callers_more"], true,
+            "more than 5 callers => callers_more true"
+        );
 
         // 3 callers — `callers_more` must be false, all 3 pass through.
         let mut small_callers = Vec::new();
@@ -1568,7 +1706,10 @@ mod tests {
         ));
         let out = trim_llm_payload("leindex.read-symbol", &data);
         assert_eq!(out["callers"].as_array().unwrap().len(), 3);
-        assert_eq!(out["callers_more"], false, "3 callers => callers_more false");
+        assert_eq!(
+            out["callers_more"], false,
+            "3 callers => callers_more false"
+        );
     }
 
     /// Regression for HIGH round 12: `trim_deep_analyze` used to
@@ -1608,7 +1749,11 @@ mod tests {
             serde_json::to_string(&results).unwrap()
         ));
         let out = trim_llm_payload("leindex.deep-analyze", &data);
-        assert_eq!(out["results"].as_array().unwrap().len(), 10, "cap at 10 entries");
+        assert_eq!(
+            out["results"].as_array().unwrap().len(),
+            10,
+            "cap at 10 entries"
+        );
         assert_eq!(out["results_more"], 5, "results_more = 15 - 10 = 5");
         // First entry: whitelisted fields present, dropped fields absent.
         let first = &out["results"].as_array().unwrap()[0];
@@ -1617,9 +1762,15 @@ mod tests {
         assert_eq!(first["symbol_name"], "sym0");
         assert_eq!(first["symbol_type"], "function");
         assert_eq!(first["signature"], "fn sym0()");
-        assert!(first.get("byte_range").is_none(), "byte_range must be dropped");
+        assert!(
+            first.get("byte_range").is_none(),
+            "byte_range must be dropped"
+        );
         assert!(first.get("language").is_none(), "language must be dropped");
-        assert!(first.get("complexity").is_none(), "complexity must be dropped");
+        assert!(
+            first.get("complexity").is_none(),
+            "complexity must be dropped"
+        );
 
         // 5 results: no cap, all pass through, results_more = 0.
         let mut small = Vec::new();
@@ -1691,7 +1842,10 @@ mod tests {
         let arr = out.as_array().unwrap();
         assert_eq!(arr.len(), 2);
         let foo = &arr[0];
-        assert!(foo.get("complexity").is_none(), "complexity must be dropped");
+        assert!(
+            foo.get("complexity").is_none(),
+            "complexity must be dropped"
+        );
         assert_eq!(foo["name"], "foo");
         assert_eq!(
             foo["callers"].as_array().unwrap().len(),
@@ -1821,41 +1975,99 @@ mod tests {
     fn test_trim_impact_borrows_impact_array() {
         let input = v(r#"{
             "symbol": "Foo::bar",
+            "file": "src/foo.rs",
+            "change_type": "modify",
             "risk_level": "medium",
-            "forward_impact": [
-                {"name": "caller_a", "file": "src/a.rs", "line": 10, "byte_range": [0, 50], "call_graph": "ignored"},
-                {"name": "caller_b", "file": "src/b.rs", "line": 20, "byte_range": [50, 100], "call_graph": "ignored"}
-            ],
-            "backward_impact": [
-                {"name": "callee_x", "file": "src/x.rs", "line": 5}
-            ]
+            "direct_callers": ["caller_a", "caller_b"],
+            "transitive_affected_symbols": ["callee_x", "callee_y", "callee_z"],
+            "transitive_affected_files": 2,
+            "transitive_callers": 5,
+            "summary": "Changing 'Foo::bar' directly affects 3 symbols in 2 files (risk: medium)"
         }"#);
         let t = trim_impact(&input);
-        // Top-level: only `symbol`, `risk_level`,
-        // `forward_impact`, `backward_impact` kept.
+        // Top-level: all handler fields are preserved.
         assert_eq!(t["symbol"], "Foo::bar");
+        assert_eq!(t["file"], "src/foo.rs");
+        assert_eq!(t["change_type"], "modify");
         assert_eq!(t["risk_level"], "medium");
-        assert!(t.get("forward_impact").is_some());
-        assert!(t.get("backward_impact").is_some());
-        // `forward_impact` per entry: only `name`, `file`,
-        // `line` kept.
-        let fwd = t["forward_impact"].as_array().unwrap();
-        assert_eq!(fwd.len(), 2);
-        for entry in fwd {
-            assert!(entry.get("name").is_some());
-            assert!(entry.get("file").is_some());
-            assert!(entry.get("line").is_some());
-            assert!(entry.get("byte_range").is_none());
-            assert!(entry.get("call_graph").is_none());
-        }
-        assert_eq!(fwd[0]["name"], "caller_a");
-        assert_eq!(fwd[0]["file"], "src/a.rs");
-        assert_eq!(fwd[0]["line"], 10);
-        // `backward_impact` per entry: same whitelist.
-        let back = t["backward_impact"].as_array().unwrap();
-        assert_eq!(back.len(), 1);
-        assert_eq!(back[0]["name"], "callee_x");
-        assert_eq!(back[0]["file"], "src/x.rs");
-        assert_eq!(back[0]["line"], 5);
+        assert!(t.get("direct_callers").is_some());
+        assert!(t.get("transitive_affected_symbols").is_some());
+        assert!(t.get("transitive_affected_files").is_some());
+        assert!(t.get("transitive_callers").is_some());
+        assert!(t.get("summary").is_some());
+        // direct_callers array preserved
+        let callers = t["direct_callers"].as_array().unwrap();
+        assert_eq!(callers.len(), 2);
+        assert_eq!(callers[0], "caller_a");
+        // transitive_affected_symbols array preserved
+        let affected = t["transitive_affected_symbols"].as_array().unwrap();
+        assert_eq!(affected.len(), 3);
+        assert_eq!(affected[0], "callee_x");
+        // summary string preserved
+        assert!(t["summary"].as_str().unwrap().contains("3 symbols"));
+    }
+
+    #[test]
+    fn test_trim_git_status_preserves_pdg_enrichment() {
+        // Regression: trim_git_status must preserve pdg_enrichment
+        // and impact_summary so they survive trimming and reach the
+        // MCP response (VAL-TRANSPORT-008).
+        let input = v(r#"{
+            "is_git_repo": true,
+            "branch": "main",
+            "summary": {"modified": 1, "staged": 0, "untracked": 0},
+            "modified_files": ["src/main.rs"],
+            "staged_files": [],
+            "untracked_files": [],
+            "changed_symbols": [
+                {"file": "src/main.rs", "status": "modified", "symbols": [{"name": "main"}]}
+            ],
+            "pdg_enrichment": {"available": true},
+            "impact_summary": {
+                "total_affected_symbols": 3,
+                "affected_files": ["src/main.rs"],
+                "pdg_enriched": true
+            },
+            "diff": "some diff"
+        }"#);
+        let t = trim_git_status(&input);
+        // Core fields preserved
+        assert_eq!(t["branch"], "main");
+        assert!(t["modified_files"].is_array());
+        assert!(t["changed_symbols"].is_array());
+        // pdg_enrichment and impact_summary must survive trimming
+        assert!(t.get("pdg_enrichment").is_some());
+        assert_eq!(t["pdg_enrichment"]["available"], true);
+        assert!(t.get("impact_summary").is_some());
+        assert_eq!(t["impact_summary"]["total_affected_symbols"], 3);
+    }
+
+    #[test]
+    fn test_trim_git_status_pdg_unavailable() {
+        // When PDG is unavailable, pdg_enrichment should still be
+        // present with available=false.
+        let input = v(r#"{
+            "branch": "main",
+            "summary": {"modified": 0, "staged": 0, "untracked": 0},
+            "modified_files": [],
+            "staged_files": [],
+            "untracked_files": [],
+            "changed_symbols": [],
+            "pdg_enrichment": {
+                "available": false,
+                "reason": "PDG load failed",
+                "error": "database error"
+            },
+            "impact_summary": {
+                "total_affected_symbols": 0,
+                "affected_files": [],
+                "pdg_enriched": false
+            }
+        }"#);
+        let t = trim_git_status(&input);
+        assert_eq!(t["pdg_enrichment"]["available"], false);
+        assert_eq!(t["pdg_enrichment"]["reason"], "PDG load failed");
+        assert_eq!(t["pdg_enrichment"]["error"], "database error");
+        assert_eq!(t["impact_summary"]["pdg_enriched"], false);
     }
 }

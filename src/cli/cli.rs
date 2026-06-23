@@ -229,6 +229,33 @@ pub enum Commands {
         #[arg(long = "dry-run")]
         dry_run: bool,
     },
+
+    /// Configure neural search: install ORT, set up models, and write config
+    ///
+    /// Run `leindex setup` for an interactive wizard, or use flags for
+    /// non-interactive mode. Neural embeddings provide semantic code search
+    /// (finding symbols by meaning). TF-IDF search works without setup.
+    Setup {
+        /// Enable neural embeddings (non-interactive mode)
+        #[arg(long = "neural")]
+        neural: bool,
+
+        /// Disable neural embeddings (TF-IDF only, non-interactive)
+        #[arg(long = "no-neural", conflicts_with = "neural")]
+        no_neural: bool,
+
+        /// Use CPU execution provider (conflicts with --gpu)
+        #[arg(long = "cpu", conflicts_with = "gpu")]
+        cpu: bool,
+
+        /// Use GPU execution provider: amd (MIGraphX/ROCm) or nvidia (CUDA)
+        #[arg(long = "gpu", value_name = "amd|nvidia", conflicts_with = "cpu")]
+        gpu: Option<String>,
+
+        /// Check current setup status without modifying anything
+        #[arg(long = "check")]
+        check: bool,
+    },
 }
 
 /// Subcommands for inspecting and executing MCP tools from the CLI.
@@ -363,6 +390,13 @@ impl Cli {
                 max_age_days,
                 dry_run,
             } => cmd_cleanup_impl(max_age_days, dry_run).await,
+            Commands::Setup {
+                neural,
+                no_neural,
+                cpu,
+                gpu,
+                check,
+            } => cmd_setup_impl(neural, no_neural, cpu, gpu, check).await,
         };
 
         // Write the memory report (if tracking was enabled) before returning.
@@ -637,25 +671,22 @@ async fn cmd_index_impl(
 
     info!("Indexing project at: {}", canonical_path.display());
 
-    // Check if already indexed (unless force)
-    if !force {
-        // Create temporary LeIndex to check if already indexed
-        if let Ok(check_leindex) = LeIndex::new(&canonical_path) {
-            if check_leindex.is_indexed() {
-                println!("Project already indexed. Use --force to re-index.");
-                println!("  Use --force to re-index if you have made changes.");
-                return Ok(());
-            }
-        }
-    }
-
     // Apply hard RSS limit via rlimit if requested (Linux-only)
     if let Some(mb) = max_memory {
         crate::cli::memory_cap::apply_hard_limit(mb)?;
     }
 
-    // Create LeIndex and index the project
+    // Create a single LeIndex instance and reuse it for both the staleness
+    // check and the indexing operation (VAL-QUALITY-015).
     let mut leindex = LeIndex::new(&canonical_path).context("Failed to create LeIndex instance")?;
+
+    // Check if already indexed (unless force)
+    if !force && leindex.is_indexed() && !leindex.is_stale_fast() {
+        println!("Project already indexed and up-to-date. Use --force to re-index.");
+        return Ok(());
+    }
+    // If indexed but stale, fall through to incremental reindex
+    // (VAL-INDEX-005). If not indexed at all, fall through to full index.
 
     let max_memory_bytes = max_memory.map(|mb| mb * 1024 * 1024);
     let stats = tokio::task::spawn_blocking(move || {
@@ -832,7 +863,11 @@ async fn cmd_context_impl(
 
     println!(
         "{}",
-        render_tool_output("leindex.context", &value, &serde_json::json!({ "node_id": &node_id }))
+        render_tool_output(
+            "leindex.context",
+            &value,
+            &serde_json::json!({ "node_id": &node_id })
+        )
     );
 
     Ok(())
@@ -931,9 +966,16 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     // Create LeIndex and try to load from storage
     let mut leindex = LeIndex::new(&canonical_path).context("Failed to create LeIndex instance")?;
 
-    // Load from storage if available
-    if let Err(e) = leindex.load_from_storage() {
-        warn!("Failed to load from storage: {}", e);
+    // For diagnostics, use the lightweight loading path: load PDG + persisted
+    // stats without rebuilding the search engine (which is O(N) and takes
+    // ~800ms for 10K nodes). The diagnostics output only needs PDG node/edge
+    // counts and persisted IndexStats, not a functional search index.
+    if let Err(e) = leindex.load_pdg_from_storage() {
+        warn!("Failed to load PDG from storage: {}", e);
+    }
+    // Load persisted stats (total_signatures, indexed_nodes, etc.)
+    if let Err(e) = leindex.load_stats_from_storage() {
+        warn!("Failed to load persisted stats: {}", e);
     }
 
     // Get diagnostics
@@ -948,10 +990,31 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         .map(|c| c.indexed_files)
         .unwrap_or(diag.stats.files_parsed);
 
-    // Compute staleness the same way DiagnosticsHandler::execute does
-    let (changed, deleted) = leindex.check_freshness().unwrap_or_default();
+    // Compute staleness: use is_stale_fast() for the boolean check (fast:
+    // mtime + count comparison), and only run the expensive check_freshness()
+    // (which hashes ALL source files) when stale to get detailed lists.
+    let stale_fast = leindex.is_stale_fast();
+    let (changed, deleted, stale_check_failed) = if stale_fast {
+        match leindex.check_freshness() {
+            Ok((changed, deleted)) => (changed, deleted, false),
+            Err(err) => {
+                tracing::warn!("failed to perform authoritative freshness check: {}", err);
+                (vec![], vec![], true)
+            }
+        }
+    } else {
+        (vec![], vec![], false)
+    };
     let is_stale = !changed.is_empty() || !deleted.is_empty();
-    let stale = is_stale || diag.index_health == "stale";
+    // When is_stale_fast() reported stale, we ran check_freshness() which
+    // is authoritative (hash-based). If check_freshness found no changes,
+    // the is_stale_fast positive was a false positive (e.g., same-second
+    // mtime) and the index is actually fresh.
+    let stale = if stale_fast {
+        is_stale || stale_check_failed
+    } else {
+        false
+    };
 
     // Estimate last_indexed_secs_ago from storage_path mtime
     let storage_path = leindex.storage_path();
@@ -976,6 +1039,34 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         }));
     }
 
+    // Determine embedding model from diagnostics or compile-time features.
+    // VAL-ONNX-006: Diagnostics must report ONNX/hybrid embedding status.
+    let embedding_model = if diag.embedding_model != "unknown" {
+        diag.embedding_model.clone()
+    } else {
+        // Lightweight path: embedder not loaded, determine from compile-time features
+        #[cfg(feature = "onnx")]
+        {
+            "onnx_hybrid".to_string()
+        }
+        #[cfg(all(not(feature = "onnx"), not(feature = "remote-embeddings")))]
+        {
+            "tfidf_only".to_string()
+        }
+        #[cfg(all(not(feature = "onnx"), feature = "remote-embeddings"))]
+        {
+            "remote_hybrid".to_string()
+        }
+    };
+
+    // VAL-CROSS-015 / VAL-ORT-022: Report the resolved ORT dylib path, the
+    // detected ORT version, and the configured execution provider so support
+    // engineers can debug any install surface identically. The diagnostic
+    // command must NOT load ORT itself (the leindex-embed worker does), so we
+    // walk the chain via `discover_path_only()` and fall back to the config
+    // file when no candidate exists on disk.
+    let (ort_path, ort_version, execution_provider) = collect_ort_diagnostics();
+
     // Convert to JSON for formatter
     let diag_json = serde_json::json!({
         "project_path": diag.project_path,
@@ -984,6 +1075,10 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         "symbol_count": diag.stats.indexed_nodes,
         "stale": stale,
         "last_indexed_secs_ago": last_indexed_secs_ago,
+        "embedding_model": embedding_model,
+        "ort_path": ort_path,
+        "ort_version": ort_version,
+        "execution_provider": execution_provider,
         "issues": issues,
     });
 
@@ -995,6 +1090,60 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     );
 
     Ok(())
+}
+
+/// Collect ORT-related diagnostics for the `leindex diagnostics` command.
+///
+/// VAL-CROSS-015 / VAL-ORT-022: surfaces the same ORT info shape on every
+/// install surface (cargo, npm, PyPI, GitHub Release bundle) so support
+/// engineers can debug identically. Returns a `(ort_path, ort_version,
+/// execution_provider)` triple where:
+///
+///   * `ort_path` is the resolved ORT dylib path the discovery chain would
+///     load right now, falling back to the path recorded in the user's config
+///     if no candidate exists on disk. `None` when neither resolves.
+///   * `ort_version` is the live-detected onnxruntime version (queried via
+///     pip/python), falling back to the version recorded during setup.
+///     `None` when neither is available.
+///   * `execution_provider` is the configured provider string ("cpu",
+///     "cuda", "migraphx", or "auto"). Defaults to "auto" when no config
+///     exists, matching the setup command's default.
+///
+/// This function does NOT call `ort::init_from()` and therefore does NOT
+/// load ORT into the main daemon process. That keeps the diagnostics command
+/// cheap and side-effect-free; the leindex-embed worker performs its own
+/// discovery at spawn time.
+pub(crate) fn collect_ort_diagnostics() -> (Option<String>, Option<String>, String) {
+    use crate::cli::leindex::setup;
+
+    // ort_path: prefer the live discovery chain, fall back to configured path.
+    #[cfg(feature = "onnx")]
+    let live_path = leindex_embed::ort_discovery::discover_path_only()
+        .map(|outcome| outcome.path.display().to_string());
+    #[cfg(not(feature = "onnx"))]
+    let live_path: Option<String> = None;
+
+    let config_path = crate::cli::neural_config::LeIndexConfig::load()
+        .ok()
+        .and_then(|c| c.neural.ort_dylib_path);
+
+    let ort_path = live_path.or(config_path);
+
+    // ort_version: prefer the live-detected version, fall back to the recorded one.
+    let live_version = setup::get_ort_version();
+    let recorded_version = crate::cli::neural_config::LeIndexConfig::load()
+        .ok()
+        .and_then(|c| c.neural.ort_version);
+    let ort_version = live_version.or(recorded_version);
+
+    // execution_provider: from config, default to "auto" when unset.
+    let execution_provider = crate::cli::neural_config::LeIndexConfig::load()
+        .ok()
+        .map(|c| c.neural.execution_provider)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "auto".to_string());
+
+    (ort_path, ort_version, execution_provider)
 }
 
 async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> AnyhowResult<()> {
@@ -1033,11 +1182,8 @@ async fn cmd_tools_impl(command: ToolCommands, project: Option<PathBuf>) -> Anyh
 
             // Use the unified renderer — same path used by the MCP transport
             // so CLI and LLM-visible payloads stay in lock-step.
-            let formatted = crate::cli::mcp::output::render_tool_output(
-                &name,
-                &value,
-                &parsed_args,
-            );
+            let formatted =
+                crate::cli::mcp::output::render_tool_output(&name, &value, &parsed_args);
 
             println!("{}", formatted);
             Ok(())
@@ -1073,8 +1219,9 @@ async fn cmd_serve_impl(host: String, port: u16) -> AnyhowResult<()> {
     // process (or to a process that no longer owns the port).
     // Doing the bind here lets us print the actual bound address.
     let server = McpServer::with_address(addr).context("Failed to create MCP server")?;
-    let listener =
-        crate::cli::mcp::server::bind_with_fallback(addr).await.context("Bind failed")?;
+    let listener = crate::cli::mcp::server::bind_with_fallback(addr)
+        .await
+        .context("Bind failed")?;
     let bound_addr = listener
         .local_addr()
         .context("Failed to read bound address")?;
@@ -1161,8 +1308,9 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
             Some(ref p) => p
                 .canonicalize()
                 .with_context(|| format!("Cannot resolve project path '{}'", p.display()))?,
-            None => std::env::current_dir()
-                .context("Cannot determine current working directory")?,
+            None => {
+                std::env::current_dir().context("Cannot determine current working directory")?
+            }
         };
         registry.set_default_path(resolved_path.clone()).await;
         info!("Default project path set to: {}", resolved_path.display());
@@ -1207,7 +1355,10 @@ async fn cmd_mcp_stdio_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
 
             const MAX_STDIN_PAYLOAD: usize = 10 * 1024 * 1024; // 10 MiB
             if length > MAX_STDIN_PAYLOAD {
-                eprintln!("[ERROR] Payload too large: {} bytes (max: {} bytes)", length, MAX_STDIN_PAYLOAD);
+                eprintln!(
+                    "[ERROR] Payload too large: {} bytes (max: {} bytes)",
+                    length, MAX_STDIN_PAYLOAD
+                );
                 // Consume remaining headers first to align the stream
                 loop {
                     let mut header = String::new();
@@ -1713,6 +1864,106 @@ async fn cmd_dashboard_impl(port: u16, prod: bool) -> AnyhowResult<()> {
     Ok(())
 }
 
+/// Setup command implementation — interactive and non-interactive setup wizard.
+///
+/// VAL-SETUP-001: `leindex setup` is listed in --help
+/// VAL-SETUP-009-015: Non-interactive flag handling and conflict detection
+/// VAL-SETUP-014: --check mode reads config and reports status
+async fn cmd_setup_impl(
+    neural: bool,
+    no_neural: bool,
+    cpu: bool,
+    gpu: Option<String>,
+    check: bool,
+) -> AnyhowResult<()> {
+    use crate::cli::leindex::setup;
+
+    // VAL-SETUP-014: --check mode is read-only
+    if check {
+        check_neutral_conflicts(neural, no_neural, cpu, gpu.as_deref())?;
+        let result = setup::run_check().map_err(|e| anyhow::anyhow!("{}", e))?;
+        // Exit code reflects completeness
+        if !result.fully_configured {
+            anyhow::bail!("setup check incomplete");
+        }
+        return Ok(());
+    }
+
+    // Parse GPU vendor if provided
+    let gpu_vendor = if let Some(ref gpu_str) = gpu {
+        Some(setup::parse_gpu_vendor(gpu_str).map_err(|e| anyhow::anyhow!("{}", e))?)
+    } else {
+        None
+    };
+
+    // Determine the mode: interactive or non-interactive
+    let has_flags = neural || no_neural || cpu || gpu.is_some();
+
+    let choices = if has_flags {
+        // Non-interactive mode: resolve from flags
+        // VAL-SETUP-015: conflicts are validated by clap (conflicts_with) and
+        // also redundantly checked here for the --neural + --no-neural case
+        // (clap's conflicts_with on bool flags detects only when explicitly given).
+        check_neutral_conflicts(neural, no_neural, cpu, gpu.as_deref())?;
+        setup::resolve_from_flags(neural, no_neural, cpu, gpu_vendor)
+            .map_err(|e| anyhow::anyhow!("{}", e))?
+    } else if setup::is_interactive() {
+        // Interactive mode: show prompts
+        // VAL-SETUP-002: prompts neural? -> CPU/GPU -> AMD/NVIDIA
+        setup::run_interactive_flow().map_err(|e| anyhow::anyhow!("{}", e))?
+    } else {
+        // No flags and not interactive: show guidance and exit with error
+        eprintln!("No setup options specified and stdin is not interactive (not a TTY).");
+        eprintln!("For non-interactive setup, use flags:");
+        eprintln!("  leindex setup --neural --cpu       # CPU neural search");
+        eprintln!("  leindex setup --neural --gpu amd   # AMD GPU (MIGraphX)");
+        eprintln!("  leindex setup --neural --gpu nvidia # NVIDIA GPU (CUDA)");
+        eprintln!("  leindex setup --no-neural          # TF-IDF only");
+        eprintln!("  leindex setup --check              # Show current status");
+        anyhow::bail!("No setup options specified in non-interactive mode");
+    };
+
+    // Execute the setup with the resolved choices
+    let result = setup::execute_setup(&choices).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    // Print the final summary
+    // VAL-SETUP-034: surfaces neural on/off, provider, ORT, model, config
+    setup::print_summary(&result);
+
+    // VAL-SETUP-026: A failed smoke test means the install did not produce a
+    // working neural configuration. We exit non-zero so CI/scripts detect the
+    // failure, but we still printed the summary and persisted the config so
+    // the user has actionable diagnostics.
+    if let Some(ref smoke) = result.smoke_test {
+        if !smoke.passed {
+            anyhow::bail!("setup smoke test failed");
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate flag conflicts that clap cannot always catch via `conflicts_with`.
+///
+/// clap's `conflicts_with` on Option/String fields works well, but boolean flag
+/// pairs like --neural + --no-neural need an explicit check because clap only
+/// errors if both are explicitly set (which is the desired behavior). This is a
+/// redundancy safety net.
+fn check_neutral_conflicts(
+    neural: bool,
+    no_neural: bool,
+    cpu: bool,
+    gpu: Option<&str>,
+) -> AnyhowResult<()> {
+    if neural && no_neural {
+        anyhow::bail!("Cannot use --neural and --no-neural together. Choose one.");
+    }
+    if cpu && gpu.is_some() {
+        anyhow::bail!("Cannot use --cpu and --gpu together. Choose one execution provider.");
+    }
+    Ok(())
+}
+
 /// Cleanup command implementation — remove stale LeIndex temp artifacts.
 async fn cmd_cleanup_impl(max_age_days: u64, dry_run: bool) -> AnyhowResult<()> {
     use crate::cli::cleanup::run_gc;
@@ -1826,7 +2077,8 @@ async fn handle_mcp_request(
     _project_path: PathBuf,
 ) -> anyhow::Result<Option<JsonRpcResponse>> {
     use crate::cli::mcp::server::{
-        handle_tool_call, list_tools_json, HANDLERS, SERVER_INSTANCE, SERVER_STATE,
+        handle_tool_call, list_tools_json, long_running_tool_timeout_secs, HANDLERS,
+        SERVER_INSTANCE, SERVER_STATE,
     };
 
     let method_name = request.method.clone();
@@ -1919,8 +2171,41 @@ async fn handle_mcp_request(
             Ok(Some(JsonRpcResponse::success(id, serde_json::json!({}))))
         }
         "tools/call" => {
-            // Use the centralized tool call handler that formats for MCP
-            let result = handle_tool_call(state, handlers, &request).await;
+            // Per-tool-call hard timeout, mirroring the HTTP transport
+            // (server.rs tools/call arm). Without this, a slow or hung
+            // tool call blocks the stdio read loop indefinitely, making
+            // the MCP server appear dead to the client.
+            //
+            // Long-running tools listed in LONG_RUNNING_TOOL_TIMEOUTS
+            // (e.g. leindex.index, which can take several minutes for a
+            // first-time build of a large monorepo) get an extended cap
+            // so the timeout does not drop the future mid-swap. All
+            // other tools use the configurable
+            // `server_instance.config.request_timeout_secs` (30s by
+            // default), matching the HTTP transport path which reads
+            // from the same config source.
+            let tool_name = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let cap_secs = long_running_tool_timeout_secs(tool_name)
+                .unwrap_or(server_instance.config.request_timeout_secs);
+            let timeout_duration = std::time::Duration::from_secs(cap_secs);
+
+            let tool_result = tokio::time::timeout(
+                timeout_duration,
+                handle_tool_call(state, handlers, &request),
+            )
+            .await;
+
+            let result = match tool_result {
+                Ok(r) => r,
+                Err(_) => Err(crate::cli::mcp::protocol::JsonRpcError::internal_error(
+                    format!("Tool call timed out after {}s", cap_secs),
+                )),
+            };
             Ok(Some(JsonRpcResponse::from_result(id, result)))
         }
         "tools/list" => {
@@ -2141,5 +2426,112 @@ mod tests {
     fn test_memory_report_flag_absent_by_default() {
         let cli = Cli::try_parse_from(["leindex", "index", "/tmp/project"]).unwrap();
         assert!(cli.memory_report.is_none());
+    }
+
+    #[test]
+    fn test_setup_command_parsing() {
+        // VAL-SETUP-001: setup command is registered
+        let cli = Cli::try_parse_from(["leindex", "setup", "--neural", "--cpu"]).unwrap();
+        match cli.command {
+            Some(Commands::Setup {
+                neural,
+                no_neural,
+                cpu,
+                gpu,
+                check,
+            }) => {
+                assert!(neural);
+                assert!(!no_neural);
+                assert!(cpu);
+                assert!(gpu.is_none());
+                assert!(!check);
+            }
+            _ => panic!("Expected Setup command"),
+        }
+    }
+
+    #[test]
+    fn test_setup_command_gpu_amd() {
+        let cli = Cli::try_parse_from(["leindex", "setup", "--neural", "--gpu", "amd"]).unwrap();
+        match cli.command {
+            Some(Commands::Setup {
+                neural, cpu, gpu, ..
+            }) => {
+                assert!(neural);
+                assert!(!cpu);
+                assert_eq!(gpu.as_deref(), Some("amd"));
+            }
+            _ => panic!("Expected Setup command"),
+        }
+    }
+
+    #[test]
+    fn test_setup_command_gpu_nvidia() {
+        let cli = Cli::try_parse_from(["leindex", "setup", "--neural", "--gpu", "nvidia"]).unwrap();
+        match cli.command {
+            Some(Commands::Setup {
+                neural, cpu, gpu, ..
+            }) => {
+                assert!(neural);
+                assert!(!cpu);
+                assert_eq!(gpu.as_deref(), Some("nvidia"));
+            }
+            _ => panic!("Expected Setup command"),
+        }
+    }
+
+    #[test]
+    fn test_setup_command_no_neural() {
+        // VAL-SETUP-013: --no-neural flag
+        let cli = Cli::try_parse_from(["leindex", "setup", "--no-neural"]).unwrap();
+        match cli.command {
+            Some(Commands::Setup {
+                neural,
+                no_neural,
+                cpu,
+                gpu,
+                check,
+            }) => {
+                assert!(!neural);
+                assert!(no_neural);
+                assert!(!cpu);
+                assert!(gpu.is_none());
+                assert!(!check);
+            }
+            _ => panic!("Expected Setup command"),
+        }
+    }
+
+    #[test]
+    fn test_setup_command_check() {
+        // VAL-SETUP-014: --check flag
+        let cli = Cli::try_parse_from(["leindex", "setup", "--check"]).unwrap();
+        match cli.command {
+            Some(Commands::Setup { check, .. }) => assert!(check),
+            _ => panic!("Expected Setup command"),
+        }
+    }
+
+    #[test]
+    fn test_setup_command_neural_gpu_conflict_rejected() {
+        // VAL-SETUP-015: conflicting flags produce error
+        let result = Cli::try_parse_from(["leindex", "setup", "--neural", "--cpu", "--gpu", "amd"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_setup_command_neural_no_neural_conflict_rejected() {
+        // VAL-SETUP-015: --neural + --no-neural is a conflict
+        let result = Cli::try_parse_from(["leindex", "setup", "--neural", "--no-neural"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_setup_help_is_valid() {
+        // VAL-SETUP-001: leindex setup --help exits 0
+        let result = Cli::try_parse_from(["leindex", "setup", "--help"]);
+        assert!(result.is_err()); // clap exits with error for --help
+        let err = result.unwrap_err();
+        assert!(matches!(err.kind(), ErrorKind::DisplayHelp));
     }
 }

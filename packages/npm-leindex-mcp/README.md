@@ -58,6 +58,26 @@ yarn add --dev @leindex/mcp
 pnpm add --save-dev @leindex/mcp
 ```
 
+### Enabling Neural Search
+
+TF-IDF (keyword) search works out of the box. To enable neural (semantic)
+search, run the setup wizard after install:
+
+```bash
+# project dependency
+npm run setup --prefix node_modules/@leindex/mcp
+
+# global install
+npm run setup --prefix "$(npm root -g)/@leindex/mcp"
+```
+
+This invokes the bundled `leindex setup` command, which installs ONNX Runtime
+and downloads the `qwen3-embed-0.6b.onnx` model. The bundled `lib/` directory
+(shipped with the package) contains ONNX Runtime shared libraries, so neural
+search may work even without running setup. See
+[docs/NEURAL_SETUP.md](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/NEURAL_SETUP.md)
+for CPU/GPU/AMD/NVIDIA paths and troubleshooting.
+
 ---
 
 ## MCP Configuration Examples

@@ -53,6 +53,7 @@ fn search_ids(engine: &mut SearchEngine, query: &str) -> Vec<String> {
         semantic: false,
         expand_context: false,
         query_embedding: None,
+        query_neural_embedding: None,
         threshold: None,
         query_type: None,
     };
@@ -112,6 +113,7 @@ fn test_complexity_metadata_correct_after_compression() {
         semantic: false,
         expand_context: false,
         query_embedding: None,
+        query_neural_embedding: None,
         threshold: None,
         query_type: None,
     };
@@ -400,6 +402,7 @@ fn test_search_cache_entry_limit() {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -438,6 +441,7 @@ fn test_search_cache_byte_limit() {
             semantic: false,
             expand_context: false,
             query_embedding: None,
+            query_neural_embedding: None,
             threshold: None,
             query_type: None,
         };
@@ -469,6 +473,7 @@ fn test_search_cache_returns_correct_results() {
         semantic: false,
         expand_context: false,
         query_embedding: None,
+        query_neural_embedding: None,
         threshold: None,
         query_type: None,
     };
@@ -649,6 +654,7 @@ fn test_search_engine_exposes_cache_bytes() {
         semantic: false,
         expand_context: false,
         query_embedding: None,
+        query_neural_embedding: None,
         threshold: None,
         query_type: None,
     };

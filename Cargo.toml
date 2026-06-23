@@ -1,6 +1,6 @@
 [package]
 name = "leindex"
-version = "1.8.1"
+version = "1.8.3"
 edition = "2021"
 rust-version = "1.75"
 authors = ["LeIndex Contributors"]
@@ -46,10 +46,15 @@ include = [
     "/leindex.jpeg",
     "/docs/MCP.md",
     "/docs/TOOL_SUPREMACY_BENCHMARKS.md",
+    "/docs/NEURAL_SETUP.md",
 ]
 
-# Note: ONNX models (models/*.onnx) will be added to includes when R15 model conversion is complete
-# See docs/R15_MODEL_DISTRIBUTION.md for the complete model distribution strategy
+# Note: ONNX models (models/*.onnx) are bundled in GitHub Release archives
+# (see .github/workflows/release.yml) and installed by `leindex setup` /
+# install.sh into ~/.leindex/models/. The models/ directory is excluded from
+# the published crate to keep the crates.io download small; users obtain
+# models via `leindex setup` or the release bundle.
+# See docs/NEURAL_SETUP.md for setup instructions.
 
 [features]
 default = ["full"]
@@ -147,6 +152,8 @@ cli = [
     "dep:notify",
     "dep:sysinfo",
     "dep:diffy",
+    "dep:dialoguer",
+    "dep:sha2",
 ]
 
 # MCP server feature for CLI
@@ -208,7 +215,17 @@ turso = ["dep:libsql", "dep:rusqlite_migration"]
 #
 # VAL-CPHASE-002: The main crate no longer owns ONNX runtime deps directly.
 # ONNX inference is delegated to the leindex-embed worker process.
-onnx = ["search", "dep:leindex-embed", "dep:which"]
+#
+# VAL-CARGO-002/005: `cargo install leindex --features onnx` must install a
+# working worker binary alongside the main binary. We propagate the `onnx`
+# feature to the leindex-embed subcrate so the installed worker binary
+# contains real ONNX inference support (not a dummy-embedding fallback).
+onnx = ["search", "dep:leindex-embed", "leindex-embed/onnx", "dep:which"]
+
+# AMD GPU acceleration via MIGraphX (requires ROCm installed).
+# MIGraphX is the modern replacement for the deprecated ROCmExecutionProvider.
+# Use with: cargo build --features onnx-migraphx
+onnx-migraphx = ["onnx", "leindex-embed/onnx-migraphx"]
 
 # Remote embedding API support (OpenAI, etc.)
 # Opt-in feature: Use cloud-based embedding services instead of local models
@@ -287,7 +304,7 @@ unicode-normalization = { version = "0.1", optional = true }
 # ONNX Runtime dependencies — delegated to the worker crate (VAL-CPHASE-002)
 # The main crate depends only on the protocol types (no ONNX runtime deps).
 # The worker binary enables the `onnx` feature separately.
-leindex-embed = { version = "1.8.1", path = "crates/leindex-embed", optional = true, default-features = false }
+leindex-embed = { version = "1.8.3", path = "crates/leindex-embed", optional = true, default-features = false }
 
 # Remote embedding API dependencies (for cloud-based embeddings)
 reqwest = { version = "0.12", features = ["json", "rustls-tls-webpki-roots", "gzip", "deflate"], optional = true, default-features = false }
@@ -306,6 +323,11 @@ toml = { version = "0.8", optional = true }
 dirs = { version = "5", optional = true }
 sysinfo = { version = "0.36.1", default-features = false, features = ["system"], optional = true }
 diffy = { version = "0.3", optional = true }
+dialoguer = { version = "0.11", optional = true }
+
+# SHA256 verification for downloaded model files during `leindex setup`.
+# VAL-SETUP-017/018: checksum verification of ~/.leindex/models/* artifacts.
+sha2 = { version = "0.10", optional = true }
 
 # Server feature dependencies (axum 0.7)
 axum = { version = "0.7", features = ["ws"], optional = true }
@@ -341,6 +363,19 @@ rand = "0.8"
 name = "leindex"
 path = "src/bin/leindex.rs"
 required-features = ["cli"]
+doc = false
+
+# VAL-CARGO-005: Worker binary co-installed via `cargo install leindex --features onnx`.
+# `cargo install <pkg>` only installs `[[bin]]` targets from `<pkg>`'s own
+# Cargo.toml, so the root crate mirrors the leindex-embed worker binary as a
+# thin wrapper (`src/bin/leindex-embed.rs`) around `leindex_embed::worker_main::run()`.
+# Gated by `required-features = ["onnx"]` so default installs without neural
+# support are unaffected. The subcrate at `crates/leindex-embed` retains its
+# own `[[bin]]` target for standalone workspace builds and tests.
+[[bin]]
+name = "leindex-embed"
+path = "src/bin/leindex-embed.rs"
+required-features = ["onnx"]
 doc = false
 
 [[bench]]
@@ -393,3 +428,70 @@ members = [
     "tools/memcheck",
     "tools/xtask",
 ]
+
+# Workspace-wide lint policy. Replaces the legacy `clippy.toml` arrays
+# (`allow = [...]`, `deny = [...]`, `warn = [...]`), which clippy 1.96+ no
+# longer parses (clippy.toml is now reserved for configuration thresholds,
+# not lint levels). Per the Cargo `[lints]` RFC, lint levels live here and
+# are inherited by every workspace member via `[lints] workspace = true`.
+#
+# Migration notes from the legacy file:
+#   * The `allow = [...]` block is preserved 1:1 below; these mirror
+#     in-source #[allow]s the codebase has always carried.
+#   * The `deny = [...]` block kept only the lints the codebase is
+#     universally clean under (across default, onnx, onnx-migraphx, and
+#     all-features, including tests and benches). Lints such as
+#     `print_stdout`/`unwrap_used`/`expect_used`/`panic`/
+#     `needless_pass_by_value`/`float_cmp` had widespread pre-existing
+#     usage (mostly in `src/cli/` where stdout printing is intentional,
+#     and in tests where strict float equality is the correct semantic),
+#     and were never actually enforced because the legacy clippy.toml
+#     arrays were already rejected by clippy 1.96+. Re-introducing those
+#     at `deny` would surface ~180 pre-existing violations, contradicting
+#     the feature contract "No new clippy warnings introduced". These
+#     lints remain at clippy's default level (`allow`, since they belong
+#     to the `restriction`/`pedantic` groups). A follow-up can tighten
+#     them in scoped #![deny] blocks after cleaning up the call sites.
+#   * Legacy `commented_code` and `drop_ref` entries were dropped: neither
+#     name resolves under clippy 1.96 (`drop_ref` was renamed away long
+#     before 1.96 and `commented_code` is not a real clippy lint).
+#   * The legacy `warn = [...]` block enabled the `pedantic`, `nursery`,
+#     `cargo`, and `restriction` groups. Under clippy 1.96 those groups
+#     now trip 50+ lints on idiomatic code (`indexing_slicing`,
+#     `as_conversions`, `arithmetic_side_effects`, `integer_division`,
+#     etc.). Since the legacy file was rejected before applying them,
+#     re-introducing the group-level `warn` would surface those lints as
+#     new warnings, again contradicting the feature contract. The default
+#     clippy groups (`style`/`perf`/`complexity`/`correctness`) remain
+#     active at their default `warn` level via `clippy::all`; no explicit
+#     entry is needed for them.
+[workspace.lints.clippy]
+# ── Allowed — intentional codebase patterns (mirror in-source #[allow]) ──
+too_many_arguments = "allow"        # CLI handlers carry rich context; counted
+module_inception = "allow"          # Multiple crate roots intentionally mirror
+result_unit_err = "allow"           # Registry operations surface cover Err(())
+arc_with_non_send_sync = "allow"    # Tokio Mutex<Arc<...>> pattern
+type_complexity = "allow"           # Rich filter builder types in handlers
+new_without_default = "allow"       # Index query builders (no default meaningful)
+should_implement_trait = "allow"    # Newtype around rusqlite types
+manual_find = "allow"               # C# parser — tree-sitter query idiom
+only_used_in_recursion = "allow"    # C# parser inherently recursive
+
+# ── Denied — downward pressure: lints the codebase is currently clean ──
+# under, so any new occurrence indicates a real regression.
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+bool_assert_comparison = "deny"
+clone_on_copy = "deny"
+equatable_if_let = "deny"
+match_like_matches_macro = "deny"
+single_match = "deny"
+suspicious_else_formatting = "deny"
+
+# Default clippy groups (style/perf/complexity/correctness) remain active at
+# their default `warn` level via `clippy::all`; no override needed here.
+
+# Root package inherits workspace lints.
+[lints]
+workspace = true

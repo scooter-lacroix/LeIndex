@@ -5,11 +5,15 @@ on:
   push:
     branches: [master]
     paths:
-      # Only trigger when version-carrying or publishable files change
+      # Trigger when version-carrying, publishable, distribution, or release files change.
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'src/**'
+      - 'crates/**'
       - 'packages/**'
+      - 'install.sh'
+      - 'docs/**'
+      - '.github/workflows/release.yml'
 
 permissions:
   contents: write
@@ -112,31 +116,101 @@ jobs:
             echo "All surfaces already published at v${VERSION}"
           fi
 
+  # ── Lint & test gate (runs before the platform matrix) ──────────────
+  # VAL-RELEASE-014/015/016 require the release/gating CI to run
+  # `cargo test --workspace`, `cargo clippy` with `-D warnings`, and
+  # `cargo fmt --all --check` before any bundle is published. Running
+  # these inline as a separate job lets the matrix fail fast and avoids
+  # wasting cross-compile cycles when a unit test would have caught the
+  # regression. The build job `needs: [detect, lint-and-test]` so a
+  # failure here blocks bundle creation.
+  lint-and-test:
+    name: Lint & test
+    needs: detect
+    if: needs.detect.outputs.needs_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lint-test-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            lint-test-cargo-
+
+      - name: cargo fmt --all --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy --workspace --all-features
+        run: cargo clippy --workspace --all-features -- -D warnings
+
+      - name: cargo test --workspace
+        run: cargo test --workspace
+
   # ── Build native binaries (main + worker) ────────────────────────────
   build:
     name: Build ${{ matrix.target }}
-    needs: detect
+    needs: [detect, lint-and-test]
     if: needs.detect.outputs.needs_build == 'true'
     strategy:
       fail-fast: false
       matrix:
         include:
+          # linux-x86_64 is the AMD-targeted bundle: it ships the
+          # MIGraphX-enabled ORT (`onnxruntime-migraphx`) so the AMD
+          # execution provider path works out of the box on ROCm
+          # systems. VAL-RELEASE-006 requires the providers_migraphx
+          # and providers_shared .so files in this archive only.
+          #
+          # The MIGraphX wheel is published as `manylinux_2_34_x86_64`
+          # (glibc 2.34+) by AMD; the CPU onnxruntime wheel is
+          # `manylinux_2_28_x86_64` (glibc 2.28+). Each matrix row
+          # pins the platform tag its target wheel actually uses, so
+          # `pip download --platform` matches a real distribution.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             asset_name: linux-x86_64
+            ort_package: onnxruntime-migraphx
+            ort_platform: manylinux_2_34_x86_64
+            include_migraphx: 'true'
 
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             asset_name: linux-aarch64
+            ort_package: onnxruntime
+            ort_platform: manylinux_2_28_aarch64
+            include_migraphx: 'false'
 
+          - target: x86_64-apple-darwin
+            os: macos-13
+            asset_name: macos-x86_64
+            ort_package: onnxruntime
+            ort_platform: macosx_13_0_x86_64
+            include_migraphx: 'false'
 
           - target: aarch64-apple-darwin
             os: macos-latest
             asset_name: macos-aarch64
+            ort_package: onnxruntime
+            ort_platform: macosx_14_0_arm64
+            include_migraphx: 'false'
 
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             asset_name: windows-x86_64
+            ort_package: onnxruntime
+            ort_platform: win_amd64
+            include_migraphx: 'false'
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -276,6 +350,81 @@ jobs:
             echo "Model assets ready at $MODELS_DIR"
           fi
 
+      # ── Extract ORT shared libs for the bundle's `lib/` directory ────
+      # VAL-RELEASE-005/011: with the load-dynamic migration the CI build
+      # no longer needs ORT at build time. The shared libraries that the
+      # worker `dlopen`s at runtime are extracted from the platform-
+      # appropriate onnxruntime wheel (onnxruntime-migraphx for linux-x86_64
+      # so VAL-RELEASE-006 ships the MIGraphX provider) and staged under
+      # /tmp/ort-extract/onnxruntime/capi/ for the Package step to copy.
+      #
+      # The ORT version is pinned to 1.25.0 to match the version the
+      # `ort` crate (2.0.0-rc.12) was migrated against, the local dev
+      # tooling, and the model file's expected ABI. Pinned == reproducible
+      # bundles regardless of upstream point releases.
+      - name: Set up Python (for ORT wheel extraction)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Extract ORT wheel for bundle lib/
+        shell: bash
+        env:
+          ORT_VERSION: '1.25.0'
+          ORT_PACKAGE: ${{ matrix.ort_package }}
+          ORT_PLATFORM: ${{ matrix.ort_platform }}
+          INCLUDE_MIGRAPHX: ${{ matrix.include_migraphx }}
+        run: |
+          set -e
+          echo "Extracting ORT wheel for bundle lib/ ..."
+          echo "  package=${ORT_PACKAGE} version=${ORT_VERSION} platform=${ORT_PLATFORM}"
+          rm -rf /tmp/ort-wheels /tmp/ort-extract
+          mkdir -p /tmp/ort-wheels /tmp/ort-extract
+
+          # Cross-compile targets (aarch64-linux built on ubuntu-latest)
+          # cannot `pip install` the foreign wheel directly because the
+          # active interpreter's tags won't accept it. Use `pip download`
+          # with the right --platform tag, then unzip the wheel into a
+          # staging directory. Native targets could pip-install directly
+          # but using the same code path keeps the bundle story uniform
+          # and verifiable.
+          pip download --no-deps \
+            --only-binary=:all: \
+            --python-version 312 \
+            --platform "${ORT_PLATFORM}" \
+            --dest /tmp/ort-wheels \
+            "${ORT_PACKAGE}==${ORT_VERSION}"
+
+          # The wheel is a zip archive; extract into the staging tree so
+          # the onnxruntime/capi/ layout matches what `pip install --target`
+          # would have produced on a native run.
+          WHEEL=$(ls /tmp/ort-wheels/*.whl | head -1)
+          echo "Extracting $WHEEL"
+          python -m zipfile -e "$WHEEL" /tmp/ort-extract
+
+          # Sanity-check the libraries we need actually landed in capi/.
+          CAPI=/tmp/ort-extract/onnxruntime/capi
+          echo "Wheel capi/ contents:"
+          ls -la "$CAPI" || true
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            test -f "$CAPI/onnxruntime.dll" \
+              || { echo "::error::onnxruntime.dll missing from wheel"; exit 1; }
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            ls "$CAPI"/libonnxruntime.*.dylib >/dev/null 2>&1 \
+              || { echo "::error::libonnxruntime.*.dylib missing from wheel"; exit 1; }
+          else
+            ls "$CAPI"/libonnxruntime.so.*.* >/dev/null 2>&1 \
+              || { echo "::error::libonnxruntime.so.*.* missing from wheel"; exit 1; }
+          fi
+          if [[ "$INCLUDE_MIGRAPHX" == "true" ]]; then
+            test -f "$CAPI/libonnxruntime_providers_migraphx.so" \
+              || { echo "::error::MIGraphX provider .so missing from wheel"; exit 1; }
+            test -f "$CAPI/libonnxruntime_providers_shared.so" \
+              || { echo "::error::providers_shared .so missing from wheel"; exit 1; }
+            echo "MIGraphX provider libs verified"
+          fi
+          echo "ORT wheel extraction complete"
+
       - name: Build release binaries
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
@@ -291,17 +440,136 @@ jobs:
           $STRIP target/${{ matrix.target }}/release/leindex
           $STRIP target/${{ matrix.target }}/release/leindex-embed
 
+      # ── Verify binaries: no NEEDED libonnxruntime, no $ORIGIN rpath ──
+      # VAL-RELEASE-012/013: with load-dynamic, the produced binaries
+      # MUST NOT carry a `NEEDED libonnxruntime.so.*` entry (ORT is
+      # dlopen'd at runtime) and MUST NOT carry a `$ORIGIN` rpath
+      # (the load-dynamic discovery chain replaces rpath-based lookup).
+      # We block the bundle from being archived until these invariants
+      # hold; failing here means a regression in build.rs / .cargo/config.
+      - name: Verify binaries (no NEEDED libonnxruntime, no $ORIGIN rpath)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -e
+          BIN_DIR="target/${{ matrix.target }}/release"
+          for bin in leindex leindex-embed; do
+            echo "Inspecting $BIN_DIR/$bin ..."
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              LOAD_DEPS=$(otool -L "$BIN_DIR/$bin")
+              # 1. No linked ONNX Runtime dylib (ORT is dlopen'd).
+              if echo "$LOAD_DEPS" | grep -i onnxruntime; then
+                echo "::error::$bin links libonnxruntime (expected load-dynamic)"
+                exit 1
+              fi
+              echo "  OK: no linked libonnxruntime in $bin"
+              # 2. No loader-relative rpath standing in for bundle lookup.
+              LOAD_COMMANDS=$(otool -l "$BIN_DIR/$bin")
+              RPATH_ENTRIES=$(echo "$LOAD_COMMANDS" | awk '/LC_RPATH/{flag=1} flag && /path /{print; flag=0}')
+              if echo "$RPATH_ENTRIES" | grep -Eq '\$ORIGIN|@loader_path'; then
+                echo "::error::$bin carries a loader-relative rpath entry: $RPATH_ENTRIES"
+                exit 1
+              fi
+              if [[ -n "$RPATH_ENTRIES" ]]; then
+                echo "  (non-loader-relative rpath entries are allowed): $RPATH_ENTRIES"
+              fi
+              echo "  OK: no loader-relative rpath in $bin"
+            else
+              DYNAMIC_SECTION=$(readelf -d "$BIN_DIR/$bin")
+              # 1. No NEEDED entry for libonnxruntime (ORT is dlopen'd).
+              if echo "$DYNAMIC_SECTION" | grep -E 'NEEDED' | grep -i onnxruntime; then
+                echo "::error::$bin has a NEEDED entry for libonnxruntime (expected load-dynamic)"
+                echo "$DYNAMIC_SECTION" | grep -i onnxruntime || true
+                exit 1
+              fi
+              echo "  OK: no NEEDED libonnxruntime in $bin"
+              # 2. No $ORIGIN rpath (load-dynamic discovery chain replaces it).
+              RPATH_ENTRIES=$(echo "$DYNAMIC_SECTION" | grep -Ei 'rpath|runpath' || true)
+              if echo "$RPATH_ENTRIES" | grep -q '\$ORIGIN'; then
+                echo "::error::$bin carries a \$ORIGIN rpath entry: $RPATH_ENTRIES"
+                exit 1
+              fi
+              if [[ -n "$RPATH_ENTRIES" ]]; then
+                echo "  (non-\$ORIGIN rpath entries are allowed): $RPATH_ENTRIES"
+              fi
+              echo "  OK: no \$ORIGIN rpath in $bin"
+            fi
+          done
+
       - name: Package release bundle
         shell: bash
+        env:
+          INCLUDE_MIGRAPHX: ${{ matrix.include_migraphx }}
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           EXT="${{ matrix.asset_name == 'windows-x86_64' && '.exe' || '' }}"
           BUNDLE_DIR="leindex-${VERSION}-${{ matrix.asset_name }}"
-          mkdir -p "$BUNDLE_DIR/bin" "$BUNDLE_DIR/models"
+          mkdir -p "$BUNDLE_DIR/bin" "$BUNDLE_DIR/lib" "$BUNDLE_DIR/models"
 
           # Copy both binaries
           cp "target/${{ matrix.target }}/release/leindex${EXT}" "$BUNDLE_DIR/bin/leindex${EXT}"
           cp "target/${{ matrix.target }}/release/leindex-embed${EXT}" "$BUNDLE_DIR/bin/leindex-embed${EXT}"
+
+          # ── Copy ORT runtime libraries into lib/ ──
+          # VAL-RELEASE-005/011: ORT is extracted from the pip wheel (above)
+          # and bundled so users get a working neural path without a separate
+          # pip install. The worker discovers these via the sibling bundle
+          # lib/ path (`bin/../lib`).
+          #
+          # The pip wheels only ship the versioned file
+          # (libonnxruntime.so.1.25.0 / libonnxruntime.1.25.0.dylib). We
+          # synthesize the versioned and unversioned symlinks the
+          # load-dynamic discovery chain falls back to:
+          #   libonnxruntime.so.1 -> libonnxruntime.so.1.25.0
+          #   libonnxruntime.so   -> libonnxruntime.so.1
+          # This matches how `apt install libonnxruntime` lays the files
+          # out under /usr/local/lib.
+          CAPI=/tmp/ort-extract/onnxruntime/capi
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # onnxruntime.dll and the shared providers dll. Windows does
+            # not use SONAME symlinks; the basename is sufficient.
+            cp "$CAPI"/onnxruntime.dll "$BUNDLE_DIR/lib/" 2>/dev/null \
+              || echo "::warning::onnxruntime.dll not found in wheel capi/"
+            cp "$CAPI"/onnxruntime_providers_shared.dll "$BUNDLE_DIR/lib/" 2>/dev/null || true
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            # macOS wheels ship libonnxruntime.<ver>.dylib only. Lay down
+            # the versioned file, then add the bare .dylib symlink so the
+            # worker's dyld fallback (`dlopen("libonnxruntime.dylib")`)
+            # resolves.
+            cp "$CAPI"/libonnxruntime.*.dylib "$BUNDLE_DIR/lib/" 2>/dev/null \
+              || echo "::warning::libonnxruntime.*.dylib not found in wheel capi/"
+            (cd "$BUNDLE_DIR/lib" && \
+              VER_FILE=$(ls libonnxruntime.*.dylib 2>/dev/null | LC_ALL=C sort | tail -1) && \
+              [[ -n "$VER_FILE" ]] && \
+              ln -sf "$VER_FILE" libonnxruntime.dylib)
+            cp "$CAPI"/libonnxruntime_providers_shared.dylib "$BUNDLE_DIR/lib/" 2>/dev/null || true
+          else
+            # Linux: copy the versioned .so file, then synthesize the
+            # libonnxruntime.so.1 (soname) and libonnxruntime.so (linker
+            # name) symlinks so the bundle matches a system install.
+            cp "$CAPI"/libonnxruntime.so.*.* "$BUNDLE_DIR/lib/" 2>/dev/null \
+              || echo "::warning::libonnxruntime.so.*.* not found in wheel capi/"
+            (cd "$BUNDLE_DIR/lib" && \
+              VER_FILE=$(ls libonnxruntime.so.*.* 2>/dev/null | sort -V | tail -1) && \
+              if [[ -n "$VER_FILE" ]]; then \
+                SONAME=$(echo "$VER_FILE" | sed -E 's/((libonnxruntime\.so\.[0-9]+)\.[0-9]+\.[0-9]+)/\2/') && \
+                ln -sf "$VER_FILE" "$SONAME" && \
+                ln -sf "$SONAME" libonnxruntime.so; \
+              fi)
+            cp "$CAPI"/libonnxruntime_providers_shared.so "$BUNDLE_DIR/lib/" 2>/dev/null || true
+            # VAL-RELEASE-006: the linux-x86_64 (AMD) bundle additionally
+            # ships the MIGraphX provider .so so the AMD execution
+            # provider path works out of the box on ROCm systems. The
+            # wheel for this target is onnxruntime-migraphx which already
+            # contains the provider; copy it through explicitly so a
+            # non-MIGraphX wheel cannot silently strip it.
+            if [[ "$INCLUDE_MIGRAPHX" == "true" ]]; then
+              cp -P "$CAPI"/libonnxruntime_providers_migraphx.so "$BUNDLE_DIR/lib/" 2>/dev/null \
+                || echo "::warning::libonnxruntime_providers_migraphx.so not found in wheel capi/"
+            fi
+          fi
+          echo "Bundle lib/ contents:"
+          ls -la "$BUNDLE_DIR/lib/"
 
           # Copy model assets
           cp models/qwen3-embed-0.6b.onnx "$BUNDLE_DIR/models/"
@@ -309,6 +577,103 @@ jobs:
           cp models/config.json "$BUNDLE_DIR/models/"
           cp models/checksums.sha256 "$BUNDLE_DIR/models/" 2>/dev/null || echo "::warning::models/checksums.sha256 not found — bundle will lack integrity checksums"
           cp models/LICENSE "$BUNDLE_DIR/models/" 2>/dev/null || echo "::warning::models/LICENSE not found — bundle will lack model license"
+
+          # ── INSTALL.txt quick-start doc ──
+          # VAL-RELEASE-008: every bundle ships an INSTALL.txt at the root
+          # explaining the layout, the install.sh path, the leindex setup
+          # command, and the ORT discovery chain so a user who extracts
+          # the archive directly can get to a working install.
+          cat > "$BUNDLE_DIR/INSTALL.txt" <<EOF
+          LeIndex $VERSION — ${{ matrix.asset_name }}
+          ==========================================
+
+          LeIndex is a code intelligence tool providing semantic and lexical
+          (TF-IDF) search over your source tree. This bundle contains:
+
+            bin/        leindex and leindex-embed binaries
+            lib/        ONNX Runtime shared libraries (loaded dynamically)
+            models/     qwen3-embed-0.6b.onnx + tokenizer + config
+            INSTALL.txt this file
+
+          QUICK START
+          -----------
+
+          1. Add this directory to your PATH (or copy bin/leindex and
+             bin/leindex-embed to ~/.cargo/bin/):
+
+               export PATH="$PWD/$BUNDLE_DIR/bin:\$PATH"
+
+          2. TF-IDF search works immediately. Index a project and search:
+
+               leindex index /path/to/project
+               leindex search "authentication" --path /path/to/project
+
+          3. To enable neural (semantic) search, run the setup wizard.
+             The bundled lib/ ONNX Runtime is discovered automatically
+             through the load-dynamic discovery chain
+             (ORT_DYLIB_PATH env, ~/.leindex/config/leindex.toml,
+             bundled lib/, sibling-to-binary, pip site-packages, system
+             paths). Setting up records the discovered ORT in config:
+
+               leindex setup --neural --cpu         # CPU ORT
+               leindex setup --neural --gpu amd     # AMD/ROCm MIGraphX
+               leindex setup --neural --gpu nvidia  # NVIDIA CUDA
+               leindex setup --check                # print current status
+
+          4. After setup, search returns neural-scored results:
+
+               leindex search "authentication" --path /path/to/project
+
+          ALTERNATIVE INSTALL PATHS
+          -------------------------
+
+            cargo install leindex     # builds from source (no ORT needed at build time)
+            npm install -g @leindex/mcp
+            pip install leindex
+
+          TROUBLESHOOTING
+          ---------------
+
+          If neural search is unavailable, LeIndex falls back to TF-IDF
+          and prints a one-time notice. To diagnose:
+
+               leindex setup --check         # status report
+               leindex diagnostics           # resolved ORT path + version
+               export ORT_DYLIB_PATH=/path/to/libonnxruntime.so   # manual override
+
+          See docs/NEURAL_SETUP.md in the repository for full guidance.
+          EOF
+
+          # ── Per-file SHA256 checksums inside the bundle ──
+          # VAL-RELEASE-009: a top-level SHA256SUMS is generated at the
+          # release level (covering each archive), AND each bundle
+          # carries a per-file checksum manifest covering bin/, lib/, and
+          # models/ so end users can verify any single artifact. This is
+          # generated BEFORE archiving so it ships inside the tarball.
+          #
+          # The output file `checksums.sha256` lives at the bundle root;
+          # we exclude only that path so the model's own
+          # `models/checksums.sha256` (when shipped from HuggingFace)
+          # remains checksummed.
+          (
+            cd "$BUNDLE_DIR"
+            checksum_file() {
+              if [[ "$RUNNER_OS" == "macOS" ]]; then
+                shasum -a 256 "$1"
+              else
+                sha256sum "$1"
+              fi
+            }
+            : > checksums.sha256
+            while IFS= read -r file; do
+              if [[ "$file" == "checksums.sha256" ]]; then
+                continue
+              fi
+              checksum_file "$file" >> checksums.sha256
+            done < <(find bin lib models -type f | LC_ALL=C sort)
+          )
+          echo "Bundle checksums.sha256:"
+          cat "$BUNDLE_DIR/checksums.sha256"
 
           # Create archive
           if [ "${{ matrix.asset_name }}" = "windows-x86_64" ]; then

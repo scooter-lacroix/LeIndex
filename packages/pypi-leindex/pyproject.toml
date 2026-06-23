@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "leindex"
-version = "1.8.1"
+version = "1.8.3"
 description = "LeIndex MCP bootstrap wrapper for the Rust LeIndex binary"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,6 +29,14 @@ classifiers = [
 ]
 dependencies = []
 
+# VAL-PYPI-006: ORT is NOT a hard Python dependency. The Rust binaries load
+# ONNX Runtime dynamically at runtime via the `load-dynamic` ort feature, and
+# `leindex setup` installs the appropriate onnxruntime pip package (cpu/gpu/
+# migraphx) into the user environment on demand. Users who want neural
+# support up front may opt into the optional `neural` extra.
+[project.optional-dependencies]
+neural = ["onnxruntime>=1.20,<2"]
+
 [project.urls]
 Homepage = "https://github.com/scooter-lacroix/LeIndex"
 Repository = "https://github.com/scooter-lacroix/LeIndex.git"
@@ -36,7 +44,12 @@ Issues = "https://github.com/scooter-lacroix/LeIndex/issues"
 Documentation = "https://docs.rs/leindex"
 
 [project.scripts]
+# VAL-PYPI-002: `leindex` bootstraps the Rust binary via cargo, then forwards
+# all CLI arguments to the real `leindex` executable.
 leindex = "leindex.bootstrap:main"
+# VAL-PYPI-005: dedicated console script that always runs the `leindex setup`
+# wizard (bootstrap first if needed), e.g. `leindex-setup --check`.
+leindex-setup = "leindex.bootstrap:setup_main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

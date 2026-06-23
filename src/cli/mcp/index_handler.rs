@@ -59,9 +59,12 @@ also accept project_path and auto-index, so explicit indexing is optional."
 
         if !force_reindex {
             // Auto-index-if-needed path: registry handles everything.
+            // If the project is already indexed AND not stale, return cached
+            // stats immediately. If stale, fall through to index_project()
+            // which performs an incremental reindex (VAL-INDEX-005).
             let handle = registry.get_or_create(Some(&project_path)).await?;
             let index = handle.read().await;
-            if index.is_indexed() {
+            if index.is_indexed() && !index.is_stale_fast() {
                 return serde_json::to_value(index.get_stats())
                     .map(|v| wrap_with_meta(v, &index))
                     .map_err(|e| {

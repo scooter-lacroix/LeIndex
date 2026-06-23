@@ -10,9 +10,10 @@
 #![warn(missing_docs)]
 
 use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
-use crate::parse::prelude::SignatureInfo;
+use crate::parse::prelude::{ImportInfo, SignatureInfo};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -904,29 +905,11 @@ pub fn extract_call_edges(
         }
     }
 
-    // Build alias map from all imports across all signatures
-    let mut alias_map: HashMap<String, String> = HashMap::new();
-    for sig in signatures {
-        for import in &sig.imports {
-            let alias = import.alias.clone().or_else(|| {
-                import
-                    .path
-                    .split(['.', ':', '/', '\\'])
-                    .next_back()
-                    .map(|s| s.to_string())
-            });
-            if let Some(alias) = alias {
-                alias_map
-                    .entry(alias)
-                    .or_insert_with(|| import.path.clone());
-            }
-        }
-    }
-
     for sig in signatures {
         let Some(&caller_id) = node_ids.get(&sig.qualified_name) else {
             continue;
         };
+        let alias_map = import_alias_map(&sig.imports);
         let caller_ns = {
             let norm = normalize_symbol(&sig.qualified_name);
             let segs: Vec<&str> = norm.split('.').collect();
@@ -1027,6 +1010,514 @@ pub fn extract_call_edges(
     }
 
     edges
+}
+
+/// Resolve cross-file call edges after all per-file PDGs have been merged.
+///
+/// During per-file PDG extraction, `extract_call_edges` can only resolve calls
+/// to symbols defined in the same file (because the resolution maps are built
+/// from that file's signatures alone). This function performs a second pass
+/// over the merged PDG using ALL signatures from ALL files, adding call edges
+/// that span file boundaries.
+///
+/// # Arguments
+///
+/// * `pdg` - The merged PDG containing nodes from all files
+/// * `all_signatures` - Signatures from all files in the project
+///
+/// This function mutates the PDG in-place, adding new `Call` edges for
+/// cross-file call relationships that were not resolved during per-file
+/// extraction.
+pub fn resolve_cross_file_call_edges(
+    pdg: &mut ProgramDependenceGraph,
+    all_signatures: &[SignatureInfo],
+) {
+    let owned: Vec<(Option<&str>, &SignatureInfo)> =
+        all_signatures.iter().map(|sig| (None, sig)).collect();
+    resolve_cross_file_call_edges_inner(pdg, &owned);
+}
+
+/// Resolve cross-file call edges with each signature bound to its source file.
+///
+/// Real indexing still knows which parse result produced each signature. Keeping
+/// that ownership here prevents duplicate `qualified_name` definitions in
+/// different files from receiving each other's calls.
+pub fn resolve_cross_file_call_edges_for_files(
+    pdg: &mut ProgramDependenceGraph,
+    all_signatures: &[(String, SignatureInfo)],
+) {
+    let owned: Vec<(Option<&str>, &SignatureInfo)> = all_signatures
+        .iter()
+        .map(|(file_path, sig)| (Some(file_path.as_str()), sig))
+        .collect();
+    resolve_cross_file_call_edges_inner(pdg, &owned);
+}
+
+fn resolve_cross_file_call_edges_inner(
+    pdg: &mut ProgramDependenceGraph,
+    all_signatures: &[(Option<&str>, &SignatureInfo)],
+) {
+    use crate::graph::pdg::{EdgeType, NodeId};
+
+    // Build lookup maps from the merged PDG nodes.
+    // Node ids are formatted as "file_path:qualified_name".
+    // We build maps keyed by various forms of the qualified name for resolution.
+    let mut qname_to_node: HashMap<String, Vec<NodeId>> = HashMap::new();
+    let mut qname_file_to_node: HashMap<(String, String), Vec<NodeId>> = HashMap::new();
+    let mut exact_map: HashMap<String, Vec<NodeId>> = HashMap::new();
+    let mut last_map: HashMap<String, Vec<NodeId>> = HashMap::new();
+    let mut suffix_map: HashMap<String, Vec<NodeId>> = HashMap::new();
+
+    for nid in pdg.node_indices() {
+        if let Some(node) = pdg.get_node(nid) {
+            // Skip external nodes - they are references, not definitions.
+            // We only want to resolve calls to actual definitions.
+            if node.node_type == crate::graph::pdg::NodeType::External {
+                continue;
+            }
+
+            let Some(qname) = qualified_name_from_node(node) else {
+                tracing::debug!(
+                    node_id = %node.id,
+                    file_path = %node.file_path,
+                    "Skipping node whose id does not start with its file_path prefix"
+                );
+                continue;
+            };
+
+            // Preserve all definitions for a qualified name. Cross-file
+            // extraction sees signatures without file ownership, so collapsing
+            // duplicate qnames here can attach calls to an arbitrary file.
+            let is_module = node.node_type == crate::graph::pdg::NodeType::Module;
+            if !is_module {
+                qname_to_node
+                    .entry(qname.to_string())
+                    .or_default()
+                    .push(nid);
+                qname_file_to_node
+                    .entry((qname.to_string(), node.file_path.to_string()))
+                    .or_default()
+                    .push(nid);
+            } else {
+                qname_to_node.entry(qname.to_string()).or_default();
+            }
+
+            let normalized = normalize_symbol(qname);
+            let segments: Vec<&str> = normalized.split('.').filter(|s| !s.is_empty()).collect();
+
+            exact_map.entry(normalized.clone()).or_default().push(nid);
+
+            if let Some(last) = segments.last() {
+                last_map.entry(last.to_string()).or_default().push(nid);
+            }
+
+            for len in 2..=3_usize.min(segments.len()) {
+                let start = segments.len() - len;
+                let key = segments[start..].join(".");
+                suffix_map.entry(key).or_default().push(nid);
+            }
+
+            // Also index by node name for last-segment resolution
+            // Only for non-module nodes to avoid noise
+            if !is_module {
+                last_map.entry(node.name.to_string()).or_default().push(nid);
+            }
+        }
+    }
+
+    // Track existing call edges to avoid duplicates
+    let mut existing_edges: HashSet<(NodeId, NodeId)> = HashSet::new();
+    for edge_idx in pdg.edge_indices() {
+        if let Some(edge) = pdg.get_edge(edge_idx) {
+            if edge.edge_type == EdgeType::Call {
+                if let Some((s, t)) = pdg.edge_endpoints(edge_idx) {
+                    existing_edges.insert((s, t));
+                }
+            }
+        }
+    }
+
+    let mut new_edges = Vec::new();
+
+    for (source_file, sig) in all_signatures {
+        let alias_map = import_alias_map(&sig.imports);
+        // Real indexing passes the source file for each signature. Use it to
+        // bind duplicate qualified names to their owning PDG node; the legacy
+        // no-file API falls back to all matching definitions.
+        let caller_ids = if let Some(source_file) = source_file {
+            match qname_file_to_node.get(&(sig.qualified_name.clone(), (*source_file).to_string()))
+            {
+                Some(ids) if !ids.is_empty() => ids.clone(),
+                _ => continue,
+            }
+        } else {
+            match qname_to_node.get(&sig.qualified_name) {
+                Some(ids) if !ids.is_empty() => ids.clone(),
+                _ => continue,
+            }
+        };
+
+        for caller_id in caller_ids {
+            let caller_ns = {
+                let norm = normalize_symbol(&sig.qualified_name);
+                let segs: Vec<&str> = norm.split('.').collect();
+                if segs.len() > 1 {
+                    Some(segs[..segs.len() - 1].join("."))
+                } else {
+                    None
+                }
+            };
+
+            for call_target in &sig.calls {
+                let mut candidates = vec![call_target.clone()];
+
+                let call_segs: Vec<String> = normalize_symbol(call_target)
+                    .split('.')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect();
+
+                // Resolve via import aliases
+                if let Some(first) = call_segs.first() {
+                    if let Some(import_path) = alias_map.get(first) {
+                        if call_segs.len() == 1 {
+                            candidates.push(import_path.clone());
+                        } else {
+                            candidates.push(format!(
+                                "{}.{}",
+                                import_path,
+                                call_segs[1..].join(".")
+                            ));
+                        }
+                    }
+                }
+
+                // Resolve via caller namespace (self.method, super::method, etc.)
+                if let Some(ns) = &caller_ns {
+                    if let Some(first) = call_segs.first() {
+                        if matches!(
+                            first.as_str(),
+                            "self" | "this" | "super" | "Self" | "crate" | "base"
+                        ) {
+                            let rest = call_segs[1..].join(".");
+                            if !rest.is_empty() {
+                                candidates.push(format!("{}.{}", ns, rest));
+                            }
+                        } else if call_segs.len() == 1 {
+                            // Bare function call - try resolving in caller's namespace
+                            candidates.push(format!("{}.{}", ns, first));
+                        }
+                    }
+                }
+
+                // Try to resolve each candidate against the global maps
+                let mut targets: Vec<NodeId> = Vec::new();
+                let mut last_segment_fallback: Option<String> = None;
+                for candidate in &candidates {
+                    let norm = normalize_symbol(candidate);
+                    let segs: Vec<String> = norm
+                        .split('.')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect();
+
+                    // 1. Try exact match first (highest confidence)
+                    if let Some(ids) = exact_map.get(&norm) {
+                        targets.extend(ids.iter().copied());
+                    }
+
+                    // 2. Try suffix matching (2-3 segments from the end)
+                    // This handles cases like `module.function_name` or `class.method_name`
+                    for len in 2..=3_usize.min(segs.len()) {
+                        let start = segs.len() - len;
+                        let key = segs[start..].join(".");
+                        if let Some(ids) = suffix_map.get(&key) {
+                            targets.extend(ids.iter().copied());
+                        }
+                    }
+
+                    // 3. For bare names (single segment), use last_map
+                    if segs.len() == 1 {
+                        if let Some(ids) = last_map.get(&norm) {
+                            targets.extend(ids.iter().copied());
+                        }
+                    }
+
+                    // 4. Track last segment for fallback (see below)
+                    if last_segment_fallback.is_none() {
+                        if let Some(last) = segs.last() {
+                            last_segment_fallback = Some(last.clone());
+                        }
+                    }
+                }
+
+                // 5. Fallback: if no targets found via exact/suffix matching,
+                // try matching the last segment of the call target against
+                // node names. This handles fully-qualified calls like
+                // `crate::module::function_name` where the PDG node only has
+                // the bare name `function_name`.
+                if targets.is_empty() {
+                    if let Some(last_seg) = last_segment_fallback {
+                        // Only do this for non-trivial names (avoid matching
+                        // common method names like `clone`, `name`, `new`, etc.)
+                        const COMMON_NAMES: &[&str] = &[
+                            "new",
+                            "clone",
+                            "name",
+                            "len",
+                            "get",
+                            "set",
+                            "add",
+                            "remove",
+                            "push",
+                            "pop",
+                            "iter",
+                            "next",
+                            "send",
+                            "recv",
+                            "read",
+                            "write",
+                            "open",
+                            "close",
+                            "start",
+                            "stop",
+                            "run",
+                            "exec",
+                            "call",
+                            "apply",
+                            "map",
+                            "filter",
+                            "fold",
+                            "collect",
+                            "into",
+                            "from",
+                            "to",
+                            "as",
+                            "is",
+                            "has",
+                            "can",
+                            "should",
+                            "will",
+                            "do",
+                            "done",
+                            "ok",
+                            "err",
+                            "some",
+                            "none",
+                            "true",
+                            "false",
+                            "nil",
+                            "null",
+                            "self",
+                            "super",
+                            "init",
+                            "free",
+                            "drop",
+                            "copy",
+                            "dup",
+                            "swap",
+                            "cmp",
+                            "eq",
+                            "ne",
+                            "lt",
+                            "le",
+                            "gt",
+                            "ge",
+                            "hash",
+                            "fmt",
+                            "dbg",
+                            "print",
+                            "println",
+                            "format",
+                            "parse",
+                            "unwrap",
+                            "expect",
+                            "ok_or",
+                            "ok_or_else",
+                            "map_err",
+                            "and_then",
+                            "or_else",
+                            "unwrap_or",
+                            "unwrap_or_else",
+                            "unwrap_or_default",
+                            "is_some",
+                            "is_none",
+                            "is_ok",
+                            "is_err",
+                            "as_ref",
+                            "as_mut",
+                            "as_str",
+                            "as_bytes",
+                            "trim",
+                            "split",
+                            "join",
+                            "replace",
+                            "contains",
+                            "starts_with",
+                            "ends_with",
+                            "find",
+                            "rfind",
+                            "matches",
+                            "parse",
+                            "to_string",
+                            "to_owned",
+                            "to_vec",
+                            "into_string",
+                            "into_bytes",
+                            "into_vec",
+                            "iter",
+                            "into_iter",
+                            "keys",
+                            "values",
+                            "entries",
+                            // Additional common names that produce false positives
+                            "execute",
+                            "handle",
+                            "process",
+                            "update",
+                            "create",
+                            "delete",
+                            "save",
+                            "load",
+                            "fetch",
+                            "build",
+                            "make",
+                            "spawn",
+                            "fork",
+                            "warn",
+                            "info",
+                            "error",
+                            "trace",
+                            "debug",
+                            "log",
+                            "json",
+                            "yaml",
+                            "toml",
+                            "xml",
+                            "html",
+                            "csv",
+                            "Ok",
+                            "Err",
+                            "Some",
+                            "None",
+                            "Result",
+                            "Option",
+                            "Vec",
+                            "Box",
+                            "Rc",
+                            "Arc",
+                            "Cell",
+                            "RefCell",
+                            "Mutex",
+                            "RwLock",
+                            "String",
+                            "str",
+                            "Vec",
+                            "HashMap",
+                            "HashSet",
+                            "BTreeMap",
+                            "BTreeSet",
+                            "VecDeque",
+                            "LinkedList",
+                            "JsonRpcError",
+                            "Error",
+                            "Result",
+                            "Response",
+                            "Request",
+                            "Value",
+                            "serde",
+                            "serde_json",
+                            "display",
+                            "render",
+                        ];
+                        if !COMMON_NAMES.contains(&last_seg.as_str()) && last_seg.len() > 2 {
+                            if let Some(ids) = last_map.get(&last_seg) {
+                                targets.extend(ids.iter().copied());
+                            }
+                        }
+                    }
+                }
+
+                for target_id in targets {
+                    if caller_id != target_id && !existing_edges.contains(&(caller_id, target_id)) {
+                        existing_edges.insert((caller_id, target_id));
+                        new_edges.push((caller_id, target_id));
+                    }
+                }
+                let callee_name = normalize_symbol(call_target);
+                if let Some((scoped_prefix, _member)) = callee_name.rsplit_once('.') {
+                    let bare_type = scoped_prefix.rsplit('.').next().unwrap_or(scoped_prefix);
+                    let looks_like_type =
+                        bare_type.chars().next().is_some_and(|c| c.is_uppercase());
+                    if looks_like_type {
+                        let struct_nid = qname_to_node
+                            .get(scoped_prefix)
+                            .and_then(|v| v.first())
+                            .or_else(|| last_map.get(bare_type).and_then(|v| v.first()))
+                            .copied();
+                        if let Some(snid) = struct_nid {
+                            let pair = (caller_id, snid);
+                            if !existing_edges.contains(&pair) {
+                                existing_edges.insert(pair);
+                                new_edges.push(pair);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !new_edges.is_empty() {
+        tracing::debug!(
+            "Cross-file call edge resolution: added {} new edges",
+            new_edges.len()
+        );
+        pdg.add_call_edges(new_edges);
+    }
+}
+
+fn qualified_name_from_node(node: &Node) -> Option<&str> {
+    if let Some(qname) = node
+        .id
+        .strip_prefix(node.file_path.as_ref())
+        .and_then(|rest| rest.strip_prefix(':'))
+    {
+        return Some(qname);
+    }
+
+    let expected_file_name = Path::new(node.file_path.as_ref()).file_name()?.to_str()?;
+    node.id.char_indices().find_map(|(idx, ch)| {
+        if ch != ':' {
+            return None;
+        }
+        let (id_path, rest) = node.id.split_at(idx);
+        let rest = rest.strip_prefix(':')?;
+        if rest.is_empty() {
+            return None;
+        }
+        let id_file_name = Path::new(id_path).file_name()?.to_str()?;
+        (id_file_name == expected_file_name).then_some(rest)
+    })
+}
+
+fn import_alias_map(imports: &[ImportInfo]) -> HashMap<String, String> {
+    let mut alias_map = HashMap::new();
+    for import in imports {
+        let alias = import.alias.clone().or_else(|| {
+            import
+                .path
+                .split(['.', ':', '/', '\\'])
+                .next_back()
+                .map(|s| s.to_string())
+        });
+        if let Some(alias) = alias {
+            alias_map
+                .entry(alias)
+                .or_insert_with(|| import.path.clone());
+        }
+    }
+    alias_map
 }
 
 // ---------------------------------------------------------------------------
@@ -1615,7 +2106,7 @@ fn signature_to_node(sig: &SignatureInfo, file_path: &str, language: &str) -> No
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::prelude::{Parameter, SignatureInfo, Visibility};
+    use crate::parse::prelude::{ImportInfo, Parameter, SignatureInfo, Visibility};
 
     fn sig(name: &str, qualified: &str, is_method: bool) -> SignatureInfo {
         SignatureInfo {
@@ -1856,5 +2347,558 @@ mod tests {
             node.complexity, 10,
             "Both: cyclomatic=10 overrides param count"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Tests for resolve_cross_file_call_edges
+    // -----------------------------------------------------------------
+
+    /// Helper: count Call edges in a PDG
+    fn count_call_edges(pdg: &ProgramDependenceGraph) -> usize {
+        pdg.edge_indices()
+            .filter_map(|e| pdg.get_edge(e))
+            .filter(|e| e.edge_type == crate::graph::pdg::EdgeType::Call)
+            .count()
+    }
+
+    /// Helper: check if a Call edge exists from caller to callee
+    fn has_call_edge(pdg: &ProgramDependenceGraph, caller_name: &str, callee_name: &str) -> bool {
+        let caller_nid = pdg.node_indices().find(|&n| {
+            pdg.get_node(n)
+                .map(|node| &*node.name == caller_name)
+                .unwrap_or(false)
+        });
+        let callee_nid = pdg.node_indices().find(|&n| {
+            pdg.get_node(n)
+                .map(|node| &*node.name == callee_name)
+                .unwrap_or(false)
+        });
+
+        match (caller_nid, callee_nid) {
+            (Some(c), Some(d)) => {
+                // Check if there's a Call edge from c to d
+                pdg.neighbors(c).contains(&d)
+            }
+            _ => false,
+        }
+    }
+
+    fn has_call_edge_from_file(
+        pdg: &ProgramDependenceGraph,
+        caller_file: &str,
+        caller_name: &str,
+        callee_name: &str,
+    ) -> bool {
+        let caller_nid = pdg.node_indices().find(|&n| {
+            pdg.get_node(n)
+                .map(|node| node.file_path.as_ref() == caller_file && &*node.name == caller_name)
+                .unwrap_or(false)
+        });
+        let callee_nid = pdg.node_indices().find(|&n| {
+            pdg.get_node(n)
+                .map(|node| &*node.name == callee_name)
+                .unwrap_or(false)
+        });
+
+        match (caller_nid, callee_nid) {
+            (Some(c), Some(d)) => pdg.neighbors(c).contains(&d),
+            _ => false,
+        }
+    }
+
+    fn has_call_edge_between_files(
+        pdg: &ProgramDependenceGraph,
+        caller_file: &str,
+        caller_name: &str,
+        callee_file: &str,
+        callee_name: &str,
+    ) -> bool {
+        let caller_nid = pdg.node_indices().find(|&n| {
+            pdg.get_node(n)
+                .map(|node| node.file_path.as_ref() == caller_file && &*node.name == caller_name)
+                .unwrap_or(false)
+        });
+        let callee_nid = pdg.node_indices().find(|&n| {
+            pdg.get_node(n)
+                .map(|node| node.file_path.as_ref() == callee_file && &*node.name == callee_name)
+                .unwrap_or(false)
+        });
+
+        match (caller_nid, callee_nid) {
+            (Some(c), Some(d)) => pdg.neighbors(c).contains(&d),
+            _ => false,
+        }
+    }
+
+    /// Tier 1: Exact match - caller references callee by exact qualified name
+    #[test]
+    fn cross_file_exact_match() {
+        // File A has a function that calls a function in File B by exact name
+        let callee = sig("target_func", "target_func", false);
+        let mut caller = sig("caller_func", "caller_func", false);
+        caller.calls.push("target_func".to_string());
+
+        // Build PDG with nodes from two different files
+        let pdg_a = extract_pdg_from_signatures(vec![caller], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        // Merge into a single PDG
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        let edges_before = count_call_edges(&merged);
+        resolve_cross_file_call_edges(
+            &mut merged,
+            &[
+                SignatureInfo {
+                    name: "caller_func".to_string(),
+                    qualified_name: "caller_func".to_string(),
+                    calls: vec!["target_func".to_string()],
+                    ..sig("caller_func", "caller_func", false)
+                },
+                SignatureInfo {
+                    name: "target_func".to_string(),
+                    qualified_name: "target_func".to_string(),
+                    calls: vec![],
+                    ..sig("target_func", "target_func", false)
+                },
+            ],
+        );
+        let edges_after = count_call_edges(&merged);
+
+        assert!(
+            edges_after > edges_before,
+            "Exact match should create a new call edge (before={}, after={})",
+            edges_before,
+            edges_after
+        );
+        assert!(
+            has_call_edge(&merged, "caller_func", "target_func"),
+            "Should have call edge from caller_func to target_func"
+        );
+    }
+
+    /// Tier 2: Suffix match - caller references callee via module-qualified path
+    #[test]
+    fn cross_file_suffix_match() {
+        // callee is defined as `my_module.helper_func` in file B
+        // caller calls `my_module.helper_func` - should match via exact normalized name
+        let callee = sig("helper_func", "my_module.helper_func", false);
+        let mut caller = sig("do_work", "do_work", false);
+        caller.calls.push("my_module.helper_func".to_string());
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        resolve_cross_file_call_edges(
+            &mut merged,
+            &[caller, sig("helper_func", "my_module.helper_func", false)],
+        );
+
+        assert!(
+            has_call_edge(&merged, "do_work", "helper_func"),
+            "Suffix match: should have call edge from do_work to helper_func"
+        );
+    }
+
+    /// Tier 2b: Suffix match with 2+ segments from the end
+    #[test]
+    fn cross_file_suffix_match_multi_segment() {
+        // callee is `crate::network::send_request` in file B
+        // caller calls `network.send_request` - should match via suffix
+        let callee = sig("send_request", "crate.network.send_request", false);
+        let mut caller = sig("handle_request", "handle_request", false);
+        caller.calls.push("network.send_request".to_string());
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        resolve_cross_file_call_edges(
+            &mut merged,
+            &[
+                caller,
+                sig("send_request", "crate.network.send_request", false),
+            ],
+        );
+
+        assert!(
+            has_call_edge(&merged, "handle_request", "send_request"),
+            "Multi-segment suffix match: should have call edge from handle_request to send_request"
+        );
+    }
+
+    /// Tier 3: Last-segment fallback - fully qualified call resolved via last segment
+    #[test]
+    fn cross_file_last_segment_fallback() {
+        // callee is defined as `process_data` in file B
+        // caller calls `some.long.path.process_data` - no exact/suffix match,
+        // but last-segment fallback should find it
+        let callee = sig("process_data", "process_data", false);
+        let mut caller = sig("main_func", "main_func", false);
+        caller.calls.push("some.long.path.process_data".to_string());
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        resolve_cross_file_call_edges(
+            &mut merged,
+            &[caller, sig("process_data", "process_data", false)],
+        );
+
+        assert!(
+            has_call_edge(&merged, "main_func", "process_data"),
+            "Last-segment fallback: should have call edge from main_func to process_data"
+        );
+    }
+
+    /// Tier 4: COMMON_NAMES exclusion - common names should NOT be resolved
+    /// via last-segment fallback to avoid false positives
+    #[test]
+    fn cross_file_common_names_excluded() {
+        // callee is named "clone" (a common name) in file B
+        // caller calls `some.path.clone` - should NOT match via last-segment
+        // fallback because "clone" is in COMMON_NAMES
+        let callee = sig("clone", "clone", false);
+        let mut caller = sig("caller", "caller", false);
+        caller.calls.push("some.path.clone".to_string());
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        let edges_before = count_call_edges(&merged);
+        resolve_cross_file_call_edges(&mut merged, &[caller, sig("clone", "clone", false)]);
+        let edges_after = count_call_edges(&merged);
+
+        assert_eq!(
+            edges_before, edges_after,
+            "COMMON_NAMES exclusion: 'clone' should NOT be resolved via last-segment fallback"
+        );
+        assert!(
+            !has_call_edge(&merged, "caller", "clone"),
+            "Should NOT have call edge from caller to clone (common name excluded)"
+        );
+    }
+
+    /// Verify that COMMON_NAMES exclusion also applies to other common names
+    #[test]
+    fn cross_file_common_names_excluded_execute() {
+        let callee = sig("execute", "execute", false);
+        let mut caller = sig("runner", "runner", false);
+        caller.calls.push("module.sub.execute".to_string());
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        let edges_before = count_call_edges(&merged);
+        resolve_cross_file_call_edges(&mut merged, &[caller, sig("execute", "execute", false)]);
+        let edges_after = count_call_edges(&merged);
+
+        assert_eq!(
+            edges_before, edges_after,
+            "COMMON_NAMES exclusion: 'execute' should NOT be resolved via last-segment fallback"
+        );
+    }
+
+    /// Verify that short names (len <= 2) are excluded from last-segment fallback
+    #[test]
+    fn cross_file_short_names_excluded_from_fallback() {
+        let callee = sig("fn", "fn", false);
+        let mut caller = sig("caller", "caller", false);
+        caller.calls.push("some.path.fn".to_string());
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for nid in pdg_a.node_indices() {
+            if let Some(node) = pdg_a.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+        for nid in pdg_b.node_indices() {
+            if let Some(node) = pdg_b.get_node(nid) {
+                merged.add_node(node.clone());
+            }
+        }
+
+        let edges_before = count_call_edges(&merged);
+        resolve_cross_file_call_edges(&mut merged, &[caller, sig("fn", "fn", false)]);
+        let edges_after = count_call_edges(&merged);
+
+        assert_eq!(
+            edges_before, edges_after,
+            "Short name 'fn' (len=2) should NOT be resolved via last-segment fallback"
+        );
+    }
+
+    #[test]
+    fn cross_file_duplicate_qnames_do_not_overwrite_callers() {
+        let mut caller_a = sig("caller", "caller", false);
+        caller_a.calls.push("target".to_string());
+        let mut caller_b = sig("caller", "caller", false);
+        caller_b.calls.push("target".to_string());
+        let callee = sig("target", "target", false);
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller_a.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![caller_b.clone()], b"", "b.rs", "rust");
+        let pdg_c = extract_pdg_from_signatures(vec![callee.clone()], b"", "c.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for source in [&pdg_a, &pdg_b, &pdg_c] {
+            for nid in source.node_indices() {
+                if let Some(node) = source.get_node(nid) {
+                    merged.add_node(node.clone());
+                }
+            }
+        }
+
+        resolve_cross_file_call_edges(&mut merged, &[caller_a, caller_b, callee]);
+
+        assert!(has_call_edge_from_file(&merged, "a.rs", "caller", "target"));
+        assert!(has_call_edge_from_file(&merged, "b.rs", "caller", "target"));
+    }
+
+    #[test]
+    fn cross_file_file_owned_signatures_do_not_cross_apply_duplicate_qnames() {
+        let mut caller_a = sig("handler", "handler", false);
+        caller_a.calls.push("target_a".to_string());
+        let mut caller_b = sig("handler", "handler", false);
+        caller_b.calls.push("target_b".to_string());
+        let target_a = sig("target_a", "target_a", false);
+        let target_b = sig("target_b", "target_b", false);
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller_a.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![caller_b.clone()], b"", "b.rs", "rust");
+        let pdg_ta =
+            extract_pdg_from_signatures(vec![target_a.clone()], b"", "target_a.rs", "rust");
+        let pdg_tb =
+            extract_pdg_from_signatures(vec![target_b.clone()], b"", "target_b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for source in [&pdg_a, &pdg_b, &pdg_ta, &pdg_tb] {
+            for nid in source.node_indices() {
+                if let Some(node) = source.get_node(nid) {
+                    merged.add_node(node.clone());
+                }
+            }
+        }
+
+        resolve_cross_file_call_edges_for_files(
+            &mut merged,
+            &[
+                ("a.rs".to_string(), caller_a),
+                ("b.rs".to_string(), caller_b),
+                ("target_a.rs".to_string(), target_a),
+                ("target_b.rs".to_string(), target_b),
+            ],
+        );
+
+        assert!(has_call_edge_between_files(
+            &merged,
+            "a.rs",
+            "handler",
+            "target_a.rs",
+            "target_a"
+        ));
+        assert!(has_call_edge_between_files(
+            &merged,
+            "b.rs",
+            "handler",
+            "target_b.rs",
+            "target_b"
+        ));
+        assert!(!has_call_edge_between_files(
+            &merged,
+            "a.rs",
+            "handler",
+            "target_b.rs",
+            "target_b"
+        ));
+        assert!(!has_call_edge_between_files(
+            &merged,
+            "b.rs",
+            "handler",
+            "target_a.rs",
+            "target_a"
+        ));
+    }
+
+    #[test]
+    fn cross_file_rust_qualified_names_preserve_colon_segments() {
+        let mut caller = sig("handler", "my_mod::handler", false);
+        caller.calls.push("other_mod::target".to_string());
+        let callee = sig("target", "other_mod::target", false);
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![callee.clone()], b"", "b.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for source in [&pdg_a, &pdg_b] {
+            for nid in source.node_indices() {
+                if let Some(node) = source.get_node(nid) {
+                    merged.add_node(node.clone());
+                }
+            }
+        }
+
+        resolve_cross_file_call_edges_for_files(
+            &mut merged,
+            &[("a.rs".to_string(), caller), ("b.rs".to_string(), callee)],
+        );
+
+        assert!(has_call_edge_between_files(
+            &merged, "a.rs", "handler", "b.rs", "target"
+        ));
+    }
+
+    #[test]
+    fn cross_file_import_aliases_are_scoped_to_the_calling_signature() {
+        let mut caller_a = sig("handler_a", "handler_a", false);
+        caller_a.imports.push(ImportInfo {
+            path: "real.module.target".to_string(),
+            alias: Some("alias".to_string()),
+        });
+        caller_a.calls.push("alias".to_string());
+
+        let mut caller_b = sig("handler_b", "handler_b", false);
+        caller_b.calls.push("alias".to_string());
+
+        let callee = sig("target", "real.module.target", false);
+
+        let pdg_a = extract_pdg_from_signatures(vec![caller_a.clone()], b"", "a.rs", "rust");
+        let pdg_b = extract_pdg_from_signatures(vec![caller_b.clone()], b"", "b.rs", "rust");
+        let pdg_c = extract_pdg_from_signatures(vec![callee.clone()], b"", "c.rs", "rust");
+
+        let mut merged = ProgramDependenceGraph::new();
+        for source in [&pdg_a, &pdg_b, &pdg_c] {
+            for nid in source.node_indices() {
+                if let Some(node) = source.get_node(nid) {
+                    merged.add_node(node.clone());
+                }
+            }
+        }
+
+        resolve_cross_file_call_edges_for_files(
+            &mut merged,
+            &[
+                ("a.rs".to_string(), caller_a),
+                ("b.rs".to_string(), caller_b),
+                ("c.rs".to_string(), callee),
+            ],
+        );
+
+        assert!(has_call_edge_between_files(
+            &merged,
+            "a.rs",
+            "handler_a",
+            "c.rs",
+            "target"
+        ));
+        assert!(!has_call_edge_between_files(
+            &merged,
+            "b.rs",
+            "handler_b",
+            "c.rs",
+            "target"
+        ));
+    }
+
+    #[test]
+    fn qualified_name_from_node_handles_equivalent_path_suffixes() {
+        let node = Node {
+            id: "relative.rs:my_mod::handler".to_string(),
+            node_type: NodeType::Function,
+            name: "handler".to_string(),
+            file_path: Arc::from("/abs/relative.rs"),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "rust".to_string(),
+        };
+
+        assert_eq!(qualified_name_from_node(&node), Some("my_mod::handler"));
+    }
+
+    #[test]
+    fn qualified_name_from_node_rejects_different_path_suffixes() {
+        let node = Node {
+            id: "other.rs:my_mod::handler".to_string(),
+            node_type: NodeType::Function,
+            name: "handler".to_string(),
+            file_path: Arc::from("/abs/relative.rs"),
+            byte_range: (0, 10),
+            complexity: 1,
+            language: "rust".to_string(),
+        };
+
+        assert_eq!(qualified_name_from_node(&node), None);
     }
 }

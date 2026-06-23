@@ -101,35 +101,40 @@ Every tool call is **context-aware** — not atomic. When you look up a symbol, 
 
 ### Install
 
-**Via cargo (recommended):**
+**Option 1: PyPI (this package, recommended for Python users)**
+
+```bash
+pip install leindex
+leindex setup
+```
+
+The PyPI package installs a small Python launcher that bootstraps the real Rust
+`leindex` binary into `~/.cargo/bin` via `cargo install` on first run. Run
+`leindex setup` afterwards to install ONNX Runtime and download the
+`qwen3-embed-0.6b.onnx` model for neural (semantic) search. TF-IDF (keyword)
+search works immediately without setup. See [docs/NEURAL_SETUP.md](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/NEURAL_SETUP.md)
+for CPU/GPU/AMD/NVIDIA paths and troubleshooting.
+
+**Option 2: cargo (recommended for Rust users)**
 
 ```bash
 cargo install leindex
+leindex setup
 ```
 
-**Via install script:**
+**Option 3: install script (GitHub Release bundle)**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/scooter-lacroix/LeIndex/master/install.sh -o install-leindex.sh
 bash install-leindex.sh
+leindex setup
 ```
 
-**Via PyPI bootstrap wrapper:**
-
-```bash
-pip install leindex
-leindex --version
-```
-
-The PyPI package installs a small Python launcher. On first run it installs or updates
-the real Rust `leindex` binary in `~/.cargo/bin` via `cargo install leindex`. If Cargo
-is missing, the launcher explains the requirement and prompts to install Rust/Cargo when
-automatic setup is supported on the current platform.
-
-**Via npm MCP wrapper (recommended for AI tools):**
+**Option 4: npm MCP wrapper (recommended for AI tools like Cursor, Claude Code)**
 
 ```bash
 npm install -g @leindex/mcp
+npm run setup --prefix "$(npm root -g)/@leindex/mcp"
 ```
 
 **Environment Variables:**
@@ -138,6 +143,7 @@ npm install -g @leindex/mcp
 |------|----------|-------------|---------|
 | `LEINDEX_HOME` | No | Override storage/index home directory | `~/.leindex` |
 | `LEINDEX_PORT` | No | Override HTTP server port | `47500` |
+| `ORT_DYLIB_PATH` | No | Override ONNX Runtime library path | (discovered) |
 
 ### Index and search
 
@@ -221,7 +227,7 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 - **PDG analysis** — program dependence graph for structural understanding
 - **5-phase analysis** — additive multi-pass codebase analysis pipeline
 - **Cross-project indexing** — search across multiple repos at once
-- **16 MCP tools** — read, analyze, edit preview/apply, rename, impact analysis
+- **20 MCP tools** — read, analyze, edit preview/apply, rename, impact analysis
 - **HTTP + WebSocket server** — available through the unified `leindex` server modules and commands
 - **Dashboard** — Bun + React operational UI with project metrics and graph telemetry
 - **Low resource mode** — works on constrained hardware
@@ -252,7 +258,7 @@ arguments to the real Rust executable.
 
 ```bash
 git clone https://github.com/scooter-lacroix/LeIndex.git
-cd leindex
+cd LeIndex
 cargo build --release
 ```
 

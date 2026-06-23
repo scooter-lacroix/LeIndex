@@ -41,6 +41,7 @@ pub use refactor::Refactor;
 // =========================================================================
 
 #[cfg(test)]
+#[allow(clippy::arc_with_non_send_sync)]
 mod tests {
     use super::*;
 
