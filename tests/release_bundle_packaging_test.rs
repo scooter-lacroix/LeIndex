@@ -438,5 +438,4 @@ mod distribution_coverage {
             );
         }
     }
-
 }
