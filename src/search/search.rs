@@ -1423,27 +1423,23 @@ impl SearchEngine {
         // of the same file both resolve to qualified_name "new"). Panicking on
         // a parser limitation would crash production indexing. Instead, keep the
         // first occurrence and silently drop subsequent duplicates.
-        let mut seen = HashSet::new();
-        let mut dup_in_batch_set = HashSet::new();
-        for node in &nodes {
-            if !seen.insert(node.node_id.clone()) {
-                dup_in_batch_set.insert(node.node_id.clone());
+        let mut kept: HashSet<String> = HashSet::new();
+        let original_len = nodes.len();
+        nodes.retain(|n| {
+            if self.node_id_to_idx.contains_key(&n.node_id) {
+                return false;
             }
-        }
-        if !dup_in_batch_set.is_empty() {
+            kept.insert(n.node_id.clone())
+        });
+        let dropped = original_len - nodes.len();
+        if dropped > 0 {
             tracing::warn!(
-                "append_nodes: {} duplicate node_id(s) within batch; keeping first occurrence (e.g., '{}')",
-                dup_in_batch_set.len(),
-                dup_in_batch_set.iter().next().unwrap()
+                "append_nodes: dropped {} duplicate node_id(s) (kept {} of {})",
+                dropped,
+                nodes.len(),
+                original_len
             );
         }
-        nodes.retain(|n| {
-            // Drop if already seen in this batch OR already in the index.
-            let is_dup_in_batch =
-                dup_in_batch_set.contains(&n.node_id) && !seen.insert(n.node_id.clone()); // first insert passes, subsequent removed
-            let is_dup_existing = self.node_id_to_idx.contains_key(&n.node_id);
-            !is_dup_in_batch && !is_dup_existing
-        });
 
         if self.nodes.len() + nodes.len() > MAX_NODES {
             panic!(
