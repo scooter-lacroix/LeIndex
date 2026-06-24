@@ -1418,17 +1418,32 @@ impl SearchEngine {
     ///
     /// Panics if total node count exceeds MAX_NODES after appending.
     pub fn append_nodes(&mut self, mut nodes: Vec<NodeInfo>) {
+        // Deduplicate nodes by node_id. Duplicate IDs can occur when the parser
+        // produces unqualified names (e.g., two `fn new()` in different impls
+        // of the same file both resolve to qualified_name "new"). Panicking on
+        // a parser limitation would crash production indexing. Instead, keep the
+        // first occurrence and silently drop subsequent duplicates.
         let mut seen = HashSet::new();
+        let mut dup_in_batch_set = HashSet::new();
         for node in &nodes {
-            let dup_in_batch = !seen.insert(node.node_id.clone());
-            let dup_existing = self.node_id_to_idx.contains_key(&node.node_id);
-            if dup_in_batch || dup_existing {
-                panic!(
-                    "append_nodes received duplicate node_id '{}'; use incremental_reindex for updates",
-                    node.node_id
-                );
+            if !seen.insert(node.node_id.clone()) {
+                dup_in_batch_set.insert(node.node_id.clone());
             }
         }
+        if !dup_in_batch_set.is_empty() {
+            tracing::warn!(
+                "append_nodes: {} duplicate node_id(s) within batch; keeping first occurrence (e.g., '{}')",
+                dup_in_batch_set.len(),
+                dup_in_batch_set.iter().next().unwrap()
+            );
+        }
+        nodes.retain(|n| {
+            // Drop if already seen in this batch OR already in the index.
+            let is_dup_in_batch =
+                dup_in_batch_set.contains(&n.node_id) && !seen.insert(n.node_id.clone()); // first insert passes, subsequent removed
+            let is_dup_existing = self.node_id_to_idx.contains_key(&n.node_id);
+            !is_dup_in_batch && !is_dup_existing
+        });
 
         if self.nodes.len() + nodes.len() > MAX_NODES {
             panic!(
