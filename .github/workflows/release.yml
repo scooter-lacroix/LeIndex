@@ -191,13 +191,6 @@ jobs:
             ort_platform: manylinux_2_28_aarch64
             include_migraphx: 'false'
 
-          - target: x86_64-apple-darwin
-            os: macos-13
-            asset_name: macos-x86_64
-            ort_package: onnxruntime
-            ort_platform: macosx_13_0_x86_64
-            include_migraphx: 'false'
-
           - target: aarch64-apple-darwin
             os: macos-latest
             asset_name: macos-aarch64
