@@ -122,10 +122,7 @@ impl SmokeTestResult {
     /// One-line status string for terminal output.
     pub fn status_line(&self) -> String {
         if self.skipped {
-            return match &self.note {
-                Some(n) => format!("embedding test: SKIP ({})", n),
-                None => "embedding test: SKIP".to_string(),
-            };
+            return "embedding test: SKIP".to_string();
         }
         if self.passed {
             match self.dimension {
