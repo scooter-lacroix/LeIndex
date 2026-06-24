@@ -35,6 +35,29 @@ fn leindex_binary() -> PathBuf {
     workspace_root().join("target/release/leindex")
 }
 
+/// Helper: check if the release leindex binary exists.
+///
+/// Memcheck integration tests require `target/release/leindex` which is NOT
+/// built during CI's `lint-and-test` job (only `cargo test --workspace` runs
+/// in debug mode). Call this at the top of each test alongside the fixture
+/// check to skip gracefully when the release binary is absent.
+fn release_binary_available() -> bool {
+    leindex_binary().exists()
+}
+
+/// Skip the current test if the release binary is absent.
+macro_rules! require_release_binary {
+    () => {
+        if !release_binary_available() {
+            eprintln!(
+                "SKIP: release binary not found at {:?}. Run: cargo build --release --bin leindex",
+                leindex_binary()
+            );
+            return;
+        }
+    };
+}
+
 /// Helper: run the memcheck binary and return (exit_code, stdout, stderr).
 fn run_memcheck(fixture: &str, extra_args: &[&str]) -> (bool, String, String) {
     let memcheck_bin = std::env::var("CARGO_BIN_EXE_memcheck")
@@ -91,6 +114,8 @@ fn test_val_measure_001_canonical_multi_phase_report() {
         return;
     }
 
+    require_release_binary!();
+
     let (success, report) = run_memcheck_to_json(fixture.to_str().unwrap());
 
     assert!(success, "memcheck should exit 0");
@@ -139,6 +164,8 @@ fn test_val_measure_002_phase_order_is_canonical() {
         eprintln!("SKIP: fixture not found at {:?}", fixture);
         return;
     }
+
+    require_release_binary!();
 
     let (success, report) = run_memcheck_to_json(fixture.to_str().unwrap());
     assert!(success, "memcheck should exit 0");
@@ -192,6 +219,8 @@ fn test_val_measure_003_per_phase_schema_has_required_metrics() {
         eprintln!("SKIP: fixture not found at {:?}", fixture);
         return;
     }
+
+    require_release_binary!();
 
     let (success, report) = run_memcheck_to_json(fixture.to_str().unwrap());
     assert!(success, "memcheck should exit 0");
@@ -276,6 +305,8 @@ fn test_val_measure_004_samples_fresh_process() {
         return;
     }
 
+    require_release_binary!();
+
     // Run twice and verify timestamps differ (proving fresh runs)
     let (success1, report1) = run_memcheck_to_json(fixture.to_str().unwrap());
     assert!(success1, "first memcheck run should succeed");
@@ -303,6 +334,8 @@ fn test_val_measure_005_linux_rss_is_primary_metric() {
         eprintln!("SKIP: fixture not found at {:?}", fixture);
         return;
     }
+
+    require_release_binary!();
 
     let (success, report) = run_memcheck_to_json(fixture.to_str().unwrap());
     assert!(success, "memcheck should exit 0");
@@ -346,6 +379,8 @@ fn test_val_measure_006_mapped_file_and_anon_captured() {
         eprintln!("SKIP: fixture not found at {:?}", fixture);
         return;
     }
+
+    require_release_binary!();
 
     let (success, report) = run_memcheck_to_json(fixture.to_str().unwrap());
     assert!(success, "memcheck should exit 0");
@@ -418,6 +453,8 @@ fn test_report_json_is_valid_and_parseable() {
         return;
     }
 
+    require_release_binary!();
+
     let (success, report) = run_memcheck_to_json(fixture.to_str().unwrap());
     assert!(success, "memcheck should exit 0");
 
@@ -451,6 +488,8 @@ fn test_idle_phases_have_reasonable_duration() {
         eprintln!("SKIP: fixture not found at {:?}", fixture);
         return;
     }
+
+    require_release_binary!();
 
     let (success, report) = run_memcheck_to_json(fixture.to_str().unwrap());
     assert!(success, "memcheck should exit 0");
