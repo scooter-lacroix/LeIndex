@@ -53,11 +53,12 @@ pub const DEFAULT_MAX_TEXT_SIZE: usize = 1024 * 1024;
 
 /// Maximum texts per ONNX inference call.
 ///
+/// Processing in batches of 32 dramatically improves throughput by amortizing
 /// The qwen3-embed-0.6b.onnx model was exported with a fixed batch dimension
-/// of 1 in its internal attention mask tensors. Any batch_size > 1 causes
-/// "Shape mismatch attempting to re-use buffer" errors in ONNX Runtime.
-/// Processing one text at a time is the only correct approach for this model.
-/// At ~17ms per text on CPU, 10,000 texts takes ~2.8 minutes.
+/// of 1 in its internal attention mask tensors (the And node's shape is
+/// {1,1,seq,seq}). Any batch_size > 1 causes "Shape mismatch attempting to
+/// re-use buffer" errors in ONNX Runtime. Processing one text at a time is
+/// the only correct approach for this model.
 #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
 const ONNX_INFERENCE_BATCH_SIZE: usize = 1;
 
@@ -366,6 +367,21 @@ impl WorkerRuntime {
             };
         }
 
+        // For GPU execution providers (MIGraphX/ROCm), use Level3 optimization
+        // so the ONNX graph undergoes maximum operator fusion and layout
+        // transformations before the EP sees it. MIGraphX works by identifying
+        // contiguous subgraphs it can compile to AMD GPU code; at Level1 the
+        // graph is too granular (individual Gemm/MatMul nodes, unfused
+        // attention) and MIGraphX falls back to CPU for most operators,
+        // leaving VRAM almost entirely unused (~42 MB / 24 GB observed
+        // on RX 7900 XTX). Level3 enables the transformer/attention fusion
+        // passes that produce subgraphs large enough for MIGraphX to take
+        // over, actually moving computation to the GPU.
+        let optimization_level = match provider_name {
+            "migraphx" | "rocm" | "auto" => GraphOptimizationLevel::Level3,
+            _ => GraphOptimizationLevel::Level1,
+        };
+
         let session_builder = Session::builder()?
             // Disable memory pattern reuse to prevent shape mismatch errors when
             // sub-batch sizes vary between inference calls (e.g., [32, seq, dim]
@@ -373,10 +389,7 @@ impl WorkerRuntime {
             // buffer shaped for the first batch size and fails on subsequent calls
             // with a different batch size: "{1,1,143,143} != {12,1,143,143}".
             .with_memory_pattern(false)?
-            // Use Level1 optimization to avoid Level2+ graph transformations
-            // that fuse attention mask operations into nodes with fixed buffer
-            // shapes, causing the same shape mismatch on variable batch sizes.
-            .with_optimization_level(GraphOptimizationLevel::Level1)?;
+            .with_optimization_level(optimization_level)?;
 
         // VAL-ORT-015 / VAL-ORT-016: dynamic-load pre-flight check.
         //
@@ -814,10 +827,13 @@ impl WorkerRuntime {
         let total_texts = encodings.len();
         for (chunk_idx, sub_batch) in encodings.chunks(ONNX_INFERENCE_BATCH_SIZE).enumerate() {
             // Pad the last sub-batch to ONNX_INFERENCE_BATCH_SIZE with dummy texts.
-            // The qwen3-embed model has internal attention bias tensors that assume
-            // a fixed batch dimension. When the last sub-batch has fewer texts than
-            // prior sub-batches, ONNX Runtime's internal buffer reuse causes a shape
-            // mismatch error. Padding ensures all sub-batches have the same batch size.
+            // Although with_memory_pattern(false) prevents most buffer-reuse shape
+            // mismatches, padding the final partial batch keeps the batch dimension
+            // constant across all inference calls. This is a belt-and-suspenders
+            // measure: some ORT EP internal optimizations may still re-use
+            // intermediate buffers keyed by batch size, so a constant batch
+            // dimension avoids any residual mismatch. Padding results are
+            // discarded after inference.
             let is_last_chunk = (chunk_idx + 1) * ONNX_INFERENCE_BATCH_SIZE >= total_texts;
             let needs_padding = is_last_chunk && sub_batch.len() < ONNX_INFERENCE_BATCH_SIZE;
 
