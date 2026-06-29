@@ -1934,8 +1934,11 @@ async fn cmd_setup_impl(
     // working neural configuration. We exit non-zero so CI/scripts detect the
     // failure, but we still printed the summary and persisted the config so
     // the user has actionable diagnostics.
+    // A *skipped* smoke test (e.g., compiled without `onnx`) does not count as
+    // a failure -- the binary is still usable for TF-IDF search, and neural
+    // inference is delegated to the leindex-embed worker at runtime.
     if let Some(ref smoke) = result.smoke_test {
-        if !smoke.passed {
+        if !smoke.passed && !smoke.skipped {
             anyhow::bail!("setup smoke test failed");
         }
     }
