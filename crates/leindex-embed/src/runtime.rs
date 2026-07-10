@@ -53,12 +53,9 @@ pub const DEFAULT_MAX_TEXT_SIZE: usize = 1024 * 1024;
 
 /// Maximum texts per ONNX inference call.
 ///
-/// Processing in batches of 32 dramatically improves throughput by amortizing
-/// The qwen3-embed-0.6b.onnx model was exported with a fixed batch dimension
-/// of 1 in its internal attention mask tensors (the And node's shape is
-/// {1,1,seq,seq}). Any batch_size > 1 causes "Shape mismatch attempting to
-/// re-use buffer" errors in ONNX Runtime. Processing one text at a time is
-/// the only correct approach for this model.
+/// The bundled qwen3-embed-0.6b.onnx model has a fixed batch dimension of 1
+/// in its internal attention-mask tensors. Larger batches cause shape-mismatch
+/// errors in ONNX Runtime, so inference processes one text per model call.
 #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
 const ONNX_INFERENCE_BATCH_SIZE: usize = 1;
 
@@ -420,7 +417,9 @@ impl WorkerRuntime {
                      ORT_DYLIB_PATH at a migraphx-enabled libonnxruntime.",
                     provider_name
                 );
-                let session = session_builder
+                let session = Session::builder()?
+                    .with_memory_pattern(false)?
+                    .with_optimization_level(GraphOptimizationLevel::Level1)?
                     .with_execution_providers([ort::ep::CPU::default().build()])?
                     .commit_from_file(model_path)?;
                 return Ok(SessionBuildOutcome {
