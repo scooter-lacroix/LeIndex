@@ -380,11 +380,9 @@ impl WorkerRuntime {
         };
 
         let session_builder = Session::builder()?
-            // Disable memory pattern reuse to prevent shape mismatch errors when
-            // sub-batch sizes vary between inference calls (e.g., [32, seq, dim]
-            // followed by [12, seq, dim]). Without this, ORT caches an internal
-            // buffer shaped for the first batch size and fails on subsequent calls
-            // with a different batch size: "{1,1,143,143} != {12,1,143,143}".
+            // Disable memory pattern reuse because tokenized sequence lengths vary
+            // between inference calls. Without this, ORT may reuse an internal
+            // buffer shaped for the previous sequence and report a shape mismatch.
             .with_memory_pattern(false)?
             .with_optimization_level(optimization_level)?;
 
