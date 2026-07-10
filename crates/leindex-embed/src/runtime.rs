@@ -15,11 +15,8 @@
 
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-#[cfg(feature = "onnx")]
-use std::sync::Mutex;
 
 use crate::model_path::ModelResolver;
 use crate::protocol::{
@@ -231,9 +228,10 @@ impl RuntimeConfig {
 ///
 /// When built with the `onnx` feature, also holds the ONNX session and tokenizer
 /// for neural embedding inference.
+#[derive(Clone)]
 pub struct WorkerRuntime {
     config: RuntimeConfig,
-    last_activity: Instant,
+    last_activity: Arc<Mutex<Instant>>,
     shutdown_flag: Arc<AtomicBool>,
 
     /// ONNX session for neural embedding inference. Only available with `onnx` feature.
@@ -298,7 +296,7 @@ impl WorkerRuntime {
 
         Self {
             config,
-            last_activity: Instant::now(),
+            last_activity: Arc::new(Mutex::new(Instant::now())),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "onnx")]
             session,
@@ -592,12 +590,19 @@ impl WorkerRuntime {
 
     /// Check if the idle timeout has elapsed.
     pub fn is_idle_expired(&self) -> bool {
-        self.last_activity.elapsed() >= self.config.idle_timeout
+        self.last_activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .elapsed()
+            >= self.config.idle_timeout
     }
 
     /// Reset the idle timer (called after each successful request).
-    pub fn touch(&mut self) {
-        self.last_activity = Instant::now();
+    pub fn touch(&self) {
+        *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
     }
 
     /// Run the main IPC loop over the given reader/writer pair.
@@ -610,7 +615,7 @@ impl WorkerRuntime {
     ///
     /// VAL-CPHASE-004: Uses local IPC only (stdin/stdout pipes or Unix socket).
     pub fn run<R: Read + Send + 'static, W: Write>(
-        &mut self,
+        &self,
         reader: R,
         writer: W,
     ) -> anyhow::Result<()> {
@@ -691,7 +696,7 @@ impl WorkerRuntime {
     /// Without this, a blocking `read_exact` would block forever and the
     /// worker would never tear down its ONNX session on idle.
     pub fn run_loop<R: Read + Send + 'static, W: Write>(
-        &mut self,
+        &self,
         reader: R,
         mut writer: W,
     ) -> anyhow::Result<()> {
@@ -925,15 +930,11 @@ impl WorkerRuntime {
         // dynamic batch; the default is safe for fixed-batch artifacts.
         let mut all_pooled: Vec<f32> = Vec::with_capacity(encodings.len() * expected_dim);
 
-        let inference_batch_size = configured_onnx_inference_batch_size(
-            &self.config.model_name,
-            &self.config.execution_provider,
-        );
-        let fixed_batch = self
-            .config
-            .execution_provider
-            .eq_ignore_ascii_case("migraphx")
-            || self.config.execution_provider.eq_ignore_ascii_case("rocm");
+        let active_provider = &self.provider_runtime_status.execution_provider;
+        let inference_batch_size =
+            configured_onnx_inference_batch_size(&self.config.model_name, active_provider);
+        let fixed_batch = active_provider.eq_ignore_ascii_case("migraphx")
+            || active_provider.eq_ignore_ascii_case("rocm");
         for sub_batch in encodings.chunks(inference_batch_size) {
             if fixed_batch && sub_batch.len() < inference_batch_size {
                 let mut padded = sub_batch.to_vec();
@@ -1666,13 +1667,25 @@ mod tests {
             idle_timeout: Duration::from_millis(10),
             ..RuntimeConfig::default()
         };
-        let mut rt = WorkerRuntime::new(config);
+        let rt = WorkerRuntime::new(config);
 
         std::thread::sleep(Duration::from_millis(20));
         assert!(rt.is_idle_expired());
 
         rt.touch();
         assert!(!rt.is_idle_expired());
+    }
+
+    #[test]
+    fn cloned_runtime_shares_idle_activity() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<WorkerRuntime>();
+
+        let runtime = WorkerRuntime::new(RuntimeConfig::default());
+        let cloned = runtime.clone();
+        assert!(Arc::ptr_eq(&runtime.last_activity, &cloned.last_activity));
+        cloned.touch();
+        assert!(!runtime.is_idle_expired());
     }
 
     #[test]
@@ -1905,7 +1918,7 @@ mod tests {
             idle_timeout: Duration::from_secs(300),
             ..RuntimeConfig::default()
         };
-        let mut rt = WorkerRuntime::new(config);
+        let rt = WorkerRuntime::new(config);
 
         // Build a single embed request frame
         let request = EmbedRequest {
@@ -1930,7 +1943,7 @@ mod tests {
             idle_timeout: Duration::from_secs(300),
             ..RuntimeConfig::default()
         };
-        let mut rt = WorkerRuntime::new(config);
+        let rt = WorkerRuntime::new(config);
 
         // Build two embed request frames
         let request1 = EmbedRequest {
@@ -1968,7 +1981,7 @@ mod tests {
             idle_timeout: Duration::from_millis(1),
             ..RuntimeConfig::default()
         };
-        let mut rt = WorkerRuntime::new(config);
+        let rt = WorkerRuntime::new(config);
 
         // Empty input — the loop should detect idle timeout
         let reader = Cursor::new(Vec::<u8>::new());

@@ -24,6 +24,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -448,6 +450,15 @@ enum WorkerWriter {
     Unix(UnixStream),
 }
 
+impl WorkerWriter {
+    fn shutdown(&self) {
+        #[cfg(unix)]
+        if let WorkerWriter::Unix(stream) = self {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
 impl Write for WorkerWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
@@ -474,6 +485,58 @@ enum ReadRequest {
     },
     /// Signal the read thread to shut down.
     Shutdown,
+}
+
+#[cfg(unix)]
+struct DaemonSpawnLock {
+    file: std::fs::File,
+}
+
+#[cfg(unix)]
+impl DaemonSpawnLock {
+    fn acquire(path: &Path, timeout: Duration) -> Result<Self, ClientError> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|e| {
+                ClientError::SpawnFailed(format!(
+                    "failed to open worker daemon lock {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result == 0 {
+                return Ok(Self { file });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(ClientError::SpawnFailed(format!(
+                    "failed to lock worker daemon startup {}: {}",
+                    path.display(),
+                    error
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(ClientError::Timeout);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for DaemonSpawnLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
 }
 
 impl Default for EmbeddingClient {
@@ -509,6 +572,20 @@ impl EmbeddingClient {
             .lock()
             .ok()
             .and_then(|line| line.as_deref().and_then(parse_startup_report_provider))
+    }
+
+    /// Wait briefly for the stderr mirror to publish the startup report.
+    pub fn wait_for_active_execution_provider(&self, timeout: Duration) -> Option<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(provider) = self.active_execution_provider() {
+                return Some(provider);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Allocate a new unique batch ID.
@@ -687,6 +764,13 @@ impl EmbeddingClient {
                 ))
             })?;
         }
+
+        let lock_path = socket_path.with_extension("lock");
+        let _spawn_lock =
+            DaemonSpawnLock::acquire(&lock_path, Duration::from_secs(IPC_TIMEOUT_SECS))?;
+        if let Some(handle) = self.connect_daemon(&socket_path, None)? {
+            return Ok(Some(handle));
+        }
         let _ = std::fs::remove_file(&socket_path);
 
         let mut cmd = Command::new(worker_path);
@@ -709,7 +793,7 @@ impl EmbeddingClient {
             .spawn()
             .map_err(|e| ClientError::SpawnFailed(e.to_string()))?;
 
-        let deadline = Instant::now() + Duration::from_secs(60);
+        let deadline = Instant::now() + Duration::from_secs(IPC_TIMEOUT_SECS);
         loop {
             match UnixStream::connect(&socket_path) {
                 Ok(stream) => {
@@ -873,12 +957,24 @@ impl EmbeddingClient {
         R: Read + Send + 'static,
     {
         thread::spawn(move || {
-            let reader = BufReader::new(stderr);
-            for line in reader.lines().map_while(Result::ok) {
-                eprintln!("{}", line);
-                if line.contains("startup_report") {
-                    if let Ok(mut report) = last_startup_report.lock() {
-                        *report = Some(line);
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let line = line.trim_end_matches(['\r', '\n']);
+                        eprintln!("{}", line);
+                        if line.contains("startup_report") {
+                            if let Ok(mut report) = last_startup_report.lock() {
+                                *report = Some(line.to_string());
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("leindex-embed stderr mirror failed: {}", e);
+                        break;
                     }
                 }
             }
@@ -904,6 +1000,9 @@ impl EmbeddingClient {
 
     fn shutdown_worker_handle(handle: &mut WorkerHandle, kill_persistent: bool) {
         let _ = handle.read_request_tx.send(ReadRequest::Shutdown);
+        if let Some(writer) = handle.writer.as_ref() {
+            writer.shutdown();
+        }
         drop(handle.writer.take());
 
         let should_kill_child = !handle.persistent || kill_persistent;
@@ -940,18 +1039,16 @@ impl EmbeddingClient {
             }
         }
 
-        if !handle.persistent || should_kill_child {
-            let (replacement_tx, _replacement_rx) = mpsc::channel::<ReadRequest>();
-            let old_tx = std::mem::replace(&mut handle.read_request_tx, replacement_tx);
-            drop(old_tx);
+        let (replacement_tx, _replacement_rx) = mpsc::channel::<ReadRequest>();
+        let old_tx = std::mem::replace(&mut handle.read_request_tx, replacement_tx);
+        drop(old_tx);
 
-            let replacement_thread = thread::spawn(|| {});
-            let read_thread = std::mem::replace(&mut handle.read_thread, replacement_thread);
-            let _ = read_thread.join();
+        let replacement_thread = thread::spawn(|| {});
+        let read_thread = std::mem::replace(&mut handle.read_thread, replacement_thread);
+        let _ = read_thread.join();
 
-            if let Some(stderr_thread) = handle.stderr_thread.take() {
-                let _ = stderr_thread.join();
-            }
+        if let Some(stderr_thread) = handle.stderr_thread.take() {
+            let _ = stderr_thread.join();
         }
     }
 
@@ -1335,6 +1432,69 @@ mod tests {
             Some("startup_report provider=cuda status=available".to_string());
 
         assert_eq!(client.active_execution_provider().as_deref(), Some("cuda"));
+    }
+
+    #[test]
+    fn test_wait_for_active_provider_observes_stderr_update() {
+        let client = EmbeddingClient::new_pipe();
+        let report = Arc::clone(&client.last_startup_report);
+        let updater = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(20));
+            *report.lock().unwrap() =
+                Some("startup_report provider=migraphx status=available".to_string());
+        });
+
+        assert_eq!(
+            client
+                .wait_for_active_execution_provider(Duration::from_secs(1))
+                .as_deref(),
+            Some("migraphx")
+        );
+        updater.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_spawn_lock_serializes_contenders() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("worker.lock");
+        let first = DaemonSpawnLock::acquire(&path, Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            DaemonSpawnLock::acquire(&path, Duration::from_millis(20)),
+            Err(ClientError::Timeout)
+        ));
+        drop(first);
+        DaemonSpawnLock::acquire(&path, Duration::from_secs(1)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_shutdown_unblocks_and_joins_reader() {
+        let (client_stream, _server_stream) = UnixStream::pair().unwrap();
+        let mut handle = EmbeddingClient::socket_worker_handle(client_stream, None, None).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        handle
+            .read_request_tx
+            .send(ReadRequest::Read { tx })
+            .unwrap();
+        thread::sleep(Duration::from_millis(10));
+
+        EmbeddingClient::shutdown_worker_handle(&mut handle, false);
+    }
+
+    #[test]
+    fn stderr_mirror_exits_after_reported_io_error() {
+        struct FailingReader;
+        impl Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("synthetic stderr failure"))
+            }
+        }
+
+        let report = Arc::new(Mutex::new(None));
+        EmbeddingClient::spawn_stderr_thread(FailingReader, report)
+            .join()
+            .unwrap();
     }
 
     #[test]

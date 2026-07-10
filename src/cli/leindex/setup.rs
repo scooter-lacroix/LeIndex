@@ -830,7 +830,8 @@ fn run_embedding_smoke_test_inner(expected_provider: Option<ExecutionProvider>) 
         .unwrap_or_else(|| "auto".to_string());
     match client.embed(&[SMOKE_TEST_TEXT.to_string()], SMOKE_TEST_EXPECTED_DIM) {
         Ok(response) => {
-            let active_provider = client.active_execution_provider();
+            let active_provider =
+                client.wait_for_active_execution_provider(std::time::Duration::from_millis(500));
             if response.count == 0 {
                 return SmokeTestResult {
                     passed: false,

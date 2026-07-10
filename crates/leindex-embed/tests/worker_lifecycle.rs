@@ -83,7 +83,7 @@ fn test_worker_uses_local_ipc_only() {
     // The worker communicates over stdin/stdout pipes (local IPC).
     // This test verifies the runtime accepts a local pipe-like interface.
     let config = RuntimeConfig::default();
-    let mut rt = WorkerRuntime::new(config);
+    let rt = WorkerRuntime::new(config);
 
     let request = EmbedRequest {
         texts: vec!["local ipc test".to_string()],
@@ -191,7 +191,7 @@ fn test_worker_reusable_via_run_loop() {
         idle_timeout: Duration::from_secs(300),
         ..RuntimeConfig::default()
     };
-    let mut rt = WorkerRuntime::new(config);
+    let rt = WorkerRuntime::new(config);
 
     let mut all_wire = Vec::new();
 
@@ -221,7 +221,7 @@ fn test_worker_idle_timeout_teardown() {
         idle_timeout: Duration::from_millis(1),
         ..RuntimeConfig::default()
     };
-    let mut rt = WorkerRuntime::new(config);
+    let rt = WorkerRuntime::new(config);
 
     // With an empty input, the run_loop should exit cleanly
     // (either from EOF or idle timeout)
@@ -794,7 +794,7 @@ fn test_full_lifecycle_cold_start_reuse_teardown_restart() {
         idle_timeout: Duration::from_secs(300),
         ..RuntimeConfig::default()
     };
-    let mut rt1 = WorkerRuntime::new(config.clone());
+    let rt1 = WorkerRuntime::new(config.clone());
 
     let request = EmbedRequest {
         texts: vec!["cold start".to_string()],
@@ -811,7 +811,7 @@ fn test_full_lifecycle_cold_start_reuse_teardown_restart() {
     drop(rt1);
 
     // Phase 3: Restart with a new runtime instance
-    let mut rt2 = WorkerRuntime::new(config);
+    let rt2 = WorkerRuntime::new(config);
 
     let request2 = EmbedRequest {
         texts: vec!["after restart".to_string()],

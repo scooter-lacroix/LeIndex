@@ -138,10 +138,10 @@ pub fn run() -> ! {
     }
 
     // Create the worker runtime
-    let mut runtime = WorkerRuntime::new(config);
+    let runtime = WorkerRuntime::new(config);
 
     if let Some(path) = socket_path {
-        if let Err(e) = run_socket_worker(&mut runtime, path) {
+        if let Err(e) = run_socket_worker(&runtime, path) {
             tracing::error!("socket worker failed: {}", e);
             process::exit(1);
         }
@@ -171,7 +171,7 @@ fn parse_socket_arg(argv: &[String]) -> Option<PathBuf> {
 }
 
 #[cfg(unix)]
-fn run_socket_worker(runtime: &mut WorkerRuntime, socket_path: PathBuf) -> anyhow::Result<()> {
+fn run_socket_worker(runtime: &WorkerRuntime, socket_path: PathBuf) -> anyhow::Result<()> {
     use std::os::unix::net::UnixListener;
 
     if socket_path.exists() {
@@ -197,36 +197,86 @@ fn run_socket_worker(runtime: &mut WorkerRuntime, socket_path: PathBuf) -> anyho
 
         match listener.accept() {
             Ok((stream, _addr)) => {
-                let reader = stream.try_clone()?;
-                match runtime.run(reader, stream) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        if e.downcast_ref::<io::Error>().is_some_and(|io_err| {
-                            matches!(
-                                io_err.kind(),
-                                io::ErrorKind::BrokenPipe
-                                    | io::ErrorKind::ConnectionReset
-                                    | io::ErrorKind::UnexpectedEof
-                            )
-                        }) {
-                            tracing::debug!(
-                                "socket client disconnected before response was written"
-                            );
-                        } else {
-                            return Err(e);
-                        }
-                    }
+                let connection_runtime = runtime.clone();
+                std::thread::spawn(move || handle_socket_client(connection_runtime, stream));
+            }
+            Err(e) => {
+                let Some(delay) = accept_retry_delay(&e) else {
+                    return Err(e.into());
+                };
+                if e.kind() != io::ErrorKind::WouldBlock {
+                    tracing::warn!(error = %e, "transient socket accept error; retrying");
+                }
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => return Err(e.into()),
         }
     }
 }
 
+#[cfg(unix)]
+fn handle_socket_client(runtime: WorkerRuntime, stream: std::os::unix::net::UnixStream) {
+    let reader = match stream.try_clone() {
+        Ok(reader) => reader,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to clone embedding client socket");
+            return;
+        }
+    };
+
+    if let Err(e) = runtime.run(reader, stream) {
+        if e.downcast_ref::<io::Error>().is_some_and(|io_err| {
+            matches!(
+                io_err.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::UnexpectedEof
+            )
+        }) {
+            tracing::debug!("socket client disconnected before response was written");
+        } else {
+            tracing::warn!(error = %e, "embedding socket client failed");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn accept_retry_delay(error: &io::Error) -> Option<Duration> {
+    match error.kind() {
+        io::ErrorKind::WouldBlock => Some(Duration::from_millis(100)),
+        io::ErrorKind::Interrupted => Some(Duration::ZERO),
+        io::ErrorKind::ConnectionAborted => Some(Duration::from_millis(10)),
+        _ if matches!(error.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) => {
+            Some(Duration::from_millis(250))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(not(unix))]
-fn run_socket_worker(_runtime: &mut WorkerRuntime, _socket_path: PathBuf) -> anyhow::Result<()> {
+fn run_socket_worker(_runtime: &WorkerRuntime, _socket_path: PathBuf) -> anyhow::Result<()> {
     anyhow::bail!("socket worker mode is only supported on Unix")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_retry_delay_covers_transient_errors() {
+        assert_eq!(
+            accept_retry_delay(&io::Error::from(io::ErrorKind::WouldBlock)),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            accept_retry_delay(&io::Error::from(io::ErrorKind::Interrupted)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            accept_retry_delay(&io::Error::from_raw_os_error(libc::EMFILE)),
+            Some(Duration::from_millis(250))
+        );
+        assert!(accept_retry_delay(&io::Error::from(io::ErrorKind::InvalidInput)).is_none());
+    }
 }

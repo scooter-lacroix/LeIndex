@@ -30,6 +30,10 @@ All notable changes to the LeIndex project are documented in this file.
 - Setup no longer treats a large ONNX file as verified solely because it exists; model, tokenizer, and config checksums must all match.
 - MIGraphX compilation and provider messages are captured in a persistent worker log instead of corrupting MCP stdio or disappearing with a short-lived process.
 - Memory-budget runs force direct worker IPC and only reap embedding workers owned by the measured process; they no longer accumulate resident daemons or risk terminating workers from another CLI or MCP session.
+- The resident embedding daemon accepts concurrent MCP and CLI connections, serializes cross-process startup with an OS lock, retries transient listener errors, and closes client reader threads deterministically after disconnects or timeouts.
+- MIGraphX batching follows the provider that actually initialized, including `auto` selection, and setup waits for the worker startup report before validating GPU activation.
+- Corrupt mmap node IDs now produce row-specific hydration errors instead of being silently reported as missing embeddings; mmap embedding copies no longer contain an unchecked slice panic.
+- PDG search fingerprints use sorted fixed-size record digests instead of allocating formatted strings for every node and edge.
 
 ### Distribution
 

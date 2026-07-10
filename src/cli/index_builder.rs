@@ -1797,18 +1797,31 @@ pub(crate) fn try_load_search_snapshot(
     }
 }
 
+struct Blake3FormatWriter<'a>(&'a mut blake3::Hasher);
+
+impl std::fmt::Write for Blake3FormatWriter<'_> {
+    fn write_str(&mut self, value: &str) -> std::fmt::Result {
+        self.0.update(value.as_bytes());
+        Ok(())
+    }
+}
+
 /// Stable fingerprint of the PDG state that materially affects search
 /// hydration. This prevents a snapshot produced for one PDG from being reused
 /// after storage changes that happen to preserve node/edge counts.
 pub(crate) fn pdg_search_fingerprint(pdg: &ProgramDependenceGraph) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"leindex-pdg-search-v1");
+    use std::fmt::Write as _;
 
-    let mut nodes: Vec<String> = pdg
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"leindex-pdg-search-v2");
+
+    let mut nodes: Vec<[u8; 32]> = pdg
         .node_indices()
         .filter_map(|node_idx| {
             pdg.get_node(node_idx).map(|node| {
-                format!(
+                let mut record = blake3::Hasher::new();
+                write!(
+                    Blake3FormatWriter(&mut record),
                     "{}\0{:?}\0{}\0{}\0{}\0{}\0{}\0{}",
                     node.id,
                     node.node_type,
@@ -1819,23 +1832,26 @@ pub(crate) fn pdg_search_fingerprint(pdg: &ProgramDependenceGraph) -> String {
                     node.complexity,
                     node.language
                 )
+                .expect("hash writer is infallible");
+                *record.finalize().as_bytes()
             })
         })
         .collect();
-    nodes.sort();
+    nodes.sort_unstable();
     for node in nodes {
-        hasher.update(node.as_bytes());
-        hasher.update(b"\n");
+        hasher.update(&node);
     }
 
-    let mut edges: Vec<String> = pdg
+    let mut edges: Vec<[u8; 32]> = pdg
         .edge_indices()
         .filter_map(|edge_idx| {
             let edge = pdg.get_edge(edge_idx)?;
             let (from, to) = pdg.edge_endpoints(edge_idx)?;
             let from = pdg.get_node(from)?;
             let to = pdg.get_node(to)?;
-            Some(format!(
+            let mut record = blake3::Hasher::new();
+            write!(
+                Blake3FormatWriter(&mut record),
                 "{}\0{}\0{:?}\0{:?}\0{:?}\0{:?}",
                 from.id,
                 to.id,
@@ -1843,13 +1859,14 @@ pub(crate) fn pdg_search_fingerprint(pdg: &ProgramDependenceGraph) -> String {
                 edge.metadata.call_count,
                 edge.metadata.variable_name,
                 edge.metadata.confidence.map(f32::to_bits)
-            ))
+            )
+            .expect("hash writer is infallible");
+            Some(*record.finalize().as_bytes())
         })
         .collect();
-    edges.sort();
+    edges.sort_unstable();
     for edge in edges {
-        hasher.update(edge.as_bytes());
-        hasher.update(b"\n");
+        hasher.update(&edge);
     }
 
     hasher.finalize().to_hex().to_string()
@@ -2734,6 +2751,44 @@ mod tests {
         assert_eq!(tfidf_small.vocab, tfidf_large.vocab);
         assert_eq!(tfidf_small.idf, tfidf_large.idf);
         assert_eq!(tfidf_small.dimension, tfidf_large.dimension);
+    }
+
+    #[test]
+    fn pdg_search_fingerprint_is_order_independent_and_content_sensitive() {
+        use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
+
+        fn node(id: &str, complexity: u32) -> Node {
+            Node {
+                id: id.to_string(),
+                name: format!("symbol_{id}"),
+                file_path: format!("/tmp/{id}.rs").into(),
+                language: "rust".to_string(),
+                node_type: NodeType::Function,
+                byte_range: (0, 10),
+                complexity,
+            }
+        }
+
+        let mut forward = ProgramDependenceGraph::new();
+        forward.add_node(node("a", 1));
+        forward.add_node(node("b", 2));
+
+        let mut reverse = ProgramDependenceGraph::new();
+        reverse.add_node(node("b", 2));
+        reverse.add_node(node("a", 1));
+
+        let mut changed = ProgramDependenceGraph::new();
+        changed.add_node(node("a", 9));
+        changed.add_node(node("b", 2));
+
+        assert_eq!(
+            pdg_search_fingerprint(&forward),
+            pdg_search_fingerprint(&reverse)
+        );
+        assert_ne!(
+            pdg_search_fingerprint(&forward),
+            pdg_search_fingerprint(&changed)
+        );
     }
 
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]

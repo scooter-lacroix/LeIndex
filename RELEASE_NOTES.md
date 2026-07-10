@@ -97,6 +97,13 @@ separate semantic file/chunk sidecar to reconcile with graph results.
 - provider startup and MIGraphX compile messages are retained in worker logs
 - unchanged search calls avoid redundant refresh and index maintenance
 - model presence checks now require a complete, checksummed profile
+- the resident worker accepts simultaneous MCP and CLI connections without one long-lived client blocking the listener
+- concurrent processes cannot race while creating or replacing the daemon socket
+- transient listener failures no longer terminate the resident worker, and disconnected clients no longer leave blocked reader threads behind
+- MIGraphX shape policy follows the active provider selected from `auto`
+- setup waits for the worker startup report before checking GPU activation
+- corrupt mmap node IDs produce explicit row-level errors during snapshot hydration
+- PDG fingerprinting uses bounded fixed-size record digests instead of per-node and per-edge formatted strings
 
 ## Upgrade
 

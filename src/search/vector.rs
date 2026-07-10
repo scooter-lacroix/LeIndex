@@ -681,11 +681,20 @@ impl MmapEmbeddingIndex {
     /// This is intended for cold-start hydration from the persisted mmap file:
     /// callers can rebuild in-memory indexes without recomputing embeddings
     /// from source content.
-    pub fn entries(&self) -> Vec<(String, Vec<f32>)> {
+    pub fn entries(&self) -> Result<Vec<(String, Vec<f32>)>, MmapError> {
         (0..self.node_count as usize)
-            .filter_map(|i| {
-                let id = self.read_node_id(i)?;
-                Some((id, self.read_embedding(i)))
+            .map(|i| {
+                let id = self.read_node_id_result(i)?;
+                let embedding = self
+                    .embedding_slice_by_index(i as u32)
+                    .ok_or_else(|| {
+                        MmapError::Corrupt(format!(
+                            "embedding row {} exceeds mapped file bounds",
+                            i
+                        ))
+                    })?
+                    .to_vec();
+                Ok((id, embedding))
             })
             .collect()
     }
@@ -699,43 +708,67 @@ impl MmapEmbeddingIndex {
 
     /// Read the node ID string at the given index.
     fn read_node_id(&self, idx: usize) -> Option<String> {
+        self.read_node_id_result(idx).ok()
+    }
+
+    fn read_node_id_result(&self, idx: usize) -> Result<String, MmapError> {
         if idx >= self.node_count as usize {
-            return None;
+            return Err(MmapError::Corrupt(format!(
+                "node ID row {} exceeds row count {}",
+                idx, self.node_count
+            )));
         }
         let n = self.node_count as usize;
         let offsets_start = MmapHeader::SIZE;
         let lengths_start = offsets_start + n * 8;
+        let offset_start = offsets_start + idx * 8;
+        let length_start = lengths_start + idx * 4;
 
         let off = u64::from_le_bytes(
-            self.mmap[offsets_start + idx * 8..offsets_start + idx * 8 + 8]
+            self.mmap
+                .get(offset_start..offset_start + 8)
+                .ok_or_else(|| {
+                    MmapError::Corrupt(format!(
+                        "node ID offset row {} exceeds mapped file bounds",
+                        idx
+                    ))
+                })?
                 .try_into()
-                .ok()?,
+                .map_err(|_| MmapError::Corrupt(format!("invalid node ID offset row {}", idx)))?,
         ) as usize;
         let len = u32::from_le_bytes(
-            self.mmap[lengths_start + idx * 4..lengths_start + idx * 4 + 4]
+            self.mmap
+                .get(length_start..length_start + 4)
+                .ok_or_else(|| {
+                    MmapError::Corrupt(format!(
+                        "node ID length row {} exceeds mapped file bounds",
+                        idx
+                    ))
+                })?
                 .try_into()
-                .ok()?,
+                .map_err(|_| MmapError::Corrupt(format!("invalid node ID length row {}", idx)))?,
         ) as usize;
 
-        let id_start = self.ids_section_offset + off;
-        let id_end = id_start + len;
-        if id_end > self.mmap.len() {
-            return None;
-        }
-        String::from_utf8(self.mmap[id_start..id_end].to_vec()).ok()
+        let id_start = self
+            .ids_section_offset
+            .checked_add(off)
+            .ok_or_else(|| MmapError::Corrupt(format!("node ID row {} offset overflow", idx)))?;
+        let id_end = id_start
+            .checked_add(len)
+            .ok_or_else(|| MmapError::Corrupt(format!("node ID row {} length overflow", idx)))?;
+        let bytes = self.mmap.get(id_start..id_end).ok_or_else(|| {
+            MmapError::Corrupt(format!("node ID row {} exceeds mapped file bounds", idx))
+        })?;
+        std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|e| MmapError::Corrupt(format!("node ID row {} is not UTF-8: {}", idx, e)))
     }
 
     /// Read the embedding vector at the given index.
     fn read_embedding(&self, idx: usize) -> Vec<f32> {
-        let dim = self.dimension as usize;
-        let byte_offset = self.embedding_matrix_offset + idx * dim * 4;
-        let mut vec = Vec::with_capacity(dim);
-        for d in 0..dim {
-            let start = byte_offset + d * 4;
-            let bytes: [u8; 4] = self.mmap[start..start + 4].try_into().unwrap();
-            vec.push(f32::from_le_bytes(bytes));
-        }
-        vec
+        self.embedding_slice_by_index(idx as u32)
+            .map(<[f32]>::to_vec)
+            .unwrap_or_default()
     }
 }
 
@@ -1110,6 +1143,29 @@ mod tests {
 
         let result = MmapEmbeddingIndex::open(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_mmap_entries_reports_invalid_utf8_node_id() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid-id.bin");
+        write_mmap_embeddings(&path, &[("a".to_string(), vec![1.0])]).unwrap();
+
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.seek(SeekFrom::Start((MmapHeader::SIZE + 8 + 4) as u64))
+            .unwrap();
+        file.write_all(&[0xff]).unwrap();
+        file.flush().unwrap();
+
+        let index = MmapEmbeddingIndex::open(&path).unwrap();
+        let error = index.entries().unwrap_err().to_string();
+        assert!(error.contains("node ID row 0 is not UTF-8"), "{error}");
     }
 
     #[test]

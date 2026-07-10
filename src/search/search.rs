@@ -1883,9 +1883,18 @@ impl SearchEngine {
             ));
         }
 
-        let mut tfidf_by_id: HashMap<String, Vec<f32>> = tfidf_mmap.entries().into_iter().collect();
+        let mut tfidf_by_id: HashMap<String, Vec<f32>> = tfidf_mmap
+            .entries()
+            .map_err(|e| format!("failed to read TF-IDF mmap entries: {}", e))?
+            .into_iter()
+            .collect();
         let mut neural_by_id: HashMap<String, Vec<f32>> = neural_mmap
-            .map(|mmap| mmap.entries().into_iter().collect())
+            .map(|mmap| {
+                mmap.entries()
+                    .map(|entries| entries.into_iter().collect())
+                    .map_err(|e| format!("failed to read neural mmap entries: {}", e))
+            })
+            .transpose()?
             .unwrap_or_default();
 
         let mut nodes = Vec::with_capacity(snapshot.nodes.len());
