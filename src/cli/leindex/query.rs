@@ -12,17 +12,25 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
-/// Maximum wall-clock time allowed for generating a single query neural
-/// embedding via ONNX/remote backends.
+/// Default wall-clock budget for generating one query neural embedding.
 ///
-/// On CPU-only systems the 600M-parameter model can take >120 seconds per
-/// inference, which would hang the search path for the full 300-second IPC
-/// timeout.  When the embedding does not complete within this duration we
-/// abandon it and fall back to TF-IDF for the query embedding.  Pre-computed
-/// neural node embeddings from indexing are still used for scoring, so search
-/// results remain useful.
-#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-const QUERY_EMBED_TIMEOUT_SECS: u64 = 15;
+/// Fast GPU paths should complete inside this budget. Slow or misconfigured
+/// providers fall back to TF-IDF instead of making every search wait seconds.
+#[allow(dead_code)]
+const DEFAULT_QUERY_EMBED_TIMEOUT_MS: u64 = 250;
+#[allow(dead_code)]
+const QUERY_EMBED_TIMEOUT_ENV: &str = "LEINDEX_QUERY_NEURAL_TIMEOUT_MS";
+
+#[allow(dead_code)]
+fn query_neural_timeout() -> std::time::Duration {
+    let timeout_ms = std::env::var(QUERY_EMBED_TIMEOUT_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_QUERY_EMBED_TIMEOUT_MS);
+
+    std::time::Duration::from_millis(timeout_ms)
+}
 
 impl LeIndex {
     fn resolve_indexed_file_path(&self, file_path: &str) -> PathBuf {
@@ -441,13 +449,9 @@ impl LeIndex {
     /// the query into the same neural vector space as the indexed nodes.
     /// Returns `None` when neural embeddings are unavailable (TF-IDF fallback).
     ///
-    /// A [`QUERY_EMBED_TIMEOUT_SECS`]-second timeout prevents CPU-only ONNX
-    /// inference (which can take >120 s with the 600M-parameter model) from
-    /// hanging the search path.  When the timeout fires the function logs a
-    /// warning and returns `None`, causing the caller to fall back to TF-IDF
-    /// for the query embedding.  Pre-computed neural node embeddings from
-    /// indexing are still used for scoring via cosine similarity, so search
-    /// results remain useful even with a TF-IDF query embedding.
+    /// A subsecond timeout prevents slow or misconfigured ONNX providers from
+    /// hanging the search path. When the timeout fires the function logs a
+    /// warning and returns `None`, causing the caller to fall back to TF-IDF.
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     pub fn generate_query_neural_embedding(&self, query: &str) -> Option<Vec<f32>> {
         let emb = self.embedder.as_ref()?;
@@ -465,7 +469,8 @@ impl LeIndex {
             let _ = tx.send(emb_clone.embed_neural_blocking(&query_owned));
         });
 
-        match rx.recv_timeout(std::time::Duration::from_secs(QUERY_EMBED_TIMEOUT_SECS)) {
+        let timeout = query_neural_timeout();
+        match rx.recv_timeout(timeout) {
             Ok(Some(Ok(vec))) => Some(vec),
             Ok(Some(Err(e))) => {
                 debug!(
@@ -477,9 +482,13 @@ impl LeIndex {
             Ok(None) => None, // TF-IDF only mode, no neural available
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 warn!(
-                    timeout_secs = QUERY_EMBED_TIMEOUT_SECS,
-                    "Neural query embedding timed out after {}s, using TF-IDF fallback",
-                    QUERY_EMBED_TIMEOUT_SECS
+                    timeout_ms = timeout.as_millis() as u64,
+                    "Neural query embedding timed out after {}ms, using TF-IDF fallback",
+                    timeout.as_millis()
+                );
+                eprintln!(
+                    "warning: neural query embedding timed out after {}ms; using TF-IDF fallback",
+                    timeout.as_millis()
                 );
                 None
             }
@@ -1169,9 +1178,15 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{simple_stem, LeIndex};
+    use super::{
+        query_neural_timeout, simple_stem, LeIndex, DEFAULT_QUERY_EMBED_TIMEOUT_MS,
+        QUERY_EMBED_TIMEOUT_ENV,
+    };
     use crate::cli::memory::CacheEntry;
     use crate::search::{ranking::Score, search::SearchResult};
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn cached_result(node_id: &str) -> SearchResult {
         SearchResult {
@@ -1190,6 +1205,50 @@ mod tests {
             byte_range: (0, 0),
             line_number: Some(1),
         }
+    }
+
+    #[test]
+    fn query_neural_timeout_defaults_to_subsecond_budget() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(QUERY_EMBED_TIMEOUT_ENV);
+
+        let timeout = query_neural_timeout();
+
+        assert_eq!(
+            timeout,
+            std::time::Duration::from_millis(DEFAULT_QUERY_EMBED_TIMEOUT_MS)
+        );
+        assert!(timeout < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn query_neural_timeout_uses_positive_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(QUERY_EMBED_TIMEOUT_ENV, "42");
+
+        let timeout = query_neural_timeout();
+
+        std::env::remove_var(QUERY_EMBED_TIMEOUT_ENV);
+        assert_eq!(timeout, std::time::Duration::from_millis(42));
+    }
+
+    #[test]
+    fn query_neural_timeout_rejects_zero_and_bad_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        std::env::set_var(QUERY_EMBED_TIMEOUT_ENV, "0");
+        assert_eq!(
+            query_neural_timeout(),
+            std::time::Duration::from_millis(DEFAULT_QUERY_EMBED_TIMEOUT_MS)
+        );
+
+        std::env::set_var(QUERY_EMBED_TIMEOUT_ENV, "nope");
+        assert_eq!(
+            query_neural_timeout(),
+            std::time::Duration::from_millis(DEFAULT_QUERY_EMBED_TIMEOUT_MS)
+        );
+
+        std::env::remove_var(QUERY_EMBED_TIMEOUT_ENV);
     }
 
     #[test]

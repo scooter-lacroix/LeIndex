@@ -4,7 +4,8 @@
  * LeIndex MCP - Main Entry Point
  * 
  * This package provides LeIndex MCP server functionality through npm.
- * The binary bundle (main + worker + models) is automatically downloaded during installation.
+ * The binary and ONNX Runtime bundle is downloaded during installation.
+ * Model provisioning is handled by `leindex setup`.
  */
 
 const { execFileSync, spawn } = require('child_process');
@@ -12,7 +13,6 @@ const path = require('path');
 const fs = require('fs');
 
 const BIN_DIR = path.join(__dirname, 'bin');
-const MODELS_DIR = path.join(__dirname, 'models');
 const LIB_DIR = path.join(__dirname, 'lib');
 const binaryName = process.platform === 'win32' ? 'leindex.exe' : 'leindex';
 const workerBinaryName = process.platform === 'win32' ? 'leindex-embed.exe' : 'leindex-embed';
@@ -37,17 +37,6 @@ function getBinaryPath() {
 function getWorkerBinaryPath() {
   if (fs.existsSync(workerBinaryPath)) {
     return workerBinaryPath;
-  }
-  return null;
-}
-
-/**
- * Get the path to bundled model assets
- * @returns {string|null} Path to the models directory, or null if not present
- */
-function getModelsPath() {
-  if (fs.existsSync(MODELS_DIR)) {
-    return MODELS_DIR;
   }
   return null;
 }
@@ -81,10 +70,6 @@ function startMcpServer() {
   const bin = getBinaryPath();
 
   const env = Object.assign({}, process.env);
-  const modelsPath = getModelsPath();
-  if (modelsPath && !env.LEINDEX_MODEL_PATH) {
-    env.LEINDEX_MODEL_PATH = modelsPath;
-  }
   const libPath = getLibPath();
   if (libPath && !env.ORT_DYLIB_PATH) {
     const ortNames = process.platform === 'win32'
@@ -120,7 +105,6 @@ function getVersion() {
 module.exports = {
   getBinaryPath,
   getWorkerBinaryPath,
-  getModelsPath,
   getLibPath,
   exec,
   startMcpServer,
@@ -135,10 +119,6 @@ if (require.main === module) {
   const workerPath = getWorkerBinaryPath();
   if (workerPath) {
     console.log('Worker:', workerPath);
-  }
-  const models = getModelsPath();
-  if (models) {
-    console.log('Models:', models);
   }
   const lib = getLibPath();
   if (lib) {

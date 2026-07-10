@@ -17,7 +17,9 @@
 // VAL-CPHASE-008: Worker restart works after idle teardown.
 
 use std::io;
+use std::path::PathBuf;
 use std::process;
+use std::time::Duration;
 
 use crate::runtime::{RuntimeConfig, WorkerRuntime};
 
@@ -49,6 +51,8 @@ pub fn run() -> ! {
         println!("leindex-embed {}", env!("CARGO_PKG_VERSION"));
         process::exit(0);
     }
+
+    let socket_path = parse_socket_arg(&argv);
     // ── Process-leak guard: PR_SET_PDEATHSIG (Linux) ─────────────────────
     //
     // Request SIGKILL from the kernel the moment our parent process dies.
@@ -73,7 +77,7 @@ pub fn run() -> ! {
     // into its own process group, so group-wide signal delivery reaches
     // the worker as well. PR_SET_PDEATHSIG is the primary defense.
     #[cfg(target_os = "linux")]
-    {
+    if socket_path.is_none() {
         // SAFETY: `prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0)` is a simple
         // scalar kernel syscall with no pointer arguments. The second
         // argument is the signal number (SIGKILL). The remaining arguments
@@ -128,20 +132,101 @@ pub fn run() -> ! {
     tracing::info!("leindex-embed worker starting");
 
     // Build runtime config from environment
-    let config = RuntimeConfig::from_env();
+    let mut config = RuntimeConfig::from_env();
+    if socket_path.is_some() {
+        config.idle_timeout = Duration::from_secs(600);
+    }
 
     // Create the worker runtime
     let mut runtime = WorkerRuntime::new(config);
 
-    // Run the main IPC loop over stdin/stdout
-    // VAL-CPHASE-004: Local IPC only (stdin/stdout pipes)
-    // Note: we pass io::stdin() directly (not .lock()) because the run_loop
-    // spawns a helper thread that needs the reader to be Send.
-    if let Err(e) = runtime.run(io::stdin(), io::stdout()) {
-        tracing::error!("worker loop failed: {}", e);
-        process::exit(1);
+    if let Some(path) = socket_path {
+        if let Err(e) = run_socket_worker(&mut runtime, path) {
+            tracing::error!("socket worker failed: {}", e);
+            process::exit(1);
+        }
+    } else {
+        // Run the main IPC loop over stdin/stdout
+        // VAL-CPHASE-004: Local IPC only (stdin/stdout pipes)
+        // Note: we pass io::stdin() directly (not .lock()) because the run_loop
+        // spawns a helper thread that needs the reader to be Send.
+        if let Err(e) = runtime.run(io::stdin(), io::stdout()) {
+            tracing::error!("worker loop failed: {}", e);
+            process::exit(1);
+        }
     }
 
     tracing::info!("leindex-embed worker exiting cleanly");
     process::exit(0);
+}
+
+fn parse_socket_arg(argv: &[String]) -> Option<PathBuf> {
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--socket" {
+            return iter.next().map(PathBuf::from);
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn run_socket_worker(runtime: &mut WorkerRuntime, socket_path: PathBuf) -> anyhow::Result<()> {
+    use std::os::unix::net::UnixListener;
+
+    if socket_path.exists() {
+        std::fs::remove_file(&socket_path)?;
+    }
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let listener = UnixListener::bind(&socket_path)?;
+    listener.set_nonblocking(true)?;
+    tracing::info!(
+        "leindex-embed socket worker listening at {}",
+        socket_path.display()
+    );
+
+    loop {
+        if runtime.is_idle_expired() {
+            tracing::info!("socket worker idle timeout expired");
+            let _ = std::fs::remove_file(&socket_path);
+            return Ok(());
+        }
+
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                let reader = stream.try_clone()?;
+                match runtime.run(reader, stream) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        if e.downcast_ref::<io::Error>().is_some_and(|io_err| {
+                            matches!(
+                                io_err.kind(),
+                                io::ErrorKind::BrokenPipe
+                                    | io::ErrorKind::ConnectionReset
+                                    | io::ErrorKind::UnexpectedEof
+                            )
+                        }) {
+                            tracing::debug!(
+                                "socket client disconnected before response was written"
+                            );
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn run_socket_worker(_runtime: &mut WorkerRuntime, _socket_path: PathBuf) -> anyhow::Result<()> {
+    anyhow::bail!("socket worker mode is only supported on Unix")
 }

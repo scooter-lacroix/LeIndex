@@ -5,7 +5,7 @@
  * 
  * Automatically downloads the appropriate LeIndex bundle for the current platform.
  * The bundle includes the main binary, the ONNX worker binary (leindex-embed),
- * and model assets required for local semantic search.
+ * and ONNX Runtime libraries. `leindex setup` downloads model assets.
  */
 
 const fs = require('fs');
@@ -17,7 +17,6 @@ const zlib = require('zlib');
 const pkg = require('./package.json');
 
 const BIN_DIR = path.join(__dirname, 'bin');
-const MODELS_DIR = path.join(__dirname, 'models');
 // VAL-NPM-002: bundled ORT shared libraries are extracted here so the
 // worker discovers ORT via its bundled/sibling-library path without
 // requiring the user to run `leindex setup`.
@@ -25,11 +24,6 @@ const LIB_DIR = path.join(__dirname, 'lib');
 const GITHUB_API_BASE = 'https://api.github.com/repos/scooter-lacroix/LeIndex';
 const DEFAULT_RELEASE_SELECTOR = 'latest';
 const MAX_REDIRECTS = 5;
-const REQUIRED_MODEL_FILES = [
-  'qwen3-embed-0.6b.onnx',
-  'tokenizer.json',
-  'config.json',
-];
 
 /**
  * The unversioned ONNX Runtime shared library name on the current platform.
@@ -81,19 +75,8 @@ function hasBundledOrtRuntime(libDir = LIB_DIR) {
   }
 }
 
-function hasRequiredModelAssets(modelsDir = MODELS_DIR) {
-  try {
-    return REQUIRED_MODEL_FILES.every((file) => {
-      const filePath = path.join(modelsDir, file);
-      return fs.existsSync(filePath) && fs.statSync(filePath).isFile();
-    });
-  } catch (_) {
-    return false;
-  }
-}
-
-function bundledAssetsComplete(libDir = LIB_DIR, modelsDir = MODELS_DIR) {
-  return hasBundledOrtRuntime(libDir) && hasRequiredModelAssets(modelsDir);
+function bundledAssetsComplete(libDir = LIB_DIR) {
+  return hasBundledOrtRuntime(libDir);
 }
 
 function isPathInside(parent, child) {
@@ -555,7 +538,7 @@ function verifyChecksum(filePath, expectedChecksum) {
 
 /**
  * Extract a tar.gz bundle using Node's built-in zlib + tar parsing.
- * Places bin/ contents into BIN_DIR and models/ contents into MODELS_DIR.
+ * Places bundle contents in a temporary extraction directory for validation.
  */
 function extractTarGz(archivePath, destDir) {
   const members = execFileSync('tar', ['tzf', archivePath], { encoding: 'utf8' })
@@ -599,7 +582,7 @@ function extractZip(archivePath, destDir) {
 }
 
 /**
- * Install from a bundle archive: extract and place binaries + models.
+ * Install from a bundle archive: extract and place binaries + ORT libraries.
  */
 async function installFromBundle(release) {
   const tempDir = path.join(BIN_DIR, '.bundle-tmp');
@@ -671,21 +654,6 @@ async function installFromBundle(release) {
       console.log('   ⚠ Worker binary not found in bundle; ONNX will use in-process fallback');
     }
 
-    // Install model assets
-    const srcModels = path.join(bundleDir, 'models');
-    if (fs.existsSync(srcModels)) {
-      if (!fs.existsSync(MODELS_DIR)) {
-        fs.mkdirSync(MODELS_DIR, { recursive: true });
-      }
-      const modelFiles = fs.readdirSync(srcModels);
-      for (const file of modelFiles) {
-        copyRegularBundledFile(path.join(srcModels, file), path.join(MODELS_DIR, file), 'model');
-      }
-      console.log(`   ✓ Model assets installed (${modelFiles.length} files)`);
-    } else {
-      console.log('   ⚠ Model assets not found in bundle');
-    }
-
     // VAL-NPM-002: Install bundled ORT shared libraries under `lib/`.
     // The worker's sibling-directory discovery path looks for
     // `libonnxruntime.{so,dylib,dll}` here, so the package works with
@@ -749,7 +717,8 @@ async function installFromBundle(release) {
     const version = execFileSync(binaryPath, ['--version'], { encoding: 'utf8' }).trim();
     console.log(`   ✓ LeIndex installed from ${release.source}: ${version}`);
     console.log('\n📦 Installation complete!');
-    console.log('   Bundle includes: main binary, ONNX worker, and model assets.');
+    console.log('   Bundle includes: main binary, ONNX worker, and ONNX Runtime libraries.');
+    console.log('   Run npm run setup to provision the Qwen3 model and select a provider.');
     console.log('   Add this package to your MCP configuration to use LeIndex.');
 
   } finally {
@@ -840,7 +809,7 @@ async function install() {
     if (existing.ok && hasWorker && hasAssets) {
       console.log(`   ✓ LeIndex already installed: ${existing.output}`);
       console.log('   ✓ Worker binary present');
-      console.log('   ✓ Bundled ORT and model assets present');
+      console.log('   ✓ Bundled ORT runtime assets present');
       console.log('\n📦 Installation complete!');
       console.log('   Add this package to your MCP configuration to use LeIndex.');
       return;
@@ -854,7 +823,7 @@ async function install() {
     } else if (!hasWorker) {
       console.log('   ⚠ Worker binary missing; reinstalling bundled worker...');
     } else if (!hasAssets) {
-      console.log('   ⚠ Bundled ORT/model assets missing; reinstalling release bundle...');
+      console.log('   ⚠ Bundled ORT runtime assets missing; reinstalling release bundle...');
     }
 
     try { fs.unlinkSync(binaryPath); } catch (_) {}
@@ -933,7 +902,6 @@ async function install() {
 
 module.exports = {
   BIN_DIR,
-  MODELS_DIR,
   LIB_DIR,
   computeFileSha256,
   copyBundledEntry,
@@ -944,7 +912,6 @@ module.exports = {
   getOrtLibNames,
   getRequestedRelease,
   hasBundledOrtRuntime,
-  hasRequiredModelAssets,
   bundledAssetsComplete,
   assertNoUnsafeExtractedSymlinks,
   assertSafeArchiveFileName,

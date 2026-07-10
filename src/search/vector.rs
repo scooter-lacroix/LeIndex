@@ -676,6 +676,20 @@ impl MmapEmbeddingIndex {
         self.dimension
     }
 
+    /// Return all `(node_id, embedding)` records in row order.
+    ///
+    /// This is intended for cold-start hydration from the persisted mmap file:
+    /// callers can rebuild in-memory indexes without recomputing embeddings
+    /// from source content.
+    pub fn entries(&self) -> Vec<(String, Vec<f32>)> {
+        (0..self.node_count as usize)
+            .filter_map(|i| {
+                let id = self.read_node_id(i)?;
+                Some((id, self.read_embedding(i)))
+            })
+            .collect()
+    }
+
     // ---- Internal helpers ----
 
     /// Find the numeric index for a given node ID (linear scan).

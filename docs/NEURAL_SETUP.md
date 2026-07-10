@@ -1,140 +1,164 @@
-# Neural Search Setup Guide
+# Neural Search Setup
 
-This guide covers configuring LeIndex's neural (semantic) embeddings, choosing an
-execution provider (CPU / GPU / AMD / NVIDIA), and troubleshooting common issues.
+LeIndex 1.8.4 combines three signals over the same PDG nodes:
 
-LeIndex ships with two search modes:
+- TF-IDF for exact vocabulary and identifier matches
+- Qwen3 embeddings for semantic similarity
+- graph structure for callers, callees, dependencies, and symbol importance
 
-- **TF-IDF (lexical)**: keyword-based search. Works immediately after install
-  with no additional setup. Good for exact-match and identifier lookups.
-- **Neural (semantic)**: embedding-based search using the `qwen3-embed-0.6b`
-  ONNX model. Finds code by meaning, not just keywords. Requires a one-time
-  `leindex setup` to install ONNX Runtime and download model files.
-
-If you skip `leindex setup`, LeIndex falls back to TF-IDF automatically and
-prints a one-time notice pointing you to `leindex setup`. Search never hard-fails
-because neural is unavailable.
-
----
+Neural search augments the existing node index. It is not a separate file or
+chunk sidecar, so semantic results retain the file, symbol, and dependency
+context used by LeIndex's navigation and analysis tools.
 
 ## Quick Setup
 
-### Interactive (recommended for first-time users)
+TF-IDF works without neural setup. Run one of these commands to enable the
+hybrid path:
 
 ```bash
 leindex setup
-```
-
-The wizard asks:
-
-1. Do you want neural embeddings / enhanced semantic search? **(Y/n)**
-2. CPU or GPU-based neural embeddings? **(CPU / GPU)**
-3. (GPU only) AMD (ROCm/MIGraphX) or NVIDIA (CUDA)? **(AMD / NVIDIA / N/A)**
-
-It then installs the right ONNX Runtime pip package, downloads the model to
-`~/.leindex/models/`, writes `~/.leindex/config/leindex.toml`, and runs a smoke
-test.
-
-### Non-interactive (CI / scripts)
-
-```bash
-# CPU neural search (universal baseline)
 leindex setup --neural --cpu
-
-# AMD GPU (ROCm / MIGraphX)
-leindex setup --neural --gpu amd
-
-# NVIDIA GPU (CUDA)
 leindex setup --neural --gpu nvidia
-
-# Disable neural, use TF-IDF only
-leindex setup --no-neural
-
-# Print current status without changing anything
+leindex setup --neural --gpu amd
 leindex setup --check
 ```
 
----
+Setup writes `$LEINDEX_HOME/config/leindex.toml`, normally
+`~/.leindex/config/leindex.toml`, then runs an embedding smoke test. A GPU
+setup is successful only when the requested provider is active; silent CPU
+fallback is reported as a failure.
 
-## Execution Providers
+## Model Provisioning
 
-### CPU (works everywhere)
+Models are never included in GitHub Release archives, crates.io, npm, or PyPI
+artifacts. `leindex setup` owns model provisioning.
 
-Installs the plain `onnxruntime` pip package and selects the CPU execution
-provider. This is the universal baseline and the recommended starting point.
+The 1.8.4 profile downloads
+[Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) from
+Hugging Face via Hugging Face CLI:
+
+- `model.onnx`, installed as `qwen3-embed-0.6b-dynamic.onnx`
+- `tokenizer.json`
+- `config.json`
+
+The selected export is a single-file ONNX graph with dynamic batch dimensions
+and the three inputs required by Qwen3: `input_ids`, `attention_mask`, and
+`position_ids`. It does not depend on external weight shards or a
+framework-specific runtime.
+
+Setup searches `HF_BIN`, `hf`, and `huggingface-cli`. If none is
+available, it installs `huggingface_hub` using the same Python/pip discovery
+path used for ONNX Runtime. Downloads are staged before installation. Setup
+then writes a SHA256 manifest for the model, tokenizer, and config; later runs
+verify all three files before reuse.
+
+The same validated graph runs on CPU, CUDA, and MIGraphX. Provider selection
+changes ONNX Runtime and session configuration, not the model weights.
+
+## Provider Paths
+
+### CPU
 
 ```bash
 leindex setup --neural --cpu
 ```
 
-The pip package installed is `onnxruntime`. Inference runs on CPU; no GPU
-drivers or toolkits are required.
+Setup installs or validates `onnxruntime`. CPU is the compatibility path for
+machines without a supported GPU. TF-IDF remains available if neural inference
+is unavailable.
 
-### AMD GPU (ROCm / MIGraphX)
-
-Installs `onnxruntime-migraphx` and registers the MIGraphX execution provider.
-Requires a working ROCm installation with MIGraphX available on the system.
-
-```bash
-leindex setup --neural --gpu amd
-```
-
-The setup wizard discovers the MIGraphX-enabled `libonnxruntime` from the pip
-wheel's `site-packages/onnxruntime/capi/` directory and records it in the config
-file. If MIGraphX is not available at runtime (e.g. the provider `.so` is
-missing), the worker falls back to CPU automatically with a logged warning.
-
-### NVIDIA GPU (CUDA)
-
-Installs `onnxruntime-gpu` and selects the CUDA execution provider. Requires a
-CUDA-capable NVIDIA GPU and compatible CUDA toolkit drivers.
+### NVIDIA CUDA
 
 ```bash
 leindex setup --neural --gpu nvidia
 ```
 
-The pip package installed is `onnxruntime-gpu`. The worker uses the CUDA
-execution provider for inference.
+Setup installs or validates `onnxruntime-gpu`, starts the worker, and confirms
+that CUDA is the active provider. The NVIDIA driver and CUDA dependencies
+required by the ONNX Runtime wheel must already be usable on the host.
 
----
+### AMD ROCm/MIGraphX
 
-## The ORT Discovery Chain
+```bash
+leindex setup --neural --gpu amd
+```
 
-When the `leindex-embed` worker starts, it locates the ONNX Runtime shared
-library (`libonnxruntime.so` / `libonnxruntime.dylib` / `onnxruntime.dll`) using
-the following priority chain:
+Setup installs or validates `onnxruntime-migraphx` and requires MIGraphX to
+be active. ROCm must already support the installed GPU.
 
-1. **`ORT_DYLIB_PATH` env var** (highest priority, explicit override)
-2. **Config file**: `~/.leindex/config/leindex.toml` `[neural] ort_dylib_path`
-3. **Bundled libs**: `~/.leindex/lib/` (GitHub Release / install.sh install)
-4. **Sibling directory**: next to the `leindex-embed` binary (release bundle)
-5. **pip site-packages**: `site-packages/onnxruntime/capi/` (`pip install`)
-6. **System paths**: `/usr/local/lib`, `/usr/lib`, ld.so.conf (final fallback)
+MIGraphX compilation is shape-specific and can take several minutes on the
+first setup. LeIndex uses a stable 128-token shape, ORT graph optimization
+level 3, setup warmup, and a persistent cache under
+`$LEINDEX_HOME/cache/migraphx`. Normal CLI and MCP requests reuse the compiled
+program through the resident worker.
 
-This means neural search works in any of these scenarios without manual path
-configuration:
+Optional MIGraphX tuning:
 
-- GitHub Release bundle (bundled `lib/` is discovered via source 3 or 4)
-- `pip install onnxruntime` (discovered via source 5)
-- System-installed ORT in `/usr/local/lib` (discovered via source 6)
-- Manual `ORT_DYLIB_PATH` override (source 1)
+```bash
+export LEINDEX_MIGRAPHX_FP16=1
+export LEINDEX_MIGRAPHX_EXHAUSTIVE_TUNE=1
+leindex setup --neural --gpu amd
+```
 
----
+These options trade setup time and numerical behavior for provider-specific
+performance. They are opt-in so the default path remains reproducible.
 
-## Configuration File
+## Runtime Behavior
 
-Settings are persisted to `~/.leindex/config/leindex.toml` (or
-`$LEINDEX_HOME/config/leindex.toml` if `LEINDEX_HOME` is set):
+On Unix, LeIndex connects to a local socket whose identity includes the model,
+provider, batch size, and sequence length. The resident `leindex-embed` process retains the ONNX session,
+GPU allocations, and compiled cache across short-lived CLI commands and MCP
+calls. It exits after ten minutes without a client. Non-Unix and setup smoke
+paths use direct worker IPC with a one-minute idle limit.
+
+Set `LEINDEX_EMBED_DAEMON=0` to force direct child-pipe IPC for isolated test
+harnesses or process supervisors. Normal CLI and MCP use should leave resident
+reuse enabled.
+
+CPU and CUDA indexing use dynamic batches of up to 32 texts by default, with
+partial final batches sent at their real size. MIGraphX compiles one input
+shape, so it uses a stable batch of 8 and sequence length of 128; incomplete
+batches and single queries are padded, then padded outputs are discarded.
+Qwen3 output uses last-unpadded-token pooling followed by L2 normalization.
+
+Hybrid query embedding has a 250 ms default budget. If a worker is cold,
+compiling, unhealthy, or simply over budget, LeIndex returns TF-IDF and
+structural results immediately. Neural scoring resumes when the worker is
+ready; the MCP connection is not sacrificed to an embedding timeout.
+
+## Persisted Search State
+
+Project search state lives under `<project>/.leindex/`:
+
+| Artifact | Purpose |
+|---|---|
+| `embeddings.bin` | memory-mapped TF-IDF vectors |
+| `neural_embeddings.bin` | memory-mapped Qwen3 vectors |
+| `search_snapshot.bin` | PDG fingerprint and search metadata |
+| `leindex.db` | persisted project graph and metadata |
+
+An unchanged project hydrates these artifacts directly. LeIndex does not run
+refresh, deduplication, or index maintenance before every search. Changed
+files flow through incremental indexing, and a snapshot rebuild occurs only
+when the PDG fingerprint or persisted artifacts require it. A project created
+before snapshots performs one compatibility rebuild, then writes the snapshot
+for later calls.
+
+## Configuration
+
+Example `~/.leindex/config/leindex.toml`:
 
 ```toml
 [neural]
 enabled = true
-execution_provider = "cpu"       # cpu | cuda | migraphx
+execution_provider = "migraphx"
+model_dir = "/home/user/.leindex/models"
+model_name = "qwen3-embed-0.6b-dynamic"
 ort_dylib_path = "/path/to/libonnxruntime.so"
-model_dir = "~/.leindex/models"
+ort_version = "1.25.0"
 
 [search]
-search_mode = "hybrid"           # hybrid | text | neural
+search_mode = "hybrid"
 neural_weight = 0.3
 
 [indexing]
@@ -142,193 +166,68 @@ batch_size = 500
 max_files = 50000
 ```
 
-Running `leindex setup` multiple times is safe (idempotent). It overwrites the
-neural block and preserves user-tuned `[search]` and `[indexing]` sections
-unless they conflict with new defaults.
+Useful overrides:
 
----
+| Variable | Meaning | Default |
+|---|---|---|
+| `LEINDEX_HOME` | config, model, cache, and worker root | `~/.leindex` |
+| `HF_BIN` | explicit Hugging Face CLI executable | auto-detected |
+| `PIP_BIN` | explicit pip executable | auto-detected |
+| `ORT_DYLIB_PATH` | explicit ONNX Runtime library | discovery chain |
+| `LEINDEX_ONNX_INFERENCE_BATCH_SIZE` | maximum inference batch | 32 dynamic, 1 legacy |
+| `LEINDEX_ONNX_SEQUENCE_LEN` | fixed token shape | 128 |
+| `LEINDEX_QUERY_NEURAL_TIMEOUT_MS` | query neural budget | 250 |
+| `LEINDEX_MIGRAPHX_FP16` | enable MIGraphX FP16 | off |
+| `LEINDEX_MIGRAPHX_EXHAUSTIVE_TUNE` | exhaustive MIGraphX tuning | off |
 
-## Model Files
-
-The neural model is `qwen3-embed-0.6b.onnx` (approximately 569 MB), sourced
-from the [onnx-community/Qwen3-Embedding-0.6B-ONNX](https://huggingface.co/onnx-community/Qwen3-Embedding-0.6B-ONNX)
-HuggingFace repository. The following files are downloaded to
-`~/.leindex/models/`:
-
-| File | Purpose |
-|------|---------|
-| `qwen3-embed-0.6b.onnx` | ONNX model weights |
-| `tokenizer.json` | HuggingFace tokenizer |
-| `config.json` | Model metadata |
-| `checksums.sha256` | SHA256 checksums for integrity verification |
-| `LICENSE` | Model license (Apache 2.0) |
-
-Setup verifies SHA256 checksums after download. If a checksum fails, the
-corrupted file is deleted and re-downloaded automatically. If checksums already
-match, the download is skipped (fast re-runs).
-
----
-
-## Troubleshooting
-
-### ORT not found anywhere
-
-**Symptom**: The worker logs an error listing searched paths and neural search
-falls back to TF-IDF.
-
-**Cause**: ONNX Runtime is not installed in any of the discovery-chain locations.
-
-**Fix**:
+## Diagnostics
 
 ```bash
-# Run the setup wizard to install ORT via pip
-leindex setup --neural --cpu
-
-# Or set ORT_DYLIB_PATH manually if you have ORT elsewhere
-export ORT_DYLIB_PATH=/path/to/libonnxruntime.so
-```
-
-### ONNX Runtime version mismatch
-
-**Symptom**: The worker reports a version-mismatch error naming the expected and
-detected ORT versions, instead of a cryptic segfault.
-
-**Cause**: The discovered `libonnxruntime` has an API/ABI version incompatible
-with the `ort` crate's expectations.
-
-**Fix**:
-
-```bash
-# Reinstall a compatible ORT version
-pip install --upgrade 'onnxruntime>=1.20,<2'
-
-# Or for GPU
-pip install --upgrade 'onnxruntime-gpu>=1.20,<2'
-
-# Then re-run setup to update the recorded path
-leindex setup --neural --cpu
-```
-
-### Corrupted or incomplete model files
-
-**Symptom**: The embedding smoke test fails, or the worker reports a model
-loading error.
-
-**Cause**: One or more model files in `~/.leindex/models/` are missing,
-truncated, or corrupted.
-
-**Fix**:
-
-```bash
-# Remove the models directory and re-run setup to re-download
-rm -rf ~/.leindex/models
-leindex setup --neural --cpu
-```
-
-### GPU provider unavailable (falls back to CPU)
-
-**Symptom**: After selecting AMD (MIGraphX) or NVIDIA (CUDA), the worker logs
-that the requested provider is not available and falls back to CPU. Inference
-still works, just slower.
-
-**Cause**: The GPU drivers / toolkit (ROCm/MIGraphX or CUDA) are not installed
-or not on the library path, so ORT cannot register the hardware provider.
-
-**Fix**:
-
-- **AMD**: Install ROCm and MIGraphX. Re-run
-  `pip install --upgrade onnxruntime-migraphx`, then `leindex setup --neural --gpu amd`.
-- **NVIDIA**: Install the CUDA toolkit and NVIDIA drivers. Re-run
-  `pip install --upgrade onnxruntime-gpu`, then `leindex setup --neural --gpu nvidia`.
-- If you do not have a GPU, switch to CPU:
-  `leindex setup --neural --cpu`.
-
-### pip not on PATH
-
-**Symptom**: Setup aborts with an actionable error explaining pip is missing,
-rather than crashing.
-
-**Cause**: `pip` (or `pip3`) is not installed or not on `PATH`.
-
-**Fix**: Install pip, then re-run setup.
-
-- **Linux (Debian/Ubuntu)**: `sudo apt install python3-pip`
-- **Linux (Fedora/RHEL)**: `sudo dnf install python3-pip`
-- **Linux (Arch)**: `sudo pacman -S python-pip`
-- **macOS**: `python3 -m ensurepip --upgrade` or use Homebrew `brew install python`
-- Or set the `PIP_BIN` env var to the full path of your pip executable, then
-  re-run `leindex setup`.
-
-### Setup succeeds but search still uses TF-IDF
-
-**Symptom**: `leindex setup --check` reports neural is configured, but search
-results show no neural score component.
-
-**Cause**: The index was built before neural was enabled, so it has no
-embeddings stored.
-
-**Fix**:
-
-```bash
-# Re-index the project so embeddings are generated
-leindex index /path/to/project
-
-# Then search
-leindex search "authentication" --path /path/to/project
-```
-
-### Read-only home directory
-
-**Symptom**: Setup exits with a permission error naming the offending path.
-
-**Cause**: `~/.leindex/` cannot be created or written (permission denied, or a
-read-only filesystem).
-
-**Fix**:
-
-```bash
-# Point LeIndex at a writable directory
-export LEINDEX_HOME=/var/lib/leindex   # or any writable path
-leindex setup --neural --cpu
-```
-
----
-
-## Checking Status
-
-```bash
-# Print current setup status (read-only, no changes)
 leindex setup --check
-```
-
-The status report includes:
-
-- Neural: enabled / disabled
-- Execution provider: cpu / cuda / migraphx
-- ORT library path and version
-- Model present / absent
-- Last smoke-test result
-
-You can also inspect the raw config:
-
-```bash
-cat ~/.leindex/config/leindex.toml
-```
-
-And check what ORT the worker actually loaded:
-
-```bash
 leindex diagnostics
 ```
 
-Look for the `ort_path` and `ort_version` fields in the diagnostics output to
-confirm which ONNX Runtime the worker resolved at runtime.
+Check the worker log under `$LEINDEX_HOME/logs` when provider startup fails.
+The report distinguishes configured and active providers and includes the ORT
+path selected by the runtime discovery chain:
 
----
+1. `ORT_DYLIB_PATH`
+2. configured `ort_dylib_path`
+3. `$LEINDEX_HOME/lib`
+4. libraries beside the worker bundle
+5. Python `site-packages/onnxruntime/capi`
+6. system loader locations and bare-name loader fallback
 
-## See Also
+## Troubleshooting
 
-- [Root README](../README.md) — install paths and feature overview
-- [docs/MCP.md](MCP.md) — MCP server configuration
-- [docs/R15_MODEL_DISTRIBUTION.md](R15_MODEL_DISTRIBUTION.md) — model bundling
-  strategy
+**Hugging Face CLI missing**
+
+Run `python3 -m pip install --upgrade huggingface_hub`, or set `HF_BIN` to
+an `hf` or `huggingface-cli` executable. Setup normally performs this
+installation automatically.
+
+**Wrong or incomplete model**
+
+Re-run `leindex setup`. Missing manifests, checksum mismatches, fixed-batch
+exports, and incomplete external-data graphs are not accepted by the current
+profile.
+
+**GPU requested but CPU active**
+
+For NVIDIA, verify the driver/CUDA dependencies and
+`onnxruntime-gpu`. For AMD, verify ROCm, the MIGraphX provider library, and
+`onnxruntime-migraphx`. `leindex setup --check` reports the resolved ORT
+library; the setup smoke test reports provider fallback as an error.
+
+**First AMD request is compiling**
+
+Allow `leindex setup --neural --gpu amd` to finish warmup. Do not delete
+`$LEINDEX_HOME/cache/migraphx` between runs. Retrieval remains available
+through TF-IDF while the neural path is over its query budget.
+
+**Search returned lexical results only**
+
+This is expected when neural setup is disabled, the worker is unavailable, or
+the 250 ms query budget expires. Run `leindex setup --check` and inspect
+diagnostics. Increase `LEINDEX_QUERY_NEURAL_TIMEOUT_MS` only when waiting is
+preferable to the bounded fallback.

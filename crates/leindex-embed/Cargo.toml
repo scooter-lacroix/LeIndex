@@ -1,6 +1,6 @@
 [package]
 name = "leindex-embed"
-version = "1.8.3"
+version = "1.8.4"
 edition = "2021"
 rust-version = "1.75"
 authors = ["LeIndex Contributors"]
@@ -22,7 +22,7 @@ default = []
 # The worker discovers and dlopens libonnxruntime at runtime via the
 # ort_discovery module (env var, config, ~/.leindex/lib, sibling dir,
 # pip site-packages, system paths). See `ort_discovery.rs`.
-onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+onnx = ["dep:ort", "ort/half", "dep:tokenizers", "dep:ndarray", "dep:half"]
 onnx-migraphx = ["onnx", "ort/migraphx"]
 
 [dependencies]
@@ -46,6 +46,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["ndarray", "std", "tracing", "load-dynamic", "api-24"] }
 tokenizers = { version = "0.20", optional = true }
 ndarray = { version = "0.17", optional = true }
+half = { version = "2.1", optional = true, default-features = false }
 dirs = { version = "5" }
 toml = { version = "0.8" }
 # Used by the worker binary to set PR_SET_PDEATHSIG on Linux so the worker

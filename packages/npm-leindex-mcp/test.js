@@ -69,10 +69,9 @@ console.log('  ✓ Checksum helpers are valid\n');
 console.log('Test 5: JS wrapper safety');
 assert.strictEqual(typeof mcp.exec, 'function', 'Wrapper should export exec');
 assert.strictEqual(typeof mcp.getWorkerBinaryPath, 'function', 'Wrapper should export getWorkerBinaryPath');
-assert.strictEqual(typeof mcp.getModelsPath, 'function', 'Wrapper should export getModelsPath');
 assert.strictEqual(typeof mcp.getLibPath, 'function', 'Wrapper should export getLibPath (VAL-NPM-002)');
 assert(!fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8').includes("args.join(' ')"), 'Wrapper should not shell-interpolate args');
-console.log('  ✓ Wrapper executes with argv arrays and exposes worker/model paths\n');
+console.log('  ✓ Wrapper executes with argv arrays and exposes worker/runtime paths\n');
 
 // Test 5b: Bundled ORT discovery wiring (VAL-NPM-003)
 console.log('Test 5b: ORT_DYLIB_PATH detection helpers');
@@ -87,7 +86,6 @@ assert.strictEqual(typeof installer.isSafeArchiveMemberName, 'function', 'instal
 assert.strictEqual(typeof installer.isOrtBundleLibraryName, 'function', 'install.js should expose isOrtBundleLibraryName');
 assert.strictEqual(typeof installer.isOrtRuntimeLibraryName, 'function', 'install.js should expose isOrtRuntimeLibraryName');
 assert.strictEqual(typeof installer.hasBundledOrtRuntime, 'function', 'install.js should expose hasBundledOrtRuntime');
-assert.strictEqual(typeof installer.hasRequiredModelAssets, 'function', 'install.js should expose hasRequiredModelAssets');
 assert.strictEqual(typeof installer.bundledAssetsComplete, 'function', 'install.js should expose bundledAssetsComplete');
 assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js LIB_DIR should point at <pkg>/lib');
 {
@@ -104,10 +102,10 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
   assert(installer.isOrtBundleLibraryName(expected), `${expected} should be accepted as a bundle library`);
   assert(installer.isOrtBundleLibraryName(providerHelper), 'provider helper libraries should be accepted as bundle libraries');
   assert(!installer.isOrtBundleLibraryName('README.txt'), 'non-library files should not be accepted as bundle libraries');
-  assert.strictEqual(installer.assertSafeArchiveFileName('leindex-1.8.3-linux-x86_64.tar.gz'), 'leindex-1.8.3-linux-x86_64.tar.gz');
+  assert.strictEqual(installer.assertSafeArchiveFileName('leindex-1.8.4-linux-x86_64.tar.gz'), 'leindex-1.8.4-linux-x86_64.tar.gz');
   assert.throws(() => installer.assertSafeArchiveFileName('../leindex.tar.gz'), /Unsafe release asset name/);
   assert.throws(() => installer.assertSafeArchiveFileName('..\\leindex.zip'), /Unsafe release asset name/);
-  assert(installer.isSafeArchiveMemberName('leindex-1.8.3-linux-x86_64/bin/leindex'));
+  assert(installer.isSafeArchiveMemberName('leindex-1.8.4-linux-x86_64/bin/leindex'));
   assert(!installer.isSafeArchiveMemberName('../../etc/passwd'));
   assert(!installer.isSafeArchiveMemberName('/tmp/pwned'));
   assert(!installer.isSafeArchiveMemberName('C:\\temp\\pwned'));
@@ -115,24 +113,16 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
 {
   const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'leindex-mcp-assets-'));
   const libDir = path.join(tmpRoot, 'lib');
-  const modelsDir = path.join(tmpRoot, 'models');
   try {
     fs.mkdirSync(libDir, { recursive: true });
-    fs.mkdirSync(modelsDir, { recursive: true });
-    assert.strictEqual(installer.bundledAssetsComplete(libDir, modelsDir), false, 'empty bundle assets should not satisfy installer fast path');
+    assert.strictEqual(installer.bundledAssetsComplete(libDir), false, 'empty runtime assets should not satisfy installer fast path');
 
     const runtimeName = process.platform === 'win32' ? 'onnxruntime.dll'
       : process.platform === 'darwin' ? 'libonnxruntime.dylib'
       : 'libonnxruntime.so';
     fs.writeFileSync(path.join(libDir, runtimeName), 'fake-ort-runtime');
     assert.strictEqual(installer.hasBundledOrtRuntime(libDir), true, 'ORT runtime library should be detected');
-    assert.strictEqual(installer.bundledAssetsComplete(libDir, modelsDir), false, 'missing model assets should prevent installer fast path');
-
-    for (const file of ['qwen3-embed-0.6b.onnx', 'tokenizer.json', 'config.json']) {
-      fs.writeFileSync(path.join(modelsDir, file), 'fake-model-asset');
-    }
-    assert.strictEqual(installer.hasRequiredModelAssets(modelsDir), true, 'required model assets should be detected');
-    assert.strictEqual(installer.bundledAssetsComplete(libDir, modelsDir), true, 'complete ORT and model assets should satisfy installer fast path');
+    assert.strictEqual(installer.bundledAssetsComplete(libDir), true, 'ORT runtime assets should satisfy installer fast path');
   } finally {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
   }
@@ -271,7 +261,7 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
   const tmpA = fs.mkdtempSync(path.join(os.tmpdir(), 'leindex-mcp-payload-'));
   const tmpB = fs.mkdtempSync(path.join(os.tmpdir(), 'leindex-mcp-payload-'));
   const outside = path.join(tmpA, '..', `leindex-outside-${process.pid}`);
-  const link = path.join(tmpA, 'qwen3-embed-0.6b.onnx');
+  const link = path.join(tmpA, 'unsafe-entry.onnx');
   try {
     fs.writeFileSync(outside, 'outside bundle');
     let symlinkCreated = false;
@@ -284,8 +274,8 @@ assert.strictEqual(installer.LIB_DIR, path.join(__dirname, 'lib'), 'install.js L
     }
     if (symlinkCreated) {
       assert.throws(
-        () => installer.copyRegularBundledFile(link, path.join(tmpB, 'qwen3-embed-0.6b.onnx'), 'model'),
-        /Unsafe model entry is a symlink/,
+        () => installer.copyRegularBundledFile(link, path.join(tmpB, 'unsafe-entry.onnx'), 'archive'),
+        /Unsafe archive entry is a symlink/,
         'copyRegularBundledFile should reject model symlinks instead of dereferencing them'
       );
     }

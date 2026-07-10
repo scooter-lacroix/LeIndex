@@ -337,6 +337,23 @@ impl LeIndex {
         {
             warn!("Failed to persist mmap embeddings: {err:#}");
         }
+        let (pdg_node_count, pdg_edge_count) = self
+            .pdg
+            .as_ref()
+            .map(|pdg| (pdg.node_count(), pdg.edge_count()))
+            .unwrap_or((self.stats.pdg_nodes, self.stats.pdg_edges));
+        if let Err(err) = index_builder::persist_search_snapshot(
+            &self.search_engine,
+            &self.project_path,
+            pdg_node_count,
+            pdg_edge_count,
+            self.pdg
+                .as_ref()
+                .map(index_builder::pdg_search_fingerprint)
+                .unwrap_or_default(),
+        ) {
+            warn!("Failed to persist search snapshot: {err:#}");
+        }
         // Persist neural embeddings separately for fast load_from_storage
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         {
@@ -676,8 +693,7 @@ impl LeIndex {
         } else if annotation_stats.total_external > 0 {
             info!(
                 "External dependency resolution: no lockfile registry found, {} builtins recognized, {} unresolved external imports",
-                annotation_stats.builtin,
-                annotation_stats.unresolved
+                annotation_stats.builtin, annotation_stats.unresolved
             );
         }
         let (ext_in_lockfile, ext_resolved, ext_unresolved, ext_total, ext_builtin) = (
@@ -717,7 +733,10 @@ impl LeIndex {
                     match index_builder::HybridEmbedder::hybrid_local(embedder.clone(), None) {
                         Ok(h) => h,
                         Err(e) => {
-                            warn!("Failed to create hybrid_local from persisted embedder (ONNX), falling back to tfidf_only: {}", e);
+                            warn!(
+                                "Failed to create hybrid_local from persisted embedder (ONNX), falling back to tfidf_only: {}",
+                                e
+                            );
                             index_builder::HybridEmbedder::tfidf_only(embedder)
                         }
                     }
@@ -800,6 +819,18 @@ impl LeIndex {
             index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)
         {
             warn!("Failed to persist mmap embeddings: {err:#}");
+        }
+        if let Err(err) = index_builder::persist_search_snapshot(
+            &self.search_engine,
+            &self.project_path,
+            pdg_node_count,
+            pdg_edge_count,
+            self.pdg
+                .as_ref()
+                .map(index_builder::pdg_search_fingerprint)
+                .unwrap_or_default(),
+        ) {
+            warn!("Failed to persist search snapshot: {err:#}");
         }
         // Persist neural embeddings separately for fast load_from_storage
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
@@ -899,11 +930,85 @@ impl LeIndex {
             return Ok(());
         }
 
-        let batch_size = self.indexing_batch_size();
         let persisted_embedder =
             index_builder::TfIdfEmbedder::load_from_storage(&self.project_path)
                 .ok()
                 .flatten();
+        let current_pdg_fingerprint = index_builder::pdg_search_fingerprint(&pdg);
+
+        if let (Some(snapshot), Some(tfidf_mmap), Some(tfidf_embedder)) = (
+            index_builder::try_load_search_snapshot(&self.project_path),
+            index_builder::try_load_mmap_embeddings(&self.project_path),
+            persisted_embedder.clone(),
+        ) {
+            if snapshot.pdg_nodes == pdg_node_count
+                && snapshot.pdg_edges == pdg_edge_count
+                && snapshot.pdg_fingerprint == current_pdg_fingerprint
+                && tfidf_embedder.is_fresh(pdg_node_count, pdg_edge_count)
+            {
+                #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+                let neural_mmap =
+                    index_builder::try_load_neural_mmap_embeddings(&self.project_path);
+                #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+                let neural_mmap: Option<crate::search::vector::MmapEmbeddingIndex> = None;
+
+                match self.search_engine.restore_from_search_snapshot(
+                    snapshot,
+                    &tfidf_mmap,
+                    neural_mmap.as_ref(),
+                ) {
+                    Ok(indexed_count) => {
+                        #[cfg(feature = "onnx")]
+                        {
+                            match index_builder::HybridEmbedder::hybrid_local(tfidf_embedder, None)
+                            {
+                                Ok(hybrid) => {
+                                    self.embedder = Some(hybrid);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to create hybrid_local embedder for query embedding: {}",
+                                        e
+                                    );
+                                    self.embedder = persisted_embedder
+                                        .clone()
+                                        .map(index_builder::HybridEmbedder::tfidf_only);
+                                }
+                            }
+                        }
+                        #[cfg(not(feature = "onnx"))]
+                        {
+                            self.embedder =
+                                Some(index_builder::HybridEmbedder::tfidf_only(tfidf_embedder));
+                        }
+
+                        if let Err(err) = self.load_stats_from_storage() {
+                            warn!("Failed to load persisted index stats: {err:#}");
+                        }
+                        self.stats.pdg_nodes = pdg_node_count;
+                        self.stats.pdg_edges = pdg_edge_count;
+                        self.stats.indexed_nodes = indexed_count;
+                        self.pdg = Some(pdg);
+                        self.build_file_stats_cache();
+                        info!(
+                            "Hydrated search index from snapshot with {} nodes",
+                            indexed_count
+                        );
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Failed to hydrate search index from snapshot; rebuilding from PDG: {}",
+                            err
+                        );
+                    }
+                }
+            } else {
+                info!("Search snapshot/embedder stale for current PDG; rebuilding search index");
+            }
+        }
+
+        let batch_size = self.indexing_batch_size();
         let embedder = if let Some(embedder) = persisted_embedder {
             if embedder.is_fresh(pdg_node_count, pdg_edge_count) {
                 info!("Loaded persisted embedder from storage");
@@ -967,10 +1072,14 @@ impl LeIndex {
                         restored
                     );
                 } else {
-                    info!("Neural mmap file loaded but no matching node IDs found; neural scores will be 0");
+                    info!(
+                        "Neural mmap file loaded but no matching node IDs found; neural scores will be 0"
+                    );
                 }
             } else {
-                info!("No persisted neural embeddings found; run 'leindex index --force' with onnx feature to generate them");
+                info!(
+                    "No persisted neural embeddings found; run 'leindex index --force' with onnx feature to generate them"
+                );
             }
         }
 
@@ -1029,6 +1138,15 @@ impl LeIndex {
             index_builder::persist_embeddings_to_mmap(&self.search_engine, &self.project_path)
         {
             warn!("Failed to persist mmap embeddings: {err:#}");
+        }
+        if let Err(err) = index_builder::persist_search_snapshot(
+            &self.search_engine,
+            &self.project_path,
+            pdg_node_count,
+            pdg_edge_count,
+            current_pdg_fingerprint,
+        ) {
+            warn!("Failed to persist search snapshot: {err:#}");
         }
         // Persist neural embeddings separately for fast load_from_storage
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]

@@ -1,4 +1,4 @@
-# LeIndex Architecture (v1.5.2)
+# LeIndex Architecture (v1.8.4)
 
 ## Overview
 
@@ -60,7 +60,7 @@ LeIndex exposes 20 MCP tools for indexing, retrieval, context, edits, and impact
 
 ## Concurrency Model
 
-LePasserelle uses a project registry model:
+LeIndex uses a project registry model:
 
 - one process can handle multiple projects
 - per-project locking enables parallel read workloads
@@ -75,6 +75,71 @@ LePasserelle uses a project registry model:
 4. Serve read/analysis/edit-preview requests via CLI, MCP, and HTTP.
 5. Emit telemetry for diagnostics and dashboard metrics.
 
+## Hybrid Search Architecture
+
+LeIndex has one node-level search corpus. Parsing creates PDG nodes for files,
+symbols, methods, and other code units; both TF-IDF and Qwen3 vectors use those
+same stable node identifiers. This preserves graph reachability and symbol
+precision while adding semantic recall. It does not maintain an independent
+file/chunk semantic sidecar.
+
+Indexing writes three search artifacts under each project:
+
+- `embeddings.bin`: memory-mapped TF-IDF rows
+- `neural_embeddings.bin`: memory-mapped Qwen3 rows
+- `search_snapshot.bin`: PDG fingerprint, row metadata, and hydration state
+
+When the PDG fingerprint matches, CLI and MCP processes hydrate the snapshot
+and mmap files directly. They do not run refresh, deduplication, or index
+maintenance before every query. Changed files update affected nodes through
+incremental indexing; a full compatibility rebuild is reserved for missing,
+stale, or incompatible artifacts.
+
+Candidate generation combines lexical, neural, and structural scores. Neural
+query embedding has a bounded default budget of 250 ms. TF-IDF and graph
+results remain available if the worker is cold, compiling, unavailable, or
+over budget.
+
+## Embedding Worker
+
+`leindex-embed` owns tokenization, ONNX Runtime, model memory, and provider
+state. On Unix, clients connect to a local socket keyed by provider, model, and
+inference shape,
+allowing short-lived CLI commands and the MCP server to share one resident
+session. Resident socket workers exit after ten idle minutes. Setup smoke tests
+and non-Unix platforms retain direct process IPC with a one-minute idle limit.
+
+The Qwen3 runtime contract is:
+
+- CPU/CUDA dynamic batches, default maximum 32
+- MIGraphX stable batches of 8 with padded inputs excluded from results
+- 128-token stable input shape by default
+- `input_ids`, `attention_mask`, and `position_ids`
+- last-unpadded-token pooling and L2 normalization
+- output order identical to request order
+
+MIGraphX uses graph optimization level 3 and a model/version/shape-specific
+compiled-program cache under `$LEINDEX_HOME/cache/migraphx`. Setup warms the selected provider
+and rejects a GPU configuration when the active provider is CPU. CUDA and CPU
+use the same model graph with their corresponding ONNX Runtime package.
+
+## Model And Runtime Distribution
+
+Release artifacts contain the main binary, embedding worker, and platform
+ONNX Runtime libraries. They never contain model weights, tokenizer data, or
+model configuration. `leindex setup` uses Hugging Face CLI to stage, install,
+and checksum the validated dynamic Qwen3 export under
+`$LEINDEX_HOME/models`.
+
+Provider choice is runtime configuration:
+
+- CPU: `onnxruntime`
+- NVIDIA: `onnxruntime-gpu` with CUDA
+- AMD: `onnxruntime-migraphx` with ROCm/MIGraphX
+
+This keeps crates.io, npm, PyPI, and GitHub bundles small and prevents a stale
+or provider-incompatible model from being embedded in a release.
+
 ## Dashboard Integration
 
 Dashboard assets live under `dashboard/` and are served in development via Bun.
@@ -88,7 +153,9 @@ Dashboard assets live under `dashboard/` and are served in development via Bun.
 
 ## Packaging Notes
 
-- `cargo install leindex` installs CLI/MCP binaries.
+- `cargo install leindex` installs CLI/MCP and embedding-worker binaries.
+- GitHub and npm bundles include ONNX Runtime libraries but no model files.
+- `leindex setup` installs the model and records provider configuration.
 - Dashboard assets are distributed via repository installs/installer, not embedded in the crate artifact.
 
 ## Removed Components Documentation

@@ -30,6 +30,8 @@ use crate::startup::{StartupReport, StartupReporter};
 
 // ONNX Runtime imports - only available with "onnx" feature
 #[cfg(feature = "onnx")]
+use ort::logging::LogLevel;
+#[cfg(feature = "onnx")]
 use ort::session::{builder::GraphOptimizationLevel, Session};
 
 /// Default idle timeout in seconds before the worker tears itself down.
@@ -41,9 +43,12 @@ use ort::session::{builder::GraphOptimizationLevel, Session};
 /// after the parent leindex process exits.
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 60; // 1 minute
 
-/// Default maximum sequence length for tokenization.
-// TODO: make this configurable from model config / RuntimeConfig.
-pub const DEFAULT_MAX_SEQ_LEN: usize = 512;
+/// Default fixed ONNX sequence length.
+///
+/// MIGraphX compiles one GPU program per input shape. Padding every request to
+/// one bounded shape lets setup warm the same shape used by indexing/search,
+/// instead of paying a multi-minute compile on the first real repo.
+pub const DEFAULT_MAX_SEQ_LEN: usize = 128;
 
 /// Default maximum outgoing frame size in bytes (16 MiB).
 pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
@@ -51,13 +56,94 @@ pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 /// Default maximum single-text size in bytes (1 MiB).
 pub const DEFAULT_MAX_TEXT_SIZE: usize = 1024 * 1024;
 
-/// Maximum texts per ONNX inference call.
-///
-/// The bundled qwen3-embed-0.6b.onnx model has a fixed batch dimension of 1
-/// in its internal attention-mask tensors. Larger batches cause shape-mismatch
-/// errors in ONNX Runtime, so inference processes one text per model call.
+/// Default maximum texts per ONNX inference call for legacy fixed-batch models.
 #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
-const ONNX_INFERENCE_BATCH_SIZE: usize = 1;
+const DEFAULT_ONNX_INFERENCE_BATCH_SIZE: usize = 1;
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+const DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE: usize = 32;
+/// MIGraphX compiles the first input shape into a fixed program. Every request
+/// in a session must therefore use one stable batch dimension.
+pub const DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE: usize = 8;
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+const MAX_ONNX_INFERENCE_BATCH_SIZE: usize = 256;
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+const ONNX_INFERENCE_BATCH_SIZE_ENV: &str = "LEINDEX_ONNX_INFERENCE_BATCH_SIZE";
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+const MIN_ONNX_SEQUENCE_LEN: usize = 8;
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+const MAX_ONNX_SEQUENCE_LEN: usize = 512;
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+const ONNX_SEQUENCE_LEN_ENV: &str = "LEINDEX_ONNX_SEQUENCE_LEN";
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+const ONNX_LOG_SHAPES_ENV: &str = "LEINDEX_ONNX_LOG_SHAPES";
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+const MIGRAPHX_FP16_ENV: &str = "LEINDEX_MIGRAPHX_FP16";
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+const MIGRAPHX_EXHAUSTIVE_TUNE_ENV: &str = "LEINDEX_MIGRAPHX_EXHAUSTIVE_TUNE";
+
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+pub fn configured_onnx_inference_batch_size(model_name: &str, provider: &str) -> usize {
+    std::env::var(ONNX_INFERENCE_BATCH_SIZE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .map(|v| v.min(MAX_ONNX_INFERENCE_BATCH_SIZE))
+        .unwrap_or_else(|| {
+            if provider.eq_ignore_ascii_case("migraphx") || provider.eq_ignore_ascii_case("rocm") {
+                DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE
+            } else if model_name.ends_with("-dynamic") {
+                DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE
+            } else {
+                DEFAULT_ONNX_INFERENCE_BATCH_SIZE
+            }
+        })
+}
+
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+fn build_position_ids(batch_size: usize, sequence_len: usize) -> Vec<i64> {
+    (0..batch_size)
+        .flat_map(|_| (0..sequence_len).map(|position| position as i64))
+        .collect()
+}
+
+#[cfg(feature = "onnx")]
+fn extract_output_tensor_f32(value: &ort::value::DynValue) -> Result<Vec<f32>, String> {
+    match value.try_extract_array::<f32>() {
+        Ok(values) => Ok(values.iter().copied().collect()),
+        Err(f32_error) => value
+            .try_extract_array::<half::f16>()
+            .map(|values| values.iter().map(|value| value.to_f32()).collect())
+            .map_err(|f16_error| {
+                format!(
+                    "output is neither f32 ({}) nor f16 ({})",
+                    f32_error, f16_error
+                )
+            }),
+    }
+}
+
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+pub fn configured_onnx_sequence_len() -> usize {
+    std::env::var(ONNX_SEQUENCE_LEN_ENV)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v >= MIN_ONNX_SEQUENCE_LEN)
+        .map(|v| v.min(MAX_ONNX_SEQUENCE_LEN))
+        .unwrap_or(DEFAULT_MAX_SEQ_LEN)
+}
+
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
 
 /// Configuration for the worker runtime.
 #[derive(Debug, Clone)]
@@ -111,7 +197,14 @@ impl RuntimeConfig {
             .unwrap_or(DEFAULT_MAX_TEXT_SIZE);
 
         let model_name = std::env::var("LEINDEX_WORKER_MODEL")
-            .unwrap_or_else(|_| "qwen3-embed-0.6b".to_string());
+            .ok()
+            .or_else(|| {
+                crate::config::LeIndexConfig::load()
+                    .ok()
+                    .map(|cfg| cfg.neural.model_name)
+                    .filter(|name| !name.trim().is_empty())
+            })
+            .unwrap_or_else(|| "qwen3-embed-0.6b".to_string());
 
         let embedding_dim = std::env::var("LEINDEX_WORKER_EMBEDDING_DIM")
             .ok()
@@ -364,6 +457,24 @@ impl WorkerRuntime {
             };
         }
 
+        fn build_migraphx_ep() -> ort::ep::ExecutionProviderDispatch {
+            let mut ep = ort::ep::MIGraphX::default();
+
+            if env_flag(MIGRAPHX_FP16_ENV) {
+                tracing::info!("MIGraphX FP16 enabled via {}", MIGRAPHX_FP16_ENV);
+                ep = ep.with_fp16(true);
+            }
+            if env_flag(MIGRAPHX_EXHAUSTIVE_TUNE_ENV) {
+                tracing::info!(
+                    "MIGraphX exhaustive tune enabled via {}",
+                    MIGRAPHX_EXHAUSTIVE_TUNE_ENV
+                );
+                ep = ep.with_exhaustive_tune(true);
+            }
+
+            ep.build()
+        }
+
         // For GPU execution providers (MIGraphX/ROCm), use Level3 optimization
         // so the ONNX graph undergoes maximum operator fusion and layout
         // transformations before the EP sees it. MIGraphX works by identifying
@@ -384,6 +495,7 @@ impl WorkerRuntime {
             // between inference calls. Without this, ORT may reuse an internal
             // buffer shaped for the previous sequence and report a shape mismatch.
             .with_memory_pattern(false)?
+            .with_log_level(LogLevel::Warning)?
             .with_optimization_level(optimization_level)?;
 
         // VAL-ORT-015 / VAL-ORT-016: dynamic-load pre-flight check.
@@ -444,22 +556,14 @@ impl WorkerRuntime {
                 // may believe MIGraphX is available even without the EP compiled
                 // in), and `try_provider_or_cpu!` will fall back if registration
                 // fails.
-                try_provider_or_cpu!(
-                    session_builder,
-                    ort::ep::MIGraphX::default().build(),
-                    "MIGraphX"
-                )
+                try_provider_or_cpu!(session_builder, build_migraphx_ep(), "MIGraphX")
             }
             "rocm" => {
                 // ROCm EP is deprecated in favor of MIGraphX. Try MIGraphX first,
                 // then fall back to ROCm if available (old ORT builds), then CPU.
                 // (The pre-flight check above has already handled the case where
                 // MIGraphX is not compiled in and the user passed "rocm".)
-                try_provider_or_cpu!(
-                    session_builder,
-                    ort::ep::MIGraphX::default().build(),
-                    "MIGraphX"
-                )
+                try_provider_or_cpu!(session_builder, build_migraphx_ep(), "MIGraphX")
             }
             "coreml" => {
                 try_provider_or_cpu!(
@@ -817,35 +921,26 @@ impl WorkerRuntime {
         }
 
         // Process encodings in sub-batches to bound peak memory.
-        // Each sub-batch runs one ONNX session.run() call with at most
-        // ONNX_INFERENCE_BATCH_SIZE texts, keeping tensor allocation bounded.
+        // Batch size is env-tunable once the selected model is validated for
+        // dynamic batch; the default is safe for fixed-batch artifacts.
         let mut all_pooled: Vec<f32> = Vec::with_capacity(encodings.len() * expected_dim);
 
-        let total_texts = encodings.len();
-        for (chunk_idx, sub_batch) in encodings.chunks(ONNX_INFERENCE_BATCH_SIZE).enumerate() {
-            // Pad the last sub-batch to ONNX_INFERENCE_BATCH_SIZE with dummy texts.
-            // Although with_memory_pattern(false) prevents most buffer-reuse shape
-            // mismatches, padding the final partial batch keeps the batch dimension
-            // constant across all inference calls. This is a belt-and-suspenders
-            // measure: some ORT EP internal optimizations may still re-use
-            // intermediate buffers keyed by batch size, so a constant batch
-            // dimension avoids any residual mismatch. Padding results are
-            // discarded after inference.
-            let is_last_chunk = (chunk_idx + 1) * ONNX_INFERENCE_BATCH_SIZE >= total_texts;
-            let needs_padding = is_last_chunk && sub_batch.len() < ONNX_INFERENCE_BATCH_SIZE;
-
-            if needs_padding {
-                let pad_count = ONNX_INFERENCE_BATCH_SIZE - sub_batch.len();
-                let mut padded: Vec<tokenizers::Encoding> = sub_batch.to_vec();
-                // Use the first encoding as a template for padding (its results will be discarded)
+        let inference_batch_size = configured_onnx_inference_batch_size(
+            &self.config.model_name,
+            &self.config.execution_provider,
+        );
+        let fixed_batch = self
+            .config
+            .execution_provider
+            .eq_ignore_ascii_case("migraphx")
+            || self.config.execution_provider.eq_ignore_ascii_case("rocm");
+        for sub_batch in encodings.chunks(inference_batch_size) {
+            if fixed_batch && sub_batch.len() < inference_batch_size {
+                let mut padded = sub_batch.to_vec();
                 if let Some(template) = sub_batch.first() {
-                    let template = template.clone();
-                    for _ in 0..pad_count {
-                        padded.push(template.clone());
-                    }
+                    padded.resize(inference_batch_size, template.clone());
                 }
                 let sub_pooled = self.run_onnx_embed_sub_batch(session, &padded, expected_dim)?;
-                // Only keep results for the real texts, discard padding
                 all_pooled.extend_from_slice(&sub_pooled[..sub_batch.len() * expected_dim]);
             } else {
                 let sub_pooled = self.run_onnx_embed_sub_batch(session, sub_batch, expected_dim)?;
@@ -871,13 +966,16 @@ impl WorkerRuntime {
             return Ok(vec![]);
         }
 
-        // Determine max sequence length within this sub-batch (capped at DEFAULT_MAX_SEQ_LEN)
-        let max_len = encodings
-            .iter()
-            .map(|e| e.len())
-            .max()
-            .unwrap_or(0)
-            .min(DEFAULT_MAX_SEQ_LEN);
+        let max_len = configured_onnx_sequence_len();
+        if env_flag(ONNX_LOG_SHAPES_ENV) {
+            let max_encoding_len = encodings.iter().map(|e| e.len()).max().unwrap_or(0);
+            tracing::info!(
+                batch_size,
+                max_len,
+                max_encoding_len,
+                "ONNX embedding input shape"
+            );
+        }
 
         if max_len == 0 {
             return Ok(vec![0.0f32; batch_size * expected_dim]);
@@ -930,20 +1028,46 @@ impl WorkerRuntime {
             message: format!("failed to create attention_mask tensor: {}", e),
         })?;
 
+        let position_ids_tensor = ort::value::Tensor::from_array(
+            ndarray::Array2::from_shape_vec(
+                (batch_size, max_len),
+                build_position_ids(batch_size, max_len),
+            )
+            .map_err(|e| WorkerError {
+                kind: ErrorKind::Inference,
+                message: format!("failed to create position_ids array: {}", e),
+            })?,
+        )
+        .map_err(|e| WorkerError {
+            kind: ErrorKind::Inference,
+            message: format!("failed to create position_ids tensor: {}", e),
+        })?;
+
         let mut session_guard = session.lock().map_err(|e| WorkerError {
             kind: ErrorKind::OnnxRuntime,
             message: format!("failed to lock ONNX session: {}", e),
         })?;
 
-        let outputs = session_guard
-            .run(ort::inputs! {
+        let uses_position_ids = session_guard
+            .inputs()
+            .iter()
+            .any(|input| input.name() == "position_ids");
+        let outputs = if uses_position_ids {
+            session_guard.run(ort::inputs! {
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+                "position_ids" => position_ids_tensor,
+            })
+        } else {
+            session_guard.run(ort::inputs! {
                 "input_ids" => input_ids_tensor,
                 "attention_mask" => attention_mask_tensor,
             })
-            .map_err(|e| WorkerError {
-                kind: ErrorKind::Inference,
-                message: format!("ONNX inference failed: {}", e),
-            })?;
+        }
+        .map_err(|e| WorkerError {
+            kind: ErrorKind::Inference,
+            message: format!("ONNX inference failed: {}", e),
+        })?;
 
         if outputs.len() == 0 {
             return Err(WorkerError {
@@ -956,18 +1080,13 @@ impl WorkerRuntime {
         // Expected: [batch_size, seq_len, hidden_dim] or [batch_size, hidden_dim].
         let output_shape: Vec<usize> = outputs[0].shape().iter().map(|&d| d as usize).collect();
 
-        // try_extract_array returns an ndarray::ArrayView (borrowed). We call
-        // to_owned() to get an owned ArrayD<f32>, then into_raw_vec_and_offset()
-        // reclaims the underlying Vec<f32> without an extra copy.
-        let embeddings_f32: Vec<f32> = outputs[0]
-            .try_extract_array::<f32>()
-            .map_err(|e| WorkerError {
-                kind: ErrorKind::Inference,
-                message: format!("failed to extract output tensor: {:?}", e),
-            })?
-            .to_owned()
-            .into_raw_vec_and_offset()
-            .0;
+        // MIGraphX may return float16 output even when the source graph is
+        // float32. Normalize both provider output types to the f32 storage
+        // contract used by search.
+        let embeddings_f32 = extract_output_tensor_f32(&outputs[0]).map_err(|e| WorkerError {
+            kind: ErrorKind::Inference,
+            message: format!("failed to extract output tensor: {}", e),
+        })?;
 
         // Derive seq_len and hidden_dim from the actual tensor shape.
         let (actual_seq_len, hidden_dim) = match output_shape.as_slice() {
@@ -1032,7 +1151,7 @@ impl WorkerRuntime {
             });
         }
 
-        // Apply mean pooling using attention mask, then L2 normalize.
+        // Select the final unpadded token required by Qwen3, then L2 normalize.
         // This is done per sub-batch.
         let pooled = self.pool_and_normalize(
             &embeddings_f32,
@@ -1054,52 +1173,30 @@ impl WorkerRuntime {
         attention_mask: &[i64],
         expected_dim: usize,
     ) -> Result<EmbedResponse, WorkerError> {
-        // Reshape: [batch_size, seq_len, hidden_dim]
-        // Apply mean pooling with attention mask weighting
-        // Then L2 normalize each embedding
-
         let hidden_dim = expected_dim;
         let mut pooled: Vec<f32> = Vec::with_capacity(batch_size * hidden_dim);
-        let mut sum: Vec<f32> = vec![0.0f32; hidden_dim];
+        let mut row: Vec<f32> = vec![0.0f32; hidden_dim];
 
         for b in 0..batch_size {
-            sum.fill(0.0);
-            let mut weight_sum: f32 = 0.0f32;
-
-            for s in 0..seq_len {
-                let mask_val = attention_mask.get(b * seq_len + s).copied().unwrap_or(0);
-                if mask_val > 0 {
-                    for (h, sum_val) in sum.iter_mut().enumerate() {
-                        let idx = b * seq_len * hidden_dim + s * hidden_dim + h;
-                        if let Some(&val) = embeddings.get(idx) {
-                            *sum_val += val;
-                        }
-                    }
-                    weight_sum += 1.0f32;
-                }
+            row.fill(0.0);
+            let mask_start = b * seq_len;
+            let last_token = (0..seq_len)
+                .rev()
+                .find(|&s| attention_mask.get(mask_start + s).copied().unwrap_or(0) > 0);
+            if let Some(token_index) = last_token {
+                let embedding_start = (b * seq_len + token_index) * hidden_dim;
+                row.copy_from_slice(&embeddings[embedding_start..embedding_start + hidden_dim]);
             }
 
-            // Mean pooling
-            if weight_sum > 0.0f32 {
-                for sum_val in sum.iter_mut() {
-                    *sum_val /= weight_sum;
-                }
-            }
-
-            // L2 normalize
-            let mut norm: f32 = 0.0f32;
-            for &val in sum.iter() {
-                norm += val * val;
-            }
-            norm = norm.sqrt();
+            let norm = row.iter().map(|value| value * value).sum::<f32>().sqrt();
 
             if norm > 1e-10f32 {
-                for sum_val in sum.iter_mut() {
-                    *sum_val /= norm;
+                for value in &mut row {
+                    *value /= norm;
                 }
             }
 
-            pooled.extend_from_slice(&sum);
+            pooled.extend_from_slice(&row);
         }
 
         Ok(EmbedResponse::new(pooled, batch_size, expected_dim))
@@ -1179,25 +1276,22 @@ impl WorkerRuntime {
         }
 
         // Process encodings in sub-batches to bound peak memory.
-        // Each sub-batch runs one ONNX session.run() call with at most
-        // ONNX_INFERENCE_BATCH_SIZE texts.
         let mut all_rerank_scores: Vec<f32> = Vec::with_capacity(rerank_req.documents.len());
 
-        let total_docs = encodings.len();
-        for (chunk_idx, sub_batch) in encodings.chunks(ONNX_INFERENCE_BATCH_SIZE).enumerate() {
-            // Pad the last sub-batch to ONNX_INFERENCE_BATCH_SIZE to prevent
-            // shape mismatch errors from ONNX Runtime buffer reuse.
-            let is_last_chunk = (chunk_idx + 1) * ONNX_INFERENCE_BATCH_SIZE >= total_docs;
-            let needs_padding = is_last_chunk && sub_batch.len() < ONNX_INFERENCE_BATCH_SIZE;
-
-            if needs_padding {
-                let pad_count = ONNX_INFERENCE_BATCH_SIZE - sub_batch.len();
-                let mut padded: Vec<tokenizers::Encoding> = sub_batch.to_vec();
+        let inference_batch_size = configured_onnx_inference_batch_size(
+            &self.config.model_name,
+            &self.config.execution_provider,
+        );
+        let fixed_batch = self
+            .config
+            .execution_provider
+            .eq_ignore_ascii_case("migraphx")
+            || self.config.execution_provider.eq_ignore_ascii_case("rocm");
+        for sub_batch in encodings.chunks(inference_batch_size) {
+            if fixed_batch && sub_batch.len() < inference_batch_size {
+                let mut padded = sub_batch.to_vec();
                 if let Some(template) = sub_batch.first() {
-                    let template = template.clone();
-                    for _ in 0..pad_count {
-                        padded.push(template.clone());
-                    }
+                    padded.resize(inference_batch_size, template.clone());
                 }
                 let sub_scores = self.run_onnx_rerank_sub_batch(session, &padded)?;
                 all_rerank_scores.extend_from_slice(&sub_scores[..sub_batch.len()]);
@@ -1246,12 +1340,9 @@ impl WorkerRuntime {
             return Ok(vec![]);
         }
 
-        let max_len = encodings
-            .iter()
-            .map(|e| e.len())
-            .max()
-            .unwrap_or(0)
-            .min(512);
+        // Keep sequence shape stable across MIGraphX compile, setup warmup,
+        // embedding, and reranking paths.
+        let max_len = configured_onnx_sequence_len();
 
         if max_len == 0 {
             // Return zero scores if tokenization produced nothing
@@ -1303,20 +1394,46 @@ impl WorkerRuntime {
             message: format!("failed to create rerank attention_mask tensor: {}", e),
         })?;
 
+        let position_ids_tensor = ort::value::Tensor::from_array(
+            ndarray::Array2::from_shape_vec(
+                (batch_size, max_len),
+                build_position_ids(batch_size, max_len),
+            )
+            .map_err(|e| WorkerError {
+                kind: ErrorKind::Inference,
+                message: format!("failed to create rerank position_ids array: {}", e),
+            })?,
+        )
+        .map_err(|e| WorkerError {
+            kind: ErrorKind::Inference,
+            message: format!("failed to create rerank position_ids tensor: {}", e),
+        })?;
+
         let mut session_guard = session.lock().map_err(|e| WorkerError {
             kind: ErrorKind::OnnxRuntime,
             message: format!("failed to lock ONNX session for rerank: {}", e),
         })?;
 
-        let outputs = session_guard
-            .run(ort::inputs! {
+        let uses_position_ids = session_guard
+            .inputs()
+            .iter()
+            .any(|input| input.name() == "position_ids");
+        let outputs = if uses_position_ids {
+            session_guard.run(ort::inputs! {
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+                "position_ids" => position_ids_tensor,
+            })
+        } else {
+            session_guard.run(ort::inputs! {
                 "input_ids" => input_ids_tensor,
                 "attention_mask" => attention_mask_tensor,
             })
-            .map_err(|e| WorkerError {
-                kind: ErrorKind::Inference,
-                message: format!("ONNX rerank inference failed: {}", e),
-            })?;
+        }
+        .map_err(|e| WorkerError {
+            kind: ErrorKind::Inference,
+            message: format!("ONNX rerank inference failed: {}", e),
+        })?;
 
         if outputs.len() == 0 {
             return Err(WorkerError {
@@ -1327,26 +1444,14 @@ impl WorkerRuntime {
 
         let output = &outputs[0];
         let shape: Vec<usize> = output.shape().iter().map(|&d| d as usize).collect();
+        let output_values = extract_output_tensor_f32(output).map_err(|e| WorkerError {
+            kind: ErrorKind::Inference,
+            message: format!("failed to extract rerank output tensor: {}", e),
+        })?;
 
         let rerank_scores: Vec<f32> = match shape.as_slice() {
-            [n] if *n == batch_size => output
-                .try_extract_array::<f32>()
-                .map_err(|e| WorkerError {
-                    kind: ErrorKind::Inference,
-                    message: format!("failed to extract scalar rerank output tensor: {:?}", e),
-                })?
-                .iter()
-                .copied()
-                .collect(),
-            [n, 1] if *n == batch_size => output
-                .try_extract_array::<f32>()
-                .map_err(|e| WorkerError {
-                    kind: ErrorKind::Inference,
-                    message: format!("failed to extract scalar rerank output tensor: {:?}", e),
-                })?
-                .iter()
-                .copied()
-                .collect(),
+            [n] if *n == batch_size => output_values,
+            [n, 1] if *n == batch_size => output_values,
             _ => {
                 return Err(WorkerError {
                     kind: ErrorKind::Inference,
@@ -1406,6 +1511,9 @@ mod tests {
     use super::*;
     use crate::protocol::EmbedRequest;
     use std::io::Cursor;
+    use std::sync::Mutex as StdMutex;
+
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
     #[test]
     fn test_runtime_config_default() {
@@ -1417,6 +1525,119 @@ mod tests {
         assert_eq!(config.max_frame_size, 16 * 1024 * 1024);
         assert_eq!(config.max_text_size, 1024 * 1024);
         assert_eq!(config.embedding_dim, 1024);
+    }
+
+    #[test]
+    fn onnx_inference_batch_size_defaults_to_fixed_batch_safe_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+        assert_eq!(
+            configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
+            DEFAULT_ONNX_INFERENCE_BATCH_SIZE
+        );
+        assert_eq!(
+            configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
+            1
+        );
+    }
+
+    #[test]
+    fn onnx_inference_batch_size_uses_positive_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(ONNX_INFERENCE_BATCH_SIZE_ENV, "32");
+
+        assert_eq!(
+            configured_onnx_inference_batch_size("qwen3-embed-0.6b", "migraphx"),
+            32
+        );
+
+        std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
+    }
+
+    #[test]
+    fn onnx_inference_batch_size_rejects_zero_and_bad_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        std::env::set_var(ONNX_INFERENCE_BATCH_SIZE_ENV, "0");
+        assert_eq!(
+            configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
+            DEFAULT_ONNX_INFERENCE_BATCH_SIZE
+        );
+
+        std::env::set_var(ONNX_INFERENCE_BATCH_SIZE_ENV, "nope");
+        assert_eq!(
+            configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
+            DEFAULT_ONNX_INFERENCE_BATCH_SIZE
+        );
+
+        std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn qwen_pooling_uses_last_unpadded_token() {
+        let runtime = WorkerRuntime::new(RuntimeConfig::default());
+        let pooled = runtime
+            .pool_and_normalize(
+                &[
+                    1.0, 0.0, // first token
+                    0.0, 2.0, // final real token
+                    8.0, 8.0, // padding
+                ],
+                1,
+                3,
+                &[1, 1, 0],
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(pooled.vectors, vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn position_ids_repeat_sequence_for_each_batch_row() {
+        assert_eq!(build_position_ids(2, 4), vec![0, 1, 2, 3, 0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn onnx_sequence_len_defaults_and_clamps_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(ONNX_SEQUENCE_LEN_ENV);
+        assert_eq!(configured_onnx_sequence_len(), DEFAULT_MAX_SEQ_LEN);
+
+        std::env::set_var(ONNX_SEQUENCE_LEN_ENV, "4");
+        assert_eq!(configured_onnx_sequence_len(), DEFAULT_MAX_SEQ_LEN);
+
+        std::env::set_var(ONNX_SEQUENCE_LEN_ENV, "256");
+        assert_eq!(configured_onnx_sequence_len(), 256);
+
+        std::env::set_var(ONNX_SEQUENCE_LEN_ENV, "4096");
+        assert_eq!(configured_onnx_sequence_len(), MAX_ONNX_SEQUENCE_LEN);
+        std::env::remove_var(ONNX_SEQUENCE_LEN_ENV);
+    }
+
+    #[test]
+    fn dynamic_qwen_uses_batched_inference_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+        assert_eq!(
+            configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "cpu"),
+            DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE
+        );
+        assert!(DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE > 1);
+    }
+
+    #[test]
+    fn migraphx_uses_one_stable_batch_shape_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
+
+        assert_eq!(
+            configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "migraphx"),
+            DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE
+        );
     }
 
     #[test]

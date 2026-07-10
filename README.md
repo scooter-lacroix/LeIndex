@@ -107,8 +107,11 @@ leindex setup
 ```
 
 `cargo install` places both `leindex` and `leindex-embed` in `~/.cargo/bin/`.
-The `setup` wizard installs ONNX Runtime via pip and downloads the
-`qwen3-embed-0.6b.onnx` model to `~/.leindex/models/`.
+The `setup` wizard selects CPU, NVIDIA CUDA, or AMD ROCm/MIGraphX, installs
+the matching ONNX Runtime package, and downloads
+[Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) from
+Hugging Face via Hugging Face CLI into `~/.leindex/models/`. If `hf` is not
+installed, setup installs `huggingface_hub` through Python/pip first.
 
 **Option 2: npm (recommended for AI tools like Cursor, Claude Code, VS Code)**
 
@@ -118,8 +121,9 @@ npm run setup --prefix "$(npm root -g)/@leindex/mcp"
 ```
 
 The npm package downloads a platform-specific bundle containing the main
-binary, the ONNX worker (`leindex-embed`), bundled ORT libraries, and model
-assets. `npm run setup` invokes the bundled `leindex setup` wizard.
+binary, the ONNX worker (`leindex-embed`), and bundled ORT libraries.
+`npm run setup` invokes the bundled `leindex setup` wizard to select the
+provider and provision model files outside the npm package.
 
 **Option 3: PyPI (recommended for Python users)**
 
@@ -141,9 +145,10 @@ bash install-leindex.sh
 leindex setup
 ```
 
-The install script downloads a pre-built release bundle (binaries + bundled ORT
-`lib/` + model assets), copies them into `~/.leindex/` and `~/.cargo/bin/`, then
-runs `leindex setup --check` to report status. No Rust toolchain required.
+The install script downloads a pre-built release bundle (binaries plus bundled
+ORT `lib/`), copies it into `~/.leindex/` and `~/.cargo/bin/`, then runs
+`leindex setup --check` to report status. Models are never shipped in release
+artifacts; the explicit `leindex setup` command downloads the correct model.
 
 > **Neural vs. TF-IDF**: TF-IDF (keyword) search works out of the box with no
 > setup. `leindex setup` enables neural (semantic) search by installing ONNX
@@ -586,11 +591,15 @@ LeIndex supports multiple embedding backends for semantic search:
 
 ### Local ONNX Models (default)
 
-Build with the default features to use local Qwen3 embedding models via ONNX Runtime. LeIndex uses a **worker-sidecar architecture** — the main `leindex` process delegates ONNX inference to a separate `leindex-embed` worker process, keeping the main daemon lightweight.
+Build with the default features to use Qwen3 embeddings through ONNX Runtime.
+LeIndex keeps TF-IDF and neural vectors per PDG node, then combines semantic,
+lexical, and structural scores during retrieval. ONNX inference runs in a
+resident `leindex-embed` worker so short-lived CLI calls and MCP requests reuse
+the loaded model, GPU allocations, and compiled provider cache.
 
 ```bash
 cargo build --release --features onnx
-./target/release/leindex setup          # install ONNX Runtime + download qwen3-embed-0.6b model
+./target/release/leindex setup          # select provider + install validated Qwen3 model
 ```
 
 The `onnx` feature uses the `load-dynamic` ORT strategy: no ONNX Runtime is
@@ -604,12 +613,16 @@ Local models provide:
 - Privacy (data never leaves your machine)
 - No API costs
 - Zero network latency
-- Support for `qwen3-embed-0.6b` (default) and optional Qwen3-Reranker-0.6B
-- Worker-sidecar ONNX inference keeps main process memory low
+- Provider-aware batching: dynamic up to 32 on CPU/CUDA, stable batches of 8 on MIGraphX
+- A 250 ms neural query budget with immediate TF-IDF/structural fallback
+- Resident worker reuse while keeping ONNX memory outside the main process
 
 The worker binary (`leindex-embed`) is built alongside the main binary and is
-discovered automatically at runtime. `leindex setup` installs the ONNX Runtime
-pip package and downloads model assets to `~/.leindex/models/`.
+discovered automatically. `leindex setup --neural --gpu amd` installs MIGraphX,
+`--gpu nvidia` installs CUDA, and `--cpu` installs standard ORT. Every path
+uses the same validated `qwen3-embed-0.6b-dynamic.onnx` graph provisioned by
+Hugging Face CLI under `~/.leindex/models/`; model files are not packaged with
+LeIndex.
 
 ### Remote Cloud Providers
 

@@ -231,118 +231,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - name: Download model assets
-        shell: bash
-        env:
-          # Authenticated HuggingFace requests get a higher rate
-          # limit per IP. The token is optional — when the
-          # workflow has no `HF_TOKEN` secret, unauthenticated
-          # requests still work, just with a tighter per-minute
-          # cap that the retry policy below absorbs.
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          set -e
-          export GH_TOKEN="${{ secrets.GITHUB_TOKEN }}"
-          MODELS_DIR="models"
-          mkdir -p "$MODELS_DIR"
-          # Model assets are gitignored so checkout won't include them.
-          # Try to fetch from a prior GitHub Release first, then HuggingFace.
-          HF_REPO="onnx-community/Qwen3-Embedding-0.6B-ONNX"
-          if [[ -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
-            echo "Model assets already present in repository"
-          else
-            echo "Model assets not in repo — attempting to fetch from prior release..."
-            # Fetch latest non-draft release tag
-            TAG=$(gh release list --limit 10 --json tagName,isDraft --jq '.[] | select(.isDraft == false) | .tagName' | head -1)
-            if [[ -n "$TAG" ]]; then
-              echo "Downloading model assets from release $TAG..."
-              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "*.onnx" 2>/dev/null || true
-              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "tokenizer.json" 2>/dev/null || true
-              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "config.json" 2>/dev/null || true
-              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "checksums.sha256" 2>/dev/null || true
-              gh release download "$TAG" --dir "$MODELS_DIR" --pattern "LICENSE" 2>/dev/null || true
-              # Try to extract from prior release bundle if direct download failed
-              if [[ ! -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
-                echo "Direct download failed — trying to extract from release bundle..."
-                BUNDLE=$(gh release download "$TAG" --dir /tmp --pattern "leindex-*-linux-x86_64.tar.gz" 2>/dev/null && ls /tmp/leindex-*-linux-x86_64.tar.gz 2>/dev/null | head -1 || true)
-                if [[ -z "$BUNDLE" || ! -f "$BUNDLE" ]]; then
-                  echo "::warning::Prior release bundle not found — cannot extract models from previous release"
-                fi
-                if [[ -n "$BUNDLE" && -f "$BUNDLE" ]]; then
-                  tar xzf "$BUNDLE" -C /tmp --strip-components=1 --wildcards "leindex-*/models/qwen3-embed-0.6b.onnx" "leindex-*/models/tokenizer.json" 2>/dev/null || true
-                  cp /tmp/models/qwen3-embed-0.6b.onnx "$MODELS_DIR/" 2>/dev/null || true
-                  cp /tmp/models/tokenizer.json "$MODELS_DIR/" 2>/dev/null || true
-                fi
-              fi
-            fi
-            # Fall back to HuggingFace download if still missing
-            # HuggingFace serves from a CDN that returns HTTP 429
-            # (Too Many Requests) under bursty CI load. The default
-            # curl behaviour is to fail on the first 429, which
-            # is what caused the 2026-06-02 memory-budget run to
-            # fail. We:
-            #   - retry up to 5 times on ANY error (the
-            #     --retry-all-errors flag), so transient 429s are
-            #     absorbed without manual re-runs
-            #   - wait 15s between retries (--retry-delay) so we
-            #     back off past the rate-limit window
-            #   - cap each curl call at 5 minutes (--retry-max-time)
-            #     so a wedged connection cannot stall the workflow
-            #   - use --retry-connrefused so a CDN edge node that
-            #     drops the TCP connection also triggers a retry
-            #   - pass the token as a Bearer header when present
-            #     (HF raises the per-IP cap for authenticated
-            #     clients; absent the token, unauthenticated
-            #     requests still work, just with tighter limits)
-            HF_AUTH=()
-            if [[ -n "${HF_TOKEN}" ]]; then
-              HF_AUTH=(-H "Authorization: Bearer ${HF_TOKEN}")
-            fi
-            CURL_COMMON=(
-              --fail
-              --location
-              --progress-bar
-              --retry 5
-              --retry-delay 15
-              --retry-all-errors
-              --retry-connrefused
-              --retry-max-time 300
-            )
-            if [[ ! -f "$MODELS_DIR/qwen3-embed-0.6b.onnx" ]]; then
-              echo "Downloading ONNX model from HuggingFace (${HF_REPO})..."
-              curl "${CURL_COMMON[@]}" "${HF_AUTH[@]}" \
-                -o "$MODELS_DIR/qwen3-embed-0.6b.onnx" \
-                "https://huggingface.co/${HF_REPO}/resolve/main/onnx/model.onnx"
-            fi
-            if [[ ! -f "$MODELS_DIR/tokenizer.json" ]]; then
-              echo "Downloading tokenizer from HuggingFace..."
-              curl "${CURL_COMMON[@]}" "${HF_AUTH[@]}" \
-                -o "$MODELS_DIR/tokenizer.json" \
-                "https://huggingface.co/${HF_REPO}/resolve/main/tokenizer.json"
-            fi
-            if [[ ! -f "$MODELS_DIR/config.json" ]]; then
-              echo "Downloading config from HuggingFace..."
-              curl "${CURL_COMMON[@]}" "${HF_AUTH[@]}" \
-                -o "$MODELS_DIR/config.json" \
-                "https://huggingface.co/${HF_REPO}/resolve/main/config.json"
-            fi
-            if [[ ! -f "$MODELS_DIR/checksums.sha256" ]]; then
-              echo "Downloading checksums from HuggingFace..."
-              curl "${CURL_COMMON[@]}" "${HF_AUTH[@]}" \
-                -o "$MODELS_DIR/checksums.sha256" \
-                "https://huggingface.co/${HF_REPO}/resolve/main/checksums.sha256" \
-                || true
-            fi
-            if [[ ! -f "$MODELS_DIR/LICENSE" ]]; then
-              echo "Downloading LICENSE from HuggingFace..."
-              curl "${CURL_COMMON[@]}" "${HF_AUTH[@]}" \
-                -o "$MODELS_DIR/LICENSE" \
-                "https://huggingface.co/${HF_REPO}/resolve/main/LICENSE" \
-                || true
-            fi
-            echo "Model assets ready at $MODELS_DIR"
-          fi
-
       # ── Extract ORT shared libs for the bundle's `lib/` directory ────
       # VAL-RELEASE-005/011: with the load-dynamic migration the CI build
       # no longer needs ORT at build time. The shared libraries that the
@@ -497,7 +385,7 @@ jobs:
           VERSION="${{ needs.detect.outputs.version }}"
           EXT="${{ matrix.asset_name == 'windows-x86_64' && '.exe' || '' }}"
           BUNDLE_DIR="leindex-${VERSION}-${{ matrix.asset_name }}"
-          mkdir -p "$BUNDLE_DIR/bin" "$BUNDLE_DIR/lib" "$BUNDLE_DIR/models"
+          mkdir -p "$BUNDLE_DIR/bin" "$BUNDLE_DIR/lib"
 
           # Copy both binaries
           cp "target/${{ matrix.target }}/release/leindex${EXT}" "$BUNDLE_DIR/bin/leindex${EXT}"
@@ -564,13 +452,6 @@ jobs:
           echo "Bundle lib/ contents:"
           ls -la "$BUNDLE_DIR/lib/"
 
-          # Copy model assets
-          cp models/qwen3-embed-0.6b.onnx "$BUNDLE_DIR/models/"
-          cp models/tokenizer.json "$BUNDLE_DIR/models/"
-          cp models/config.json "$BUNDLE_DIR/models/"
-          cp models/checksums.sha256 "$BUNDLE_DIR/models/" 2>/dev/null || echo "::warning::models/checksums.sha256 not found — bundle will lack integrity checksums"
-          cp models/LICENSE "$BUNDLE_DIR/models/" 2>/dev/null || echo "::warning::models/LICENSE not found — bundle will lack model license"
-
           # ── INSTALL.txt quick-start doc ──
           # VAL-RELEASE-008: every bundle ships an INSTALL.txt at the root
           # explaining the layout, the install.sh path, the leindex setup
@@ -585,7 +466,6 @@ jobs:
 
             bin/        leindex and leindex-embed binaries
             lib/        ONNX Runtime shared libraries (loaded dynamically)
-            models/     qwen3-embed-0.6b.onnx + tokenizer + config
             INSTALL.txt this file
 
           QUICK START
@@ -606,7 +486,9 @@ jobs:
              through the load-dynamic discovery chain
              (ORT_DYLIB_PATH env, ~/.leindex/config/leindex.toml,
              bundled lib/, sibling-to-binary, pip site-packages, system
-             paths). Setting up records the discovered ORT in config:
+             paths). Setup uses the Hugging Face CLI to install the validated
+             dynamic-batch Qwen3 model under ~/.leindex/models/ and records
+             the selected provider and paths in config:
 
                leindex setup --neural --cpu         # CPU ORT
                leindex setup --neural --gpu amd     # AMD/ROCm MIGraphX
@@ -640,14 +522,12 @@ jobs:
           # ── Per-file SHA256 checksums inside the bundle ──
           # VAL-RELEASE-009: a top-level SHA256SUMS is generated at the
           # release level (covering each archive), AND each bundle
-          # carries a per-file checksum manifest covering bin/, lib/, and
-          # models/ so end users can verify any single artifact. This is
+          # carries a per-file checksum manifest covering bin/ and lib/ so
+          # end users can verify any single artifact. This is
           # generated BEFORE archiving so it ships inside the tarball.
           #
-          # The output file `checksums.sha256` lives at the bundle root;
-          # we exclude only that path so the model's own
-          # `models/checksums.sha256` (when shipped from HuggingFace)
-          # remains checksummed.
+          # The output file `checksums.sha256` lives at the bundle root and
+          # is excluded from its own input set.
           (
             cd "$BUNDLE_DIR"
             checksum_file() {
@@ -663,7 +543,7 @@ jobs:
                 continue
               fi
               checksum_file "$file" >> checksums.sha256
-            done < <(find bin lib models -type f | LC_ALL=C sort)
+            done < <(find bin lib -type f | LC_ALL=C sort)
           )
           echo "Bundle checksums.sha256:"
           cat "$BUNDLE_DIR/checksums.sha256"
@@ -975,7 +855,7 @@ jobs:
           echo "- **npm**: Binary wrapper with GH Release download (optional — needs NPM_TOKEN)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "### Bundle topology" >> "$GITHUB_STEP_SUMMARY"
-          echo "Each platform archive includes \`leindex\`, \`leindex-embed\` (ONNX worker), and model assets." >> "$GITHUB_STEP_SUMMARY"
+          echo "Each platform archive includes \`leindex\`, \`leindex-embed\` (ONNX worker), and ONNX Runtime libraries. Models are provisioned by \`leindex setup\`." >> "$GITHUB_STEP_SUMMARY"
 
   # ── Update version badge ─────────────────────────────────────────────
   badge:

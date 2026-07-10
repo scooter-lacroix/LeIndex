@@ -8,8 +8,7 @@ bin/.bundle-tmp/
 # Bundled ORT shared libraries (downloaded inside the platform bundle)
 lib/
 
-# Bundled model assets (downloaded inside the platform bundle)
-models/
+# Models are provisioned under LEINDEX_HOME by `leindex setup`, never here.
 
 # Node
 node_modules/

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 1.8.3 - Rust Edition + Dashboard Assets
+# Version: 1.8.4 - Rust Edition + Dashboard Assets
 # Platform: Linux/Unix
 #
 # Installer:
@@ -25,7 +25,7 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="1.8.3"
+readonly SCRIPT_VERSION="1.8.4"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
@@ -722,11 +722,6 @@ install_leindex() {
         log_warn "Worker binary not found (leindex-embed); ONNX inference will use in-process fallback"
     fi
 
-    # Install bundled model assets
-    if ! install_model_assets "$repo_dir"; then
-        log_warn "Model asset installation failed; neural setup will need to download models again"
-    fi
-
     # Install bundled ORT runtime libraries (from release bundle lib/
     # or a local lib/ directory). When building from source with
     # load-dynamic, there is no lib/ directory — this is a safe no-op.
@@ -742,66 +737,6 @@ install_leindex() {
         rm -rf "$repo_dir"
         log_success "Cleanup complete"
     fi
-}
-
-install_model_assets() {
-    local repo_dir="$1"
-    local source_dir="$repo_dir/models"
-
-    if [[ ! -d "$source_dir" ]]; then
-        log_warn "Model bundle directory not found; skipping model asset install"
-        return 0
-    fi
-
-    # Check for required model files
-    if [[ ! -f "$source_dir/qwen3-embed-0.6b.onnx" ]]; then
-        log_warn "ONNX model file not found in bundle; skipping model asset install"
-        return 0
-    fi
-
-    local model_dir="${LEINDEX_HOME}/models"
-    log_info "Installing model assets to $model_dir"
-    mkdir -p "$model_dir"
-
-    # Copy model assets atomically
-    local temp_model_dir="${model_dir}.tmp"
-    rm -rf "$temp_model_dir"
-    mkdir -p "$temp_model_dir"
-
-    for asset in qwen3-embed-0.6b.onnx tokenizer.json config.json checksums.sha256 LICENSE; do
-        if [[ -f "$source_dir/$asset" ]]; then
-            cp "$source_dir/$asset" "$temp_model_dir/"
-        fi
-    done
-
-    rm -rf "$model_dir"
-    mv "$temp_model_dir" "$model_dir"
-
-    # Validate checksums if checksums.sha256 exists
-    if [[ -f "$model_dir/checksums.sha256" ]]; then
-        log_info "Validating model checksums..."
-        # Run checksum validation from within $model_dir so relative paths in
-        # checksums.sha256 (e.g. "tokenizer.json  abc123...") resolve correctly.
-        if command -v sha256sum &>/dev/null; then
-            if ! (cd "$model_dir" && sha256sum -c checksums.sha256) >> "$INSTALL_LOG" 2>&1; then
-                log_warn "Checksum validation failed; removing corrupted model files"
-                rm -rf "$model_dir"
-                return 1
-            fi
-            log_info "Checksum validation passed"
-        elif command -v shasum &>/dev/null; then
-            if ! (cd "$model_dir" && shasum -a 256 -c checksums.sha256) >> "$INSTALL_LOG" 2>&1; then
-                log_warn "Checksum validation failed; removing corrupted model files"
-                rm -rf "$model_dir"
-                return 1
-            fi
-            log_info "Checksum validation passed"
-        else
-            log_warn "No checksum tool found (sha256sum or shasum), skipping validation"
-        fi
-    fi
-
-    log_success "Model assets installed to $model_dir"
 }
 
 install_ort_libraries() {
@@ -882,12 +817,11 @@ try_install_from_release_bundle() {
     #   leindex-<version>-<platform>/
     #   ├── bin/   (leindex, leindex-embed)
     #   ├── lib/   (ORT runtime libraries for zero-setup neural search)
-    #   ├── models/ (qwen3-embed-0.6b.onnx + tokenizer + config)
     #   └── INSTALL.txt
     #
-    # This function installs bin/ → ~/.cargo/bin/, lib/ → ~/.leindex/lib/,
-    # models/ → ~/.leindex/models/. The discovery chain then finds the
-    # bundled ORT at ~/.leindex/lib/ without requiring `leindex setup`.
+    # This function installs bin/ → ~/.cargo/bin/ and lib/ → ~/.leindex/lib/.
+    # Models are installed separately by `leindex setup` through the
+    # Hugging Face CLI.
 
     local version
     version="${SCRIPT_VERSION}"
@@ -1002,11 +936,8 @@ try_install_from_release_bundle() {
         fi
     fi
 
-    # Install bundled ORT libraries and model assets.
+    # Install bundled ORT libraries. Models are provisioned by `leindex setup`.
     install_ort_libraries "$bundle_dir"
-    if ! install_model_assets "$bundle_dir"; then
-        log_warn "Model asset installation from bundle failed; neural setup will need to download models again"
-    fi
 
     # Clean up.
     rm -rf "$tmp_bundle"

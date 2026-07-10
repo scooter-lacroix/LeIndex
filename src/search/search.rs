@@ -944,6 +944,33 @@ pub struct SearchEngine {
     search_cache_bytes: usize,
 }
 
+const SEARCH_SNAPSHOT_VERSION: u32 = 1;
+
+/// Persisted metadata needed to hydrate `SearchEngine` without re-running the
+/// source-content indexing pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SearchSnapshot {
+    pub(crate) version: u32,
+    pub(crate) pdg_nodes: usize,
+    pub(crate) pdg_edges: usize,
+    pub(crate) pdg_fingerprint: String,
+    pub(crate) indexed_nodes: usize,
+    pub(crate) nodes: Vec<SearchSnapshotNode>,
+}
+
+/// Per-node metadata for fast search-index hydration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SearchSnapshotNode {
+    pub(crate) node_id: String,
+    pub(crate) file_path: String,
+    pub(crate) symbol_name: String,
+    pub(crate) language: String,
+    pub(crate) byte_range: (usize, usize),
+    pub(crate) complexity: u32,
+    pub(crate) signature: Option<String>,
+    pub(crate) tokens: Vec<String>,
+}
+
 // A+ Search cache budget constants (Section 8.1)
 /// Maximum entries in the search cache.
 pub const SEARCH_CACHE_MAX_ENTRIES: usize = 256;
@@ -1514,7 +1541,9 @@ impl SearchEngine {
         // Extract signatures before clearing content (for search results)
         // This must happen before T13 optimization clears the content
         for node in &mut nodes {
-            node.signature = Self::extract_signature_from_content(&node.content);
+            if node.signature.is_none() {
+                node.signature = Self::extract_signature_from_content(&node.content);
+            }
         }
 
         // Free content memory after all indexes are built (T13 optimization)
@@ -1723,8 +1752,12 @@ impl SearchEngine {
             }
         }
 
-        // Extract signature before clearing content (same as index_nodes does)
-        node.signature = Self::extract_signature_from_content(&node.content);
+        // Extract signature before clearing content (same as index_nodes does).
+        // Hydrated nodes can already carry a persisted signature with empty
+        // content, so preserve it when present.
+        if node.signature.is_none() {
+            node.signature = Self::extract_signature_from_content(&node.content);
+        }
 
         // Clear content to save memory (same as index_nodes does)
         node.content.clear();
@@ -1769,6 +1802,142 @@ impl SearchEngine {
                     .map(|e| (n.node_id.clone(), e.clone()))
             })
             .collect()
+    }
+
+    /// Create a compact persisted metadata snapshot for fast cold-start load.
+    pub(crate) fn search_snapshot(
+        &self,
+        pdg_nodes: usize,
+        pdg_edges: usize,
+        pdg_fingerprint: String,
+    ) -> SearchSnapshot {
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|node| {
+                let mut tokens: Vec<String> = self
+                    .node_tokens
+                    .get(&node.node_id)
+                    .map(|set| set.iter().cloned().collect())
+                    .unwrap_or_default();
+                tokens.sort();
+
+                SearchSnapshotNode {
+                    node_id: node.node_id.clone(),
+                    file_path: node.file_path.clone(),
+                    symbol_name: node.symbol_name.clone(),
+                    language: node.language.clone(),
+                    byte_range: node.byte_range,
+                    complexity: node.complexity,
+                    signature: node.signature.clone(),
+                    tokens,
+                }
+            })
+            .collect();
+
+        SearchSnapshot {
+            version: SEARCH_SNAPSHOT_VERSION,
+            pdg_nodes,
+            pdg_edges,
+            pdg_fingerprint,
+            indexed_nodes: self.nodes.len(),
+            nodes,
+        }
+    }
+
+    /// Hydrate the search engine from persisted metadata plus mmap embeddings.
+    ///
+    /// This preserves the same resident structures built by `append_nodes`
+    /// without rereading source files or recomputing TF-IDF/neural embeddings.
+    pub(crate) fn restore_from_search_snapshot(
+        &mut self,
+        snapshot: SearchSnapshot,
+        tfidf_mmap: &crate::search::vector::MmapEmbeddingIndex,
+        neural_mmap: Option<&crate::search::vector::MmapEmbeddingIndex>,
+    ) -> Result<usize, String> {
+        if snapshot.version != SEARCH_SNAPSHOT_VERSION {
+            return Err(format!(
+                "unsupported search snapshot version {}",
+                snapshot.version
+            ));
+        }
+        if snapshot.indexed_nodes != snapshot.nodes.len() {
+            return Err(format!(
+                "snapshot indexed_nodes {} != node metadata count {}",
+                snapshot.indexed_nodes,
+                snapshot.nodes.len()
+            ));
+        }
+        if tfidf_mmap.len() != snapshot.indexed_nodes {
+            return Err(format!(
+                "TF-IDF mmap row count {} != snapshot indexed_nodes {}",
+                tfidf_mmap.len(),
+                snapshot.indexed_nodes
+            ));
+        }
+        if tfidf_mmap.dimension() as usize != DEFAULT_EMBEDDING_DIMENSION {
+            return Err(format!(
+                "TF-IDF mmap dimension {} != expected {}",
+                tfidf_mmap.dimension(),
+                DEFAULT_EMBEDDING_DIMENSION
+            ));
+        }
+
+        let mut tfidf_by_id: HashMap<String, Vec<f32>> = tfidf_mmap.entries().into_iter().collect();
+        let mut neural_by_id: HashMap<String, Vec<f32>> = neural_mmap
+            .map(|mmap| mmap.entries().into_iter().collect())
+            .unwrap_or_default();
+
+        let mut nodes = Vec::with_capacity(snapshot.nodes.len());
+        let mut missing_tfidf = 0usize;
+        for snap in snapshot.nodes {
+            let Some(tfidf_embedding) = tfidf_by_id.remove(&snap.node_id) else {
+                missing_tfidf += 1;
+                continue;
+            };
+            let neural_embedding = neural_by_id.remove(&snap.node_id);
+
+            nodes.push(NodeInfo {
+                node_id: snap.node_id,
+                file_path: snap.file_path,
+                symbol_name: snap.symbol_name,
+                language: snap.language,
+                content: String::new(),
+                byte_range: snap.byte_range,
+                tfidf_embedding,
+                neural_embedding,
+                complexity: snap.complexity,
+                signature: snap.signature,
+                pre_tokenized: Some(snap.tokens),
+            });
+        }
+
+        if missing_tfidf > 0 {
+            return Err(format!(
+                "snapshot missing {} TF-IDF embedding record(s)",
+                missing_tfidf
+            ));
+        }
+
+        self.clear_index();
+        self.append_nodes(nodes);
+
+        if self.nodes.len() != snapshot.indexed_nodes {
+            return Err(format!(
+                "hydrated node count {} != snapshot indexed_nodes {}",
+                self.nodes.len(),
+                snapshot.indexed_nodes
+            ));
+        }
+        if self.vector_index.len() != snapshot.indexed_nodes {
+            return Err(format!(
+                "hydrated vector count {} != snapshot indexed_nodes {}",
+                self.vector_index.len(),
+                snapshot.indexed_nodes
+            ));
+        }
+
+        Ok(self.nodes.len())
     }
 
     /// Check if the index is empty
@@ -1917,13 +2086,13 @@ impl SearchEngine {
                     return Err(format!(
                         "complexity_cache[{}] = {} != node.complexity = {}",
                         node.node_id, c, node.complexity
-                    ))
+                    ));
                 }
                 None => {
                     return Err(format!(
                         "complexity_cache missing entry for {}",
                         node.node_id
-                    ))
+                    ));
                 }
             }
         }
@@ -2970,6 +3139,100 @@ mod tests {
         engine.index_nodes(nodes);
         assert_eq!(engine.node_count(), 2);
         assert!(!engine.is_empty());
+    }
+
+    #[test]
+    fn test_search_snapshot_restore_round_trip() {
+        let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+        tfidf_embedding[0] = 1.0;
+
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(vec![NodeInfo {
+            node_id: "auth.rs:authenticate_user".to_string(),
+            file_path: "auth.rs".to_string(),
+            symbol_name: "authenticate_user".to_string(),
+            language: "rust".to_string(),
+            content: "// authenticate_user in auth.rs\npub fn authenticate_user() {}".to_string(),
+            byte_range: (0, 57),
+            tfidf_embedding,
+            neural_embedding: None,
+            complexity: 3,
+            signature: None,
+            pre_tokenized: Some(vec![
+                "authenticate".to_string(),
+                "user".to_string(),
+                "token".to_string(),
+            ]),
+        }]);
+
+        let snapshot = engine.search_snapshot(1, 0, "test-fingerprint".to_string());
+        let embeddings = engine.collect_embeddings();
+        let dir = tempfile::tempdir().unwrap();
+        let mmap_path = dir.path().join("embeddings.bin");
+        crate::search::vector::write_mmap_embeddings(&mmap_path, &embeddings).unwrap();
+        let mmap = crate::search::vector::MmapEmbeddingIndex::open(&mmap_path).unwrap();
+
+        let mut restored = SearchEngine::new();
+        let restored_count = restored
+            .restore_from_search_snapshot(snapshot, &mmap, None)
+            .unwrap();
+
+        assert_eq!(restored_count, 1);
+        assert!(restored.validate_coherence().is_ok());
+        assert_eq!(
+            restored.nodes[0].signature.as_deref(),
+            Some("pub fn authenticate_user() {}")
+        );
+
+        let results = restored
+            .search(SearchQuery {
+                query: "authenticate token".to_string(),
+                top_k: 5,
+                token_budget: None,
+                semantic: true,
+                expand_context: false,
+                query_embedding: Some(embeddings[0].1.clone()),
+                query_neural_embedding: None,
+                threshold: None,
+                query_type: None,
+            })
+            .unwrap();
+        assert_eq!(results[0].node_id, "auth.rs:authenticate_user");
+    }
+
+    #[test]
+    fn test_search_snapshot_restore_rejects_wrong_tfidf_dimension() {
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(vec![NodeInfo {
+            node_id: "auth.rs:authenticate_user".to_string(),
+            file_path: "auth.rs".to_string(),
+            symbol_name: "authenticate_user".to_string(),
+            language: "rust".to_string(),
+            content: "pub fn authenticate_user() {}".to_string(),
+            byte_range: (0, 29),
+            tfidf_embedding: vec![1.0, 0.0, 0.0],
+            neural_embedding: None,
+            complexity: 3,
+            signature: None,
+            pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+        }]);
+
+        let snapshot = engine.search_snapshot(1, 0, "test-fingerprint".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let mmap_path = dir.path().join("bad_embeddings.bin");
+        crate::search::vector::write_mmap_embeddings(
+            &mmap_path,
+            &[("auth.rs:authenticate_user".to_string(), vec![1.0, 0.0, 0.0])],
+        )
+        .unwrap();
+        let mmap = crate::search::vector::MmapEmbeddingIndex::open(&mmap_path).unwrap();
+
+        let mut restored = SearchEngine::new();
+        let err = restored
+            .restore_from_search_snapshot(snapshot, &mmap, None)
+            .unwrap_err();
+        assert!(err.contains("TF-IDF mmap dimension"));
+        assert!(restored.is_empty());
     }
 
     #[test]

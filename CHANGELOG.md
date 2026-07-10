@@ -2,6 +2,47 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [1.8.4] - 2026-07-10 - Fast Hybrid Retrieval and Reliable Local Embeddings
+
+### Added
+
+- **Validated dynamic Qwen3 model profile**: `leindex setup` provisions [Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) from Hugging Face via Hugging Face CLI as `qwen3-embed-0.6b-dynamic.onnx`. The same graph is used with CPU, CUDA, or MIGraphX; setup selects and validates the provider-specific ONNX Runtime package.
+- **Hugging Face CLI provisioning**: Setup detects `hf` or `huggingface-cli`, installs `huggingface_hub` through the selected Python/pip path when needed, downloads the model and metadata into a staging directory, then installs them under `$LEINDEX_HOME/models`. A local SHA256 manifest is generated and checked on later setup runs.
+- **Search snapshots**: `.leindex/search_snapshot.bin` records the PDG fingerprint and search metadata needed to hydrate TF-IDF and neural mmap indexes without repeating refresh, deduplication, or index-maintenance work on every CLI invocation.
+- **Resident Unix embedding service**: CLI and MCP requests share a provider/model/shape-specific local socket worker. The ONNX session, GPU allocations, and MIGraphX compiled-program cache survive short-lived CLI commands and are released after ten minutes of inactivity.
+- **Provider diagnostics**: Worker startup records the configured and active execution providers. GPU setup smoke tests fail when the requested CUDA or MIGraphX provider silently falls back to CPU.
+
+### Changed
+
+- **Hybrid retrieval remains node-level**: TF-IDF, neural embeddings, and PDG structural signals continue to index and rank code nodes rather than a separate file/chunk sidecar. Semantic scoring augments symbol, context, impact, and traversal tools without reducing their graph coverage.
+- **Batched neural indexing**: CPU and CUDA use dynamic batches of up to 32 with real-size final batches. MIGraphX uses one stable 8-row shape, padding only the final batch or query and discarding padded outputs. Every provider supplies `position_ids`, caps inputs at 128 tokens by default, and preserves request order through IPC.
+- **Correct Qwen3 embeddings**: Runtime pooling now selects the final unpadded token and L2-normalizes it, matching the model contract. The previous mean-pooling path produced embeddings that were valid tensors but semantically incorrect for Qwen3.
+- **Bounded query latency**: Hybrid search gives neural query embedding 250 ms by default. If the worker is cold, compiling, unavailable, or over budget, TF-IDF and structural retrieval return immediately instead of holding the request for seconds. `LEINDEX_QUERY_NEURAL_TIMEOUT_MS` adjusts the budget.
+- **Incremental loading**: Unchanged projects load persisted snapshots and mmap vectors directly. Incremental indexing only updates changed PDG nodes; maintenance is performed when the fingerprint or stored artifacts require it.
+- **MIGraphX execution**: MIGraphX sessions use ORT graph optimization level 3, a persistent model/version/batch/sequence cache under `$LEINDEX_HOME/cache/migraphx`, stable input shapes, and setup warmup so compilation is not repeated by each command.
+- **Version parity**: Cargo, shell installers, root/npm/dashboard/pi package metadata, PyPI metadata, and runtime constants are aligned at `1.8.4`.
+
+### Fixed
+
+- Duplicate node appends now retain one canonical row instead of panicking or emitting duplicate search entries.
+- Neural IPC startup and response handling no longer impose multi-second query stalls on an otherwise usable TF-IDF result path.
+- Search startup no longer refreshes, deduplicates, and rebuilds unchanged indexes before every CLI or MCP result.
+- Setup no longer treats a large ONNX file as verified solely because it exists; model, tokenizer, and config checksums must all match.
+- MIGraphX compilation and provider messages are captured in a persistent worker log instead of corrupting MCP stdio or disappearing with a short-lived process.
+- Memory-budget runs force direct worker IPC and only reap embedding workers owned by the measured process; they no longer accumulate resident daemons or risk terminating workers from another CLI or MCP session.
+
+### Distribution
+
+- Model files are not included in GitHub Release archives, crates.io, npm, or PyPI artifacts. Platform bundles contain `leindex`, `leindex-embed`, and provider-appropriate ONNX Runtime libraries only.
+- Linux x86_64 bundles retain MIGraphX runtime support for AMD/ROCm. NVIDIA systems use CUDA ORT, while CPU-only systems use standard ORT. All three providers load the same validated dynamic model installed by `leindex setup`.
+- Memory-budget CI no longer downloads a model for its TF-IDF-only workload.
+
+### Upgrade Notes
+
+- Run `leindex setup` after upgrading. Existing fixed-batch or incomplete external-data models are not selected by the 1.8.4 profile; setup downloads and records the validated dynamic model.
+- AMD: `leindex setup --neural --gpu amd`. NVIDIA: `leindex setup --neural --gpu nvidia`. CPU: `leindex setup --neural --cpu`.
+- The first MIGraphX setup may spend several minutes compiling the graph. Setup warms and caches that program; normal indexing and retrieval reuse the resident worker and cache.
+
 ## [1.8.3] - 2026-06-19 - Distribution Remediation and Release Readiness
 
 ### Fixed

@@ -7,7 +7,7 @@ A lightweight npm package that automatically downloads and configures LeIndex fo
 ## Worker Architecture (Plan 3)
 
 - **Version parity** with Cargo: npm package version matches `Cargo.toml` — bundles always stay in sync.
-- **Worker bundle topology**: auto-downloads platform-native bundle (`leindex-embed` sidecar + ONNX model assets) on install; falls back to bare binary or `cargo install` gracefully.
+- **Worker bundle topology**: auto-downloads the platform-native `leindex` and `leindex-embed` binaries plus ONNX Runtime libraries; models are provisioned separately by setup.
 - **Memory targets**: idle_warm ~9852 KiB, index ~20168 KiB, query ~13480 KiB (within A+ bands).
 - **Install** (MCP): `npx -y @leindex/mcp`.
 
@@ -17,7 +17,7 @@ This package provides the **leanest** LeIndex distribution:
 - ✅ MCP server functionality (stdio mode)
 - ✅ Auto-downloads LeIndex binary bundle on install
 - ✅ Includes ONNX worker binary (`leindex-embed`) for local semantic search
-- ✅ Includes bundled model assets for zero-config embeddings
+- ✅ Provisions [Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) from Hugging Face via Hugging Face CLI with `npm run setup`
 - ✅ Works with Cursor, Claude Code, Zed, VS Code, and other MCP clients
 - ❌ No dashboard
 - ❌ No HTTP server (`leindex serve`)
@@ -71,12 +71,18 @@ npm run setup --prefix node_modules/@leindex/mcp
 npm run setup --prefix "$(npm root -g)/@leindex/mcp"
 ```
 
-This invokes the bundled `leindex setup` command, which installs ONNX Runtime
-and downloads the `qwen3-embed-0.6b.onnx` model. The bundled `lib/` directory
-(shipped with the package) contains ONNX Runtime shared libraries, so neural
-search may work even without running setup. See
+This invokes the bundled `leindex setup` command. It selects CPU, NVIDIA CUDA,
+or AMD ROCm/MIGraphX, installs the matching ONNX Runtime when necessary, and
+downloads Qwen3 Embedding from Hugging Face via Hugging Face CLI under
+`~/.leindex/models/`. Model files are never stored in the npm package. The
+bundled `lib/` directory provides the platform runtime baseline. See
 [docs/NEURAL_SETUP.md](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/NEURAL_SETUP.md)
 for CPU/GPU/AMD/NVIDIA paths and troubleshooting.
+
+CPU and CUDA use dynamic batches up to 32. MIGraphX uses a stable 8-by-128
+profile warmed during setup and reused through its compiled cache and resident
+worker. Hybrid queries keep a 250 ms neural budget and return TF-IDF/structural
+results when neural inference is not ready within that budget.
 
 ---
 
@@ -184,7 +190,7 @@ Add to Claude Desktop config:
 | **MCP Server** | ✅ Yes | ✅ Yes |
 | **Auto-install** | ✅ Downloads on npm install | ❌ Manual install |
 | **ONNX Worker** | ✅ Bundled (`leindex-embed`) | ✅ Built from source |
-| **Model Assets** | ✅ Bundled in package | ✅ In repo `models/` |
+| **Model Assets** | Installed by `npm run setup` | Installed by `leindex setup` |
 | **Dashboard** | ❌ No | ✅ Yes (`leindex dashboard`) |
 | **HTTP Server** | ❌ No | ✅ Yes (`leindex serve`) |
 | **CLI Tools** | ❌ No | ✅ Yes (`leindex search`, `index`, etc.) |
@@ -209,11 +215,11 @@ Add to Claude Desktop config:
 
 ## How It Works
 
-1. **On `npm install`**: The `postinstall` script downloads the platform-specific LeIndex bundle archive from GitHub Releases. The bundle includes the main binary, the ONNX worker binary (`leindex-embed`), and model assets.
-2. **Binary Storage**: Downloaded to `node_modules/@leindex/mcp/bin/` (binaries) and `node_modules/@leindex/mcp/models/` (model assets).
-3. **MCP Mode**: When called via `npx -y @leindex/mcp`, launches LeIndex in MCP stdio mode. The main process spawns the ONNX worker as a sidecar for embedding operations.
-4. **Updates**: By default the installer resolves the GitHub `latest` release and verifies the downloaded bundle against `SHA256SUMS`
-5. **Fallback**: If the bundle archive is not available (older releases), the installer falls back to downloading the bare main binary. If GitHub is unreachable, it falls back to `cargo install`.
+1. **On `npm install`**: The postinstall script downloads the platform-specific LeIndex bundle with the main binary, `leindex-embed`, and ONNX Runtime libraries.
+2. **Model setup**: `npm run setup` downloads Qwen3 through Hugging Face CLI into `$LEINDEX_HOME/models`, outside `node_modules`.
+3. **MCP mode**: `npx -y @leindex/mcp` launches LeIndex over stdio. Unix requests reuse a resident local embedding worker.
+4. **Updates**: The installer resolves the GitHub `latest` release and verifies the bundle against `SHA256SUMS`.
+5. **Fallback**: Older releases can fall back to a bare main binary; an unreachable release endpoint falls back to `cargo install`.
 
 To pin a specific binary release instead of `latest`:
 

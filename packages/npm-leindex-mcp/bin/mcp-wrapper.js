@@ -5,8 +5,8 @@
  *
  * Launches the LeIndex binary in MCP stdio mode.
  * This wrapper is used by MCP clients to communicate with LeIndex.
- * Sets up the environment so the ONNX worker can discover bundled model
- * assets and the bundled ONNX Runtime shared library.
+ * Sets up the environment so the ONNX worker can discover the bundled ONNX
+ * Runtime shared library. Models live under LEINDEX_HOME after setup.
  *
  * VAL-NPM-003: ORT_DYLIB_PATH is set from the bundled `lib/` directory
  * before spawning, so the worker reliably loads the bundled ORT
@@ -21,7 +21,6 @@ const path = require('path');
 const fs = require('fs');
 
 const BIN_DIR = path.join(__dirname);
-const MODELS_DIR = path.join(__dirname, '..', 'models');
 const LIB_DIR = path.join(__dirname, '..', 'lib');
 const binaryName = process.platform === 'win32' ? 'leindex.exe' : 'leindex';
 
@@ -85,11 +84,6 @@ if (!fs.existsSync(binaryPath)) {
 
 // Prepare environment for worker discovery
 const env = Object.assign({}, process.env);
-
-// Point the worker to bundled models if available and not already overridden
-if (fs.existsSync(MODELS_DIR) && !env.LEINDEX_MODEL_PATH) {
-  env.LEINDEX_MODEL_PATH = MODELS_DIR;
-}
 
 // VAL-NPM-003: point the worker at the bundled ORT shared library. We
 // never overwrite an explicit user override so manual ORT selection
