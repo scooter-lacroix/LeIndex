@@ -1418,16 +1418,27 @@ impl SearchEngine {
     ///
     /// Panics if total node count exceeds MAX_NODES after appending.
     pub fn append_nodes(&mut self, mut nodes: Vec<NodeInfo>) {
-        let mut seen = HashSet::new();
-        for node in &nodes {
-            let dup_in_batch = !seen.insert(node.node_id.clone());
-            let dup_existing = self.node_id_to_idx.contains_key(&node.node_id);
-            if dup_in_batch || dup_existing {
-                panic!(
-                    "append_nodes received duplicate node_id '{}'; use incremental_reindex for updates",
-                    node.node_id
-                );
+        // Deduplicate nodes by node_id. Duplicate IDs can occur when the parser
+        // produces unqualified names (e.g., two `fn new()` in different impls
+        // of the same file both resolve to qualified_name "new"). Panicking on
+        // a parser limitation would crash production indexing. Instead, keep the
+        // first occurrence and silently drop subsequent duplicates.
+        let mut kept: HashSet<String> = HashSet::new();
+        let original_len = nodes.len();
+        nodes.retain(|n| {
+            if self.node_id_to_idx.contains_key(&n.node_id) {
+                return false;
             }
+            kept.insert(n.node_id.clone())
+        });
+        let dropped = original_len - nodes.len();
+        if dropped > 0 {
+            tracing::warn!(
+                "append_nodes: dropped {} duplicate node_id(s) (kept {} of {})",
+                dropped,
+                nodes.len(),
+                original_len
+            );
         }
 
         if self.nodes.len() + nodes.len() > MAX_NODES {

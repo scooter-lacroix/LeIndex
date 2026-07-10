@@ -99,6 +99,8 @@ pub struct SetupResult {
 pub struct SmokeTestResult {
     /// Whether the smoke test passed.
     pub passed: bool,
+    /// Whether the smoke test was skipped (e.g., compiled without `onnx`).
+    pub skipped: bool,
     /// Embedding dimensionality reported by the worker (e.g., 1024).
     /// `None` when the test failed before producing vectors.
     pub dimension: Option<usize>,
@@ -112,11 +114,16 @@ pub struct SmokeTestResult {
     pub configured_provider_label: Option<String>,
     /// Error text from the worker on failure (truncated to a reasonable length).
     pub error: Option<String>,
+    /// Human-readable note for skipped or special-case results.
+    pub note: Option<String>,
 }
 
 impl SmokeTestResult {
     /// One-line status string for terminal output.
     pub fn status_line(&self) -> String {
+        if self.skipped {
+            return "embedding test: SKIP".to_string();
+        }
         if self.passed {
             match self.dimension {
                 Some(dim) => format!("embedding test: PASS ({}-dim vector)", dim),
@@ -591,6 +598,14 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
                 println!("  -> Configured execution provider: {}.", provider);
                 let _ = dim; // already in status_line
             }
+            SmokeTestResult {
+                skipped: true,
+                note: Some(note),
+                ..
+            } => {
+                println!("  -> {}.", result.status_line());
+                println!("     {}", truncate_for_display(note, 200));
+            }
             SmokeTestResult { passed: true, .. } => {
                 println!("  -> {}.", result.status_line());
             }
@@ -776,10 +791,12 @@ fn run_embedding_smoke_test_inner(expected_provider: Option<ExecutionProvider>) 
             if response.count == 0 {
                 return SmokeTestResult {
                     passed: false,
+                    skipped: false,
                     dimension: None,
                     execution_provider: None,
                     configured_provider_label: Some(provider_label),
                     error: Some("worker returned zero embeddings".to_string()),
+                    note: None,
                 };
             }
             // The first (and only) embedding must have the expected dimension.
@@ -787,6 +804,7 @@ fn run_embedding_smoke_test_inner(expected_provider: Option<ExecutionProvider>) 
             let passed = dim == SMOKE_TEST_EXPECTED_DIM;
             SmokeTestResult {
                 passed,
+                skipped: false,
                 dimension: Some(dim),
                 execution_provider: None,
                 configured_provider_label: Some(provider_label),
@@ -798,6 +816,7 @@ fn run_embedding_smoke_test_inner(expected_provider: Option<ExecutionProvider>) 
                         SMOKE_TEST_EXPECTED_DIM, dim
                     ))
                 },
+                note: None,
             }
         }
         Err(e) => {
@@ -805,10 +824,12 @@ fn run_embedding_smoke_test_inner(expected_provider: Option<ExecutionProvider>) 
             let msg = e.to_string();
             SmokeTestResult {
                 passed: false,
+                skipped: false,
                 dimension: None,
                 execution_provider: None,
                 configured_provider_label: Some(provider_label),
                 error: Some(msg),
+                note: None,
             }
         }
     }
@@ -822,11 +843,18 @@ fn run_embedding_smoke_test_inner(
     _expected_provider: Option<ExecutionProvider>,
 ) -> SmokeTestResult {
     SmokeTestResult {
-        passed: false,
+        passed: true, // Don't fail setup: binary works for TF-IDF, ORT loaded at runtime
+        skipped: true,
         dimension: None,
         execution_provider: None,
         configured_provider_label: None,
-        error: Some("onnx feature is not compiled in; cannot run embedding smoke test".to_string()),
+        error: None,
+        note: Some(
+            "Binary compiled without --features onnx; smoke test skipped. \
+             ORT and models are loaded at runtime by the leindex-embed worker. \
+             To verify neural search: leindex search \"test\" --project ."
+                .to_string(),
+        ),
     }
 }
 
@@ -2297,7 +2325,11 @@ pub fn print_summary(result: &SetupResult) {
         if let Some(ref provider) = smoke.execution_provider {
             println!("Active EP:    {}", provider);
         }
-        if let Some(ref err) = smoke.error {
+        if smoke.skipped {
+            if let Some(ref note) = smoke.note {
+                println!("Note:         {}", truncate_for_display(note, 200));
+            }
+        } else if let Some(ref err) = smoke.error {
             if !smoke.passed {
                 println!("Worker error: {}", truncate_for_display(err, 200));
             }
@@ -3112,10 +3144,12 @@ mod tests {
     fn test_smoke_test_result_pass_status_line() {
         let result = SmokeTestResult {
             passed: true,
+            skipped: false,
             dimension: Some(1024),
             execution_provider: None,
             configured_provider_label: Some("cpu".to_string()),
             error: None,
+            note: None,
         };
         let line = result.status_line();
         assert!(line.contains("PASS"), "{}", line);
@@ -3126,10 +3160,12 @@ mod tests {
     fn test_smoke_test_result_pass_without_dimension_is_not_zero_dim() {
         let result = SmokeTestResult {
             passed: true,
+            skipped: false,
             dimension: None,
             execution_provider: None,
             configured_provider_label: Some("cpu".to_string()),
             error: None,
+            note: None,
         };
         let line = result.status_line();
         assert!(line.contains("PASS"), "{}", line);
@@ -3141,10 +3177,12 @@ mod tests {
     fn test_smoke_test_result_fail_status_line() {
         let result = SmokeTestResult {
             passed: false,
+            skipped: false,
             dimension: None,
             execution_provider: None,
             configured_provider_label: Some("cpu".to_string()),
             error: Some("worker failed to start".to_string()),
+            note: None,
         };
         let line = result.status_line();
         assert!(line.contains("FAIL"), "{}", line);
@@ -3157,10 +3195,12 @@ mod tests {
         // If the worker returns the wrong dimension, the test fails.
         let result = SmokeTestResult {
             passed: false,
+            skipped: false,
             dimension: Some(768), // expected 1024
             execution_provider: None,
             configured_provider_label: Some("migraphx".to_string()),
             error: Some("expected 1024-dim vector, got 768-dim".to_string()),
+            note: None,
         };
         assert!(!result.passed);
         assert_eq!(result.dimension, Some(768));

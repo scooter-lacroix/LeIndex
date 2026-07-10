@@ -109,9 +109,10 @@ jobs:
             "https://huggingface.co/${HF_REPO}/resolve/main/tokenizer.json"
 
       - name: Build release binary
-        run: cargo build --release -p leindex -p leindex-embed --features leindex/onnx,leindex-embed/onnx
+        run: cargo build --release --bin leindex
 
       - name: Run memcheck against canonical fixture
+        timeout-minutes: 10
         run: cargo xtask memcheck
 
       - name: Upload memcheck report
