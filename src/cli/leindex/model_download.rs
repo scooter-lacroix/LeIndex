@@ -39,7 +39,7 @@ pub const MODEL_HF_REPO: &str = "onnx-community/Qwen3-Embedding-0.6B-ONNX";
 /// The on-disk filename of the embedding model file.
 pub const MODEL_ONNX_FILENAME: &str = "qwen3-embed-0.6b.onnx";
 
-/// MIGraphX-compatible dynamic-batch ONNX export used on AMD GPUs.
+/// Dynamic-batch ONNX export used by CPU, CUDA, and MIGraphX providers.
 pub const DYNAMIC_MODEL_ONNX_FILENAME: &str = "qwen3-embed-0.6b-dynamic.onnx";
 
 /// File listing within the bundled checksum manifest. The trailing

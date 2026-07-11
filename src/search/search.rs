@@ -49,6 +49,9 @@ pub const WORK_HOISTER_MAX_ENTRIES: usize = 4_096;
 /// Maximum byte budget for the work-hoister cache.
 pub const WORK_HOISTER_MAX_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
+/// Output dimension of the bundled Qwen3 embedding model.
+const NEURAL_EMBEDDING_DIMENSION: usize = 1024;
+
 /// Decision returned by the content pruner for each node.
 ///
 /// This enum is externally observable in tests so that pruning behavior
@@ -1888,6 +1891,16 @@ impl SearchEngine {
             .map_err(|e| format!("failed to read TF-IDF mmap entries: {}", e))?
             .into_iter()
             .collect();
+        if let Some(mmap) = neural_mmap {
+            if mmap.dimension() as usize != NEURAL_EMBEDDING_DIMENSION {
+                return Err(format!(
+                    "neural mmap dimension {} != expected {}",
+                    mmap.dimension(),
+                    NEURAL_EMBEDDING_DIMENSION
+                ));
+            }
+        }
+
         let mut neural_by_id: HashMap<String, Vec<f32>> = neural_mmap
             .map(|mmap| {
                 mmap.entries()
@@ -1928,24 +1941,25 @@ impl SearchEngine {
             ));
         }
 
-        self.clear_index();
-        self.append_nodes(nodes);
+        let mut staged = SearchEngine::new();
+        staged.append_nodes(nodes);
 
-        if self.nodes.len() != snapshot.indexed_nodes {
+        if staged.nodes.len() != snapshot.indexed_nodes {
             return Err(format!(
                 "hydrated node count {} != snapshot indexed_nodes {}",
-                self.nodes.len(),
+                staged.nodes.len(),
                 snapshot.indexed_nodes
             ));
         }
-        if self.vector_index.len() != snapshot.indexed_nodes {
+        if staged.vector_index.len() != snapshot.indexed_nodes {
             return Err(format!(
                 "hydrated vector count {} != snapshot indexed_nodes {}",
-                self.vector_index.len(),
+                staged.vector_index.len(),
                 snapshot.indexed_nodes
             ));
         }
 
+        *self = staged;
         Ok(self.nodes.len())
     }
 

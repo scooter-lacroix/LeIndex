@@ -52,7 +52,13 @@ pub fn run() -> ! {
         process::exit(0);
     }
 
-    let socket_path = parse_socket_arg(&argv);
+    let socket_path = match parse_socket_arg(&argv) {
+        Ok(path) => path,
+        Err(message) => {
+            eprintln!("{message}");
+            process::exit(2);
+        }
+    };
     // ── Process-leak guard: PR_SET_PDEATHSIG (Linux) ─────────────────────
     //
     // Request SIGKILL from the kernel the moment our parent process dies.
@@ -160,14 +166,18 @@ pub fn run() -> ! {
     process::exit(0);
 }
 
-fn parse_socket_arg(argv: &[String]) -> Option<PathBuf> {
+fn parse_socket_arg(argv: &[String]) -> Result<Option<PathBuf>, &'static str> {
     let mut iter = argv.iter();
     while let Some(arg) = iter.next() {
         if arg == "--socket" {
-            return iter.next().map(PathBuf::from);
+            return iter
+                .next()
+                .map(PathBuf::from)
+                .map(Some)
+                .ok_or("--socket requires a path");
         }
     }
-    None
+    Ok(None)
 }
 
 #[cfg(unix)]
@@ -262,6 +272,19 @@ fn run_socket_worker(_runtime: &WorkerRuntime, _socket_path: PathBuf) -> anyhow:
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn socket_argument_requires_a_path() {
+        assert_eq!(parse_socket_arg(&["worker".into()]), Ok(None));
+        assert_eq!(
+            parse_socket_arg(&["worker".into(), "--socket".into()]),
+            Err("--socket requires a path")
+        );
+        assert_eq!(
+            parse_socket_arg(&["worker".into(), "--socket".into(), "run.sock".into()]),
+            Ok(Some(PathBuf::from("run.sock")))
+        );
+    }
 
     #[test]
     fn accept_retry_delay_covers_transient_errors() {

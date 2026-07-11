@@ -445,6 +445,7 @@ mod tests {
         // Defaults should fill in missing keys
         assert_eq!(config.search.search_mode, "hybrid");
         assert_eq!(config.indexing.batch_size, 500);
+        assert_eq!(config.neural.model_name, "qwen3-embed-0.6b");
     }
 
     #[test]

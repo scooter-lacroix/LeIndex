@@ -663,8 +663,14 @@ async function installFromBundle(release) {
       if (!fs.existsSync(LIB_DIR)) {
         fs.mkdirSync(LIB_DIR, { recursive: true });
       }
-      // Clean any stale lib/ entries from a previous (or upgraded) bundle
-      // before copying the new ones, so renamed files don't linger.
+      const libFiles = fs.readdirSync(srcLib);
+      const bundledOrtFiles = libFiles.filter(isOrtBundleLibraryName);
+      const ignoredLibFiles = libFiles.filter((file) => !isOrtBundleLibraryName(file));
+      if (!bundledOrtFiles.some(isOrtRuntimeLibraryName)) {
+        throw new Error('bundle lib/ directory did not contain any ORT runtime libraries');
+      }
+
+      // Clean stale lib/ entries only after validating the incoming bundle.
       for (const stale of fs.readdirSync(LIB_DIR)) {
         const stalePath = path.join(LIB_DIR, stale);
         try {
@@ -674,12 +680,6 @@ async function installFromBundle(release) {
         }
       }
 
-      const libFiles = fs.readdirSync(srcLib);
-      const bundledOrtFiles = libFiles.filter(isOrtBundleLibraryName);
-      const ignoredLibFiles = libFiles.filter((file) => !isOrtBundleLibraryName(file));
-      if (!bundledOrtFiles.some(isOrtRuntimeLibraryName)) {
-        throw new Error('bundle lib/ directory did not contain any ORT runtime libraries');
-      }
       if (ignoredLibFiles.length > 0) {
         console.log(`   ⚠ Ignoring non-ORT bundle library entries: ${ignoredLibFiles.join(', ')}`);
       }

@@ -243,34 +243,20 @@ fn daemon_socket_path(provider: Option<&str>, model_name: Option<&str>) -> Optio
     let home = leindex_home_dir()?;
     let provider_name = provider.unwrap_or("auto");
     let model_name = model_name.unwrap_or("qwen3-embed-0.6b");
-    let provider = sanitize_socket_component(provider_name);
-    let model = sanitize_socket_component(model_name);
-    let version = sanitize_socket_component(env!("CARGO_PKG_VERSION"));
     let batch =
         leindex_embed::runtime::configured_onnx_inference_batch_size(model_name, provider_name);
     let sequence = leindex_embed::runtime::configured_onnx_sequence_len();
-    Some(home.join("run").join(format!(
-        "leindex-embed-{version}-{provider}-{model}-b{batch}-s{sequence}.sock"
-    )))
-}
+    let descriptor = format!(
+        "{}:{provider_name}:{model_name}:b{batch}:s{sequence}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let digest = blake3::hash(descriptor.as_bytes()).to_hex();
+    let socket_path = home
+        .join("run")
+        .join(format!("leindex-embed-{}.sock", &digest[..16]));
 
-#[cfg(unix)]
-fn sanitize_socket_component(value: &str) -> String {
-    let sanitized: String = value
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitized.is_empty() {
-        "unknown".to_string()
-    } else {
-        sanitized
-    }
+    use std::os::unix::ffi::OsStrExt;
+    (socket_path.as_os_str().as_bytes().len() <= 100).then_some(socket_path)
 }
 
 fn parse_config_assignment(line: &str, key: &str) -> Option<String> {
@@ -665,8 +651,10 @@ impl EmbeddingClient {
         } else if let Some(model_name) = &config_env.model_name {
             cmd.env("LEINDEX_WORKER_MODEL", model_name);
         }
-        if matches!(configured_provider, Some("migraphx" | "rocm"))
-            && std::env::var_os("ORT_MIGRAPHX_MODEL_CACHE_PATH").is_none()
+        if matches!(
+            configured_provider,
+            Some("migraphx" | "rocm" | "auto") | None
+        ) && std::env::var_os("ORT_MIGRAPHX_MODEL_CACHE_PATH").is_none()
         {
             if let Some(cache_path) = migraphx_model_cache_path(config_env.model_name.as_deref()) {
                 if let Err(e) = std::fs::create_dir_all(&cache_path) {
@@ -1662,10 +1650,10 @@ mod tests {
 
         let socket =
             daemon_socket_path(Some("migraphx"), Some("qwen3-embed-0.6b-dynamic")).unwrap();
-        assert_eq!(
-            socket.file_name().and_then(|name| name.to_str()),
-            Some("leindex-embed-1_8_4-migraphx-qwen3-embed-0_6b-dynamic-b8-s128.sock")
-        );
+        let filename = socket.file_name().and_then(|name| name.to_str()).unwrap();
+        assert!(filename.starts_with("leindex-embed-"));
+        assert!(filename.ends_with(".sock"));
+        assert!(socket.to_string_lossy().len() <= 100);
 
         std::env::remove_var("LEINDEX_HOME");
     }

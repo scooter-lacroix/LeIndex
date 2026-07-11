@@ -143,6 +143,6 @@ existing `hf` executable.
 cargo uninstall leindex
 ```
 
-Removing `~/.leindex` also removes downloaded models, provider caches,
-configuration, and global LeIndex data. Project-local `.leindex/` directories
+Removing `${LEINDEX_HOME:-$HOME/.leindex}` also removes downloaded models,
+provider caches, configuration, and global LeIndex data. Project-local `.leindex/` directories
 must be removed separately when their persisted indexes are no longer wanted.

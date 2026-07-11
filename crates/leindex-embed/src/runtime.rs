@@ -557,8 +557,8 @@ impl WorkerRuntime {
                 try_provider_or_cpu!(session_builder, build_migraphx_ep(), "MIGraphX")
             }
             "rocm" => {
-                // ROCm EP is deprecated in favor of MIGraphX. Try MIGraphX first,
-                // then fall back to ROCm if available (old ORT builds), then CPU.
+                // ROCm EP is deprecated in favor of MIGraphX; requests for "rocm"
+                // use MIGraphX and fall back directly to CPU if registration fails.
                 // (The pre-flight check above has already handled the case where
                 // MIGraphX is not compiled in and the user passed "rocm".)
                 try_provider_or_cpu!(session_builder, build_migraphx_ep(), "MIGraphX")
@@ -1186,7 +1186,18 @@ impl WorkerRuntime {
                 .find(|&s| attention_mask.get(mask_start + s).copied().unwrap_or(0) > 0);
             if let Some(token_index) = last_token {
                 let embedding_start = (b * seq_len + token_index) * hidden_dim;
-                row.copy_from_slice(&embeddings[embedding_start..embedding_start + hidden_dim]);
+                let embedding = embeddings
+                    .get(embedding_start..embedding_start + hidden_dim)
+                    .ok_or_else(|| WorkerError {
+                        kind: ErrorKind::Inference,
+                        message: format!(
+                            "embedding output is too short: need elements {}..{}, got {}",
+                            embedding_start,
+                            embedding_start + hidden_dim,
+                            embeddings.len()
+                        ),
+                    })?;
+                row.copy_from_slice(embedding);
             }
 
             let norm = row.iter().map(|value| value * value).sum::<f32>().sqrt();
@@ -1279,15 +1290,11 @@ impl WorkerRuntime {
         // Process encodings in sub-batches to bound peak memory.
         let mut all_rerank_scores: Vec<f32> = Vec::with_capacity(rerank_req.documents.len());
 
-        let inference_batch_size = configured_onnx_inference_batch_size(
-            &self.config.model_name,
-            &self.config.execution_provider,
-        );
-        let fixed_batch = self
-            .config
-            .execution_provider
-            .eq_ignore_ascii_case("migraphx")
-            || self.config.execution_provider.eq_ignore_ascii_case("rocm");
+        let active_provider = &self.provider_runtime_status.execution_provider;
+        let inference_batch_size =
+            configured_onnx_inference_batch_size(&self.config.model_name, active_provider);
+        let fixed_batch = active_provider.eq_ignore_ascii_case("migraphx")
+            || active_provider.eq_ignore_ascii_case("rocm");
         for sub_batch in encodings.chunks(inference_batch_size) {
             if fixed_batch && sub_batch.len() < inference_batch_size {
                 let mut padded = sub_batch.to_vec();
@@ -1594,6 +1601,18 @@ mod tests {
             .unwrap();
 
         assert_eq!(pooled.vectors, vec![0.0, 1.0]);
+    }
+
+    #[cfg(feature = "onnx")]
+    #[test]
+    fn qwen_pooling_rejects_short_embedding_output() {
+        let runtime = WorkerRuntime::new(RuntimeConfig::default());
+        let error = runtime
+            .pool_and_normalize(&[1.0], 1, 2, &[1, 1], 2)
+            .unwrap_err();
+
+        assert_eq!(error.kind, ErrorKind::Inference);
+        assert!(error.message.contains("embedding output is too short"));
     }
 
     #[test]

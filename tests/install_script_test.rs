@@ -226,7 +226,7 @@ mod bundle_consumption {
             "install.sh must not define a bundled model installer"
         );
         assert!(
-            !sh.contains("qwen3-embed-0.6b.onnx"),
+            !sh.contains("qwen3-embed-0.6b"),
             "install.sh must not carry a release-bundled model filename"
         );
     }
@@ -412,7 +412,7 @@ mod exit_handling {
             "source and bundle install paths must leave model provisioning to setup"
         );
         assert!(
-            !script.contains("BUNDLE_DIR/models") && !script.contains("qwen3-embed-0.6b.onnx"),
+            !script.contains("BUNDLE_DIR/models") && !script.contains("qwen3-embed-0.6b"),
             "installer must not expect model files in release bundles"
         );
     }

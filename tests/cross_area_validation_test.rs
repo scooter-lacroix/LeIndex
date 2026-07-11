@@ -678,8 +678,8 @@ mod per_surface_journeys {
             "VAL-NPM-003: npm wrapper must set env.ORT_DYLIB_PATH before spawning"
         );
         assert!(
-            wrapper.contains("MODELS_DIR"),
-            "VAL-NPM-001: npm wrapper must reference the bundled MODELS_DIR"
+            !wrapper.contains("MODELS_DIR"),
+            "VAL-NPM-001: npm wrapper must leave model provisioning to leindex setup"
         );
         // The npm setup script bridges into `leindex setup` so users can
         // bring up neural search through npm.

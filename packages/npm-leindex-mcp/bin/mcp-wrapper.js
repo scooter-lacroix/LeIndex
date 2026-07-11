@@ -133,4 +133,4 @@ process.on('SIGTERM', () => {
 });
 
 // Export helpers for unit testing
-module.exports = { findBundledOrt, getOrtLibNames, LIB_DIR, MODELS_DIR };
+module.exports = { findBundledOrt, getOrtLibNames, LIB_DIR };

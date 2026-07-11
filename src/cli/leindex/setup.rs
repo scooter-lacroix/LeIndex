@@ -118,6 +118,8 @@ pub struct SmokeTestResult {
     pub note: Option<String>,
 }
 
+const QWEN3_EMBEDDING_DIMENSION: usize = 1024;
+
 impl SmokeTestResult {
     #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
     fn from_embedding_outcome(
@@ -125,21 +127,25 @@ impl SmokeTestResult {
         execution_provider: Option<String>,
         configured_provider_label: Option<String>,
     ) -> Self {
-        const EXPECTED_DIM: usize = 1024;
-        let mut error = if dimension == EXPECTED_DIM {
+        let mut error = if dimension == QWEN3_EMBEDDING_DIMENSION {
             None
         } else {
             Some(format!(
                 "expected {}-dim vector, got {}-dim",
-                EXPECTED_DIM, dimension
+                QWEN3_EMBEDDING_DIMENSION, dimension
             ))
         };
 
         if error.is_none() {
             if let Some(configured) = configured_provider_label.as_deref() {
                 let active = execution_provider.as_deref();
-                if matches!(configured, "migraphx" | "rocm" | "cuda") && active != Some(configured)
-                {
+                let provider_matches = matches!(
+                    (configured, active),
+                    ("cuda", Some("cuda"))
+                        | ("migraphx", Some("migraphx"))
+                        | ("rocm", Some("migraphx" | "rocm"))
+                );
+                if matches!(configured, "migraphx" | "rocm" | "cuda") && !provider_matches {
                     error = Some(format!(
                         "configured execution provider {} but worker reported {}",
                         configured,
@@ -820,15 +826,13 @@ fn run_embedding_smoke_test(expected_provider: Option<ExecutionProvider>) -> Smo
 fn run_embedding_smoke_test_inner(expected_provider: Option<ExecutionProvider>) -> SmokeTestResult {
     use crate::search::onnx::EmbeddingClient;
 
-    // The Qwen3-Embedding-0.6B model produces 1024-dimensional vectors.
-    const SMOKE_TEST_EXPECTED_DIM: usize = 1024;
     const SMOKE_TEST_TEXT: &str = "hello world";
 
     let client = EmbeddingClient::new_pipe();
     let provider_label: String = expected_provider
         .map(|p| p.config_value().to_string())
         .unwrap_or_else(|| "auto".to_string());
-    match client.embed(&[SMOKE_TEST_TEXT.to_string()], SMOKE_TEST_EXPECTED_DIM) {
+    match client.embed(&[SMOKE_TEST_TEXT.to_string()], QWEN3_EMBEDDING_DIMENSION) {
         Ok(response) => {
             let active_provider =
                 client.wait_for_active_execution_provider(std::time::Duration::from_millis(500));
@@ -984,7 +988,7 @@ fn build_config(
 const QWEN3_ONNX_REPOSITORY: &str = "zhiqing/Qwen3-Embedding-0.6B-ONNX";
 const QWEN3_ONNX_REVISION: &str = "c96cc9c82d08ee7869600e2191078fc939957026";
 const QWEN3_REMOTE_MODEL: &str = "model.onnx";
-const QWEN3_LOCAL_MODEL: &str = "qwen3-embed-0.6b-dynamic.onnx";
+const QWEN3_LOCAL_MODEL: &str = crate::cli::leindex::model_download::DYNAMIC_MODEL_ONNX_FILENAME;
 const QWEN3_MODEL_FILES: &[&str] = &[QWEN3_REMOTE_MODEL, "tokenizer.json", "config.json"];
 
 #[derive(Debug, Clone, Copy)]
@@ -3548,6 +3552,18 @@ mod tests {
 
         std::fs::write(model_dir.path().join("config.json"), br#"{"changed":true}"#).unwrap();
         assert!(!profile_assets_verified(model_dir.path(), profile));
+    }
+
+    #[test]
+    fn test_rocm_smoke_result_accepts_migraphx_runtime() {
+        let result = SmokeTestResult::from_embedding_outcome(
+            QWEN3_EMBEDDING_DIMENSION,
+            Some("migraphx".to_string()),
+            Some("rocm".to_string()),
+        );
+
+        assert!(result.passed);
+        assert!(result.error.is_none());
     }
 
     #[test]
