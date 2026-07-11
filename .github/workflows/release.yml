@@ -666,10 +666,15 @@ jobs:
       - name: Wait for leindex-embed registry visibility
         run: |
           VERSION=$(grep '^version =' crates/leindex-embed/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          INDEX_URL="https://index.crates.io/le/in/leindex-embed"
           for attempt in $(seq 1 30); do
-            if cargo search leindex-embed 2>/dev/null | grep -q "^leindex-embed = \"${VERSION}\""; then
-              echo "leindex-embed ${VERSION} is visible in the crates.io index"
-              exit 0
+            if INDEX_ENTRY=$(curl -fsS "$INDEX_URL"); then
+              if grep -q "\"vers\":\"${VERSION}\"" <<< "$INDEX_ENTRY"; then
+                echo "leindex-embed ${VERSION} is visible in the crates.io index"
+                exit 0
+              fi
+            else
+              echo "::warning::Failed to query the crates.io sparse index (${attempt}/30)"
             fi
             echo "Waiting for crates.io index propagation (${attempt}/30)..."
             sleep 10
