@@ -9,8 +9,8 @@
 //!
 //!   * install.sh copies bundled ORT libs to `~/.leindex/lib/`
 //!     (the GitHub Release bundle install path with pre-built `lib/`)
-//!   * install.sh copies bundled models to `~/.leindex/models/`
-//!     (supports both the bundle and local-repo build paths)
+//!   * install.sh never copies model files from release artifacts; setup owns
+//!     model provisioning
 //!   * install.sh runs `leindex setup --check` after install to report
 //!     neural search status, suggesting `leindex setup` when unconfigured
 //!   * install.sh contains NO `ORT_LIB_PATH` or `ORT_PREFER_DYNAMIC_LINK`
@@ -176,7 +176,7 @@ mod build_line_invariants {
 }
 
 // ============================================================================
-// Bundle consumption: lib/ and models/ install paths
+// Bundle consumption: runtime libraries and setup-owned model provisioning
 // ============================================================================
 
 mod bundle_consumption {
@@ -215,37 +215,26 @@ mod bundle_consumption {
         );
     }
 
-    /// install.sh must copy bundled models to `~/.leindex/models/`. This
-    /// applies to both the bundle install path (models/ in the archive)
-    /// and the local-repo build path (models/ checked out alongside source).
+    /// Model files are never part of release bundles. The installer must leave
+    /// model provisioning to `leindex setup`.
     #[test]
-    fn copies_bundled_models_to_leindex_models() {
+    fn does_not_copy_models_from_release_bundles() {
         let sh = install_sh();
 
-        // There must be a function that installs model assets.
         assert!(
-            sh.contains("install_model_assets"),
-            "install.sh must define an install_model_assets function"
+            !sh.contains("install_model_assets"),
+            "install.sh must not define a bundled model installer"
         );
-
-        // It must target the LEINDEX_HOME models/ subdirectory.
         assert!(
-            sh.contains("models"),
-            "install.sh must install model assets to a models/ directory"
-        );
-
-        // It must reference the primary model file.
-        assert!(
-            sh.contains("qwen3-embed-0.6b.onnx"),
-            "install.sh must reference the qwen3-embed-0.6b.onnx model file"
+            !sh.contains("qwen3-embed-0.6b"),
+            "install.sh must not carry a release-bundled model filename"
         );
     }
 
     /// install.sh should prefer the pre-built release bundle (fast path,
     /// no Rust toolchain needed) before falling back to building from
     /// source. This is the distribution model described in architecture.md
-    /// Section 3: install.sh "downloads (or builds) the bundle, copies lib/
-    /// and models/ into ~/.leindex/".
+    /// Section 3: install.sh downloads or builds the runtime bundle.
     #[test]
     fn prefers_release_bundle_download() {
         let sh = install_sh();
@@ -416,15 +405,15 @@ mod exit_handling {
     }
 
     #[test]
-    fn model_asset_install_failure_is_checked_by_callers() {
+    fn install_paths_do_not_copy_model_assets() {
         let script = install_sh();
         assert!(
-            script.contains(r#"if ! install_model_assets "$repo_dir"; then"#),
-            "source install path must check install_model_assets failure"
+            !script.contains("install_model_assets"),
+            "source and bundle install paths must leave model provisioning to setup"
         );
         assert!(
-            script.contains(r#"if ! install_model_assets "$bundle_dir"; then"#),
-            "bundle install path must check install_model_assets failure"
+            !script.contains("BUNDLE_DIR/models") && !script.contains("qwen3-embed-0.6b"),
+            "installer must not expect model files in release bundles"
         );
     }
 }

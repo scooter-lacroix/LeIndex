@@ -76,7 +76,7 @@ mod tests {
             idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
             ..leindex_embed::runtime::RuntimeConfig::default()
         };
-        let mut rt = WorkerRuntime::new(config);
+        let rt = WorkerRuntime::new(config);
 
         let request = EmbedRequest {
             texts: vec!["hello".to_string()],

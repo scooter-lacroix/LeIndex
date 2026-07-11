@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #############################################
 # LeIndex Universal Installer
-# Version: 1.8.3 - Rust Edition
+# Version: 1.8.4 - Rust Edition
 # Platform: macOS
 #
 # Installer:
@@ -17,7 +17,7 @@ set -euo pipefail
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-readonly SCRIPT_VERSION="1.8.3"
+readonly SCRIPT_VERSION="1.8.4"
 readonly PROJECT_NAME="LeIndex"
 readonly PROJECT_SLUG="leindex"
 readonly MIN_RUST_MAJOR=1
@@ -257,57 +257,6 @@ install_rust() {
 }
 
 # ============================================================================
-# MODEL ASSET INSTALLATION
-# ============================================================================
-
-install_model_assets() {
-    local repo_dir="$1"
-    local source_dir="$repo_dir/models"
-
-    if [[ ! -d "$source_dir" ]]; then
-        log_warn "Model bundle directory not found; skipping model asset install"
-        return 0
-    fi
-
-    if [[ ! -f "$source_dir/qwen3-embed-0.6b.onnx" ]]; then
-        log_warn "ONNX model file not found in bundle; skipping model asset install"
-        return 0
-    fi
-
-    local model_dir="${LEINDEX_HOME}/models"
-    log_info "Installing model assets to $model_dir"
-    mkdir -p "$model_dir"
-
-    local temp_model_dir="${model_dir}.tmp"
-    rm -rf "$temp_model_dir"
-    mkdir -p "$temp_model_dir"
-
-    for asset in qwen3-embed-0.6b.onnx tokenizer.json config.json checksums.sha256 LICENSE; do
-        if [[ -f "$source_dir/$asset" ]]; then
-            cp "$source_dir/$asset" "$temp_model_dir/"
-        fi
-    done
-
-    rm -rf "$model_dir"
-    mv "$temp_model_dir" "$model_dir"
-
-    # Validate checksums if checksums.sha256 exists
-    if [[ -f "$model_dir/checksums.sha256" ]]; then
-        log_info "Validating model checksums..."
-        # Run checksum validation from within $model_dir so relative paths in
-        # checksums.sha256 (e.g. "tokenizer.json  abc123...") resolve correctly.
-        if ! (cd "$model_dir" && shasum -a 256 -c checksums.sha256) >> "$INSTALL_LOG" 2>&1; then
-            log_warn "Checksum validation failed; removing corrupted model files"
-            rm -rf "$model_dir"
-            return 1
-        fi
-        log_info "Checksum validation passed"
-    fi
-
-    log_success "Model assets installed to $model_dir"
-}
-
-# ============================================================================
 # INSTALLATION
 # ============================================================================
 
@@ -398,9 +347,6 @@ install_leindex() {
     else
         log_warn "Worker binary not found (leindex-embed); ONNX inference will use in-process fallback"
     fi
-
-    # Install bundled model assets
-    install_model_assets "$repo_dir"
 
     # Clean up temporary clone if we created it
     if [[ "$should_cleanup" == true ]]; then

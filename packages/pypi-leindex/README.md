@@ -110,9 +110,14 @@ leindex setup
 
 The PyPI package installs a small Python launcher that bootstraps the real Rust
 `leindex` binary into `~/.cargo/bin` via `cargo install` on first run. Run
-`leindex setup` afterwards to install ONNX Runtime and download the
-`qwen3-embed-0.6b.onnx` model for neural (semantic) search. TF-IDF (keyword)
-search works immediately without setup. See [docs/NEURAL_SETUP.md](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/NEURAL_SETUP.md)
+`leindex setup` afterwards to select CPU, NVIDIA CUDA, or AMD MIGraphX,
+install the matching ONNX Runtime, and provision
+[Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) from
+Hugging Face via Hugging Face CLI. Models are stored under `~/.leindex/models/`
+and are never included in PyPI artifacts. CPU/CUDA use dynamic batches up to
+32; MIGraphX uses a warmed, cached 8-by-128 profile. Hybrid queries use a
+250 ms neural budget with immediate TF-IDF/structural fallback. TF-IDF search
+works immediately without setup. See [docs/NEURAL_SETUP.md](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/NEURAL_SETUP.md)
 for CPU/GPU/AMD/NVIDIA paths and troubleshooting.
 
 **Option 2: cargo (recommended for Rust users)**

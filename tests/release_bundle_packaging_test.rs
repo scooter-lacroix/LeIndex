@@ -5,7 +5,8 @@
 //! the distribution contract:
 //!
 //!   * `bin/` carries both `leindex` and `leindex-embed`
-//!   * `models/` ships the ONNX model, tokenizer, and config
+//!   * Model files are excluded; `leindex setup` provisions them through
+//!     Hugging Face CLI
 //!   * `lib/` contains ORT runtime libraries obtained from a pip wheel extract
 //!     (not linked at build time)
 //!   * The linux-x86_64 (AMD) bundle additionally ships the MIGraphX provider
@@ -137,7 +138,7 @@ mod build_time_invariants {
 }
 
 // ============================================================================
-// Bundle layout: bin/, lib/, models/, INSTALL.txt
+// Bundle layout: bin/, lib/, INSTALL.txt
 // ============================================================================
 
 mod bundle_layout {
@@ -164,9 +165,10 @@ mod bundle_layout {
         );
     }
 
-    /// VAL-RELEASE-003 / VAL-RELEASE-004: The bundle ships model assets.
+    /// Models are downloaded by `leindex setup` through Hugging Face CLI and
+    /// must never be embedded in GitHub release archives.
     #[test]
-    fn bundle_contains_model_assets() {
+    fn bundle_excludes_model_assets() {
         let yml = release_yml();
         let package_section = yml
             .split("Package release bundle")
@@ -175,16 +177,13 @@ mod bundle_layout {
             .expect("release.yml must contain a 'Package release bundle' step");
 
         assert!(
-            package_section.contains("models/qwen3-embed-0.6b.onnx"),
-            "bundle must ship the ONNX model"
+            !package_section.contains("BUNDLE_DIR/models")
+                && !package_section.contains("models/qwen3"),
+            "release bundles must not contain model assets"
         );
         assert!(
-            package_section.contains("tokenizer.json"),
-            "bundle must ship tokenizer.json"
-        );
-        assert!(
-            package_section.contains("config.json"),
-            "bundle must ship config.json"
+            !yml.contains("- name: Download model assets"),
+            "release workflow must not download models during packaging"
         );
     }
 
@@ -241,9 +240,8 @@ mod bundle_layout {
         );
     }
 
-    /// VAL-RELEASE-007: The bundle top level must consist of exactly
-    /// `bin/`, `lib/`, `models/`, and `INSTALL.txt`. The package step must
-    /// create those directories.
+    /// VAL-RELEASE-007: The bundle contains `bin/`, `lib/`, and
+    /// `INSTALL.txt`, and does not create a model directory.
     #[test]
     fn bundle_directory_tree_matches_spec() {
         let yml = release_yml();
@@ -262,8 +260,8 @@ mod bundle_layout {
             "package step must create lib/ under the bundle root"
         );
         assert!(
-            package_section.contains("BUNDLE_DIR/models"),
-            "package step must create models/ under the bundle root"
+            !package_section.contains("BUNDLE_DIR/models"),
+            "package step must not create models/ under the bundle root"
         );
     }
 
@@ -301,7 +299,7 @@ mod checksum_coverage {
 
     /// VAL-RELEASE-009: The `SHA256SUMS` published at the release level must
     /// remain, AND each bundle must include per-file checksums that cover the
-    /// `lib/` directory (not just models/).
+    /// `lib/` directory.
     #[test]
     fn checksums_cover_lib_directory() {
         let yml = release_yml();

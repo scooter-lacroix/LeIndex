@@ -455,7 +455,8 @@ fn launch_mcp_process(config: &WorkloadConfig) -> Result<Child> {
         .arg("--stdio")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .env("LEINDEX_EMBED_DAEMON", "0");
 
     if config.verbose {
         eprintln!("  launching MCP: {:?}", cmd);
@@ -477,32 +478,26 @@ fn launch_mcp_process(config: &WorkloadConfig) -> Result<Child> {
 /// is somehow unavailable (e.g., non-Linux platforms or older kernels).
 fn kill_child(mut child: Child) {
     let pid = child.id();
+    let worker_pids = find_worker_pids(pid, WORKER_BINARY_NAME);
 
-    // Kill the primary child first.
     let _ = child.kill();
     let _ = child.wait();
 
-    // Reap any leindex-embed worker children that the now-killed process
-    // spawned. We do this AFTER killing the parent so the workers are
-    // already orphaned (reparented to init) and we can find them by name
-    // without needing the parent pid relationship.
-    reap_worker_processes(pid);
+    // Only reap workers proven to be direct children before the measured
+    // process exited. PPID-1 workers may belong to another LeIndex session.
+    reap_worker_processes(&worker_pids);
 }
 
 /// Find and kill any lingering `leindex-embed` worker processes.
 ///
-/// Scans `/proc` for processes whose name matches `leindex-embed` and whose
-/// PPID is either the just-killed parent or 1 (already orphaned). This is the
-/// memcheck-harness-side counterpart to the worker's PR_SET_PDEATHSIG guard:
-/// it guarantees no worker survives past a phase boundary even on platforms
-/// where PR_SET_PDEATHSIG is unavailable.
+/// Kills only worker PIDs captured as direct children of the measured process.
+/// This complements the worker's PR_SET_PDEATHSIG guard without touching
+/// resident workers owned by another CLI or MCP session.
 ///
 /// On non-Linux platforms this is a no-op (the memcheck harness is Linux-only
 /// anyway, but the conditional keeps the code portable).
-fn reap_worker_processes(parent_pid: u32) {
-    let worker_name = WORKER_BINARY_NAME;
-    let to_kill = find_worker_pids(parent_pid, worker_name);
-    for worker_pid in to_kill {
+fn reap_worker_processes(worker_pids: &[u32]) {
+    for &worker_pid in worker_pids {
         // SAFETY: `kill(pid, SIGKILL)` is a scalar syscall with no pointer
         // arguments. We ignore the return value because the worker may have
         // already exited between our scan and the kill.
@@ -513,7 +508,7 @@ fn reap_worker_processes(parent_pid: u32) {
 }
 
 /// Scan `/proc` for worker processes matching `worker_name` whose PPID is
-/// either `parent_pid` or 1 (already orphaned by the parent's death).
+/// `parent_pid`.
 fn find_worker_pids(parent_pid: u32, worker_name: &str) -> Vec<u32> {
     let mut found = Vec::new();
 
@@ -549,9 +544,9 @@ fn find_worker_pids(parent_pid: u32, worker_name: &str) -> Vec<u32> {
             continue;
         }
 
-        // Resolve the ppid and accept either the just-killed parent or init (1).
+        // Only workers directly owned by the measured process are eligible.
         let ppid = read_proc_ppid(candidate_pid);
-        if ppid == parent_pid || ppid == 1 {
+        if ppid == parent_pid {
             found.push(candidate_pid);
         }
     }
@@ -908,7 +903,6 @@ mod tests {
     #[test]
     fn test_reap_worker_processes_no_crash_with_no_workers() {
         // Ensures the reaper is a no-op when no workers are running.
-        // Use a deliberately unused parent pid that no real workers belong to.
-        reap_worker_processes(u32::MAX);
+        reap_worker_processes(&[]);
     }
 }

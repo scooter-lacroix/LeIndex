@@ -20,6 +20,7 @@ pub const LEINDEX_HOME_ENV: &str = "LEINDEX_HOME";
 
 /// Default model directory relative to LeIndex home.
 const DEFAULT_MODEL_DIR_SUFFIX: &str = "models";
+const DEFAULT_MODEL_NAME: &str = "qwen3-embed-0.6b";
 
 /// Default execution provider string.
 const DEFAULT_EXECUTION_PROVIDER: &str = "auto";
@@ -80,6 +81,10 @@ pub struct NeuralConfig {
     /// Directory containing model files (ONNX model, tokenizer, etc.).
     #[serde(default = "default_model_dir")]
     pub model_dir: String,
+
+    /// ONNX model stem to load from model directories.
+    #[serde(default = "default_model_name")]
+    pub model_name: String,
 }
 
 /// Search behavior configuration (`[search]` section).
@@ -116,6 +121,7 @@ impl Default for NeuralConfig {
             ort_dylib_path: None,
             ort_version: None,
             model_dir: default_model_dir(),
+            model_name: default_model_name(),
         }
     }
 }
@@ -149,6 +155,10 @@ fn default_model_dir() -> String {
     resolve_leindex_home()
         .map(|h| h.join(DEFAULT_MODEL_DIR_SUFFIX).display().to_string())
         .unwrap_or_else(|| format!("~/.leindex/{}", DEFAULT_MODEL_DIR_SUFFIX))
+}
+
+fn default_model_name() -> String {
+    DEFAULT_MODEL_NAME.to_string()
 }
 
 fn default_search_mode() -> String {
@@ -416,6 +426,7 @@ mod tests {
             ort_dylib_path: Some("/usr/local/lib/libonnxruntime.so".to_string()),
             ort_version: Some("1.25.0".to_string()),
             model_dir: "/home/user/.leindex/models".to_string(),
+            model_name: "qwen3-embed-0.6b".to_string(),
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -434,6 +445,7 @@ mod tests {
         // Defaults should fill in missing keys
         assert_eq!(config.search.search_mode, "hybrid");
         assert_eq!(config.indexing.batch_size, 500);
+        assert_eq!(config.neural.model_name, "qwen3-embed-0.6b");
     }
 
     #[test]
@@ -475,6 +487,7 @@ mod tests {
                 ort_dylib_path: Some("/usr/local/lib/libonnxruntime.so.1.25.0".to_string()),
                 ort_version: Some("1.25.0".to_string()),
                 model_dir: "/home/user/.leindex/models".to_string(),
+                model_name: "qwen3-embed-0.6b".to_string(),
             },
             search: SearchConfig {
                 search_mode: "hybrid".to_string(),
@@ -531,6 +544,7 @@ mod tests {
             ort_dylib_path: None,
             ort_version: None,
             model_dir: "/models".to_string(),
+            model_name: "qwen3-embed-0.6b".to_string(),
         };
         let toml_str = toml::to_string(&config).unwrap();
         assert!(!toml_str.contains("ort_dylib_path"));
@@ -580,6 +594,7 @@ mod tests {
                 ort_dylib_path: Some("/usr/lib/libonnxruntime.so".to_string()),
                 ort_version: Some("1.25.0".to_string()),
                 model_dir: tmp.path().join("models").display().to_string(),
+                model_name: "qwen3-embed-0.6b".to_string(),
             },
             ..Default::default()
         };
@@ -606,6 +621,7 @@ mod tests {
                 ort_dylib_path: Some("/usr/lib/libonnxruntime.so".to_string()),
                 ort_version: Some("1.25.0".to_string()),
                 model_dir: "/models".to_string(),
+                model_name: "qwen3-embed-0.6b".to_string(),
             },
             ..Default::default()
         };

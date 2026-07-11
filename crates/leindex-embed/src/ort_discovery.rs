@@ -165,6 +165,7 @@ pub fn last_outcome() -> Option<DiscoveryOutcome> {
     LAST_OUTCOME.read().ok().and_then(|outcome| outcome.clone())
 }
 
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
 fn record_last_outcome(outcome: Option<DiscoveryOutcome>) {
     if let Ok(mut cached) = LAST_OUTCOME.write() {
         *cached = outcome;

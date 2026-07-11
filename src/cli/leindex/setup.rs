@@ -118,7 +118,54 @@ pub struct SmokeTestResult {
     pub note: Option<String>,
 }
 
+const QWEN3_EMBEDDING_DIMENSION: usize = 1024;
+
 impl SmokeTestResult {
+    #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+    fn from_embedding_outcome(
+        dimension: usize,
+        execution_provider: Option<String>,
+        configured_provider_label: Option<String>,
+    ) -> Self {
+        let mut error = if dimension == QWEN3_EMBEDDING_DIMENSION {
+            None
+        } else {
+            Some(format!(
+                "expected {}-dim vector, got {}-dim",
+                QWEN3_EMBEDDING_DIMENSION, dimension
+            ))
+        };
+
+        if error.is_none() {
+            if let Some(configured) = configured_provider_label.as_deref() {
+                let active = execution_provider.as_deref();
+                let provider_matches = matches!(
+                    (configured, active),
+                    ("cuda", Some("cuda"))
+                        | ("migraphx", Some("migraphx"))
+                        | ("rocm", Some("migraphx" | "rocm"))
+                );
+                if matches!(configured, "migraphx" | "rocm" | "cuda") && !provider_matches {
+                    error = Some(format!(
+                        "configured execution provider {} but worker reported {}",
+                        configured,
+                        active.unwrap_or("none")
+                    ));
+                }
+            }
+        }
+
+        Self {
+            passed: error.is_none(),
+            skipped: false,
+            dimension: Some(dimension),
+            execution_provider,
+            configured_provider_label,
+            error,
+            note: None,
+        }
+    }
+
     /// One-line status string for terminal output.
     pub fn status_line(&self) -> String {
         if self.skipped {
@@ -432,7 +479,8 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
 
     // Check current state
     let ort_installed = check_ort_installed();
-    let model_present = check_model_present();
+    let desired_model_name = model_name_for_provider(choices.provider);
+    let model_present = check_model_present_for_name(desired_model_name);
 
     // VAL-SETUP-027/028: Surface partial-setup edge cases with explicit log
     // lines so the user knows setup detected the partial state and is only
@@ -553,7 +601,7 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
     // present, checksum verified" line so the second run is informative
     // without doing any network round-trips.
     let model_present = if choices.neural_enabled {
-        ensure_models_present()?
+        ensure_models_present(choices.provider, desired_model_name)?
     } else {
         model_present
     };
@@ -596,6 +644,9 @@ pub fn execute_setup(choices: &SetupChoices) -> Result<SetupResult, SetupError> 
             } => {
                 println!("  -> {}.", result.status_line());
                 println!("  -> Configured execution provider: {}.", provider);
+                if let Some(active) = &result.execution_provider {
+                    println!("  -> Active execution provider: {}.", active);
+                }
                 let _ = dim; // already in status_line
             }
             SmokeTestResult {
@@ -775,58 +826,42 @@ fn run_embedding_smoke_test(expected_provider: Option<ExecutionProvider>) -> Smo
 fn run_embedding_smoke_test_inner(expected_provider: Option<ExecutionProvider>) -> SmokeTestResult {
     use crate::search::onnx::EmbeddingClient;
 
-    // The Qwen3-Embedding-0.6B model produces 1024-dimensional vectors.
-    const SMOKE_TEST_EXPECTED_DIM: usize = 1024;
     const SMOKE_TEST_TEXT: &str = "hello world";
 
-    let client = EmbeddingClient::new();
+    let client = EmbeddingClient::new_pipe();
     let provider_label: String = expected_provider
         .map(|p| p.config_value().to_string())
         .unwrap_or_else(|| "auto".to_string());
-    // Spawn the worker and run a single embedding. EmbeddingClient does not
-    // currently expose the worker startup report, so the active EP remains
-    // unknown unless that plumbing is added later.
-    match client.embed(&[SMOKE_TEST_TEXT.to_string()], SMOKE_TEST_EXPECTED_DIM) {
+    match client.embed(&[SMOKE_TEST_TEXT.to_string()], QWEN3_EMBEDDING_DIMENSION) {
         Ok(response) => {
+            let active_provider =
+                client.wait_for_active_execution_provider(std::time::Duration::from_millis(500));
             if response.count == 0 {
                 return SmokeTestResult {
                     passed: false,
                     skipped: false,
                     dimension: None,
-                    execution_provider: None,
+                    execution_provider: active_provider,
                     configured_provider_label: Some(provider_label),
                     error: Some("worker returned zero embeddings".to_string()),
                     note: None,
                 };
             }
-            // The first (and only) embedding must have the expected dimension.
-            let dim = response.dimension;
-            let passed = dim == SMOKE_TEST_EXPECTED_DIM;
-            SmokeTestResult {
-                passed,
-                skipped: false,
-                dimension: Some(dim),
-                execution_provider: None,
-                configured_provider_label: Some(provider_label),
-                error: if passed {
-                    None
-                } else {
-                    Some(format!(
-                        "expected {}-dim vector, got {}-dim",
-                        SMOKE_TEST_EXPECTED_DIM, dim
-                    ))
-                },
-                note: None,
-            }
+            SmokeTestResult::from_embedding_outcome(
+                response.dimension,
+                active_provider,
+                Some(provider_label),
+            )
         }
         Err(e) => {
             // Translate the client error into actionable text.
             let msg = e.to_string();
+            let active_provider = client.active_execution_provider();
             SmokeTestResult {
                 passed: false,
                 skipped: false,
                 dimension: None,
-                execution_provider: None,
+                execution_provider: active_provider,
                 configured_provider_label: Some(provider_label),
                 error: Some(msg),
                 note: None,
@@ -943,10 +978,43 @@ fn build_config(
             model_dir: crate::cli::neural_config::model_dir_path()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "~/.leindex/models".to_string()),
+            model_name: model_name_for_provider(choices.provider).to_string(),
         },
         search: SearchConfig::default(),
         indexing: IndexingConfig::default(),
     }
+}
+
+const QWEN3_ONNX_REPOSITORY: &str = "zhiqing/Qwen3-Embedding-0.6B-ONNX";
+const QWEN3_ONNX_REVISION: &str = "c96cc9c82d08ee7869600e2191078fc939957026";
+const QWEN3_REMOTE_MODEL: &str = "model.onnx";
+const QWEN3_LOCAL_MODEL: &str = crate::cli::leindex::model_download::DYNAMIC_MODEL_ONNX_FILENAME;
+const QWEN3_MODEL_FILES: &[&str] = &[QWEN3_REMOTE_MODEL, "tokenizer.json", "config.json"];
+
+#[derive(Debug, Clone, Copy)]
+struct ModelDownloadProfile {
+    repository: &'static str,
+    revision: &'static str,
+    remote_model: &'static str,
+    local_model: &'static str,
+    files: &'static [&'static str],
+}
+
+fn model_download_profile(_provider: Option<ExecutionProvider>) -> ModelDownloadProfile {
+    ModelDownloadProfile {
+        repository: QWEN3_ONNX_REPOSITORY,
+        revision: QWEN3_ONNX_REVISION,
+        remote_model: QWEN3_REMOTE_MODEL,
+        local_model: QWEN3_LOCAL_MODEL,
+        files: QWEN3_MODEL_FILES,
+    }
+}
+
+fn model_name_for_provider(provider: Option<ExecutionProvider>) -> &'static str {
+    model_download_profile(provider)
+        .local_model
+        .strip_suffix(".onnx")
+        .expect("model profile local filename must end in .onnx")
 }
 
 /// Check if onnxruntime is installed (any variant).
@@ -1117,12 +1185,17 @@ fn check_provider_available(provider: ExecutionProvider) -> bool {
 /// file as "present" if it exists on disk; the checksum-aware variant is
 /// `model_checksum_status()` which returns one of Ok/Mismatch/Unknown so the
 /// caller can warn about a corrupted file without failing the existence check.
+#[allow(dead_code)]
 fn check_model_present() -> bool {
-    let model_name = "qwen3-embed-0.6b.onnx";
+    check_model_present_for_name("qwen3-embed-0.6b")
+}
+
+fn check_model_present_for_name(model_name: &str) -> bool {
+    let model_filename = format!("{}.onnx", model_name);
 
     // Check via config module's model_dir_path
     if let Some(model_dir) = crate::cli::neural_config::model_dir_path() {
-        if model_dir.join(model_name).exists() {
+        if model_assets_present(&model_dir, &model_filename) {
             return true;
         }
     }
@@ -1130,11 +1203,11 @@ fn check_model_present() -> bool {
     // Also check bundled models relative to the binary
     if let Ok(exe) = std::env::current_exe() {
         if let Some(parent) = exe.parent() {
-            if parent.join("models").join(model_name).exists() {
+            if model_assets_present(&parent.join("models"), &model_filename) {
                 return true;
             }
             if let Some(gp) = parent.parent() {
-                if gp.join("models").join(model_name).exists() {
+                if model_assets_present(&gp.join("models"), &model_filename) {
                     return true;
                 }
             }
@@ -1142,6 +1215,35 @@ fn check_model_present() -> bool {
     }
 
     false
+}
+
+fn model_assets_present(model_dir: &Path, model_filename: &str) -> bool {
+    if !model_dir.join(model_filename).exists() {
+        return false;
+    }
+
+    if model_filename != crate::cli::leindex::model_download::DYNAMIC_MODEL_ONNX_FILENAME {
+        return true;
+    }
+
+    dynamic_model_assets_present(model_dir)
+}
+
+fn dynamic_model_assets_present(model_dir: &Path) -> bool {
+    const MIN_MODEL_BYTES: u64 = 100 * 1024 * 1024;
+
+    let model = model_dir.join(crate::cli::leindex::model_download::DYNAMIC_MODEL_ONNX_FILENAME);
+    if std::fs::metadata(model)
+        .map(|metadata| metadata.len() < MIN_MODEL_BYTES)
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    ["tokenizer.json", "config.json"].iter().all(|file| {
+        std::fs::metadata(model_dir.join(file))
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false)
+    })
 }
 
 /// Outcome of comparing the on-disk model file against the checksum manifest.
@@ -1167,9 +1269,14 @@ pub enum ModelChecksumStatus {
 /// `check_model_present()`. When a `checksums.sha256` sibling file exists,
 /// its entry for `qwen3-embed-0.6b.onnx` is compared against the file's
 /// computed SHA256.
+#[allow(dead_code)]
 pub fn model_checksum_status() -> ModelChecksumStatus {
+    model_checksum_status_for_name("qwen3-embed-0.6b")
+}
+
+fn model_checksum_status_for_name(model_name: &str) -> ModelChecksumStatus {
     use crate::cli::leindex::model_download::{
-        check_file_against_manifest, parse_checksums, CheckResult, MODEL_ONNX_FILENAME,
+        check_file_against_manifest, parse_checksums, CheckResult, DYNAMIC_MODEL_ONNX_FILENAME,
     };
 
     let model_dir = match crate::cli::neural_config::model_dir_path() {
@@ -1177,7 +1284,8 @@ pub fn model_checksum_status() -> ModelChecksumStatus {
         None => return ModelChecksumStatus::Missing,
     };
 
-    let onnx_path = model_dir.join(MODEL_ONNX_FILENAME);
+    let model_filename = format!("{}.onnx", model_name);
+    let onnx_path = model_dir.join(&model_filename);
     if !onnx_path.exists() {
         return ModelChecksumStatus::Missing;
     }
@@ -1189,7 +1297,7 @@ pub fn model_checksum_status() -> ModelChecksumStatus {
     };
     let manifest = parse_checksums(&manifest_str);
 
-    match check_file_against_manifest(&onnx_path, &manifest) {
+    let status = match check_file_against_manifest(&onnx_path, &manifest) {
         Ok(CheckResult::Verified) => ModelChecksumStatus::Ok,
         Ok(CheckResult::NoEntry) => ModelChecksumStatus::Unknown,
         Ok(CheckResult::Mismatch { expected, actual }) => {
@@ -1197,7 +1305,20 @@ pub fn model_checksum_status() -> ModelChecksumStatus {
         }
         Ok(CheckResult::Missing) => ModelChecksumStatus::Missing,
         Err(_) => ModelChecksumStatus::Unknown,
+    };
+
+    if model_filename == DYNAMIC_MODEL_ONNX_FILENAME && status == ModelChecksumStatus::Ok {
+        let metadata_verified = ["tokenizer.json", "config.json"].iter().all(|file| {
+            matches!(
+                check_file_against_manifest(&model_dir.join(file), &manifest),
+                Ok(CheckResult::Verified)
+            )
+        });
+        if !metadata_verified {
+            return ModelChecksumStatus::Unknown;
+        }
     }
+    status
 }
 
 /// Install ORT via pip for the given execution provider.
@@ -1651,33 +1772,234 @@ fn is_ort_runtime_lib_name_for_setup(name: &str) -> bool {
     ort_lib_names().iter().any(|candidate| candidate == &name)
 }
 
-/// Ensure model files are present, downloading from HuggingFace if needed.
+/// Locate a Hugging Face CLI executable, honoring `HF_BIN` first.
+fn find_hugging_face_cli() -> Option<String> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = std::env::var("HF_BIN") {
+        if !path.trim().is_empty() {
+            candidates.push(path);
+        }
+    }
+    candidates.extend(["hf".to_string(), "huggingface-cli".to_string()]);
+
+    candidates.into_iter().find(|program| {
+        Command::new(program)
+            .arg("download")
+            .arg("--help")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    })
+}
+
+fn ensure_hugging_face_cli() -> Result<String, SetupError> {
+    if let Some(cli) = find_hugging_face_cli() {
+        return Ok(cli);
+    }
+
+    let package = "huggingface_hub";
+    let pip_cmd = find_pip().ok_or(SetupError::PipNotFound)?;
+    println!("Installing {} for model downloads...", package);
+    let output = Command::new(&pip_cmd.0)
+        .args(&pip_cmd.1)
+        .arg("install")
+        .arg(package)
+        .arg("--upgrade")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|_| SetupError::PipInstallFailed {
+            package: package.to_string(),
+            exit_code: -1,
+        })?;
+
+    if !output.status.success() {
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if is_network_error(&combined) {
+            return Err(SetupError::PipNetworkFailed {
+                package: package.to_string(),
+                exit_code: output.status.code().unwrap_or(-1),
+                output: truncate_for_error(&combined),
+            });
+        }
+        return Err(SetupError::PipInstallFailed {
+            package: package.to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+        });
+    }
+
+    find_hugging_face_cli().ok_or(SetupError::HuggingFaceCliNotFound)
+}
+
+fn profile_assets_verified(model_dir: &Path, profile: ModelDownloadProfile) -> bool {
+    use crate::cli::leindex::model_download::{
+        check_file_against_manifest, parse_checksums, CheckResult,
+    };
+
+    if !dynamic_model_assets_present(model_dir) {
+        return false;
+    }
+    let Ok(contents) = std::fs::read_to_string(model_dir.join("checksums.sha256")) else {
+        return false;
+    };
+    let source_marker = format!("# source: {}@{}", profile.repository, profile.revision);
+    if !contents
+        .lines()
+        .any(|line| line.trim() == source_marker.as_str())
+    {
+        return false;
+    }
+    let manifest = parse_checksums(&contents);
+    [profile.local_model, "tokenizer.json", "config.json"]
+        .iter()
+        .all(|file| {
+            matches!(
+                check_file_against_manifest(&model_dir.join(file), &manifest),
+                Ok(CheckResult::Verified)
+            )
+        })
+}
+
+fn install_downloaded_model_file(src: &Path, dst: &Path) -> Result<(), SetupError> {
+    if !src.exists() {
+        return Err(SetupError::Io(format!(
+            "Hugging Face download did not produce {}",
+            src.display()
+        )));
+    }
+
+    if dst.exists() {
+        std::fs::remove_file(dst)
+            .map_err(|e| SetupError::Io(format!("Cannot replace {}: {}", dst.display(), e)))?;
+    }
+
+    if std::fs::rename(src, dst).is_err() {
+        std::fs::copy(src, dst).map_err(|e| {
+            SetupError::Io(format!(
+                "Cannot install downloaded model file {}: {}",
+                dst.display(),
+                e
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn generate_profile_checksum_manifest(
+    model_dir: &Path,
+    profile: ModelDownloadProfile,
+) -> Result<(), SetupError> {
+    use crate::cli::leindex::model_download::sha256_of_file;
+
+    let mut manifest = format!("# source: {}@{}\n", profile.repository, profile.revision);
+    for file in [profile.local_model, "tokenizer.json", "config.json"] {
+        let path = model_dir.join(file);
+        let hash = sha256_of_file(&path)
+            .map_err(|e| SetupError::Io(format!("Cannot checksum {}: {}", path.display(), e)))?;
+        manifest.push_str(&format!("{}  {}\n", hash, file));
+    }
+    std::fs::write(model_dir.join("checksums.sha256"), manifest)
+        .map_err(|e| SetupError::Io(format!("Cannot write model checksums: {}", e)))
+}
+
+fn ensure_hugging_face_model_present(
+    profile: ModelDownloadProfile,
+    model_dir: &Path,
+) -> Result<bool, SetupError> {
+    if profile_assets_verified(model_dir, profile) {
+        println!(
+            "  -> {} already present; all model checksums verified.",
+            profile.local_model
+        );
+        return Ok(true);
+    }
+
+    let hf = ensure_hugging_face_cli()?;
+    let staging = model_dir.join(format!(".hf-download-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging).map_err(|e| {
+        SetupError::Io(format!(
+            "Cannot create Hugging Face staging directory {}: {}",
+            staging.display(),
+            e
+        ))
+    })?;
+
+    println!(
+        "Downloading {} with Hugging Face CLI...",
+        profile.repository
+    );
+    let output = Command::new(&hf)
+        .arg("download")
+        .arg(profile.repository)
+        .args(profile.files)
+        .arg("--revision")
+        .arg(profile.revision)
+        .arg("--local-dir")
+        .arg(&staging)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .map_err(|e| SetupError::Io(format!("Failed to run {}: {}", hf, e)))?;
+
+    if !output.status.success() {
+        let details = truncate_for_error(&format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(SetupError::HuggingFaceDownloadFailed {
+            repository: profile.repository.to_string(),
+            exit_code: output.status.code().unwrap_or(-1),
+            output: details,
+        });
+    }
+
+    install_downloaded_model_file(
+        &staging.join(profile.remote_model),
+        &model_dir.join(profile.local_model),
+    )?;
+    for file in ["tokenizer.json", "config.json"] {
+        install_downloaded_model_file(&staging.join(file), &model_dir.join(file))?;
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+
+    if !dynamic_model_assets_present(model_dir) {
+        return Err(SetupError::ModelUnavailable {
+            model_name: profile.local_model.trim_end_matches(".onnx").to_string(),
+            model_dir: model_dir.to_path_buf(),
+        });
+    }
+    generate_profile_checksum_manifest(model_dir, profile)?;
+    println!("  -> Model files ready at {}", model_dir.display());
+    Ok(true)
+}
+
+/// Provision the configured embedding model.
 ///
-/// VAL-SETUP-016: First run downloads model files to `~/.leindex/models/`,
-///   printing progress for each file fetched.
-/// VAL-SETUP-017: Second run skips when the on-disk file's SHA256 matches the
-///   entry in `checksums.sha256`.
-/// VAL-SETUP-018: A corrupted file (checksum mismatch) is deleted and
-///   re-downloaded, then verified again.
-/// VAL-SETUP-019: Network failures surface an actionable error mentioning
-///   connectivity and `LEINDEX_MODEL_PATH`; no partial file is left at the
-///   canonical target path.
-///
-/// The flow prefers, in order:
-///   1. Bundled model files (next to the running binary) — copy without
-///      hitting the network. This makes the GitHub Release bundle surface
-///      zero-network once `install.sh` places the binary + models together.
-///   2. Verified existing files in the model directory.
-///   3. HuggingFace CDN download (with retries).
-///
-/// `checksums.sha256` and `LICENSE` are treated as OPTIONAL because the
-/// onnx-community/Qwen3-Embedding-0.6B-ONNX repo does not host either file.
-/// When the manifest is unavailable, one is generated locally from the
-/// downloaded files so second-run verification still works.
-fn ensure_models_present() -> Result<bool, SetupError> {
+/// Current provider profiles use the validated single-file dynamic Qwen3
+/// export and download it with the Hugging Face CLI. A locally generated
+/// checksum manifest protects subsequent setup and check runs. The legacy
+/// fixed-model path remains below only for existing pre-1.8.4 configurations;
+/// release artifacts never contain model files.
+fn ensure_models_present(
+    provider: Option<ExecutionProvider>,
+    model_name: &str,
+) -> Result<bool, SetupError> {
     use crate::cli::leindex::model_download::{
         self, check_file_against_manifest, download_file_with_retry, iter_model_files,
         parse_checksums, CheckResult, DownloadOutcome, DEFAULT_DOWNLOAD_RETRIES,
+        DYNAMIC_MODEL_ONNX_FILENAME,
     };
 
     let model_dir = crate::cli::neural_config::model_dir_path()
@@ -1687,6 +2009,11 @@ fn ensure_models_present() -> Result<bool, SetupError> {
     // on it existing.
     std::fs::create_dir_all(&model_dir)
         .map_err(|e| SetupError::Io(format!("Cannot create model dir: {}", e)))?;
+
+    let model_filename = format!("{}.onnx", model_name);
+    if model_filename == DYNAMIC_MODEL_ONNX_FILENAME {
+        return ensure_hugging_face_model_present(model_download_profile(provider), &model_dir);
+    }
 
     let manifest_path = model_dir.join("checksums.sha256");
     let model_onnx_name = model_download::MODEL_ONNX_FILENAME;
@@ -2089,10 +2416,10 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
 
     let ort_installed = check_ort_installed();
     let live_version = get_ort_version();
-    let model_present = check_model_present();
+    let model_present = check_model_present_for_name(&config.neural.model_name);
     // VAL-SETUP-014/018: checksum status is surfaced so a corrupted file
     // is visible from `--check` without needing to re-run setup.
-    let checksum_status = model_checksum_status();
+    let checksum_status = model_checksum_status_for_name(&config.neural.model_name);
     let ort_path = discover_ort_path().or_else(|| {
         config
             .neural
@@ -2175,6 +2502,7 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
     // Model status
     let model_status = if model_present { "present" } else { "absent" };
     println!("Model files:        {}", model_status);
+    println!("Model name:         {}", config.neural.model_name);
     println!("Model directory:    {}", config.neural.model_dir);
 
     // VAL-SETUP-017/018: report the checksum verdict so users can tell whether
@@ -2223,7 +2551,10 @@ pub fn run_check() -> Result<CheckResult, SetupError> {
             println!("  -> Install ORT: leindex setup --neural --cpu");
         }
         if !model_present {
-            println!("  -> Model files needed: run leindex setup --neural --cpu");
+            println!(
+                "  -> Model files needed for {}: run leindex setup --neural",
+                config.neural.model_name
+            );
         }
     } else {
         println!("Status: TF-IDF only (neural not configured)");
@@ -2440,6 +2771,19 @@ pub enum SetupError {
         expected: String,
         actual: String,
     },
+    /// The configured model variant cannot be found or prepared.
+    ModelUnavailable {
+        model_name: String,
+        model_dir: PathBuf,
+    },
+    /// Hugging Face CLI is required for model installation.
+    HuggingFaceCliNotFound,
+    /// Hugging Face CLI failed to download the selected model repository.
+    HuggingFaceDownloadFailed {
+        repository: String,
+        exit_code: i32,
+        output: String,
+    },
     /// I/O error.
     Io(String),
     /// Permission denied writing to the LeIndex home directory.
@@ -2573,6 +2917,43 @@ impl std::fmt::Display for SetupError {
                      `leindex setup`, or copy the file manually from a trusted source \
                      to ~/.leindex/models/{}.",
                     file, expected, actual, file
+                )
+            }
+            SetupError::ModelUnavailable {
+                model_name,
+                model_dir,
+            } => {
+                write!(
+                    f,
+                    "Model '{}' is not available in {}. \
+                     LeIndex requires a validated dynamic Qwen3 ONNX model plus \
+                     tokenizer.json and config.json. Re-run `leindex setup`, or set \
+                     LEINDEX_MODEL_PATH to a directory containing '{}.onnx' and the metadata files.",
+                    model_name,
+                    model_dir.display(),
+                    model_name
+                )
+            }
+            SetupError::HuggingFaceCliNotFound => {
+                write!(
+                    f,
+                    "Hugging Face CLI was not found. Install it with \
+                     `python3 -m pip install --upgrade huggingface_hub`, ensure `hf` \
+                     or `huggingface-cli` is on PATH, then rerun `leindex setup`. \
+                     Set HF_BIN to use a specific executable."
+                )
+            }
+            SetupError::HuggingFaceDownloadFailed {
+                repository,
+                exit_code,
+                output,
+            } => {
+                write!(
+                    f,
+                    "Hugging Face CLI failed to download '{}' (exit code {}). \
+                     Check network access, authentication, and available disk space, \
+                     then rerun `leindex setup`. Output:\n{}",
+                    repository, exit_code, output
                 )
             }
             SetupError::Io(msg) => write!(f, "I/O error: {}", msg),
@@ -2828,6 +3209,35 @@ mod tests {
     }
 
     #[test]
+    fn test_model_unavailable_error_names_dynamic_assets() {
+        let err = SetupError::ModelUnavailable {
+            model_name: "qwen3-embed-0.6b-dynamic".to_string(),
+            model_dir: PathBuf::from("/tmp/leindex-models"),
+        };
+        let msg = err.to_string();
+
+        assert!(msg.contains("qwen3-embed-0.6b-dynamic.onnx"), "{}", msg);
+        assert!(msg.contains("tokenizer.json"), "{}", msg);
+        assert!(msg.contains("config.json"), "{}", msg);
+        assert!(msg.contains("LEINDEX_MODEL_PATH"), "{}", msg);
+    }
+
+    #[test]
+    fn test_dynamic_model_assets_require_complete_single_file_download() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_path = tmp
+            .path()
+            .join(crate::cli::leindex::model_download::DYNAMIC_MODEL_ONNX_FILENAME);
+        let model = std::fs::File::create(model_path).unwrap();
+        model.set_len(100 * 1024 * 1024).unwrap();
+        std::fs::write(tmp.path().join("tokenizer.json"), b"{}").unwrap();
+        assert!(!dynamic_model_assets_present(tmp.path()));
+
+        std::fs::write(tmp.path().join("config.json"), b"{}").unwrap();
+        assert!(dynamic_model_assets_present(tmp.path()));
+    }
+
+    #[test]
     fn test_model_checksum_status_missing_for_clean_dir() {
         // VAL-SETUP-017: no model + no manifest -> Missing. We exercise this by
         // pointing LEINDEX_HOME at a fresh tempfile::TempDir (auto-cleanup on drop).
@@ -3077,6 +3487,99 @@ mod tests {
         );
         assert!(cfg.neural.enabled);
         assert_eq!(cfg.neural.execution_provider, "cpu");
+    }
+
+    #[test]
+    fn test_build_config_selects_dynamic_qwen_model_for_all_local_providers() {
+        for provider in [
+            ExecutionProvider::Cpu,
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Migraphx,
+        ] {
+            let choices = SetupChoices {
+                neural_enabled: true,
+                provider: Some(provider),
+            };
+
+            let cfg = build_config(&choices, None, None);
+
+            assert_eq!(cfg.neural.model_name, "qwen3-embed-0.6b-dynamic");
+        }
+    }
+
+    #[test]
+    fn test_model_download_profile_uses_hugging_face_cli_assets() {
+        for provider in [
+            ExecutionProvider::Cpu,
+            ExecutionProvider::Cuda,
+            ExecutionProvider::Migraphx,
+        ] {
+            let profile = model_download_profile(Some(provider));
+            assert_eq!(profile.repository, "zhiqing/Qwen3-Embedding-0.6B-ONNX");
+            assert_eq!(profile.revision, "c96cc9c82d08ee7869600e2191078fc939957026");
+            assert_eq!(profile.remote_model, "model.onnx");
+            assert_eq!(profile.local_model, "qwen3-embed-0.6b-dynamic.onnx");
+            assert_eq!(
+                profile.files,
+                &["model.onnx", "tokenizer.json", "config.json"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_dynamic_profile_requires_all_checksums_to_match() {
+        let model_dir = tempfile::tempdir().unwrap();
+        let profile = model_download_profile(Some(ExecutionProvider::Cpu));
+        let model = std::fs::File::create(model_dir.path().join(profile.local_model)).unwrap();
+        model.set_len(100 * 1024 * 1024).unwrap();
+        std::fs::write(model_dir.path().join("tokenizer.json"), b"{}").unwrap();
+        std::fs::write(model_dir.path().join("config.json"), b"{}").unwrap();
+
+        generate_profile_checksum_manifest(model_dir.path(), profile).unwrap();
+        assert!(profile_assets_verified(model_dir.path(), profile));
+
+        let manifest_path = model_dir.path().join("checksums.sha256");
+        let unpinned_manifest = std::fs::read_to_string(&manifest_path)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("# source:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&manifest_path, unpinned_manifest).unwrap();
+        assert!(!profile_assets_verified(model_dir.path(), profile));
+
+        generate_profile_checksum_manifest(model_dir.path(), profile).unwrap();
+
+        std::fs::write(model_dir.path().join("config.json"), br#"{"changed":true}"#).unwrap();
+        assert!(!profile_assets_verified(model_dir.path(), profile));
+    }
+
+    #[test]
+    fn test_rocm_smoke_result_accepts_migraphx_runtime() {
+        let result = SmokeTestResult::from_embedding_outcome(
+            QWEN3_EMBEDDING_DIMENSION,
+            Some("migraphx".to_string()),
+            Some("rocm".to_string()),
+        );
+
+        assert!(result.passed);
+        assert!(result.error.is_none());
+    }
+
+    #[test]
+    fn test_gpu_smoke_result_fails_provider_mismatch() {
+        let result = SmokeTestResult::from_embedding_outcome(
+            1024,
+            Some("cpu".to_string()),
+            Some("migraphx".to_string()),
+        );
+
+        assert!(!result.passed);
+        assert!(result
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("configured execution provider migraphx"));
     }
 
     #[test]

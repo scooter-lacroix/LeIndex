@@ -12,9 +12,9 @@
  *   npm run setup -- --neural --cpu
  *
  * Run synchronously because setup is a one-shot command, not a long-running
- * server. The same env detection the MCP wrapper uses (bundled lib/ +
- * models/) is applied so `setup` can mutate the user-level config while
- * still seeing the bundled assets. Exit status matches the underlying
+ * server. The same bundled-lib detection the MCP wrapper uses is applied so
+ * `setup` can mutate user-level config while seeing the packaged runtime.
+ * Exit status matches the underlying
  * binary so CI gates and `&&` chains behave correctly.
  */
 
@@ -23,7 +23,6 @@ const path = require('path');
 const fs = require('fs');
 
 const BIN_DIR = path.join(__dirname);
-const MODELS_DIR = path.join(__dirname, '..', 'models');
 const LIB_DIR = path.join(__dirname, '..', 'lib');
 const binaryName = process.platform === 'win32' ? 'leindex.exe' : 'leindex';
 
@@ -42,12 +41,8 @@ if (!fs.existsSync(binaryPath)) {
 }
 
 // Build the env in lockstep with bin/mcp-wrapper.js so setup detects the
-// same bundled ORT + models the MCP server uses.
+// same bundled ORT the MCP server uses.
 const env = Object.assign({}, process.env);
-
-if (fs.existsSync(MODELS_DIR) && !env.LEINDEX_MODEL_PATH) {
-  env.LEINDEX_MODEL_PATH = MODELS_DIR;
-}
 
 if (fs.existsSync(LIB_DIR) && !env.ORT_DYLIB_PATH) {
   const ortNames = process.platform === 'win32'

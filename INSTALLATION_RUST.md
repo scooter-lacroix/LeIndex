@@ -1,279 +1,148 @@
 # LeIndex Rust Installation Guide
 
-Complete guide to installing LeIndex, the pure Rust code search and analysis engine.
+This guide covers crates.io and source builds for LeIndex 1.8.4. For release
+bundles, npm, and PyPI, see [INSTALLATION.md](INSTALLATION.md).
 
----
+## Requirements
 
-## System Requirements
+- current stable Rust toolchain
+- a C/C++ build toolchain for native dependencies
+- Python 3 with pip when neural search is enabled
+- sufficient disk space for Rust build output and the separately downloaded
+  Qwen3 model
 
-### Minimum Requirements
+Supported release targets are Linux x86_64/aarch64, macOS x86_64/arm64, and
+Windows x86_64.
 
-| Component | Minimum | Recommended |
-|-----------|---------|-------------|
-| **Rust** | 1.75+ | Latest stable |
-| **RAM** | 4GB | 8GB+ |
-| **Disk** | 1GB | 2GB+ SSD |
-| **CPU** | 4 cores | 8+ cores |
+Ubuntu/Debian build prerequisites:
 
-### Supported Platforms
-
-- ✅ **Linux** - x86_64, aarch64
-- ✅ **macOS** - x86_64, arm64 (Apple Silicon)
-- ✅ **Windows** - x86_64
-
----
-
-## Prerequisites
-
-### 1. Install Rust
-
-LeIndex requires Rust 1.75 or later. Install via rustup:
-
-**Linux/macOS:**
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-source $HOME/.cargo/env
-```
-
-**Windows:**
-```powershell
-# Download and run rustup-init.exe from https://rustup.rs/
-```
-
-Verify installation:
-```bash
-rustc --version
-cargo --version
-```
-
-### 2. System Dependencies
-
-**Linux (Ubuntu/Debian):**
 ```bash
 sudo apt-get update
-sudo apt-get install -y build-essential pkg-config libssl-dev
+sudo apt-get install -y build-essential pkg-config libssl-dev python3 python3-pip
 ```
 
-**macOS:**
+macOS requires Xcode Command Line Tools:
+
 ```bash
-# Install Xcode Command Line Tools
 xcode-select --install
 ```
 
-**Windows:**
-- Install [Microsoft C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-- Install [Git](https://git-scm.com/)
+Windows source builds require Rust's MSVC toolchain and Microsoft C++ Build
+Tools.
 
----
-
-## Installation Methods
-
-### Method 1: Build from Source (Recommended)
-
-This is the recommended method for most users.
-
-```bash
-# Clone the repository
-git clone https://github.com/scooter-lacroix/leindex.git
-cd leindex
-
-# Build release binaries
-cargo build --release --bins
-
-# The binary will be at:
-# - target/release/leindex (Linux/macOS)
-# - target\release\leindex.exe (Windows)
-```
-
-### Method 2: Using the Installer
-
-The installer handles Rust detection, building, and PATH configuration.
-
-**Linux/macOS:**
-```bash
-./install.sh
-```
-
-**Windows (PowerShell):**
-```powershell
-.\install.ps1
-```
-
-The installer will:
-1. Check for Rust installation (install if missing)
-2. Build LeIndex from source
-3. Install to `~/.leindex/bin/`
-4. Update your PATH
-5. Configure directories
-
-### Method 3: Cargo Install (Future)
-
-Once published to crates.io:
+## crates.io
 
 ```bash
 cargo install leindex
-```
-
-*Note: Not yet available - use Method 1 or 2.*
-
----
-
-## Post-Installation Setup
-
-### 1. Verify Installation
-
-```bash
 leindex --version
-# Output: LeIndex 0.1.0
+leindex setup
 ```
 
-### 2. Check Your PATH
+Cargo installs `leindex` and `leindex-embed` under `$CARGO_HOME/bin`,
+normally `~/.cargo/bin`. The build uses ONNX Runtime dynamic loading, so ORT
+does not need to be installed while Cargo compiles LeIndex.
 
-The `leindex` command should be available. If not, add to your PATH:
+## Build From Source
 
-**Linux/macOS (bash):**
 ```bash
-export PATH="$HOME/.leindex/bin:$PATH"
-echo 'export PATH="$HOME/.leindex/bin:$PATH"' >> ~/.bashrc
+git clone https://github.com/scooter-lacroix/LeIndex.git
+cd LeIndex
+cargo build --release --bins
+./target/release/leindex --version
+./target/release/leindex setup
 ```
 
-**Linux/macOS (zsh):**
+Outputs:
+
+- `target/release/leindex`
+- `target/release/leindex-embed`
+
+Use `cargo install --path . --locked` to install the checked-out source into
+Cargo's binary directory.
+
+## Neural Setup
+
+The Rust crate does not package model files. Setup selects the execution
+provider, installs the matching ONNX Runtime package, installs
+`huggingface_hub` if needed, and downloads
+[Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) from
+Hugging Face via Hugging Face CLI, then writes
+`~/.leindex/config/leindex.toml`.
+
 ```bash
-export PATH="$HOME/.leindex/bin:$PATH"
-echo 'export PATH="$HOME/.leindex/bin:$PATH"' >> ~/.zshrc
+leindex setup --neural --cpu
+leindex setup --neural --gpu nvidia
+leindex setup --neural --gpu amd
+leindex setup --check
 ```
 
-**Windows (PowerShell):**
-```powershell
-$env:Path += ";$env:USERPROFILE\.leindex\bin"
-[System.Environment]::SetEnvironmentVariable("Path", $env:Path, "User")
-```
+The provider packages are `onnxruntime`, `onnxruntime-gpu`, and
+`onnxruntime-migraphx`, respectively. CUDA or ROCm/MIGraphX system
+dependencies remain the responsibility of the host. Setup validates the active
+provider and rejects silent GPU-to-CPU fallback.
 
-### 3. Create Configuration
+The model is stored under `$LEINDEX_HOME/models`, normally
+`~/.leindex/models`; it is not written into the Cargo registry or build
+directory.
 
-LeIndex will use default configuration. Create `leindex.toml` in your project root for custom settings:
-
-```toml
-# Memory settings
-[memory]
-total_budget_mb = 3072
-soft_limit_percent = 0.80
-hard_limit_percent = 0.93
-emergency_percent = 0.98
-
-# File filtering
-[file_filtering]
-max_file_size = 1073741824
-exclude_patterns = [
-    "**/node_modules/**",
-    "**/.git/**",
-    "**/target/**",
-    "**/build/**"
-]
-```
-
----
+See [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md) for provider tuning and
+runtime details.
 
 ## Verification
 
-### Run Diagnostics
-
 ```bash
+leindex --version
+leindex setup --check
 leindex diagnostics
+leindex index /path/to/project
+leindex search "request authentication" --project /path/to/project
 ```
 
-This will display:
-- LeIndex version
-- System information
-- Memory status
-- Parser availability
+TF-IDF search remains usable before neural setup and whenever the neural worker
+is unavailable. After indexing, unchanged CLI and MCP calls hydrate the
+persisted snapshot rather than repeating index maintenance.
 
-### Test Indexing
+## PATH
+
+If Cargo's binary directory is not already available:
 
 ```bash
-# Index a small project
-leindex index /path/to/project
-
-# Search the indexed code
-leindex search "function"
+export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
----
+Add that line to the shell profile used for LeIndex and any MCP client launched
+from the shell.
 
 ## Troubleshooting
 
-### Rust Not Found
+**Cargo cannot compile native dependencies**
 
-**Problem:** `rustc: command not found`
+Update Rust and install the platform build tools listed above. Avoid using
+`cargo clean` unless stale build output is the suspected cause because it
+forces a full rebuild.
 
-**Solution:**
-1. Install Rust via rustup (see Prerequisites)
-2. Restart your terminal
-3. Verify with `rustc --version`
+**`leindex-embed` is missing**
 
-### Build Fails
+Build or install all binaries with `cargo build --release --bins` or
+`cargo install leindex --force`.
 
-**Problem:** Compilation errors during `cargo build`
+**ONNX Runtime is not found**
 
-**Solutions:**
-1. Update Rust: `rustup update`
-2. Clean build: `cargo clean && cargo build --release`
-3. Check dependencies: `cargo fetch`
-4. Ensure sufficient disk space (>5GB)
+Run `leindex setup`. For a manual runtime, set `ORT_DYLIB_PATH` to the
+absolute shared-library path, then run `leindex setup --check`.
 
-### Permissions Error
+**Hugging Face CLI cannot be installed**
 
-**Problem:** Permission denied when installing
+Install it directly with
+`python3 -m pip install --upgrade huggingface_hub`, or set `HF_BIN` to an
+existing `hf` executable.
 
-**Solutions:**
-1. Use `--prefix` with cargo: `cargo install --prefix ~/.local`
-2. Or run the installer which uses user directory
-
-### Binary Not Found
-
-**Problem:** `leindex: command not found` after installation
-
-**Solutions:**
-1. Check binary exists: `ls ~/.leindex/bin/leindex`
-2. Add to PATH (see Post-Installation Setup)
-3. Restart terminal
-
----
-
-## Uninstallation
-
-### Remove Binaries
+## Removal
 
 ```bash
-# Remove installed binary
-rm -f ~/.leindex/bin/leindex
-
-# Remove from PATH (edit ~/.bashrc, ~/.zshrc, or Windows environment variables)
+cargo uninstall leindex
 ```
 
-### Remove Data
-
-```bash
-# Remove all LeIndex data (WARNING: deletes indexed data)
-rm -rf ~/.leindex
-```
-
----
-
-## Next Steps
-
-- [Configuration Reference](README.md#configuration) - Customize LeIndex
-- [Architecture](ARCHITECTURE.md) - Understand the system
-- [MCP Integration](MCP_COMPATIBILITY.md) - Set up AI assistant integration
-- [Migration Guide](MIGRATION.md) - Upgrading from Python v2.0.2
-
----
-
-## Getting Help
-
-- **GitHub Issues:** [https://github.com/scooter-lacroix/leindex/issues](https://github.com/scooter-lacroix/leindex/issues)
-- **Documentation:** [https://github.com/scooter-lacroix/leindex](https://github.com/scooter-lacroix/leindex)
-
----
-
-**Happy indexing!** 🚀
+Removing `${LEINDEX_HOME:-$HOME/.leindex}` also removes downloaded models,
+provider caches, configuration, and global LeIndex data. Project-local `.leindex/` directories
+must be removed separately when their persisted indexes are no longer wanted.

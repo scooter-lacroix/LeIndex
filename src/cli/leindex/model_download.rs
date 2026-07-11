@@ -39,6 +39,9 @@ pub const MODEL_HF_REPO: &str = "onnx-community/Qwen3-Embedding-0.6B-ONNX";
 /// The on-disk filename of the embedding model file.
 pub const MODEL_ONNX_FILENAME: &str = "qwen3-embed-0.6b.onnx";
 
+/// Dynamic-batch ONNX export used by CPU, CUDA, and MIGraphX providers.
+pub const DYNAMIC_MODEL_ONNX_FILENAME: &str = "qwen3-embed-0.6b-dynamic.onnx";
+
 /// File listing within the bundled checksum manifest. The trailing
 /// `(local_filename, remote_subpath)` pairs let the local layout (flat
 /// `~/.leindex/models/qwen3-embed-0.6b.onnx`) diverge from the HuggingFace
@@ -586,7 +589,7 @@ pub fn iter_model_files() -> impl Iterator<Item = &'static ModelFile> {
 ///
 /// The returned path is the canonicalized directory containing the model file,
 /// or `None` if no bundled model is found.
-pub fn find_bundled_models() -> Option<PathBuf> {
+pub fn find_bundled_models_for_filename(model_filename: &str) -> Option<PathBuf> {
     // Canonicalize current_exe so symlinks in the binary path are resolved.
     // This is important for npm installs and dev workspaces.
     let exe = std::env::current_exe().ok()?;
@@ -601,7 +604,7 @@ pub fn find_bundled_models() -> Option<PathBuf> {
             // file may be a symlink itself (release bundle), so we resolve it
             // before checking existence. canonicalize follows all symlinks in
             // the path and the final component.
-            let model_candidate = dir.join(MODEL_ONNX_FILENAME);
+            let model_candidate = dir.join(model_filename);
             if model_candidate.exists() {
                 // Canonicalize the directory so callers get the real path.
                 // This ensures copy_bundled_models creates symlinks pointing
@@ -611,6 +614,10 @@ pub fn find_bundled_models() -> Option<PathBuf> {
         }
     }
     None
+}
+
+pub fn find_bundled_models() -> Option<PathBuf> {
+    find_bundled_models_for_filename(MODEL_ONNX_FILENAME)
 }
 
 #[cfg(test)]

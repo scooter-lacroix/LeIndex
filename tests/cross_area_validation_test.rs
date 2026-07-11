@@ -118,16 +118,19 @@ mod no_ort_fallback_notice {
         );
     }
 
-    /// VAL-CROSS-007: the worker stderr is inherited by the parent process so
-    /// the no-ORT notice is visible to the user running `leindex search`
-    /// (not swallowed). The discovery chain error reaches the user's terminal
-    /// once per worker spawn.
+    /// VAL-CROSS-007: worker stderr remains operator-visible. Direct pipe
+    /// workers mirror stderr to the parent; resident daemon workers keep a
+    /// durable stderr log and surface its tail on startup failure. Daemons must
+    /// not inherit the short-lived parent fd because later writes to a closed
+    /// stderr pipe can kill the warm worker.
     #[test]
     fn worker_inherits_stderr_so_notice_reaches_user() {
         let src = read_file("src/search/onnx/client.rs");
         assert!(
-            src.contains("Stdio::inherit()"),
-            "the EmbeddingClient must inherit worker stderr so the no-ORT notice reaches the user"
+            src.contains("spawn_stderr_thread")
+                && src.contains("daemon_stderr")
+                && src.contains("print_daemon_log_tail"),
+            "EmbeddingClient must mirror pipe stderr and surface daemon stderr failures to the user"
         );
     }
 }
@@ -675,8 +678,8 @@ mod per_surface_journeys {
             "VAL-NPM-003: npm wrapper must set env.ORT_DYLIB_PATH before spawning"
         );
         assert!(
-            wrapper.contains("MODELS_DIR"),
-            "VAL-NPM-001: npm wrapper must reference the bundled MODELS_DIR"
+            !wrapper.contains("MODELS_DIR"),
+            "VAL-NPM-001: npm wrapper must leave model provisioning to leindex setup"
         );
         // The npm setup script bridges into `leindex setup` so users can
         // bring up neural search through npm.

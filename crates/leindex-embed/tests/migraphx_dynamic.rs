@@ -189,7 +189,7 @@ fn val_ort_015_migraphx_ep_registers_in_session() {
         Some(p) => p,
         None => {
             eprintln!(
-                "VAL-ORT-015: no qwen3-embed-0.6b.onnx model on disk; \
+                "VAL-ORT-015: no qwen3-embed-0.6b-dynamic.onnx model on disk; \
                  skipping session-build MIGraphX registration check"
             );
             return;
@@ -361,20 +361,20 @@ fn searcher_paths(searched: &[(leindex_embed::DiscoverySource, String)]) -> Vec<
     searched.iter().map(|(_, p)| p.as_str()).collect()
 }
 
-/// Locate the qwen3-embed-0.6b.onnx model used by the worker binary.
+/// Locate the setup-managed dynamic Qwen3 model used by the worker binary.
 /// Returns None if no model file is found.
 fn locate_test_model() -> Option<std::path::PathBuf> {
     use std::path::PathBuf;
 
     // Reuse the worker's ModelResolver for path resolution precedence.
-    match leindex_embed::ModelResolver::resolve("qwen3-embed-0.6b") {
+    match leindex_embed::ModelResolver::resolve("qwen3-embed-0.6b-dynamic") {
         Ok(path) => Some(path),
         Err(_) => {
             // Fallback: look in common source-tree locations for development.
             let candidates: Vec<PathBuf> = [
-                "../models/qwen3-embed-0.6b.onnx",
-                "models/qwen3-embed-0.6b.onnx",
-                "../../models/qwen3-embed-0.6b.onnx",
+                "../models/qwen3-embed-0.6b-dynamic.onnx",
+                "models/qwen3-embed-0.6b-dynamic.onnx",
+                "../../models/qwen3-embed-0.6b-dynamic.onnx",
             ]
             .iter()
             .map(PathBuf::from)
