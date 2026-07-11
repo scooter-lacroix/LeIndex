@@ -309,7 +309,7 @@ jobs:
       - name: Build release binaries
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} -p leindex -p leindex-embed --features leindex/onnx,leindex-embed/onnx
+        run: cargo build --release --target ${{ matrix.target }} -p leindex --bins --features leindex/onnx
 
       - name: Strip binaries (Linux/macOS)
         if: runner.os != 'Windows'
@@ -663,6 +663,20 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
+      - name: Wait for leindex-embed registry visibility
+        run: |
+          VERSION=$(grep '^version =' crates/leindex-embed/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          for attempt in $(seq 1 30); do
+            if cargo search leindex-embed 2>/dev/null | grep -q "^leindex-embed = \"${VERSION}\""; then
+              echo "leindex-embed ${VERSION} is visible in the crates.io index"
+              exit 0
+            fi
+            echo "Waiting for crates.io index propagation (${attempt}/30)..."
+            sleep 10
+          done
+          echo "::error::leindex-embed ${VERSION} was not visible after 5 minutes"
+          exit 1
+
       - name: Publish leindex to crates.io
         run: |
           VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
@@ -693,13 +707,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check NPM_TOKEN availability
+        id: check_token
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::NPM_TOKEN not set - skipping npm publish"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Setup Node.js
+        if: steps.check_token.outputs.available == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
       - name: Verify version parity
+        if: steps.check_token.outputs.available == 'true'
         run: |
           CARGO_VERSION=$(grep '^version =' ../../Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
           NPM_VERSION=$(node -p "require('./package.json').version")
@@ -710,6 +738,7 @@ jobs:
           echo "Versions match: v${CARGO_VERSION}"
 
       - name: Publish to npm
+        if: steps.check_token.outputs.available == 'true'
         run: |
           PKG_NAME=$(node -p "require('./package.json').name")
           PKG_VER=$(node -p "require('./package.json').version")

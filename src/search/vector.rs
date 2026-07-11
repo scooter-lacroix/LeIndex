@@ -302,7 +302,7 @@ impl Default for VectorIndex {
 // ============================================================================
 
 /// Magic bytes identifying a LeIndex embedding file: "LIEE"
-const MMAP_MAGIC: [u8; 4] = [b'L', b'I', b'E', b'E'];
+const MMAP_MAGIC: [u8; 4] = *b"LIEE";
 
 /// Current on-disk format version.
 const MMAP_VERSION: u32 = 1;
