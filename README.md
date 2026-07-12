@@ -103,6 +103,7 @@ without setup.
 
 ```bash
 cargo install leindex
+cargo install leindex --features onnx --force (to ensure appropriate onnx runtime is installed)
 leindex setup
 ```
 
