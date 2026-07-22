@@ -3,7 +3,9 @@ use super::helpers::{
     node_type_str, read_source_snippet, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
+use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
+use crate::storage::{CatalogReader, CatalogSymbol};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -73,6 +75,32 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
         let token_budget = extract_usize(&args, "token_budget", 8000)?;
 
         let project_path = args.get("project_path").and_then(|v| v.as_str());
+        if let Some(project_path) = project_path {
+            let live = LiveProject::resolve(project_path).map_err(|e| {
+                JsonRpcError::invalid_params(format!(
+                    "Cannot resolve project_path '{}': {}",
+                    project_path, e
+                ))
+            })?;
+            let canonical_file = file_path_hint
+                .as_deref()
+                .map(|path| live.file(path))
+                .transpose()
+                .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
+            let db_path = live.storage().join("leindex.db");
+            if db_path.is_file() {
+                if let Ok(Some(catalog)) = CatalogReader::open(&db_path, live.root()).await {
+                    if let Ok(symbols) = catalog
+                        .find_symbol(&symbol, canonical_file.as_deref())
+                        .await
+                    {
+                        if let Some(node) = symbols.into_iter().next() {
+                            return catalog_symbol_response(node, token_budget);
+                        }
+                    }
+                }
+            }
+        }
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
@@ -261,6 +289,64 @@ functions, methods, classes, or types. Set include_dependencies=true for full si
             &guard,
         ))
     }
+}
+
+fn catalog_symbol_response(
+    node: CatalogSymbol,
+    token_budget: usize,
+) -> Result<Value, JsonRpcError> {
+    let bytes = std::fs::read(&node.file_path).map_err(|e| {
+        JsonRpcError::invalid_params(format!(
+            "Cannot read source '{}': {}",
+            node.file_path.display(),
+            e
+        ))
+    })?;
+    let (start, end) = node.byte_range;
+    if start > end || end > bytes.len() {
+        return Err(JsonRpcError::invalid_params(format!(
+            "Indexed byte range for '{}' is outside the live source file",
+            node.symbol_name
+        )));
+    }
+    let content = String::from_utf8_lossy(&bytes);
+    let source: String = String::from_utf8_lossy(&bytes[start..end])
+        .chars()
+        .take(token_budget * 4)
+        .collect();
+    let (line_start, line_end) = byte_range_to_line_range(&content, node.byte_range);
+    let doc_comment = content[..start]
+        .lines()
+        .rev()
+        .take_while(|line| line.trim().is_empty() || line.trim_start().starts_with("///"))
+        .filter(|line| line.trim_start().starts_with("///"))
+        .collect::<Vec<_>>();
+    let doc_comment = if doc_comment.is_empty() {
+        None
+    } else {
+        Some(doc_comment.into_iter().rev().collect::<Vec<_>>().join("\n"))
+    };
+    Ok(serde_json::json!({
+        "symbol": node.symbol_name,
+        "qualified_name": node.qualified_name,
+        "node_id": node.node_id,
+        "type": node.node_type,
+        "file": node.file_path,
+        "language": node.language,
+        "complexity": node.complexity,
+        "line_start": line_start,
+        "line_end": line_end,
+        "doc_comment": doc_comment,
+        "source": source,
+        "source_truncated": end - start > token_budget * 4,
+        "_source_char_budget": token_budget * 4,
+        "callers": [],
+        "callees": [],
+        "dependencies": [],
+        "symbol_index_miss": false,
+        "source_freshness": "live",
+        "pdg_status": "not_loaded"
+    }))
 }
 
 #[cfg(test)]

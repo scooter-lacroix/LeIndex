@@ -331,6 +331,14 @@ CREATE TABLE IF NOT EXISTS project_metadata (
             "CREATE INDEX IF NOT EXISTS idx_nodes_hash ON intel_nodes(content_hash)",
             [],
         )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_nodes_project_file_name ON intel_nodes(project_id, file_path, symbol_name COLLATE NOCASE)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_nodes_project_qualified ON intel_nodes(project_id, qualified_name COLLATE NOCASE)",
+            [],
+        )?;
 
         // Create indexes for global_symbols (Phase 7)
         self.conn.execute(
@@ -436,7 +444,7 @@ CREATE TABLE IF NOT EXISTS project_metadata (
     }
 
     /// Current schema version. Increment when adding migrations.
-    const SCHEMA_VERSION: u32 = 2;
+    pub const SCHEMA_VERSION: u32 = 3;
 
     /// Run database migrations based on the stored schema version.
     /// Creates the version tracking table if it doesn't exist.
@@ -473,6 +481,9 @@ CREATE TABLE IF NOT EXISTS project_metadata (
         // Migration v1 to v2: Add last_indexed column to project_metadata
         if current < 2 {
             self.migrate_v1_to_v2()?;
+        }
+        if current < 3 {
+            self.migrate_v2_to_v3()?;
         }
 
         // Update stored version
@@ -511,6 +522,27 @@ CREATE TABLE IF NOT EXISTS project_metadata (
                 [],
             )?;
         }
+        Ok(())
+    }
+
+    /// Migration from v2 to v3: bounded catalog point-lookup indexes.
+    fn migrate_v2_to_v3(&mut self) -> SqliteResult<()> {
+        let table_exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'intel_nodes')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !table_exists {
+            return Ok(());
+        }
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_nodes_project_file_name ON intel_nodes(project_id, file_path, symbol_name COLLATE NOCASE)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_nodes_project_qualified ON intel_nodes(project_id, qualified_name COLLATE NOCASE)",
+            [],
+        )?;
         Ok(())
     }
 }

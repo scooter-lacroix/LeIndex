@@ -1,6 +1,7 @@
 #![cfg(feature = "cli")]
 
 use leindex::cli::mcp::handlers::all_tool_handlers;
+use leindex::cli::mcp::handlers::ReadSymbolHandler;
 use leindex::cli::mcp::protocol::JsonRpcRequest;
 use leindex::cli::mcp::request_meta::{
     collect_request_timings, current_request_timing_sink, record_hydrate_ms, record_neural_ms,
@@ -9,6 +10,8 @@ use leindex::cli::mcp::request_meta::{
 };
 use leindex::cli::mcp::server::handle_tool_call;
 use leindex::cli::ProjectRegistry;
+use leindex::storage::nodes::NodeType;
+use leindex::storage::{NodeRecord, NodeStore, Storage, UniqueProjectId};
 use serde_json::{json, Value};
 use std::fs;
 use std::process::Command;
@@ -259,4 +262,93 @@ async fn exact_grep_must_not_request_neural_search() {
     assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), 0);
     assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
     assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
+}
+
+fn catalog_fixture() -> (TempDir, std::path::PathBuf) {
+    let temp = TempDir::new().expect("create catalog fixture");
+    let project = temp.path().join("project");
+    let source = project.join("src/lib.rs");
+    fs::create_dir_all(source.parent().unwrap()).expect("create catalog source directory");
+    fs::write(&source, "pub struct Askpass;\n").expect("write catalog source");
+    fs::write(temp.path().join("outside.rs"), "pub struct Outside;\n")
+        .expect("write outside fixture");
+
+    let canonical_project = project.canonicalize().expect("canonical project");
+    let canonical_source = source.canonicalize().expect("canonical source");
+    let storage_dir = project.join(".leindex");
+    fs::create_dir_all(&storage_dir).expect("create catalog storage directory");
+    let db_path = storage_dir.join("leindex.db");
+    let mut storage = Storage::open(&db_path).expect("open catalog storage");
+    let project_id = UniqueProjectId::generate(&canonical_project, &[]);
+    storage
+        .store_project_metadata(&project_id, &canonical_project)
+        .expect("store catalog metadata");
+    NodeStore::new(&mut storage)
+        .insert(&NodeRecord {
+            id: None,
+            project_id: project_id.to_string(),
+            file_path: canonical_source.display().to_string(),
+            node_id: "src/lib.rs:Askpass".to_string(),
+            symbol_name: "Askpass".to_string(),
+            qualified_name: "Askpass".to_string(),
+            language: "rust".to_string(),
+            node_type: NodeType::Class,
+            signature: None,
+            complexity: Some(1),
+            content_hash: "catalog-fixture".to_string(),
+            embedding: None,
+            byte_range_start: Some(0),
+            byte_range_end: Some(19),
+            embedding_format: None,
+        })
+        .expect("store catalog symbol");
+
+    (temp, canonical_project)
+}
+
+#[tokio::test]
+async fn canonical_path_read_symbol_uses_the_same_catalog_key() {
+    let (_temp, project) = catalog_fixture();
+    let registry = Arc::new(ProjectRegistry::new(2));
+    let absolute_path = project.join("src/lib.rs");
+
+    for file_path in [
+        absolute_path.display().to_string(),
+        "src/lib.rs".to_string(),
+        "src/../src/lib.rs".to_string(),
+    ] {
+        let response = ReadSymbolHandler
+            .execute(
+                &registry,
+                json!({
+                    "project_path": project,
+                    "file_path": file_path,
+                    "symbol": "Askpass",
+                }),
+            )
+            .await
+            .expect("catalog read-symbol response");
+        assert_eq!(response["symbol"], "Askpass");
+        assert_eq!(response["symbol_index_miss"], false);
+        assert_eq!(response["source_freshness"], "live");
+        assert_eq!(response["pdg_status"], "not_loaded");
+    }
+}
+
+#[tokio::test]
+async fn canonical_path_read_symbol_rejects_files_outside_the_project() {
+    let (_temp, project) = catalog_fixture();
+    let registry = Arc::new(ProjectRegistry::new(2));
+    let error = ReadSymbolHandler
+        .execute(
+            &registry,
+            json!({
+                "project_path": project,
+                "file_path": "../outside.rs",
+                "symbol": "Outside",
+            }),
+        )
+        .await
+        .expect_err("outside path must be rejected");
+    assert!(error.to_string().contains("outside the project boundary"));
 }

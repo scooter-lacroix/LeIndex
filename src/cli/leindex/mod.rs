@@ -29,6 +29,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
+/// Find existing index storage without creating a directory or opening SQLite.
+pub(crate) fn resolve_existing_storage_path(project_path: &Path) -> Option<PathBuf> {
+    LeIndex::resolve_existing_storage_path(project_path)
+}
+
 /// LeIndex - Main orchestration struct for the entire LeIndex system.
 ///
 /// ```ignore
@@ -80,8 +85,37 @@ impl LeIndex {
                 .unwrap_or(false)
     }
 
+    /// Find an existing storage directory without creating or modifying it.
+    pub(crate) fn resolve_existing_storage_path(project_path: &Path) -> Option<PathBuf> {
+        let path_hash = &blake3::hash(project_path.to_string_lossy().as_bytes()).to_hex()[..12];
+        let dir_name = project_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let in_project = project_path.join(".leindex");
+        let env_path = std::env::var("LEINDEX_HOME")
+            .ok()
+            .map(|home| PathBuf::from(home).join(format!("{}-{}", dir_name, path_hash)));
+        let xdg_dir = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("leindex")
+            .join(format!("{}-{}", dir_name, path_hash));
+        let tmp_path = std::env::temp_dir()
+            .join("leindex")
+            .join(format!("{}-{}", dir_name, path_hash));
+        std::iter::once(in_project)
+            .chain(env_path)
+            .chain([xdg_dir, tmp_path])
+            .find(|candidate| candidate.is_dir())
+    }
+
     /// Resolve the storage directory (in-project → LEINDEX_HOME → XDG → tmp).
     fn resolve_storage_path(project_path: &Path) -> Result<PathBuf> {
+        if let Some(existing) = Self::resolve_existing_storage_path(project_path) {
+            if Self::try_create_dir(&existing) {
+                return Ok(existing);
+            }
+        }
         let path_hash = &blake3::hash(project_path.to_string_lossy().as_bytes()).to_hex()[..12];
         let dir_name = project_path
             .file_name()

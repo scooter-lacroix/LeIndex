@@ -48,11 +48,14 @@ pub(crate) fn validate_file_within_project(
     file_path: &str,
     project_root: &std::path::Path,
 ) -> Result<PathBuf, JsonRpcError> {
-    let canonical = std::path::Path::new(file_path)
-        .canonicalize()
-        .map_err(|e| {
-            JsonRpcError::invalid_params(format!("Cannot resolve file path '{}': {}", file_path, e))
-        })?;
+    let candidate = if std::path::Path::new(file_path).is_absolute() {
+        PathBuf::from(file_path)
+    } else {
+        project_root.join(file_path)
+    };
+    let canonical = candidate.canonicalize().map_err(|e| {
+        JsonRpcError::invalid_params(format!("Cannot resolve file path '{}': {}", file_path, e))
+    })?;
     if !canonical.starts_with(project_root) {
         return Err(JsonRpcError::invalid_params(format!(
             "File '{}' is outside the project boundary '{}'",

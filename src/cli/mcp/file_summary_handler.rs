@@ -3,8 +3,11 @@ use super::helpers::{
     read_source_snippet, validate_file_within_project, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
+use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
+use crate::storage::{CatalogReader, CatalogSymbol};
 use serde_json::Value;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Handler for LeIndex [file_summary — structured file analysis replacing Read.
@@ -65,7 +68,7 @@ use LeIndex [Read Symbol]."
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let file_path = extract_string(&args, "file_path")?;
+        let mut file_path = extract_string(&args, "file_path")?;
         let include_source = extract_bool(&args, "include_source", false);
         let focus_symbol = args
             .get("focus_symbol")
@@ -74,6 +77,34 @@ use LeIndex [Read Symbol]."
         let token_budget = extract_usize(&args, "token_budget", 1000)?;
 
         let project_path = args.get("project_path").and_then(|v| v.as_str());
+        if let Some(project_path) = project_path {
+            let live = LiveProject::resolve(project_path).map_err(|e| {
+                JsonRpcError::invalid_params(format!(
+                    "Cannot resolve project_path '{}': {}",
+                    project_path, e
+                ))
+            })?;
+            let canonical_file = live
+                .file(&file_path)
+                .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
+            file_path = canonical_file.display().to_string();
+            let db_path = live.storage().join("leindex.db");
+            if db_path.is_file() {
+                if let Ok(Some(catalog)) = CatalogReader::open(&db_path, live.root()).await {
+                    if let Ok(symbols) = catalog.symbols_in_file(&canonical_file).await {
+                        if !symbols.is_empty() {
+                            return catalog_file_summary_response(
+                                &canonical_file,
+                                symbols,
+                                include_source,
+                                focus_symbol.as_deref(),
+                                token_budget,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
 
@@ -235,6 +266,81 @@ use LeIndex [Read Symbol]."
             &guard,
         ))
     }
+}
+
+fn catalog_file_summary_response(
+    file_path: &Path,
+    symbols: Vec<CatalogSymbol>,
+    include_source: bool,
+    focus_symbol: Option<&str>,
+    token_budget: usize,
+) -> Result<Value, JsonRpcError> {
+    let content = std::fs::read_to_string(file_path).map_err(|e| {
+        JsonRpcError::invalid_params(format!(
+            "Cannot read source '{}': {}",
+            file_path.display(),
+            e
+        ))
+    })?;
+    let mut total_chars = 0usize;
+    let char_budget = token_budget * 4;
+    let mut shown = Vec::new();
+    let mut total = 0usize;
+    for symbol in symbols {
+        if symbol.symbol_name.is_empty()
+            || focus_symbol.is_some_and(|focus| {
+                !symbol
+                    .symbol_name
+                    .to_lowercase()
+                    .contains(&focus.to_lowercase())
+            })
+        {
+            continue;
+        }
+        total += 1;
+        if total_chars >= char_budget {
+            continue;
+        }
+        let mut value = serde_json::json!({
+            "name": symbol.symbol_name,
+            "qualified_name": symbol.qualified_name,
+            "type": symbol.node_type,
+            "byte_range": symbol.byte_range,
+            "complexity": symbol.complexity,
+            "dependencies": [],
+            "dependents": [],
+            "cross_file_refs": []
+        });
+        if include_source {
+            let (start, end) = symbol.byte_range;
+            if start <= end && end <= content.len() {
+                value["source"] = Value::String(content[start..end].chars().take(500).collect());
+            }
+        }
+        total_chars += value.to_string().len();
+        shown.push(value);
+    }
+    let function_count = shown
+        .iter()
+        .filter(|symbol| symbol["type"] == "function")
+        .count();
+    let class_count = shown
+        .iter()
+        .filter(|symbol| symbol["type"] == "class")
+        .count();
+    Ok(serde_json::json!({
+        "file_path": file_path,
+        "language": Path::new(file_path).extension().and_then(|ext| ext.to_str()).unwrap_or("text"),
+        "line_count": content.lines().count(),
+        "symbol_count": total,
+        "symbols_shown": shown.len(),
+        "symbols_truncated": shown.len() < total,
+        "symbols": shown,
+        "module_role": if class_count > function_count { "Class definitions" } else { "Function module" },
+        "symbol_index_miss": false,
+        "source_freshness": "live",
+        "pdg_status": "not_loaded"
+    }))
 }
 
 #[cfg(test)]

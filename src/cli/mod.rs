@@ -93,6 +93,8 @@ pub mod index_cache;
 pub mod index_freshness;
 /// Core orchestration logic for indexing and search.
 pub mod leindex;
+/// Canonical project identity for live, non-hydrating MCP reads.
+pub mod live_project;
 /// Memory management and cache orchestration.
 pub mod memory;
 /// Memory cap enforcement (RSS monitoring and hard limits).
