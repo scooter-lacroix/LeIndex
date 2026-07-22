@@ -1301,6 +1301,54 @@ impl ProgramDependenceGraph {
         self.bfs_directed(start, config, Direction::Forward)
     }
 
+    /// Forward impact from many roots using one visited set.
+    pub fn forward_impact_multi_source(
+        &self,
+        starts: &HashSet<NodeId>,
+        config: &TraversalConfig,
+    ) -> Vec<NodeId> {
+        let mut visited = starts.clone();
+        let mut ordered_starts = starts.iter().copied().collect::<Vec<_>>();
+        ordered_starts.sort_by_key(|id| id.index());
+        let mut queue: VecDeque<(NodeId, usize)> =
+            ordered_starts.into_iter().map(|id| (id, 0)).collect();
+        let mut result = Vec::new();
+
+        while let Some((current, depth)) = queue.pop_front() {
+            if let Some(max_nodes) = config.max_nodes {
+                if result.len() >= max_nodes {
+                    break;
+                }
+            }
+            if !starts.contains(&current)
+                && self
+                    .graph
+                    .node_weight(current)
+                    .is_some_and(|node| config.node_should_collect(node))
+            {
+                result.push(current);
+            }
+            if config.max_depth.is_some_and(|max_depth| depth >= max_depth) {
+                continue;
+            }
+
+            let mut scratch = self.bfs_scratch.lock().unwrap();
+            scratch.clear();
+            scratch.extend(
+                self.graph
+                    .edges(current)
+                    .filter(|edge| config.edge_allowed(edge.weight()))
+                    .map(|edge| edge.target()),
+            );
+            for &neighbor in scratch.iter() {
+                if visited.insert(neighbor) {
+                    queue.push_back((neighbor, depth + 1));
+                }
+            }
+        }
+        result
+    }
+
     /// Backward impact: nodes that can reach `start` following incoming edges.
     pub fn backward_impact(&self, start: NodeId, config: &TraversalConfig) -> Vec<NodeId> {
         self.bfs_directed(start, config, Direction::Backward)

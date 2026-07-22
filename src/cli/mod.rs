@@ -85,6 +85,8 @@ pub mod cli;
 pub mod config;
 /// Error types and error handling logic.
 pub mod errors;
+/// Live Git porcelain-v2 status operations.
+pub mod git;
 /// Indexing pipeline: project parsing, PDG building, search indexing.
 pub mod index_builder;
 /// Cache subsystem: CacheSpiller, project scan, file stats cache.

@@ -284,6 +284,18 @@ async fn exact_grep_must_not_request_neural_search() {
     assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
 }
 
+#[tokio::test]
+async fn git_status_does_not_hydrate_when_no_generation_is_resident() {
+    let fixture = GitFixture::new();
+    let counters = counters_after_call(
+        "leindex.git-status",
+        json!({ "project_path": fixture.project_path() }),
+    )
+    .await;
+
+    assert_eq!(counters, (0, 0, 0));
+}
+
 fn catalog_fixture() -> (TempDir, std::path::PathBuf) {
     let temp = TempDir::new().expect("create catalog fixture");
     let project = temp.path().join("project");

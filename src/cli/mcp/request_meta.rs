@@ -89,6 +89,15 @@ pub fn record_pdg_ms(elapsed_ms: u64) {
     let _ = REQUEST_TIMINGS.try_with(|timings| record_pdg_ms_to(timings, elapsed_ms));
 }
 
+pub fn record_git_ms(elapsed_ms: u64) {
+    let _ = REQUEST_TIMINGS.try_with(|timings| {
+        timings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .git_ms = elapsed_ms;
+    });
+}
+
 pub fn record_neural_ms(elapsed_ms: u64) {
     let _ = REQUEST_TIMINGS.try_with(|timings| record_neural_ms_to(timings, elapsed_ms));
 }
