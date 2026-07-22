@@ -33,6 +33,8 @@ pub mod helpers;
 pub mod output;
 /// MCP protocol definitions and JSON-RPC types.
 pub mod protocol;
+/// Request budgets, timing metadata, and causal-path counters.
+pub mod request_meta;
 
 /// Handler for LeIndex [Context] — PDG-based context expansion.
 pub mod context_handler;

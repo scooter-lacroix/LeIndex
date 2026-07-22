@@ -465,8 +465,17 @@ impl LeIndex {
         let (tx, rx) = std::sync::mpsc::channel();
         let emb_clone = emb.clone();
         let query_owned = query.to_string();
+        let timing_sink = crate::cli::mcp::request_meta::current_request_timing_sink();
         std::thread::spawn(move || {
-            let _ = tx.send(emb_clone.embed_neural_blocking(&query_owned));
+            let neural_started = std::time::Instant::now();
+            let result = emb_clone.embed_neural_blocking(&query_owned);
+            if let Some(timing_sink) = timing_sink {
+                crate::cli::mcp::request_meta::record_neural_ms_to(
+                    &timing_sink,
+                    neural_started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                );
+            }
+            let _ = tx.send(result);
         });
 
         let timeout = query_neural_timeout();

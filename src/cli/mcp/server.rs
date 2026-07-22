@@ -5,6 +5,7 @@
 
 use super::handlers::{all_tool_handlers, ToolHandler};
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use super::request_meta::{collect_request_timings, elapsed_ms};
 use crate::cli::registry::ProjectRegistry;
 use anyhow::Context;
 use axum::{
@@ -807,6 +808,7 @@ fn handle_ping() -> Value {
 
 /// JSON-RPC request handler
 async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    let transport_started = Instant::now();
     // Extract Mcp-Session-Id header (if present)
     let incoming_session_id = headers
         .get("Mcp-Session-Id")
@@ -964,8 +966,11 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
             let _guard = incoming_session_id
                 .as_ref()
                 .map(|sid| McpServer::in_flight_guard(server_instance, sid));
-            let tool_result =
-                tokio::time::timeout(timeout, handle_tool_call(&state, handlers, &json_req)).await;
+            let tool_result = tokio::time::timeout(
+                timeout,
+                handle_tool_call_timed(&state, handlers, &json_req, transport_started),
+            )
+            .await;
             match tool_result {
                 Ok(result) => result,
                 Err(_) => Err(JsonRpcError::internal_error(format!(
@@ -1003,6 +1008,17 @@ pub async fn handle_tool_call(
     handlers: &[ToolHandler],
     req: &JsonRpcRequest,
 ) -> Result<Value, JsonRpcError> {
+    handle_tool_call_timed(registry, handlers, req, Instant::now()).await
+}
+
+/// Handle a tool call with a transport timestamp captured at message receipt.
+async fn handle_tool_call_timed(
+    registry: &Arc<ProjectRegistry>,
+    handlers: &[ToolHandler],
+    req: &JsonRpcRequest,
+    transport_started: Instant,
+) -> Result<Value, JsonRpcError> {
+    let handler_started = Instant::now();
     let tool_call = req.extract_tool_call()?;
     debug!("Tool call: name={}", tool_call.name);
 
@@ -1017,7 +1033,24 @@ pub async fn handle_tool_call(
     let call_name = tool_call.name.clone();
 
     // Execute the tool and wrap the result in standard MCP content format
-    match handler.execute(registry, tool_call.arguments).await {
+    let (handler_result, mut timings) =
+        collect_request_timings(handler.execute(registry, tool_call.arguments)).await;
+    let handler_ms = elapsed_ms(handler_started);
+    timings.handler_ms = handler_ms;
+    timings.transport_queue_ms = handler_started
+        .saturating_duration_since(transport_started)
+        .as_millis()
+        .min(u64::MAX as u128) as u64;
+    timings.total_ms = elapsed_ms(transport_started);
+    debug!(
+        tool = %call_name,
+        handler_ms,
+        transport_queue_ms = timings.transport_queue_ms,
+        total_ms = timings.total_ms,
+        "MCP tool call complete"
+    );
+
+    match handler_result {
         Ok(value) => {
             // The MCP transport is what the LLM actually sees. Run the
             // tool's raw value through the per-tool payload trimmer so we
@@ -1045,7 +1078,8 @@ pub async fn handle_tool_call(
                         "text": payload
                     }
                 ],
-                "isError": false
+                "isError": false,
+                "_meta": { "timings": timings }
             }))
         }
         Err(e) => {
@@ -1058,7 +1092,8 @@ pub async fn handle_tool_call(
                         "text": format!("Error: {}", e)
                     }
                 ],
-                "isError": true
+                "isError": true,
+                "_meta": { "timings": timings }
             }))
         }
     }
@@ -1435,8 +1470,9 @@ async fn handle_socket_message(
     handshake_complete: &Arc<AtomicBool>,
 ) -> Option<String> {
     use super::protocol::{JsonRpcMessage, JsonRpcResponse};
-    use crate::cli::mcp::server::{handle_tool_call, list_tools_json, HANDLERS, SERVER_STATE};
+    use crate::cli::mcp::server::{list_tools_json, HANDLERS, SERVER_STATE};
 
+    let transport_started = Instant::now();
     let message = match JsonRpcMessage::from_json(json_payload) {
         Ok(m) => m,
         Err(e) => {
@@ -1528,7 +1564,8 @@ async fn handle_socket_message(
                 }
                 "ping" => JsonRpcResponse::success(request_id, serde_json::json!({})),
                 "tools/call" => {
-                    let result = handle_tool_call(state, handlers, &request).await;
+                    let result =
+                        handle_tool_call_timed(state, handlers, &request, transport_started).await;
                     JsonRpcResponse::from_result(request_id, result)
                 }
                 "tools/list" => JsonRpcResponse::success(request_id, list_tools_json(handlers)),

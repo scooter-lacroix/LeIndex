@@ -505,7 +505,19 @@ impl ProjectRegistry {
         })?;
         // Load from storage to populate search_engine (is_indexed() depends on it).
         // PDG remains in memory; ensure_pdg_loaded() is a no-op after this.
-        if let Err(e) = leindex.load_from_storage() {
+        let hydration_started = std::time::Instant::now();
+        let hydration_result = leindex.load_from_storage();
+        let hydrate_ms = hydration_started
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        tracing::debug!(
+            project = %canonical.display(),
+            hydrate_ms,
+            "MCP project hydration attempt complete"
+        );
+        crate::cli::mcp::request_meta::record_hydrate_ms(hydrate_ms);
+        if let Err(e) = hydration_result {
             warn!(
                 "Failed to load project from storage for {}: {}. \
                  The project will be auto-indexed on first tool call.",

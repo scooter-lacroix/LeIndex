@@ -405,6 +405,12 @@ name = "text_search_bench"
 path = "benches/text_search_bench.rs"
 harness = false
 
+[[bench]]
+name = "mcp_tool_latency"
+path = "benches/mcp_tool_latency.rs"
+harness = false
+required-features = ["cli"]
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

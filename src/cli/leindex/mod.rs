@@ -467,7 +467,18 @@ impl LeIndex {
             let has_content =
                 crate::storage::pdg_store::has_indexed_files(&self.storage, &self.project_id);
             if has_content {
-                self.load_from_storage()?;
+                crate::cli::mcp::request_meta::PDG_LOADS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let pdg_load_started = std::time::Instant::now();
+                let result = self.load_from_storage();
+                let pdg_ms = pdg_load_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                tracing::debug!(
+                    project = %self.project_path.display(),
+                    pdg_ms,
+                    "PDG load attempt complete"
+                );
+                crate::cli::mcp::request_meta::record_pdg_ms(pdg_ms);
+                result?;
             }
         }
         Ok(())

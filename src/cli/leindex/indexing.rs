@@ -903,6 +903,8 @@ impl LeIndex {
     }
 
     fn load_from_storage_inner(&mut self, pdg_only: bool) -> Result<()> {
+        crate::cli::mcp::request_meta::PROJECT_HYDRATIONS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         info!(
             "Loading project from storage: {} (pdg_only={})",
             self.project_id, pdg_only

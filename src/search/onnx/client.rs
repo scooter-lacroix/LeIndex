@@ -1114,42 +1114,55 @@ impl EmbeddingClient {
         texts: &[String],
         expected_dim: usize,
     ) -> Result<EmbedResponse, ClientError> {
-        self.ensure_worker()?;
+        crate::cli::mcp::request_meta::NEURAL_REQUESTS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let neural_started = Instant::now();
+        let result = (|| {
+            self.ensure_worker()?;
 
-        let request = EmbedRequest {
-            texts: texts.to_vec(),
-            expected_dim,
-        };
+            let request = EmbedRequest {
+                texts: texts.to_vec(),
+                expected_dim,
+            };
 
-        let frame = protocol::embed_request_frame(batch_id, request)
-            .map_err(|e| ClientError::Ipc(e.to_string()))?;
+            let frame = protocol::embed_request_frame(batch_id, request)
+                .map_err(|e| ClientError::Ipc(e.to_string()))?;
 
-        let response_frame = self.send_and_receive(frame)?;
+            let response_frame = self.send_and_receive(frame)?;
 
-        match response_frame.header.msg_type {
-            MsgType::EmbedResponse => {
-                let response: Response = response_frame
-                    .decode_payload()
-                    .map_err(|e| ClientError::Ipc(e.to_string()))?;
-                match response {
-                    Response::Embed(embed_resp) => Ok(embed_resp),
-                    _ => Err(ClientError::Protocol("expected Embed response".to_string())),
+            match response_frame.header.msg_type {
+                MsgType::EmbedResponse => {
+                    let response: Response = response_frame
+                        .decode_payload()
+                        .map_err(|e| ClientError::Ipc(e.to_string()))?;
+                    match response {
+                        Response::Embed(embed_resp) => Ok(embed_resp),
+                        _ => Err(ClientError::Protocol("expected Embed response".to_string())),
+                    }
                 }
-            }
-            MsgType::Error => {
-                let response: Response = response_frame
-                    .decode_payload()
-                    .map_err(|e| ClientError::Ipc(e.to_string()))?;
-                match response {
-                    Response::Error(err) => Err(ClientError::Worker(err)),
-                    _ => Err(ClientError::Protocol("expected Error response".to_string())),
+                MsgType::Error => {
+                    let response: Response = response_frame
+                        .decode_payload()
+                        .map_err(|e| ClientError::Ipc(e.to_string()))?;
+                    match response {
+                        Response::Error(err) => Err(ClientError::Worker(err)),
+                        _ => Err(ClientError::Protocol("expected Error response".to_string())),
+                    }
                 }
+                other => Err(ClientError::Protocol(format!(
+                    "unexpected response type: {:?}",
+                    other
+                ))),
             }
-            other => Err(ClientError::Protocol(format!(
-                "unexpected response type: {:?}",
-                other
-            ))),
-        }
+        })();
+        let neural_ms = neural_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        tracing::debug!(
+            batch_id = %batch_id,
+            neural_ms,
+            "ONNX embedding attempt complete"
+        );
+        crate::cli::mcp::request_meta::record_neural_ms(neural_ms);
+        result
     }
 
     /// Send an embed request to the worker and return the response.
