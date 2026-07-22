@@ -702,6 +702,16 @@ impl ProjectRegistry {
         *default = Some(path);
     }
 
+    /// Return the configured default path without creating or hydrating a project.
+    pub async fn default_project_path(&self) -> Result<PathBuf, JsonRpcError> {
+        self.resolve_path(None).await
+    }
+
+    /// Return an already-loaded project without creating or hydrating it.
+    pub async fn try_get_loaded(&self, path: &Path) -> Option<ProjectHandle> {
+        self.projects.read().await.get(path).cloned()
+    }
+
     /// Evict the least-recently-used project if we're at or over capacity.
     async fn evict_lru_if_needed(&self) {
         let current_count = self.projects.read().await.len();

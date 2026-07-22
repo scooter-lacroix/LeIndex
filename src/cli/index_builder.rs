@@ -590,6 +590,14 @@ impl HybridEmbedder {
         }
     }
 
+    /// Whether neural inference is already ready for a query.
+    ///
+    /// Task 7 will replace this conservative gate with the worker readiness
+    /// handshake. Until then, searches never spawn a model on their hot path.
+    pub fn neural_ready(&self) -> bool {
+        false
+    }
+
     /// Get the neural weight for scoring
     pub fn neural_weight(&self) -> f32 {
         match self {

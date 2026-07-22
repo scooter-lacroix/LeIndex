@@ -11,6 +11,8 @@ pub mod hnsw;
 pub mod quantization;
 /// Query parsing and intent detection.
 pub mod query;
+/// Deterministic routing before search state is hydrated.
+pub mod query_route;
 /// Hybrid ranking and scoring algorithms.
 pub mod ranking;
 /// Unified search engine combining keyword and semantic search.

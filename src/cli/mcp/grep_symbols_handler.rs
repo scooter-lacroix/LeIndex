@@ -3,10 +3,12 @@ use super::helpers::{
     read_source_snippet, resolve_scope, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
+use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
 use crate::graph::pdg::{NodeId, ProgramDependenceGraph};
+use crate::search::query_route::{classify, QueryRoute, RequestedMode};
 use crate::search::ranking::Score;
-use regex::RegexBuilder;
+use crate::storage::{CatalogReader, CatalogSymbol};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -86,6 +88,137 @@ fn build_symbol_entry(pdg: &ProgramDependenceGraph, nid: NodeId, opts: &SymbolEn
     }
 
     entry
+}
+
+fn build_catalog_symbol_entry(symbol: CatalogSymbol, opts: &SymbolEntryOpts) -> Value {
+    let source = if opts.context_lines > 0 || opts.include_source {
+        read_source_snippet(&symbol.file_path.to_string_lossy(), symbol.byte_range)
+    } else {
+        None
+    };
+    let mut entry = serde_json::json!({
+        "name": symbol.symbol_name,
+        "type": symbol.node_type,
+        "file": symbol.file_path,
+        "byte_range": symbol.byte_range,
+        "complexity": symbol.complexity,
+        "caller_count": 0,
+        "dependency_count": 0,
+        "callers": [],
+        "callees": [],
+        "language": symbol.language,
+    });
+    if opts.context_lines > 0 {
+        if let Some(source) = &source {
+            entry["context"] = Value::String(
+                source
+                    .lines()
+                    .take(opts.context_lines)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        }
+    }
+    if opts.include_source {
+        if let Some(source) = source {
+            let truncated: String = source.chars().take(4000).collect();
+            let was_truncated = source.char_indices().nth(4000).is_some();
+            entry["source"] = Value::String(truncated);
+            if was_truncated {
+                entry["source_truncated"] = Value::Bool(true);
+            }
+        }
+    }
+    entry
+}
+
+async fn catalog_exact_response(
+    args: &Value,
+    pattern: &str,
+    project_path: Option<&std::path::Path>,
+    type_filter: &str,
+    token_budget: usize,
+    max_results: usize,
+    offset: usize,
+    context_lines: usize,
+    include_source: bool,
+) -> Result<Option<Value>, JsonRpcError> {
+    let Some(project_path) = project_path else {
+        return Ok(None);
+    };
+    let live = LiveProject::resolve(&project_path.to_string_lossy()).map_err(|error| {
+        JsonRpcError::invalid_params(format!(
+            "Cannot resolve project_path '{}': {}",
+            project_path.display(),
+            error
+        ))
+    })?;
+    let db_path = live.storage().join("leindex.db");
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    let Some(catalog) = CatalogReader::open(&db_path, live.root())
+        .await
+        .ok()
+        .flatten()
+    else {
+        return Ok(None);
+    };
+    let scope = resolve_scope(args, live.root())?;
+    let pattern_lower = pattern.to_lowercase();
+    let mut symbols = catalog
+        .find_symbols_matching(pattern)
+        .await
+        .unwrap_or_default();
+    symbols.retain(|symbol| {
+        let in_scope = scope.as_ref().map_or(true, |scope| {
+            symbol.file_path.starts_with(scope)
+                || symbol.file_path
+                    == std::path::Path::new(scope.trim_end_matches(std::path::MAIN_SEPARATOR))
+        });
+        let type_matches = type_filter == "all" || symbol.node_type == type_filter;
+        let name_matches = symbol.symbol_name.to_lowercase().contains(&pattern_lower)
+            || symbol
+                .qualified_name
+                .to_lowercase()
+                .contains(&pattern_lower);
+        in_scope && type_matches && name_matches
+    });
+
+    if symbols.is_empty() {
+        return Ok(None);
+    }
+
+    let total_matches = symbols.len();
+    let char_budget = token_budget * 4;
+    let mut results = Vec::new();
+    let mut used_chars = 0;
+    for symbol in symbols.into_iter().skip(offset).take(max_results) {
+        let entry = build_catalog_symbol_entry(
+            symbol,
+            &SymbolEntryOpts {
+                context_lines,
+                include_source,
+                score: None,
+            },
+        );
+        let entry_chars = entry.to_string().len();
+        if used_chars + entry_chars > char_budget {
+            break;
+        }
+        used_chars += entry_chars;
+        results.push(entry);
+    }
+    let shown = results.len();
+    Ok(Some(serde_json::json!({
+        "results": results,
+        "total_matches": total_matches,
+        "shown": shown,
+        "offset": offset,
+        "mode": "exact",
+        "truncated": total_matches.saturating_sub(offset).min(max_results) > shown,
+        "pdg_status": "not_loaded",
+    })))
 }
 
 /// Handler for LeIndex [grep_symbols — structurally-aware symbol search.
@@ -194,18 +327,50 @@ impl GrepSymbolsHandler {
             .to_owned();
         let project_path = args.get("project_path").and_then(|v| v.as_str());
 
+        let requested_mode = match mode.as_str() {
+            "auto" => RequestedMode::Auto,
+            "semantic" => RequestedMode::Semantic,
+            "deep" => RequestedMode::Deep,
+            _ => RequestedMode::Exact,
+        };
+        let route = classify(&pattern, requested_mode);
+        if route == QueryRoute::DeepPdg {
+            return Err(JsonRpcError::invalid_params(
+                "deep mode is available through deep-analyze or context, not grep-symbols",
+            ));
+        }
+
+        if matches!(route, QueryRoute::ExactSymbol | QueryRoute::ExactText) {
+            let default_project_path = if project_path.is_none() {
+                registry.default_project_path().await.ok()
+            } else {
+                None
+            };
+            let catalog_project_path = project_path
+                .map(std::path::Path::new)
+                .or(default_project_path.as_deref());
+            if let Some(response) = catalog_exact_response(
+                &args,
+                &pattern,
+                catalog_project_path,
+                &type_filter,
+                token_budget,
+                max_results,
+                offset,
+                context_lines,
+                include_source,
+            )
+            .await?
+            {
+                return Ok(response);
+            }
+        }
+
         let handle = registry.get_or_create(project_path).await?;
         let mut index = handle.write().await;
         let scope = resolve_scope(&args, index.project_path())?;
 
         const MAX_CANDIDATE_LIMIT: usize = 1000;
-        let effective_fetch = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
-        let mut candidate_limit = effective_fetch
-            .saturating_mul(5)
-            .clamp(50, MAX_CANDIDATE_LIMIT);
-        let mut candidate_results = index
-            .search(&pattern, candidate_limit, None)
-            .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
         index
             .ensure_pdg_loaded()
@@ -240,7 +405,14 @@ impl GrepSymbolsHandler {
             .as_ref()
             .map(|s| s.trim_end_matches(std::path::MAIN_SEPARATOR).to_string());
 
-        if mode == "semantic" {
+        if route == QueryRoute::Semantic {
+            let effective_fetch = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
+            let mut candidate_limit = effective_fetch
+                .saturating_mul(5)
+                .clamp(50, MAX_CANDIDATE_LIMIT);
+            let mut candidate_results = index
+                .search(&pattern, candidate_limit, None)
+                .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
             'semantic_retry: for _attempt in 0..2 {
                 all_matches.clear();
                 seen_ids.clear();
@@ -339,52 +511,58 @@ impl GrepSymbolsHandler {
 
         let pdg = index.pdg().unwrap();
 
-        for sr in candidate_results {
+        let mut candidates = pdg
+            .node_indices()
+            .filter_map(|nid| {
+                let node = pdg.get_node(nid)?;
+                if (matches!(node.node_type, crate::graph::pdg::NodeType::External)
+                    && type_filter != "external")
+                    || (type_filter != "all"
+                        && node_type_str(&node.node_type) != type_filter.as_str())
+                    || scope.as_ref().is_some_and(|scope| {
+                        !node.file_path.starts_with(scope.as_str())
+                            && node.file_path.as_ref()
+                                != scope.trim_end_matches(std::path::MAIN_SEPARATOR)
+                    })
+                {
+                    return None;
+                }
+                let rank = if node.id == pattern {
+                    0
+                } else if node.name == pattern {
+                    1
+                } else if node.id.eq_ignore_ascii_case(&pattern) {
+                    2
+                } else if node.name.to_lowercase().contains(&pattern_lower)
+                    || node.id.to_lowercase().contains(&pattern_lower)
+                {
+                    3
+                } else {
+                    return None;
+                };
+                Some((rank, node.id.clone(), nid))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+
+        for (_, _, nid) in candidates {
             if all_matches.len() >= fetch_limit {
                 break;
             }
-
-            let Some(nid) = pdg.find_by_id(&sr.node_id) else {
+            let Some(node) = pdg.get_node(nid) else {
                 continue;
             };
-            let node = match pdg.get_node(nid) {
-                Some(n) => n,
-                None => continue,
-            };
-
-            if matches!(node.node_type, crate::graph::pdg::NodeType::External)
-                && type_filter != "external"
-            {
-                continue;
-            }
-
-            if type_filter != "all" && node_type_str(&node.node_type) != type_filter.as_str() {
-                continue;
-            }
-
-            if let Some(ref s) = scope {
-                if !node.file_path.starts_with(s.as_str())
-                    && node.file_path.as_ref() != s.trim_end_matches(std::path::MAIN_SEPARATOR)
-                {
-                    continue;
-                }
-            }
-
-            let matches = node.name.to_lowercase().contains(&pattern_lower)
-                || node.id.to_lowercase().contains(&pattern_lower);
-
             let location_key = (node.file_path.clone(), node.byte_range);
             let is_duplicate_location =
                 node.byte_range != (0, 0) && seen_locations.contains(&location_key);
-            if !matches || seen_ids.contains(&node.id) || is_duplicate_location {
+            if seen_ids.contains(&node.id) || is_duplicate_location {
                 continue;
             }
             seen_ids.insert(node.id.clone());
             if node.byte_range != (0, 0) {
                 seen_locations.insert(location_key);
             }
-
-            let entry = build_symbol_entry(
+            all_matches.push(build_symbol_entry(
                 pdg,
                 nid,
                 &SymbolEntryOpts {
@@ -392,72 +570,7 @@ impl GrepSymbolsHandler {
                     include_source,
                     score: None,
                 },
-            );
-            all_matches.push(entry);
-        }
-
-        if all_matches.len() < fetch_limit {
-            let re = RegexBuilder::new(&pattern)
-                .case_insensitive(true)
-                .build()
-                .ok();
-
-            for nid in pdg.node_indices() {
-                if all_matches.len() >= fetch_limit {
-                    break;
-                }
-
-                let Some(node) = pdg.get_node(nid) else {
-                    continue;
-                };
-
-                if matches!(node.node_type, crate::graph::pdg::NodeType::External)
-                    && type_filter != "external"
-                {
-                    continue;
-                }
-
-                if type_filter != "all" && node_type_str(&node.node_type) != type_filter.as_str() {
-                    continue;
-                }
-
-                if let Some(ref s) = scope {
-                    if !node.file_path.starts_with(s.as_str())
-                        && node.file_path.as_ref() != s.trim_end_matches(std::path::MAIN_SEPARATOR)
-                    {
-                        continue;
-                    }
-                }
-
-                let matches = if let Some(ref re) = re {
-                    re.is_match(&node.name) || re.is_match(&node.id)
-                } else {
-                    node.name.to_lowercase().contains(&pattern_lower)
-                        || node.id.to_lowercase().contains(&pattern_lower)
-                };
-
-                let location_key = (node.file_path.clone(), node.byte_range);
-                let is_duplicate_location =
-                    node.byte_range != (0, 0) && seen_locations.contains(&location_key);
-                if !matches || seen_ids.contains(&node.id) || is_duplicate_location {
-                    continue;
-                }
-                seen_ids.insert(node.id.clone());
-                if node.byte_range != (0, 0) {
-                    seen_locations.insert(location_key);
-                }
-
-                let entry = build_symbol_entry(
-                    pdg,
-                    nid,
-                    &SymbolEntryOpts {
-                        context_lines,
-                        include_source,
-                        score: None,
-                    },
-                );
-                all_matches.push(entry);
-            }
+            ));
         }
 
         let total_matches = all_matches.len();
