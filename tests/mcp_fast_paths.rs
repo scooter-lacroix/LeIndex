@@ -1,7 +1,7 @@
 #![cfg(feature = "cli")]
 
 use leindex::cli::mcp::handlers::all_tool_handlers;
-use leindex::cli::mcp::handlers::ReadSymbolHandler;
+use leindex::cli::mcp::handlers::{GrepSymbolsHandler, ReadSymbolHandler};
 use leindex::cli::mcp::protocol::JsonRpcRequest;
 use leindex::cli::mcp::request_meta::{
     collect_request_timings, current_request_timing_sink, record_hydrate_ms, record_neural_ms,
@@ -10,6 +10,7 @@ use leindex::cli::mcp::request_meta::{
 };
 use leindex::cli::mcp::server::handle_tool_call;
 use leindex::cli::ProjectRegistry;
+use leindex::search::query_route::{classify, QueryRoute, RequestedMode};
 use leindex::storage::nodes::NodeType;
 use leindex::storage::{NodeRecord, NodeStore, Storage, UniqueProjectId};
 use serde_json::{json, Value};
@@ -172,6 +173,30 @@ fn path_metadata_primitives_are_deterministic() {
     assert_eq!(metadata["neural_ms"], json!(0));
 }
 
+#[test]
+fn exact_route_classifier_is_deterministic() {
+    assert_eq!(
+        classify("Askpass::new", RequestedMode::Auto),
+        QueryRoute::ExactSymbol
+    );
+    assert_eq!(
+        classify("run_installation", RequestedMode::Auto),
+        QueryRoute::ExactSymbol
+    );
+    assert_eq!(
+        classify("registry_record", RequestedMode::Exact),
+        QueryRoute::ExactText
+    );
+    assert_eq!(
+        classify("how are sudo credentials propagated", RequestedMode::Auto),
+        QueryRoute::Semantic
+    );
+    assert_eq!(
+        classify("sudo credential flow", RequestedMode::Deep),
+        QueryRoute::DeepPdg
+    );
+}
+
 #[tokio::test]
 async fn request_timing_collector_keeps_causal_phase_measurements() {
     let (_, timings) = collect_request_timings(async {
@@ -236,21 +261,16 @@ async fn live_fast_paths_must_not_hydrate_or_load_search_dependencies() {
 }
 
 #[tokio::test]
-// Task 2/3 unblock: route exact grep before search setup and supply an indexed no-neural fixture.
-#[ignore = "requires Task 2/3 unblock"]
 async fn exact_grep_must_not_request_neural_search() {
-    let fixture = GitFixture::new();
-    let project_path = fixture.project_path();
-    let mut index = leindex::cli::leindex::LeIndex::new(fixture.temp.path()).expect("create index");
-    index.index_project(true).expect("index exact-grep fixture");
-    let registry = Arc::new(ProjectRegistry::with_initial_project(2, index));
+    let (_temp, project_path) = catalog_fixture();
+    let registry = Arc::new(ProjectRegistry::new(2));
 
     reset_path_counters();
     let request = tool_request(
         "leindex.grep-symbols",
         json!({
             "project_path": project_path,
-            "pattern": "fast_path_marker",
+            "pattern": "Askpass",
             "mode": "exact",
         }),
     );
@@ -279,14 +299,15 @@ fn catalog_fixture() -> (TempDir, std::path::PathBuf) {
     fs::create_dir_all(&storage_dir).expect("create catalog storage directory");
     let db_path = storage_dir.join("leindex.db");
     let mut storage = Storage::open(&db_path).expect("open catalog storage");
-    let project_id = UniqueProjectId::generate(&canonical_project, &[]);
+    let metadata_id = UniqueProjectId::generate(&canonical_project, &[]);
     storage
-        .store_project_metadata(&project_id, &canonical_project)
+        .store_project_metadata(&metadata_id, &canonical_project)
         .expect("store catalog metadata");
+    let project_id = "project".to_string();
     NodeStore::new(&mut storage)
         .insert(&NodeRecord {
             id: None,
-            project_id: project_id.to_string(),
+            project_id: project_id.clone(),
             file_path: canonical_source.display().to_string(),
             node_id: "src/lib.rs:Askpass".to_string(),
             symbol_name: "Askpass".to_string(),
@@ -302,6 +323,17 @@ fn catalog_fixture() -> (TempDir, std::path::PathBuf) {
             embedding_format: None,
         })
         .expect("store catalog symbol");
+    storage
+        .conn()
+        .execute(
+            "INSERT INTO indexed_files (file_path, project_id, file_hash, last_indexed) VALUES (?1, ?2, ?3, 0)",
+            rusqlite::params![
+                canonical_source.display().to_string(),
+                project_id,
+                blake3::hash(&fs::read(&canonical_source).expect("read fixture source")).to_hex().to_string(),
+            ],
+        )
+        .expect("store catalog file hash");
 
     (temp, canonical_project)
 }
@@ -311,6 +343,7 @@ async fn canonical_path_read_symbol_uses_the_same_catalog_key() {
     let (_temp, project) = catalog_fixture();
     let registry = Arc::new(ProjectRegistry::new(2));
     let absolute_path = project.join("src/lib.rs");
+    reset_path_counters();
 
     for file_path in [
         absolute_path.display().to_string(),
@@ -333,6 +366,35 @@ async fn canonical_path_read_symbol_uses_the_same_catalog_key() {
         assert_eq!(response["source_freshness"], "live");
         assert_eq!(response["pdg_status"], "not_loaded");
     }
+    assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn default_project_exact_catalog_grep_does_not_hydrate() {
+    let (_temp, project) = catalog_fixture();
+    let registry = Arc::new(ProjectRegistry::new(2));
+    registry.set_default_path(project).await;
+    reset_path_counters();
+
+    let response = GrepSymbolsHandler
+        .execute(
+            &registry,
+            json!({
+                "pattern": "Askpass",
+                "mode": "exact",
+                "type_filter": "class",
+                "scope": "src",
+                "max_results": 1,
+                "offset": 0,
+            }),
+        )
+        .await
+        .expect("default project exact catalog grep response");
+
+    assert_eq!(response["results"][0]["name"], "Askpass");
+    assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
+    assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -351,4 +413,82 @@ async fn canonical_path_read_symbol_rejects_files_outside_the_project() {
         .await
         .expect_err("outside path must be rejected");
     assert!(error.to_string().contains("outside the project boundary"));
+}
+
+#[tokio::test]
+async fn catalog_rows_cannot_escape_the_live_project_root() {
+    let (_temp, project) = catalog_fixture();
+    let outside = project.parent().unwrap().join("outside.rs");
+    let db_path = project.join(".leindex/leindex.db");
+    let storage = Storage::open(&db_path).expect("open catalog storage");
+    let project_id: String = storage
+        .conn()
+        .query_row(
+            "SELECT unique_project_id FROM project_metadata",
+            [],
+            |row| row.get(0),
+        )
+        .expect("catalog project id");
+    storage
+        .conn()
+        .execute(
+            "INSERT INTO intel_nodes (project_id, file_path, node_id, symbol_name, qualified_name, language, node_type, content_hash, byte_range_start, byte_range_end, created_at, updated_at) VALUES (?1, ?2, 'outside:Escape', 'Escape', 'Escape', 'rust', 'class', 'outside', 0, 19, 0, 0)",
+            rusqlite::params![project_id, outside.display().to_string()],
+        )
+        .expect("store malicious catalog row");
+
+    let error = ReadSymbolHandler
+        .execute(
+            &Arc::new(ProjectRegistry::new(2)),
+            json!({ "project_path": project, "symbol": "Escape" }),
+        )
+        .await
+        .expect_err("catalog path outside root must be rejected");
+    assert!(error.to_string().contains("outside the project boundary"));
+}
+
+#[tokio::test]
+async fn default_project_catalog_reads_do_not_hydrate() {
+    let (_temp, project) = catalog_fixture();
+    let registry = Arc::new(ProjectRegistry::new(2));
+    registry.set_default_path(project).await;
+    reset_path_counters();
+    let response = ReadSymbolHandler
+        .execute(
+            &registry,
+            json!({ "file_path": "src/lib.rs", "symbol": "Askpass" }),
+        )
+        .await
+        .expect("default project catalog response");
+    assert_eq!(response["symbol"], "Askpass");
+    assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
+    assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn stale_catalog_symbol_uses_live_parser_without_hydration() {
+    let (_temp, project) = catalog_fixture();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub struct Askpass;\npub fn live_marker() {}\n",
+    )
+    .expect("make catalog source stale");
+    reset_path_counters();
+    let response = ReadSymbolHandler
+        .execute(
+            &Arc::new(ProjectRegistry::new(2)),
+            json!({
+                "project_path": project,
+                "file_path": "src/lib.rs",
+                "symbol": "live_marker",
+            }),
+        )
+        .await
+        .expect("live parser response");
+    assert_eq!(response["symbol"], "live_marker");
+    assert_eq!(response["symbol_index_miss"], true);
+    assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
+    assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
 }
