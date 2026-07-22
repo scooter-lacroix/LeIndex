@@ -1,10 +1,13 @@
-use super::helpers::{extract_bool, extract_string, extract_usize};
+use super::helpers::{
+    extract_bool, extract_string, extract_usize, get_direct_callers, node_type_str,
+};
 use super::protocol::JsonRpcError;
 use super::read_symbol_handler::{catalog_is_fresh, parse_live_file, read_live_bytes};
 use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
 use crate::storage::{CatalogReader, CatalogSymbol};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -74,6 +77,8 @@ impl FileSummaryHandler {
                         let catalog_truncated = symbols.len() >= 200;
                         let bytes = read_live_bytes(file.clone()).await?;
                         if catalog_is_fresh(&catalog, &file, &bytes).await {
+                            let (relations, pdg_status) =
+                                resident_file_relations(registry, &live, &symbols).await;
                             return file_summary_response(
                                 &file,
                                 &bytes,
@@ -83,6 +88,8 @@ impl FileSummaryHandler {
                                 token_budget,
                                 false,
                                 catalog_truncated,
+                                &relations,
+                                pdg_status,
                             );
                         }
                     }
@@ -90,6 +97,8 @@ impl FileSummaryHandler {
             }
         }
         let parsed = parse_live_file(file.clone()).await?;
+        let (relations, pdg_status) =
+            resident_file_relations(registry, &live, &parsed.symbols).await;
         file_summary_response(
             &file,
             &parsed.bytes,
@@ -99,6 +108,8 @@ impl FileSummaryHandler {
             token_budget,
             true,
             false,
+            &relations,
+            pdg_status,
         )
     }
 }
@@ -112,6 +123,8 @@ fn file_summary_response(
     token_budget: usize,
     symbol_index_miss: bool,
     catalog_truncated: bool,
+    relations: &HashMap<String, Value>,
+    pdg_status: &'static str,
 ) -> Result<Value, JsonRpcError> {
     let content = std::str::from_utf8(bytes).map_err(|e| {
         JsonRpcError::invalid_params(format!(
@@ -150,15 +163,20 @@ fn file_summary_response(
                 symbol.symbol_name
             )));
         }
+        let relation = relations.get(&symbol.node_id).cloned().unwrap_or_else(|| {
+            serde_json::json!({
+                "dependencies": [], "dependents": [], "cross_file_refs": []
+            })
+        });
         let mut value = serde_json::json!({
             "name": symbol.symbol_name,
             "qualified_name": symbol.qualified_name,
             "type": symbol.node_type,
             "byte_range": symbol.byte_range,
             "complexity": symbol.complexity,
-            "dependencies": [],
-            "dependents": [],
-            "cross_file_refs": []
+            "dependencies": relation["dependencies"],
+            "dependents": relation["dependents"],
+            "cross_file_refs": relation["cross_file_refs"]
         });
         if include_source {
             value["source"] = Value::String(content[start..end].chars().take(500).collect());
@@ -186,8 +204,55 @@ fn file_summary_response(
         "module_role": if class_count > function_count { "Class definitions" } else { "Function module" },
         "symbol_index_miss": symbol_index_miss,
         "source_freshness": "live",
-        "pdg_status": "not_loaded"
+        "pdg_status": pdg_status
     }))
+}
+
+async fn resident_file_relations(
+    registry: &Arc<ProjectRegistry>,
+    live: &LiveProject,
+    symbols: &[CatalogSymbol],
+) -> (HashMap<String, Value>, &'static str) {
+    let Some(handle) = registry.try_get_loaded(live.root()).await else {
+        return (HashMap::new(), "not_loaded");
+    };
+    let guard = handle.read().await;
+    let Some(pdg) = guard.pdg() else {
+        return (HashMap::new(), "not_loaded");
+    };
+    let mut result = HashMap::new();
+    for symbol in symbols {
+        let Some(node_id) = pdg
+            .find_by_symbol(&symbol.node_id)
+            .or_else(|| pdg.find_by_symbol(&symbol.symbol_name))
+        else {
+            continue;
+        };
+        let dependencies: Vec<Value> = pdg.neighbors(node_id).iter().filter_map(|&id| {
+            let node = pdg.get_node(id)?;
+            let file = live.file(&node.file_path).ok()?;
+            Some(serde_json::json!({ "name": node.name, "type": node_type_str(&node.node_type), "file": file }))
+        }).take(50).collect();
+        let dependents: Vec<Value> = get_direct_callers(pdg, node_id).iter().filter_map(|&id| {
+            let node = pdg.get_node(id)?;
+            let file = live.file(&node.file_path).ok()?;
+            Some(serde_json::json!({ "name": node.name, "type": node_type_str(&node.node_type), "file": file }))
+        }).take(50).collect();
+        let cross_file_refs: Vec<Value> = pdg.neighbors(node_id).iter().filter_map(|&id| {
+            let node = pdg.get_node(id)?;
+            let file = live.file(&node.file_path).ok()?;
+            if file != symbol.file_path { Some(serde_json::json!({ "symbol": node.name, "file": file, "relationship": "dependency" })) } else { None }
+        }).take(50).collect();
+        result.insert(
+            symbol.node_id.clone(),
+            serde_json::json!({
+                "dependencies": dependencies,
+                "dependents": dependents,
+                "cross_file_refs": cross_file_refs,
+            }),
+        );
+    }
+    (result, "fresh")
 }
 
 #[cfg(test)]

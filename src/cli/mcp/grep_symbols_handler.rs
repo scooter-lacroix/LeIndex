@@ -3,6 +3,7 @@ use super::helpers::{
     read_source_snippet, resolve_scope, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
+use super::read_symbol_handler::{catalog_is_fresh, parse_live_file, read_live_bytes};
 use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
 use crate::graph::pdg::{NodeId, ProgramDependenceGraph};
@@ -10,6 +11,8 @@ use crate::search::query_route::{classify, QueryRoute, RequestedMode};
 use crate::search::ranking::Score;
 use crate::storage::{CatalogReader, CatalogSymbol};
 use serde_json::Value;
+use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Options for building a symbol entry in grep results.
@@ -90,12 +93,19 @@ fn build_symbol_entry(pdg: &ProgramDependenceGraph, nid: NodeId, opts: &SymbolEn
     entry
 }
 
-fn build_catalog_symbol_entry(symbol: CatalogSymbol, opts: &SymbolEntryOpts) -> Value {
-    let source = if opts.context_lines > 0 || opts.include_source {
-        read_source_snippet(&symbol.file_path.to_string_lossy(), symbol.byte_range)
-    } else {
-        None
-    };
+fn build_catalog_symbol_entry(
+    symbol: CatalogSymbol,
+    opts: &SymbolEntryOpts,
+    content: Option<&str>,
+) -> Value {
+    let source = content.and_then(|content| {
+        let (start, end) = symbol.byte_range;
+        (start <= end
+            && end <= content.len()
+            && content.is_char_boundary(start)
+            && content.is_char_boundary(end))
+        .then(|| &content[start..end])
+    });
     let mut entry = serde_json::json!({
         "name": symbol.symbol_name,
         "type": symbol.node_type,
@@ -154,23 +164,29 @@ async fn catalog_exact_response(
         ))
     })?;
     let db_path = live.storage().join("leindex.db");
-    if !db_path.is_file() {
-        return Ok(None);
-    }
-    let Some(catalog) = CatalogReader::open(&db_path, live.root())
-        .await
-        .ok()
-        .flatten()
-    else {
-        return Ok(None);
+    let catalog = if db_path.is_file() {
+        CatalogReader::open(&db_path, live.root())
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
     };
     let scope = resolve_scope(args, live.root())?;
     let pattern_lower = pattern.to_lowercase();
-    let mut symbols = catalog
-        .find_symbols_matching(pattern)
-        .await
-        .unwrap_or_default();
-    symbols.retain(|symbol| {
+    let symbols = match &catalog {
+        Some(catalog) => catalog
+            .find_symbols_matching(pattern)
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let mut fresh = Vec::new();
+    let mut stale_paths = HashSet::new();
+    for mut symbol in symbols {
+        symbol.file_path = live
+            .file(&symbol.file_path.to_string_lossy())
+            .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
         let in_scope = scope.as_ref().map_or(true, |scope| {
             symbol.file_path.starts_with(scope)
                 || symbol.file_path
@@ -182,18 +198,74 @@ async fn catalog_exact_response(
                 .qualified_name
                 .to_lowercase()
                 .contains(&pattern_lower);
-        in_scope && type_matches && name_matches
-    });
-
-    if symbols.is_empty() {
-        return Ok(None);
+        if !(in_scope && type_matches && name_matches) {
+            continue;
+        }
+        let bytes = read_live_bytes(symbol.file_path.clone()).await?;
+        let is_fresh = match &catalog {
+            Some(catalog) => catalog_is_fresh(catalog, &symbol.file_path, &bytes).await,
+            None => false,
+        };
+        if is_fresh {
+            fresh.push((symbol, bytes));
+        } else {
+            stale_paths.insert(symbol.file_path);
+        }
     }
 
-    let total_matches = symbols.len();
+    // A stale catalog's paths are safe candidates; an empty catalog falls
+    // back to a bounded live scan, never a registry hydration.
+    let paths: Vec<PathBuf> = if stale_paths.is_empty() {
+        if fresh.is_empty() {
+            tokio::task::spawn_blocking({
+                let root = live.root().to_path_buf();
+                move || {
+                    crate::cli::index_builder::scan_project_files(&root)
+                        .map(|scan| scan.source_paths)
+                }
+            })
+            .await
+            .map_err(|e| JsonRpcError::internal_error(format!("live scan task failed: {}", e)))?
+            .map_err(|e| JsonRpcError::invalid_params(format!("Cannot scan live project: {}", e)))?
+        } else {
+            Vec::new()
+        }
+    } else {
+        stale_paths.into_iter().collect()
+    };
+    if !paths.is_empty() {
+        for path in paths.into_iter().take(200) {
+            let parsed = match parse_live_file(path).await {
+                Ok(parsed) => parsed,
+                Err(_) => continue,
+            };
+            let content = match std::str::from_utf8(&parsed.bytes) {
+                Ok(content) => content.to_owned(),
+                Err(_) => continue,
+            };
+            for symbol in parsed.symbols {
+                let in_scope = scope
+                    .as_ref()
+                    .map_or(true, |scope| symbol.file_path.starts_with(scope));
+                let type_matches = type_filter == "all" || symbol.node_type == type_filter;
+                let name_matches = symbol.symbol_name.to_lowercase().contains(&pattern_lower)
+                    || symbol
+                        .qualified_name
+                        .to_lowercase()
+                        .contains(&pattern_lower);
+                if in_scope && type_matches && name_matches {
+                    fresh.push((symbol, content.as_bytes().to_vec()));
+                }
+            }
+        }
+    }
+
+    let total_matches = fresh.len();
     let char_budget = token_budget * 4;
     let mut results = Vec::new();
     let mut used_chars = 0;
-    for symbol in symbols.into_iter().skip(offset).take(max_results) {
+    for (symbol, bytes) in fresh.into_iter().skip(offset).take(max_results) {
+        let content = std::str::from_utf8(&bytes).ok();
         let entry = build_catalog_symbol_entry(
             symbol,
             &SymbolEntryOpts {
@@ -201,6 +273,7 @@ async fn catalog_exact_response(
                 include_source,
                 score: None,
             },
+            content,
         );
         let entry_chars = entry.to_string().len();
         if used_chars + entry_chars > char_budget {
@@ -218,6 +291,7 @@ async fn catalog_exact_response(
         "mode": "exact",
         "truncated": total_matches.saturating_sub(offset).min(max_results) > shown,
         "pdg_status": "not_loaded",
+        "symbol_index_miss": false,
     })))
 }
 

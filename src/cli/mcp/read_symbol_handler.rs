@@ -58,7 +58,7 @@ impl ReadSymbolHandler {
                 e
             ))
         })?;
-        let file = file_hint
+        let mut file = file_hint
             .map(|raw| live.file(raw))
             .transpose()
             .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
@@ -73,18 +73,14 @@ impl ReadSymbolHandler {
                             .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
                         let bytes = read_live_bytes(node.file_path.clone()).await?;
                         if catalog_is_fresh(&catalog, &node.file_path, &bytes).await {
-                            let (dependencies, pdg_status) =
-                                resident_dependencies(registry, &live, &node, include_dependencies)
+                            let relations =
+                                resident_relations(registry, &live, &node, include_dependencies)
                                     .await;
-                            return symbol_response(
-                                node,
-                                bytes,
-                                token_budget,
-                                false,
-                                dependencies,
-                                pdg_status,
-                            );
+                            return symbol_response(node, bytes, token_budget, false, relations);
                         }
+                        // A stale catalog still supplies a vetted in-root source
+                        // candidate; parse it live instead of hydrating a PDG.
+                        file = Some(node.file_path);
                     }
                 }
             }
@@ -106,16 +102,8 @@ impl ReadSymbolHandler {
                     symbol
                 ))
             })?;
-        let (dependencies, pdg_status) =
-            resident_dependencies(registry, &live, &node, include_dependencies).await;
-        symbol_response(
-            node,
-            parsed.bytes,
-            token_budget,
-            true,
-            dependencies,
-            pdg_status,
-        )
+        let relations = resident_relations(registry, &live, &node, include_dependencies).await;
+        symbol_response(node, parsed.bytes, token_budget, true, relations)
     }
 }
 
@@ -124,8 +112,7 @@ fn symbol_response(
     bytes: Vec<u8>,
     token_budget: usize,
     symbol_index_miss: bool,
-    dependencies: Vec<Value>,
-    pdg_status: &'static str,
+    relations: ResidentRelations,
 ) -> Result<Value, JsonRpcError> {
     let (start, end) = node.byte_range;
     let content = std::str::from_utf8(&bytes).map_err(|e| {
@@ -167,12 +154,12 @@ fn symbol_response(
         "source": source,
         "source_truncated": end - start > token_budget * 4,
         "_source_char_budget": token_budget * 4,
-        "callers": [],
-        "callees": [],
-        "dependencies": dependencies,
+        "callers": relations.callers,
+        "callees": relations.callees,
+        "dependencies": relations.dependencies,
         "symbol_index_miss": symbol_index_miss,
         "source_freshness": "live",
-        "pdg_status": pdg_status
+        "pdg_status": relations.pdg_status
     }))
 }
 
@@ -242,29 +229,56 @@ pub(crate) async fn parse_live_file(path: PathBuf) -> Result<LiveParse, JsonRpcE
     .map_err(|e| JsonRpcError::internal_error(format!("live parser task failed: {}", e)))?
 }
 
-async fn resident_dependencies(
+struct ResidentRelations {
+    callers: Vec<Value>,
+    callees: Vec<Value>,
+    dependencies: Vec<Value>,
+    pdg_status: &'static str,
+}
+
+async fn resident_relations(
     registry: &Arc<ProjectRegistry>,
     live: &LiveProject,
     node: &CatalogSymbol,
     include_dependencies: bool,
-) -> (Vec<Value>, &'static str) {
+) -> ResidentRelations {
     if !include_dependencies {
-        return (Vec::new(), "not_loaded");
+        return ResidentRelations {
+            callers: Vec::new(),
+            callees: Vec::new(),
+            dependencies: Vec::new(),
+            pdg_status: "not_loaded",
+        };
     }
     let Some(handle) = registry.try_get_loaded(live.root()).await else {
-        return (Vec::new(), "not_loaded");
+        return ResidentRelations {
+            callers: Vec::new(),
+            callees: Vec::new(),
+            dependencies: Vec::new(),
+            pdg_status: "not_loaded",
+        };
     };
     let guard = handle.read().await;
     let Some(pdg) = guard.pdg() else {
-        return (Vec::new(), "not_loaded");
+        return ResidentRelations {
+            callers: Vec::new(),
+            callees: Vec::new(),
+            dependencies: Vec::new(),
+            pdg_status: "not_loaded",
+        };
     };
     let node_id = pdg
         .find_by_symbol(&node.node_id)
         .or_else(|| pdg.find_by_symbol(&node.symbol_name));
     let Some(node_id) = node_id else {
-        return (Vec::new(), "fresh");
+        return ResidentRelations {
+            callers: Vec::new(),
+            callees: Vec::new(),
+            dependencies: Vec::new(),
+            pdg_status: "fresh",
+        };
     };
-    let dependencies = pdg
+    let callees: Vec<Value> = pdg
         .neighbors(node_id)
         .iter()
         .filter_map(|&id| {
@@ -278,7 +292,25 @@ async fn resident_dependencies(
         })
         .take(20)
         .collect();
-    (dependencies, "fresh")
+    let callers: Vec<Value> = super::helpers::get_direct_callers(pdg, node_id)
+        .iter()
+        .filter_map(|&id| {
+            let caller = pdg.get_node(id)?;
+            let file = live.file(&caller.file_path).ok()?;
+            Some(serde_json::json!({
+                "name": caller.name,
+                "type": super::helpers::node_type_str(&caller.node_type),
+                "file": file,
+            }))
+        })
+        .take(20)
+        .collect();
+    ResidentRelations {
+        dependencies: callees.clone(),
+        callees,
+        callers,
+        pdg_status: "fresh",
+    }
 }
 
 #[cfg(test)]

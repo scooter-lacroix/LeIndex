@@ -492,3 +492,50 @@ async fn stale_catalog_symbol_uses_live_parser_without_hydration() {
     assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
     assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
 }
+
+#[tokio::test]
+async fn stale_unscoped_catalog_symbol_uses_its_validated_candidate() {
+    let (_temp, project) = catalog_fixture();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub struct Askpass;\npub fn live_marker() {}\n",
+    )
+    .expect("make catalog source stale");
+    reset_path_counters();
+    let response = ReadSymbolHandler
+        .execute(
+            &Arc::new(ProjectRegistry::new(2)),
+            json!({ "project_path": project, "symbol": "Askpass" }),
+        )
+        .await
+        .expect("unscoped live parser response");
+    assert_eq!(response["symbol"], "Askpass");
+    assert_eq!(response["symbol_index_miss"], true);
+    assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn exact_grep_catalog_miss_uses_live_parser_without_hydration() {
+    let (_temp, project) = catalog_fixture();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub struct Askpass;\npub fn live_marker() {}\n",
+    )
+    .expect("make catalog source stale");
+    reset_path_counters();
+    let response = GrepSymbolsHandler
+        .execute(
+            &Arc::new(ProjectRegistry::new(2)),
+            json!({
+                "project_path": project,
+                "pattern": "live_marker",
+                "mode": "exact",
+            }),
+        )
+        .await
+        .expect("live exact grep response");
+    assert_eq!(response["results"][0]["name"], "live_marker");
+    assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
+    assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
+}
