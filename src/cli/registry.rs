@@ -30,6 +30,7 @@
 //!     stats when possible.
 
 use crate::cli::errors::detect_corruption;
+use crate::cli::index_job::{new_job_id, IndexJobSnapshot, IndexJobState, JobPaths};
 use crate::cli::leindex::{IndexStats, LeIndex};
 use crate::cli::mcp::protocol::JsonRpcError;
 use crate::cli::watcher::IndexWatcher;
@@ -211,6 +212,9 @@ pub struct ProjectRegistry {
     /// Per-project indexing slots used to consolidate concurrent reindex requests.
     index_slots: Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>,
 
+    /// Owned indexing jobs survive the MCP request that started them.
+    index_jobs: Mutex<HashMap<PathBuf, Arc<IndexJobState>>>,
+
     /// Maximum number of projects to keep in memory.
     max_projects: usize,
 
@@ -224,6 +228,11 @@ pub struct ProjectRegistry {
     /// of freshness checks that arrive at startup, short enough that a
     /// file edit becomes visible to subsequent reads within reasonable time.
     stale_cache: RwLock<HashMap<PathBuf, (std::time::Instant, bool)>>,
+
+    /// Per-project incremental refresh guard. When `true`, an incremental
+    /// refresh is in progress for that project and new requests skip the
+    /// refresh to avoid duplicate work.
+    incremental_refresh_guard: Mutex<HashMap<PathBuf, bool>>,
 }
 
 impl ProjectRegistry {
@@ -234,9 +243,11 @@ impl ProjectRegistry {
             lru_order: Mutex::new(VecDeque::new()),
             default_project: RwLock::new(None),
             index_slots: Mutex::new(HashMap::new()),
+            index_jobs: Mutex::new(HashMap::new()),
             max_projects,
             watchers: Mutex::new(HashMap::new()),
             stale_cache: RwLock::new(HashMap::new()),
+            incremental_refresh_guard: Mutex::new(HashMap::new()),
         }
     }
 
@@ -268,9 +279,11 @@ impl ProjectRegistry {
             lru_order: Mutex::new(lru),
             default_project: RwLock::new(Some(path)),
             index_slots: Mutex::new(slots),
+            index_jobs: Mutex::new(HashMap::new()),
             max_projects,
             watchers: Mutex::new(watchers),
             stale_cache: RwLock::new(HashMap::new()),
+            incremental_refresh_guard: Mutex::new(HashMap::new()),
         }
     }
 
@@ -314,7 +327,7 @@ impl ProjectRegistry {
 
     /// Get or create a project, auto-indexing if it has no stored index.
     pub async fn get_or_create(
-        &self,
+        self: &Arc<Self>,
         project_path: Option<&str>,
     ) -> Result<ProjectHandle, JsonRpcError> {
         let handle = self.get_or_load(project_path).await?;
@@ -365,18 +378,93 @@ impl ProjectRegistry {
             self.index_handle(&handle, false).await?;
             // stale_cache is invalidated inside index_handle() after successful swap
         } else if needs_refresh {
-            // Read paths (search/symbol-lookup/etc.) must NEVER auto-trigger a
-            // full reindex — that's the single biggest source of "all
-            // operations hang and time out" reports. If the on-disk index is
-            // stale we serve the existing results with a `_warning` field
-            // (added in `wrap_with_meta`) so the caller knows.
+            // The index is stale but still usable. Serve existing results
+            // immediately and trigger a lightweight incremental refresh in
+            // the background. The next request will see fresh data.
             //
-            // Use the explicit `leindex.index` tool (force_reindex=true) to
-            // rebuild the index when freshness matters.
-            debug!("Index is stale; serving existing results without auto-rebuild");
+            // Read paths must NEVER auto-trigger a FULL reindex (that was the
+            // single biggest source of "all operations hang" reports), but an
+            // incremental refresh only re-parses changed files and is safe to
+            // run opportunistically.
+            self.maybe_incremental_refresh(&handle, &canonical);
+            debug!(
+                "Index is stale; serving existing results while incremental refresh runs in background"
+            );
         }
 
         Ok(handle)
+    }
+
+    /// Trigger a lightweight incremental index refresh in the background if one
+    /// is not already running for this project.
+    ///
+    /// This is non-blocking: the caller proceeds with existing data and the
+    /// next request will see fresh results. The incremental refresh re-parses
+    /// only changed files and updates their symbols/edges/embeddings in-place.
+    /// A per-project guard prevents concurrent refreshes.
+    pub fn maybe_incremental_refresh(
+        self: &Arc<Self>,
+        _handle: &ProjectHandle,
+        project_path: &Path,
+    ) {
+        // Check if a refresh is already in progress for this project.
+        {
+            let guard = self.incremental_refresh_guard.try_lock();
+            match guard {
+                Ok(mut map) => {
+                    if *map.get(project_path).unwrap_or(&false) {
+                        return;
+                    }
+                    map.insert(project_path.to_path_buf(), true);
+                }
+                Err(_) => {
+                    // Lock contention means another thread is managing refreshes;
+                    // skip this one.
+                    return;
+                }
+            }
+        }
+
+        let registry = Arc::clone(self);
+        let path = project_path.to_path_buf();
+        let path_string = path.to_string_lossy().into_owned();
+
+        tokio::spawn(async move {
+            debug!(
+                project = %path.display(),
+                "Starting background incremental refresh"
+            );
+
+            // Run the incremental index (force_reindex=false means only
+            // changed files are re-parsed).
+            let result = registry.index_project(Some(&path_string), false).await;
+
+            // Clear the guard.
+            {
+                if let Ok(mut map) = registry.incremental_refresh_guard.try_lock() {
+                    map.insert(path.clone(), false);
+                }
+            }
+
+            match result {
+                Ok(stats) => {
+                    debug!(
+                        project = %path.display(),
+                        files_parsed = stats.files_parsed,
+                        "Background incremental refresh completed"
+                    );
+                    // Invalidate stale cache so next request sees fresh state.
+                    registry.invalidate_stale_cache(&path).await;
+                }
+                Err(error) => {
+                    warn!(
+                        project = %path.display(),
+                        error = %error,
+                        "Background incremental refresh failed; existing index remains usable"
+                    );
+                }
+            }
+        });
     }
 
     /// Explicitly index a project, with consolidation for concurrent requests.
@@ -387,6 +475,229 @@ impl ProjectRegistry {
     ) -> Result<IndexStats, JsonRpcError> {
         let handle = self.get_or_load(project_path).await?;
         self.index_handle(&handle, force_reindex).await
+    }
+
+    /// Start (or coalesce with) an owned indexing job.
+    ///
+    /// The returned task is detached from the caller's future. Dropping the
+    /// MCP request therefore cannot cancel a parse, transaction, or
+    /// generation swap. `wait=true` is an explicit compatibility mode for
+    /// interactive callers; MCP defaults to polling.
+    pub async fn start_index_job(
+        self: &Arc<Self>,
+        project_path: Option<&str>,
+        force_reindex: bool,
+        wait: bool,
+    ) -> Result<IndexJobSnapshot, JsonRpcError> {
+        let canonical = self.resolve_path(project_path).await?;
+        let previous_generation = crate::cli::index_freshness::load_health(
+            &crate::cli::leindex::resolve_existing_storage_path(&canonical)
+                .unwrap_or_else(|| canonical.join(".leindex")),
+        )
+        .map(|health| health.generation)
+        .unwrap_or(0);
+        let storage_root = crate::cli::leindex::resolve_existing_storage_path(&canonical)
+            .unwrap_or_else(|| canonical.join(".leindex"));
+        let next_state_path =
+            JobPaths::new(&storage_root, previous_generation.saturating_add(1)).job_status();
+        let state = {
+            let mut jobs = self.index_jobs.lock().await;
+            if let Some(existing) = jobs.get(&canonical).cloned() {
+                let current = existing.snapshot().await;
+                if current.status == "running" || !force_reindex {
+                    existing
+                } else {
+                    let state = Arc::new(IndexJobState::with_state_path(
+                        new_job_id(&canonical),
+                        next_state_path.clone(),
+                    ));
+                    jobs.insert(canonical.clone(), state.clone());
+                    state
+                }
+            } else {
+                let state = Arc::new(IndexJobState::with_state_path(
+                    new_job_id(&canonical),
+                    next_state_path.clone(),
+                ));
+                jobs.insert(canonical.clone(), state.clone());
+                state
+            }
+        };
+
+        if state.snapshot().await.status == "running" {
+            let path = canonical.clone();
+            let path_string = path.to_string_lossy().into_owned();
+            let registry = Arc::clone(self);
+            let task_state = Arc::clone(&state);
+            let storage_for_poll = storage_root.clone();
+            if task_state.try_start() {
+                tokio::spawn(async move {
+                    // Spawn the actual indexing work as an inner task so that
+                    // JoinHandle captures panics. If the inner task panics,
+                    // `task_state.fail()` is called here instead of leaving the
+                    // job in "running" state forever (which would hang
+                    // `state.wait()` on the caller side).
+                    let task_state_for_panic = Arc::clone(&task_state);
+                    let path_for_panic = path.clone();
+
+                    let inner = tokio::spawn(async move {
+                        let mut resident_core_generation = previous_generation;
+                        task_state.set_phase("scan", 0, 0).await;
+
+                        // Test-only panic injection. Used by
+                        // `panic_during_index_sets_failed_status` to verify
+                        // that the outer task catches panics and marks the job
+                        // as failed. The env var is never set in production.
+                        if std::env::var("LEINDEX_INJECT_PANIC")
+                            .ok()
+                            .is_some_and(|value| value == "1")
+                        {
+                            panic!("injected test panic for index job lifecycle test");
+                        }
+
+                        let indexing = registry.index_project(Some(&path_string), force_reindex);
+                        tokio::pin!(indexing);
+                        let result = loop {
+                            tokio::select! {
+                                result = &mut indexing => break result,
+                                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                                    if let Some(health) = crate::cli::index_freshness::load_health(&storage_for_poll) {
+                                        if health.phase == crate::cli::leindex::IndexPhase::Complete
+                                            && health.generation > resident_core_generation
+                                        {
+                                            match registry
+                                                .refresh_loaded_from_active_generation(&path)
+                                                .await
+                                            {
+                                                Ok(()) => {
+                                                    resident_core_generation = health.generation;
+                                                    task_state
+                                                        .mark_core_published(health.generation)
+                                                        .await;
+                                                }
+                                                Err(error) => {
+                                                    warn!(
+                                                        project = %path.display(),
+                                                        "Core generation is published but resident hydration is pending: {error}"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        let phase = format!("{:?}", health.phase).to_ascii_lowercase();
+                                        let total = health.indexed_file_count;
+                                        let completed = if health.phase == crate::cli::leindex::IndexPhase::Complete {
+                                            total
+                                        } else {
+                                            0
+                                        };
+                                        task_state.set_phase(phase, completed, total).await;
+                                    }
+                                }
+                            }
+                        };
+                        match result {
+                            Ok(_stats) => {
+                                let generation =
+                                    crate::cli::leindex::resolve_existing_storage_path(&path)
+                                        .and_then(|storage| {
+                                            crate::cli::index_freshness::load_health(&storage)
+                                        })
+                                        .map(|health| health.generation)
+                                        .unwrap_or(previous_generation.saturating_add(1));
+                                let neural_path =
+                                    crate::cli::leindex::resolve_existing_storage_path(&path)
+                                        .and_then(|storage| {
+                                            crate::cli::index_freshness::load_health(&storage).map(
+                                                |health| {
+                                                    storage
+                                                        .join("generations")
+                                                        .join(health.generation.to_string())
+                                                        .join("neural_embeddings.bin")
+                                                },
+                                            )
+                                        });
+                                if neural_path.as_ref().is_some_and(|path| {
+                                    path.is_file()
+                                        && std::fs::metadata(path)
+                                            .is_ok_and(|metadata| metadata.len() > 0)
+                                }) {
+                                    task_state.mark_neural_published().await;
+                                }
+                                task_state.complete(generation).await;
+                            }
+                            Err(error) => {
+                                // The core snapshot is published before neural
+                                // enrichment. Preserve those layer flags if the
+                                // optional follow-up fails afterward.
+                                if let Some(health) =
+                                    crate::cli::index_freshness::load_health(&storage_for_poll)
+                                {
+                                    if health.generation > previous_generation {
+                                        let core_loaded = if health.generation
+                                            > resident_core_generation
+                                        {
+                                            match registry
+                                                .refresh_loaded_from_active_generation(&path)
+                                                .await
+                                            {
+                                                Ok(()) => true,
+                                                Err(refresh_error) => {
+                                                    warn!(
+                                                        project = %path.display(),
+                                                        "Core generation remains durable but resident hydration failed: {refresh_error}"
+                                                    );
+                                                    false
+                                                }
+                                            }
+                                        } else {
+                                            true
+                                        };
+                                        if core_loaded {
+                                            task_state.mark_core_published(health.generation).await;
+                                        }
+                                    }
+                                }
+                                task_state.fail(error.to_string()).await;
+                            }
+                        }
+                    });
+
+                    // If the inner task panicked, recover the payload and mark
+                    // the job as failed so waiters do not hang forever.
+                    if let Err(join_error) = inner.await {
+                        if join_error.is_panic() {
+                            let payload = join_error.into_panic();
+                            let panic_msg = payload
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| payload.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "non-string panic payload".to_string());
+                            warn!(
+                                project = %path_for_panic.display(),
+                                "Indexing task panicked: {}; marking job as failed", panic_msg
+                            );
+                            task_state_for_panic
+                                .fail(format!("indexing panicked: {}", panic_msg))
+                                .await;
+                        } else {
+                            warn!(
+                                project = %path_for_panic.display(),
+                                "Indexing task was cancelled; marking job as failed"
+                            );
+                            task_state_for_panic
+                                .fail("indexing task was cancelled".to_string())
+                                .await;
+                        }
+                    }
+                });
+            }
+        }
+
+        if wait {
+            Ok(state.wait().await)
+        } else {
+            Ok(state.snapshot().await)
+        }
     }
 
     /// Number of projects currently in memory.
@@ -439,6 +750,9 @@ impl ProjectRegistry {
         // A+ hotspot cleanup: evict stale-cache entry so residency does not
         // grow monotonically across long-lived sessions (VAL-APLUS-027).
         self.stale_cache.write().await.remove(path);
+
+        // Clean up incremental refresh guard.
+        self.incremental_refresh_guard.lock().await.remove(path);
     }
 
     /// Resolve an optional `project_path` string to a canonical `PathBuf`.
@@ -506,7 +820,7 @@ impl ProjectRegistry {
         // Load from storage to populate search_engine (is_indexed() depends on it).
         // PDG remains in memory; ensure_pdg_loaded() is a no-op after this.
         let hydration_started = std::time::Instant::now();
-        let hydration_result = leindex.load_from_storage();
+        let hydration_result = leindex.load_from_active_storage();
         let hydrate_ms = hydration_started
             .elapsed()
             .as_millis()
@@ -526,7 +840,9 @@ impl ProjectRegistry {
             );
         }
 
-        // Corruption detection and auto-repair
+        // Corruption detection and auto-repair. Never delete the whole
+        // storage root: an interrupted build may still have reusable job
+        // artifacts and an older generation for rollback.
         let corruption =
             detect_corruption(&canonical).unwrap_or(crate::cli::errors::CorruptionStatus::Healthy);
         if !corruption.is_usable() {
@@ -535,20 +851,22 @@ impl ProjectRegistry {
                 canonical.display(),
                 corruption.message()
             );
-            let storage_path = canonical.join(".leindex");
-            if let Err(e) = std::fs::remove_dir_all(&storage_path) {
+            let storage_path = crate::cli::leindex::resolve_existing_storage_path(&canonical)
+                .unwrap_or_else(|| canonical.join(".leindex"));
+            if restore_latest_generation(&storage_path) {
                 warn!(
-                    "Failed to remove corrupted storage at {}: {}. \
-                     Attempting reindex anyway.",
-                    storage_path.display(),
-                    e
+                    "Rolled back {} to latest usable generation; preserved corrupt root artifact",
+                    canonical.display()
                 );
             }
-
             let mut fresh = LeIndex::new(&canonical).map_err(|e| {
                 JsonRpcError::init_failed(
                     &canonical.display().to_string(),
-                    &format!("Original: {}. After wipe: {}", corruption.message(), e),
+                    &format!(
+                        "Original: {}. Preserving artifacts: {}",
+                        corruption.message(),
+                        e
+                    ),
                 )
             })?;
             fresh.index_project(true).map_err(|e| {
@@ -639,17 +957,63 @@ impl ProjectRegistry {
             force_reindex
         );
 
+        let previous_generation = crate::cli::index_freshness::load_health(
+            &crate::cli::leindex::resolve_existing_storage_path(&project_path)
+                .unwrap_or_else(|| project_path.join(".leindex")),
+        )
+        .map(|health| health.generation)
+        .unwrap_or(0);
         let path_for_blocking = project_path.clone();
-        let temp = tokio::task::spawn_blocking(move || {
+        let indexing = tokio::task::spawn_blocking(move || {
             let mut temp = LeIndex::new(&path_for_blocking).map_err(|e| {
                 JsonRpcError::init_failed(&path_for_blocking.display().to_string(), &e.to_string())
             })?;
             temp.index_project(force_reindex)
                 .map_err(|e| JsonRpcError::indexing_failed(format!("Indexing failed: {}", e)))?;
             Ok::<LeIndex, JsonRpcError>(temp)
-        })
-        .await
-        .map_err(|e| JsonRpcError::internal_error(format!("Task join error: {}", e)))??;
+        });
+        tokio::pin!(indexing);
+        let mut resident_core_generation = previous_generation;
+        let indexing_result = loop {
+            tokio::select! {
+                result = &mut indexing => break result,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    let storage_path = crate::cli::leindex::resolve_existing_storage_path(&project_path)
+                        .unwrap_or_else(|| project_path.join(".leindex"));
+                    if let Some(health) = crate::cli::index_freshness::load_health(&storage_path) {
+                        if health.phase == crate::cli::leindex::IndexPhase::Complete
+                            && health.generation > resident_core_generation
+                        {
+                            match self.refresh_loaded_from_active_generation(&project_path).await {
+                                Ok(()) => resident_core_generation = health.generation,
+                                Err(error) => debug!(
+                                    project = %project_path.display(),
+                                    "Published core generation is waiting for resident hydration: {error}"
+                                ),
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let temp = match indexing_result {
+            Ok(Ok(temp)) => temp,
+            Ok(Err(error)) => {
+                let core_published = self
+                    .refresh_core_after_index_failure(&project_path, resident_core_generation)
+                    .await;
+                mark_index_failure(&project_path, &error.to_string(), core_published);
+                return Err(error);
+            }
+            Err(error) => {
+                let error = JsonRpcError::internal_error(format!("Task join error: {}", error));
+                let core_published = self
+                    .refresh_core_after_index_failure(&project_path, resident_core_generation)
+                    .await;
+                mark_index_failure(&project_path, &error.to_string(), core_published);
+                return Err(error);
+            }
+        };
 
         {
             let mut idx = handle.write().await;
@@ -712,6 +1076,52 @@ impl ProjectRegistry {
         self.projects.read().await.get(path).cloned()
     }
 
+    /// Refresh the resident handle from the immutable generation selected by
+    /// `CURRENT`. Owned jobs publish PDG/TF-IDF before neural enrichment; the
+    /// poller uses this short reload so registry-backed tools see that core
+    /// generation while the builder continues in the background.
+    async fn refresh_loaded_from_active_generation(&self, path: &Path) -> Result<(), JsonRpcError> {
+        let Some(handle) = self.try_get_loaded(path).await else {
+            return Ok(());
+        };
+        tokio::task::spawn_blocking(move || {
+            let mut index = handle.blocking_write();
+            index.load_from_active_storage().map_err(|error| {
+                JsonRpcError::internal_error(format!(
+                    "Failed to hydrate published core generation: {error:#}"
+                ))
+            })
+        })
+        .await
+        .map_err(|error| {
+            JsonRpcError::internal_error(format!("Core hydration task failed: {error}"))
+        })?
+    }
+
+    async fn refresh_core_after_index_failure(
+        &self,
+        path: &Path,
+        previous_generation: u64,
+    ) -> bool {
+        let storage_path = crate::cli::leindex::resolve_existing_storage_path(path)
+            .unwrap_or_else(|| path.join(".leindex"));
+        let Some(health) = crate::cli::index_freshness::load_health(&storage_path) else {
+            return false;
+        };
+        if health.phase != crate::cli::leindex::IndexPhase::Complete
+            || health.generation <= previous_generation
+        {
+            return false;
+        }
+        if let Err(refresh_error) = self.refresh_loaded_from_active_generation(path).await {
+            debug!(
+                project = %path.display(),
+                "Published core generation could not be made resident after indexing failure: {refresh_error}"
+            );
+        }
+        true
+    }
+
     /// Evict the least-recently-used project if we're at or over capacity.
     async fn evict_lru_if_needed(&self) {
         let current_count = self.projects.read().await.len();
@@ -762,6 +1172,69 @@ impl ProjectRegistry {
     }
 }
 
+fn restore_latest_generation(storage_path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(storage_path.join("generations")) else {
+        return false;
+    };
+    let mut generations = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u64>().ok())
+        .collect::<Vec<_>>();
+    generations.sort_unstable_by(|a, b| b.cmp(a));
+    for generation in generations {
+        let source = storage_path
+            .join("generations")
+            .join(generation.to_string())
+            .join("leindex.db");
+        if !source.is_file() {
+            continue;
+        }
+        let target = storage_path.join("leindex.db");
+        if target.is_file() {
+            let backup = storage_path.join(format!("leindex.db.corrupt-{generation}"));
+            if std::fs::rename(&target, &backup).is_err() {
+                continue;
+            }
+        }
+        let next = storage_path.join("leindex.db.recovery.next");
+        if std::fs::copy(&source, &next).is_err() || std::fs::rename(&next, &target).is_err() {
+            let _ = std::fs::remove_file(&next);
+            return false;
+        }
+        let _ = std::fs::write(storage_path.join("CURRENT"), format!("{generation}\n"));
+        return true;
+    }
+    false
+}
+
+fn mark_index_failure(project_path: &Path, message: &str, core_published: bool) {
+    let storage_path = crate::cli::leindex::resolve_existing_storage_path(project_path)
+        .unwrap_or_else(|| project_path.join(".leindex"));
+    let previous = crate::cli::index_freshness::load_health(&storage_path).unwrap_or_default();
+    let health = crate::cli::leindex::IndexHealth {
+        generation: previous.generation,
+        phase: previous.phase,
+        status: if core_published {
+            previous.status
+        } else {
+            crate::cli::leindex::ComponentStatus::Failed
+        },
+        head_oid: previous.head_oid,
+        tree_oid: previous.tree_oid,
+        indexed_file_count: previous.indexed_file_count,
+        dirty_file_count: previous.dirty_file_count,
+        changed_unindexed_count: previous.changed_unindexed_count,
+        indexed_at_unix_ms: previous.indexed_at_unix_ms,
+        last_failure_phase: Some(if core_published {
+            crate::cli::leindex::IndexPhase::Neural
+        } else {
+            previous.phase
+        }),
+        last_failure: Some(message.to_string()),
+    };
+    let _ = crate::cli::index_freshness::save_health(&storage_path, &health);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -770,6 +1243,49 @@ mod tests {
     async fn test_registry_creation() {
         let registry = ProjectRegistry::new(5);
         assert_eq!(registry.len().await, 0);
+    }
+
+    #[test]
+    fn post_core_failure_preserves_published_health() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join(".leindex");
+        let health = crate::cli::leindex::IndexHealth {
+            generation: 4,
+            phase: crate::cli::leindex::IndexPhase::Complete,
+            status: crate::cli::leindex::ComponentStatus::Fresh,
+            indexed_at_unix_ms: Some(1),
+            ..Default::default()
+        };
+        crate::cli::index_freshness::save_health(&storage, &health).unwrap();
+
+        mark_index_failure(temp.path(), "neural failed", true);
+
+        let recorded = crate::cli::index_freshness::load_health(&storage).unwrap();
+        assert_eq!(recorded.status, crate::cli::leindex::ComponentStatus::Fresh);
+        assert_eq!(
+            recorded.last_failure_phase,
+            Some(crate::cli::leindex::IndexPhase::Neural)
+        );
+        assert_eq!(recorded.last_failure.as_deref(), Some("neural failed"));
+    }
+
+    #[test]
+    fn restore_latest_generation_preserves_corrupt_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().join(".leindex");
+        let generation = storage.join("generations/3");
+        std::fs::create_dir_all(&generation).unwrap();
+        std::fs::write(storage.join("leindex.db"), b"corrupt").unwrap();
+        std::fs::write(generation.join("leindex.db"), b"usable").unwrap();
+        assert!(restore_latest_generation(&storage));
+        assert_eq!(
+            std::fs::read(storage.join("leindex.db")).unwrap(),
+            b"usable"
+        );
+        assert_eq!(
+            std::fs::read(storage.join("leindex.db.corrupt-3")).unwrap(),
+            b"corrupt"
+        );
     }
 
     #[tokio::test]
@@ -797,6 +1313,33 @@ mod tests {
         assert_eq!(registry.len().await, 1);
         let handle = registry.get_or_load(None).await;
         assert!(handle.is_ok());
+    }
+
+    #[tokio::test]
+    async fn core_generation_refreshes_the_resident_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn resident_core() {}\n").unwrap();
+
+        let mut builder = LeIndex::new(tmp.path()).unwrap();
+        builder.index_project(true).unwrap();
+        drop(builder);
+
+        let resident = LeIndex::new(tmp.path()).unwrap();
+        let registry = ProjectRegistry::with_initial_project(2, resident);
+        let canonical = tmp.path().canonicalize().unwrap();
+        let handle = registry
+            .get_or_load(Some(canonical.to_str().unwrap()))
+            .await
+            .unwrap();
+        assert!(handle.read().await.pdg().is_none());
+
+        registry
+            .refresh_loaded_from_active_generation(&canonical)
+            .await
+            .unwrap();
+        let guard = handle.read().await;
+        assert!(guard.pdg().is_some());
+        assert!(guard.search_engine().node_count() > 0);
     }
 
     #[tokio::test]
