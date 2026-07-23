@@ -557,3 +557,248 @@ mod client_fallback_tests {
         // The fallback is a valid embedding, just degraded
     }
 }
+
+// ── VAL-DEADWORKER-001: Dead worker detected via read error (EOF/EPIPE) ──
+// ── VAL-DEADWORKER-002: ClientError::WorkerDied variant exists ───────────
+// ── VAL-DEADWORKER-003: Stale daemon killed and replaced ────────────────
+//
+// These tests exercise the real `EmbeddingClient` I/O path using injected
+// UnixStream pairs (no real daemon spawn needed). The mock "worker" end
+// closes the connection, simulating a dead worker process. The client must
+// detect this via EOF on read and return `ClientError::WorkerDied`.
+
+#[cfg(all(unix, feature = "onnx"))]
+mod dead_worker_tests {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    use leindex::search::{ClientError, EmbeddingClient};
+    use leindex_embed::protocol::{BatchId, EmbedRequest, Frame};
+
+    /// VAL-DEADWORKER-002: `ClientError` has a `WorkerDied` variant.
+    #[test]
+    fn client_error_worker_died_variant_exists() {
+        let err = ClientError::WorkerDied {
+            message: "test".to_string(),
+        };
+        // The variant must be constructible and matchable.
+        assert!(matches!(err, ClientError::WorkerDied { .. }));
+        // Display must mention "died".
+        let display = format!("{}", err);
+        assert!(
+            display.contains("died"),
+            "WorkerDied display must mention 'died': got '{}'",
+            display
+        );
+    }
+
+    /// VAL-DEADWORKER-001: When the worker closes its end of the socket (EOF),
+    /// `send_and_receive` returns `ClientError::WorkerDied`.
+    ///
+    /// The detection happens through the reader thread: it reads EOF on
+    /// `read_exact`, classifies it as `WorkerDied`, and propagates through
+    /// the response channel. No arbitrary timeout is introduced.
+    #[test]
+    fn dead_worker_detected_via_read_error() {
+        // Create a connected UnixStream pair.
+        // client_stream goes into the EmbeddingClient; mock_stream simulates
+        // the worker process.
+        let (client_stream, mut mock_stream) = UnixStream::pair().unwrap();
+        let client = EmbeddingClient::test_from_unix_stream(client_stream);
+
+        // Spawn a mock worker that reads the request then immediately closes
+        // its end of the connection (simulating process death).
+        std::thread::spawn(move || {
+            // Read the request frame (4-byte length + payload) so the write
+            // succeeds. Then close without sending a response.
+            let _ = mock_stream.read_exact(&mut [0u8; 4]);
+            // Closing the stream simulates the worker process dying.
+            // The reader thread will get EOF on its next read.
+        });
+
+        // Build a minimal embed request frame.
+        let request = EmbedRequest {
+            texts: vec!["test".to_string()],
+            expected_dim: 4,
+        };
+        let frame = leindex_embed::protocol::embed_request_frame(BatchId::new(1), request).unwrap();
+
+        // send_and_receive must detect the dead worker and return WorkerDied.
+        let result = client.test_send_and_receive(frame);
+
+        assert!(
+            matches!(result, Err(ClientError::WorkerDied { .. })),
+            "expected ClientError::WorkerDied, got {:?}",
+            result
+        );
+    }
+
+    /// VAL-DEADWORKER-001: When the reader thread cannot read a complete frame
+    /// (partial send then close), the error is still `WorkerDied`.
+    #[test]
+    fn dead_worker_partial_frame_then_eof() {
+        let (client_stream, mut mock_stream) = UnixStream::pair().unwrap();
+        let client = EmbeddingClient::test_from_unix_stream(client_stream);
+
+        std::thread::spawn(move || {
+            // Read the request, then send only 2 bytes of a length prefix
+            // (partial frame), then close. The reader thread will call
+            // read_exact which fails with UnexpectedEof.
+            let _ = mock_stream.read_exact(&mut [0u8; 4]);
+            let _ = mock_stream.write_all(&[0xAB, 0xCD]);
+            // Stream is closed when it goes out of scope.
+        });
+
+        let request = EmbedRequest {
+            texts: vec!["partial".to_string()],
+            expected_dim: 4,
+        };
+        let frame = leindex_embed::protocol::embed_request_frame(BatchId::new(2), request).unwrap();
+        let result = client.test_send_and_receive(frame);
+
+        assert!(
+            matches!(result, Err(ClientError::WorkerDied { .. })),
+            "expected ClientError::WorkerDied for partial frame + EOF, got {:?}",
+            result
+        );
+    }
+
+    /// VAL-DEADWORKER-003: After detecting a dead worker, the local worker
+    /// handle is cleared so the next call triggers a fresh spawn.
+    #[test]
+    fn dead_worker_clears_local_handle() {
+        let (client_stream, mut mock_stream) = UnixStream::pair().unwrap();
+        let client = EmbeddingClient::test_from_unix_stream(client_stream);
+
+        std::thread::spawn(move || {
+            // Read the request frame header, then close.
+            let _ = mock_stream.read_exact(&mut [0u8; 4]);
+        });
+
+        let request = EmbedRequest {
+            texts: vec!["clear test".to_string()],
+            expected_dim: 4,
+        };
+        let frame = leindex_embed::protocol::embed_request_frame(BatchId::new(3), request).unwrap();
+
+        let result = client.test_send_and_receive(frame);
+        assert!(matches!(result, Err(ClientError::WorkerDied { .. })));
+
+        // After WorkerDied, the local worker handle must be cleared so the
+        // next embed_attempt triggers spawn_or_connect_daemon().
+        assert!(
+            client.test_worker_handle_cleared(),
+            "worker handle must be cleared after WorkerDied"
+        );
+    }
+
+    /// VAL-DEADWORKER-003: On WorkerDied, the stale daemon PID file is cleaned
+    /// up (if the client was connected to a daemon).
+    ///
+    /// This test verifies that `handle_worker_died` removes the daemon's
+    /// socket/status/pid sidecar files for a daemon-mode client.
+    #[test]
+    fn dead_worker_cleans_up_daemon_paths() {
+        use std::path::PathBuf;
+
+        // Use a temp directory for the fake socket path.
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path: PathBuf = temp.path().join("leindex-embed-test.sock");
+        let pid_path = socket_path.with_extension("pid");
+        let status_path = socket_path.with_extension("status");
+
+        // Create the sidecar files (simulating a daemon that wrote them).
+        // Write a PID that doesn't exist (so kill_stale_daemon_by_pid is a
+        // no-op — it will just fail to signal and the cleanup proceeds).
+        std::fs::write(&pid_path, "999999").unwrap();
+        std::fs::write(&status_path, "ready").unwrap();
+        std::fs::write(&socket_path, b"fake socket").unwrap();
+
+        let (client_stream, mut mock_stream) = UnixStream::pair().unwrap();
+        let client = EmbeddingClient::test_from_daemon_stream(client_stream, socket_path.clone());
+
+        std::thread::spawn(move || {
+            // Read the request frame header, then close.
+            let _ = mock_stream.read_exact(&mut [0u8; 4]);
+        });
+
+        let request = EmbedRequest {
+            texts: vec!["cleanup test".to_string()],
+            expected_dim: 4,
+        };
+        let frame = leindex_embed::protocol::embed_request_frame(BatchId::new(4), request).unwrap();
+
+        let result = client.test_send_and_receive(frame);
+        assert!(matches!(result, Err(ClientError::WorkerDied { .. })));
+
+        // After WorkerDied, the daemon sidecar files must be cleaned up.
+        assert!(
+            !socket_path.exists(),
+            "daemon socket must be cleaned up after WorkerDied"
+        );
+        assert!(
+            !pid_path.exists(),
+            "daemon PID file must be cleaned up after WorkerDied"
+        );
+        assert!(
+            !status_path.exists(),
+            "daemon status file must be cleaned up after WorkerDied"
+        );
+        assert!(
+            client.test_worker_handle_cleared(),
+            "worker handle must be cleared after WorkerDied"
+        );
+    }
+
+    /// VAL-DEADWORKER-001/002: A normal successful request-response cycle
+    /// still works correctly after the dead-worker detection changes.
+    /// This is a regression guard.
+    #[test]
+    fn dead_worker_changes_do_not_break_normal_requests() {
+        let (client_stream, mut mock_stream) = UnixStream::pair().unwrap();
+        let client = EmbeddingClient::test_from_unix_stream(client_stream);
+
+        // Mock worker: read request, send back a valid embed response.
+        let worker_thread = std::thread::spawn(
+            move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                use std::io::Read;
+
+                // Read 4-byte length prefix
+                let mut len_buf = [0u8; 4];
+                mock_stream.read_exact(&mut len_buf)?;
+                let payload_len = u32::from_le_bytes(len_buf) as usize;
+                // Read payload
+                let mut payload = vec![0u8; payload_len];
+                mock_stream.read_exact(&mut payload)?;
+
+                // Decode to get batch_id
+                let req_frame = Frame::from_wire_bytes(&payload)?;
+                let batch_id = req_frame.header.batch_id;
+
+                // Send back a valid embed response (1 text, dim=4)
+                let response = leindex_embed::protocol::EmbedResponse::new(vec![0.0f32; 4], 1, 4);
+                let resp_frame = leindex_embed::protocol::embed_response_frame(batch_id, response)?;
+                let wire = resp_frame.encode_wire()?;
+                mock_stream.write_all(&wire)?;
+                mock_stream.flush()?;
+                Ok(())
+            },
+        );
+
+        let request = EmbedRequest {
+            texts: vec!["normal request".to_string()],
+            expected_dim: 4,
+        };
+        let frame = leindex_embed::protocol::embed_request_frame(BatchId::new(5), request).unwrap();
+        let result = client.test_send_and_receive(frame);
+
+        // Normal request should succeed (not WorkerDied).
+        assert!(
+            result.is_ok(),
+            "normal request should succeed, got: {:?}",
+            result
+        );
+
+        worker_thread.join().unwrap().unwrap();
+    }
+}

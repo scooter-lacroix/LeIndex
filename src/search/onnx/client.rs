@@ -35,16 +35,42 @@ use leindex_embed::protocol::{
     RerankDocument, RerankRequest, RerankResponse, Response, WorkerError, WorkerState,
 };
 
+/// Classify a `std::io::Error` as one that indicates the worker process has
+/// died (closed the connection or crashed).
+///
+/// VAL-DEADWORKER-001: When the worker process dies, `read_exact` on the
+/// `UnixStream` returns one of these error kinds. This is a deterministic
+/// transport-level signal, not an arbitrary wall-clock timeout.
+fn is_worker_dead_io_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::UnexpectedEof
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+    )
+}
+
 /// Read a response frame from the worker.
 ///
 /// This is the core I/O routine used by the persistent reader thread.
 /// It reads the 4-byte length prefix followed by the payload, enforcing
 /// the max frame size guard to prevent excessive allocations.
+///
+/// VAL-DEADWORKER-001: On EOF/EPIPE (worker process died), the error is
+/// classified as `ClientError::WorkerDied` so the caller can kill the stale
+/// daemon and spawn a replacement, rather than being masked as a generic
+/// IPC error.
 fn read_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, ClientError> {
     // Read response length (4 bytes, little-endian)
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf) {
         Ok(()) => {}
+        Err(e) if is_worker_dead_io_error(&e) => {
+            return Err(ClientError::WorkerDied {
+                message: format!("EOF/EPIPE reading frame length: {}", e),
+            });
+        }
         Err(e) => {
             return Err(ClientError::Ipc(format!(
                 "failed to read frame length: {}",
@@ -67,6 +93,9 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, ClientError> {
     let mut frame_buf = vec![0u8; payload_len];
     match reader.read_exact(&mut frame_buf) {
         Ok(()) => Ok(frame_buf),
+        Err(e) if is_worker_dead_io_error(&e) => Err(ClientError::WorkerDied {
+            message: format!("EOF/EPIPE reading frame payload: {}", e),
+        }),
         Err(e) => Err(ClientError::Ipc(format!(
             "failed to read frame payload: {}",
             e
@@ -131,6 +160,14 @@ const DAEMON_READINESS_POLL: Duration = Duration::from_millis(25);
 /// results. 120 seconds is generous enough for real cold starts including
 /// first-time ONNX model compilation.
 const DAEMON_READY_MAX_WAIT: Duration = Duration::from_secs(120);
+
+/// Grace window for a stale daemon to exit after `SIGTERM` before receiving
+/// `SIGKILL`.
+///
+/// VAL-DEADWORKER-003: This is a bounded process-cleanup guard for a daemon
+/// that has already been confirmed dead by the read-error path. It is not a
+/// request-path timeout and does not cancel inference.
+const STALE_DAEMON_KILL_GRACE: Duration = Duration::from_secs(1);
 
 fn platform_binary_name(binary_name: &str) -> String {
     if cfg!(windows) {
@@ -310,6 +347,46 @@ fn cleanup_daemon_paths(socket_path: &Path) {
     let _ = std::fs::remove_file(socket_path);
     let _ = std::fs::remove_file(socket_path.with_extension("status"));
     let _ = std::fs::remove_file(socket_path.with_extension("pid"));
+}
+
+/// Kill a stale daemon process by reading its PID from the `.pid` sidecar
+/// file next to the socket.
+///
+/// VAL-DEADWORKER-003: When dead-worker detection fires, the stale daemon PID
+/// (recorded during spawn) is read from the status/PID sidecar and sent
+/// `SIGTERM`. If the process does not exit within a short grace window, it
+/// receives `SIGKILL`. This is a bounded cleanup of a known-dead process,
+/// not a request-path timeout.
+#[cfg(unix)]
+fn kill_stale_daemon_by_pid(socket_path: &Path) {
+    let pid_path = socket_path.with_extension("pid");
+    let Some(pid) = std::fs::read_to_string(&pid_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+    else {
+        return;
+    };
+    if pid <= 0 {
+        return;
+    }
+
+    // SIGTERM first to allow graceful cleanup.
+    let _ = unsafe { libc::kill(pid, libc::SIGTERM) };
+
+    // Bounded grace window for graceful exit, then SIGKILL.
+    let deadline = Instant::now() + STALE_DAEMON_KILL_GRACE;
+    loop {
+        // Check liveness: kill(pid, 0) returns 0 if the process exists.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        if !alive {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            break;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn worker_health_snapshot(
@@ -496,6 +573,19 @@ pub enum ClientError {
     /// path waits for a connected peer or receives an explicit worker error.
     #[error("worker control-plane operation timed out")]
     Timeout,
+
+    /// The worker process died during an inference request.
+    ///
+    /// VAL-DEADWORKER-001/002: The reader thread detected EOF or EPIPE on the
+    /// Unix stream, confirming the worker process is no longer alive. This is
+    /// detected through the natural read-error path, not an arbitrary timeout.
+    /// On this error, the stale daemon is killed and local state cleared so
+    /// the next request triggers a fresh `spawn_or_connect_daemon()`.
+    #[error("worker process died: {message}")]
+    WorkerDied {
+        /// Diagnostic context (e.g. "EOF reading frame", "reader thread disconnected").
+        message: String,
+    },
 }
 
 /// Non-blocking observation of the local neural worker.
@@ -1597,6 +1687,93 @@ impl EmbeddingClient {
         }
     }
 
+    /// Kill the stale daemon and clear local worker state after detecting a
+    /// dead worker.
+    ///
+    /// VAL-DEADWORKER-003: On `ClientError::WorkerDied`, the stale daemon PID
+    /// is read from the `.pid` sidecar file and killed (SIGTERM then SIGKILL
+    /// if needed), daemon filesystem paths are cleaned up, and the local
+    /// `WorkerHandle` is cleared so the next `embed_attempt` triggers a fresh
+    /// `spawn_or_connect_daemon()`.
+    fn handle_worker_died(&self) {
+        #[cfg(unix)]
+        {
+            // Kill the stale daemon process by PID from the sidecar file.
+            // The socket_path on the WorkerHandle pinpoints which daemon to
+            // reap. For persistent daemons the client does not own the child
+            // (the reaper thread does), so we kill it directly by PID.
+            if let Ok(guard) = self.worker.lock() {
+                if let Some(handle) = guard.as_ref() {
+                    if let Some(socket_path) = handle.socket_path.as_ref() {
+                        kill_stale_daemon_by_pid(socket_path);
+                        cleanup_daemon_paths(socket_path);
+                    }
+                }
+            }
+        }
+
+        // Clear the local worker handle so the next call spawns fresh.
+        if let Ok(mut guard) = self.worker.lock() {
+            if let Some(mut handle) = guard.take() {
+                Self::shutdown_worker_handle(&mut handle, true);
+            }
+        }
+    }
+
+    // ── Test helpers (not part of the public API) ────────────────────────
+    //
+    // These `#[doc(hidden)]` methods exist solely so integration tests in
+    // `tests/onnx_worker_fallback.rs` can inject mock connections and exercise
+    // the `send_and_receive` I/O path without spawning a real daemon.
+
+    /// **Test-only:** Create a pipe-mode client whose worker handle is backed
+    /// by the supplied `UnixStream`. This bypasses the daemon spawn/connect
+    /// flow, allowing deterministic dead-worker detection tests.
+    #[doc(hidden)]
+    #[cfg(all(unix, feature = "onnx"))]
+    pub fn test_from_unix_stream(stream: UnixStream) -> Self {
+        let client = Self::new_pipe();
+        let handle = Self::socket_worker_handle(stream, None, None)
+            .expect("socket_worker_handle must succeed for test stream");
+        *client.worker.lock().unwrap() = Some(handle);
+        client
+    }
+
+    /// **Test-only:** Create a daemon-mode client whose worker handle is
+    /// backed by the supplied `UnixStream` and `socket_path`. This simulates
+    /// a connected daemon so tests can verify stale-daemon cleanup on
+    /// `WorkerDied`.
+    #[doc(hidden)]
+    #[cfg(all(unix, feature = "onnx"))]
+    pub fn test_from_daemon_stream(stream: UnixStream, socket_path: PathBuf) -> Self {
+        let client = Self::new();
+        let handle = Self::socket_worker_handle(stream, None, Some(socket_path))
+            .expect("socket_worker_handle must succeed for test stream");
+        *client.worker.lock().unwrap() = Some(handle);
+        client
+    }
+
+    /// **Test-only:** Send a raw frame and receive the response, bypassing the
+    /// `ensure_worker_ready()` readiness gate. This exposes the private
+    /// `send_and_receive` to integration tests so dead-worker I/O behavior can
+    /// be verified without spawning a real worker process.
+    #[doc(hidden)]
+    #[cfg(feature = "onnx")]
+    pub fn test_send_and_receive(&self, frame: Frame) -> Result<Frame, ClientError> {
+        self.send_and_receive(frame)
+    }
+
+    /// **Test-only:** Check whether the local worker handle has been cleared
+    /// (i.e., `handle_worker_died` ran successfully).
+    #[doc(hidden)]
+    #[cfg(feature = "onnx")]
+    pub fn test_worker_handle_cleared(&self) -> bool {
+        self.worker
+            .lock()
+            .map(|guard| guard.is_none())
+            .unwrap_or(true)
+    }
+
     fn shutdown_worker_handle(handle: &mut WorkerHandle, kill_persistent: bool) {
         // Signal the reader thread to stop. If the reader is currently
         // blocked inside read_frame (waiting for worker response), the
@@ -1931,6 +2108,11 @@ impl EmbeddingClient {
     /// stack, while the response channel waits for either a complete frame or
     /// a real transport disconnect. Model compilation and inference are not
     /// cancelled by elapsed-time policy.
+    ///
+    /// VAL-DEADWORKER-001/002: When the reader thread detects EOF/EPIPE (the
+    /// worker process died), or when the reader thread itself disconnects, the
+    /// error is mapped to `ClientError::WorkerDied` and `handle_worker_died`
+    /// is called to kill the stale daemon and clear local state.
     fn send_and_receive(&self, frame: Frame) -> Result<Frame, ClientError> {
         let mut guard = self
             .worker
@@ -1954,6 +2136,15 @@ impl EmbeddingClient {
 
         if let Err(e) = writer.write_all(&wire) {
             drop(guard);
+            // VAL-DEADWORKER-001: EPIPE on write means the worker died
+            // (reading end closed). Classify as WorkerDied so the stale
+            // daemon is killed and replaced.
+            if is_worker_dead_io_error(&e) {
+                self.handle_worker_died();
+                return Err(ClientError::WorkerDied {
+                    message: format!("EPIPE writing request frame: {}", e),
+                });
+            }
             self.kill_worker();
             return Err(ClientError::Ipc(format!(
                 "failed to write to worker: {}",
@@ -1962,6 +2153,12 @@ impl EmbeddingClient {
         }
         if let Err(e) = writer.flush() {
             drop(guard);
+            if is_worker_dead_io_error(&e) {
+                self.handle_worker_died();
+                return Err(ClientError::WorkerDied {
+                    message: format!("EPIPE flushing request frame: {}", e),
+                });
+            }
             self.kill_worker();
             return Err(ClientError::Ipc(format!(
                 "failed to flush worker transport: {}",
@@ -1998,6 +2195,13 @@ impl EmbeddingClient {
             }
             Ok(Err(e)) => {
                 drop(guard);
+                // VAL-DEADWORKER-001/002: The reader thread got EOF/EPIPE (the
+                // worker process died). Map this to WorkerDied and reap the
+                // stale daemon so the next call spawns a replacement.
+                if matches!(e, ClientError::WorkerDied { .. }) {
+                    self.handle_worker_died();
+                    return Err(e);
+                }
                 self.kill_worker();
                 // Frame too large or other I/O error
                 if e.to_string().contains("too large") {
@@ -2011,10 +2215,13 @@ impl EmbeddingClient {
             }
             Err(mpsc::RecvError) => {
                 drop(guard);
-                self.kill_worker();
-                Err(ClientError::Ipc(
-                    "reader thread disconnected unexpectedly".to_string(),
-                ))
+                // VAL-DEADWORKER-001/002: The reader thread itself
+                // disconnected, which means it either received EOF/EPIPE or
+                // panicked. Either way the worker is dead.
+                self.handle_worker_died();
+                Err(ClientError::WorkerDied {
+                    message: "reader thread disconnected".to_string(),
+                })
             }
         }
     }

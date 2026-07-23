@@ -2611,51 +2611,59 @@ pub struct CheckResult {
 /// The MIGraphX compilation is triggered by the inference request, and the
 /// compiled kernels are cached in the `ORT_MIGraphX_MODEL_CACHE_PATH`
 /// directory. Subsequent index runs skip the compilation step entirely.
+#[cfg(feature = "onnx")]
 pub fn run_warmup() -> Result<(), SetupError> {
-    #[cfg(feature = "onnx")]
-    {
-        use crate::search::onnx::EmbeddingClient;
+    use crate::search::onnx::EmbeddingClient;
 
-        println!("  -> Starting MIGraphX warmup pre-compilation...");
+    run_warmup_inner(&EmbeddingClient::new())
+}
 
-        let client = EmbeddingClient::new();
+/// Inner warmup logic, separated for testability.
+///
+/// VAL-DAEMON-007: This follows the 5-step lifecycle:
+/// 1. Spawn worker
+/// 2. Wait for Ready
+/// 3. Send embed request (dummy text)
+/// 4. Wait for response
+/// 5. Graceful shutdown
+///
+/// The MIGraphX compilation is triggered by the inference request, and the
+/// compiled kernels are cached in the `ORT_MIGraphX_MODEL_CACHE_PATH`
+/// directory. Subsequent index runs skip the compilation step entirely.
+#[cfg(feature = "onnx")]
+fn run_warmup_inner(client: &crate::search::onnx::EmbeddingClient) -> Result<(), SetupError> {
+    println!("  -> Starting MIGraphX warmup pre-compilation...");
 
-        // Step 1-2: Ensure worker is spawned and ready.
-        // Use embed() which internally calls ensure_worker_ready().
-        // Step 3-4: Send a dummy embed request to trigger MIGraphX compilation.
-        const WARMUP_TEXT: &str = "warmup compilation text";
-        let result = client.embed(&[WARMUP_TEXT.to_string()], 1024);
+    // Step 1-2: Ensure worker is spawned and ready.
+    // Use embed() which internally calls ensure_worker_ready().
+    // Step 3-4: Send a dummy embed request to trigger MIGraphX compilation.
+    const WARMUP_TEXT: &str = "warmup compilation text";
+    let result = client.embed(&[WARMUP_TEXT.to_string()], 1024);
 
-        // Step 5: Graceful shutdown.
-        client.kill_worker();
+    // Step 5: Graceful shutdown.
+    client.kill_worker();
 
-        match result {
-            Ok(response) => {
-                println!(
-                    "  -> MIGraphX warm compilation complete (dim={}, count={})",
-                    response.dimension, response.count
-                );
-                tracing::info!("MIGraphX warm compilation complete");
-                Ok(())
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                // Check if the worker reported a provider. If it's CPU, the
-                // warmup is still "successful" in the sense that the worker
-                // ran - MIGraphX just wasn't available.
-                let provider = client.active_execution_provider();
-                if provider.as_deref() == Some("cpu") {
-                    println!("  -> MIGraphX warmup skipped: worker fell back to CPU provider");
-                    return Ok(());
-                }
-                Err(SetupError::Io(format!("MIGraphX warmup failed: {}", msg)))
-            }
+    match result {
+        Ok(response) => {
+            println!(
+                "  -> MIGraphX warm compilation complete (dim={}, count={})",
+                response.dimension, response.count
+            );
+            tracing::info!("MIGraphX warm compilation complete");
+            Ok(())
         }
-    }
-    #[cfg(not(feature = "onnx"))]
-    {
-        println!("  -> MIGraphX warmup skipped: ONNX feature not enabled");
-        Ok(())
+        Err(e) => {
+            let msg = e.to_string();
+            // Check if the worker reported a provider. If it's CPU, the
+            // warmup is still "successful" in the sense that the worker
+            // ran - MIGraphX just wasn't available.
+            let provider = client.active_execution_provider();
+            if provider.as_deref() == Some("cpu") {
+                println!("  -> MIGraphX warmup skipped: worker fell back to CPU provider");
+                return Ok(());
+            }
+            Err(SetupError::Io(format!("MIGraphX warmup failed: {}", msg)))
+        }
     }
 }
 
