@@ -30,7 +30,7 @@
 //!     stats when possible.
 
 use crate::cli::errors::detect_corruption;
-use crate::cli::index_job::{new_job_id, IndexJobSnapshot, IndexJobState, JobPaths};
+use crate::cli::index_job::{new_job_id, IndexJobSnapshot, IndexJobState, JobPaths, JobStatus};
 use crate::cli::leindex::{IndexStats, LeIndex};
 use crate::cli::mcp::protocol::JsonRpcError;
 use crate::cli::watcher::IndexWatcher;
@@ -504,7 +504,7 @@ impl ProjectRegistry {
             let mut jobs = self.index_jobs.lock().await;
             if let Some(existing) = jobs.get(&canonical).cloned() {
                 let current = existing.snapshot().await;
-                if current.status == "running" || !force_reindex {
+                if current.status == JobStatus::Running || !force_reindex {
                     existing
                 } else {
                     let state = Arc::new(IndexJobState::with_state_path(
@@ -524,7 +524,7 @@ impl ProjectRegistry {
             }
         };
 
-        if state.snapshot().await.status == "running" {
+        if state.snapshot().await.status == JobStatus::Running {
             let path = canonical.clone();
             let path_string = path.to_string_lossy().into_owned();
             let registry = Arc::clone(self);

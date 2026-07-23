@@ -1,8 +1,8 @@
 //! Durable checkpoint/recovery contract tests.
 
 use leindex::cli::index_job::{
-    CheckpointStore, FileFingerprint, JobCheckpointState, LexicalCheckpoint, NeuralCheckpoint,
-    ParseCheckpoint, ParsedFileCheckpoint, ScanCheckpoint,
+    CheckpointStore, FileFingerprint, JobCheckpointState, JobStatus, LexicalCheckpoint,
+    NeuralCheckpoint, ParseCheckpoint, ParsedFileCheckpoint, ScanCheckpoint,
 };
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -361,7 +361,8 @@ async fn disconnect_survival_job_continues_to_completion() {
             .await
             .expect("start job");
         assert_eq!(
-            snapshot.status, "running",
+            snapshot.status,
+            JobStatus::Running,
             "freshly started job must report running status"
         );
         drop(snapshot);
@@ -378,7 +379,7 @@ async fn disconnect_survival_job_continues_to_completion() {
             .start_index_job(Some(&project), false, false)
             .await
             .expect("poll job");
-        if snapshot.status != "running" {
+        if snapshot.status != JobStatus::Running {
             final_snapshot = snapshot;
             break;
         }
@@ -392,7 +393,8 @@ async fn disconnect_survival_job_continues_to_completion() {
     }
 
     assert_eq!(
-        final_snapshot.status, "complete",
+        final_snapshot.status,
+        JobStatus::Complete,
         "disconnect-survival job must reach complete status, got: {:?}",
         final_snapshot.last_error
     );
@@ -516,7 +518,8 @@ async fn panic_during_index_sets_failed_status() {
         .await
         .expect("start job");
     assert_eq!(
-        snapshot.status, "running",
+        snapshot.status,
+        JobStatus::Running,
         "job must be running immediately after start"
     );
     drop(snapshot);
@@ -531,7 +534,7 @@ async fn panic_during_index_sets_failed_status() {
             .start_index_job(Some(&project), false, false)
             .await
             .expect("poll job");
-        if snapshot.status != "running" {
+        if snapshot.status != JobStatus::Running {
             final_snapshot = snapshot;
             break;
         }
@@ -545,7 +548,8 @@ async fn panic_during_index_sets_failed_status() {
     }
 
     assert_eq!(
-        final_snapshot.status, "failed",
+        final_snapshot.status,
+        JobStatus::Failed,
         "panic-injected job must report failed status, got {:?}",
         final_snapshot.status
     );

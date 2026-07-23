@@ -93,6 +93,8 @@ pub mod index_builder;
 pub mod index_cache;
 /// Staleness detection: is_stale_fast, check_freshness, check_manifest_stale.
 pub mod index_freshness;
+/// Registry-owned resumable indexing job state.
+pub mod index_job;
 /// Core orchestration logic for indexing and search.
 pub mod leindex;
 /// Canonical project identity for live, non-hydrating MCP reads.
