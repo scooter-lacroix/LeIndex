@@ -255,6 +255,13 @@ pub enum Commands {
         /// Check current setup status without modifying anything
         #[arg(long = "check")]
         check: bool,
+
+        /// Pre-compile MIGraphX kernels by spawning the embed worker and
+        /// sending a warmup inference request. This populates the MIGraphX
+        /// cache so subsequent index runs skip compilation.
+        /// Auto-runs on cold cache when neural is enabled with a GPU provider.
+        #[arg(long = "warmup")]
+        warmup: bool,
     },
 }
 
@@ -396,7 +403,8 @@ impl Cli {
                 cpu,
                 gpu,
                 check,
-            } => cmd_setup_impl(neural, no_neural, cpu, gpu, check).await,
+                warmup,
+            } => cmd_setup_impl(neural, no_neural, cpu, gpu, check, warmup).await,
         };
 
         // Write the memory report (if tracking was enabled) before returning.
@@ -966,14 +974,10 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
     // Create LeIndex and try to load from storage
     let mut leindex = LeIndex::new(&canonical_path).context("Failed to create LeIndex instance")?;
 
-    // For diagnostics, use the lightweight loading path: load PDG + persisted
-    // stats without rebuilding the search engine (which is O(N) and takes
-    // ~800ms for 10K nodes). The diagnostics output only needs PDG node/edge
-    // counts and persisted IndexStats, not a functional search index.
-    if let Err(e) = leindex.load_pdg_from_storage() {
-        warn!("Failed to load PDG from storage: {}", e);
-    }
-    // Load persisted stats (total_signatures, indexed_nodes, etc.)
+    // Diagnostics must remain a snapshot operation. Do not hydrate the PDG or
+    // rebuild search state here; persisted stats/health plus one live Git
+    // status provide the useful facts without the multi-gigabyte resident load
+    // that previously made `leindex diagnostics` take tens of seconds.
     if let Err(e) = leindex.load_stats_from_storage() {
         warn!("Failed to load persisted stats: {}", e);
     }
@@ -983,38 +987,33 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         .get_diagnostics()
         .context("Failed to get diagnostics")?;
 
-    // Use coverage report for accurate indexed_files count
-    let indexed_ct = leindex
-        .coverage_report()
-        .ok()
-        .map(|c| c.indexed_files)
+    let health = crate::cli::index_freshness::load_health(leindex.storage_path());
+    let indexed_ct = health
+        .as_ref()
+        .map(|snapshot| snapshot.indexed_file_count)
         .unwrap_or(diag.stats.files_parsed);
-
-    // Compute staleness: use is_stale_fast() for the boolean check (fast:
-    // mtime + count comparison), and only run the expensive check_freshness()
-    // (which hashes ALL source files) when stale to get detailed lists.
-    let stale_fast = leindex.is_stale_fast();
-    let (changed, deleted, stale_check_failed) = if stale_fast {
-        match leindex.check_freshness() {
-            Ok((changed, deleted)) => (changed, deleted, false),
-            Err(err) => {
-                tracing::warn!("failed to perform authoritative freshness check: {}", err);
-                (vec![], vec![], true)
-            }
-        }
-    } else {
-        (vec![], vec![], false)
-    };
-    let is_stale = !changed.is_empty() || !deleted.is_empty();
-    // When is_stale_fast() reported stale, we ran check_freshness() which
-    // is authoritative (hash-based). If check_freshness found no changes,
-    // the is_stale_fast positive was a false positive (e.g., same-second
-    // mtime) and the index is actually fresh.
-    let stale = if stale_fast {
-        is_stale || stale_check_failed
-    } else {
-        false
-    };
+    let (changed, deleted) = crate::cli::git::status(leindex.project_path())
+        .ok()
+        .map(|status| {
+            let changed = status
+                .modified
+                .into_iter()
+                .chain(status.staged)
+                .chain(status.untracked)
+                .map(|path| leindex.project_path().join(path))
+                .collect::<Vec<_>>();
+            (changed, status.deleted)
+        })
+        .unwrap_or_else(|| (Vec::new(), Vec::new()));
+    let health_stale = health.as_ref().is_some_and(|snapshot| {
+        matches!(
+            snapshot.status,
+            crate::cli::leindex::ComponentStatus::Stale
+                | crate::cli::leindex::ComponentStatus::Partial
+                | crate::cli::leindex::ComponentStatus::Failed
+        )
+    });
+    let stale = health_stale || !changed.is_empty() || !deleted.is_empty();
 
     // Estimate last_indexed_secs_ago from storage_path mtime
     let storage_path = leindex.storage_path();
@@ -1074,6 +1073,7 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
         "index_size_mb": diag.memory_usage_bytes as f64 / 1024.0 / 1024.0,
         "symbol_count": diag.stats.indexed_nodes,
         "stale": stale,
+        "freshness": health,
         "last_indexed_secs_ago": last_indexed_secs_ago,
         "embedding_model": embedding_model,
         "ort_path": ort_path,
@@ -1875,6 +1875,7 @@ async fn cmd_setup_impl(
     cpu: bool,
     gpu: Option<String>,
     check: bool,
+    warmup: bool,
 ) -> AnyhowResult<()> {
     use crate::cli::leindex::setup;
 
@@ -1943,7 +1944,53 @@ async fn cmd_setup_impl(
         }
     }
 
+    // VAL-DAEMON-007: MIGraphX warmup pre-compilation.
+    //
+    // When --warmup is explicitly requested (or auto-triggered for a cold
+    // MIGraphX cache), spawn the embed worker, send a dummy embed request
+    // to trigger MIGraphX compilation, and shut down gracefully. This
+    // populates the MIGraphX cache so subsequent index runs skip the
+    // multi-minute compilation step.
+    #[cfg(feature = "onnx")]
+    if warmup || should_auto_warmup(&choices, &result) {
+        if let Err(e) = setup::run_warmup() {
+            eprintln!("  -> MIGraphX warmup warning: {}", e);
+            // Warmup failure is non-fatal; indexing will still work.
+        }
+    }
+    #[cfg(not(feature = "onnx"))]
+    if warmup {
+        eprintln!("  -> MIGraphX warmup skipped: ONNX feature not enabled");
+    }
+
     Ok(())
+}
+
+/// Determine whether auto-warmup should run on a cold MIGraphX cache.
+///
+/// Auto-warmup triggers when neural is enabled, a GPU (MIGraphX) provider was
+/// selected, and the MIGraphX cache directory does not yet exist (cold cache).
+#[cfg(feature = "onnx")]
+fn should_auto_warmup(
+    choices: &crate::cli::leindex::setup::SetupChoices,
+    result: &crate::cli::leindex::setup::SetupResult,
+) -> bool {
+    use crate::cli::leindex::setup::ExecutionProvider;
+
+    // Only warm up for MIGraphX provider.
+    let is_migraphx = choices.provider == Some(ExecutionProvider::Migraphx);
+    if !is_migraphx {
+        return false;
+    }
+
+    // Only auto-warm if setup succeeded (ORT + model present).
+    if !result.ort_installed || !result.model_present {
+        return false;
+    }
+
+    // Auto-warm only when the MIGraphX cache is cold (does not exist yet).
+    let cache_path = crate::search::onnx::client::migraphx_cache_path("qwen3-embed-0.6b-dynamic");
+    !cache_path.exists()
 }
 
 /// Validate flag conflicts that clap cannot always catch via `conflicts_with`.
@@ -2080,8 +2127,7 @@ async fn handle_mcp_request(
     _project_path: PathBuf,
 ) -> anyhow::Result<Option<JsonRpcResponse>> {
     use crate::cli::mcp::server::{
-        handle_tool_call, list_tools_json, long_running_tool_timeout_secs, HANDLERS,
-        SERVER_INSTANCE, SERVER_STATE,
+        handle_tool_call, list_tools_json, HANDLERS, SERVER_INSTANCE, SERVER_STATE,
     };
 
     let method_name = request.method.clone();
@@ -2174,41 +2220,10 @@ async fn handle_mcp_request(
             Ok(Some(JsonRpcResponse::success(id, serde_json::json!({}))))
         }
         "tools/call" => {
-            // Per-tool-call hard timeout, mirroring the HTTP transport
-            // (server.rs tools/call arm). Without this, a slow or hung
-            // tool call blocks the stdio read loop indefinitely, making
-            // the MCP server appear dead to the client.
-            //
-            // Long-running tools listed in LONG_RUNNING_TOOL_TIMEOUTS
-            // (e.g. leindex.index, which can take several minutes for a
-            // first-time build of a large monorepo) get an extended cap
-            // so the timeout does not drop the future mid-swap. All
-            // other tools use the configurable
-            // `server_instance.config.request_timeout_secs` (30s by
-            // default), matching the HTTP transport path which reads
-            // from the same config source.
-            let tool_name = request
-                .params
-                .as_ref()
-                .and_then(|p| p.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or("");
-            let cap_secs = long_running_tool_timeout_secs(tool_name)
-                .unwrap_or(server_instance.config.request_timeout_secs);
-            let timeout_duration = std::time::Duration::from_secs(cap_secs);
-
-            let tool_result = tokio::time::timeout(
-                timeout_duration,
-                handle_tool_call(state, handlers, &request),
-            )
-            .await;
-
-            let result = match tool_result {
-                Ok(r) => r,
-                Err(_) => Err(crate::cli::mcp::protocol::JsonRpcError::internal_error(
-                    format!("Tool call timed out after {}s", cap_secs),
-                )),
-            };
+            // Correctness-critical work is owned by the registry/job layer;
+            // awaiting it here never drops a spawned blocking build halfway
+            // through persistence or publication.
+            let result = handle_tool_call(state, handlers, &request).await;
             Ok(Some(JsonRpcResponse::from_result(id, result)))
         }
         "tools/list" => {
@@ -2442,6 +2457,7 @@ mod tests {
                 cpu,
                 gpu,
                 check,
+                warmup: _,
             }) => {
                 assert!(neural);
                 assert!(!no_neural);
@@ -2494,6 +2510,7 @@ mod tests {
                 cpu,
                 gpu,
                 check,
+                warmup: _,
             }) => {
                 assert!(!neural);
                 assert!(no_neural);

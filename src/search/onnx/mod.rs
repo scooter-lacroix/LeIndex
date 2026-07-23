@@ -33,7 +33,9 @@ pub mod remote;
 pub use chunking::{ChunkConfig, CrossLanguageChunker, SemanticChunk};
 
 #[cfg(feature = "onnx")]
-pub use client::{ClientError, EmbedResult, EmbeddingClient};
+pub use client::{
+    migraphx_cache_path, ClientError, EmbedResult, EmbeddingClient, WorkerAvailability,
+};
 
 #[cfg(feature = "remote-embeddings")]
 pub use remote::{

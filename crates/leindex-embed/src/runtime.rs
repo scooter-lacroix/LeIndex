@@ -25,6 +25,13 @@ use crate::protocol::{
 use crate::provider::ExecutionProviderSelector;
 use crate::startup::{StartupReport, StartupReporter};
 
+fn unix_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u64::MAX as u128) as u64)
+        .unwrap_or(0)
+}
+
 // ONNX Runtime imports - only available with "onnx" feature
 #[cfg(feature = "onnx")]
 use ort::logging::LogLevel;
@@ -52,6 +59,13 @@ pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 
 /// Default maximum single-text size in bytes (1 MiB).
 pub const DEFAULT_MAX_TEXT_SIZE: usize = 1024 * 1024;
+
+/// Read buffer capacity for BufReader on the IPC data path.
+///
+/// VAL-DAEMON-006: A 128KB buffer reduces the number of `read()` syscalls
+/// for large embedding responses (e.g., 1024-dim x 32 batch x 4 bytes =
+/// 128KB fits in a single read instead of many small reads).
+pub const READ_BUF_CAPACITY: usize = 128 * 1024;
 
 /// Default maximum texts per ONNX inference call for legacy fixed-batch models.
 #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
@@ -196,10 +210,15 @@ impl RuntimeConfig {
         let model_name = std::env::var("LEINDEX_WORKER_MODEL")
             .ok()
             .or_else(|| {
-                crate::config::LeIndexConfig::load()
-                    .ok()
-                    .map(|cfg| cfg.neural.model_name)
-                    .filter(|name| !name.trim().is_empty())
+                // VAL-DAEMON-002: Use load_cached() so config TOML is parsed
+                // at most once per process via OnceLock.
+                let cfg = crate::config::LeIndexConfig::load_cached();
+                let name = cfg.neural.model_name.clone();
+                if name.trim().is_empty() {
+                    None
+                } else {
+                    Some(name)
+                }
             })
             .unwrap_or_else(|| "qwen3-embed-0.6b".to_string());
 
@@ -233,6 +252,7 @@ pub struct WorkerRuntime {
     config: RuntimeConfig,
     last_activity: Arc<Mutex<Instant>>,
     shutdown_flag: Arc<AtomicBool>,
+    started_unix_ms: u64,
 
     /// ONNX session for neural embedding inference. Only available with `onnx` feature.
     #[cfg(feature = "onnx")]
@@ -298,6 +318,7 @@ impl WorkerRuntime {
             config,
             last_activity: Arc::new(Mutex::new(Instant::now())),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
+            started_unix_ms: unix_now_ms(),
             #[cfg(feature = "onnx")]
             session,
             #[cfg(feature = "onnx")]
@@ -307,6 +328,48 @@ impl WorkerRuntime {
             #[cfg(feature = "onnx")]
             provider_runtime_status,
         }
+    }
+
+    /// Whether this runtime can serve neural requests immediately.
+    pub fn is_neural_ready(&self) -> bool {
+        #[cfg(feature = "onnx")]
+        {
+            self.session.is_some() && self.tokenizer.is_some()
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            true
+        }
+    }
+
+    /// Build a control-plane health response without touching model work.
+    pub fn health_response(
+        &self,
+        state: protocol::WorkerState,
+        error: Option<String>,
+    ) -> protocol::HealthResponse {
+        #[cfg(feature = "onnx")]
+        let provider = Some(self.provider_runtime_status.execution_provider.clone());
+        #[cfg(not(feature = "onnx"))]
+        let provider = Some(self.config.execution_provider.clone());
+        protocol::HealthResponse {
+            state,
+            phase: match state {
+                protocol::WorkerState::Initializing => "initializing",
+                protocol::WorkerState::Ready => "ready",
+                protocol::WorkerState::Failed => "failed",
+            }
+            .to_string(),
+            started_unix_ms: self.started_unix_ms,
+            provider,
+            model: self.config.model_name.clone(),
+            error,
+        }
+    }
+
+    /// Emit the normal startup report after model initialization completes.
+    pub fn log_startup_report(&self) {
+        self.build_startup_report().log();
     }
 
     #[cfg(feature = "onnx")]
@@ -619,9 +682,7 @@ impl WorkerRuntime {
         reader: R,
         writer: W,
     ) -> anyhow::Result<()> {
-        // Emit startup report
-        let startup = self.build_startup_report();
-        startup.log();
+        self.log_startup_report();
 
         self.run_loop(reader, writer)
     }
@@ -721,7 +782,9 @@ impl WorkerRuntime {
         //   1. The pipe closes (EOF on read_exact), or
         //   2. The `tx` channel is disconnected (main loop exited).
         std::thread::spawn(move || {
-            let mut buf_reader = io::BufReader::new(reader);
+            // VAL-DAEMON-006: Use 128KB BufReader capacity to reduce syscall
+            // count for large embedding requests and responses.
+            let mut buf_reader = io::BufReader::with_capacity(READ_BUF_CAPACITY, reader);
             let mut frame_buf: Vec<u8> = Vec::new();
             loop {
                 // Read 4-byte length prefix
@@ -829,6 +892,19 @@ impl WorkerRuntime {
                 Err(e) => protocol::error_frame(batch_id, e)
                     .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
             },
+            MsgType::HealthRequest => protocol::health_response_frame(
+                batch_id,
+                self.health_response(
+                    if self.is_neural_ready() {
+                        protocol::WorkerState::Ready
+                    } else {
+                        protocol::WorkerState::Failed
+                    },
+                    (!self.is_neural_ready())
+                        .then(|| "neural runtime unavailable after initialization".to_string()),
+                ),
+            )
+            .unwrap_or_else(|e| self.internal_error_frame(batch_id, &e)),
             _ => {
                 let err = WorkerError {
                     kind: ErrorKind::InvalidRequest,
@@ -1646,7 +1722,7 @@ mod tests {
             configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "cpu"),
             DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE
         );
-        assert!(DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE > 1);
+        const _: () = assert!(DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE > 1);
     }
 
     #[test]

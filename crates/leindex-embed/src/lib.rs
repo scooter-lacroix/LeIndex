@@ -35,8 +35,8 @@ pub mod startup;
 pub mod worker_main;
 
 pub use protocol::{
-    BatchId, EmbedRequest, EmbedResponse, ErrorKind, Frame, FrameHeader, Request, RerankRequest,
-    RerankResponse, Response,
+    BatchId, EmbedRequest, EmbedResponse, ErrorKind, Frame, FrameHeader, HealthRequest,
+    HealthResponse, Request, RerankRequest, RerankResponse, Response, WorkerState,
 };
 
 pub use batch::{split_request, stitch_responses, truncate_text, BatchConfig};
@@ -51,7 +51,7 @@ pub use ort_discovery::{
 pub use provider::{is_cuda_compiled_in, is_migraphx_compiled_in, ExecutionProviderSelector};
 pub use runtime::{
     RuntimeConfig, WorkerRuntime, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_FRAME_SIZE,
-    DEFAULT_MAX_TEXT_SIZE,
+    DEFAULT_MAX_TEXT_SIZE, READ_BUF_CAPACITY,
 };
 pub use startup::{StartupReport, StartupReporter};
 

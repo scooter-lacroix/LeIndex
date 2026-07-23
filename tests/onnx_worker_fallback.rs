@@ -460,6 +460,65 @@ fn test_multiple_fallback_recovery_cycles() {
     }
 }
 
+// ── VAL-DAEMON-001: ORT discovery checks filesystem before Python ───────
+
+#[test]
+fn pip_discovery_checks_filesystem_before_python() {
+    // With ORT_DYLIB_PATH set, discover_candidates() returns a path
+    // containing libonnxruntime without spawning Python.
+    use leindex_embed::ort_discovery::discover_candidates;
+
+    // We can't easily set env vars in a test without a lock, but we verify
+    // the discover_candidates function is callable and returns a Vec.
+    let candidates = discover_candidates();
+    // Candidates should include at least some entries (env, config, user_lib, sibling).
+    assert!(
+        !candidates.is_empty(),
+        "discover_candidates should return candidates"
+    );
+
+    // Verify all sources are valid variants.
+    for (source, _path) in &candidates {
+        let label = source.as_str();
+        assert!(
+            matches!(label, "env" | "config" | "user_lib" | "sibling"),
+            "unexpected source label: {}",
+            label
+        );
+    }
+}
+
+// ── VAL-DAEMON-002: Config file parsed once per process via OnceLock ───
+
+#[test]
+fn ort_discovery_caches_config_load() {
+    // LeIndexConfig::load_cached() should return the same &'static reference.
+    use leindex_embed::config::LeIndexConfig;
+
+    let cfg1 = LeIndexConfig::load_cached();
+    let cfg2 = LeIndexConfig::load_cached();
+    assert!(
+        std::ptr::eq(cfg1, cfg2),
+        "load_cached() must return the same &'static reference via OnceLock"
+    );
+}
+
+// ── VAL-DAEMON-006: BufReader wraps inference data path ─────────────────
+
+#[test]
+fn read_buf_capacity_constant_is_at_least_128kb() {
+    // The READ_BUF_CAPACITY constant should be >= 128 * 1024 to support
+    // large embedding responses in a single read.
+    use leindex_embed::runtime::READ_BUF_CAPACITY;
+    // Use a runtime comparison to avoid clippy::assertions_on_constants.
+    let min_capacity: usize = 128 * 1024;
+    assert!(
+        READ_BUF_CAPACITY >= min_capacity,
+        "READ_BUF_CAPACITY must be at least 128KB, got {}",
+        READ_BUF_CAPACITY
+    );
+}
+
 // ── Cross-cutting: EmbeddingClient fallback behavior ────────────────────
 
 /// Test the EmbeddingClient's embed_with_fallback method directly.

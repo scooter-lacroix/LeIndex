@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Environment variable for the LeIndex home directory override.
 pub const LEINDEX_HOME_ENV: &str = "LEINDEX_HOME";
@@ -204,6 +205,12 @@ pub fn model_dir_path() -> Option<PathBuf> {
 
 // ── Config I/O ──────────────────────────────────────────────────────────
 
+/// Process-local cache for `LeIndexConfig::load_cached()`.
+///
+/// VAL-DAEMON-002: Config TOML is parsed once per process, not on every
+/// call. Subsequent calls return the `&'static` reference instantly.
+static CACHED_CONFIG: OnceLock<LeIndexConfig> = OnceLock::new();
+
 impl LeIndexConfig {
     /// Write the configuration to the TOML file.
     ///
@@ -236,6 +243,30 @@ impl LeIndexConfig {
     /// VAL-SETUP-030: Merges defaults for missing keys.
     pub fn load() -> Result<Self, ConfigError> {
         Self::load_from_path(&config_file_path().ok_or(ConfigError::NoHomeDir)?)
+    }
+
+    /// Load config from TOML, cached in a process-local `OnceLock`.
+    ///
+    /// VAL-DAEMON-002: The second and all subsequent calls complete in
+    /// effectively zero time (no disk I/O, no TOML parse). All embed-crate
+    /// callers should use `load_cached()` instead of `load()` so the config
+    /// is parsed at most once per process.
+    ///
+    /// On first call, if the config file is missing or corrupted, the cache
+    /// stores `LeIndexConfig::default()` and returns that. This means the
+    /// first-call error is not recoverable via `load_cached()`; callers that
+    /// need error handling or recovery should use `load()` or
+    /// `load_or_recover()` for the initial read.
+    pub fn load_cached() -> &'static LeIndexConfig {
+        CACHED_CONFIG.get_or_init(|| {
+            Self::load().unwrap_or_else(|err| {
+                tracing::warn!(
+                    error = %err,
+                    "failed to load leindex.toml for caching; using defaults"
+                );
+                LeIndexConfig::default()
+            })
+        })
     }
 
     /// Load config from an explicit path (for testing).
@@ -637,5 +668,29 @@ mod tests {
         assert_eq!(first, second);
 
         std::env::remove_var(LEINDEX_HOME_ENV);
+    }
+
+    #[test]
+    fn test_load_cached_returns_same_reference() {
+        // VAL-DAEMON-002: load_cached() should return the same &'static
+        // reference on every call so the TOML is parsed at most once per
+        // process.
+        let cfg1 = LeIndexConfig::load_cached();
+        let cfg2 = LeIndexConfig::load_cached();
+        // Same pointer = same allocation cached via OnceLock.
+        assert!(
+            std::ptr::eq(cfg1, cfg2),
+            "load_cached() must return the same &'static reference"
+        );
+    }
+
+    #[test]
+    fn test_load_cached_returns_valid_config() {
+        // VAL-DAEMON-002: load_cached() returns a valid config (even if it's
+        // the default when no file exists).
+        let cfg = LeIndexConfig::load_cached();
+        // The cached config should be a valid LeIndexConfig instance.
+        assert_eq!(cfg.search.search_mode, "hybrid");
+        assert_eq!(cfg.indexing.batch_size, 500);
     }
 }

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -31,16 +31,16 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 
 use leindex_embed::protocol::{
-    self, BatchId, EmbedRequest, EmbedResponse, Frame, MsgType, RerankDocument, RerankRequest,
-    RerankResponse, Response, WorkerError,
+    self, BatchId, EmbedRequest, EmbedResponse, ErrorKind, Frame, HealthResponse, MsgType,
+    RerankDocument, RerankRequest, RerankResponse, Response, WorkerError, WorkerState,
 };
 
-/// Read a response frame from the worker with timeout enforcement.
+/// Read a response frame from the worker.
 ///
 /// This is the core I/O routine used by the persistent reader thread.
 /// It reads the 4-byte length prefix followed by the payload, enforcing
 /// the max frame size guard to prevent excessive allocations.
-fn read_frame_with_timeout<R: Read>(reader: &mut R) -> Result<Vec<u8>, ClientError> {
+fn read_frame<R: Read>(reader: &mut R) -> Result<Vec<u8>, ClientError> {
     // Read response length (4 bytes, little-endian)
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf) {
@@ -98,14 +98,39 @@ fn embed_daemon_enabled() -> bool {
 /// A response larger than this is rejected with a clear protocol error.
 const MAX_RESPONSE_FRAME_SIZE: u32 = 64 * 1024 * 1024; // 64 MiB
 
-/// Timeout for IPC read/write operations.
+/// Read buffer capacity for BufReader wrapping the inference data path.
 ///
-/// If the worker does not respond within this window, the IPC operation
-/// fails with a timeout error rather than blocking indefinitely.
-/// Set to 600 seconds because the first MIGraphX compile of Qwen3 can take
-/// just under five minutes before the compiled `.mxr` cache exists. Warm runs
-/// are expected to complete in seconds.
-const IPC_TIMEOUT_SECS: u64 = 600;
+/// VAL-DAEMON-006: A 128KB buffer reduces the number of `read()` syscalls
+/// for large embedding responses (e.g., 1024-dim x 32 batch x 4 bytes =
+/// 128KB fits in a single read instead of many small reads).
+const READ_BUF_CAPACITY: usize = 128 * 1024;
+
+/// Control-plane lock wait. The lock is held only while publishing a daemon
+/// process/socket, never while loading ORT or compiling a model.
+const DAEMON_LOCK_WAIT_SECS: u64 = 5;
+
+/// Socket bind is a transport startup guard, not an inference deadline. The
+/// worker binds before model initialization, so a healthy process normally
+/// reaches this point in milliseconds.
+const DAEMON_BIND_WAIT_SECS: u64 = 2;
+
+/// Health probes are bounded only to avoid a dead control-plane socket
+/// stalling a readiness observation. Model loading and inference have no
+/// elapsed-time cancel.
+#[cfg(unix)]
+const DAEMON_HEALTH_WAIT: Duration = Duration::from_millis(250);
+
+/// Poll interval while a resident worker finishes model initialization.
+const DAEMON_READINESS_POLL: Duration = Duration::from_millis(25);
+
+/// Maximum wall-clock duration to wait for the daemon to transition from
+/// Initializing to Ready before treating the neural worker as unavailable.
+///
+/// This is a **readiness deadline**, not a cancellation of inference or model
+/// loading. When the deadline fires, indexing proceeds with core TF-IDF/PDG
+/// results. 120 seconds is generous enough for real cold starts including
+/// first-time ONNX model compilation.
+const DAEMON_READY_MAX_WAIT: Duration = Duration::from_secs(120);
 
 fn platform_binary_name(binary_name: &str) -> String {
     if cfg!(windows) {
@@ -117,17 +142,19 @@ fn platform_binary_name(binary_name: &str) -> String {
 
 /// Resolve the path to the worker binary.
 ///
-/// First tries to find `leindex-embed` in the same directory as the running
-/// binary (sibling path), so the worker is found even when the main binary
-/// is invoked via absolute path. Falls back to PATH lookup if the sibling
-/// doesn't exist.
+/// First tries the running binary's directory and its Cargo `deps` parent, so
+/// tests/invocations from `target/{debug,release}/deps` use the worker built
+/// from this checkout instead of an older globally installed binary. Falls
+/// back to PATH lookup for packaged installations.
 fn resolve_worker_binary() -> Result<PathBuf, std::io::Error> {
     let binary_name = platform_binary_name("leindex-embed");
     if let Ok(exe) = std::env::current_exe() {
         if let Some(exe_dir) = exe.parent() {
-            let sibling = exe_dir.join(&binary_name);
-            if sibling.exists() {
-                return Ok(sibling);
+            for candidate_dir in [Some(exe_dir), exe_dir.parent()].into_iter().flatten() {
+                let sibling = candidate_dir.join(&binary_name);
+                if sibling.is_file() {
+                    return Ok(sibling);
+                }
             }
         }
     }
@@ -220,6 +247,15 @@ fn migraphx_model_cache_path(model_name: Option<&str>) -> Option<std::path::Path
     })
 }
 
+/// Public accessor for the MIGraphX model cache path.
+///
+/// VAL-DAEMON-007: Used by `leindex setup --warmup` to check whether the
+/// MIGraphX cache is cold (absent) and should trigger auto-warmup.
+pub fn migraphx_cache_path(model_name: &str) -> std::path::PathBuf {
+    migraphx_model_cache_path(Some(model_name))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/leindex-migraphx-cache-unresolved"))
+}
+
 fn sanitize_cache_component(value: &str) -> String {
     let value: String = value
         .chars()
@@ -257,6 +293,143 @@ fn daemon_socket_path(provider: Option<&str>, model_name: Option<&str>) -> Optio
 
     use std::os::unix::ffi::OsStrExt;
     (socket_path.as_os_str().as_bytes().len() <= 100).then_some(socket_path)
+}
+
+#[cfg(unix)]
+fn daemon_status_path(provider: Option<&str>, model_name: Option<&str>) -> Option<PathBuf> {
+    daemon_socket_path(provider, model_name).map(|path| path.with_extension("status"))
+}
+
+#[cfg(unix)]
+fn daemon_pid_path(provider: Option<&str>, model_name: Option<&str>) -> Option<PathBuf> {
+    daemon_socket_path(provider, model_name).map(|path| path.with_extension("pid"))
+}
+
+#[cfg(unix)]
+fn cleanup_daemon_paths(socket_path: &Path) {
+    let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_file(socket_path.with_extension("status"));
+    let _ = std::fs::remove_file(socket_path.with_extension("pid"));
+}
+
+fn worker_health_snapshot(
+    state: WorkerState,
+    provider: Option<String>,
+    model: Option<String>,
+    error: Option<String>,
+) -> HealthResponse {
+    let phase = match state {
+        WorkerState::Initializing => "initializing",
+        WorkerState::Ready => "ready",
+        WorkerState::Failed => "failed",
+    };
+    HealthResponse {
+        state,
+        phase: phase.to_string(),
+        started_unix_ms: 0,
+        provider,
+        model: model.unwrap_or_else(|| "qwen3-embed-0.6b".to_string()),
+        error,
+    }
+}
+
+#[cfg(unix)]
+fn status_state(path: &Path) -> Option<WorkerState> {
+    let status = std::fs::read_to_string(path).ok()?;
+    match status.trim() {
+        "initializing" => Some(WorkerState::Initializing),
+        "ready" => Some(WorkerState::Ready),
+        "failed" => Some(WorkerState::Failed),
+        _ => None,
+    }
+}
+
+#[cfg(unix)]
+fn daemon_pid_alive(path: &Path) -> bool {
+    let Some(pid) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+    else {
+        return false;
+    };
+    if pid <= 0 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(unix)]
+fn probe_daemon_health(socket_path: &Path) -> Result<HealthResponse, ClientError> {
+    probe_daemon_health_with_timeout(socket_path, Some(DAEMON_HEALTH_WAIT))
+}
+
+#[cfg(unix)]
+fn probe_daemon_health_with_timeout(
+    socket_path: &Path,
+    read_timeout: Option<Duration>,
+) -> Result<HealthResponse, ClientError> {
+    let mut stream = UnixStream::connect(socket_path).map_err(|error| {
+        ClientError::Ipc(format!(
+            "failed to connect worker health socket {}: {}",
+            socket_path.display(),
+            error
+        ))
+    })?;
+    if let Some(timeout) = read_timeout {
+        stream
+            .set_read_timeout(Some(timeout))
+            .and_then(|_| stream.set_write_timeout(Some(timeout)))
+            .map_err(|error| {
+                ClientError::Ipc(format!("failed to configure health socket: {}", error))
+            })?;
+    }
+
+    let batch_id = BatchId::new(BATCH_COUNTER.fetch_add(1, Ordering::Relaxed));
+    let wire = protocol::health_request_frame(batch_id)
+        .map_err(|error| ClientError::Ipc(error.to_string()))?
+        .encode_wire()
+        .map_err(|error| ClientError::Ipc(error.to_string()))?;
+    stream
+        .write_all(&wire)
+        .and_then(|_| stream.flush())
+        .map_err(|error| {
+            ClientError::Ipc(format!("failed to send worker health request: {}", error))
+        })?;
+
+    let payload = read_frame(&mut stream)?;
+    let frame =
+        Frame::from_wire_bytes(&payload).map_err(|error| ClientError::Ipc(error.to_string()))?;
+    if frame.header.batch_id != batch_id {
+        return Err(ClientError::Protocol(format!(
+            "health response batch_id mismatch: expected {}, got {}",
+            batch_id, frame.header.batch_id
+        )));
+    }
+    match frame.header.msg_type {
+        MsgType::HealthResponse => match frame
+            .decode_payload::<Response>()
+            .map_err(|error| ClientError::Ipc(error.to_string()))?
+        {
+            Response::Health(health) => Ok(health),
+            _ => Err(ClientError::Protocol(
+                "expected Health response payload".to_string(),
+            )),
+        },
+        MsgType::Error => match frame
+            .decode_payload::<Response>()
+            .map_err(|error| ClientError::Ipc(error.to_string()))?
+        {
+            Response::Error(error) => Err(ClientError::Worker(error)),
+            _ => Err(ClientError::Protocol(
+                "expected Error response payload".to_string(),
+            )),
+        },
+        other => Err(ClientError::Protocol(format!(
+            "unexpected health response type: {:?}",
+            other
+        ))),
+    }
 }
 
 fn parse_config_assignment(line: &str, key: &str) -> Option<String> {
@@ -317,12 +490,36 @@ pub enum ClientError {
     #[error("protocol error: {0}")]
     Protocol(String),
 
-    /// IPC operation timed out.
-    #[error(
-        "IPC timeout: worker did not respond within {} seconds",
-        IPC_TIMEOUT_SECS
-    )]
+    /// A control-plane operation exceeded its bounded transport guard.
+    ///
+    /// This is never used to cancel model loading or inference. The request
+    /// path waits for a connected peer or receives an explicit worker error.
+    #[error("worker control-plane operation timed out")]
     Timeout,
+}
+
+/// Non-blocking observation of the local neural worker.
+#[derive(Debug, Clone)]
+pub enum WorkerAvailability {
+    /// The worker has completed model initialization and accepts inference.
+    Ready,
+    /// The daemon is reachable but still loading runtime/model state.
+    Initializing(HealthResponse),
+    /// Initialization completed unsuccessfully; the health payload explains why.
+    Failed(HealthResponse),
+    /// No worker process/socket is currently available.
+    Absent,
+}
+
+impl WorkerAvailability {
+    /// Return whether neural inference can be attempted now.
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    fn is_unavailable(&self) -> bool {
+        matches!(self, Self::Initializing(_) | Self::Failed(_) | Self::Absent)
+    }
 }
 
 /// Result of an embed request with fallback semantics.
@@ -385,6 +582,9 @@ pub struct EmbeddingClient {
     last_startup_report: Arc<Mutex<Option<String>>>,
     /// Whether Unix socket daemon reuse is allowed.
     use_daemon: bool,
+    /// Cached worker config env, read from leindex.toml at most once per client.
+    /// VAL-DAEMON-003: Avoids re-reading leindex.toml on every availability() poll.
+    cached_config: OnceLock<WorkerConfigEnv>,
 }
 
 /// Manual Debug impl — Child doesn't implement Debug.
@@ -407,6 +607,7 @@ impl Clone for EmbeddingClient {
             worker: Arc::clone(&self.worker),
             last_startup_report: Arc::clone(&self.last_startup_report),
             use_daemon: self.use_daemon,
+            cached_config: OnceLock::new(),
         }
     }
 }
@@ -540,6 +741,7 @@ impl EmbeddingClient {
             worker: Arc::new(Mutex::new(None)),
             last_startup_report: Arc::new(Mutex::new(None)),
             use_daemon: embed_daemon_enabled(),
+            cached_config: OnceLock::new(),
         }
     }
 
@@ -549,6 +751,7 @@ impl EmbeddingClient {
             worker: Arc::new(Mutex::new(None)),
             last_startup_report: Arc::new(Mutex::new(None)),
             use_daemon: false,
+            cached_config: OnceLock::new(),
         }
     }
 
@@ -558,6 +761,140 @@ impl EmbeddingClient {
             .lock()
             .ok()
             .and_then(|line| line.as_deref().and_then(parse_startup_report_provider))
+    }
+
+    /// Return cached worker config env, reading from leindex.toml at most once.
+    ///
+    /// VAL-DAEMON-003: The config file is read on the first call and stored in
+    /// a `OnceLock`, so subsequent `availability()` polling does not re-read
+    /// the file from disk.
+    fn cached_config(&self) -> &WorkerConfigEnv {
+        self.cached_config
+            .get_or_init(read_worker_config_env_from_config)
+    }
+
+    /// Observe worker lifecycle without spawning a process or waiting for
+    /// model initialization. Socket health is the source of truth for daemon
+    /// workers; the pipe startup report remains the compatibility boundary.
+    pub fn availability(&self) -> WorkerAvailability {
+        let report = self
+            .last_startup_report
+            .lock()
+            .ok()
+            .and_then(|report| report.clone());
+        if !self.use_daemon {
+            return match report {
+                Some(report) if report.contains("status=available") => WorkerAvailability::Ready,
+                Some(report) if report.contains("status=unavailable") => {
+                    WorkerAvailability::Failed(worker_health_snapshot(
+                        WorkerState::Failed,
+                        parse_startup_report_provider(&report),
+                        None,
+                        Some(report),
+                    ))
+                }
+                _ => WorkerAvailability::Absent,
+            };
+        }
+
+        #[cfg(unix)]
+        {
+            // VAL-DAEMON-003: Use cached config so leindex.toml is not re-read.
+            let config = self.cached_config();
+            let provider = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER")
+                .ok()
+                .or(config.execution_provider.clone());
+            let model = std::env::var("LEINDEX_WORKER_MODEL")
+                .ok()
+                .or(config.model_name.clone());
+            let Some(socket_path) = daemon_socket_path(provider.as_deref(), model.as_deref())
+            else {
+                return WorkerAvailability::Absent;
+            };
+            let status_path = daemon_status_path(provider.as_deref(), model.as_deref());
+            let state_hint = status_path.as_deref().and_then(status_state);
+            let pid_path = daemon_pid_path(provider.as_deref(), model.as_deref());
+
+            if state_hint.is_some()
+                && pid_path
+                    .as_deref()
+                    .is_some_and(|path| !daemon_pid_alive(path))
+            {
+                cleanup_daemon_paths(&socket_path);
+                return WorkerAvailability::Absent;
+            }
+
+            if !socket_path.exists() {
+                if state_hint.is_some() {
+                    let _ = status_path.as_deref().map(std::fs::remove_file);
+                    let _ = daemon_pid_path(provider.as_deref(), model.as_deref())
+                        .as_deref()
+                        .map(std::fs::remove_file);
+                }
+                return WorkerAvailability::Absent;
+            }
+
+            // VAL-DAEMON-005: Fast path. When the status file says "ready"
+            // and the PID is alive, return Ready immediately without a
+            // socket health probe. This eliminates a Unix socket connect +
+            // write + read cycle on every availability() poll.
+            if state_hint == Some(WorkerState::Ready)
+                && pid_path.as_deref().is_some_and(daemon_pid_alive)
+            {
+                return WorkerAvailability::Ready;
+            }
+
+            match probe_daemon_health(&socket_path) {
+                Ok(health) => match health.state {
+                    WorkerState::Ready => WorkerAvailability::Ready,
+                    WorkerState::Initializing => WorkerAvailability::Initializing(health),
+                    WorkerState::Failed => WorkerAvailability::Failed(health),
+                },
+                Err(ClientError::Worker(error)) if error.kind == ErrorKind::Initializing => {
+                    WorkerAvailability::Initializing(worker_health_snapshot(
+                        WorkerState::Initializing,
+                        provider,
+                        model,
+                        Some(error.message),
+                    ))
+                }
+                Err(error) => {
+                    // A status hint still gives callers an immediate, useful
+                    // answer when a health connection is momentarily busy.
+                    match state_hint {
+                        Some(WorkerState::Initializing) => {
+                            WorkerAvailability::Initializing(worker_health_snapshot(
+                                WorkerState::Initializing,
+                                provider,
+                                model,
+                                Some(error.to_string()),
+                            ))
+                        }
+                        Some(WorkerState::Failed) => {
+                            WorkerAvailability::Failed(worker_health_snapshot(
+                                WorkerState::Failed,
+                                provider,
+                                model,
+                                Some(error.to_string()),
+                            ))
+                        }
+                        Some(WorkerState::Ready) => WorkerAvailability::Ready,
+                        None => WorkerAvailability::Absent,
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            WorkerAvailability::Absent
+        }
+    }
+
+    /// Return true only after the worker has emitted a successful startup
+    /// handshake. This is a non-blocking observation; it never spawns a
+    /// process or waits for ORT/model initialization.
+    pub fn is_ready(&self) -> bool {
+        self.availability().is_ready()
     }
 
     /// Wait briefly for the stderr mirror to publish the startup report.
@@ -593,6 +930,75 @@ impl EmbeddingClient {
         self.spawn_worker(&mut guard)
     }
 
+    fn ensure_worker_ready(&self) -> Result<(), ClientError> {
+        let started = Instant::now();
+
+        // If the worker cannot be spawned or connected (daemon timeout, missing
+        // binary, IPC failure), treat neural as unavailable. Indexing proceeds
+        // with core TF-IDF/PDG results (decision #6: terminal neural failure
+        // preserves useful TF-IDF/PDG results).
+        if let Err(error) = self.ensure_worker() {
+            tracing::warn!(
+                error = %error,
+                "neural worker unavailable; proceeding with core TF-IDF/PDG results"
+            );
+            return Ok(());
+        }
+
+        loop {
+            match self.availability() {
+                WorkerAvailability::Ready => return Ok(()),
+                WorkerAvailability::Initializing(health) if self.use_daemon => {
+                    // The daemon binds its socket before ORT/model loading.
+                    // Wait for the explicit lifecycle transition so the
+                    // first request uses neural embeddings instead of being
+                    // silently downgraded merely because startup is cold.
+                    if started.elapsed() >= DAEMON_READY_MAX_WAIT {
+                        tracing::warn!(
+                            phase = %health.phase,
+                            elapsed_secs = started.elapsed().as_secs(),
+                            "neural worker did not become ready within {}s; \
+                             falling back to core TF-IDF/PDG results",
+                            DAEMON_READY_MAX_WAIT.as_secs()
+                        );
+                        return Ok(());
+                    }
+                    tracing::debug!(
+                        phase = %health.phase,
+                        "waiting for neural worker readiness"
+                    );
+                    thread::sleep(DAEMON_READINESS_POLL);
+                }
+                WorkerAvailability::Initializing(_) => {
+                    // Pipe mode initializes before publishing its handle, so
+                    // the stderr startup report can legitimately arrive after
+                    // this check. The framed request below blocks until the
+                    // worker has finished initialization.
+                    return Ok(());
+                }
+                WorkerAvailability::Failed(health) => {
+                    return Err(ClientError::Worker(WorkerError {
+                        kind: ErrorKind::OnnxRuntime,
+                        message: health
+                            .error
+                            .unwrap_or_else(|| "worker neural runtime is unavailable".to_string()),
+                    }));
+                }
+                WorkerAvailability::Absent if !self.use_daemon => {
+                    // Pipe mode has no external health endpoint. A missing
+                    // startup report is normal until the worker writes stderr.
+                    return Ok(());
+                }
+                WorkerAvailability::Absent => {
+                    return Err(ClientError::Worker(WorkerError {
+                        kind: ErrorKind::OnnxRuntime,
+                        message: "worker daemon is absent".to_string(),
+                    }));
+                }
+            }
+        }
+    }
+
     /// Spawn a new worker process into the given guard slot.
     fn spawn_worker(
         &self,
@@ -601,7 +1007,8 @@ impl EmbeddingClient {
         let worker_path = resolve_worker_binary().map_err(|e| {
             ClientError::SpawnFailed(format!("failed to resolve worker binary: {}", e))
         })?;
-        let config_env = read_worker_config_env_from_config();
+        // VAL-DAEMON-003: Use cached config so leindex.toml is not re-read.
+        let config_env = self.cached_config();
         let configured_provider = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER")
             .ok()
             .or_else(|| config_env.execution_provider.clone());
@@ -613,7 +1020,7 @@ impl EmbeddingClient {
         if self.use_daemon {
             if let Some(handle) = self.spawn_or_connect_daemon(
                 &worker_path,
-                &config_env,
+                config_env,
                 configured_provider.as_deref(),
                 configured_model.as_deref(),
             )? {
@@ -624,7 +1031,7 @@ impl EmbeddingClient {
 
         **guard = Some(self.spawn_pipe_worker(
             &worker_path,
-            &config_env,
+            config_env,
             configured_provider.as_deref(),
         )?);
 
@@ -739,7 +1146,7 @@ impl EmbeddingClient {
             return Ok(None);
         };
 
-        if let Some(handle) = self.connect_daemon(&socket_path, None)? {
+        if let Some(handle) = self.connect_daemon_when_ready(&socket_path, None)? {
             return Ok(Some(handle));
         }
 
@@ -755,11 +1162,11 @@ impl EmbeddingClient {
 
         let lock_path = socket_path.with_extension("lock");
         let _spawn_lock =
-            DaemonSpawnLock::acquire(&lock_path, Duration::from_secs(IPC_TIMEOUT_SECS))?;
-        if let Some(handle) = self.connect_daemon(&socket_path, None)? {
+            DaemonSpawnLock::acquire(&lock_path, Duration::from_secs(DAEMON_LOCK_WAIT_SECS))?;
+        if let Some(handle) = self.connect_daemon_when_ready(&socket_path, None)? {
             return Ok(Some(handle));
         }
-        let _ = std::fs::remove_file(&socket_path);
+        cleanup_daemon_paths(&socket_path);
 
         let mut cmd = Command::new(worker_path);
         Self::configure_worker_command(&mut cmd, config_env, configured_provider);
@@ -781,12 +1188,37 @@ impl EmbeddingClient {
             .spawn()
             .map_err(|e| ClientError::SpawnFailed(e.to_string()))?;
 
-        let deadline = Instant::now() + Duration::from_secs(IPC_TIMEOUT_SECS);
+        let deadline = Instant::now() + Duration::from_secs(DAEMON_BIND_WAIT_SECS);
         loop {
             match UnixStream::connect(&socket_path) {
                 Ok(stream) => {
-                    return Self::socket_worker_handle(stream, Some(child), Some(socket_path))
-                        .map(Some);
+                    // The daemon accepts connections before model loading so
+                    // health probes can observe `initializing`. Do not keep
+                    // this bootstrap connection: its server thread may have
+                    // entered the not-ready path and would reject the first
+                    // inference frame even after the lifecycle becomes ready.
+                    drop(stream);
+                    match Self::wait_for_daemon_ready(&socket_path) {
+                        Ok(()) => {
+                            Self::spawn_daemon_reaper(child, socket_path.clone());
+                            let stream = UnixStream::connect(&socket_path).map_err(|e| {
+                                ClientError::Ipc(format!(
+                                    "failed to reconnect ready worker daemon {}: {}",
+                                    socket_path.display(),
+                                    e
+                                ))
+                            })?;
+                            return Self::socket_worker_handle(stream, None, Some(socket_path))
+                                .map(Some);
+                        }
+                        Err(error) => {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            cleanup_daemon_paths(&socket_path);
+                            Self::print_daemon_log_tail();
+                            return Err(error);
+                        }
+                    }
                 }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::NotFound
@@ -794,7 +1226,7 @@ impl EmbeddingClient {
                 Err(e) => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    let _ = std::fs::remove_file(&socket_path);
+                    cleanup_daemon_paths(&socket_path);
                     Self::print_daemon_log_tail();
                     return Err(ClientError::Ipc(format!(
                         "failed to connect worker daemon {}: {}",
@@ -806,7 +1238,7 @@ impl EmbeddingClient {
 
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    let _ = std::fs::remove_file(&socket_path);
+                    cleanup_daemon_paths(&socket_path);
                     Self::print_daemon_log_tail();
                     return Err(ClientError::SpawnFailed(format!(
                         "worker daemon exited before accepting connections: {}",
@@ -815,7 +1247,7 @@ impl EmbeddingClient {
                 }
                 Ok(None) => {}
                 Err(e) => {
-                    let _ = std::fs::remove_file(&socket_path);
+                    cleanup_daemon_paths(&socket_path);
                     Self::print_daemon_log_tail();
                     return Err(ClientError::SpawnFailed(format!(
                         "failed to poll worker daemon startup: {}",
@@ -827,7 +1259,7 @@ impl EmbeddingClient {
             if Instant::now() >= deadline {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = std::fs::remove_file(&socket_path);
+                cleanup_daemon_paths(&socket_path);
                 Self::print_daemon_log_tail();
                 return Err(ClientError::Timeout);
             }
@@ -836,18 +1268,30 @@ impl EmbeddingClient {
     }
 
     #[cfg(unix)]
-    fn connect_daemon(
+    fn connect_daemon_when_ready(
         &self,
         socket_path: &Path,
         child: Option<Child>,
     ) -> Result<Option<WorkerHandle>, ClientError> {
         match UnixStream::connect(socket_path) {
             Ok(stream) => {
+                // A connection accepted during model initialization is bound
+                // to the server's not-ready handler. Close it, wait for the
+                // explicit Ready state, then create the inference connection.
+                drop(stream);
+                Self::wait_for_daemon_ready(socket_path)?;
+                let stream = UnixStream::connect(socket_path).map_err(|e| {
+                    ClientError::Ipc(format!(
+                        "failed to reconnect ready worker daemon {}: {}",
+                        socket_path.display(),
+                        e
+                    ))
+                })?;
                 Self::socket_worker_handle(stream, child, Some(socket_path.to_path_buf())).map(Some)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
-                let _ = std::fs::remove_file(socket_path);
+                cleanup_daemon_paths(socket_path);
                 Ok(None)
             }
             Err(e) => Err(ClientError::Ipc(format!(
@@ -858,12 +1302,178 @@ impl EmbeddingClient {
         }
     }
 
+    /// Wait for the daemon's explicit lifecycle transition before retaining a
+    /// socket for inference. A readiness deadline prevents an infinite hang
+    /// when the daemon is stuck in Initializing state. When the deadline fires,
+    /// the error propagates so callers can treat neural as unavailable.
+    ///
+    /// VAL-DAEMON-004: Uses one persistent Unix socket connection held in
+    /// `stream: Option<UnixStream>` for the entire polling duration. Each
+    /// poll writes + reads on the same socket; the connection is only
+    /// dropped on error (triggering a reconnect on the next iteration).
+    #[cfg(unix)]
+    fn wait_for_daemon_ready(socket_path: &Path) -> Result<(), ClientError> {
+        let started = Instant::now();
+        let mut stream: Option<UnixStream> = None;
+
+        loop {
+            if started.elapsed() >= DAEMON_READY_MAX_WAIT {
+                return Err(ClientError::Worker(WorkerError {
+                    kind: ErrorKind::OnnxRuntime,
+                    message: format!(
+                        "daemon did not reach Ready state within {}s;\
+                         falling back to core TF-IDF/PDG results",
+                        DAEMON_READY_MAX_WAIT.as_secs()
+                    ),
+                }));
+            }
+
+            // Establish connection once, reuse for all subsequent polls.
+            // On error, drop and reconnect on the next iteration.
+            if stream.is_none() {
+                match UnixStream::connect(socket_path) {
+                    Ok(s) => {
+                        // No timeout: once connected to a live daemon, let
+                        // the health response arrive without a deadline.
+                        let _ = s.set_read_timeout(None);
+                        let _ = s.set_write_timeout(None);
+                        stream = Some(s);
+                    }
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::NotFound
+                            || e.kind() == std::io::ErrorKind::ConnectionRefused =>
+                    {
+                        // Daemon hasn't bound yet; wait and retry.
+                        thread::sleep(DAEMON_READINESS_POLL);
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(ClientError::Ipc(format!(
+                            "failed to connect worker health socket {}: {}",
+                            socket_path.display(),
+                            e
+                        )));
+                    }
+                }
+            }
+
+            let s = stream.as_mut().unwrap();
+
+            // Health probe on the persistent connection.
+            let batch_id = BatchId::new(BATCH_COUNTER.fetch_add(1, Ordering::Relaxed));
+            let wire = protocol::health_request_frame(batch_id)
+                .map_err(|e| ClientError::Ipc(e.to_string()))?
+                .encode_wire()
+                .map_err(|e| ClientError::Ipc(e.to_string()))?;
+
+            if let Err(e) = s.write_all(&wire).and_then(|_| s.flush()) {
+                // Connection error; drop and reconnect on next iteration.
+                tracing::debug!(error = %e, "health probe write failed; reconnecting");
+                stream.take();
+                thread::sleep(DAEMON_READINESS_POLL);
+                continue;
+            }
+
+            match read_frame(s) {
+                Ok(payload) => {
+                    let frame = match Frame::from_wire_bytes(&payload) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            tracing::debug!(error = %e, "health frame decode failed");
+                            stream.take();
+                            thread::sleep(DAEMON_READINESS_POLL);
+                            continue;
+                        }
+                    };
+                    if frame.header.batch_id != batch_id {
+                        tracing::debug!("health response batch_id mismatch; reconnecting");
+                        stream.take();
+                        thread::sleep(DAEMON_READINESS_POLL);
+                        continue;
+                    }
+                    let health = match frame.header.msg_type {
+                        MsgType::HealthResponse => match frame.decode_payload::<Response>() {
+                            Ok(Response::Health(h)) => h,
+                            _ => {
+                                stream.take();
+                                thread::sleep(DAEMON_READINESS_POLL);
+                                continue;
+                            }
+                        },
+                        MsgType::Error => match frame.decode_payload::<Response>() {
+                            Ok(Response::Error(error)) if error.kind == ErrorKind::Initializing => {
+                                thread::sleep(DAEMON_READINESS_POLL);
+                                continue;
+                            }
+                            Ok(Response::Error(error)) => {
+                                return Err(ClientError::Worker(WorkerError {
+                                    kind: ErrorKind::OnnxRuntime,
+                                    message: error.message,
+                                }));
+                            }
+                            _ => {
+                                stream.take();
+                                thread::sleep(DAEMON_READINESS_POLL);
+                                continue;
+                            }
+                        },
+                        _ => {
+                            stream.take();
+                            thread::sleep(DAEMON_READINESS_POLL);
+                            continue;
+                        }
+                    };
+
+                    match health.state {
+                        WorkerState::Ready => return Ok(()),
+                        WorkerState::Initializing => {
+                            thread::sleep(DAEMON_READINESS_POLL);
+                        }
+                        WorkerState::Failed => {
+                            return Err(ClientError::Worker(WorkerError {
+                                kind: ErrorKind::OnnxRuntime,
+                                message: health.error.unwrap_or_else(|| {
+                                    "worker daemon initialization failed".to_string()
+                                }),
+                            }));
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Connection error (EOF, reset, etc.); drop and reconnect.
+                    tracing::debug!(error = %e, "health probe read failed; reconnecting");
+                    stream.take();
+                    thread::sleep(DAEMON_READINESS_POLL);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn spawn_daemon_reaper(mut child: Child, socket_path: PathBuf) {
+        let pid = child.id();
+        thread::spawn(move || {
+            let _ = child.wait();
+            let pid_path = socket_path.with_extension("pid");
+            let owns_state = std::fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|value| value.trim().parse::<u32>().ok())
+                .is_some_and(|recorded| recorded == pid);
+            if owns_state {
+                cleanup_daemon_paths(&socket_path);
+            }
+        });
+    }
+
     #[cfg(unix)]
     fn socket_worker_handle(
         stream: UnixStream,
         child: Option<Child>,
         socket_path: Option<PathBuf>,
     ) -> Result<WorkerHandle, ClientError> {
+        stream.set_nonblocking(false).map_err(|e| {
+            ClientError::Ipc(format!("failed to make worker socket blocking: {}", e))
+        })?;
         let writer = stream
             .try_clone()
             .map_err(|e| ClientError::Ipc(format!("failed to clone worker socket: {}", e)))?;
@@ -919,16 +1529,19 @@ impl EmbeddingClient {
         }
     }
 
-    fn spawn_reader_thread<R>(mut reader: R) -> (thread::JoinHandle<()>, mpsc::Sender<ReadRequest>)
+    fn spawn_reader_thread<R>(reader: R) -> (thread::JoinHandle<()>, mpsc::Sender<ReadRequest>)
     where
         R: Read + Send + 'static,
     {
         let (read_request_tx, read_request_rx) = mpsc::channel::<ReadRequest>();
         let read_thread = thread::spawn(move || {
+            // VAL-DAEMON-006: Wrap reader in BufReader with 128KB capacity to
+            // reduce syscall count for large embedding responses.
+            let mut buf_reader = BufReader::with_capacity(READ_BUF_CAPACITY, reader);
             while let Ok(request) = read_request_rx.recv() {
                 match request {
                     ReadRequest::Read { tx } => {
-                        let _ = tx.send(read_frame_with_timeout(&mut reader));
+                        let _ = tx.send(read_frame(&mut buf_reader));
                     }
                     ReadRequest::Shutdown => break,
                 }
@@ -969,15 +1582,13 @@ impl EmbeddingClient {
         })
     }
 
-    /// Kill the current worker and clear the handle so a fresh worker
-    /// can be spawned on the next request.
+    /// Clear the current worker connection so a fresh request can reconnect.
     ///
     /// VAL-CPHASE-021: After calling this, the next embed request will
     /// transparently spawn a new worker process.
     ///
-    /// On Unix, sends SIGTERM first and waits up to 2 seconds before
-    /// falling back to SIGKILL. On other platforms, drops stdin (EOF)
-    /// then waits with a timeout before killing.
+    /// Resident daemon ownership stays with its reaper; a client never
+    /// deletes a persistent daemon socket or kills a process it did not own.
     pub fn kill_worker(&self) {
         if let Ok(mut guard) = self.worker.lock() {
             if let Some(mut handle) = guard.take() {
@@ -987,17 +1598,22 @@ impl EmbeddingClient {
     }
 
     fn shutdown_worker_handle(handle: &mut WorkerHandle, kill_persistent: bool) {
+        // Signal the reader thread to stop. If the reader is currently
+        // blocked inside read_frame (waiting for worker response), the
+        // Shutdown message stays queued until read_frame returns.
         let _ = handle.read_request_tx.send(ReadRequest::Shutdown);
         if let Some(writer) = handle.writer.as_ref() {
             writer.shutdown();
         }
         drop(handle.writer.take());
 
-        let should_kill_child = !handle.persistent || kill_persistent;
+        let owns_child = handle.child.is_some();
+        let should_kill_child = !handle.persistent || (kill_persistent && owns_child);
         if should_kill_child {
-            if handle.persistent {
+            if handle.persistent && owns_child {
                 if let Some(socket_path) = handle.socket_path.take() {
-                    let _ = std::fs::remove_file(socket_path);
+                    #[cfg(unix)]
+                    cleanup_daemon_paths(&socket_path);
                 }
             }
             if let Some(child) = handle.child.as_mut() {
@@ -1033,10 +1649,40 @@ impl EmbeddingClient {
 
         let replacement_thread = thread::spawn(|| {});
         let read_thread = std::mem::replace(&mut handle.read_thread, replacement_thread);
-        let _ = read_thread.join();
+        // Bounded join: if the reader thread is stuck inside read_frame on
+        // a socket that the worker hasn't closed, join would block forever.
+        // Give it 2 seconds; if it doesn't exit, the OS reaps the thread at
+        // process exit. This prevents the index command from hanging after
+        // all work is complete.
+        let join_deadline = Instant::now() + Duration::from_secs(2);
+        while !read_thread.is_finished() {
+            if Instant::now() >= join_deadline {
+                #[cfg(unix)]
+                {
+                    tracing::warn!(
+                        "reader thread did not exit within 2s during worker shutdown; \
+                         detaching (process exit will clean up)"
+                    );
+                }
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        if read_thread.is_finished() {
+            let _ = read_thread.join();
+        }
 
         if let Some(stderr_thread) = handle.stderr_thread.take() {
-            let _ = stderr_thread.join();
+            let stderr_deadline = Instant::now() + Duration::from_secs(2);
+            while !stderr_thread.is_finished() {
+                if Instant::now() >= stderr_deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            if stderr_thread.is_finished() {
+                let _ = stderr_thread.join();
+            }
         }
     }
 
@@ -1059,6 +1705,25 @@ impl EmbeddingClient {
         match self.embed_attempt(batch_id, texts, expected_dim) {
             Ok(response) => EmbedResult::Success(response),
             Err(first_error) => {
+                // Readiness is a state decision, not an elapsed-time retry.
+                // `ensure_worker_ready` waits for an initializing daemon, so
+                // this branch is reserved for a worker that explicitly
+                // disappeared or failed while the request was in flight.
+                if (self.use_daemon && self.availability().is_unavailable())
+                    || matches!(
+                        &first_error,
+                        ClientError::Worker(WorkerError {
+                            kind: ErrorKind::Initializing,
+                            ..
+                        })
+                    )
+                {
+                    return EmbedResult::Fallback {
+                        batch_id,
+                        error: first_error,
+                    };
+                }
+
                 // VAL-CPHASE-017: Retry once after killing the failed worker
                 tracing::warn!(
                     batch_id = %batch_id,
@@ -1118,7 +1783,7 @@ impl EmbeddingClient {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let neural_started = Instant::now();
         let result = (|| {
-            self.ensure_worker()?;
+            self.ensure_worker_ready()?;
 
             let request = EmbedRequest {
                 texts: texts.to_vec(),
@@ -1174,7 +1839,7 @@ impl EmbeddingClient {
         texts: &[String],
         expected_dim: usize,
     ) -> Result<EmbedResponse, ClientError> {
-        self.ensure_worker()?;
+        self.ensure_worker_ready()?;
 
         let batch_id = Self::next_batch_id();
         let request = EmbedRequest {
@@ -1219,7 +1884,7 @@ impl EmbeddingClient {
         query: &str,
         documents: Vec<RerankDocument>,
     ) -> Result<RerankResponse, ClientError> {
-        self.ensure_worker()?;
+        self.ensure_worker_ready()?;
 
         let batch_id = Self::next_batch_id();
         let request = RerankRequest {
@@ -1262,14 +1927,10 @@ impl EmbeddingClient {
 
     /// Send a frame and receive the response frame.
     ///
-    /// Uses a persistent reader thread with a oneshot channel to enforce
-    /// timeout on blocking pipe I/O. The persistent thread is spawned once
-    /// when the worker starts and reused for all requests, avoiding the
-    /// overhead of spawning a new thread per request.
-    ///
-    /// On timeout, the worker is left in an undefined state but no stdout
-    /// is consumed (the thread may still be blocked on read — the process
-    /// will be killed via kill_worker if needed).
+    /// A persistent reader thread keeps pipe/socket I/O off the caller's
+    /// stack, while the response channel waits for either a complete frame or
+    /// a real transport disconnect. Model compilation and inference are not
+    /// cancelled by elapsed-time policy.
     fn send_and_receive(&self, frame: Frame) -> Result<Frame, ClientError> {
         let mut guard = self
             .worker
@@ -1308,15 +1969,14 @@ impl EmbeddingClient {
             )));
         }
 
-        // Use the persistent reader thread to read the response with timeout.
+        // Use the persistent reader thread to read the response.
         let (tx, rx) = mpsc::channel();
         handle
             .read_request_tx
             .send(ReadRequest::Read { tx })
             .map_err(|_e| ClientError::Ipc("reader thread channel closed".to_string()))?;
 
-        // Wait for the read with timeout.
-        match rx.recv_timeout(Duration::from_secs(IPC_TIMEOUT_SECS)) {
+        match rx.recv() {
             Ok(Ok(frame_buf)) => {
                 let response = match Frame::from_wire_bytes(&frame_buf) {
                     Ok(response) => response,
@@ -1349,18 +2009,7 @@ impl EmbeddingClient {
                     )))
                 }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if handle.persistent {
-                    if let Some(mut handle) = guard.take() {
-                        Self::shutdown_worker_handle(&mut handle, false);
-                    }
-                    return Err(ClientError::Timeout);
-                }
-                drop(guard);
-                self.kill_worker();
-                Err(ClientError::Timeout)
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(mpsc::RecvError) => {
                 drop(guard);
                 self.kill_worker();
                 Err(ClientError::Ipc(
@@ -1394,6 +2043,15 @@ mod tests {
     #[test]
     fn test_client_creation() {
         let _client = EmbeddingClient::new();
+    }
+
+    #[test]
+    fn availability_uses_pipe_startup_report_without_spawning() {
+        let client = EmbeddingClient::new_pipe();
+        assert!(matches!(client.availability(), WorkerAvailability::Absent));
+        *client.last_startup_report.lock().unwrap() =
+            Some("startup_report provider=cpu status=available".to_string());
+        assert!(matches!(client.availability(), WorkerAvailability::Ready));
     }
 
     #[test]
@@ -1481,6 +2139,21 @@ mod tests {
         thread::sleep(Duration::from_millis(10));
 
         EmbeddingClient::shutdown_worker_handle(&mut handle, false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_client_does_not_delete_daemon_socket() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket_path = temp.path().join("daemon.sock");
+        std::fs::write(&socket_path, b"owned by daemon").unwrap();
+        let (client_stream, _server_stream) = UnixStream::pair().unwrap();
+        let mut handle =
+            EmbeddingClient::socket_worker_handle(client_stream, None, Some(socket_path.clone()))
+                .unwrap();
+
+        EmbeddingClient::shutdown_worker_handle(&mut handle, true);
+        assert!(socket_path.exists());
     }
 
     #[test]
@@ -1642,7 +2315,7 @@ mod tests {
             .join("cache")
             .join("migraphx")
             .join("qwen3-embed-0_6b-dynamic")
-            .join("v1_8_4-b8-s128");
+            .join("v1_9_0-b8-s128");
 
         assert_eq!(
             migraphx_model_cache_path(Some("qwen3-embed-0.6b-dynamic")).as_deref(),
