@@ -8,7 +8,6 @@ idle_timeout_secs = 600
 host = "127.0.0.1"
 port = 8080
 workers = 4
-request_timeout_secs = 60
 
 [cache]
 enabled = true

@@ -562,6 +562,8 @@ mod tests {
             calls: vec![],
             imports: vec![],
             byte_range: (0, 14),
+            flow_facts: vec![],
+
             cyclomatic_complexity: 0,
         };
 

@@ -7,9 +7,15 @@
 //! - VAL-MEASURE-004: Memcheck samples a fresh leindex process
 //! - VAL-MEASURE-005: Linux RSS is the primary measured metric
 //! - VAL-MEASURE-006: Mapped-file and anonymous memory captured when available
+//!
+//! These tests share the leindex-embed worker daemon socket and the fixture
+//! directory. They MUST run serially: `cargo test -- --test-threads=1`.
+//! Running them in parallel causes concurrent worker spawns against the same
+//! daemon socket, producing false failures.
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 /// Helper: get the workspace root directory.
@@ -58,8 +64,18 @@ macro_rules! require_release_binary {
     };
 }
 
+static MEMCHECK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn memcheck_lock() -> std::sync::MutexGuard<'static, ()> {
+    MEMCHECK_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("memcheck test lock poisoned")
+}
+
 /// Helper: run the memcheck binary and return (exit_code, stdout, stderr).
 fn run_memcheck(fixture: &str, extra_args: &[&str]) -> (bool, String, String) {
+    let _lock = memcheck_lock();
     let memcheck_bin = std::env::var("CARGO_BIN_EXE_memcheck")
         .map(PathBuf::from)
         .unwrap_or_else(|_| workspace_root().join("target/debug/memcheck"));
@@ -69,6 +85,7 @@ fn run_memcheck(fixture: &str, extra_args: &[&str]) -> (bool, String, String) {
     for arg in extra_args {
         cmd.arg(arg);
     }
+    cmd.env("LEINDEX_WORKER_EXECUTION_PROVIDER", "cpu");
 
     let output = cmd.output().expect("failed to run memcheck");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -78,8 +95,13 @@ fn run_memcheck(fixture: &str, extra_args: &[&str]) -> (bool, String, String) {
 
 /// Helper: run memcheck with --output to a temp file and parse the JSON report.
 fn run_memcheck_to_json(fixture: &str) -> (bool, serde_json::Value) {
+    let _lock = memcheck_lock();
     let dir = tempfile::tempdir().unwrap();
     let output_path = dir.path().join("report.json");
+    // These tests validate report shape and phase behavior. Keep host RSS
+    // variance out of them; baseline-threshold behavior is covered by the
+    // diff-logic tests, while the absolute budget remains active here.
+    let baselines_path = dir.path().join("baselines");
 
     let memcheck_bin = std::env::var("CARGO_BIN_EXE_memcheck")
         .map(PathBuf::from)
@@ -89,11 +111,23 @@ fn run_memcheck_to_json(fixture: &str) -> (bool, serde_json::Value) {
         .arg(fixture)
         .arg("--output")
         .arg(&output_path)
+        .arg("--baselines-dir")
+        .arg(&baselines_path)
         .arg("--verbose")
+        .env("LEINDEX_HOME", dir.path().join("leindex-home"))
+        .env("LEINDEX_WORKER_EXECUTION_PROVIDER", "cpu")
         .output()
         .expect("failed to run memcheck");
 
     let success = output.status.success();
+    if !success {
+        eprintln!(
+            "memcheck failed (status={}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     let report_json = if output_path.exists() {
         let content = std::fs::read_to_string(&output_path).unwrap();
         serde_json::from_str(&content).unwrap_or(serde_json::Value::Null)

@@ -1,7 +1,11 @@
 #![cfg(feature = "cli")]
+// The global guard intentionally serializes counter-based async tests; holding
+// it across the awaited tool call prevents concurrent tests from corrupting
+// the process-wide instrumentation snapshot.
+#![allow(clippy::await_holding_lock)]
 
 use leindex::cli::mcp::handlers::all_tool_handlers;
-use leindex::cli::mcp::handlers::{GrepSymbolsHandler, ReadSymbolHandler};
+use leindex::cli::mcp::handlers::{FileSummaryHandler, GrepSymbolsHandler, ReadSymbolHandler};
 use leindex::cli::mcp::protocol::JsonRpcRequest;
 use leindex::cli::mcp::request_meta::{
     collect_request_timings, current_request_timing_sink, record_hydrate_ms, record_neural_ms,
@@ -17,9 +21,18 @@ use serde_json::{json, Value};
 use std::fs;
 use std::process::Command;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Instant;
 use tempfile::TempDir;
+
+static COUNTER_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn counter_test_lock() -> MutexGuard<'static, ()> {
+    COUNTER_TEST_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct GitFixture {
     temp: TempDir,
@@ -78,6 +91,11 @@ fn tool_request(tool_name: &str, arguments: Value) -> JsonRpcRequest {
 }
 
 async fn counters_after_call(tool_name: &str, arguments: Value) -> (u64, u64, u64) {
+    let _lock = counter_test_lock();
+    counters_after_call_unlocked(tool_name, arguments).await
+}
+
+async fn counters_after_call_unlocked(tool_name: &str, arguments: Value) -> (u64, u64, u64) {
     reset_path_counters();
     let registry = Arc::new(ProjectRegistry::new(2));
     let request = tool_request(tool_name, arguments);
@@ -95,11 +113,12 @@ async fn counters_after_call(tool_name: &str, arguments: Value) -> (u64, u64, u6
 }
 
 async fn current_fast_path_counters(fixture: &GitFixture) -> Vec<(&'static str, (u64, u64, u64))> {
+    let _lock = counter_test_lock();
     let project_path = fixture.project_path();
     vec![
         (
             "git-status",
-            counters_after_call(
+            counters_after_call_unlocked(
                 "leindex.git-status",
                 json!({ "project_path": project_path }),
             )
@@ -107,7 +126,7 @@ async fn current_fast_path_counters(fixture: &GitFixture) -> Vec<(&'static str, 
         ),
         (
             "read-file",
-            counters_after_call(
+            counters_after_call_unlocked(
                 "leindex.read-file",
                 json!({
                     "project_path": project_path,
@@ -119,7 +138,7 @@ async fn current_fast_path_counters(fixture: &GitFixture) -> Vec<(&'static str, 
         ),
         (
             "exact-text-search",
-            counters_after_call(
+            counters_after_call_unlocked(
                 "leindex.text-search",
                 json!({
                     "project_path": project_path,
@@ -135,6 +154,7 @@ async fn current_fast_path_counters(fixture: &GitFixture) -> Vec<(&'static str, 
 
 #[test]
 fn path_metadata_primitives_are_deterministic() {
+    let _lock = counter_test_lock();
     PROJECT_HYDRATIONS.store(7, Ordering::Relaxed);
     PDG_LOADS.store(11, Ordering::Relaxed);
     NEURAL_REQUESTS.store(13, Ordering::Relaxed);
@@ -225,17 +245,15 @@ async fn request_timing_collector_accepts_neural_worker_measurements() {
 }
 
 #[tokio::test]
-// Task 2/3 unblock: route fast paths before hydration and supply an indexed no-neural fixture.
-#[ignore = "requires Task 2/3 unblock"]
-async fn current_fast_paths_hydrate_the_project_before_serving_live_data() {
+async fn current_fast_paths_do_not_hydrate_the_project_before_live_reads() {
     let fixture = GitFixture::new();
 
     for (tool, (hydrations, pdg_loads, neural_requests)) in
         current_fast_path_counters(&fixture).await
     {
-        assert!(
-            hydrations > 0,
-            "{tool} currently hydrates a project: {hydrations}"
+        assert_eq!(
+            hydrations, 0,
+            "{tool} must stay on the live path: {hydrations} hydrations"
         );
         assert_eq!(pdg_loads, 0, "{tool} fixture has no persisted PDG to load");
         assert_eq!(neural_requests, 0, "{tool} must not need neural search");
@@ -243,8 +261,6 @@ async fn current_fast_paths_hydrate_the_project_before_serving_live_data() {
 }
 
 #[tokio::test]
-// Task 2/3 unblock: route fast paths before hydration and supply an indexed no-neural fixture.
-#[ignore = "requires Task 2/3 unblock"]
 async fn live_fast_paths_must_not_hydrate_or_load_search_dependencies() {
     let fixture = GitFixture::new();
     let observed = current_fast_path_counters(&fixture).await;
@@ -262,6 +278,7 @@ async fn live_fast_paths_must_not_hydrate_or_load_search_dependencies() {
 
 #[tokio::test]
 async fn exact_grep_must_not_request_neural_search() {
+    let _lock = counter_test_lock();
     let (_temp, project_path) = catalog_fixture();
     let registry = Arc::new(ProjectRegistry::new(2));
 
@@ -352,6 +369,7 @@ fn catalog_fixture() -> (TempDir, std::path::PathBuf) {
 
 #[tokio::test]
 async fn canonical_path_read_symbol_uses_the_same_catalog_key() {
+    let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     let registry = Arc::new(ProjectRegistry::new(2));
     let absolute_path = project.join("src/lib.rs");
@@ -383,6 +401,7 @@ async fn canonical_path_read_symbol_uses_the_same_catalog_key() {
 
 #[tokio::test]
 async fn default_project_exact_catalog_grep_does_not_hydrate() {
+    let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     let registry = Arc::new(ProjectRegistry::new(2));
     registry.set_default_path(project).await;
@@ -461,6 +480,7 @@ async fn catalog_rows_cannot_escape_the_live_project_root() {
 
 #[tokio::test]
 async fn default_project_catalog_reads_do_not_hydrate() {
+    let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     let registry = Arc::new(ProjectRegistry::new(2));
     registry.set_default_path(project).await;
@@ -480,6 +500,7 @@ async fn default_project_catalog_reads_do_not_hydrate() {
 
 #[tokio::test]
 async fn stale_catalog_symbol_uses_live_parser_without_hydration() {
+    let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     fs::write(
         project.join("src/lib.rs"),
@@ -493,13 +514,16 @@ async fn stale_catalog_symbol_uses_live_parser_without_hydration() {
             json!({
                 "project_path": project,
                 "file_path": "src/lib.rs",
-                "symbol": "live_marker",
+                "symbol": "Askpass",
+                "include_dependencies": true,
             }),
         )
         .await
         .expect("live parser response");
-    assert_eq!(response["symbol"], "live_marker");
+    assert_eq!(response["symbol"], "Askpass");
     assert_eq!(response["symbol_index_miss"], true);
+    assert_eq!(response["pdg_status"], "stale");
+    assert!(response["dependencies"].as_array().unwrap().is_empty());
     assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), 0);
     assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
     assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
@@ -507,6 +531,7 @@ async fn stale_catalog_symbol_uses_live_parser_without_hydration() {
 
 #[tokio::test]
 async fn stale_unscoped_catalog_symbol_uses_its_validated_candidate() {
+    let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     fs::write(
         project.join("src/lib.rs"),
@@ -527,7 +552,36 @@ async fn stale_unscoped_catalog_symbol_uses_its_validated_candidate() {
 }
 
 #[tokio::test]
+async fn stale_catalog_file_summary_does_not_attach_stale_pdg_relations() {
+    let _lock = counter_test_lock();
+    let (_temp, project) = catalog_fixture();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub struct Askpass;\npub fn live_marker() {}\n",
+    )
+    .expect("make catalog source stale");
+    let response = FileSummaryHandler
+        .execute(
+            &Arc::new(ProjectRegistry::new(2)),
+            json!({
+                "project_path": project,
+                "file_path": "src/lib.rs",
+            }),
+        )
+        .await
+        .expect("stale file summary response");
+    assert_eq!(response["pdg_status"], "stale");
+    assert_eq!(response["retrieval"]["partial"], true);
+    assert!(response["symbols"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|symbol| { symbol["name"] == "live_marker" }));
+}
+
+#[tokio::test]
 async fn exact_grep_catalog_miss_uses_live_parser_without_hydration() {
+    let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     fs::write(
         project.join("src/lib.rs"),

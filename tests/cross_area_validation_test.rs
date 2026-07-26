@@ -772,22 +772,19 @@ mod per_surface_journeys {
 mod cross_surface_fallback_consistency {
     use super::*;
 
-    /// VAL-CROSS-007: After `cargo install leindex` (no setup), running
-    /// `leindex search` must NOT hard-crash. The search flow returns
-    /// `None` from `generate_query_neural_embedding` and proceeds with
-    /// TF-IDF, returning ranked results. We verify the query path defeats
-    /// the neural attempt gracefully.
+    /// VAL-CROSS-007: A configured semantic request must attempt the cold
+    /// neural worker; only an explicit terminal failure may return `None` and
+    /// continue with TF-IDF, without crashing the search surface.
     #[test]
-    fn search_query_neural_embedding_returns_none_on_failure() {
+    fn search_query_neural_embedding_attempts_cold_worker_and_falls_back_on_failure() {
         let src = read_file("src/cli/leindex/query.rs");
         assert!(
-            src.contains("Ok(None) => None, // TF-IDF only mode, no neural available"),
-            "VAL-CROSS-007: query embedding must fall back to None so TF-IDF keeps working"
+            src.contains("emb.embed_neural_blocking(query)"),
+            "VAL-CROSS-007: semantic query must attempt the configured neural worker"
         );
-        // The timeout/disconnect paths also fall back to TF-IDF (no panic).
         assert!(
-            src.contains("using TF-IDF fallback"),
-            "VAL-CROSS-007: query embedding must log a TF-IDF fallback message on failures"
+            src.contains("Neural query embedding unavailable; using TF-IDF fallback"),
+            "VAL-CROSS-007: terminal neural failure must preserve a TF-IDF fallback"
         );
     }
 

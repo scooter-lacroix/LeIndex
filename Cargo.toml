@@ -409,7 +409,7 @@ harness = false
 name = "mcp_tool_latency"
 path = "benches/mcp_tool_latency.rs"
 harness = false
-required-features = ["cli"]
+required-features = ["cli", "mcp-server", "search"]
 
 [profile.release]
 lto = "thin"
