@@ -60,8 +60,9 @@ pnpm add --save-dev @leindex/mcp
 
 ### Enabling Neural Search
 
-TF-IDF (keyword) search works out of the box. To enable neural (semantic)
-search, run the setup wizard after install:
+TF-IDF lexical retrieval and PDG relationships are mandatory LeIndex result
+layers. With ONNX enabled, the setup wizard provisions the default hybrid
+neural scorer over the same nodes:
 
 ```bash
 # project dependency
@@ -81,8 +82,8 @@ for CPU/GPU/AMD/NVIDIA paths and troubleshooting.
 
 CPU and CUDA use dynamic batches up to 32. MIGraphX uses a stable 8-by-128
 profile warmed during setup and reused through its compiled cache and resident
-worker. Hybrid queries keep a 250 ms neural budget and return TF-IDF/structural
-results when neural inference is not ready within that budget.
+worker. Indexing and semantic requests start/await the configured worker when
+it is cold; terminal provider failure preserves the core TF-IDF/PDG result.
 
 ---
 
@@ -224,7 +225,7 @@ Add to Claude Desktop config:
 To pin a specific binary release instead of `latest`:
 
 ```bash
-LEINDEX_BINARY_VERSION=1.6.3 npm install @leindex/mcp
+LEINDEX_BINARY_VERSION=1.9.0 npm install @leindex/mcp
 ```
 
 ---
@@ -307,6 +308,12 @@ for the complete table):
 | `LeIndex [Symbol Lookup]` | `leindex.symbol-lookup` | Symbol definition + callers/callees |
 | `LeIndex [Text Search]` | `leindex.text-search` | PRIMARY text search (replaces `Grep`/`rg`) |
 | `LeIndex [Write]` | `leindex.write` | Create or overwrite a file |
+
+`leindex.index` is a registry-owned start/poll job: it returns a `job_id` and
+phase/status snapshot by default (`wait=false`). Poll that job or pass
+`wait=true`; MCP requests never cancel indexing or publication at a wall-clock
+deadline. Results expose core TF-IDF/PDG status and configured neural provider
+status.
 
 ### Output formatting
 
