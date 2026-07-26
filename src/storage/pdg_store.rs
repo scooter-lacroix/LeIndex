@@ -94,7 +94,11 @@ fn convert_edge_type(edge_type: &PDGEdgeType) -> StorageEdgeType {
         PDGEdgeType::DataDependency => StorageEdgeType::DataDependency,
         PDGEdgeType::Inheritance => StorageEdgeType::Inheritance,
         PDGEdgeType::Import => StorageEdgeType::Import,
-        PDGEdgeType::Containment => StorageEdgeType::Call, // Map Containment to Call for storage
+        PDGEdgeType::Containment => StorageEdgeType::Containment,
+        PDGEdgeType::StateTransition => StorageEdgeType::StateTransition,
+        PDGEdgeType::CommandArgument => StorageEdgeType::CommandArgument,
+        PDGEdgeType::Environment => StorageEdgeType::Environment,
+        PDGEdgeType::Stdin => StorageEdgeType::Stdin,
     }
 }
 
@@ -106,6 +110,10 @@ fn convert_storage_edge_type(edge_type: &StorageEdgeType) -> PDGEdgeType {
         StorageEdgeType::Inheritance => PDGEdgeType::Inheritance,
         StorageEdgeType::Import => PDGEdgeType::Import,
         StorageEdgeType::Containment => PDGEdgeType::Containment,
+        StorageEdgeType::StateTransition => PDGEdgeType::StateTransition,
+        StorageEdgeType::CommandArgument => PDGEdgeType::CommandArgument,
+        StorageEdgeType::Environment => PDGEdgeType::Environment,
+        StorageEdgeType::Stdin => PDGEdgeType::Stdin,
     }
 }
 
@@ -115,6 +123,8 @@ fn convert_edge_metadata(metadata: &PDGEdgeMetadata) -> StorageEdgeMetadata {
         call_count: metadata.call_count,
         variable_name: metadata.variable_name.clone(),
         confidence: metadata.confidence,
+        channel: metadata.channel.clone(),
+        position: metadata.position,
     }
 }
 
@@ -124,6 +134,8 @@ fn convert_storage_edge_metadata(metadata: &StorageEdgeMetadata) -> PDGEdgeMetad
         call_count: metadata.call_count,
         variable_name: metadata.variable_name.clone(),
         confidence: metadata.confidence,
+        channel: metadata.channel.clone(),
+        position: metadata.position,
     }
 }
 
@@ -439,6 +451,8 @@ pub fn load_pdg(storage: &Storage, project_id: &str) -> Result<ProgramDependence
                 call_count: None,
                 variable_name: None,
                 confidence: None,
+                channel: None,
+                position: None,
             },
         };
 
@@ -694,6 +708,8 @@ mod tests {
                     call_count: Some(5),
                     variable_name: None,
                     confidence: None,
+                    channel: None,
+                    position: None,
                 },
             },
         );
@@ -837,6 +853,22 @@ mod tests {
             convert_edge_type(&PDGEdgeType::Import),
             StorageEdgeType::Import
         );
+        for (pdg, storage) in [
+            (PDGEdgeType::Containment, StorageEdgeType::Containment),
+            (
+                PDGEdgeType::StateTransition,
+                StorageEdgeType::StateTransition,
+            ),
+            (
+                PDGEdgeType::CommandArgument,
+                StorageEdgeType::CommandArgument,
+            ),
+            (PDGEdgeType::Environment, StorageEdgeType::Environment),
+            (PDGEdgeType::Stdin, StorageEdgeType::Stdin),
+        ] {
+            assert_eq!(convert_edge_type(&pdg), storage);
+            assert_eq!(convert_storage_edge_type(&storage), pdg);
+        }
 
         assert_eq!(
             convert_storage_edge_type(&StorageEdgeType::Call),
@@ -862,14 +894,20 @@ mod tests {
             call_count: Some(42),
             variable_name: Some("x".to_string()),
             confidence: None,
+            channel: Some("env".to_string()),
+            position: Some(1),
         };
 
         let storage_meta = convert_edge_metadata(&pdg_meta);
         assert_eq!(storage_meta.call_count, Some(42));
         assert_eq!(storage_meta.variable_name, Some("x".to_string()));
+        assert_eq!(storage_meta.channel.as_deref(), Some("env"));
+        assert_eq!(storage_meta.position, Some(1));
 
         let converted_back = convert_storage_edge_metadata(&storage_meta);
         assert_eq!(converted_back.call_count, Some(42));
+        assert_eq!(converted_back.channel.as_deref(), Some("env"));
+        assert_eq!(converted_back.position, Some(1));
         assert_eq!(converted_back.variable_name, Some("x".to_string()));
     }
 
@@ -919,6 +957,8 @@ mod tests {
                     call_count: None,
                     variable_name: None,
                     confidence: None,
+                    channel: None,
+                    position: None,
                 },
             },
         );
@@ -932,6 +972,8 @@ mod tests {
                     call_count: None,
                     variable_name: Some("child_instance".to_string()),
                     confidence: None,
+                    channel: None,
+                    position: None,
                 },
             },
         );

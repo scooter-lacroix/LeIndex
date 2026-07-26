@@ -30,6 +30,14 @@ pub enum EdgeType {
     Import,
     /// Structural containment (Class -> Method, Module -> Function)
     Containment,
+    /// State transition (for example install result -> verification).
+    StateTransition,
+    /// External command argv channel.
+    CommandArgument,
+    /// External command environment channel.
+    Environment,
+    /// External command stdin channel.
+    Stdin,
 }
 
 impl EdgeType {
@@ -41,6 +49,10 @@ impl EdgeType {
             EdgeType::Inheritance => "inheritance",
             EdgeType::Import => "import",
             EdgeType::Containment => "containment",
+            EdgeType::StateTransition => "state_transition",
+            EdgeType::CommandArgument => "command_argument",
+            EdgeType::Environment => "environment",
+            EdgeType::Stdin => "stdin",
         }
     }
 
@@ -52,6 +64,10 @@ impl EdgeType {
             "inheritance" => Some(EdgeType::Inheritance),
             "import" => Some(EdgeType::Import),
             "containment" => Some(EdgeType::Containment),
+            "state_transition" => Some(EdgeType::StateTransition),
+            "command_argument" => Some(EdgeType::CommandArgument),
+            "environment" => Some(EdgeType::Environment),
+            "stdin" => Some(EdgeType::Stdin),
             _ => None,
         }
     }
@@ -66,6 +82,12 @@ pub struct EdgeMetadata {
     pub variable_name: Option<String>,
     /// Confidence score for inferred edges (inheritance, type deps)
     pub confidence: Option<f32>,
+    /// Flow channel label, if present.
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// Argument ordinal, if present.
+    #[serde(default)]
+    pub position: Option<usize>,
 }
 
 /// Edge store for CRUD operations
@@ -255,6 +277,8 @@ mod tests {
                 call_count: Some(5),
                 variable_name: None,
                 confidence: None,
+                channel: None,
+                position: None,
             }),
         };
 

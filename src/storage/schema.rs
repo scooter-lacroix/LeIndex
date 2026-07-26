@@ -409,7 +409,7 @@ CREATE TABLE IF NOT EXISTS project_metadata (
         // Force WAL checkpoint to ensure all data is written to main DB
         // This releases locks on the -wal and -shm files
         if self.config.wal_enabled {
-            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)", [])?;
+            self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
         }
         // Optionally run optimize to clean up the database file
         // self.conn.execute("PRAGMA optimize", [])?;
@@ -557,6 +557,21 @@ mod tests {
         let temp_file = NamedTempFile::new().unwrap();
         let storage = Storage::open(temp_file.path());
         assert!(storage.is_ok());
+    }
+
+    #[test]
+    fn close_checkpoints_wal_without_execute_return_error() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let mut storage = Storage::open(temp_file.path()).unwrap();
+        storage
+            .conn_mut()
+            .execute_batch(
+                "CREATE TABLE close_probe(value INTEGER); INSERT INTO close_probe VALUES (1);",
+            )
+            .unwrap();
+        storage
+            .close()
+            .expect("WAL checkpoint should close cleanly");
     }
 
     #[test]
