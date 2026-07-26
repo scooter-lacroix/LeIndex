@@ -453,6 +453,10 @@ fn edge_type_code(et: &EdgeType) -> u8 {
         EdgeType::Inheritance => 3,
         EdgeType::Import => 4,
         EdgeType::Containment => 5,
+        EdgeType::StateTransition => 6,
+        EdgeType::CommandArgument => 7,
+        EdgeType::Environment => 8,
+        EdgeType::Stdin => 9,
     }
 }
 
@@ -507,6 +511,8 @@ mod tests {
             calls: Vec::new(),
             imports,
             byte_range: (0, 10),
+            flow_facts: vec![],
+
             cyclomatic_complexity: 0,
         }
     }

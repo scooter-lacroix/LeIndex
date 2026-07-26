@@ -53,6 +53,8 @@ impl BashParser {
 
                                 imports: vec![],
                                 byte_range: (node.start_byte(), node.end_byte()),
+                                flow_facts: vec![],
+
                                 cyclomatic_complexity: 0,
                             });
                         }

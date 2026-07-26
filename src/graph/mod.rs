@@ -26,6 +26,7 @@ pub use external_deps::{annotate_external_nodes, ExternalDependencyRegistry};
 pub use extraction::extract_pdg_from_signatures;
 pub use extraction::resolve_cross_file_call_edges;
 pub use extraction::resolve_cross_file_call_edges_for_files;
+pub use extraction::resolve_cross_file_flow_edges_for_files;
 pub use pdg::{Edge, Node, ProgramDependenceGraph};
 pub use traversal::{GravityTraversal, TraversalConfig};
 

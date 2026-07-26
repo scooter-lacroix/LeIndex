@@ -70,6 +70,8 @@ impl JavaParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
+                            flow_facts: vec![],
+
                             cyclomatic_complexity: 0,
                         });
                     }
@@ -103,6 +105,8 @@ impl JavaParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
+                            flow_facts: vec![],
+
                             cyclomatic_complexity: 0,
                         });
                     }
@@ -136,6 +140,8 @@ impl JavaParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
+                            flow_facts: vec![],
+
                             cyclomatic_complexity: 0,
                         });
                     }
@@ -167,6 +173,8 @@ impl JavaParser {
                                     calls: vec![],
                                     imports: vec![],
                                     byte_range: (0, 0),
+                                    flow_facts: vec![],
+
                                     cyclomatic_complexity: 0,
                                 });
                             }
@@ -328,6 +336,8 @@ fn extract_method_signature(
 
         imports: vec![],
         byte_range: (node.start_byte(), node.end_byte()),
+        flow_facts: vec![],
+
         cyclomatic_complexity: 0,
     })
 }
@@ -367,6 +377,8 @@ fn extract_constructor_signature(
 
         imports: vec![],
         byte_range: (node.start_byte(), node.end_byte()),
+        flow_facts: vec![],
+
         cyclomatic_complexity: 0,
     })
 }

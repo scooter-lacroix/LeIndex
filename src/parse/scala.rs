@@ -115,6 +115,8 @@ fn visit(
 
                     imports: vec![],
                     byte_range: (0, 0),
+                    flow_facts: vec![],
+
                     cyclomatic_complexity: 0,
                 });
             }
@@ -146,6 +148,8 @@ fn visit(
                     calls: vec![],
                     imports: vec![],
                     byte_range: (0, 0),
+                    flow_facts: vec![],
+
                     cyclomatic_complexity: 0,
                 });
 

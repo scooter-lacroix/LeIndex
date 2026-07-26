@@ -84,6 +84,8 @@ impl GoParser {
                                         calls: vec![],
                                         imports: vec![],
                                         byte_range: (child.start_byte(), child.end_byte()),
+                                        flow_facts: vec![],
+
                                         cyclomatic_complexity: 0,
                                     });
                                 }
@@ -255,6 +257,8 @@ fn extract_function_signature(
 
         imports: vec![],
         byte_range: (node.start_byte(), node.end_byte()),
+        flow_facts: vec![],
+
         cyclomatic_complexity: 0,
     })
 }
@@ -314,6 +318,8 @@ fn extract_method_signature(
 
         imports: vec![],
         byte_range: (node.start_byte(), node.end_byte()),
+        flow_facts: vec![],
+
         cyclomatic_complexity: 0,
     })
 }

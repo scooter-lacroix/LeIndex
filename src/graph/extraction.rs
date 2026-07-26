@@ -9,8 +9,8 @@
 
 #![warn(missing_docs)]
 
-use crate::graph::pdg::{Node, NodeType, ProgramDependenceGraph};
-use crate::parse::prelude::{ImportInfo, SignatureInfo};
+use crate::graph::pdg::{Edge, EdgeMetadata, EdgeType, Node, NodeType, ProgramDependenceGraph};
+use crate::parse::prelude::{FlowChannel, ImportInfo, SignatureInfo};
 use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -59,6 +59,11 @@ pub fn extract_pdg_from_signatures(
     // Phase 4: Explicit call edges from parser
     let call_edges = extract_call_edges(&signatures, &node_ids);
     pdg.add_call_edges(call_edges);
+
+    // Phase 4b: source-level value/state/command channels. These edges are
+    // intentionally bounded and additive; ordinary call extraction remains
+    // the authoritative control-flow relation.
+    extract_flow_edges(&signatures, &node_ids, &mut pdg);
 
     // Phase 5: Import edges with multi-line source fallback
     let import_edges = extract_import_edges(
@@ -1012,6 +1017,173 @@ pub fn extract_call_edges(
     edges
 }
 
+/// Add explicit source-level flow facts to a per-file PDG.
+///
+/// Facts are resolved locally by qualified/last symbol name. Unresolved
+/// command and state labels become lightweight external nodes so tools can
+/// still explain argv/env/stdin and registry/verification channels without
+/// hydrating unrelated project state.
+fn extract_flow_edges(
+    signatures: &[SignatureInfo],
+    node_ids: &HashMap<String, crate::graph::pdg::NodeId>,
+    pdg: &mut ProgramDependenceGraph,
+) {
+    let mut by_normalized: HashMap<String, crate::graph::pdg::NodeId> = HashMap::new();
+    let mut by_last: HashMap<String, Vec<crate::graph::pdg::NodeId>> = HashMap::new();
+    for sig in signatures {
+        if let Some(&id) = node_ids.get(&sig.qualified_name) {
+            by_normalized.insert(normalize_symbol(&sig.qualified_name), id);
+            if let Some(last) = normalize_symbol(&sig.qualified_name).rsplit('.').next() {
+                by_last.entry(last.to_string()).or_default().push(id);
+            }
+        }
+    }
+
+    let mut external: HashMap<String, crate::graph::pdg::NodeId> = HashMap::new();
+    for sig in signatures {
+        let Some(&caller_id) = node_ids.get(&sig.qualified_name) else {
+            continue;
+        };
+        let command = sig
+            .flow_facts
+            .iter()
+            .find(|fact| fact.channel == FlowChannel::CommandArgument && fact.target == "command")
+            .map(|fact| fact.source.clone());
+
+        for fact in &sig.flow_facts {
+            let (edge_type, target_label, channel) = match &fact.channel {
+                FlowChannel::Argument => {
+                    let target = resolve_flow_target(&fact.target, &by_normalized, &by_last);
+                    let Some(target) = target else { continue };
+                    if target == caller_id {
+                        continue;
+                    }
+                    let mut metadata = EdgeMetadata::with_variable(fact.source.clone());
+                    metadata.channel = Some("argument".to_string());
+                    metadata.position = fact.position;
+                    pdg.add_edge(
+                        caller_id,
+                        target,
+                        Edge {
+                            edge_type: EdgeType::DataDependency,
+                            metadata,
+                        },
+                    );
+                    continue;
+                }
+                FlowChannel::ReturnValue => {
+                    // A return/assignment fact is useful context, but only
+                    // becomes an edge when its target names a local symbol.
+                    let Some(target) = resolve_flow_target(&fact.target, &by_normalized, &by_last)
+                    else {
+                        continue;
+                    };
+                    if target == caller_id {
+                        continue;
+                    }
+                    let target_label = pdg
+                        .get_node(target)
+                        .map(|node| node.name.to_string())
+                        .unwrap_or_else(|| fact.target.clone());
+                    (
+                        EdgeType::DataDependency,
+                        target_label,
+                        "return_value".to_string(),
+                    )
+                }
+                FlowChannel::StateRead | FlowChannel::StateWrite => {
+                    let target = resolve_flow_target(&fact.target, &by_normalized, &by_last);
+                    let target_label = target
+                        .and_then(|id| pdg.get_node(id).map(|node| node.name.to_string()))
+                        .unwrap_or_else(|| fact.target.clone());
+                    (
+                        EdgeType::StateTransition,
+                        target_label,
+                        flow_channel_name(&fact.channel),
+                    )
+                }
+                FlowChannel::CommandArgument => {
+                    if fact.target == "command" {
+                        continue;
+                    }
+                    let label = match fact.target.as_str() {
+                        "argv" => command.clone().unwrap_or_else(|| fact.source.clone()),
+                        "env" => fact.source.clone(),
+                        _ => fact.target.clone(),
+                    };
+                    let edge_type = match fact.target.as_str() {
+                        "env" => EdgeType::Environment,
+                        "stdin" => EdgeType::Stdin,
+                        _ => EdgeType::CommandArgument,
+                    };
+                    (edge_type, label, fact.target.clone())
+                }
+                FlowChannel::Environment => (
+                    EdgeType::Environment,
+                    fact.target.clone(),
+                    "env".to_string(),
+                ),
+                FlowChannel::Stdin => (EdgeType::Stdin, fact.target.clone(), "stdin".to_string()),
+            };
+
+            let target_id =
+                if let Some(id) = resolve_flow_target(&target_label, &by_normalized, &by_last) {
+                    id
+                } else {
+                    *external.entry(target_label.clone()).or_insert_with(|| {
+                        pdg.add_node(Node {
+                            id: format!("external:{}", target_label),
+                            node_type: NodeType::External,
+                            name: target_label.clone(),
+                            file_path: Arc::from("<external>"),
+                            byte_range: (0, 0),
+                            complexity: 0,
+                            language: "external".to_string(),
+                        })
+                    })
+                };
+            let mut metadata = EdgeMetadata::with_variable(fact.source.clone());
+            metadata.channel = Some(channel);
+            metadata.position = fact.position;
+            pdg.add_edge(
+                caller_id,
+                target_id,
+                Edge {
+                    edge_type,
+                    metadata,
+                },
+            );
+        }
+    }
+}
+
+fn resolve_flow_target(
+    target: &str,
+    by_normalized: &HashMap<String, crate::graph::pdg::NodeId>,
+    by_last: &HashMap<String, Vec<crate::graph::pdg::NodeId>>,
+) -> Option<crate::graph::pdg::NodeId> {
+    let normalized = normalize_symbol(target);
+    by_normalized.get(&normalized).copied().or_else(|| {
+        normalized
+            .rsplit('.')
+            .next()
+            .and_then(|last| by_last.get(last)?.first().copied())
+    })
+}
+
+fn flow_channel_name(channel: &FlowChannel) -> String {
+    match channel {
+        FlowChannel::StateRead => "state_read",
+        FlowChannel::StateWrite => "state_write",
+        FlowChannel::Argument => "argument",
+        FlowChannel::ReturnValue => "return_value",
+        FlowChannel::CommandArgument => "argv",
+        FlowChannel::Environment => "env",
+        FlowChannel::Stdin => "stdin",
+    }
+    .to_string()
+}
+
 /// Resolve cross-file call edges after all per-file PDGs have been merged.
 ///
 /// During per-file PDG extraction, `extract_call_edges` can only resolve calls
@@ -1475,6 +1647,136 @@ fn resolve_cross_file_call_edges_inner(
         );
         pdg.add_call_edges(new_edges);
     }
+}
+
+/// Resolve source-level value/state channels after all per-file PDGs merge.
+///
+/// Per-file extraction already emits local flow edges. This pass connects the
+/// same facts to definitions in other files, using the existing call-resolution
+/// name maps rather than attempting type inference or alias analysis.
+// ponytail: syntax/name matching keeps indexing bounded; add type/alias analysis
+// only when measured flow misses justify its cost.
+pub fn resolve_cross_file_flow_edges_for_files(
+    pdg: &mut ProgramDependenceGraph,
+    all_signatures: &[(String, SignatureInfo)],
+) {
+    use crate::graph::pdg::{EdgeType, NodeId};
+
+    let mut by_qname: HashMap<String, Vec<NodeId>> = HashMap::new();
+    let mut by_file_qname: HashMap<(String, String), Vec<NodeId>> = HashMap::new();
+    let mut by_last: HashMap<String, Vec<NodeId>> = HashMap::new();
+
+    for nid in pdg.node_indices() {
+        let Some(node) = pdg.get_node(nid) else {
+            continue;
+        };
+        if node.node_type == NodeType::External {
+            continue;
+        }
+        let Some(qname) = qualified_name_from_node(node) else {
+            continue;
+        };
+        let normalized = normalize_symbol(qname);
+        by_qname.entry(normalized.clone()).or_default().push(nid);
+        by_file_qname
+            .entry((normalized.clone(), node.file_path.to_string()))
+            .or_default()
+            .push(nid);
+        if let Some(last) = normalized.rsplit('.').next() {
+            by_last.entry(last.to_string()).or_default().push(nid);
+        }
+    }
+
+    let mut existing: HashSet<(NodeId, NodeId, EdgeType)> = HashSet::new();
+    for edge_id in pdg.edge_indices() {
+        let Some(edge) = pdg.get_edge(edge_id) else {
+            continue;
+        };
+        let Some((from, to)) = pdg.edge_endpoints(edge_id) else {
+            continue;
+        };
+        existing.insert((from, to, edge.edge_type.clone()));
+    }
+
+    let mut added = 0usize;
+    for (source_file, sig) in all_signatures {
+        let normalized_sig = normalize_symbol(&sig.qualified_name);
+        let caller_ids = by_file_qname
+            .get(&(normalized_sig.clone(), source_file.clone()))
+            .cloned()
+            .or_else(|| by_qname.get(&normalized_sig).cloned())
+            .unwrap_or_default();
+        if caller_ids.is_empty() {
+            continue;
+        }
+
+        for fact in &sig.flow_facts {
+            let (edge_type, target_label) = match fact.channel {
+                FlowChannel::Argument => (EdgeType::DataDependency, fact.target.as_str()),
+                FlowChannel::StateRead | FlowChannel::StateWrite => {
+                    (EdgeType::StateTransition, fact.target.as_str())
+                }
+                FlowChannel::ReturnValue if fact.target != "return" => {
+                    (EdgeType::DataDependency, fact.target.as_str())
+                }
+                _ => continue,
+            };
+            let targets = resolve_cross_file_flow_targets(target_label, &by_qname, &by_last);
+            for caller_id in &caller_ids {
+                for target_id in &targets {
+                    if caller_id == target_id
+                        || !existing.insert((*caller_id, *target_id, edge_type.clone()))
+                    {
+                        continue;
+                    }
+                    let mut metadata = EdgeMetadata::with_variable(fact.source.clone());
+                    metadata.channel = Some(flow_channel_name(&fact.channel));
+                    metadata.position = fact.position;
+                    pdg.add_edge(
+                        *caller_id,
+                        *target_id,
+                        Edge {
+                            edge_type: edge_type.clone(),
+                            metadata,
+                        },
+                    );
+                    added += 1;
+                }
+            }
+        }
+    }
+
+    if added > 0 {
+        tracing::debug!("Cross-file flow edge resolution: added {added} edges");
+    }
+}
+
+fn resolve_cross_file_flow_targets(
+    target: &str,
+    by_qname: &HashMap<String, Vec<crate::graph::pdg::NodeId>>,
+    by_last: &HashMap<String, Vec<crate::graph::pdg::NodeId>>,
+) -> Vec<crate::graph::pdg::NodeId> {
+    let normalized = normalize_symbol(target);
+    let mut targets = by_qname.get(&normalized).cloned().unwrap_or_default();
+    if targets.is_empty() {
+        let segments: Vec<&str> = normalized.split('.').filter(|s| !s.is_empty()).collect();
+        for len in 2..=3_usize.min(segments.len()) {
+            let suffix = segments[segments.len() - len..].join(".");
+            if let Some(ids) = by_qname.get(&suffix) {
+                targets.extend(ids);
+            }
+        }
+    }
+    if targets.is_empty() {
+        if let Some(last) = normalized.rsplit('.').next() {
+            if let Some(ids) = by_last.get(last) {
+                targets.extend(ids);
+            }
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    targets
 }
 
 fn qualified_name_from_node(node: &Node) -> Option<&str> {
@@ -2078,10 +2380,13 @@ pub fn normalize_symbol(raw: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn signature_to_node(sig: &SignatureInfo, file_path: &str, language: &str) -> Node {
-    let node_type = if sig.is_method {
-        NodeType::Method
-    } else {
-        NodeType::Function
+    let node_type = match sig.return_type.as_deref() {
+        Some("module") => NodeType::Module,
+        Some("enum_variant") => NodeType::Variable,
+        Some("enum") | Some("trait") => NodeType::Class,
+        Some(value) if value.starts_with("struct") => NodeType::Class,
+        _ if sig.is_method => NodeType::Method,
+        _ => NodeType::Function,
     };
     let complexity = if sig.cyclomatic_complexity > 0 {
         sig.cyclomatic_complexity
@@ -2106,7 +2411,9 @@ fn signature_to_node(sig: &SignatureInfo, file_path: &str, language: &str) -> No
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parse::prelude::{ImportInfo, Parameter, SignatureInfo, Visibility};
+    use crate::parse::prelude::{
+        CodeIntelligence, ImportInfo, Parameter, SignatureInfo, Visibility,
+    };
 
     fn sig(name: &str, qualified: &str, is_method: bool) -> SignatureInfo {
         SignatureInfo {
@@ -2121,8 +2428,70 @@ mod tests {
             calls: vec![],
             imports: vec![],
             byte_range: (0, 100),
+            flow_facts: vec![],
+
             cyclomatic_complexity: 0,
         }
+    }
+
+    #[test]
+    fn rust_flow_channels_are_first_class_pdg_edges() {
+        let source = br#"
+fn execute_native_command(password: &str, askpass: &str) {
+    let mut command = std::process::Command::new("sudo");
+    command.arg("-S").env("SUDO_ASKPASS", askpass).stdin(password);
+    registry_record(password);
+    verify_installation();
+}
+fn registry_record(value: &str) {}
+fn verify_installation() {}
+"#;
+        let signatures = crate::parse::rust::RustParser::new()
+            .get_signatures(source)
+            .unwrap();
+        let pdg = extract_pdg_from_signatures(signatures, source, "flows.rs", "rust");
+        let from = pdg.find_by_name("execute_native_command").unwrap();
+
+        let mut channels = HashSet::new();
+        for edge_id in pdg.edge_indices() {
+            let Some((source_id, target_id)) = pdg.edge_endpoints(edge_id) else {
+                continue;
+            };
+            if source_id != from {
+                continue;
+            }
+            let Some(edge) = pdg.get_edge(edge_id) else {
+                continue;
+            };
+            if let Some(target) = pdg.get_node(target_id) {
+                channels.insert((
+                    target.name.clone(),
+                    edge.edge_type.clone(),
+                    edge.metadata.channel.clone(),
+                ));
+            }
+        }
+
+        assert!(channels.contains(&(
+            "sudo".to_string(),
+            EdgeType::CommandArgument,
+            Some("argv".to_string())
+        )));
+        assert!(channels.contains(&(
+            "SUDO_ASKPASS".to_string(),
+            EdgeType::Environment,
+            Some("env".to_string())
+        )));
+        assert!(channels.contains(&(
+            "password".to_string(),
+            EdgeType::Stdin,
+            Some("stdin".to_string())
+        )));
+        assert!(channels.iter().any(|(name, ty, channel)| {
+            name == "registry_record"
+                && *ty == EdgeType::StateTransition
+                && channel.as_deref() == Some("state_write")
+        }));
     }
 
     fn sig_with_types(
@@ -2151,6 +2520,8 @@ mod tests {
             calls: vec![],
             imports: vec![],
             byte_range: (0, 100),
+            flow_facts: vec![],
+
             cyclomatic_complexity: 0,
         }
     }
@@ -2259,6 +2630,56 @@ mod tests {
     }
 
     #[test]
+    fn cross_file_flow_argument_is_resolved_after_merge() {
+        let mut caller = sig("dispatch", "dispatch", false);
+        caller.flow_facts.push(crate::parse::traits::FlowFact {
+            channel: FlowChannel::Argument,
+            source: "password".to_string(),
+            target: "resolve_password".to_string(),
+            position: Some(0),
+            byte_range: (0, 8),
+        });
+        let callee = sig("resolve_password", "resolve_password", false);
+        let mut merged = ProgramDependenceGraph::new();
+        crate::cli::index_builder::merge_pdgs(
+            &mut merged,
+            extract_pdg_from_signatures(vec![caller.clone()], b"", "a.rs", "rust"),
+        );
+        crate::cli::index_builder::merge_pdgs(
+            &mut merged,
+            extract_pdg_from_signatures(vec![callee.clone()], b"", "b.rs", "rust"),
+        );
+
+        resolve_cross_file_flow_edges_for_files(
+            &mut merged,
+            &[("a.rs".to_string(), caller), ("b.rs".to_string(), callee)],
+        );
+
+        let caller_id = merged
+            .node_indices()
+            .find(|&id| {
+                merged
+                    .get_node(id)
+                    .is_some_and(|node| node.id == "a.rs:dispatch")
+            })
+            .unwrap();
+        let callee_id = merged
+            .node_indices()
+            .find(|&id| {
+                merged
+                    .get_node(id)
+                    .is_some_and(|node| node.id == "b.rs:resolve_password")
+            })
+            .unwrap();
+        assert!(merged.edge_indices().any(|edge_id| {
+            merged.edge_endpoints(edge_id) == Some((caller_id, callee_id))
+                && merged
+                    .get_edge(edge_id)
+                    .is_some_and(|edge| edge.edge_type == EdgeType::DataDependency)
+        }));
+    }
+
+    #[test]
     fn python_multiline_import_parsed() {
         let source = b"from os.path import (\n    join,\n    exists,\n    dirname\n)\n";
         let imports = extract_import_paths_from_source(source, "python");
@@ -2298,6 +2719,8 @@ mod tests {
             calls: vec![],
             imports: vec![],
             byte_range: (0, 10),
+            flow_facts: vec![],
+
             cyclomatic_complexity: 0,
         };
 
@@ -2306,6 +2729,8 @@ mod tests {
 
         // Test 2: cyclomatic_complexity > 0 should use that value
         let sig_complex = SignatureInfo {
+            flow_facts: vec![],
+
             cyclomatic_complexity: 5,
             ..sig_simple.clone()
         };
@@ -2329,6 +2754,8 @@ mod tests {
                     default_value: None,
                 },
             ],
+            flow_facts: vec![],
+
             cyclomatic_complexity: 0,
             ..sig_simple
         };
@@ -2338,6 +2765,8 @@ mod tests {
 
         // Test 4: cyclomatic should override parameter count
         let sig_both = SignatureInfo {
+            flow_facts: vec![],
+
             cyclomatic_complexity: 10,
             ..sig_params
         };

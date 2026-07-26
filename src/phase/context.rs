@@ -364,6 +364,8 @@ mod tests {
                 calls: Vec::new(),
                 imports: Vec::new(),
                 byte_range: (0, 10),
+                flow_facts: vec![],
+
                 cyclomatic_complexity: 0,
             }],
             error: None,
@@ -403,6 +405,8 @@ mod tests {
                 calls: Vec::new(),
                 imports: Vec::new(),
                 byte_range: (0, 1),
+                flow_facts: vec![],
+
                 cyclomatic_complexity: 0,
             }],
             error: None,

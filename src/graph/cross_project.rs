@@ -433,6 +433,8 @@ mod tests {
                 call_count: Some(1),
                 variable_name: None,
                 confidence: None,
+                channel: None,
+                position: None,
             },
         };
         root_pdg.add_edge(id_a, id_b, edge);
@@ -453,6 +455,8 @@ mod tests {
                 call_count: None,
                 confidence: None,
                 variable_name: Some("data".to_string()),
+                channel: None,
+                position: None,
             },
         };
         ext_pdg.add_edge(id_x, id_y, ext_edge);

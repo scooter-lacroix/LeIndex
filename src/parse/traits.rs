@@ -83,6 +83,49 @@ pub struct SignatureInfo {
     /// Cyclomatic complexity extracted from AST
     #[serde(default)]
     pub cyclomatic_complexity: u32,
+
+    /// Bounded, source-level value-flow facts extracted from the body.
+    ///
+    /// Older persisted signatures deserialize with an empty list. Facts are
+    /// intentionally shallow: they describe explicit arguments, returns, and
+    /// command channels without attempting alias analysis or macro expansion.
+    #[serde(default)]
+    pub flow_facts: Vec<FlowFact>,
+}
+
+/// Channel through which a value or side effect flows between symbols.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowChannel {
+    /// Ordinary call argument flow, identified by ordinal position.
+    Argument,
+    /// A returned value or tail expression.
+    ReturnValue,
+    /// A state read (for example `verify` or `get`).
+    StateRead,
+    /// A state write (for example `insert`, `record`, or `save`).
+    StateWrite,
+    /// An argument passed to an external command builder.
+    CommandArgument,
+    /// An environment variable passed to an external command.
+    Environment,
+    /// Standard input passed to an external command.
+    Stdin,
+}
+
+/// A bounded source-level value-flow fact.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FlowFact {
+    /// Channel carrying the value or side effect.
+    pub channel: FlowChannel,
+    /// Source label (argument name, receiver, or literal).
+    pub source: String,
+    /// Target label (callee parameter, command channel, or state method).
+    pub target: String,
+    /// Argument ordinal when the fact came from a call expression.
+    pub position: Option<usize>,
+    /// Byte range of the expression that produced the fact.
+    pub byte_range: (usize, usize),
 }
 
 /// Function parameter

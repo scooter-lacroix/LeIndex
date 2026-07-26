@@ -72,6 +72,8 @@ impl JavaScriptParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
+                            flow_facts: vec![],
+
                             cyclomatic_complexity: 0,
                         });
 
@@ -265,6 +267,8 @@ impl TypeScriptParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
+                            flow_facts: vec![],
+
                             cyclomatic_complexity: 0,
                         });
                     }
@@ -300,6 +304,8 @@ impl TypeScriptParser {
                             calls: vec![],
                             imports: vec![],
                             byte_range: (node.start_byte(), node.end_byte()),
+                            flow_facts: vec![],
+
                             cyclomatic_complexity: 0,
                         });
 
@@ -545,6 +551,8 @@ fn extract_function_signature(
 
         imports: vec![],
         byte_range: (node.start_byte(), node.end_byte()),
+        flow_facts: vec![],
+
         cyclomatic_complexity: 0,
     })
 }
@@ -595,6 +603,8 @@ fn extract_ts_function_signature(
 
         imports: vec![],
         byte_range: (node.start_byte(), node.end_byte()),
+        flow_facts: vec![],
+
         cyclomatic_complexity: 0,
     })
 }

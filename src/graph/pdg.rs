@@ -121,6 +121,14 @@ pub enum EdgeType {
     /// Structural containment: Class contains Method, Module contains Function.
     /// NOT a semantic dependency. Exclude from impact traversal by default.
     Containment,
+    /// A state transition such as install result → verification → registry write.
+    StateTransition,
+    /// An argument passed to an external command (`argv`).
+    CommandArgument,
+    /// An environment variable passed to an external command.
+    Environment,
+    /// Bytes or a value passed to command standard input.
+    Stdin,
 }
 
 /// An edge in the Program Dependence Graph representing a relationship between nodes.
@@ -165,6 +173,15 @@ pub struct EdgeMetadata {
     /// relationship is inferred rather than explicitly declared. Higher
     /// values indicate stronger evidence for the relationship.
     pub confidence: Option<f32>,
+
+    /// Flow channel (`argument`, `env`, `stdin`, etc.) when the edge was
+    /// extracted from a source-level flow fact.
+    #[serde(default)]
+    pub channel: Option<String>,
+
+    /// Argument ordinal for call/data-flow edges.
+    #[serde(default)]
+    pub position: Option<usize>,
 }
 
 impl EdgeMetadata {
@@ -177,6 +194,8 @@ impl EdgeMetadata {
             call_count: None,
             variable_name: None,
             confidence: None,
+            channel: None,
+            position: None,
         }
     }
 
@@ -195,6 +214,8 @@ impl EdgeMetadata {
             call_count: None,
             variable_name: None,
             confidence: Some(confidence),
+            channel: None,
+            position: None,
         }
     }
 
@@ -213,6 +234,8 @@ impl EdgeMetadata {
             call_count: None,
             variable_name: Some(name),
             confidence: None,
+            channel: None,
+            position: None,
         }
     }
 }
@@ -261,7 +284,14 @@ impl TraversalConfig {
         Self {
             max_depth: Some(3),
             max_nodes: Some(50),
-            allowed_edge_types: Some(&[EdgeType::Call, EdgeType::DataDependency]),
+            allowed_edge_types: Some(&[
+                EdgeType::Call,
+                EdgeType::DataDependency,
+                EdgeType::StateTransition,
+                EdgeType::CommandArgument,
+                EdgeType::Environment,
+                EdgeType::Stdin,
+            ]),
             excluded_node_types: Some(vec![NodeType::Module]),
             min_complexity: None,
             min_edge_confidence: 0.5,
@@ -277,6 +307,10 @@ impl TraversalConfig {
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
+                EdgeType::StateTransition,
+                EdgeType::CommandArgument,
+                EdgeType::Environment,
+                EdgeType::Stdin,
             ]),
             excluded_node_types: None,
             min_complexity: None,
@@ -293,6 +327,10 @@ impl TraversalConfig {
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
+                EdgeType::StateTransition,
+                EdgeType::CommandArgument,
+                EdgeType::Environment,
+                EdgeType::Stdin,
             ]),
             excluded_node_types: None,
             min_complexity: None,
@@ -1194,6 +1232,8 @@ impl ProgramDependenceGraph {
                         call_count: None,
                         variable_name: Some(var_name),
                         confidence: Some(confidence),
+                        channel: None,
+                        position: None,
                     },
                 },
             );
