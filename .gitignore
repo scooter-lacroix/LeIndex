@@ -1,3 +1,8 @@
+# Environment files (may contain secrets — never commit)
+.env
+.env.*
+!.env.example
+
 # Python cache files
 __pycache__/
 *.py[cod]
@@ -164,3 +169,14 @@ docs/R15_*.md
 docs/planning/
 docs/review/
 docs/optimization/
+
+# Personal runtime config, DB backups, and logs (never commit user paths)
+# The live config lives at ~/.leindex/config/leindex.toml (outside the repo);
+# leindex.toml.example is the committed template. These guard dev artifacts that
+# could leak absolute home/library paths.
+*.bak
+*.db.bak
+*.db-journal
+/leindex.toml
+/config/leindex.toml
+/logs/

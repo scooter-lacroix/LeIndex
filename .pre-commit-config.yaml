@@ -1,0 +1,64 @@
+# Pre-commit hooks for LeIndex
+# Install: pip install pre-commit && pre-commit install
+# Run manually: pre-commit run --all-files
+
+repos:
+  # Rust formatting and linting
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --check
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-clippy
+        name: cargo clippy
+        entry: cargo clippy --workspace --all-targets -- -D warnings
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      - id: cargo-test
+        name: cargo test
+        entry: cargo test --workspace
+        language: system
+        types: [rust]
+        pass_filenames: false
+
+      # Large file detection - blocks files over 1MB
+      - id: check-large-files
+        name: Check large files
+        entry: bash -c 'find . -not -path "./target/*" -not -path "./.git/*" -not -path "./node_modules/*" -type f -size +1M -print0 | xargs -0 -r echo "ERROR: Large file(s) detected (>1MB):" && test -z "$(find . -not -path "./target/*" -not -path "./.git/*" -not -path "./node_modules/*" -type f -size +1M)"'
+        language: system
+        pass_filenames: false
+
+      # Check for duplicate code using cargo-dup  
+      - id: check-line-endings
+        name: Check line endings (no CRLF)
+        entry: bash -c 'if grep -rIl --include="*.rs" --include="*.toml" --include="*.yaml" --include="*.yml" --include="*.md" $'\''\r$'\'' . --exclude-dir=target --exclude-dir=.git --exclude-dir=node_modules; then echo "ERROR: CRLF line endings detected"; exit 1; fi'
+        language: system
+        pass_filenames: false
+
+  # General file hygiene
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '\.md$'
+      - id: end-of-file-fixer
+        exclude: '\.min\.(js|css)$'
+      - id: check-yaml
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=1024']
+      - id: mixed-line-ending
+        args: ['--fix=lf']
+
+  # Secret scanning - detects accidental commits of API keys, tokens, passwords
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks

@@ -1,0 +1,82 @@
+version: 2
+# Minimum dependency release age policy:
+# Dependabot creates PRs but dependabot will not auto-merge new releases
+# immediately. Reviewers should wait at least 3 days after a dependency
+# release before merging to mitigate supply chain risk. This is documented
+# in AGENTS.md under "Secrets Management" (minimum dependency release age).
+updates:
+  # Rust dependencies (Cargo)
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+    groups:
+      tree-sitter:
+        patterns:
+          - "tree-sitter*"
+      tokio:
+        patterns:
+          - "tokio*"
+      axum:
+        patterns:
+          - "axum"
+          - "tower"
+          - "tower-http"
+
+  # Subcrate: leindex-embed
+  - package-ecosystem: "cargo"
+    directory: "/crates/leindex-embed"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+
+  # npm (dashboard)
+  - package-ecosystem: "npm"
+    directory: "/dashboard"
+    schedule:
+      interval: "monthly"
+    labels:
+      - "dependencies"
+      - "npm"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+  # npm (leindex-mcp package)
+  - package-ecosystem: "npm"
+    directory: "/packages/npm-leindex-mcp"
+    schedule:
+      interval: "monthly"
+    labels:
+      - "dependencies"
+      - "npm"
+    commit-message:
+      prefix: "deps"
+      include: "scope"

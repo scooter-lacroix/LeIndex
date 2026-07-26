@@ -9,5 +9,27 @@
 #
 # This file is reserved for clippy *configuration thresholds* only
 # (e.g. `too-many-arguments-threshold`, `type-complexity-threshold`,
-# `msrv`). The workspace currently relies on clippy's defaults, so it is
-# intentionally empty. Add threshold entries here as the codebase evolves.
+# `msrv`).
+
+# ── Cognitive complexity threshold ───────────────────────────────────
+# Enforces a maximum cognitive complexity per function via clippy's
+# `cognitive_complexity` lint (active in the complexity group).
+# Functions exceeding the threshold trigger a warning that must be
+# refactored or explicitly allowed with #[allow(clippy::cognitive_complexity)].
+# Default is 25; we allow 30 to accommodate CLI handlers with rich context.
+cognitive-complexity-threshold = 30
+
+# ── Other quality thresholds ────────────────────────────────────────
+
+# Max arguments per function before `too_many_arguments` triggers.
+# Set higher than default (7) to accommodate CLI handlers with rich context.
+too-many-arguments-threshold = 10
+
+# Max enum variant body size before `large_enum_variant` triggers (in bytes).
+enum-variant-size-threshold = 200
+
+# Max single-char binding names in a scope.
+single-char-binding-names-threshold = 4
+
+# MSRV for lint compatibility.
+msrv = "1.75"
