@@ -17,6 +17,9 @@ downloads/
 eggs/
 .eggs/
 lib/
+!dashboard/src/lib/
+!dashboard/src/lib/**
+.worktrees/
 lib64/
 parts/
 sdist/
