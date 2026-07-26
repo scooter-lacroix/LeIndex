@@ -43,8 +43,8 @@
     },
     "embed_active": {
       "rss_max_kib": 102400,
-      "description": "After C: 102400 KiB (100 MiB). Main daemon during worker-active embedding. Worker carries the model residency.",
-      "combined_rss_max_kib": 307200
+      "description": "Main daemon remains capped at 100 MiB; provider-default auto/MIGraphX neural worker measured 5472552 KiB, with an 8 GiB combined ceiling for model/runtime residency.",
+      "combined_rss_max_kib": 8388608
     },
     "embed_teardown": {
       "rss_max_kib": 102400,
