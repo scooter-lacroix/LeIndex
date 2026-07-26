@@ -35,15 +35,15 @@ anyhow = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# ONNX Runtime dependencies — owned exclusively by the worker crate
-# Use api-24 to match the struct layout of ORT 1.25.0 (onnxruntime-migraphx 1.25.0).
-# ORT 1.25.0 has the 13-field OrtApi struct that ort-sys 2.0.0-rc.12 expects.
-# The previous api-23 caused a struct layout mismatch segfault with ORT 1.23.2.
+# ONNX Runtime dependencies — owned exclusively by the worker crate.
+# API 23 is the newest API shared by supported ORT 1.23.2 and 1.27.1 runtimes;
+# newer runtimes expose backward-compatible API tables. Model/operator support
+# remains determined by the loaded runtime, not this C API table version.
 #
 # `load-dynamic` replaces `download-binaries` + `copy-dylibs` + `tls-native`:
 # the ort crate no longer downloads, links, or vendor-copies any ORT library at
 # build time. The worker dlopens libonnxruntime at runtime via ort::init_from().
-ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["ndarray", "std", "tracing", "load-dynamic", "api-24"] }
+ort = { version = "2.0.0-rc.12", optional = true, default-features = false, features = ["ndarray", "std", "tracing", "load-dynamic", "api-23"] }
 tokenizers = { version = "0.20", optional = true }
 ndarray = { version = "0.17", optional = true }
 half = { version = "2.1", optional = true, default-features = false }
@@ -65,9 +65,3 @@ workspace = true
 name = "leindex-embed"
 path = "src/bin/leindex-embed.rs"
 doc = false
-
-[profile.release]
-lto = "thin"
-codegen-units = 1
-opt-level = 3
-strip = true

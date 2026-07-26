@@ -157,8 +157,12 @@ const DAEMON_READINESS_POLL: Duration = Duration::from_millis(25);
 ///
 /// This is a **readiness deadline**, not a cancellation of inference or model
 /// loading. When the deadline fires, indexing proceeds with core TF-IDF/PDG
-/// results. 120 seconds is generous enough for real cold starts including
-/// first-time ONNX model compilation.
+/// results. The daemon does NOT run the MIGraphX cold JIT compile before
+/// reporting Ready (that compile is owned by ORT's native `.mxr` cache and
+/// paid once at `leindex setup` warmup); Ready only waits on ORT dylib load +
+/// model load + EP registration (~10 s observed). 120 s is therefore a generous
+/// ceiling; a genuinely broken worker still fails fast (init reports `Failed`
+/// immediately rather than stalling to this deadline).
 const DAEMON_READY_MAX_WAIT: Duration = Duration::from_secs(120);
 
 /// Grace window for a stale daemon to exit after `SIGTERM` before receiving
@@ -270,12 +274,13 @@ fn migraphx_model_cache_path(model_name: Option<&str>) -> Option<std::path::Path
         "migraphx",
     );
     let sequence = leindex_embed::runtime::configured_onnx_sequence_len();
-    let profile = format!(
-        "v{}-b{}-s{}",
-        sanitize_cache_component(env!("CARGO_PKG_VERSION")),
-        batch,
-        sequence
-    );
+    // Key on batch + sequence only. A compiled MIGraphX program depends on the
+    // model graph + input shape, never on LeIndex's software version (the model
+    // name is already a parent dir segment). Including the package version here
+    // forced a fresh ~600s JIT recompile on every minor release bump and grew a
+    // new ~1.2GB cache profile each time. The worker prunes stale `.mxr` files
+    // within this dir on startup; `leindex setup` prunes stale sibling profiles.
+    let profile = format!("b{}-s{}", batch, sequence);
     leindex_home_dir().map(|home| {
         home.join("cache")
             .join("migraphx")
@@ -291,6 +296,43 @@ fn migraphx_model_cache_path(model_name: Option<&str>) -> Option<std::path::Path
 pub fn migraphx_cache_path(model_name: &str) -> std::path::PathBuf {
     migraphx_model_cache_path(Some(model_name))
         .unwrap_or_else(|| std::path::PathBuf::from("/tmp/leindex-migraphx-cache-unresolved"))
+}
+
+/// Remove stale MIGraphX cache profile directories for `model_name`, keeping
+/// only the profile matching the current batch + sequence length.
+///
+/// Each profile dir holds a ~1.2 GB compiled program. Old profiles — left
+/// behind by a prior package version, batch size, or sequence length —
+/// accumulate without bound. The worker prunes `.mxr` files within the active
+/// profile on startup; this prunes the sibling profile dirs themselves, so the
+/// cache tree never grows past one live profile. Returns the number removed.
+pub fn prune_stale_migraphx_profiles(model_name: &str) -> usize {
+    let current = migraphx_cache_path(model_name);
+    let Some(parent) = current.parent() else {
+        return 0;
+    };
+    let mut removed = 0;
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return 0;
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if path == current || !path.is_dir() {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {
+                tracing::debug!("pruned stale MIGraphX cache profile: {}", path.display());
+                removed += 1;
+            }
+            Err(error) => tracing::warn!(
+                "failed to prune stale MIGraphX cache profile {}: {}",
+                path.display(),
+                error
+            ),
+        }
+    }
+    removed
 }
 
 fn sanitize_cache_component(value: &str) -> String {
@@ -853,6 +895,52 @@ impl EmbeddingClient {
             .and_then(|line| line.as_deref().and_then(parse_startup_report_provider))
     }
 
+    /// The model name the worker is configured to load (env or leindex.toml).
+    pub fn configured_model_name(&self) -> Option<String> {
+        std::env::var("LEINDEX_WORKER_MODEL")
+            .ok()
+            .or_else(|| self.cached_config().model_name.clone())
+    }
+
+    /// Return a human-readable reason when a GPU execution provider was
+    /// *requested* but the worker *fell back to CPU*.
+    ///
+    /// This is the signal the indexing pipeline uses to bail neural enrichment
+    /// to TF-IDF instead of silently running 100-1000x slower CPU inference the
+    /// user did not ask for. Returns `None` (proceed with neural) when:
+    ///   - the configured provider is `cpu`, `auto`, or unset — the user either
+    ///     asked for CPU or accepted whatever is available, so the path stays
+    ///     fully operational; or
+    ///   - the requested GPU provider is actually active; or
+    ///   - the worker could not yet report a provider (e.g. still compiling on a
+    ///     cold GPU start) — do not punish a legitimate cold compile.
+    pub fn cpu_fallback_reason(&self) -> Option<String> {
+        let requested = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER")
+            .ok()
+            .or_else(|| self.cached_config().execution_provider.clone());
+        let requested_gpu = matches!(
+            requested.as_deref(),
+            Some("migraphx") | Some("cuda") | Some("rocm")
+        );
+        if !requested_gpu {
+            return None;
+        }
+        // Bring the worker up so its actual provider is observable. This spawns
+        // the daemon the enrichment pass would spawn anyway, so it is not net
+        // extra work; on a fast CPU fallback the worker reports Ready quickly.
+        let _ = self.ensure_worker_ready();
+        match self.active_execution_provider().as_deref() {
+            Some("cpu") => Some(format!(
+                "neural worker fell back to CPU although `{}` was requested; \
+                 skipping neural enrichment (TF-IDF only). Point ORT_DYLIB_PATH at a \
+                 migraphx-enabled libonnxruntime, or set execution_provider = \"cpu\" \
+                 in ~/.leindex/config/leindex.toml to use CPU embeddings deliberately.",
+                requested.unwrap_or_default()
+            )),
+            _ => None,
+        }
+    }
+
     /// Return cached worker config env, reading from leindex.toml at most once.
     ///
     /// VAL-DAEMON-003: The config file is read on the first call and stored in
@@ -1172,7 +1260,12 @@ impl EmbeddingClient {
         // chain consistent across both the interactive setup flow (which
         // installs ORT via pip and remembers the discovered `.so`) and the
         // plain-spawn path used by searches.
-        if std::env::var_os("ORT_DYLIB_PATH").is_none() {
+        // An empty value is treated as unset so the config fallback fires.
+        let ort_dylib_unset = match std::env::var_os("ORT_DYLIB_PATH") {
+            None => true,
+            Some(v) => v.is_empty(),
+        };
+        if ort_dylib_unset {
             if let Some(path) = &config_env.ort_dylib_path {
                 cmd.env("ORT_DYLIB_PATH", path);
             }
@@ -1680,6 +1773,26 @@ impl EmbeddingClient {
     /// Resident daemon ownership stays with its reaper; a client never
     /// deletes a persistent daemon socket or kills a process it did not own.
     pub fn kill_worker(&self) {
+        if let Ok(mut guard) = self.worker.lock() {
+            if let Some(mut handle) = guard.take() {
+                Self::shutdown_worker_handle(&mut handle, true);
+            }
+        }
+    }
+
+    /// Force-shutdown the persistent ONNX daemon, killing it even if the
+    /// client does not own the child process.
+    ///
+    /// This is the CLI-mode cleanup: after a one-shot command (e.g. `leindex
+    /// index` or `leindex search`) completes, the persistent daemon it spawned
+    /// has no reason to outlive the process. The default `Drop` impl passes
+    /// `kill_persistent=false`, which leaves daemon workers running for reuse
+    /// by the MCP server. This method forces `kill_persistent=true` so the
+    /// daemon is properly terminated before the CLI process exits.
+    ///
+    /// This is a no-op if no worker was ever spawned or the worker has already
+    /// been shut down.
+    pub fn force_shutdown_daemon(&self) {
         if let Ok(mut guard) = self.worker.lock() {
             if let Some(mut handle) = guard.take() {
                 Self::shutdown_worker_handle(&mut handle, true);
@@ -2247,6 +2360,29 @@ mod tests {
     use super::*;
     use leindex_embed::protocol::ErrorKind;
 
+    /// TEMP verification: spawn the REAL leindex-embed worker (pipe mode) and run
+    /// one embed through the production EmbeddingClient. On a cold MIGraphX cache
+    /// this JIT-compiles (~300 s) and the native ORT cache writes a `.mxr`; on a
+    /// warm cache it loads the `.mxr` (~10 s). Run: `cargo test -p leindex
+    /// --features onnx real_pipe_embed -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "spawns real leindex-embed worker + ~300s MIGraphX JIT compile"]
+    fn real_pipe_embed_seeds_migraphx_cache() {
+        let cache = migraphx_cache_path("qwen3-embed-0.6b");
+        eprintln!("cache dir: {}", cache.display());
+        let start = std::time::Instant::now();
+        let client = EmbeddingClient::new_pipe();
+        let response = client
+            .embed(&["hello world".to_string()], 1024)
+            .expect("pipe embed failed");
+        eprintln!(
+            "embed count={} elapsed={:?}",
+            response.count,
+            start.elapsed()
+        );
+        assert!(response.count > 0, "embed returned no vectors");
+    }
+
     #[test]
     fn test_client_creation() {
         let _client = EmbeddingClient::new();
@@ -2522,7 +2658,7 @@ mod tests {
             .join("cache")
             .join("migraphx")
             .join("qwen3-embed-0_6b-dynamic")
-            .join("v1_9_0-b8-s128");
+            .join("b8-s128");
 
         assert_eq!(
             migraphx_model_cache_path(Some("qwen3-embed-0.6b-dynamic")).as_deref(),

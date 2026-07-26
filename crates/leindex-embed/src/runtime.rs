@@ -92,6 +92,12 @@ const MIGRAPHX_FP16_ENV: &str = "LEINDEX_MIGRAPHX_FP16";
 #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
 const MIGRAPHX_EXHAUSTIVE_TUNE_ENV: &str = "LEINDEX_MIGRAPHX_EXHAUSTIVE_TUNE";
 
+/// Profile directory holding compiled MIGraphX `.mxr` programs. Set on the
+/// worker process by the embedding client; keyed on model + batch + seq (NOT
+/// package version) so a release bump does not invalidate the cache.
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+const MIGRAPHX_MODEL_CACHE_PATH_ENV: &str = "ORT_MIGRAPHX_MODEL_CACHE_PATH";
+
 #[cfg_attr(not(feature = "onnx"), allow(dead_code))]
 pub fn configured_onnx_inference_batch_size(model_name: &str, provider: &str) -> usize {
     std::env::var(ONNX_INFERENCE_BATCH_SIZE_ENV)
@@ -115,6 +121,43 @@ fn build_position_ids(batch_size: usize, sequence_len: usize) -> Vec<i64> {
     (0..batch_size)
         .flat_map(|_| (0..sequence_len).map(|position| position as i64))
         .collect()
+}
+
+/// Remove all but the `keep` newest `.mxr` files from a cache dir.
+///
+/// Without this, every model/shape/version change leaves a ~1.2 GB orphan
+/// (MIGraphX JIT artifacts are large), so the cache grows without bound across
+/// releases. Keeping one is sufficient because the active profile recompiles
+/// into the same deterministic `compiled.mxr` path.
+#[cfg_attr(not(feature = "onnx"), allow(dead_code))]
+fn prune_migraphx_cache(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut mxr: Vec<(std::path::PathBuf, std::time::SystemTime)> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "mxr"))
+        .filter_map(|path| {
+            std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .map(|mtime| (path, mtime))
+        })
+        .collect();
+    mxr.sort_by_key(|item| std::cmp::Reverse(item.1)); // newest first
+    for (path, _) in mxr.into_iter().skip(keep) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::debug!("pruned stale MIGraphX cache file: {}", path.display()),
+            Err(error) => {
+                tracing::warn!(
+                    "failed to prune stale MIGraphX cache file {}: {}",
+                    path.display(),
+                    error
+                )
+            }
+        }
+    }
 }
 
 #[cfg(feature = "onnx")]
@@ -171,6 +214,9 @@ pub struct RuntimeConfig {
     pub embedding_dim: usize,
     /// Requested execution provider.
     pub execution_provider: String,
+    /// Reranker cross-encoder model name (loaded on demand). Empty disables
+    /// reranking (handle_rerank returns passthrough scores).
+    pub rerank_model_name: String,
 }
 
 impl Default for RuntimeConfig {
@@ -184,6 +230,7 @@ impl Default for RuntimeConfig {
             // Default to "auto" which will detect the best available provider.
             // The worker will try MIGraphX (AMD GPU), then CUDA, then CPU.
             execution_provider: "auto".to_string(),
+            rerank_model_name: "qwen3-reranker-0.6b-seq-cls".to_string(),
         }
     }
 }
@@ -230,6 +277,10 @@ impl RuntimeConfig {
         let execution_provider = std::env::var("LEINDEX_WORKER_EXECUTION_PROVIDER")
             .unwrap_or_else(|_| "auto".to_string());
 
+        let rerank_model_name = std::env::var("LEINDEX_WORKER_RERANK_MODEL")
+            .ok()
+            .unwrap_or_else(|| "qwen3-reranker-0.6b-seq-cls".to_string());
+
         Self {
             idle_timeout,
             max_frame_size,
@@ -237,6 +288,7 @@ impl RuntimeConfig {
             model_name,
             embedding_dim,
             execution_provider,
+            rerank_model_name,
         }
     }
 }
@@ -269,7 +321,37 @@ pub struct WorkerRuntime {
     /// Actual provider status observed while building the ONNX session.
     #[cfg(feature = "onnx")]
     provider_runtime_status: ProviderRuntimeStatus,
+
+    /// Lazy on-demand reranker cross-encoder session. `None` until the first
+    /// rerank request loads it; evicted after `RERANK_IDLE_EVICTION_SECS` of
+    /// rerank idleness to free memory/VRAM. Held as `Arc<Mutex<Option<...>>>`
+    /// so it can be loaded + evicted through the shared `Arc<WorkerRuntime>` in
+    /// the socket path (handle_rerank takes &self). Separate from `session`
+    /// (the embedder) so the reranker only costs resources while in use.
+    #[cfg(feature = "onnx")]
+    rerank_session: Arc<Mutex<Option<Arc<Mutex<Session>>>>>,
+    #[cfg(feature = "onnx")]
+    rerank_tokenizer: Arc<Mutex<Option<Arc<tokenizers::Tokenizer>>>>,
+    /// Last time the reranker was used (for idle eviction).
+    #[cfg(feature = "onnx")]
+    last_rerank_activity: Arc<Mutex<Instant>>,
+    /// Serializes reranker lazy-load (prevents double-load on concurrent
+    /// socket requests).
+    #[cfg(feature = "onnx")]
+    rerank_init_lock: Arc<Mutex<()>>,
 }
+
+/// Reranker idle eviction threshold: after this many seconds with no rerank
+/// request, the lazy rerank session + tokenizer are dropped to free memory.
+#[cfg(feature = "onnx")]
+const RERANK_IDLE_EVICTION_SECS: u64 = 120;
+
+/// Rerank sequence length. Larger than the embed model's (128) because the
+/// Qwen3-Reranker chat template (prefix + instruct + query + document + suffix)
+/// is ~60 tokens before the document even starts; 128 would truncate the
+/// document + the required assistant suffix. 512 covers typical code symbols.
+#[cfg(feature = "onnx")]
+const RERANK_MAX_SEQ_LEN: usize = 512;
 
 #[cfg(feature = "onnx")]
 #[derive(Debug, Clone)]
@@ -319,6 +401,14 @@ impl WorkerRuntime {
             last_activity: Arc::new(Mutex::new(Instant::now())),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             started_unix_ms: unix_now_ms(),
+            #[cfg(feature = "onnx")]
+            rerank_session: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "onnx")]
+            rerank_tokenizer: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "onnx")]
+            last_rerank_activity: Arc::new(Mutex::new(Instant::now())),
+            #[cfg(feature = "onnx")]
+            rerank_init_lock: Arc::new(Mutex::new(())),
             #[cfg(feature = "onnx")]
             session,
             #[cfg(feature = "onnx")]
@@ -436,7 +526,7 @@ impl WorkerRuntime {
         };
 
         // Load tokenizer
-        let tokenizer = match tokenizers::Tokenizer::from_file(&tokenizer_path) {
+        let mut tokenizer = match tokenizers::Tokenizer::from_file(&tokenizer_path) {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(
@@ -447,6 +537,27 @@ impl WorkerRuntime {
                 return (None, None, load_start.elapsed(), provider_runtime_status);
             }
         };
+        // Configure token-level truncation at load so an oversized input never
+        // allocates a full-length encoding before the inference path pads it.
+        // Padding targets `configured_onnx_sequence_len()`, so truncating to the
+        // same length only bounds intermediate allocation — it does not change
+        // the model's input shape or the result for in-bounds texts.
+        let seq_len = configured_onnx_sequence_len();
+        use tokenizers::utils::truncation::{
+            TruncationDirection, TruncationParams, TruncationStrategy,
+        };
+        if let Err(error) = tokenizer.with_truncation(Some(TruncationParams {
+            direction: TruncationDirection::Right,
+            max_length: seq_len,
+            strategy: TruncationStrategy::LongestFirst,
+            stride: 0,
+        })) {
+            tracing::warn!(
+                "failed to set tokenizer truncation (max_length={}): {}",
+                seq_len,
+                error
+            );
+        }
 
         // Create ONNX session
         let provider_selection = ExecutionProviderSelector::select(&config.execution_provider);
@@ -474,9 +585,14 @@ impl WorkerRuntime {
 
         match session_result {
             Ok(outcome) => {
-                provider_runtime_status = outcome.provider_status;
+                let SessionBuildOutcome {
+                    session,
+                    provider_status,
+                } = outcome;
+
+                provider_runtime_status = provider_status;
                 (
-                    Some(Arc::new(Mutex::new(outcome.session))),
+                    Some(Arc::new(Mutex::new(session))),
                     Some(Arc::new(tokenizer)),
                     model_load_time,
                     provider_runtime_status,
@@ -520,6 +636,27 @@ impl WorkerRuntime {
 
         fn build_migraphx_ep() -> ort::ep::ExecutionProviderDispatch {
             let mut ep = ort::ep::MIGraphX::default();
+
+            // Compiled-program persistence is owned by ORT's native
+            // `ORT_MIGraphX_MODEL_CACHE_PATH` cache, set on the worker process by
+            // the embedding client (`client.rs`). On a COLD start the first real
+            // inference JIT-compiles (~300 s) and the native cache writes the
+            // `.mxr`; on a WARM start the EP loads it at init (~4 s) and skips the
+            // compile. We do NOT use the crate-level `with_save_model`/
+            // `with_load_model`: under the ort-crate/ORT struct skew those read an
+            // empty save path, collide with the native cache, and a synthetic
+            // zero-input warmup makes the compiled kernel fail (so no `.mxr` is
+            // ever written). The first real embed request (e.g. `leindex setup`
+            // pipe mode) is the compile trigger. Only prune stale `.mxr` files to
+            // bound the ~1.2 GB-per-shape growth.
+            if let Ok(cache_dir_str) = std::env::var(MIGRAPHX_MODEL_CACHE_PATH_ENV) {
+                // Keep enough .mxr for the embedder (index b8 + query b1) AND the
+                // on-demand reranker (b8 x 512) to coexist. The prior keep=1 made
+                // them evict each other every process (mutual recompile, ~300s
+                // each, every search). They share this one cache dir because
+                // ORT_MIGraphX_MODEL_CACHE_PATH is a single process-global path.
+                prune_migraphx_cache(std::path::Path::new(&cache_dir_str), 6);
+            }
 
             if env_flag(MIGRAPHX_FP16_ENV) {
                 tracing::info!("MIGraphX FP16 enabled via {}", MIGRAPHX_FP16_ENV);
@@ -713,6 +850,22 @@ impl WorkerRuntime {
                 self.provider_runtime_status.provider_available,
                 self.provider_runtime_status.fallback_reason.as_deref(),
             );
+            // T5: explicit, actionable warning when a GPU provider was requested
+            // but the worker fell back to CPU. A deliberate `cpu` configuration
+            // has provider_available=true and no fallback_reason, so it stays
+            // silent here — the CPU path is fully operational by user choice.
+            if !self.provider_runtime_status.provider_available {
+                if let Some(reason) = &self.provider_runtime_status.fallback_reason {
+                    tracing::warn!(
+                        reason = %reason,
+                        provider = %self.provider_runtime_status.execution_provider,
+                        "neural worker is on CPU after a GPU provider was requested; \
+                         inference will be 100-1000x slower than GPU. Point ORT_DYLIB_PATH at \
+                         a migraphx-enabled libonnxruntime, or set execution_provider=\"cpu\" to \
+                         use CPU embeddings deliberately."
+                    );
+                }
+            }
         }
         #[cfg(not(feature = "onnx"))]
         {
@@ -839,6 +992,12 @@ impl WorkerRuntime {
                 return Ok(());
             }
 
+            // Evict the on-demand reranker if it has been idle long enough to
+            // free its memory/VRAM between rerank bursts. (Worker itself stays
+            // alive for embeds; only the rerank session is reclaimed.)
+            #[cfg(feature = "onnx")]
+            self.maybe_evict_rerank();
+
             // Read frame with timeout so idle check fires periodically
             let frame_buf = match rx.recv_timeout(read_timeout) {
                 Ok(Ok(buf)) => buf,
@@ -877,6 +1036,12 @@ impl WorkerRuntime {
 
     /// Dispatch a request frame to the appropriate handler.
     pub fn dispatch(&self, frame: &Frame) -> Frame {
+        // Reset the idle timer on request entry. Without this, the accept loop's
+        // top-of-iteration idle check can kill the worker during a long-running
+        // inference (e.g. the first MIGraphX JIT compile) even though it is
+        // actively processing. `touch()` is also called after write and between
+        // sub-batches for defense in depth.
+        self.touch();
         let batch_id = frame.header.batch_id;
 
         match frame.header.msg_type {
@@ -982,9 +1147,11 @@ impl WorkerRuntime {
         texts: &[String],
         expected_dim: usize,
     ) -> Result<EmbedResponse, WorkerError> {
-        // Batch tokenize all texts (tokenizer handles this efficiently)
+        // Batch tokenize all texts. Borrow as &str to avoid cloning every text
+        // into the tokenizer call (the texts are already owned by the caller).
+        let text_refs: Vec<&str> = texts.iter().map(String::as_str).collect();
         let encodings = tokenizer
-            .encode_batch(texts.to_vec(), true)
+            .encode_batch(text_refs, true)
             .map_err(|e| WorkerError {
                 kind: ErrorKind::Tokenizer,
                 message: format!("tokenization failed: {}", e),
@@ -1012,6 +1179,8 @@ impl WorkerRuntime {
         let fixed_batch = active_provider.eq_ignore_ascii_case("migraphx")
             || active_provider.eq_ignore_ascii_case("rocm");
         for sub_batch in encodings.chunks(inference_batch_size) {
+            // Keep the worker alive across a large multi-batch codebase.
+            self.touch();
             if fixed_batch && sub_batch.len() < inference_batch_size {
                 let mut padded = sub_batch.to_vec();
                 if let Some(template) = sub_batch.first() {
@@ -1120,6 +1289,27 @@ impl WorkerRuntime {
             message: format!("failed to create position_ids tensor: {}", e),
         })?;
 
+        // token_type_ids: BERT/GTE-style models (e.g. SFR-Embedding-Code-400M)
+        // have a `token_type_embeddings` layer that requires this input —
+        // without it inference fails at `/embeddings/token_type_embeddings/Gather`
+        // with "Missing Input: token_type_ids". For single-text retrieval every
+        // token is segment 0, so feed all-zeros. Models that lack this input
+        // never read it (see `uses_token_type_ids` below).
+        let token_type_ids_tensor = ort::value::Tensor::from_array(
+            ndarray::Array2::from_shape_vec(
+                (batch_size, max_len),
+                vec![0i64; batch_size * max_len],
+            )
+            .map_err(|e| WorkerError {
+                kind: ErrorKind::Inference,
+                message: format!("failed to create token_type_ids array: {}", e),
+            })?,
+        )
+        .map_err(|e| WorkerError {
+            kind: ErrorKind::Inference,
+            message: format!("failed to create token_type_ids tensor: {}", e),
+        })?;
+
         let mut session_guard = session.lock().map_err(|e| WorkerError {
             kind: ErrorKind::OnnxRuntime,
             message: format!("failed to lock ONNX session: {}", e),
@@ -1129,17 +1319,33 @@ impl WorkerRuntime {
             .inputs()
             .iter()
             .any(|input| input.name() == "position_ids");
-        let outputs = if uses_position_ids {
-            session_guard.run(ort::inputs! {
+        let uses_token_type_ids = session_guard
+            .inputs()
+            .iter()
+            .any(|input| input.name() == "token_type_ids");
+        // Feed only the inputs the model declares; extras would be rejected.
+        // Arms are mutually exclusive, so each tensor moves on exactly one path.
+        let outputs = match (uses_position_ids, uses_token_type_ids) {
+            (true, true) => session_guard.run(ort::inputs! {
                 "input_ids" => input_ids_tensor,
                 "attention_mask" => attention_mask_tensor,
                 "position_ids" => position_ids_tensor,
-            })
-        } else {
-            session_guard.run(ort::inputs! {
+                "token_type_ids" => token_type_ids_tensor,
+            }),
+            (true, false) => session_guard.run(ort::inputs! {
                 "input_ids" => input_ids_tensor,
                 "attention_mask" => attention_mask_tensor,
-            })
+                "position_ids" => position_ids_tensor,
+            }),
+            (false, true) => session_guard.run(ort::inputs! {
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+                "token_type_ids" => token_type_ids_tensor,
+            }),
+            (false, false) => session_guard.run(ort::inputs! {
+                "input_ids" => input_ids_tensor,
+                "attention_mask" => attention_mask_tensor,
+            }),
         }
         .map_err(|e| WorkerError {
             kind: ErrorKind::Inference,
@@ -1291,6 +1497,113 @@ impl WorkerRuntime {
     }
 
     /// Handle a rerank request.
+    /// Lazily load + return the reranker cross-encoder session + tokenizer (on
+    /// demand). The reranker is loaded only on the first rerank request and
+    /// evicted after `RERANK_IDLE_EVICTION_SECS` of idleness
+    /// (`maybe_evict_rerank`). Uses the CPU execution provider so it does not
+    /// contend with the embedder's GPU session and stays cheap (a cross-encoder
+    /// over a small top-N). Double-checked under `rerank_init_lock` so concurrent
+    /// socket requests don't double-load.
+    #[cfg(feature = "onnx")]
+    fn ensure_rerank_session(
+        &self,
+    ) -> Result<(Arc<Mutex<Session>>, Arc<tokenizers::Tokenizer>), WorkerError> {
+        // Fast path: already resident.
+        if let (Some(s), Some(t)) = (
+            self.rerank_session.lock().ok().and_then(|g| g.clone()),
+            self.rerank_tokenizer.lock().ok().and_then(|g| g.clone()),
+        ) {
+            *self.last_rerank_activity.lock().unwrap() = Instant::now();
+            return Ok((s, t));
+        }
+        let _init = self.rerank_init_lock.lock().map_err(|e| WorkerError {
+            kind: ErrorKind::Inference,
+            message: format!("rerank init lock poisoned: {}", e),
+        })?;
+        // Double-check after acquiring the lock.
+        if let (Some(s), Some(t)) = (
+            self.rerank_session.lock().ok().and_then(|g| g.clone()),
+            self.rerank_tokenizer.lock().ok().and_then(|g| g.clone()),
+        ) {
+            *self.last_rerank_activity.lock().unwrap() = Instant::now();
+            return Ok((s, t));
+        }
+        let model_name = self.config.rerank_model_name.clone();
+        if model_name.trim().is_empty() {
+            return Err(WorkerError {
+                kind: ErrorKind::ModelNotFound,
+                message: "no rerank model configured".to_string(),
+            });
+        }
+        let model_path =
+            crate::model_path::ModelResolver::resolve(&model_name).map_err(|e| WorkerError {
+                kind: ErrorKind::ModelNotFound,
+                message: format!("rerank model '{}' not found: {}", model_name, e),
+            })?;
+        // Rerank tokenizer: convention `{model_stem}-tokenizer.json` beside the
+        // model. ModelResolver::resolve_tokenizer ignores model_name and would
+        // return the EMBED tokenizer (wrong vocab), so derive the path
+        // explicitly: bge-reranker-base.onnx -> bge-reranker-base-tokenizer.json.
+        let tokenizer_path = format!("{}-tokenizer.json", model_path.with_extension("").display());
+        let tokenizer = Arc::new(tokenizers::Tokenizer::from_file(&tokenizer_path).map_err(
+            |e| WorkerError {
+                kind: ErrorKind::Tokenizer,
+                message: format!("rerank tokenizer load failed ({}): {}", tokenizer_path, e),
+            },
+        )?);
+        // Use the configured execution provider (typically MIGraphX/GPU) so the
+        // cross-encoder is fast (~1-3s after a one-time compile cached as a
+        // .mxr). The native ORT_MIGraphX_MODEL_CACHE_PATH cache persists across
+        // idle evictions, so on-demand reloads stay warm. CPU is ~70s/query for
+        // top-20 × 512 — unusable interactively. If the provider is unavailable
+        // for this model, build_session falls back to CPU automatically.
+        let provider = if self.config.execution_provider.trim().is_empty() {
+            "auto"
+        } else {
+            self.config.execution_provider.as_str()
+        };
+        let outcome = Self::build_session(&model_path, provider).map_err(|e| WorkerError {
+            kind: ErrorKind::Inference,
+            message: format!("rerank session build failed: {}", e),
+        })?;
+        let session = Arc::new(Mutex::new(outcome.session));
+        tracing::info!(model = %model_name, provider, "reranker loaded on demand");
+        *self.rerank_session.lock().unwrap() = Some(session.clone());
+        *self.rerank_tokenizer.lock().unwrap() = Some(tokenizer.clone());
+        *self.last_rerank_activity.lock().unwrap() = Instant::now();
+        Ok((session, tokenizer))
+    }
+
+    /// Drop the reranker session + tokenizer if it has been idle longer than
+    /// `RERANK_IDLE_EVICTION_SECS`. Called from the worker idle loop so the
+    /// reranker's memory is reclaimed between rerank bursts. No-op if the
+    /// reranker isn't loaded.
+    #[cfg(feature = "onnx")]
+    pub fn maybe_evict_rerank(&self) {
+        let evict = {
+            let last = match self.last_rerank_activity.lock() {
+                Ok(g) => *g,
+                Err(_) => return,
+            };
+            self.rerank_session
+                .lock()
+                .map(|g| g.is_some())
+                .unwrap_or(false)
+                && last.elapsed().as_secs() > RERANK_IDLE_EVICTION_SECS
+        };
+        if evict {
+            let had = self
+                .rerank_session
+                .lock()
+                .map(|mut g| g.take().is_some())
+                .unwrap_or(false);
+            if had {
+                let _ = self.rerank_tokenizer.lock().map(|mut g| g.take());
+                tracing::info!(secs = RERANK_IDLE_EVICTION_SECS, "reranker idle-evicted");
+            }
+        }
+    }
+
     fn handle_rerank(&self, frame: &Frame) -> Result<RerankResponse, WorkerError> {
         let request: Request = frame.decode_payload().map_err(|e| WorkerError {
             kind: ErrorKind::InvalidRequest,
@@ -1309,14 +1622,9 @@ impl WorkerRuntime {
 
         #[cfg(feature = "onnx")]
         {
-            if let (Some(session), Some(tokenizer)) = (&self.session, &self.tokenizer) {
-                self.run_onnx_rerank(session, tokenizer, &rerank_req)
-            } else {
-                Err(WorkerError {
-                    kind: ErrorKind::ModelNotFound,
-                    message: "ONNX session or tokenizer not initialized for rerank".to_string(),
-                })
-            }
+            // Reranker is loaded ON DEMAND (separate from the embed session).
+            let (session, tokenizer) = self.ensure_rerank_session()?;
+            self.run_onnx_rerank(&session, &tokenizer, &rerank_req)
         }
 
         #[cfg(not(feature = "onnx"))]
@@ -1344,14 +1652,30 @@ impl WorkerRuntime {
         tokenizer: &Arc<tokenizers::Tokenizer>,
         rerank_req: &protocol::RerankRequest,
     ) -> Result<RerankResponse, WorkerError> {
-        // Encode query-document pairs as "Query: {q} Document: {d}"
+        // Qwen3-Reranker (including the seq-cls ONNX port) REQUIRES its chat
+        // template — the model was trained on the "Judge whether the Document
+        // meets the requirements... answer yes or no" prompt. Raw (query, doc)
+        // pairs are out-of-distribution and produce near-random logits (this was
+        // the regression: the reranker surfaced tests/garbage). Build the full
+        // templated string per document. Format verified against the seq-cls
+        // model card. Instruction is code-tuned (Qwen3-Reranker is
+        // instruction-sensitive; the web-search default is ~1-5% weaker on code).
+        const RERANK_PREFIX: &str = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n";
+        const RERANK_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\nThinking\n\nAnswer\n\n";
+        const RERANK_INSTRUCT: &str =
+            "Given a code search query, retrieve the most relevant source code";
         let pair_texts: Vec<String> = rerank_req
             .documents
             .iter()
-            .map(|doc| format!("Query: {} Document: {}", rerank_req.query, doc.content))
+            .map(|doc| {
+                format!(
+                    "{RERANK_PREFIX}<Instruct>: {RERANK_INSTRUCT}\n<Query>: {}\n<Document>: {}{RERANK_SUFFIX}",
+                    rerank_req.query, doc.content
+                )
+            })
             .collect();
 
-        // Batch tokenize all pairs (tokenizer handles this efficiently)
+        // Batch tokenize all templated inputs.
         let encodings = tokenizer
             .encode_batch(pair_texts, true)
             .map_err(|e| WorkerError {
@@ -1372,6 +1696,7 @@ impl WorkerRuntime {
         let fixed_batch = active_provider.eq_ignore_ascii_case("migraphx")
             || active_provider.eq_ignore_ascii_case("rocm");
         for sub_batch in encodings.chunks(inference_batch_size) {
+            self.touch();
             if fixed_batch && sub_batch.len() < inference_batch_size {
                 let mut padded = sub_batch.to_vec();
                 if let Some(template) = sub_batch.first() {
@@ -1424,9 +1749,11 @@ impl WorkerRuntime {
             return Ok(vec![]);
         }
 
-        // Keep sequence shape stable across MIGraphX compile, setup warmup,
-        // embedding, and reranking paths.
-        let max_len = configured_onnx_sequence_len();
+        // Rerank uses a larger context than the embed model: the Qwen3-Reranker
+        // chat template (prefix + instruct + query + document + suffix) is ~60
+        // tokens before the document, so the embed model's 128 would truncate
+        // the document + the required assistant suffix.
+        let max_len = RERANK_MAX_SEQ_LEN;
 
         if max_len == 0 {
             // Return zero scores if tokenization produced nothing
@@ -1437,18 +1764,21 @@ impl WorkerRuntime {
         let mut input_ids: Vec<i64> = Vec::with_capacity(batch_size * max_len);
         let mut attention_mask: Vec<i64> = Vec::with_capacity(batch_size * max_len);
 
+        // LEFT padding: Qwen3-Reranker is decoder-style — it must attend up to
+        // the final real token (the assistant position). Right padding would
+        // place pads after the suffix and break the position the model predicts
+        // on. Real tokens go at the END, pads at the start.
         for encoding in encodings {
             let ids = encoding.get_ids();
             let mask = encoding.get_attention_mask();
-
-            for i in 0..max_len {
-                if i < ids.len() {
-                    input_ids.push(ids[i] as i64);
-                    attention_mask.push(mask[i] as i64);
-                } else {
-                    input_ids.push(0i64);
-                    attention_mask.push(0i64);
-                }
+            let n = ids.len().min(max_len);
+            for _ in 0..(max_len - n) {
+                input_ids.push(0);
+                attention_mask.push(0);
+            }
+            for i in 0..n {
+                input_ids.push(ids[i] as i64);
+                attention_mask.push(mask[i] as i64);
             }
         }
 
@@ -1533,7 +1863,7 @@ impl WorkerRuntime {
             message: format!("failed to extract rerank output tensor: {}", e),
         })?;
 
-        let rerank_scores: Vec<f32> = match shape.as_slice() {
+        let raw_logits: Vec<f32> = match shape.as_slice() {
             [n] if *n == batch_size => output_values,
             [n, 1] if *n == batch_size => output_values,
             _ => {
@@ -1546,6 +1876,13 @@ impl WorkerRuntime {
                 });
             }
         };
+        // Qwen3-Reranker seq-cls emits a raw yes/no logit; sigmoid maps it to
+        // [0,1] relevance so the 0.7*rerank + 0.3*initial combine (in the
+        // caller) is on the same scale as the initial search score.
+        let rerank_scores: Vec<f32> = raw_logits
+            .into_iter()
+            .map(|l| 1.0 / (1.0 + (-l).exp()))
+            .collect();
 
         Ok(rerank_scores)
     }
@@ -1590,6 +1927,23 @@ impl WorkerRuntime {
     }
 }
 
+impl Drop for WorkerRuntime {
+    fn drop(&mut self) {
+        // Drop the ONNX session first so the ort/MIGraphX/ROCm destructors free
+        // compiled-program and workspace GPU memory deterministically on
+        // shutdown, rather than leaving it for `process::exit`/SIGKILL (which
+        // skip Drop entirely). WorkerRuntime is Clone and shares the session via
+        // an Arc, so the underlying Session — and its EP resources — are only
+        // released when the last clone drops; `worker_main` drains the runtime
+        // explicitly before exiting to guarantee that happens here.
+        #[cfg(feature = "onnx")]
+        {
+            self.session = None;
+            tracing::trace!("WorkerRuntime dropped; ONNX/GPU resources released");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1598,6 +1952,19 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// Config whose model name resolves to no on-disk file, so
+    /// `WorkerRuntime::new` skips the ~300s MIGraphX JIT compile. The worker
+    /// tests below exercise pooling / idle-timer logic, never real inference, so
+    /// no model is needed. Without this, a real `qwen3-embed-0.6b.onnx` under
+    /// `~/.leindex/models` makes every `WorkerRuntime::new` compile the model and
+    /// OOM the test binary (regression introduced when the static model shipped).
+    fn no_compile_config() -> RuntimeConfig {
+        RuntimeConfig {
+            model_name: "__leindex_test_no_model__".to_string(),
+            ..RuntimeConfig::default()
+        }
+    }
 
     #[test]
     fn test_runtime_config_default() {
@@ -1661,7 +2028,7 @@ mod tests {
     #[cfg(feature = "onnx")]
     #[test]
     fn qwen_pooling_uses_last_unpadded_token() {
-        let runtime = WorkerRuntime::new(RuntimeConfig::default());
+        let runtime = WorkerRuntime::new(no_compile_config());
         let pooled = runtime
             .pool_and_normalize(
                 &[
@@ -1682,7 +2049,7 @@ mod tests {
     #[cfg(feature = "onnx")]
     #[test]
     fn qwen_pooling_rejects_short_embedding_output() {
-        let runtime = WorkerRuntime::new(RuntimeConfig::default());
+        let runtime = WorkerRuntime::new(no_compile_config());
         let error = runtime
             .pool_and_normalize(&[1.0], 1, 2, &[1, 1], 2)
             .unwrap_err();
@@ -1738,7 +2105,7 @@ mod tests {
 
     #[test]
     fn test_runtime_idle_not_expired_initially() {
-        let config = RuntimeConfig::default();
+        let config = no_compile_config();
         let rt = WorkerRuntime::new(config);
         assert!(!rt.is_idle_expired());
     }
@@ -1747,7 +2114,7 @@ mod tests {
     fn test_runtime_idle_expired_with_zero_timeout() {
         let config = RuntimeConfig {
             idle_timeout: Duration::from_secs(0),
-            ..RuntimeConfig::default()
+            ..no_compile_config()
         };
         let rt = WorkerRuntime::new(config);
         // With zero timeout, it should be expired immediately
@@ -1760,7 +2127,7 @@ mod tests {
     fn test_runtime_touch_resets_idle() {
         let config = RuntimeConfig {
             idle_timeout: Duration::from_millis(10),
-            ..RuntimeConfig::default()
+            ..no_compile_config()
         };
         let rt = WorkerRuntime::new(config);
 
@@ -1776,7 +2143,7 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<WorkerRuntime>();
 
-        let runtime = WorkerRuntime::new(RuntimeConfig::default());
+        let runtime = WorkerRuntime::new(no_compile_config());
         let cloned = runtime.clone();
         assert!(Arc::ptr_eq(&runtime.last_activity, &cloned.last_activity));
         cloned.touch();
@@ -1785,7 +2152,7 @@ mod tests {
 
     #[test]
     fn test_shutdown_flag() {
-        let config = RuntimeConfig::default();
+        let config = no_compile_config();
         let rt = WorkerRuntime::new(config);
         let flag = rt.shutdown_flag();
 
@@ -1796,7 +2163,7 @@ mod tests {
 
     #[test]
     fn test_truncate_text_within_limit() {
-        let config = RuntimeConfig::default();
+        let config = no_compile_config();
         let rt = WorkerRuntime::new(config);
         let text = "hello world".to_string();
         let result = rt.truncate_text(text.clone());
@@ -1807,7 +2174,7 @@ mod tests {
     fn test_truncate_text_exceeds_limit() {
         let config = RuntimeConfig {
             max_text_size: 10,
-            ..RuntimeConfig::default()
+            ..no_compile_config()
         };
         let rt = WorkerRuntime::new(config);
         let text = "hello world, this is a long string".to_string();
@@ -1820,7 +2187,7 @@ mod tests {
     fn test_truncate_text_unicode_boundary() {
         let config = RuntimeConfig {
             max_text_size: 10,
-            ..RuntimeConfig::default()
+            ..no_compile_config()
         };
         let rt = WorkerRuntime::new(config);
         // "héllo" has multi-byte chars
@@ -1833,7 +2200,7 @@ mod tests {
 
     #[test]
     fn test_handle_embed_empty_batch() {
-        let config = RuntimeConfig::default();
+        let config = no_compile_config();
         let rt = WorkerRuntime::new(config);
 
         let request = EmbedRequest {
@@ -1853,7 +2220,7 @@ mod tests {
 
     #[test]
     fn test_handle_embed_returns_flat_row_major() {
-        let config = RuntimeConfig::default();
+        let config = no_compile_config();
         let rt = WorkerRuntime::new(config);
 
         let request = EmbedRequest {
@@ -1894,7 +2261,7 @@ mod tests {
 
     #[test]
     fn test_handle_embed_preserves_ordering() {
-        let config = RuntimeConfig::default();
+        let config = no_compile_config();
         let rt = WorkerRuntime::new(config);
 
         let texts: Vec<String> = (0..5).map(|i| format!("text {}", i)).collect();
@@ -1933,7 +2300,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_embed_request() {
-        let config = RuntimeConfig::default();
+        let config = no_compile_config();
         let rt = WorkerRuntime::new(config);
 
         let request = EmbedRequest {
@@ -1960,7 +2327,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_rerank_request() {
-        let config = RuntimeConfig::default();
+        let config = no_compile_config();
         let rt = WorkerRuntime::new(config);
 
         let request = protocol::RerankRequest {
@@ -1991,7 +2358,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_unknown_message_type() {
-        let config = RuntimeConfig::default();
+        let config = no_compile_config();
         let rt = WorkerRuntime::new(config);
 
         let frame = Frame {
@@ -2011,7 +2378,7 @@ mod tests {
     fn test_run_loop_single_request() {
         let config = RuntimeConfig {
             idle_timeout: Duration::from_secs(300),
-            ..RuntimeConfig::default()
+            ..no_compile_config()
         };
         let rt = WorkerRuntime::new(config);
 
@@ -2036,7 +2403,7 @@ mod tests {
         // VAL-CPHASE-006: Worker remains reusable across successive batches
         let config = RuntimeConfig {
             idle_timeout: Duration::from_secs(300),
-            ..RuntimeConfig::default()
+            ..no_compile_config()
         };
         let rt = WorkerRuntime::new(config);
 
@@ -2074,7 +2441,7 @@ mod tests {
         // VAL-CPHASE-007: Worker tears down on idle
         let config = RuntimeConfig {
             idle_timeout: Duration::from_millis(1),
-            ..RuntimeConfig::default()
+            ..no_compile_config()
         };
         let rt = WorkerRuntime::new(config);
 

@@ -499,3 +499,10 @@ suspicious_else_formatting = "deny"
 # Root package inherits workspace lints.
 [lints]
 workspace = true
+
+# ort rc.12 deadlocks while reporting dynamic-loader errors because its error
+# constructor recursively initializes ORT under the dylib OnceLock. Pin the
+# focused upstream fix until a crates.io release containing it is available.
+[patch.crates-io]
+ort = { git = "https://github.com/pykeio/ort", rev = "17ed727770746447620d0d76e9893ed1a3d7c221" }
+ort-sys = { git = "https://github.com/pykeio/ort", rev = "17ed727770746447620d0d76e9893ed1a3d7c221" }

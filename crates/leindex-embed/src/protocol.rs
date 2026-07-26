@@ -63,6 +63,10 @@ pub enum MsgType {
     RerankResponse,
     /// Worker error response.
     Error,
+    /// Health/readiness request.
+    HealthRequest,
+    /// Health/readiness response.
+    HealthResponse,
 }
 
 /// A complete protocol frame: header + serialised payload.
@@ -207,6 +211,31 @@ pub struct RerankResponse {
     pub results: Vec<RerankResult>,
 }
 
+/// Health request. Kept as a payload type so the protocol can evolve without
+/// changing the frame shape.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HealthRequest;
+
+/// Worker lifecycle state exposed on the local control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerState {
+    Initializing,
+    Ready,
+    Failed,
+}
+
+/// Readiness response. Health is available before model initialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub state: WorkerState,
+    pub phase: String,
+    pub started_unix_ms: u64,
+    pub provider: Option<String>,
+    pub model: String,
+    pub error: Option<String>,
+}
+
 /// A single reranked result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankResult {
@@ -229,6 +258,8 @@ pub enum Request {
     Embed(EmbedRequest),
     /// Rerank documents against a query.
     Rerank(RerankRequest),
+    /// Query worker lifecycle state.
+    Health(HealthRequest),
 }
 
 /// Top-level response message from worker to main daemon.
@@ -240,6 +271,8 @@ pub enum Response {
     Rerank(RerankResponse),
     /// Worker error.
     Error(WorkerError),
+    /// Worker lifecycle state.
+    Health(HealthResponse),
 }
 
 /// Structured error from the worker.
@@ -257,6 +290,8 @@ pub struct WorkerError {
 /// Classification of worker errors for fallback decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorKind {
+    /// Worker has a socket but model initialization is still in progress.
+    Initializing,
     /// ONNX Runtime initialization or execution failure.
     OnnxRuntime,
     /// Model file not found or unreadable.
@@ -333,6 +368,28 @@ pub fn error_frame(batch_id: BatchId, error: WorkerError) -> anyhow::Result<Fram
             msg_type: MsgType::Error,
         },
         &Response::Error(error),
+    )
+}
+
+/// Build a health request frame.
+pub fn health_request_frame(batch_id: BatchId) -> anyhow::Result<Frame> {
+    Frame::new(
+        FrameHeader {
+            batch_id,
+            msg_type: MsgType::HealthRequest,
+        },
+        &Request::Health(HealthRequest),
+    )
+}
+
+/// Build a health response frame.
+pub fn health_response_frame(batch_id: BatchId, response: HealthResponse) -> anyhow::Result<Frame> {
+    Frame::new(
+        FrameHeader {
+            batch_id,
+            msg_type: MsgType::HealthResponse,
+        },
+        &Response::Health(response),
     )
 }
 
@@ -540,6 +597,31 @@ mod tests {
                 assert!(embed_req.texts.is_empty());
             }
             _ => panic!("Expected Embed request"),
+        }
+    }
+
+    #[test]
+    fn test_health_roundtrip_preserves_lifecycle_state() {
+        let batch_id = BatchId::new(77);
+        let health = HealthResponse {
+            state: WorkerState::Initializing,
+            phase: "initializing".to_string(),
+            started_unix_ms: 1234,
+            provider: Some("migraphx".to_string()),
+            model: "qwen3-embed-0.6b".to_string(),
+            error: None,
+        };
+
+        let request = health_request_frame(batch_id).unwrap();
+        let decoded_request: Request = request.decode_payload().unwrap();
+        assert!(matches!(decoded_request, Request::Health(HealthRequest)));
+
+        let response = health_response_frame(batch_id, health.clone()).unwrap();
+        assert_eq!(response.header.msg_type, MsgType::HealthResponse);
+        let decoded: Response = response.decode_payload().unwrap();
+        match decoded {
+            Response::Health(actual) => assert_eq!(actual.state, health.state),
+            _ => panic!("expected health response"),
         }
     }
 }

@@ -29,6 +29,28 @@ use leindex_embed::provider::ExecutionProviderSelector;
 use leindex_embed::runtime::{RuntimeConfig, WorkerRuntime};
 use leindex_embed::startup::{StartupReport, StartupReporter};
 
+/// Config whose model name resolves to no on-disk file, so `WorkerRuntime::new`
+/// leaves the ONNX session unset and skips the ~300s MIGraphX JIT compile. The
+/// lifecycle tests below drive `run_loop` with embed frames and assert the IPC
+/// handling succeeds (as they did before a real `qwen3-embed-0.6b.onnx` shipped);
+/// they never require real embeddings. Fully specified (no `..Default::default()`)
+/// so the global `no_compile_config()` -> `no_compile_config()` swap below
+/// cannot recurse.
+fn no_compile_config() -> RuntimeConfig {
+    use leindex_embed::runtime::{
+        DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_MAX_FRAME_SIZE, DEFAULT_MAX_TEXT_SIZE,
+    };
+    RuntimeConfig {
+        idle_timeout: Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS),
+        max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+        max_text_size: DEFAULT_MAX_TEXT_SIZE,
+        model_name: "__leindex_test_no_model__".to_string(),
+        embedding_dim: 1024,
+        execution_provider: "auto".to_string(),
+        rerank_model_name: "__leindex_test_no_model__".to_string(),
+    }
+}
+
 #[cfg(feature = "onnx")]
 mod rerank_output_shape_tests {
     use ndarray::ArrayD;
@@ -82,7 +104,7 @@ mod rerank_output_shape_tests {
 fn test_worker_uses_local_ipc_only() {
     // The worker communicates over stdin/stdout pipes (local IPC).
     // This test verifies the runtime accepts a local pipe-like interface.
-    let config = RuntimeConfig::default();
+    let config = no_compile_config();
     let rt = WorkerRuntime::new(config);
 
     let request = EmbedRequest {
@@ -106,7 +128,7 @@ fn test_worker_uses_local_ipc_only() {
 fn test_worker_cold_starts_on_first_demand() {
     // The worker runtime starts without any pre-existing state and
     // processes the first request successfully.
-    let config = RuntimeConfig::default();
+    let config = no_compile_config();
     let rt = WorkerRuntime::new(config);
 
     // No pre-warming needed — the first request should work
@@ -142,7 +164,7 @@ fn test_worker_cold_starts_on_first_demand() {
 
 #[test]
 fn test_worker_reusable_across_batches() {
-    let config = RuntimeConfig::default();
+    let config = no_compile_config();
     let rt = WorkerRuntime::new(config);
 
     // Without a real ONNX session, dispatch returns error frames
@@ -189,7 +211,7 @@ fn test_worker_reusable_via_run_loop() {
     // Test reuse through the actual run loop (multiple requests in sequence)
     let config = RuntimeConfig {
         idle_timeout: Duration::from_secs(300),
-        ..RuntimeConfig::default()
+        ..no_compile_config()
     };
     let rt = WorkerRuntime::new(config);
 
@@ -219,7 +241,7 @@ fn test_worker_reusable_via_run_loop() {
 fn test_worker_idle_timeout_teardown() {
     let config = RuntimeConfig {
         idle_timeout: Duration::from_millis(1),
-        ..RuntimeConfig::default()
+        ..no_compile_config()
     };
     let rt = WorkerRuntime::new(config);
 
@@ -236,7 +258,7 @@ fn test_worker_idle_timeout_teardown() {
 fn test_worker_idle_timer_expires() {
     let config = RuntimeConfig {
         idle_timeout: Duration::from_millis(5),
-        ..RuntimeConfig::default()
+        ..no_compile_config()
     };
     let rt = WorkerRuntime::new(config);
 
@@ -262,7 +284,7 @@ fn test_worker_restart_after_teardown() {
     let expected_msg_type = MsgType::EmbedResponse;
 
     // First instance
-    let config = RuntimeConfig::default();
+    let config = no_compile_config();
     let rt1 = WorkerRuntime::new(config.clone());
 
     let request1 = EmbedRequest {
@@ -519,7 +541,7 @@ fn test_execution_provider_reports_fallback_reason() {
 
 #[test]
 fn test_embed_response_flat_row_major() {
-    let config = RuntimeConfig::default();
+    let config = no_compile_config();
     let rt = WorkerRuntime::new(config);
 
     let request = EmbedRequest {
@@ -565,7 +587,7 @@ fn test_embed_response_flat_row_major() {
 
 #[test]
 fn test_batch_ordering_preserved() {
-    let config = RuntimeConfig::default();
+    let config = no_compile_config();
     let rt = WorkerRuntime::new(config);
 
     let texts: Vec<String> = (0..10).map(|i| format!("text_{}", i)).collect();
@@ -694,7 +716,7 @@ fn test_split_preserves_batch_identity() {
 fn test_oversized_single_text_truncated() {
     let config = RuntimeConfig {
         max_text_size: 50,
-        ..RuntimeConfig::default()
+        ..no_compile_config()
     };
     let rt = WorkerRuntime::new(config);
 
@@ -748,7 +770,7 @@ fn test_truncate_at_exact_boundary() {
 fn test_batch_truncate_multiple_oversized_texts() {
     let config = RuntimeConfig {
         max_text_size: 20,
-        ..RuntimeConfig::default()
+        ..no_compile_config()
     };
     let rt = WorkerRuntime::new(config);
 
@@ -792,7 +814,7 @@ fn test_full_lifecycle_cold_start_reuse_teardown_restart() {
     // Phase 1: Cold start and process a request
     let config = RuntimeConfig {
         idle_timeout: Duration::from_secs(300),
-        ..RuntimeConfig::default()
+        ..no_compile_config()
     };
     let rt1 = WorkerRuntime::new(config.clone());
 
@@ -886,7 +908,7 @@ fn test_default_config_uses_reduced_idle_timeout() {
     // The default RuntimeConfig must reflect the reduced timeout so the
     // worker binary (which calls `RuntimeConfig::from_env()` without an
     // explicit override) gets the 60s ceiling automatically.
-    let config = RuntimeConfig::default();
+    let config = no_compile_config();
     assert_eq!(
         config.idle_timeout,
         Duration::from_secs(leindex_embed::runtime::DEFAULT_IDLE_TIMEOUT_SECS)

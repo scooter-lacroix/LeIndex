@@ -184,6 +184,12 @@ fn leindex_home() -> Option<PathBuf> {
 }
 
 /// Read `ort_dylib_path` from `~/.leindex/config/leindex.toml` if present.
+///
+/// When the configured path exists on disk, it is returned as-is. When the
+/// exact path is stale (e.g., ORT was upgraded from 1.27.1 to 1.23.2 and the
+/// old `.so` was removed), `resolve_config_ort_path` searches the same
+/// directory for the closest matching `libonnxruntime.so.*` so LeIndex
+/// automatically picks up the new version without requiring a config update.
 fn read_config_ort_path() -> Option<PathBuf> {
     // VAL-DAEMON-002: In production, the runtime path uses load_cached()
     // (via RuntimeConfig::from_env). This function is also called from
@@ -195,6 +201,36 @@ fn read_config_ort_path() -> Option<PathBuf> {
         .and_then(|cfg| cfg.neural.ort_dylib_path)
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
+        .and_then(|path| resolve_config_ort_path(&path))
+}
+
+/// Resolve a configured ORT dylib path, falling back to a sibling search
+/// when the exact path no longer exists (version mismatch after ORT upgrade).
+fn resolve_config_ort_path(config_path: &Path) -> Option<PathBuf> {
+    if config_path.exists() {
+        return Some(config_path.to_path_buf());
+    }
+    // The exact path is stale (version mismatch, e.g. ORT was upgraded). Look
+    // for any libonnxruntime.so.* in the same directory and prefer a
+    // migraphx-ABI-compatible version (>= MIN_ORT_VERSION), newest first.
+    let parent = config_path.parent()?;
+    let prefix = "libonnxruntime.so";
+    let mut versioned: Vec<PathBuf> = Vec::new();
+    let entries = std::fs::read_dir(parent).ok()?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        // Prefer exact .so over versioned .so.X.Y.Z.
+        if name_str == prefix {
+            return Some(entry.path());
+        }
+        if name_str.starts_with(prefix) && !name_str.ends_with(".debug") {
+            versioned.push(entry.path());
+        }
+    }
+    pick_best_ort_lib(&versioned)
 }
 
 /// Look for the first matching ORT library file in `dir`.
@@ -210,7 +246,7 @@ fn find_lib_in_dir(dir: &Path) -> Option<PathBuf> {
 
     // Fall back to versioned pip-wheel runtime libraries (e.g.
     // `libonnxruntime.so.1.25.0`) which have no unversioned symlink.
-    let mut matches = std::fs::read_dir(dir)
+    let matches: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -220,28 +256,56 @@ fn find_lib_in_dir(dir: &Path) -> Option<PathBuf> {
                 .map(is_ort_runtime_lib_name)
                 .unwrap_or(false)
         })
-        .collect::<Vec<_>>();
-
-    matches.sort_by(|a, b| {
-        let a_name = a
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        let b_name = b
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        ort_runtime_version_key(a_name).cmp(&ort_runtime_version_key(b_name))
-    });
-    matches.pop()
+        .collect();
+    // Prefer migraphx-ABI-compatible runtimes (>= MIN_ORT_VERSION), newest first.
+    pick_best_ort_lib(&matches)
 }
 
-#[cfg(any(feature = "onnx", test))]
-fn ort_runtime_version_key(name: &str) -> Vec<u64> {
-    name.split(|c: char| !c.is_ascii_digit())
+/// Minimum ONNX Runtime version whose MIGraphX provider-options struct ABI is
+/// compatible with the pinned `ort` crate (2.0.0-rc.12). ORT < 1.24 exposes a
+/// `OrtMIGraphXProviderOptions` layout this crate mismatches, so populating the
+/// save/load-model fields triggers a silent `Failed to parse provider option
+/// "migraphx_exhaustive_tune"` error and a CPU fallback. Discovery PREFERS
+/// candidates at or above this floor; older runtimes remain usable for the CPU
+/// provider but are deprioritized (and rejected up-front by `build_session`'s
+/// migraphx pre-flight when migraphx is requested).
+const MIN_ORT_VERSION: (u64, u64, u64) = (1, 24, 0);
+
+/// Parse a `major.minor.patch` tuple from an ORT library filename
+/// (e.g. `libonnxruntime.so.1.27.1` -> `(1, 27, 1)`). `None` if the name does
+/// not encode three leading numeric components.
+fn parse_ort_version_tuple(name: &str) -> Option<(u64, u64, u64)> {
+    let digits: Vec<u64> = name
+        .split(|c: char| !c.is_ascii_digit())
         .filter(|part| !part.is_empty())
         .filter_map(|part| part.parse::<u64>().ok())
-        .collect()
+        .collect();
+    match digits.as_slice() {
+        [major, minor, patch, ..] => Some((*major, *minor, *patch)),
+        _ => None,
+    }
+}
+
+/// Pick the best ORT library from `paths`: prefer versions >= `MIN_ORT_VERSION`
+/// (newest first), then older versions (newest first). Paths with an unparseable
+/// version sort last. This is what keeps LeIndex working across ORT upgrades —
+/// any future install >= 1.24 wins over an older leftover without a config edit.
+fn pick_best_ort_lib(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut keyed: Vec<(bool, (u64, u64, u64), PathBuf)> = paths
+        .iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let version = parse_ort_version_tuple(name).unwrap_or((0, 0, 0));
+            (version >= MIN_ORT_VERSION, version, path.clone())
+        })
+        .collect();
+    // Sort: ge-floor first, then newest version. `true > false` so the `b.cmp(a)`
+    // ordering on the bool puts ge-floor entries first.
+    keyed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    keyed.into_iter().next().map(|(_, _, path)| path)
 }
 
 /// Discover the running worker binary's directory (siblings of `current_exe`).
@@ -792,17 +856,26 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
 
+        // Create the library file so resolve_config_ort_path succeeds.
+        let lib_dir = tmp.path().join("ort");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        let lib_path = lib_dir.join("libonnxruntime.so");
+        std::fs::write(&lib_path, b"fake").unwrap();
+
         let cfg_dir = tmp.path().join("config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         let cfg_path = cfg_dir.join("leindex.toml");
         std::fs::write(
             &cfg_path,
-            "[neural]\nenabled = true\nort_dylib_path = \"/some/path/libonnxruntime.so\"\nmodel_dir = \"~/.leindex/models\"\n",
+            format!(
+                "[neural]\nenabled = true\nort_dylib_path = \"{}\"\nmodel_dir = \"~/.leindex/models\"\n",
+                lib_path.display()
+            ),
         )
         .unwrap();
 
         let parsed = read_config_ort_path();
-        assert_eq!(parsed, Some(PathBuf::from("/some/path/libonnxruntime.so")));
+        assert_eq!(parsed, Some(lib_path));
 
         std::env::remove_var(LEINDEX_HOME_ENV);
     }
@@ -835,20 +908,67 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
 
+        // Create the library file so resolve_config_ort_path succeeds.
+        let lib_dir = tmp.path().join("quote");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        let lib_path = lib_dir.join("libonnxruntime.so");
+        std::fs::write(&lib_path, b"fake").unwrap();
+
         let cfg_dir = tmp.path().join("config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         std::fs::write(
             cfg_dir.join("leindex.toml"),
-            "[neural]\nort_dylib_path = '/quote/libonnxruntime.so'\n",
+            format!("[neural]\nort_dylib_path = '{}'\n", lib_path.display()),
         )
         .unwrap();
 
-        assert_eq!(
-            read_config_ort_path(),
-            Some(PathBuf::from("/quote/libonnxruntime.so"))
-        );
+        assert_eq!(read_config_ort_path(), Some(lib_path));
 
         std::env::remove_var(LEINDEX_HOME_ENV);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_resolve_config_ort_path_finds_versioned_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("capi");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Simulate ORT 1.23.2 installed (no unversioned symlink).
+        let actual = dir.join("libonnxruntime.so.1.23.2");
+        std::fs::write(&actual, b"fake").unwrap();
+
+        // Configured path points at old 1.27.1 that no longer exists.
+        let stale = dir.join("libonnxruntime.so.1.27.1");
+        let resolved = resolve_config_ort_path(&stale);
+        assert_eq!(resolved, Some(actual));
+    }
+
+    #[test]
+    fn test_resolve_config_ort_path_prefers_exact_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("lib");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let exact = dir.join("libonnxruntime.so");
+        std::fs::write(&exact, b"fake").unwrap();
+        let versioned = dir.join("libonnxruntime.so.1.25.0");
+        std::fs::write(&versioned, b"fake").unwrap();
+
+        // Config references a stale versioned path.
+        let stale = dir.join("libonnxruntime.so.1.27.1");
+        let resolved = resolve_config_ort_path(&stale);
+        assert_eq!(resolved, Some(exact));
+    }
+
+    #[test]
+    fn test_resolve_config_ort_path_returns_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = tmp.path().join("libonnxruntime.so");
+        std::fs::write(&existing, b"fake").unwrap();
+
+        let resolved = resolve_config_ort_path(&existing);
+        assert_eq!(resolved, Some(existing));
     }
 
     #[test]
