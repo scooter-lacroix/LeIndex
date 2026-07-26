@@ -1,5 +1,6 @@
 use super::helpers::{byte_range_to_line_range, extract_bool, extract_string, extract_usize};
 use super::protocol::JsonRpcError;
+use super::request_meta::WorkBudget;
 use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
 use crate::parse::parallel::ParallelParser;
@@ -7,6 +8,7 @@ use crate::storage::{CatalogReader, CatalogSymbol};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Handler for LeIndex [read_symbol — targeted symbol source read.
 #[derive(Clone)]
@@ -32,7 +34,9 @@ impl ReadSymbolHandler {
                 "file_path": { "type": "string", "description": "Optional file disambiguator" },
                 "project_path": { "type": "string", "description": "Project directory" },
                 "include_dependencies": { "type": "boolean", "default": false },
-                "token_budget": { "type": "integer", "default": 8000 }
+                "token_budget": { "type": "integer", "default": 8000 },
+                "max_latency_ms": { "type": "integer", "default": 250, "minimum": 0, "maximum": 60000 },
+                "allow_partial": { "type": "boolean", "default": true }
             },
             "required": ["symbol"]
         })
@@ -47,6 +51,11 @@ impl ReadSymbolHandler {
         let file_hint = args.get("file_path").and_then(|v| v.as_str());
         let include_dependencies = extract_bool(&args, "include_dependencies", false);
         let token_budget = extract_usize(&args, "token_budget", 8000)?;
+        let budget = WorkBudget {
+            max_latency_ms: extract_usize(&args, "max_latency_ms", 250)?.min(60000) as u64,
+            allow_partial: extract_bool(&args, "allow_partial", true),
+        };
+        let started = Instant::now();
         let project_path = match args.get("project_path").and_then(|v| v.as_str()) {
             Some(path) => PathBuf::from(path),
             None => registry.default_project_path().await?,
@@ -62,8 +71,9 @@ impl ReadSymbolHandler {
             .map(|raw| live.file(raw))
             .transpose()
             .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
+        let mut source_stale = false;
 
-        let db_path = live.storage().join("leindex.db");
+        let db_path = live.active_storage().join("leindex.db");
         if db_path.is_file() {
             if let Ok(Some(catalog)) = CatalogReader::open(&db_path, live.root()).await {
                 if let Ok(symbols) = catalog.find_symbol(&symbol, file.as_deref()).await {
@@ -73,37 +83,120 @@ impl ReadSymbolHandler {
                             .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
                         let bytes = read_live_bytes(node.file_path.clone()).await?;
                         if catalog_is_fresh(&catalog, &node.file_path, &bytes).await {
-                            let relations =
-                                resident_relations(registry, &live, &node, include_dependencies)
-                                    .await;
-                            return symbol_response(node, bytes, token_budget, false, relations);
+                            let relations = resident_relations(
+                                registry,
+                                &live,
+                                &node,
+                                include_dependencies,
+                                false,
+                                budget,
+                                started,
+                            )
+                            .await;
+                            return symbol_response(
+                                node,
+                                bytes,
+                                token_budget,
+                                false,
+                                relations,
+                                budget,
+                            );
                         }
                         // A stale catalog still supplies a vetted in-root source
                         // candidate; parse it live instead of hydrating a PDG.
+                        source_stale = true;
                         file = Some(node.file_path);
                     }
                 }
             }
         }
 
-        let file = file.ok_or_else(|| {
-            JsonRpcError::invalid_params(
-                "file_path is required when the catalog has no fresh symbol match",
-            )
-        })?;
-        let parsed = parse_live_file(file).await?;
-        let node = parsed
-            .symbols
-            .into_iter()
-            .find(|node| node.symbol_name.eq_ignore_ascii_case(&symbol))
-            .ok_or_else(|| {
+        let (parsed, node) = if let Some(file) = file {
+            let parsed = parse_live_file(file).await?;
+            let node = parsed
+                .symbols
+                .iter()
+                .find(|node| {
+                    node.symbol_name.eq_ignore_ascii_case(&symbol)
+                        || node.qualified_name.eq_ignore_ascii_case(&symbol)
+                })
+                .cloned()
+                .ok_or_else(|| {
+                    JsonRpcError::invalid_params(format!(
+                        "Symbol '{}' not found in live source",
+                        symbol
+                    ))
+                })?;
+            (parsed, node)
+        } else {
+            // A catalog miss without a file hint should still be useful. Git
+            // supplies an ignore-aware candidate list; cap parsing at 20 files
+            // so a typo cannot turn a symbol lookup into a repository scan.
+            let root = live.root().to_path_buf();
+            let candidates = tokio::task::spawn_blocking(move || {
+                match crate::cli::git::source_inventory(&root) {
+                    Ok(paths) => paths,
+                    Err(crate::cli::git::GitInventoryError::NotRepository) => {
+                        walkdir::WalkDir::new(&root)
+                            .follow_links(false)
+                            .into_iter()
+                            .filter_entry(|entry| {
+                                let name = entry.file_name().to_string_lossy();
+                                !crate::cli::skip_dirs::SKIP_DIRS
+                                    .iter()
+                                    .any(|skip| name == *skip)
+                            })
+                            .filter_map(Result::ok)
+                            .filter(|entry| entry.file_type().is_file())
+                            .map(|entry| entry.path().to_path_buf())
+                            .collect()
+                    }
+                    Err(_) => Vec::new(),
+                }
+                .into_iter()
+                .take(20)
+                .collect::<Vec<_>>()
+            })
+            .await
+            .map_err(|error| {
+                JsonRpcError::internal_error(format!("live symbol inventory failed: {error}"))
+            })?;
+            let mut found = None;
+            for candidate in candidates {
+                let Ok(parsed) = parse_live_file(candidate).await else {
+                    continue;
+                };
+                if let Some(node) = parsed
+                    .symbols
+                    .iter()
+                    .find(|node| {
+                        node.symbol_name.eq_ignore_ascii_case(&symbol)
+                            || node.qualified_name.eq_ignore_ascii_case(&symbol)
+                    })
+                    .cloned()
+                {
+                    found = Some((parsed, node));
+                    break;
+                }
+            }
+            found.ok_or_else(|| {
                 JsonRpcError::invalid_params(format!(
-                    "Symbol '{}' not found in live source",
+                    "Symbol '{}' not found in the first 20 live source candidates",
                     symbol
                 ))
-            })?;
-        let relations = resident_relations(registry, &live, &node, include_dependencies).await;
-        symbol_response(node, parsed.bytes, token_budget, true, relations)
+            })?
+        };
+        let relations = resident_relations(
+            registry,
+            &live,
+            &node,
+            include_dependencies,
+            source_stale,
+            budget,
+            started,
+        )
+        .await;
+        symbol_response(node, parsed.bytes, token_budget, true, relations, budget)
     }
 }
 
@@ -113,6 +206,7 @@ fn symbol_response(
     token_budget: usize,
     symbol_index_miss: bool,
     relations: ResidentRelations,
+    budget: WorkBudget,
 ) -> Result<Value, JsonRpcError> {
     let (start, end) = node.byte_range;
     let content = std::str::from_utf8(&bytes).map_err(|e| {
@@ -159,7 +253,14 @@ fn symbol_response(
         "dependencies": relations.dependencies,
         "symbol_index_miss": symbol_index_miss,
         "source_freshness": "live",
-        "pdg_status": relations.pdg_status
+        "pdg_status": relations.pdg_status,
+        "retrieval": {
+            "tfidf_status": "not_used_exact",
+            "neural_status": "not_used_exact",
+            "partial": matches!(relations.pdg_status, "partial" | "stale"),
+            "max_latency_ms": budget.max_latency_ms,
+            "allow_partial": budget.allow_partial
+        }
     }))
 }
 
@@ -213,10 +314,13 @@ pub(crate) async fn parse_live_file(path: PathBuf) -> Result<LiveParse, JsonRpcE
                 qualified_name: signature.qualified_name,
                 file_path: path.clone(),
                 language: language.clone(),
-                node_type: if signature.is_method {
-                    "method"
-                } else {
-                    "function"
+                node_type: match signature.return_type.as_deref() {
+                    Some("module") => "module",
+                    Some("enum_variant") => "variable",
+                    Some("enum") | Some("trait") => "class",
+                    Some(value) if value.starts_with("struct") => "class",
+                    _ if signature.is_method => "method",
+                    _ => "function",
                 }
                 .to_string(),
                 complexity: signature.cyclomatic_complexity,
@@ -241,23 +345,61 @@ async fn resident_relations(
     live: &LiveProject,
     node: &CatalogSymbol,
     include_dependencies: bool,
+    source_stale: bool,
+    budget: WorkBudget,
+    started: Instant,
 ) -> ResidentRelations {
-    if !include_dependencies {
+    if source_stale {
         return ResidentRelations {
             callers: Vec::new(),
             callees: Vec::new(),
             dependencies: Vec::new(),
-            pdg_status: "not_loaded",
+            pdg_status: "stale",
         };
     }
-    let Some(handle) = registry.try_get_loaded(live.root()).await else {
-        return ResidentRelations {
-            callers: Vec::new(),
-            callees: Vec::new(),
-            dependencies: Vec::new(),
-            pdg_status: "not_loaded",
-        };
+
+    let handle = match registry.try_get_loaded(live.root()).await {
+        Some(handle) => handle,
+        None if include_dependencies => {
+            let project = live.root().to_string_lossy().into_owned();
+            match registry.get_or_load(Some(&project)).await {
+                Ok(handle) => handle,
+                Err(_) => {
+                    return ResidentRelations {
+                        callers: Vec::new(),
+                        callees: Vec::new(),
+                        dependencies: Vec::new(),
+                        pdg_status: "partial",
+                    }
+                }
+            }
+        }
+        None => {
+            return ResidentRelations {
+                callers: Vec::new(),
+                callees: Vec::new(),
+                dependencies: Vec::new(),
+                pdg_status: "not_loaded",
+            }
+        }
     };
+
+    // `include_dependencies=true` is an explicit request for PDG-backed
+    // relationships. Hydrate the active immutable generation when the
+    // resident handle has not loaded it yet; never silently return an empty
+    // dependency list for a requested enrichment layer.
+    if include_dependencies {
+        let mut guard = handle.write().await;
+        if guard.pdg().is_none() && guard.load_from_storage().is_err() {
+            return ResidentRelations {
+                callers: Vec::new(),
+                callees: Vec::new(),
+                dependencies: Vec::new(),
+                pdg_status: "partial",
+            };
+        }
+    }
+
     let guard = handle.read().await;
     let Some(pdg) = guard.pdg() else {
         return ResidentRelations {
@@ -278,6 +420,14 @@ async fn resident_relations(
             pdg_status: "fresh",
         };
     };
+    if budget.elapsed(started) {
+        return ResidentRelations {
+            callers: Vec::new(),
+            callees: Vec::new(),
+            dependencies: Vec::new(),
+            pdg_status: "partial",
+        };
+    }
     let callees: Vec<Value> = pdg
         .neighbors(node_id)
         .iter()
@@ -306,10 +456,18 @@ async fn resident_relations(
         .take(20)
         .collect();
     ResidentRelations {
-        dependencies: callees.clone(),
+        dependencies: if include_dependencies {
+            callees.clone()
+        } else {
+            Vec::new()
+        },
         callees,
         callers,
-        pdg_status: "fresh",
+        pdg_status: if budget.elapsed(started) {
+            "partial"
+        } else {
+            "fresh"
+        },
     }
 }
 

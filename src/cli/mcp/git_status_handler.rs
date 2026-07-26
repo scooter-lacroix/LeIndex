@@ -1,4 +1,7 @@
-use super::helpers::{extract_bool, extract_usize, get_direct_callers, node_type_str};
+use super::helpers::{
+    extract_bool, extract_usize, get_direct_callers, node_type_str, wrap_live_with_meta,
+    wrap_live_with_meta_dirty,
+};
 use super::protocol::JsonRpcError;
 use super::request_meta::{record_git_ms, record_pdg_ms, WorkBudget};
 use crate::cli::git::{self, GitStatus};
@@ -74,11 +77,14 @@ impl GitStatusHandler {
         let status = match status {
             Ok(status) => status,
             Err(git::GitStatusError::NotRepository) => {
-                return Ok(json!({
-                    "is_git_repo": false,
-                    "message": "Not a git repository",
-                    "pdg_status": "not_loaded",
-                }));
+                return Ok(wrap_live_with_meta(
+                    json!({
+                        "is_git_repo": false,
+                        "message": "Not a git repository",
+                        "pdg_status": "not_loaded",
+                    }),
+                    &root,
+                ));
             }
             Err(error) => {
                 return Err(JsonRpcError::internal_error(format!(
@@ -87,7 +93,15 @@ impl GitStatusHandler {
             }
         };
 
-        let mut result = base_result(&status, &root, scope.as_deref());
+        let live_dirty = status.modified.len()
+            + status.staged.len()
+            + status.untracked.len()
+            + status.deleted.len();
+        let mut result = wrap_live_with_meta_dirty(
+            base_result(&status, &root, scope.as_deref()),
+            &root,
+            live_dirty,
+        );
         let started = Instant::now();
 
         // This lookup is deliberately after the complete live Git response is built.
@@ -99,9 +113,23 @@ impl GitStatusHandler {
         let Some(pdg) = guard.pdg() else {
             return Ok(result);
         };
-        if guard.is_stale_fast() {
-            result["pdg_status"] = Value::String("stale".to_string());
-            return Ok(result);
+        if let Some(health) = crate::cli::index_freshness::load_health(guard.storage_path()) {
+            if matches!(
+                health.status,
+                crate::cli::leindex::ComponentStatus::Stale
+                    | crate::cli::leindex::ComponentStatus::Partial
+                    | crate::cli::leindex::ComponentStatus::Failed
+            ) {
+                result["pdg_status"] = Value::String(
+                    match health.status {
+                        crate::cli::leindex::ComponentStatus::Partial => "partial",
+                        crate::cli::leindex::ComponentStatus::Failed => "failed",
+                        _ => "stale",
+                    }
+                    .to_string(),
+                );
+                return Ok(result);
+            }
         }
 
         let pdg_started = Instant::now();
@@ -131,6 +159,7 @@ fn base_result(status: &GitStatus, root: &Path, scope: Option<&Path>) -> Value {
         .filter(|path| safe_stage_candidate(path, status, root, scope))
         .map(|path| path_string(&path))
         .collect::<Vec<_>>();
+    let categories = change_categories(status);
     json!({
         "is_git_repo": true,
         "branch": status.branch,
@@ -141,6 +170,7 @@ fn base_result(status: &GitStatus, root: &Path, scope: Option<&Path>) -> Value {
             "untracked": status.untracked.len(),
             "conflicted": status.conflicted.len(),
         },
+        "change_categories": categories,
         "modified_files": paths(&status.modified),
         "staged_files": paths(&status.staged),
         "untracked_files": paths(&status.untracked),
@@ -155,7 +185,88 @@ fn base_result(status: &GitStatus, root: &Path, scope: Option<&Path>) -> Value {
         "changed_symbols": [],
         "impact_summary": { "total_affected_symbols": 0, "affected_files": [], "pdg_enriched": false },
         "pdg_status": "not_loaded",
+        "retrieval": { "tfidf_status": "not_used_live_status", "neural_status": "not_used_live_status" },
     })
+}
+
+fn change_categories(status: &GitStatus) -> Value {
+    let mut tracked_source = 0usize;
+    let mut untracked_notes = 0usize;
+    let mut other = 0usize;
+    let mut seen = HashSet::new();
+
+    for path in status
+        .modified
+        .iter()
+        .chain(status.staged.iter())
+        .chain(status.deleted.iter())
+    {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if is_source_path(path) {
+            tracked_source += 1;
+        } else {
+            other += 1;
+        }
+    }
+    for path in &status.untracked {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if is_note_path(path) {
+            untracked_notes += 1;
+        } else {
+            other += 1;
+        }
+    }
+
+    json!({
+        "tracked_source": tracked_source,
+        "untracked_notes": untracked_notes,
+        "other": other,
+        "submodules": status.submodules.len(),
+    })
+}
+
+fn is_note_path(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == ".omx")
+        || matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("md" | "txt" | "rst")
+        )
+}
+
+fn is_source_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some(
+            "rs" | "py"
+                | "js"
+                | "ts"
+                | "tsx"
+                | "jsx"
+                | "go"
+                | "java"
+                | "c"
+                | "h"
+                | "cc"
+                | "cpp"
+                | "hpp"
+                | "cs"
+                | "rb"
+                | "php"
+                | "swift"
+                | "kt"
+                | "kts"
+                | "lua"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "zig"
+        )
+    )
 }
 
 struct PdgEnrichment {

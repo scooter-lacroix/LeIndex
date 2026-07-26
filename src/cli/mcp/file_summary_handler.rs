@@ -3,6 +3,7 @@ use super::helpers::{
 };
 use super::protocol::JsonRpcError;
 use super::read_symbol_handler::{catalog_is_fresh, parse_live_file, read_live_bytes};
+use super::request_meta::WorkBudget;
 use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
 use crate::storage::{CatalogReader, CatalogSymbol};
@@ -10,6 +11,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Handler for LeIndex [file_summary — structured file analysis replacing Read.
 #[derive(Clone)]
@@ -35,7 +37,9 @@ impl FileSummaryHandler {
                 "project_path": { "type": "string", "description": "Project directory" },
                 "token_budget": { "type": "integer", "default": 1000 },
                 "include_source": { "type": "boolean", "default": false },
-                "focus_symbol": { "type": "string" }
+                "focus_symbol": { "type": "string" },
+                "max_latency_ms": { "type": "integer", "default": 250, "minimum": 0, "maximum": 60000 },
+                "allow_partial": { "type": "boolean", "default": true }
             },
             "required": ["file_path"]
         })
@@ -50,6 +54,11 @@ impl FileSummaryHandler {
         let include_source = extract_bool(&args, "include_source", false);
         let focus_symbol = args.get("focus_symbol").and_then(|v| v.as_str());
         let token_budget = extract_usize(&args, "token_budget", 1000)?;
+        let budget = WorkBudget {
+            max_latency_ms: extract_usize(&args, "max_latency_ms", 250)?.min(60000) as u64,
+            allow_partial: extract_bool(&args, "allow_partial", true),
+        };
+        let started = Instant::now();
         let project_path = match args.get("project_path").and_then(|v| v.as_str()) {
             Some(path) => PathBuf::from(path),
             None => registry.default_project_path().await?,
@@ -64,7 +73,8 @@ impl FileSummaryHandler {
         let file = live
             .file(&requested_file)
             .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
-        let db_path = live.storage().join("leindex.db");
+        let mut source_stale = false;
+        let db_path = live.active_storage().join("leindex.db");
         if db_path.is_file() {
             if let Ok(Some(catalog)) = CatalogReader::open(&db_path, live.root()).await {
                 if let Ok(mut symbols) = catalog.symbols_in_file(&file).await {
@@ -74,11 +84,16 @@ impl FileSummaryHandler {
                             .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
                     }
                     if !symbols.is_empty() {
-                        let catalog_truncated = symbols.len() >= 200;
+                        let catalog_total = catalog.count_symbols_in_file(&file).await.ok();
+                        let catalog_truncated = catalog_total
+                            .map(|total| total > symbols.len())
+                            .unwrap_or(symbols.len() >= 200);
                         let bytes = read_live_bytes(file.clone()).await?;
                         if catalog_is_fresh(&catalog, &file, &bytes).await {
-                            let (relations, pdg_status) =
-                                resident_file_relations(registry, &live, &symbols).await;
+                            let (relations, pdg_status) = resident_file_relations(
+                                registry, &live, &symbols, false, budget, started,
+                            )
+                            .await;
                             return file_summary_response(
                                 &file,
                                 &bytes,
@@ -88,17 +103,27 @@ impl FileSummaryHandler {
                                 token_budget,
                                 false,
                                 catalog_truncated,
+                                catalog_total,
                                 &relations,
                                 pdg_status,
+                                budget,
                             );
                         }
+                        source_stale = true;
                     }
                 }
             }
         }
         let parsed = parse_live_file(file.clone()).await?;
-        let (relations, pdg_status) =
-            resident_file_relations(registry, &live, &parsed.symbols).await;
+        let (relations, pdg_status) = resident_file_relations(
+            registry,
+            &live,
+            &parsed.symbols,
+            source_stale,
+            budget,
+            started,
+        )
+        .await;
         file_summary_response(
             &file,
             &parsed.bytes,
@@ -108,8 +133,10 @@ impl FileSummaryHandler {
             token_budget,
             true,
             false,
+            None,
             &relations,
             pdg_status,
+            budget,
         )
     }
 }
@@ -123,8 +150,10 @@ fn file_summary_response(
     token_budget: usize,
     symbol_index_miss: bool,
     catalog_truncated: bool,
+    catalog_total: Option<usize>,
     relations: &HashMap<String, Value>,
     pdg_status: &'static str,
+    budget: WorkBudget,
 ) -> Result<Value, JsonRpcError> {
     let content = std::str::from_utf8(bytes).map_err(|e| {
         JsonRpcError::invalid_params(format!(
@@ -192,19 +221,27 @@ fn file_summary_response(
         .iter()
         .filter(|symbol| symbol["type"] == "class")
         .count();
+    let symbol_count = catalog_total.unwrap_or(total);
     Ok(serde_json::json!({
         "file_path": file_path,
         "language": file_path.extension().and_then(|ext| ext.to_str()).unwrap_or("text"),
         "line_count": content.lines().count(),
-        "symbol_count": if catalog_truncated { total + 1 } else { total },
+        "symbol_count": symbol_count,
         "symbols_shown": shown.len(),
-        "symbols_truncated": shown.len() < total || catalog_truncated,
+        "symbols_truncated": shown.len() < symbol_count || catalog_truncated,
         "catalog_truncated": catalog_truncated,
         "symbols": shown,
         "module_role": if class_count > function_count { "Class definitions" } else { "Function module" },
         "symbol_index_miss": symbol_index_miss,
         "source_freshness": "live",
-        "pdg_status": pdg_status
+        "pdg_status": pdg_status,
+        "retrieval": {
+            "tfidf_status": "not_used_exact",
+            "neural_status": "not_used_exact",
+            "partial": matches!(pdg_status, "partial" | "stale"),
+            "max_latency_ms": budget.max_latency_ms,
+            "allow_partial": budget.allow_partial
+        }
     }))
 }
 
@@ -212,7 +249,14 @@ async fn resident_file_relations(
     registry: &Arc<ProjectRegistry>,
     live: &LiveProject,
     symbols: &[CatalogSymbol],
+    source_stale: bool,
+    budget: WorkBudget,
+    started: Instant,
 ) -> (HashMap<String, Value>, &'static str) {
+    if source_stale {
+        return (HashMap::new(), "stale");
+    }
+
     let Some(handle) = registry.try_get_loaded(live.root()).await else {
         return (HashMap::new(), "not_loaded");
     };
@@ -222,6 +266,9 @@ async fn resident_file_relations(
     };
     let mut result = HashMap::new();
     for symbol in symbols {
+        if budget.elapsed(started) {
+            return (result, "partial");
+        }
         let Some(node_id) = pdg
             .find_by_symbol(&symbol.node_id)
             .or_else(|| pdg.find_by_symbol(&symbol.symbol_name))

@@ -65,130 +65,8 @@ fn generate_session_id() -> String {
 /// Override with the `LEINDEX_PORT` environment variable.
 pub const DEFAULT_MCP_PORT: u16 = 47500;
 
-/// Default per-tool-call timeout in seconds.
-///
-/// Hard cap on any single MCP tool call so a slow operation cannot block
-/// the server indefinitely. Individual tool handlers may set a tighter
-/// internal timeout. Long-running tools listed in
-/// `LONG_RUNNING_TOOL_TIMEOUTS` are exempt from this default and use
-/// a per-tool cap instead — see that map for the rationale.
-pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 30;
-
 /// Number of consecutive ports to try on `bind()` failure before giving up.
 pub const BIND_FALLBACK_PORT_RANGE: u16 = 10;
-
-/// Default timeout (in seconds) for `leindex.index`, the one tool that
-/// can legitimately take much longer than the per-tool default because
-/// it walks and parses the entire project on first use. 30s is fine
-/// for search, context, read-symbol, etc. — none of which should
-/// approach that — but a first-time index of a large monorepo is
-/// routinely several minutes. 600s (10 min) is the documented
-/// per-tool cap. Override with `LEINDEX_INDEX_TIMEOUT_SECS`.
-pub const DEFAULT_INDEX_TIMEOUT_SECS: u64 = 600;
-
-/// Tools whose work can legitimately exceed `DEFAULT_REQUEST_TIMEOUT_SECS`.
-///
-/// This list is the single source of truth for "which tools need
-/// a per-tool cap". The actual cap is resolved at runtime by
-/// `long_running_tool_timeout_secs(name)` so environment-variable
-/// overrides (e.g. `LEINDEX_INDEX_TIMEOUT_SECS` for `leindex.index`)
-/// take effect. Keeping the list as a `const` documents the
-/// extension point and lets future long-running tools opt in
-/// without touching the call site in `tools/call`.
-///
-/// Rationale for `leindex.index` being on this list: the first call
-/// for a new project runs `ProjectRegistry::get_or_create`, which
-/// spawns a blocking `temp.index_project(...)` future. If that future
-/// is dropped by a 30s timeout, the in-memory index is never swapped
-/// in even though the spawned blocking work may keep running in the
-/// background — subsequent retries would then race against an
-/// already-cancelled-but-still-running build. A 10-minute cap keeps
-/// the server responsive to admin shutdown while letting large
-/// projects complete their first index.
-pub const LONG_RUNNING_TOOL_TIMEOUTS: &[&str] = &["leindex.index"];
-
-/// Environment variable that overrides the per-tool timeout for
-/// `leindex.index` (seconds). Useful for CI runners on small
-/// projects (lower it) and very large monorepos (raise it).
-pub const INDEX_TIMEOUT_ENV: &str = "LEINDEX_INDEX_TIMEOUT_SECS";
-
-/// Resolved per-tool timeout for `leindex.index`, in seconds.
-///
-/// Reads `LEINDEX_INDEX_TIMEOUT_SECS` from the environment; falls
-/// back to `DEFAULT_INDEX_TIMEOUT_SECS` when the variable is unset,
-/// empty, not a positive integer, or zero.
-pub fn index_timeout_secs() -> u64 {
-    match std::env::var(INDEX_TIMEOUT_ENV) {
-        Ok(v) => v
-            .trim()
-            .parse::<u64>()
-            .ok()
-            .filter(|n| *n > 0)
-            .unwrap_or(DEFAULT_INDEX_TIMEOUT_SECS),
-        Err(_) => DEFAULT_INDEX_TIMEOUT_SECS,
-    }
-}
-
-/// Runtime-resolved per-tool timeout cap, in seconds.
-///
-/// Returns `Some(cap)` when `tool_name` matches an entry in
-/// `LONG_RUNNING_TOOL_TIMEOUTS` and `None` otherwise. The
-/// per-tool cap is read from the environment (e.g.
-/// `LEINDEX_INDEX_TIMEOUT_SECS`) for tools whose default would
-/// otherwise be too tight — keeping the resolution at runtime
-/// is what makes the env override actually take effect. The
-/// previous design baked the cap into a const slice, which
-/// meant the env var was dead code.
-///
-/// Name matching is normalised so that all of `leindex.index`,
-/// `leindex-index`, and `leindex_index` resolve to the same
-/// entry: trim, lower-case ASCII, and replace `-` / `.` / ` `
-/// with `_`. The trim dispatcher (`output::trim::trim_llm_payload`)
-/// already accepts both the canonical dotted form and the
-/// snake-case alias, so the timeout resolver must follow suit or
-/// a client that uses an alternative form would silently fall
-/// back to the 30s default and have its long-running tool call
-/// dropped mid-flight.
-pub fn long_running_tool_timeout_secs(tool_name: &str) -> Option<u64> {
-    // Fast path: direct equality. This function is called on
-    // every incoming MCP tool request, and the canonical tool
-    // name is the most common form. A raw `&str` compare avoids
-    // the unconditional `String` allocation that
-    // `normalize_tool_name` performs (one for the input, plus
-    // one per table entry). For a per-request hot path that
-    // runs once per tool call, the allocation cost is visible
-    // when the request rate is high and most callers are
-    // already using the canonical name verbatim.
-    if LONG_RUNNING_TOOL_TIMEOUTS.contains(&tool_name) {
-        return Some(index_timeout_secs());
-    }
-    // Slow path: alias / case / whitespace tolerance. Required
-    // for callers that use the snake-case or trimmed form
-    // (e.g. `leindex_index`, `  LeIndex.Index  `). The
-    // normalised comparison matches the contract documented on
-    // the function and exercised by the round-11 test
-    // `test_long_running_tool_timeout_secs_normalises_tool_name`.
-    let normalized = normalize_tool_name(tool_name);
-    if LONG_RUNNING_TOOL_TIMEOUTS
-        .iter()
-        .any(|t| normalize_tool_name(t) == normalized)
-    {
-        Some(index_timeout_secs())
-    } else {
-        None
-    }
-}
-
-/// Normalise a tool name to the form used by the long-running
-/// timeout table: trim, ASCII lower-case, and `-` / `.` / ` `
-/// replaced with `_`. This is the same shape that
-/// `output::trim::trim_llm_payload` accepts for its alias
-/// dispatch (`leindex_index | index`).
-fn normalize_tool_name(name: &str) -> String {
-    name.trim()
-        .to_ascii_lowercase()
-        .replace(['-', '.', ' '], "_")
-}
 
 /// Default cap on concurrently-tracked HTTP sessions before the oldest
 /// idle session is evicted to make room for a new one. Tunable via the
@@ -223,9 +101,6 @@ pub struct McpServerConfig {
 
     /// Maximum request size in megabytes
     pub max_request_size_mb: usize,
-
-    /// Request timeout in seconds (per tool call)
-    pub request_timeout_secs: u64,
 }
 
 impl Default for McpServerConfig {
@@ -237,7 +112,6 @@ impl Default for McpServerConfig {
             bind_address: SocketAddr::from(([127, 0, 0, 1], DEFAULT_MCP_PORT)),
             enable_cors: true,
             max_request_size_mb: 10,
-            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
         }
     }
 }
@@ -264,6 +138,10 @@ pub struct McpServer {
     /// `begin_request`/`end_request` bump a refcount instead of
     /// allocating a new `String` for every request.
     pub(crate) in_flight: Arc<DashMap<Arc<str>, ()>>,
+    /// Per-session freshness advisories already shown, keyed by project.
+    /// The compact freshness badge remains on every response; only the
+    /// verbose advisory is emitted once per session and generation.
+    pub(crate) freshness_advisories: Arc<DashMap<(Arc<str>, std::path::PathBuf), u64>>,
 }
 
 impl McpServer {
@@ -305,6 +183,7 @@ impl McpServer {
             handshake_complete: Arc::new(AtomicBool::new(false)),
             session_handshakes: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
+            freshness_advisories: Arc::new(DashMap::new()),
         };
 
         SERVER_INSTANCE
@@ -351,7 +230,54 @@ impl McpServer {
                 last_access.elapsed() < max_idle
             }
         });
-        before - self.session_handshakes.len()
+        let removed = before - self.session_handshakes.len();
+        self.freshness_advisories
+            .retain(|(session_id, _), _| self.session_handshakes.contains_key(session_id.as_ref()));
+        removed
+    }
+
+    /// Apply the session/generation freshness advisory policy to a raw tool
+    /// result before output trimming. This is deliberately transport-owned so
+    /// handlers stay stateless and direct CLI calls remain unaffected.
+    fn apply_freshness_advisory(
+        &self,
+        session_id: &str,
+        project_path: Option<&str>,
+        result: &mut Value,
+    ) {
+        let result_project_path = result
+            .get("project_path")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let Some(freshness) = result
+            .get_mut("_meta")
+            .and_then(Value::as_object_mut)
+            .and_then(|meta| meta.get_mut("freshness"))
+            .and_then(Value::as_object_mut)
+        else {
+            return;
+        };
+        let generation = freshness
+            .get("generation")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let project = project_path
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| result_project_path.map(std::path::PathBuf::from))
+            .unwrap_or_else(|| std::path::PathBuf::from("<current>"));
+        let key = (Arc::<str>::from(session_id), project);
+        let already_shown = self
+            .freshness_advisories
+            .get(&key)
+            .is_some_and(|seen| *seen == generation);
+        let advisory = freshness.remove("warning");
+        if already_shown {
+            freshness.insert("advisory".to_string(), Value::Null);
+        } else {
+            freshness.insert("advisory".to_string(), advisory.unwrap_or(Value::Null));
+            self.freshness_advisories.insert(key, generation);
+        }
     }
 
     /// Get the number of active sessions (for diagnostics and testing).
@@ -397,9 +323,9 @@ impl McpServer {
     ///
     /// The returned `InFlightGuard` removes the session from the
     /// `in_flight` set on drop, so the cleanup task never sees a
-    /// session as in-flight if the tool call panics, the timeout
-    /// future is dropped, or any other path bypasses the explicit
-    /// `end_request` call. This is a small RAII wrapper that
+    /// session as in-flight if the tool call panics, its response is
+    /// disconnected, or any other path bypasses the explicit `end_request`
+    /// call. This is a small RAII wrapper that
     /// eliminates an entire class of session-leak bugs.
     pub fn in_flight_guard(server: &Arc<Self>, session_id: &str) -> InFlightGuard {
         server.begin_request(session_id);
@@ -761,6 +687,9 @@ fn handle_initialize(server: &McpServer) -> (Value, Option<String>) {
                 .map(|r| r.key().clone());
             if let Some(id) = oldest_id {
                 server.session_handshakes.remove(id.as_ref());
+                server
+                    .freshness_advisories
+                    .retain(|(session_id, _), _| session_id.as_ref() != id.as_ref());
             }
         }
         server.session_handshakes.insert(
@@ -935,49 +864,18 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
         }
         "ping" => Ok(handle_ping()),
         "tools/call" => {
-            // Per-tool-call hard timeout + in-flight session tracking so the
-            // background cleanup task never evicts a session that's still
-            // processing a request. The in-flight guard is RAII — its Drop
-            // always calls `end_request`, so a panic inside `handle_tool_call`
-            // or a dropped timeout future cannot leak the session in the
-            // in-flight map forever.
-            //
-            // The timeout cap is per-tool: long-running tools listed in
-            // `LONG_RUNNING_TOOL_TIMEOUTS` (e.g. `leindex.index`, which can
-            // legitimately take several minutes for a first-time build of
-            // a large monorepo) get a higher cap so the timeout does not
-            // drop the future mid-swap and leak the spawned blocking work
-            // into a state where the in-memory index is never populated.
-            // All other tools use `DEFAULT_REQUEST_TIMEOUT_SECS` (30s).
-            let tool_name = json_req
-                .params
-                .as_ref()
-                .and_then(|p| p.get("name"))
-                .and_then(|n| n.as_str())
-                .unwrap_or("");
-            // Resolve the per-tool cap at runtime so environment
-            // overrides like `LEINDEX_INDEX_TIMEOUT_SECS` take
-            // effect. The previous const-slice lookup baked the
-            // default into a compile-time constant, which made
-            // the env var dead code.
-            let cap_secs = long_running_tool_timeout_secs(tool_name)
-                .unwrap_or(server_instance.config.request_timeout_secs);
-            let timeout = std::time::Duration::from_secs(cap_secs);
+            // Keep the in-flight session guard, but do not wrap correctness-
+            // critical work in a wall-clock timeout. Tokio cannot cancel a
+            // `spawn_blocking` parse/transaction safely; dropping that future
+            // creates the disk/memory generation split this server is meant
+            // to prevent. Indexing itself returns an owned job snapshot.
             let _guard = incoming_session_id
                 .as_ref()
                 .map(|sid| McpServer::in_flight_guard(server_instance, sid));
-            let tool_result = tokio::time::timeout(
-                timeout,
-                handle_tool_call_timed(&state, handlers, &json_req, transport_started),
-            )
-            .await;
-            match tool_result {
-                Ok(result) => result,
-                Err(_) => Err(JsonRpcError::internal_error(format!(
-                    "Tool call timed out after {}s",
-                    cap_secs
-                ))),
-            }
+            let advisory = incoming_session_id
+                .as_deref()
+                .map(|sid| (server_instance.as_ref(), sid));
+            handle_tool_call_timed(&state, handlers, &json_req, transport_started, advisory).await
         }
         "tools/list" => Ok(list_tools_json(handlers)),
         "prompts/list" => Ok(list_prompts_json()),
@@ -1008,7 +906,7 @@ pub async fn handle_tool_call(
     handlers: &[ToolHandler],
     req: &JsonRpcRequest,
 ) -> Result<Value, JsonRpcError> {
-    handle_tool_call_timed(registry, handlers, req, Instant::now()).await
+    handle_tool_call_timed(registry, handlers, req, Instant::now(), None).await
 }
 
 /// Handle a tool call with a transport timestamp captured at message receipt.
@@ -1017,6 +915,7 @@ async fn handle_tool_call_timed(
     handlers: &[ToolHandler],
     req: &JsonRpcRequest,
     transport_started: Instant,
+    advisory: Option<(&McpServer, &str)>,
 ) -> Result<Value, JsonRpcError> {
     let handler_started = Instant::now();
     let tool_call = req.extract_tool_call()?;
@@ -1051,7 +950,14 @@ async fn handle_tool_call_timed(
     );
 
     match handler_result {
-        Ok(value) => {
+        Ok(mut value) => {
+            if let Some((server, session_id)) = advisory {
+                server.apply_freshness_advisory(
+                    session_id,
+                    call_args.get("project_path").and_then(Value::as_str),
+                    &mut value,
+                );
+            }
             // The MCP transport is what the LLM actually sees. Run the
             // tool's raw value through the per-tool payload trimmer so we
             // hand the model only the fields it needs (no scoring
@@ -1222,8 +1128,8 @@ async fn health_check_handler() -> Json<Value> {
 ///
 /// Removes the session from the server's `in_flight` set on `Drop`, so
 /// the cleanup task never sees a session as in-flight if the tool call
-/// panics, the timeout future is dropped, or any other code path
-/// bypasses the explicit `end_request` call. Without this guard, a
+/// panics, its response disconnects, or any other code path bypasses the
+/// explicit `end_request` call. Without this guard, a
 /// panic inside a tool handler would leak the session in the in-flight
 /// map forever, defeating the cleanup task's ability to evict the
 /// session.
@@ -1564,8 +1470,17 @@ async fn handle_socket_message(
                 }
                 "ping" => JsonRpcResponse::success(request_id, serde_json::json!({})),
                 "tools/call" => {
-                    let result =
-                        handle_tool_call_timed(state, handlers, &request, transport_started).await;
+                    let advisory = SERVER_INSTANCE
+                        .get()
+                        .map(|server| (server.as_ref(), session_id));
+                    let result = handle_tool_call_timed(
+                        state,
+                        handlers,
+                        &request,
+                        transport_started,
+                        advisory,
+                    )
+                    .await;
                     JsonRpcResponse::from_result(request_id, result)
                 }
                 "tools/list" => JsonRpcResponse::success(request_id, list_tools_json(handlers)),
@@ -1659,6 +1574,7 @@ mod tests {
             handshake_complete: Arc::new(AtomicBool::new(false)),
             session_handshakes: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
+            freshness_advisories: Arc::new(DashMap::new()),
         };
 
         // Simulate multiple concurrent session handshakes
@@ -1698,6 +1614,7 @@ mod tests {
             handshake_complete: Arc::new(AtomicBool::new(false)),
             session_handshakes: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
+            freshness_advisories: Arc::new(DashMap::new()),
         };
 
         let (_, sid1) = handle_initialize_for_test(&server);
@@ -1713,6 +1630,49 @@ mod tests {
         assert_eq!(server.active_session_count(), 1);
     }
 
+    #[test]
+    fn test_freshness_advisory_is_once_per_session_and_generation() {
+        let registry = Arc::new(ProjectRegistry::new(5));
+        let server = McpServer {
+            config: McpServerConfig::default(),
+            _registry: registry,
+            handshake_complete: Arc::new(AtomicBool::new(false)),
+            session_handshakes: Arc::new(DashMap::new()),
+            in_flight: Arc::new(DashMap::new()),
+            freshness_advisories: Arc::new(DashMap::new()),
+        };
+        let (_, session_id) = handle_initialize_for_test(&server);
+
+        let response = || {
+            serde_json::json!({
+                "project_path": "/tmp/project",
+                "_meta": {"freshness": {
+                    "generation": 7,
+                    "warning": "refresh recommended"
+                }}
+            })
+        };
+        let mut first = response();
+        server.apply_freshness_advisory(&session_id, None, &mut first);
+        assert_eq!(
+            first["_meta"]["freshness"]["advisory"],
+            "refresh recommended"
+        );
+        assert!(first["_meta"]["freshness"].get("warning").is_none());
+
+        let mut second = response();
+        server.apply_freshness_advisory(&session_id, None, &mut second);
+        assert!(second["_meta"]["freshness"]["advisory"].is_null());
+
+        let mut new_generation = response();
+        new_generation["_meta"]["freshness"]["generation"] = serde_json::json!(8);
+        server.apply_freshness_advisory(&session_id, None, &mut new_generation);
+        assert_eq!(
+            new_generation["_meta"]["freshness"]["advisory"],
+            "refresh recommended"
+        );
+    }
+
     /// VAL-APLUS-025 variant: stale session cleanup removes only expired sessions.
     #[test]
     fn test_stale_session_cleanup() {
@@ -1723,6 +1683,7 @@ mod tests {
             handshake_complete: Arc::new(AtomicBool::new(false)),
             session_handshakes: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
+            freshness_advisories: Arc::new(DashMap::new()),
         };
 
         // Create a session
@@ -1781,6 +1742,7 @@ mod tests {
             handshake_complete: Arc::new(AtomicBool::new(false)),
             session_handshakes: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
+            freshness_advisories: Arc::new(DashMap::new()),
         };
 
         // Fill the session map to the cap. We use `insert` directly
@@ -1879,6 +1841,7 @@ mod tests {
             handshake_complete: Arc::new(AtomicBool::new(false)),
             session_handshakes: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
+            freshness_advisories: Arc::new(DashMap::new()),
         };
 
         // Register a session directly so the key is an `Arc<str>` we
@@ -1921,6 +1884,7 @@ mod tests {
             handshake_complete: Arc::new(AtomicBool::new(false)),
             session_handshakes: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
+            freshness_advisories: Arc::new(DashMap::new()),
         };
 
         // Session not registered yet — should still insert into
@@ -1938,101 +1902,6 @@ mod tests {
             .get("unregistered-session")
             .expect("lookup by &str must work");
         assert_eq!(stored.key().as_ref(), "unregistered-session");
-    }
-
-    /// Regression for MED round 11: `long_running_tool_timeout_secs`
-    /// used to do an exact match against `LONG_RUNNING_TOOL_TIMEOUTS`.
-    /// The trim dispatcher (`output::trim::trim_llm_payload`)
-    /// already accepts both the canonical dotted form and the
-    /// snake-case alias (`leindex_index | index`), so the timeout
-    /// resolver must follow suit. A client that uses an
-    /// alternative form would otherwise silently fall back to the
-    /// 30s default and have its long-running tool call dropped
-    /// mid-flight.
-    #[test]
-    fn test_long_running_tool_timeout_secs_normalises_tool_name() {
-        // The canonical dotted form must match.
-        let canonical = long_running_tool_timeout_secs("leindex.index");
-        assert!(
-            canonical.is_some(),
-            "canonical form `leindex.index` must be recognised as long-running"
-        );
-        // The hyphenated alias must also match.
-        let hyphenated = long_running_tool_timeout_secs("leindex-index");
-        assert!(
-            hyphenated.is_some(),
-            "hyphenated alias `leindex-index` must be recognised as long-running"
-        );
-        // The snake_case alias (the form used by `trim_llm_payload`)
-        // must also match.
-        let snake = long_running_tool_timeout_secs("leindex_index");
-        assert!(
-            snake.is_some(),
-            "snake_case alias `leindex_index` must be recognised as long-running"
-        );
-        // Whitespace and case must be tolerated.
-        let padded = long_running_tool_timeout_secs("  LeIndex.Index  ");
-        assert!(
-            padded.is_some(),
-            "padded / mixed-case variant must be recognised as long-running"
-        );
-        // Unrelated tools must not match.
-        let search = long_running_tool_timeout_secs("leindex.search");
-        assert!(
-            search.is_none(),
-            "`leindex.search` must NOT be classified as long-running"
-        );
-        let context = long_running_tool_timeout_secs("leindex.context");
-        assert!(
-            context.is_none(),
-            "`leindex.context` must NOT be classified as long-running"
-        );
-    }
-
-    /// Regression for MED round 18: the per-call hot path of
-    /// `long_running_tool_timeout_secs` previously allocated
-    /// two `String`s on every call (one for the input via
-    /// `normalize_tool_name`, one per table entry — N=1 today
-    /// but the slice is treated as the source of truth, so the
-    /// allocation cost is a per-entry cost in general). The
-    /// canonical tool name is by far the most common input
-    /// form, so the function must short-circuit on direct
-    /// `&str` equality before paying the allocation cost.
-    ///
-    /// This test asserts the result is identical for the
-    /// canonical input — i.e. the fast path is observably
-    /// equivalent to the slow path for that case. It also
-    /// asserts the function returns the same value (whatever
-    /// `index_timeout_secs()` resolves to at test time, which
-    /// honours `LEINDEX_INDEX_TIMEOUT_SECS`) for the fast path
-    /// and the slow path when both are eligible, so a future
-    /// refactor cannot accidentally diverge the two.
-    #[test]
-    fn test_long_running_tool_timeout_secs_fast_path_matches_slow_path() {
-        // Canonical form → fast path (direct equality).
-        let fast = long_running_tool_timeout_secs("leindex.index");
-        // Snake-case alias → slow path (normalised equality).
-        let slow = long_running_tool_timeout_secs("leindex_index");
-        // Padded / mixed-case → slow path.
-        let slow_padded = long_running_tool_timeout_secs("  LeIndex.Index  ");
-        // Hyphenated alias → slow path.
-        let slow_hyphen = long_running_tool_timeout_secs("leindex-index");
-
-        // All four must produce the same per-tool timeout
-        // (whatever the env override resolves to at test
-        // time), proving the fast path returns an identical
-        // result to the slow path.
-        assert_eq!(fast, slow, "fast path must match slow path result");
-        assert_eq!(fast, slow_padded, "fast path must match slow path result");
-        assert_eq!(fast, slow_hyphen, "fast path must match slow path result");
-
-        // And the value must be Some(...) — the canonical
-        // `leindex.index` is the long-running tool whose
-        // timeout is exposed via `LEINDEX_INDEX_TIMEOUT_SECS`.
-        assert!(
-            fast.is_some(),
-            "canonical `leindex.index` must be classified as long-running"
-        );
     }
 
     /// Regression for MED round 18: the fixed-port loop in

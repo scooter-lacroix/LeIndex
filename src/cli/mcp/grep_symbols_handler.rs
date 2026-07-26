@@ -4,6 +4,7 @@ use super::helpers::{
 };
 use super::protocol::JsonRpcError;
 use super::read_symbol_handler::{catalog_is_fresh, parse_live_file, read_live_bytes};
+use super::request_meta::WorkBudget;
 use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
 use crate::graph::pdg::{NodeId, ProgramDependenceGraph};
@@ -14,6 +15,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Options for building a symbol entry in grep results.
 struct SymbolEntryOpts {
@@ -107,6 +109,7 @@ fn build_catalog_symbol_entry(
         .then(|| &content[start..end])
     });
     let mut entry = serde_json::json!({
+        "node_id": symbol.node_id,
         "name": symbol.symbol_name,
         "type": symbol.node_type,
         "file": symbol.file_path,
@@ -143,6 +146,7 @@ fn build_catalog_symbol_entry(
 }
 
 async fn catalog_exact_response(
+    registry: &Arc<ProjectRegistry>,
     args: &Value,
     pattern: &str,
     project_path: Option<&std::path::Path>,
@@ -163,7 +167,7 @@ async fn catalog_exact_response(
             error
         ))
     })?;
-    let db_path = live.storage().join("leindex.db");
+    let db_path = live.active_storage().join("leindex.db");
     let catalog = if db_path.is_file() {
         CatalogReader::open(&db_path, live.root())
             .await
@@ -172,9 +176,28 @@ async fn catalog_exact_response(
     } else {
         None
     };
+    // A complete catalog built from the current Git tree already covers every
+    // unchanged tracked file. Limit a miss fallback to live edits; when the
+    // generation tree cannot be proven current, retain the full Git grep path
+    // so committed changes cannot be hidden by an old snapshot.
+    let catalog_tree_current = catalog.as_ref().is_some_and(|_| {
+        crate::cli::index_freshness::load_health(&live.active_storage()).is_some_and(|health| {
+            health.phase == crate::cli::leindex::IndexPhase::Complete
+                && health.status == crate::cli::leindex::ComponentStatus::Fresh
+                && health.tree_oid.is_some()
+                && health.tree_oid == crate::cli::git::tree_oid(live.root()).ok().flatten()
+        })
+    });
     let scope = resolve_scope(args, live.root())?;
     let pattern_lower = pattern.to_lowercase();
     let symbols = match &catalog {
+        Some(catalog) if is_code_pattern(pattern) => {
+            // Identifier-shaped exact requests should use the indexed equality
+            // path. A leading-wildcard LIKE scan over every catalog row is
+            // the scale cliff on large projects; the live Git candidate path
+            // below handles substring misses without hydrating the catalog.
+            catalog.find_symbol(pattern, None).await.unwrap_or_default()
+        }
         Some(catalog) => catalog
             .find_symbols_matching(pattern)
             .await
@@ -183,6 +206,7 @@ async fn catalog_exact_response(
     };
     let mut fresh = Vec::new();
     let mut stale_paths = HashSet::new();
+    let mut symbol_index_miss = false;
     for mut symbol in symbols {
         symbol.file_path = live
             .file(&symbol.file_path.to_string_lossy())
@@ -214,14 +238,24 @@ async fn catalog_exact_response(
     }
 
     // A stale catalog's paths are safe candidates; an empty catalog falls
-    // back to a bounded live scan, never a registry hydration.
+    // back to the Git-authoritative live inventory, never registry hydration.
     let paths: Vec<PathBuf> = if stale_paths.is_empty() {
         if fresh.is_empty() {
+            symbol_index_miss = true;
             tokio::task::spawn_blocking({
                 let root = live.root().to_path_buf();
-                move || {
-                    crate::cli::index_builder::scan_project_files(&root)
-                        .map(|scan| scan.source_paths)
+                let pattern = pattern.to_owned();
+                move || match if catalog_tree_current {
+                    crate::cli::git::changed_source_candidates(&root)
+                } else {
+                    crate::cli::git::source_candidates(&root, &pattern)
+                } {
+                    Ok(paths) => Ok(paths),
+                    Err(crate::cli::git::GitInventoryError::NotRepository) => {
+                        crate::cli::index_builder::scan_project_files(&root)
+                            .map(|scan| scan.source_paths)
+                    }
+                    Err(error) => Err(anyhow::anyhow!(error.to_string())),
                 }
             })
             .await
@@ -231,10 +265,18 @@ async fn catalog_exact_response(
             Vec::new()
         }
     } else {
+        symbol_index_miss = true;
         stale_paths.into_iter().collect()
     };
     if !paths.is_empty() {
-        for path in paths.into_iter().take(200) {
+        for path in paths {
+            // Avoid invoking Tree-sitter for every source file when a catalog
+            // is missing. A cheap byte-level prefilter keeps the live fallback
+            // bounded by files that can actually contain the requested anchor.
+            let bytes = read_live_bytes(path.clone()).await?;
+            if !live_text_might_match(&bytes, pattern) {
+                continue;
+            }
             let parsed = match parse_live_file(path).await {
                 Ok(parsed) => parsed,
                 Err(_) => continue,
@@ -283,6 +325,45 @@ async fn catalog_exact_response(
         results.push(entry);
     }
     let shown = results.len();
+    let mut pdg_status = "not_loaded";
+    if let Some(handle) = registry.try_get_loaded(live.root()).await {
+        let guard = handle.read().await;
+        if let Some(pdg) = guard.pdg() {
+            pdg_status = "fresh";
+            for result in &mut results {
+                let Some(node_id) = result.get("node_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(node_index) = pdg.find_by_id(node_id) else {
+                    continue;
+                };
+                let callers = get_direct_callers(pdg, node_index);
+                let callees = pdg.neighbors(node_index);
+                result["caller_count"] = Value::from(callers.len());
+                result["dependency_count"] = Value::from(callees.len());
+                result["callers"] = Value::Array(
+                    callers
+                        .iter()
+                        .take(50)
+                        .filter_map(|id| {
+                            pdg.get_node(*id)
+                                .map(|node| Value::String(node.name.clone()))
+                        })
+                        .collect(),
+                );
+                result["callees"] = Value::Array(
+                    callees
+                        .iter()
+                        .take(50)
+                        .filter_map(|id| {
+                            pdg.get_node(*id)
+                                .map(|node| Value::String(node.name.clone()))
+                        })
+                        .collect(),
+                );
+            }
+        }
+    }
     Ok(Some(serde_json::json!({
         "results": results,
         "total_matches": total_matches,
@@ -290,9 +371,32 @@ async fn catalog_exact_response(
         "offset": offset,
         "mode": "exact",
         "truncated": total_matches.saturating_sub(offset).min(max_results) > shown,
-        "pdg_status": "not_loaded",
-        "symbol_index_miss": false,
+        "pdg_status": pdg_status,
+        "symbol_index_miss": symbol_index_miss,
+        "retrieval": {
+            "tfidf_status": "not_used_exact",
+            "neural_status": "not_used_exact"
+        },
     })))
+}
+
+fn is_code_pattern(pattern: &str) -> bool {
+    !pattern.is_empty()
+        && pattern
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '$' | '-'))
+}
+
+fn live_text_might_match(bytes: &[u8], pattern: &str) -> bool {
+    let haystack = String::from_utf8_lossy(bytes).to_ascii_lowercase();
+    let pattern = pattern.trim().to_ascii_lowercase();
+    if pattern.is_empty() || haystack.contains(&pattern) {
+        return true;
+    }
+    pattern
+        .rsplit_once([':', '.'])
+        .map(|(_, tail)| !tail.is_empty() && haystack.contains(tail))
+        .unwrap_or(false)
 }
 
 /// Handler for LeIndex [grep_symbols — structurally-aware symbol search.
@@ -372,6 +476,17 @@ impl GrepSymbolsHandler {
                     "enum": ["exact", "semantic"],
                     "description": "Search mode: 'exact' for name substring matching (default), 'semantic' for concept-based similarity search using TF-IDF embeddings",
                     "default": "exact"
+                },
+                "max_latency_ms": {
+                    "type": "integer",
+                    "description": "Optional enrichment budget (default: 250)",
+                    "default": 250,
+                    "minimum": 0,
+                    "maximum": 60000
+                },
+                "allow_partial": {
+                    "type": "boolean",
+                    "default": true
                 }
             },
             "required": ["pattern"]
@@ -400,6 +515,11 @@ impl GrepSymbolsHandler {
             .unwrap_or("exact")
             .to_owned();
         let project_path = args.get("project_path").and_then(|v| v.as_str());
+        let budget = WorkBudget {
+            max_latency_ms: extract_usize(&args, "max_latency_ms", 250)?.min(60000) as u64,
+            allow_partial: extract_bool(&args, "allow_partial", true),
+        };
+        let started = Instant::now();
 
         let requested_mode = match mode.as_str() {
             "auto" => RequestedMode::Auto,
@@ -424,6 +544,7 @@ impl GrepSymbolsHandler {
                 .map(std::path::Path::new)
                 .or(default_project_path.as_deref());
             if let Some(response) = catalog_exact_response(
+                registry,
                 &args,
                 &pattern,
                 catalog_project_path,
@@ -436,7 +557,13 @@ impl GrepSymbolsHandler {
             )
             .await?
             {
-                return Ok(response);
+                return Ok(annotate_retrieval(
+                    response,
+                    "exact",
+                    "not_used_exact",
+                    budget,
+                    started,
+                ));
             }
         }
 
@@ -580,7 +707,13 @@ impl GrepSymbolsHandler {
                 "truncated": total_matches.saturating_sub(offset).min(max_results) > shown,
             });
             response = wrap_with_meta(response, &index);
-            return Ok(response);
+            return Ok(annotate_retrieval(
+                response,
+                "semantic",
+                index.neural_status(),
+                budget,
+                started,
+            ));
         }
 
         let pdg = index.pdg().unwrap();
@@ -676,8 +809,42 @@ impl GrepSymbolsHandler {
         });
 
         response = wrap_with_meta(response, &index);
-        Ok(response)
+        Ok(annotate_retrieval(
+            response,
+            "exact",
+            "not_used_exact",
+            budget,
+            started,
+        ))
     }
+}
+
+fn annotate_retrieval(
+    mut response: Value,
+    route: &str,
+    neural_status: &'static str,
+    budget: WorkBudget,
+    started: Instant,
+) -> Value {
+    let partial = budget.elapsed(started);
+    let pdg_status = response
+        .get("pdg_status")
+        .and_then(Value::as_str)
+        .unwrap_or(if partial { "partial" } else { "resident" });
+    response["pdg_status"] = Value::String(if partial {
+        "partial".to_string()
+    } else {
+        pdg_status.to_string()
+    });
+    response["retrieval"] = serde_json::json!({
+        "tfidf_status": if route == "semantic" { "fresh" } else { "not_used_exact" },
+        "pdg_status": response["pdg_status"],
+        "neural_status": neural_status,
+        "partial": partial,
+        "max_latency_ms": budget.max_latency_ms,
+        "allow_partial": budget.allow_partial
+    });
+    response
 }
 
 #[cfg(test)]

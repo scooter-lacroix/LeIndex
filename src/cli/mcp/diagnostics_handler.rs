@@ -48,32 +48,70 @@ impl DiagnosticsHandler {
     ) -> Result<Value, JsonRpcError> {
         let project_path = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path).await?;
-        let mut guard = handle.write().await;
+        let guard = handle.read().await;
 
         let diagnostics = guard.get_diagnostics().map_err(|e| {
             JsonRpcError::internal_error(format!("Failed to get diagnostics: {}", e))
         })?;
 
-        // Use is_stale_fast() for the boolean staleness check (fast: mtime +
-        // count comparison). Only run the expensive check_freshness() (which
-        // hashes ALL source files) when the index is actually stale, to
-        // provide detailed changed/deleted file lists.
-        let stale_fast = guard.is_stale_fast();
-        let (changed, deleted) = if stale_fast {
-            guard.check_freshness().unwrap_or_else(|_| (vec![], vec![]))
-        } else {
-            (vec![], vec![])
-        };
+        // MCP diagnostics reads the persisted health snapshot and one live
+        // Git status. It must not hash/stat every indexed file on the hot
+        // response path; the CLI retains `is_stale_fast` for compatibility.
+        let health = crate::cli::index_freshness::load_health(guard.storage_path());
+        let stale_fast = health.as_ref().is_some_and(|health| {
+            matches!(
+                health.status,
+                crate::cli::leindex::ComponentStatus::Stale
+                    | crate::cli::leindex::ComponentStatus::Partial
+                    | crate::cli::leindex::ComponentStatus::Failed
+            )
+        });
+        let (changed, deleted) = crate::cli::git::status(guard.project_path())
+            .ok()
+            .map(|status| {
+                let changed = status
+                    .modified
+                    .into_iter()
+                    .chain(status.staged)
+                    .chain(status.untracked)
+                    .map(|path| guard.project_path().join(path))
+                    .collect::<Vec<_>>();
+                let deleted = status
+                    .deleted
+                    .into_iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>();
+                (changed, deleted)
+            })
+            .unwrap_or_else(|| (Vec::new(), Vec::new()));
         let storage_path = guard.storage_path().display().to_string();
         let db_size = std::fs::metadata(guard.storage_path().join("leindex.db"))
             .map(|m| m.len())
             .unwrap_or(0);
-        let coverage = guard.coverage_report().ok();
+        // Coverage is a persisted index-time fact here. Re-running the full
+        // source inventory on every diagnostics call defeats the live fast
+        // path and was a primary source of multi-second responses on large
+        // worktrees. Git status above supplies the current delta.
+        let coverage = health.as_ref().map(|snapshot| {
+            let total = snapshot
+                .indexed_file_count
+                .saturating_add(snapshot.changed_unindexed_count);
+            serde_json::json!({
+                "total_source_files": total,
+                "indexed_files": snapshot.indexed_file_count,
+                "missing_files": [],
+                "orphaned_entries": [],
+                "coverage_pct": if total == 0 { 100.0 } else {
+                    snapshot.indexed_file_count as f64 / total as f64 * 100.0
+                },
+                "source": "persisted_health",
+            })
+        });
 
         // Extract values from diagnostics before it's consumed by serde
-        let indexed_files_ct = coverage
+        let indexed_files_ct = health
             .as_ref()
-            .map(|c| c.indexed_files)
+            .map(|snapshot| snapshot.indexed_file_count)
             .unwrap_or(diagnostics.stats.files_parsed);
         let symbol_count = diagnostics.stats.indexed_nodes;
         let memory_rss_mb =
@@ -81,12 +119,12 @@ impl DiagnosticsHandler {
         let size_mb = diagnostics.memory_usage_bytes as f64 / 1024.0 / 1024.0;
         let failed_parses = diagnostics.stats.failed_parses;
         let index_health = diagnostics.index_health.clone();
-        let is_stale = !changed.is_empty() || !deleted.is_empty();
+        let is_stale = stale_fast || !changed.is_empty() || !deleted.is_empty();
         // When is_stale_fast() reported stale, we ran check_freshness() which
         // is authoritative (hash-based). If check_freshness found no changes,
         // the is_stale_fast positive was a false positive (e.g., same-second
         // mtime) and the index is actually fresh.
-        let stale_bool = if stale_fast { is_stale } else { false };
+        let stale_bool = is_stale;
         // Live PDG counts from the in-memory graph (pdg.node_count() /
         // pdg.edge_count()). These reflect the current state of the loaded
         // PDG and may differ from the index-time snapshot in stats.pdg_nodes
@@ -204,10 +242,7 @@ impl DiagnosticsHandler {
             };
             map.insert("freshness".to_string(), staleness);
             if let Some(cov) = coverage {
-                map.insert(
-                    "coverage".to_string(),
-                    serde_json::to_value(cov).unwrap_or(Value::Null),
-                );
+                map.insert("coverage".to_string(), cov);
             }
         }
 

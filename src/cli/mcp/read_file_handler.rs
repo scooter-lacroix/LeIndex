@@ -1,13 +1,14 @@
 use super::helpers::{
     extract_bool, extract_string, extract_usize, get_direct_callers, node_type_str,
-    validate_file_within_project, wrap_with_meta,
+    validate_file_within_project, wrap_live_with_meta, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
+use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
 use crate::graph::pdg::ProgramDependenceGraph;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 /// Handler for LeIndex [read_file — PDG-annotated file read.
@@ -239,20 +240,20 @@ Works for any text file including configs and docs."
         let max_lines = extract_usize(&args, "max_lines", 500)?.min(2000);
         let include_symbol_map = extract_bool(&args, "include_symbol_map", false);
 
-        // Try to get project handle for boundary validation and PDG, but don't require it
+        // Resolve and validate against the live project without creating or
+        // hydrating a registry entry. Resident PDG data is enrichment only;
+        // an exact file read must remain useful before any index exists.
         let project_path = args.get("project_path").and_then(|v| v.as_str());
-        let maybe_handle = if project_path.is_some() {
-            Some(registry.get_or_create(project_path).await?)
+        let project_root = if let Some(project_path) = project_path {
+            LiveProject::resolve(project_path)
+                .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?
+                .root()
+                .to_path_buf()
         } else {
-            registry.get_or_create(project_path).await.ok()
+            registry.default_project_path().await?
         };
-
-        let resolved_file_path = if let Some(ref handle) = maybe_handle {
-            let guard = handle.read().await;
-            validate_file_within_project(&file_path, guard.project_path())?
-        } else {
-            PathBuf::from(&file_path)
-        };
+        let resolved_file_path = validate_file_within_project(&file_path, &project_root)?;
+        let maybe_handle = registry.try_get_loaded(&project_root).await;
 
         // Read file content — works for any text file
         let content = tokio::fs::read_to_string(&resolved_file_path)
@@ -340,20 +341,17 @@ Works for any text file including configs and docs."
             .unwrap_or("text");
 
         let pdg_snapshot = if let Some(ref handle) = maybe_handle {
-            let mut guard = handle.write().await;
-            if let Err(e) = guard.ensure_pdg_loaded() {
-                tracing::warn!(
-                    "PDG load failed for enrichment, degrading gracefully: {}",
-                    e
-                );
-                None
-            } else {
-                guard.pdg().cloned()
-            }
+            let guard = handle.read().await;
+            guard.pdg().cloned()
         } else {
             None
         };
 
+        let pdg_status = if pdg_snapshot.is_some() {
+            "fresh"
+        } else {
+            "not_loaded"
+        };
         let enrichment_file_path = resolved_file_path.to_string_lossy().to_string();
         let (symbol_map, context) = if let Some(pdg) = pdg_snapshot {
             tokio::task::spawn_blocking(move || {
@@ -392,6 +390,12 @@ Works for any text file including configs and docs."
             result["context"] = ctx;
         }
 
+        result["retrieval"] = serde_json::json!({
+            "tfidf_status": "not_used_exact",
+            "pdg_status": pdg_status,
+            "neural_status": "not_used_exact"
+        });
+
         // Verbose symbol map only when explicitly requested
         if include_symbol_map && !symbol_map.is_empty() {
             result["symbol_map"] = serde_json::json!(symbol_map);
@@ -401,6 +405,8 @@ Works for any text file including configs and docs."
         if let Some(ref handle) = maybe_handle {
             let guard = handle.read().await;
             result = wrap_with_meta(result, &guard);
+        } else {
+            result = wrap_live_with_meta(result, &project_root);
         }
 
         Ok(result)

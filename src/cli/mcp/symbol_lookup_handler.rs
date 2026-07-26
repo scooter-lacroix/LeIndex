@@ -3,9 +3,11 @@ use super::helpers::{
     read_source_snippet, resolve_scope, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
+use super::request_meta::WorkBudget;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Handler for LeIndex [symbol_lookup — full call graph for any symbol.
 #[derive(Clone)]
@@ -77,6 +79,17 @@ For the exact source implementation use LeIndex [Read Symbol]."
                     "default": 2,
                     "minimum": 1,
                     "maximum": 5
+                },
+                "max_latency_ms": {
+                    "type": "integer",
+                    "description": "Optional caller/callee enrichment budget (default: 250)",
+                    "default": 250,
+                    "minimum": 0,
+                    "maximum": 60000
+                },
+                "allow_partial": {
+                    "type": "boolean",
+                    "default": true
                 }
             },
             "required": []
@@ -97,6 +110,11 @@ For the exact source implementation use LeIndex [Read Symbol]."
         let include_callees = extract_bool(&args, "include_callees", true);
         let depth = extract_usize(&args, "depth", 2)?.min(5);
         let token_budget = extract_usize(&args, "token_budget", 1500)?;
+        let budget = WorkBudget {
+            max_latency_ms: extract_usize(&args, "max_latency_ms", 250)?.min(60000) as u64,
+            allow_partial: extract_bool(&args, "allow_partial", true),
+        };
+        let started = Instant::now();
 
         // Resolve scope and get project handle
         let project_path = args.get("project_path").and_then(|v| v.as_str());
@@ -164,8 +182,13 @@ For the exact source implementation use LeIndex [Read Symbol]."
                     include_callees,
                     depth,
                     per_symbol_budget,
+                    started,
+                    budget,
                 ) {
-                    Ok(val) => results.push(val),
+                    Ok(mut val) => {
+                        add_retrieval_meta(&mut val, budget, started);
+                        results.push(val);
+                    }
                     Err(e) => results.push(serde_json::json!({
                         "symbol": symbol,
                         "error": format!("{}", e)
@@ -177,7 +200,8 @@ For the exact source implementation use LeIndex [Read Symbol]."
                 serde_json::json!({
                     "batch": true,
                     "count": results.len(),
-                    "results": results
+                    "results": results,
+                    "retrieval": retrieval_meta(budget, started)
                 }),
                 &guard,
             ));
@@ -194,8 +218,12 @@ For the exact source implementation use LeIndex [Read Symbol]."
             include_callees,
             depth,
             char_budget,
+            started,
+            budget,
         )?;
 
+        let mut single = single;
+        add_retrieval_meta(&mut single, budget, started);
         Ok(wrap_with_meta(single, &guard))
     }
 
@@ -211,6 +239,8 @@ For the exact source implementation use LeIndex [Read Symbol]."
         include_callees: bool,
         depth: usize,
         char_budget: usize,
+        started: Instant,
+        budget: WorkBudget,
     ) -> Result<Value, JsonRpcError> {
         let in_scope = |node: &crate::graph::pdg::Node| match scope {
             Some(s) => node.file_path.starts_with(s),
@@ -287,9 +317,10 @@ For the exact source implementation use LeIndex [Read Symbol]."
         let node = pdg
             .get_node(node_id)
             .ok_or_else(|| JsonRpcError::internal_error("PDG node disappeared after lookup"))?;
+        let mut partial = budget.elapsed(started);
 
         // Callees (direct)
-        let (callees, callees_truncated) = if include_callees {
+        let (callees, callees_truncated) = if include_callees && !partial {
             let capped_callees: Vec<Value> = pdg
                 .neighbors(node_id)
                 .iter()
@@ -312,9 +343,10 @@ For the exact source implementation use LeIndex [Read Symbol]."
         } else {
             (Vec::new(), false)
         };
+        partial |= budget.elapsed(started);
 
         // Callers (direct)
-        let (callers, callers_truncated) = if include_callers {
+        let (callers, callers_truncated) = if include_callers && !partial {
             let capped_callers: Vec<Value> = get_direct_callers(pdg, node_id)
                 .iter()
                 .filter_map(|&cid| {
@@ -336,15 +368,20 @@ For the exact source implementation use LeIndex [Read Symbol]."
         } else {
             (Vec::new(), false)
         };
+        partial |= budget.elapsed(started);
 
         // Forward impact (depth-bounded transitive dependents)
-        let forward = pdg.forward_impact(
-            node_id,
-            &crate::graph::pdg::TraversalConfig {
-                max_depth: Some(depth),
-                ..crate::graph::pdg::TraversalConfig::for_impact_analysis()
-            },
-        );
+        let forward = if partial {
+            Vec::new()
+        } else {
+            pdg.forward_impact(
+                node_id,
+                &crate::graph::pdg::TraversalConfig {
+                    max_depth: Some(depth),
+                    ..crate::graph::pdg::TraversalConfig::for_impact_analysis()
+                },
+            )
+        };
         let affected_files: std::collections::HashSet<&str> = forward
             .iter()
             .filter_map(|&nid| pdg.get_node(nid).map(|n| n.file_path.as_ref()))
@@ -354,6 +391,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
             "affected_files": affected_files.len()
         });
 
+        partial |= budget.elapsed(started);
         let mut result = serde_json::json!({
             "symbol": node.name,
             "type": node_type_str(&node.node_type),
@@ -365,10 +403,12 @@ For the exact source implementation use LeIndex [Read Symbol]."
             "callees": callees,
             "callers_truncated": callers_truncated,
             "callees_truncated": callees_truncated,
-            "impact_radius": impact_radius
+            "impact_radius": impact_radius,
+            "pdg_status": if partial { "partial" } else { "fresh" },
+            "retrieval": retrieval_meta_with_partial(budget, partial)
         });
 
-        if include_source {
+        if include_source && !partial {
             if let Some(src) = read_source_snippet(&node.file_path, node.byte_range) {
                 let truncated: String = src.chars().take(char_budget / 2).collect();
                 result["source"] = Value::String(truncated);
@@ -376,6 +416,35 @@ For the exact source implementation use LeIndex [Read Symbol]."
         }
 
         Ok(result)
+    }
+}
+
+fn retrieval_meta(budget: WorkBudget, started: Instant) -> Value {
+    retrieval_meta_with_partial(budget, budget.elapsed(started))
+}
+
+fn retrieval_meta_with_partial(budget: WorkBudget, partial: bool) -> Value {
+    serde_json::json!({
+        "tfidf_status": "not_used_exact",
+        "pdg_status": if partial { "partial" } else { "fresh" },
+        "neural_status": "not_used_exact",
+        "partial": partial,
+        "max_latency_ms": budget.max_latency_ms,
+        "allow_partial": budget.allow_partial
+    })
+}
+
+fn add_retrieval_meta(value: &mut Value, budget: WorkBudget, started: Instant) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("retrieval".to_string(), retrieval_meta(budget, started));
+        object.insert(
+            "pdg_status".to_string(),
+            Value::String(if budget.elapsed(started) {
+                "partial".to_string()
+            } else {
+                "fresh".to_string()
+            }),
+        );
     }
 }
 

@@ -1,11 +1,15 @@
 use super::helpers::{
     extract_bool, extract_string, extract_usize, glob_match, node_type_str, resolve_scope,
-    wrap_with_meta,
+    wrap_live_with_meta, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
+use super::request_meta::WorkBudget;
+use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
 use regex::RegexBuilder;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// Handler for LeIndex [text_search — raw text/regex search across files.
@@ -14,6 +18,41 @@ pub struct TextSearchHandler;
 
 fn strip_line_ending(line: &str) -> &str {
     line.trim_end_matches(['\r', '\n'])
+}
+
+async fn live_source_inventory(project_root: &Path) -> Result<Vec<PathBuf>, JsonRpcError> {
+    let project_root = project_root.to_path_buf();
+    tokio::task::spawn_blocking(
+        move || match crate::cli::git::source_inventory(&project_root) {
+            Ok(paths) => Ok(paths),
+            Err(crate::cli::git::GitInventoryError::NotRepository) => {
+                let mut paths = Vec::new();
+                for entry in walkdir::WalkDir::new(&project_root)
+                    .follow_links(false)
+                    .into_iter()
+                    .filter_entry(|entry| {
+                        let name = entry.file_name().to_string_lossy();
+                        !crate::cli::skip_dirs::SKIP_DIRS
+                            .iter()
+                            .any(|skip| name == *skip)
+                    })
+                {
+                    let entry = match entry {
+                        Ok(entry) => entry,
+                        Err(_) => continue,
+                    };
+                    if entry.file_type().is_file() {
+                        paths.push(entry.path().to_path_buf());
+                    }
+                }
+                Ok(paths)
+            }
+            Err(error) => Err(anyhow::anyhow!(error.to_string())),
+        },
+    )
+    .await
+    .map_err(|error| JsonRpcError::internal_error(format!("live text inventory failed: {error}")))?
+    .map_err(|error| JsonRpcError::internal_error(format!("live text inventory failed: {error}")))
 }
 
 #[allow(missing_docs)]
@@ -87,6 +126,18 @@ to understand match context. Supports regex, globs, scope, and context_lines."
                     "default": 2,
                     "minimum": 0,
                     "maximum": 10
+                },
+                "max_latency_ms": {
+                    "type": "integer",
+                    "description": "Optional live scan budget; returns matches found so far (default: 150)",
+                    "default": 150,
+                    "minimum": 0,
+                    "maximum": 60000
+                },
+                "allow_partial": {
+                    "type": "boolean",
+                    "description": "Return matches found before the live scan budget is reached",
+                    "default": true
                 }
             },
             "required": ["query"]
@@ -104,6 +155,11 @@ to understand match context. Supports regex, globs, scope, and context_lines."
         let max_results = extract_usize(&args, "max_results", 100)?.min(1000);
         let offset = extract_usize(&args, "offset", 0)?;
         let context_lines = extract_usize(&args, "context_lines", 2)?.min(10);
+        let budget = WorkBudget {
+            max_latency_ms: extract_usize(&args, "max_latency_ms", 150)?.min(60000) as u64,
+            allow_partial: extract_bool(&args, "allow_partial", true),
+        };
+        let started = std::time::Instant::now();
 
         let include_globs: Vec<String> = args
             .get("include_globs")
@@ -126,17 +182,16 @@ to understand match context. Supports regex, globs, scope, and context_lines."
             .unwrap_or_default();
 
         let project_path = args.get("project_path").and_then(|v| v.as_str());
-        let handle = registry.get_or_create(project_path).await?;
-        let mut guard = handle.write().await;
-
-        if let Err(e) = guard.ensure_pdg_loaded() {
-            tracing::warn!(
-                "Failed to load PDG for text search; continuing without enrichment: {}",
-                e
-            );
-        }
-
-        let scope = resolve_scope(&args, guard.project_path())?;
+        let project_root = if let Some(project_path) = project_path {
+            LiveProject::resolve(project_path)
+                .map_err(|error| JsonRpcError::invalid_params(error.to_string()))?
+                .root()
+                .to_path_buf()
+        } else {
+            registry.default_project_path().await?
+        };
+        let scope = resolve_scope(&args, &project_root)?;
+        let handle = registry.try_get_loaded(&project_root).await;
 
         // Build regex or literal matcher
         let regex = if is_regex {
@@ -157,38 +212,65 @@ to understand match context. Supports regex, globs, scope, and context_lines."
             query.to_lowercase()
         };
 
-        // Get PDG for enrichment (optional — works without it)
-        let pdg = guard.pdg();
-
-        // Collect source files from the project
-        let project_root = guard.project_path();
         let mut results: Vec<Value> = Vec::new();
 
-        // Dirs to always skip
-        use crate::cli::skip_dirs::SKIP_DIRS;
+        let source_paths = if let Some(scope) = scope.as_deref() {
+            let path = Path::new(scope.trim_end_matches(std::path::MAIN_SEPARATOR));
+            if path.is_file() {
+                // A file scope is already canonical and bounded. Do not
+                // enumerate the whole worktree just to read one file.
+                vec![path.to_path_buf()]
+            } else {
+                live_source_inventory(&project_root).await?
+            }
+        } else {
+            live_source_inventory(&project_root).await?
+        };
 
-        for entry in walkdir::WalkDir::new(project_root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| {
-                let name = e.file_name().to_string_lossy();
-                !SKIP_DIRS.iter().any(|s| name == *s)
-            })
-        {
+        // Snapshot only the small symbol-span metadata needed to annotate
+        // matches, then release the registry lock before reading/scanning
+        // source files. Cloning the whole PDG here would recreate the memory
+        // spike this live path is meant to avoid.
+        let pdg_spans: HashMap<String, Vec<((usize, usize), String, String)>> =
+            if let Some(handle) = handle.as_ref() {
+                let guard = handle.read().await;
+                guard
+                    .pdg()
+                    .map(|pdg| {
+                        source_paths
+                            .iter()
+                            .map(|file_path| {
+                                let key = file_path.to_string_lossy().into_owned();
+                                let spans = pdg
+                                    .nodes_in_file(&key)
+                                    .into_iter()
+                                    .filter_map(|node_id| {
+                                        let node = pdg.get_node(node_id)?;
+                                        Some((
+                                            node.byte_range,
+                                            node.name.clone(),
+                                            node_type_str(&node.node_type).to_owned(),
+                                        ))
+                                    })
+                                    .collect();
+                                (key, spans)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            } else {
+                HashMap::new()
+            };
+
+        let mut partial = false;
+        for file_path in source_paths {
             if results.len() >= max_results {
                 break;
             }
-
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-
-            if !entry.file_type().is_file() {
-                continue;
+            if budget.elapsed(started) {
+                partial = true;
+                break;
             }
-
-            let file_path = entry.path();
             let file_path_str = file_path.to_string_lossy();
 
             // Apply scope filter
@@ -212,7 +294,7 @@ to understand match context. Supports regex, globs, scope, and context_lines."
             }
 
             // Read file content
-            let content = match std::fs::read_to_string(file_path) {
+            let content = match std::fs::read_to_string(&file_path) {
                 Ok(c) => c,
                 Err(_) => continue, // Skip binary or unreadable files
             };
@@ -235,6 +317,10 @@ to understand match context. Supports regex, globs, scope, and context_lines."
 
             for (line_idx, line) in lines.iter().enumerate() {
                 if results.len() >= max_results {
+                    break;
+                }
+                if budget.elapsed(started) {
+                    partial = true;
                     break;
                 }
 
@@ -266,31 +352,18 @@ to understand match context. Supports regex, globs, scope, and context_lines."
 
                 // Compact PDG enrichment: just symbol name + type (~4 tokens)
                 // Eliminates follow-up Read to understand what code this match is in
-                let (in_symbol, symbol_type) = pdg
-                    .and_then(|pdg| {
-                        // O(1) lookup from precomputed prefix sums — avoids O(N²) recomputation
-                        let byte_offset: usize = line_byte_offsets[line_idx];
-
-                        let nodes = pdg.nodes_in_file(&file_path_str);
-                        let mut best: Option<(crate::graph::pdg::NodeId, usize)> = None;
-
-                        for nid in nodes {
-                            if let Some(node) = pdg.get_node(nid) {
-                                let (start, end) = node.byte_range;
-                                if byte_offset >= start && byte_offset < end {
-                                    let range_size = end - start;
-                                    if best.map_or(true, |(_, sz)| range_size < sz) {
-                                        best = Some((nid, range_size));
-                                    }
-                                }
-                            }
-                        }
-
-                        best.and_then(|(nid, _)| {
-                            pdg.get_node(nid).map(|node| {
-                                (node.name.clone(), node_type_str(&node.node_type).to_owned())
+                let (in_symbol, symbol_type) = pdg_spans
+                    .get(file_path_str.as_ref())
+                    .and_then(|spans| {
+                        // O(1) lookup from precomputed prefix sums — avoids O(N²) recomputation.
+                        let byte_offset = line_byte_offsets[line_idx];
+                        spans
+                            .iter()
+                            .filter(|((start, end), _, _)| {
+                                byte_offset >= *start && byte_offset < *end
                             })
-                        })
+                            .min_by_key(|((start, end), _, _)| end.saturating_sub(*start))
+                            .map(|(_, name, typ)| (name.clone(), typ.clone()))
                     })
                     .map(|(name, typ)| (Some(name), Some(typ)))
                     .unwrap_or((None, None));
@@ -325,17 +398,35 @@ to understand match context. Supports regex, globs, scope, and context_lines."
         let paginated: Vec<Value> = results.into_iter().skip(offset).collect();
         let count = paginated.len();
 
-        Ok(wrap_with_meta(
-            serde_json::json!({
-                "query": query,
-                "is_regex": is_regex,
-                "offset": offset,
-                "count": count,
-                "total_matched": total,
-                "has_more": offset + count < total,
-                "results": paginated,
-            }),
-            &guard,
-        ))
+        let mut response = serde_json::json!({
+            "query": query,
+            "is_regex": is_regex,
+            "offset": offset,
+            "count": count,
+            "total_matched": total,
+            "has_more": offset + count < total,
+            "results": paginated,
+            "retrieval": {
+                "tfidf_status": "not_used_exact",
+                "pdg_status": if partial {
+                    "partial"
+                } else if pdg_spans.is_empty() {
+                    "not_loaded"
+                } else {
+                    "resident"
+                },
+                "neural_status": "not_used_exact",
+                "max_latency_ms": budget.max_latency_ms,
+                "allow_partial": budget.allow_partial,
+                "partial": partial
+            }
+        });
+        if let Some(handle) = handle.as_ref() {
+            let guard = handle.read().await;
+            response = wrap_with_meta(response, &guard);
+        } else {
+            response = wrap_live_with_meta(response, &project_root);
+        }
+        Ok(response)
     }
 }

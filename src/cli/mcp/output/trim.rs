@@ -67,6 +67,16 @@ fn merge_meta(original: &Value, trimmed: &Value) -> Value {
             out_obj.insert(k.clone(), v.clone());
         }
     }
+    if let Some(meta) = orig_obj.get("_meta") {
+        let target = out_obj
+            .entry("_meta".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let (Some(source), Some(target)) = (meta.as_object(), target.as_object_mut()) {
+            for (key, value) in source {
+                target.entry(key.clone()).or_insert_with(|| value.clone());
+            }
+        }
+    }
     out
 }
 

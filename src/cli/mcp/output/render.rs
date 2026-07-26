@@ -1996,7 +1996,7 @@ fn render_tool_output_with_color(name: &str, data: &Value, args: &Value, color: 
     let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
     let node_id = args.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
 
-    match normalized.as_str() {
+    let mut rendered = match normalized.as_str() {
         "leindex_search" | "search" => render_search(data, query, color),
         "leindex_context" | "context" => render_context(data, node_id, color),
         "leindex_diagnostics" | "diagnostics" => render_diagnostics(data, color),
@@ -2020,7 +2020,33 @@ fn render_tool_output_with_color(name: &str, data: &Value, args: &Value, color: 
         "leindex_write" | "write" => render_write(data, color),
         "leindex_rename_symbol" | "rename_symbol" => render_rename_symbol(data, color),
         _ => render_default(data, color),
+    };
+    if let Some(freshness) = data
+        .get("_meta")
+        .and_then(|meta| meta.get("freshness"))
+        .or_else(|| data.get("freshness"))
+    {
+        let status = freshness
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let generation = freshness
+            .get("generation")
+            .and_then(Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let advisory = freshness
+            .get("advisory")
+            .and_then(Value::as_str)
+            .or_else(|| freshness.get("warning").and_then(Value::as_str));
+        rendered.push_str(&format!(
+            "\nFreshness: status={status}, generation={generation}\n"
+        ));
+        if let Some(advisory) = advisory {
+            rendered.push_str(&format!("Advisory: {advisory}\n"));
+        }
     }
+    rendered
 }
 
 // =============================================================================

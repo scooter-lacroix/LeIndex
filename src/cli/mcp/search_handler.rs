@@ -1,8 +1,10 @@
-use super::helpers::{extract_string, extract_usize, resolve_scope, wrap_with_meta};
+use super::helpers::{extract_bool, extract_string, extract_usize, resolve_scope, wrap_with_meta};
 use super::protocol::JsonRpcError;
+use super::request_meta::WorkBudget;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Handler for LeIndex [search
 ///
@@ -67,6 +69,23 @@ to auto-switch/auto-index projects."
         'exact' prioritizes exact symbol name matches (higher text/structural weights), \
         'semantic' prioritizes conceptual relevance (higher TF-IDF semantic weights).",
                     "default": "code"
+                },
+                "task_context": {
+                    "type": "string",
+                    "description": "Optional bounded review/task context used for this retrieval only",
+                    "maxLength": 2000
+                },
+                "max_latency_ms": {
+                    "type": "integer",
+                    "description": "Optional enrichment budget; never cancels the search (default: 500)",
+                    "default": 500,
+                    "minimum": 0,
+                    "maximum": 60000
+                },
+                "allow_partial": {
+                    "type": "boolean",
+                    "description": "Return core TF-IDF results when optional enrichment exceeds the budget",
+                    "default": true
                 }
             },
             "required": ["query"]
@@ -86,41 +105,49 @@ to auto-switch/auto-index projects."
             .get("search_mode")
             .and_then(|v| v.as_str())
             .unwrap_or("code");
+        let task_context = args
+            .get("task_context")
+            .and_then(Value::as_str)
+            .map(|context| context.chars().take(2000).collect::<String>());
+        let budget = WorkBudget {
+            max_latency_ms: extract_usize(&args, "max_latency_ms", 500)?.min(60000) as u64,
+            allow_partial: extract_bool(&args, "allow_partial", true),
+        };
+        let started = Instant::now();
+        let effective_query = task_context.as_deref().map_or_else(
+            || query.clone(),
+            |context| format!("{}\nTask context: {}", query, context),
+        );
 
-        // Resolve query type
-        let query_type = match search_mode {
-            "prose" => Some(crate::search::ranking::QueryType::Text),
-            "code" => Some(crate::search::ranking::QueryType::Semantic),
-            "exact" => Some(crate::search::ranking::QueryType::Exact),
-            "semantic" => Some(crate::search::ranking::QueryType::Semantic),
-            "auto" => {
-                let q_lower = query.to_lowercase();
-                let prose_keywords = [
-                    "how", "what", "where", "why", "who", "when", "can", "is", "explain",
-                    "describe", "find", "show",
-                ];
-                let is_natural_language = q_lower.split_whitespace().count() > 3
-                    || prose_keywords.iter().any(|k| q_lower.contains(k));
-
-                if is_natural_language {
-                    Some(crate::search::ranking::QueryType::Text)
-                } else {
-                    Some(crate::search::ranking::QueryType::Semantic)
-                }
+        let requested_mode = match search_mode {
+            "exact" => crate::search::query_route::RequestedMode::Exact,
+            "semantic" | "code" => crate::search::query_route::RequestedMode::Semantic,
+            "prose" => crate::search::query_route::RequestedMode::Auto,
+            _ => crate::search::query_route::RequestedMode::Auto,
+        };
+        let route = crate::search::query_route::classify(&effective_query, requested_mode);
+        let route_name = match route {
+            crate::search::query_route::QueryRoute::ExactSymbol => "exact_symbol",
+            crate::search::query_route::QueryRoute::ExactText => "exact_text",
+            crate::search::query_route::QueryRoute::Semantic => "semantic",
+            crate::search::query_route::QueryRoute::DeepPdg => "deep_pdg",
+        };
+        let query_type = match route {
+            crate::search::query_route::QueryRoute::ExactSymbol
+            | crate::search::query_route::QueryRoute::ExactText => {
+                Some(crate::search::ranking::QueryType::Exact)
             }
-            _ => Some(crate::search::ranking::QueryType::Semantic),
+            crate::search::query_route::QueryRoute::Semantic
+            | crate::search::query_route::QueryRoute::DeepPdg => Some(if search_mode == "prose" {
+                crate::search::ranking::QueryType::Text
+            } else {
+                crate::search::ranking::QueryType::Semantic
+            }),
         };
 
         let project_path = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
-
-        if let Err(e) = guard.ensure_pdg_loaded() {
-            tracing::warn!(
-                "Failed to load PDG for semantic search; continuing without enrichment: {}",
-                e
-            );
-        }
 
         let scope = resolve_scope(&args, guard.project_path())?;
 
@@ -132,8 +159,17 @@ to auto-switch/auto-index projects."
 
         const MAX_FETCH_K: usize = 1000;
         let mut fetch_k = (top_k + offset).min(MAX_FETCH_K);
-        let mut all_results = guard
-            .search(&query, fetch_k, query_type)
+        let search = |index: &mut crate::cli::leindex::LeIndex,
+                      query: &str,
+                      top_k: usize,
+                      query_type: Option<crate::search::ranking::QueryType>| {
+            if task_context.is_some() {
+                index.search_ephemeral(query, top_k, query_type)
+            } else {
+                index.search(query, top_k, query_type)
+            }
+        };
+        let mut all_results = search(&mut guard, &effective_query, fetch_k, query_type)
             .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
 
         let in_scope = |file_path: &str| match &scope {
@@ -158,8 +194,7 @@ to auto-switch/auto-index projects."
         if filtered.is_empty() && scope.is_some() && !all_results.is_empty() {
             fetch_k = (fetch_k * 10).min(MAX_FETCH_K * 10);
             if fetch_k > top_k + offset {
-                all_results = guard
-                    .search(&query, fetch_k, query_type)
+                all_results = search(&mut guard, &effective_query, fetch_k, query_type)
                     .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
                 filtered = all_results
                     .iter()
@@ -185,7 +220,24 @@ to auto-switch/auto-index projects."
                         Try: rephrase query, use different keywords, or try LeIndex [Grep Symbols] for exact symbol names.",
                         query,
                         guard.source_file_paths().map(|p| p.len()).unwrap_or(0)
-                    )
+                    ),
+                    "retrieval": {
+                        "tfidf_status": "fresh",
+                        "pdg_status": if guard.pdg().is_some() { "resident" } else { "not_loaded" },
+                        "neural_status": if matches!(
+                            route,
+                            crate::search::query_route::QueryRoute::ExactSymbol
+                                | crate::search::query_route::QueryRoute::ExactText
+                        ) {
+                            "not_used_exact"
+                        } else {
+                            guard.neural_status()
+                        },
+                        "route": route_name,
+                        "partial": budget.elapsed(started),
+                        "max_latency_ms": budget.max_latency_ms,
+                        "allow_partial": budget.allow_partial
+                    }
                 }),
                 &guard,
             ));
@@ -197,7 +249,24 @@ to auto-switch/auto-index projects."
                     JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
                 "offset": offset,
                 "count": total_returned,
-                "has_more": offset + total_returned < total_filtered
+                "has_more": offset + total_returned < total_filtered,
+                "retrieval": {
+                    "tfidf_status": "fresh",
+                    "pdg_status": if guard.pdg().is_some() { "resident" } else { "not_loaded" },
+                    "neural_status": if matches!(
+                        route,
+                        crate::search::query_route::QueryRoute::ExactSymbol
+                            | crate::search::query_route::QueryRoute::ExactText
+                    ) {
+                        "not_used_exact"
+                    } else {
+                        guard.neural_status()
+                    },
+                    "route": route_name,
+                    "partial": budget.elapsed(started),
+                    "max_latency_ms": budget.max_latency_ms,
+                    "allow_partial": budget.allow_partial
+                }
             }),
             &guard,
         ))
