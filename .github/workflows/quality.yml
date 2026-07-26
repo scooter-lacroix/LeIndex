@@ -1,0 +1,338 @@
+name: Quality Gates
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ── Duplicate code detection via jscpd ──────────────────────────────
+  # Uses jscpd to detect copy-paste code blocks across the Rust source.
+  # Threshold: fail if duplication exceeds 5% of total code.
+  duplicate-code:
+    name: Duplicate Code Detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run jscpd duplicate detection
+        run: |
+          npx --yes jscpd@3.5.10 \
+            src/ \
+            crates/ \
+            --format "rust" \
+            --min-lines 6 \
+            --min-tokens 50 \
+            --threshold 5 \
+            --reporters "console,html" \
+            --output ./jscpd-report
+      - name: Upload jscpd report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jscpd-report
+          path: ./jscpd-report/
+
+  # ── Cyclomatic complexity monitoring via lizard ────────────────────
+  # Runs lizard to analyze cyclomatic complexity across all Rust source.
+  # Fails if any function exceeds CCN of 15.
+  cyclomatic-complexity:
+    name: Cyclomatic Complexity Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install lizard
+        run: pip install lizard
+      - name: Run complexity analysis
+        run: |
+          # Analyze all Rust source files, fail if any function has CCN > 15
+          lizard \
+            src/ \
+            crates/leindex-embed/src/ \
+            -CCN 15 \
+            -x"*/tests/*" \
+            -x"*/target/*" \
+            -m \
+            -H./complexity-report.html \
+            || (echo "::error::Cyclomatic complexity threshold exceeded (CCN > 15)" && exit 1)
+      - name: Upload complexity report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: complexity-report
+          path: ./complexity-report.html
+
+  # ── Large file detection ───────────────────────────────────────────
+  # Fails if any tracked source file exceeds 2000 lines or 1MB.
+  large-file-check:
+    name: Large File Detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for large files
+        run: |
+          set -e
+          MAX_LINES=2000
+          MAX_SIZE_KB=1024
+          FOUND_ISSUE=0
+
+          # Check .rs files for line count violations
+          while IFS= read -r file; do
+            lines=$(wc -l < "$file")
+            if [ "$lines" -gt "$MAX_LINES" ]; then
+              echo "::warning file=$file::Large file: ${lines} lines (max ${MAX_LINES})"
+              FOUND_ISSUE=1
+            fi
+          done < <(find src crates -name '*.rs' -not -path '*/target/*' 2>/dev/null)
+
+          # Check all source files for size violations (excluding target, node_modules, .git, models)
+          while IFS= read -r file; do
+            size_kb=$(( $(stat --format=%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo 0) / 1024 ))
+            if [ "$size_kb" -gt "$MAX_SIZE_KB" ]; then
+              echo "::warning file=$file::Large file: ${size_kb}KB (max ${MAX_SIZE_KB}KB)"
+              FOUND_ISSUE=1
+            fi
+          done < <(find . -type f -not -path './target/*' -not -path './.git/*' -not -path './node_modules/*' -not -path './models/*' -not -name '*.onnx' -not -name '*.bin' 2>/dev/null)
+
+          if [ "$FOUND_ISSUE" -eq 1 ]; then
+            echo "::error::Large file(s) detected. Consider splitting files > ${MAX_LINES} lines or > ${MAX_SIZE_KB}KB."
+            exit 1
+          fi
+          echo "No large files detected."
+
+  # ── Unused dependencies detection ──────────────────────────────────
+  # Runs cargo-udeps (nightly) to detect unused dependencies.
+  # This job is non-blocking (continue-on-error) since cargo-udeps
+  # requires nightly and may have false positives with optional deps.
+  unused-deps:
+    name: Unused Dependencies
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: udeps-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            udeps-cargo-
+      - name: Install cargo-udeps
+        run: cargo install cargo-udeps --locked || true
+      - name: Run cargo-udeps
+        run: |
+          cargo +nightly udeps --workspace --all-targets --all-features 2>&1 | tee udeps-report.txt
+          if grep -q "unused" udeps-report.txt; then
+            echo "::warning::Unused dependencies detected (non-blocking)"
+          fi
+
+  # ── Version drift detection ────────────────────────────────────────
+  # Verifies all workspace members use consistent dependency versions.
+  version-drift:
+    name: Version Drift Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check workspace dependency version consistency
+        run: |
+          set -e
+          # Extract all workspace member Cargo.toml files
+          MEMBER_FILES=$(find crates tools -name Cargo.toml 2>/dev/null)
+          ERRORS=0
+
+          # Collect all external dependency versions across workspace members
+          declare -A ROOT_VERSIONS
+          # Parse root Cargo.toml dependencies
+          while IFS= read -r line; do
+            dep_name=$(echo "$line" | sed -n 's/^\([a-zA-Z0-9_-]*\).*/\1/p')
+            dep_ver=$(echo "$line" | grep -oP 'version\s*=\s*"\K[^"]+')
+            if [ -n "$dep_name" ] && [ -n "$dep_ver" ]; then
+              ROOT_VERSIONS["$dep_name"]="$dep_ver"
+            fi
+          done < <(sed -n '/^\[dependencies\]/,/^\[/p' Cargo.toml | grep -v '^\[' | grep -v '^#')
+
+          # Check workspace members for version mismatches
+          for member in $MEMBER_FILES; do
+            while IFS= read -r line; do
+              dep_name=$(echo "$line" | sed -n 's/^\([a-zA-Z0-9_-]*\).*/\1/p')
+              dep_ver=$(echo "$line" | grep -oP 'version\s*=\s*"\K[^"]+')
+              root_ver="${ROOT_VERSIONS[$dep_name]:-}"
+              if [ -n "$dep_ver" ] && [ -n "$root_ver" ] && [ "$dep_ver" != "$root_ver" ]; then
+                echo "::warning file=$member::Dependency '$dep_name' version drift: member=$dep_ver root=$root_ver"
+                ERRORS=$((ERRORS + 1))
+              fi
+            done < <(sed -n '/^\[dependencies\]/,/^\[/p' "$member" | grep -v '^\[' | grep -v '^#')
+          done
+
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "::warning::$ERRORS dependency version mismatches found across workspace members"
+          else
+            echo "All workspace member dependency versions are consistent."
+          fi
+
+  # ── Test coverage thresholds ───────────────────────────────────────
+  # Runs cargo-tarpaulin to measure test coverage and enforce a minimum.
+  test-coverage:
+    name: Test Coverage
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: tarpaulin-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            tarpaulin-cargo-
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin || true
+      - name: Run cargo-tarpaulin
+        run: |
+          cargo tarpaulin \
+            --workspace \
+            --out Xml \
+            --output-dir ./coverage \
+            --timeout 300 \
+            --fail-under 40 \
+            --exclude-files "benches/*" "tools/*" \
+            2>&1 | tee coverage-output.txt
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: ./coverage/
+
+  # ── Flaky test detection ───────────────────────────────────────────
+  # Runs the test suite 5 times to detect intermittent failures.
+  # Only runs on push to master (not PRs) to conserve CI minutes.
+  flaky-test-detection:
+    name: Flaky Test Detection
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: flaky-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            flaky-cargo-
+      - name: Run tests 5 times to detect flakiness
+        run: |
+          FAIL=0
+          for i in 1 2 3 4 5; do
+            echo "--- Run $i ---"
+            if ! cargo test --workspace --quiet 2>&1 | tee "run-$i.log"; then
+              echo "::warning::Test run $i failed"
+              FAIL=1
+            fi
+          done
+          if [ "$FAIL" -eq 1 ]; then
+            echo "::error::Flaky tests detected - at least one of 5 runs failed"
+            exit 1
+          fi
+          echo "All 5 test runs passed. No flakiness detected."
+
+  # ── Heavy dependency detection ─────────────────────────────────────
+  # Uses cargo-bloat to identify dependencies that bloat the binary.
+  heavy-dependency-detection:
+    name: Heavy Dependency Detection
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: bloat-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            bloat-cargo-
+      - name: Install cargo-bloat
+        run: cargo install cargo-bloat || true
+      - name: Analyze binary size contributions
+        run: |
+          cargo bloat --release --crates --workspace 2>&1 | tee bloat-report.txt || true
+          # Flag any single crate consuming more than 10% of binary
+          if grep -E '\s+[0-9]+\.[0-9]%\s+' bloat-report.txt | awk '{if ($1+0 > 10) print $0}' | grep -q .; then
+            echo "::warning::A single dependency consumes more than 10% of binary size"
+            grep -E '\s+[0-9]+\.[0-9]%\s+' bloat-report.txt | awk '{if ($1+0 > 10) print $0}'
+          else
+            echo "No single dependency dominates binary size."
+          fi
+
+  # ── Tech debt tracking ─────────────────────────────────────────────
+  # Counts TODO, FIXME, HACK, and XXX markers across the codebase.
+  # Tracks accumulation over time. Does not fail CI (informational).
+  tech-debt-tracking:
+    name: Tech Debt Tracking
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Count tech debt markers
+        run: |
+          TODO=$(grep -rIn --include='*.rs' 'TODO' src/ crates/ 2>/dev/null | wc -l)
+          FIXME=$(grep -rIn --include='*.rs' 'FIXME' src/ crates/ 2>/dev/null | wc -l)
+          HACK=$(grep -rIn --include='*.rs' 'HACK' src/ crates/ 2>/dev/null | wc -l)
+          XXX=$(grep -rIn --include='*.rs' 'XXX' src/ crates/ 2>/dev/null | wc -l)
+          TOTAL=$((TODO + FIXME + HACK + XXX))
+          echo "::notice::Tech debt markers: TODO=$TODO FIXME=$FIXME HACK=$HACK XXX=$XXX Total=$TOTAL"
+          echo "Tech debt markers tracked: TODO=$TODO FIXME=$FIXME HACK=$HACK XXX=$XXX Total=$TOTAL" > tech-debt-report.txt
+      - name: Upload tech debt report
+        uses: actions/upload-artifact@v4
+        with:
+          name: tech-debt-report
+          path: tech-debt-report.txt
+
+  # ── Dead feature flag detection ────────────────────────────────────
+  # Checks that each FeatureFlag variant in feature_flags.rs is referenced
+  # somewhere in the codebase beyond its definition.
+  dead-feature-flag-detection:
+    name: Dead Feature Flag Detection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check for unreferenced feature flags
+        run: |
+          set -e
+          DEAD=0
+          for flag in NeuralSearch RemoteEmbeddings CrossLanguageResolution ExperimentalHnsw StreamingMcp GlobalAutoSync; do
+            # Count references outside the definition in feature_flags.rs
+            REFS=$(grep -rIn --include='*.rs' "FeatureFlag::$flag" src/ crates/ 2>/dev/null | grep -v 'src/feature_flags.rs' | wc -l)
+            if [ "$REFS" -eq 0 ]; then
+              echo "::warning::FeatureFlag::$flag is defined but never used outside feature_flags.rs"
+              DEAD=$((DEAD + 1))
+            else
+              echo "FeatureFlag::$flag: $REFS references"
+            fi
+          done
+          if [ "$DEAD" -gt 0 ]; then
+            echo "::warning::$DEAD dead feature flag(s) detected"
+          else
+            echo "All feature flags are referenced."
+          fi

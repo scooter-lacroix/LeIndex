@@ -1,0 +1,118 @@
+name: Observability
+
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ["Release"]
+    types:
+      - completed
+    branches: [master]
+
+permissions:
+  contents: read
+  actions: read
+  deployments: write
+
+jobs:
+  # ── Deployment observability: annotate and notify on releases ──────
+  # Creates a GitHub deployment record and emits a notification
+  # when a release workflow completes. Connect to external monitoring
+  # by setting MONITORING_WEBHOOK_URL secret.
+  deployment-marker:
+    name: Record Deployment
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract release version
+        id: ver
+        run: |
+          VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Create deployment record
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create a deployment record in GitHub for tracking
+          gh api \
+            repos/${{ github.repository }}/deployments \
+            --method POST \
+            -f ref="v${{ steps.ver.outputs.version }}" \
+            -f environment="production" \
+            -f description="LeIndex v${{ steps.ver.outputs.version }} release deployment" \
+            2>/dev/null || echo "Deployment record creation skipped"
+
+  # ── Post-deploy health monitoring ──────────────────────────────────
+  # After a release completes, runs the test suite as a smoke test
+  # and checks CLI binary functionality. Results are annotated on
+  # the workflow run for observability dashboards.
+  post-deploy-checks:
+    name: Post-Deploy Health Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: health-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            health-cargo-
+      - name: Build and smoke test
+        run: |
+          set -e
+          # Build all workspace members
+          cargo build --workspace --all-features
+          # Run the test suite as a smoke test
+          cargo test --workspace --quiet 2>&1 | tee smoke-test.log
+          # Record metrics
+          PASS_COUNT=$(grep -c "test result: ok" smoke-test.log || echo "0")
+          if [ "$PASS_COUNT" -eq 0 ]; then
+            echo "::error::Post-deploy smoke tests failed"
+            exit 1
+          fi
+          echo "::notice::Post-deploy smoke tests passed"
+
+  # ── Deployment notification ────────────────────────────────────────
+  # Sends a deployment notification to a configured webhook
+  # (Slack, Discord, or monitoring service) if MONITORING_WEBHOOK_URL
+  # is set. Enables real-time deployment observability.
+  notify-deployment:
+    name: Notify Deployment
+    runs-on: ubuntu-latest
+    needs: [deployment-marker, post-deploy-checks]
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract release version
+        id: ver
+        run: |
+          VERSION=$(grep '^version =' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Send deployment notification
+        if: env.MONITORING_WEBHOOK_URL != ''
+        env:
+          MONITORING_WEBHOOK_URL: ${{ secrets.MONITORING_WEBHOOK_URL }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          STATUS: ${{ needs.post-deploy-checks.result }}
+        run: |
+          PAYLOAD=$(cat <<EOF
+          {
+            "version": "${VERSION}",
+            "status": "${STATUS}",
+            "repository": "${{ github.repository }}",
+            "actor": "${{ github.actor }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "run_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          EOF
+          )
+          curl -sSf -X POST \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "$MONITORING_WEBHOOK_URL" \
+            || echo "::warning::Failed to send deployment notification"

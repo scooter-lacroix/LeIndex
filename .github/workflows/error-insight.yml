@@ -1,0 +1,174 @@
+name: Error to Insight
+
+on:
+  # Manual trigger
+  workflow_dispatch:
+  # Run daily to check for error patterns
+  schedule:
+    - cron: '0 6 * * *'
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  # ── Error-to-issue automation ──────────────────────────────────────
+  # Scans recent CI/test failures and creates GitHub issues for
+  # recurring error patterns. This bridges the gap between error
+  # tracking (Sentry/LogScrubber in observability.rs) and actionable
+  # issue creation, forming the error-to-insight pipeline.
+  error-triage:
+    name: Triage Errors into Issues
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scan recent workflow failures
+        id: scan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          echo "Scanning recent workflow runs for error patterns..."
+
+          # Get recent failed workflow runs (last 7 days)
+          FAILED_RUNS=$(gh run list \
+            --repo "${{ github.repository }}" \
+            --status failure \
+            --limit 20 \
+            --json databaseId,name,conclusion,createdAt,headBranch \
+            2>/dev/null || echo "[]")
+
+          FAIL_COUNT=$(echo "$FAILED_RUNS" | jq 'length' 2>/dev/null || echo "0")
+          echo "Found $FAIL_COUNT recent failed runs"
+
+          # Check if any recent failures are from test regressions
+          TEST_FAILURES=$(echo "$FAILED_RUNS" | jq '[.[] | select(.name | test("test|lint|quality"; "i"))] | length' 2>/dev/null || echo "0")
+          echo "test_quality_failures=$TEST_FAILURES" >> "$GITHUB_OUTPUT"
+          echo "total_failures=$FAIL_COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update error tracking issue
+        if: steps.scan.outputs.test_quality_failures > 2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Check if an open tracking issue already exists
+          EXISTING=$(gh issue list \
+            --repo "${{ github.repository }}" \
+            --label "state:needs-triage" \
+            --label "type:bug" \
+            --state open \
+            --limit 1 \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || echo "")
+
+          BODY="## Automated Error Triage Report
+
+          **Generated**: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          The error-to-insight pipeline detected **${{ steps.scan.outputs.test_quality_failures }}** recent test/quality workflow failures out of ${{ steps.scan.outputs.total_failures }} total failures.
+
+          ### Action Required
+          - Review recent [workflow failures](https://github.com/${{ github.repository }}/actions)
+          - Identify root cause of recurring failures
+          - Close this issue once resolved
+
+          ### Automation Details
+          - This issue was created automatically by the \`Error to Insight\` workflow
+          - The workflow runs daily and creates issues when failure count exceeds threshold
+          - Configure error tracking integration via \`SENTRY_DSN\` for production errors
+          - See \`src/observability.rs\` for error event capture infrastructure"
+
+          if [ -n "$EXISTING" ]; then
+            # Add a comment to existing issue
+            gh issue comment "$EXISTING" \
+              --repo "${{ github.repository }}" \
+              --body "$BODY"
+            echo "Updated existing issue #$EXISTING"
+          else
+            # Create a new issue
+            gh issue create \
+              --repo "${{ github.repository }}" \
+              --title "Automated Triage: Recurring CI failures detected" \
+              --label "state:needs-triage,type:bug" \
+              --body "$BODY"
+            echo "Created new triage issue"
+          fi
+
+      - name: Check for Sentry integration
+        run: |
+          # The observability module (src/observability.rs) provides
+          # ErrorTracker::capture() which forwards to Sentry when
+          # SENTRY_DSN is configured. This step reports on its status.
+          if grep -q "SENTRY_DSN" .env.example 2>/dev/null; then
+            echo "Sentry integration is configured in the observability module."
+            echo "Set SENTRY_DSN secret to enable production error tracking."
+            echo "Once enabled, errors flow from Sentry -> GitHub issues via Sentry's"
+            echo "GitHub integration (see Sentry project settings > Integrations)."
+          fi
+          echo "Error-to-insight pipeline configured:"
+          echo "  1. Runtime errors -> ErrorTracker::capture() in observability.rs"
+          echo "  2. CI failures -> This workflow (daily triage)"
+          echo "  3. Production -> Sentry -> GitHub issues (when SENTRY_DSN set)"
+
+  # ── Product analytics: usage metrics collection ───────────────────
+  # Collects anonymous usage metrics from CI (test counts, build times,
+  # MCP tool latency) and stores them for trend analysis. This provides
+  # basic product analytics without external service dependencies.
+  product-metrics:
+    name: Collect Product Metrics
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: metrics-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            metrics-cargo-
+      - name: Collect build and test metrics
+        run: |
+          set -e
+
+          # Time the full build
+          BUILD_START=$(date +%s)
+          cargo build --workspace --all-features 2>/dev/null
+          BUILD_END=$(date +%s)
+          BUILD_TIME=$((BUILD_END - BUILD_START))
+
+          # Time the test suite
+          TEST_START=$(date +%s)
+          cargo test --workspace --quiet 2>&1 | tee test-output.txt || true
+          TEST_END=$(date +%s)
+          TEST_TIME=$((TEST_END - TEST_START))
+
+          # Count tests
+          TEST_COUNT=$(grep -oP '\d+ passed' test-output.txt | head -1 | grep -oP '\d+' || echo "0")
+
+          # Run MCP tool latency benchmark (if available)
+          cargo bench --bench mcp_tool_latency -- --output-format bencher 2>/dev/null | tee mcp-latency.txt || echo "MCP benchmark skipped"
+
+          # Output metrics (consumed by workflow run history as product analytics)
+          echo "::notice::Build time: ${BUILD_TIME}s, Test time: ${TEST_TIME}s, Tests passed: ${TEST_COUNT}"
+
+          # Create metrics JSON for external consumption
+          cat > product-metrics.json <<EOF
+          {
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "build_time_seconds": $BUILD_TIME,
+            "test_time_seconds": $TEST_TIME,
+            "tests_passed": $TEST_COUNT,
+            "repository": "${{ github.repository }}"
+          }
+          EOF
+      - name: Upload metrics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: product-metrics
+          path: product-metrics.json
+          retention-days: 90

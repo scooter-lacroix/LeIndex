@@ -1,0 +1,65 @@
+name: Rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to rollback (e.g., 1.8.4)'
+        required: true
+      reason:
+        description: 'Reason for rollback'
+        required: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  rollback:
+    name: Rollback Release v${{ inputs.version }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create rollback issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ISSUE_URL=$(gh issue create \
+            --repo "${{ github.repository }}" \
+            --title "Rollback: v${{ inputs.version }} - ${{ inputs.reason }}" \
+            --label "type:bug, P0-critical" \
+            --body "## Rollback Initiated
+
+          **Version**: v${{ inputs.version }}
+          **Reason**: ${{ inputs.reason }}
+          **Initiated by**: ${{ github.actor }}
+          **Timestamp**: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          ### Steps
+          1. [ ] Yank crate from crates.io if published
+          2. [ ] Unpublish npm package if published
+          3. [ ] Mark GitHub Release as pre-release/draft
+          4. [ ] Revert the version bump commit on master
+          5. [ ] Publish patch release with fix
+          6. [ ] Close this issue when resolved
+
+          ### Quick Commands
+          \`\`\`bash
+          # Yank from crates.io
+          cargo yank --version ${{ inputs.version }}
+
+          # Revert merge commit (find it first)
+          git log --oneline --grep='${{ inputs.version }}'
+          git revert <commit-hash>
+          \`\`\`" \
+            2>&1)
+          echo "Created rollback issue: $ISSUE_URL"
+
+      - name: Re-trigger release pipeline
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "To re-release after fix:"
+          echo "1. Fix the issue identified above"
+          echo "2. Push the fix to master with the corrected version"
+          echo "3. The release.yml workflow will automatically publish"

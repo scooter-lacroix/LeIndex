@@ -47,14 +47,39 @@ jobs:
         run: |
           set -e
           CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          WORKER_VER=$(grep -m1 '^version' crates/leindex-embed/Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          ROOT_NPM_VER=$(node -p "require('./package.json').version")
+          DASHBOARD_VER=$(node -p "require('./dashboard/package.json').version")
+          PI_VER=$(node -p "require('./pi/package.json').version")
           NPM_VER=$(python3 -c "import json; print(json.load(open('packages/npm-leindex-mcp/package.json'))['version'])" 2>/dev/null || echo "MISSING")
           PYPI_VER=$(python3 -c "import tomllib; print(tomllib.load(open('packages/pypi-leindex/pyproject.toml','rb'))['project']['version'])" 2>/dev/null || echo "MISSING")
-          echo "Cargo: ${CARGO_VER}  npm: ${NPM_VER}  PyPI: ${PYPI_VER}"
+          PYPI_RUNTIME_VER=$(grep -m1 '__version__' packages/pypi-leindex/src/leindex/__init__.py | sed 's/.*"\(.*\)".*/\1/')
+          INSTALL_SH_VER=$(grep -m1 'SCRIPT_VERSION=' install.sh | sed 's/.*"\(.*\)".*/\1/')
+          INSTALL_MACOS_VER=$(grep -m1 'SCRIPT_VERSION=' install_macos.sh | sed 's/.*"\(.*\)".*/\1/')
+          INSTALL_PS_VER=$(grep -m1 '\$ScriptVersion' install.ps1 | sed 's/.*"\(.*\)".*/\1/')
+          INSTALL_PS_EXPECTED=$(grep -m1 '\$ExpectedVersion' install.ps1 | sed 's/.*"\(.*\)".*/\1/')
+          echo "Cargo=$CARGO_VER worker=$WORKER_VER root=$ROOT_NPM_VER dashboard=$DASHBOARD_VER pi=$PI_VER npm=$NPM_VER PyPI=$PYPI_VER runtime=$PYPI_RUNTIME_VER installers=$INSTALL_SH_VER/$INSTALL_MACOS_VER/$INSTALL_PS_VER/$INSTALL_PS_EXPECTED"
+          for surface in "$WORKER_VER" "$ROOT_NPM_VER" "$DASHBOARD_VER" "$PI_VER" "$NPM_VER" "$PYPI_VER" "$PYPI_RUNTIME_VER" "$INSTALL_SH_VER" "$INSTALL_MACOS_VER" "$INSTALL_PS_VER" "$INSTALL_PS_EXPECTED"; do
+            if [ "$CARGO_VER" != "$surface" ]; then
+              echo "ERROR: published version surface mismatch (Cargo=$CARGO_VER, found=$surface)"
+              exit 1
+            fi
+          done
           if [ "$CARGO_VER" != "$NPM_VER" ] || [ "$CARGO_VER" != "$PYPI_VER" ]; then
             echo "ERROR: Version mismatch! Cargo=$CARGO_VER npm=$NPM_VER PyPI=$PYPI_VER"
             exit 1
           fi
           echo "All versions match: ${CARGO_VER}"
+
+      - name: Reject obsolete request-timeout guidance
+        run: |
+          set -e
+          if rg -n --hidden --glob '!target/**' --glob '!docs/superpowers/**' \
+            'LEINDEX_INDEX_TIMEOUT_SECS|DEFAULT_INDEX_TIMEOUT_SECS|LONG_RUNNING_TOOL_TIMEOUTS|long_running_tool_timeout_secs' \
+            src crates install.sh install_macos.sh install.ps1 README.md docs packages; then
+            echo "ERROR: obsolete request-timeout cancellation surface detected"
+            exit 1
+          fi
 
       - name: Extract version and check per-surface publish status
         id: ver
@@ -155,7 +180,7 @@ jobs:
         run: cargo clippy --workspace --all-features -- -D warnings
 
       - name: cargo test --workspace
-        run: cargo test --workspace
+        run: cargo test --workspace -- --test-threads=1
 
   # ── Build native binaries (main + worker) ────────────────────────────
   build:
