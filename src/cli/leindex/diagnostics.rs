@@ -52,15 +52,19 @@ impl LeIndex {
             }
         };
 
-        // Determine index health based on actual staleness, not parse failures.
-        // A freshly indexed project with some unparseable files is still "healthy"
-        // (the index reflects the current state of the source tree). "stale" means
-        // the on-disk files have changed since the last index, which is detected
-        // separately via is_stale_fast / check_freshness.
-        let is_stale = self.is_stale_fast();
+        // Read persisted health rather than rescanning/hash-stat'ing every
+        // source file. The MCP handler adds a live Git delta separately.
+        let health = crate::cli::index_freshness::load_health(&self.storage_path);
         let index_health = if search_index_nodes == 0 {
             "empty".to_string()
-        } else if is_stale {
+        } else if health.as_ref().is_some_and(|health| {
+            matches!(
+                health.status,
+                super::ComponentStatus::Stale
+                    | super::ComponentStatus::Partial
+                    | super::ComponentStatus::Failed
+            )
+        }) {
             "stale".to_string()
         } else {
             "healthy".to_string()

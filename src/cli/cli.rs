@@ -698,7 +698,15 @@ async fn cmd_index_impl(
 
     let max_memory_bytes = max_memory.map(|mb| mb * 1024 * 1024);
     let stats = tokio::task::spawn_blocking(move || {
-        leindex.index_project_with_memory_cap(force, max_memory_bytes)
+        let result = leindex.index_project_with_memory_cap(force, max_memory_bytes);
+        // Force-shutdown any persistent ONNX daemon spawned during indexing.
+        // CLI commands are short-lived: the daemon has no reason to persist
+        // beyond the process lifetime. Without this, the daemon survives as
+        // an orphan, living until its idle timeout (up to 10 minutes).
+        // This runs regardless of success or failure to ensure cleanup in
+        // all exit paths.
+        leindex.shutdown_daemon();
+        result
     })
     .await
     .context("Indexing task failed")?
@@ -744,6 +752,9 @@ async fn cmd_search_impl(
     let results = leindex
         .search(&query, top_k, None)
         .context("Search failed")?;
+
+    // Force-shutdown any persistent ONNX daemon spawned during search.
+    leindex.shutdown_daemon();
 
     if results.is_empty() {
         println!("No results found for: {}", query);
@@ -810,6 +821,9 @@ async fn cmd_analyze_impl(
     let result = leindex
         .analyze(&query, token_budget)
         .context("Analysis failed")?;
+
+    // Force-shutdown any persistent ONNX daemon spawned during analysis.
+    leindex.shutdown_daemon();
 
     // Print results with nice formatting
     let output = format_analysis_output(&query, &result);

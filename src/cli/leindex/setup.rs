@@ -2615,7 +2615,13 @@ pub struct CheckResult {
 pub fn run_warmup() -> Result<(), SetupError> {
     use crate::search::onnx::EmbeddingClient;
 
-    run_warmup_inner(&EmbeddingClient::new())
+    // Pipe mode (not the persistent socket daemon): the MIGraphX cold JIT compile
+    // happens during this single warmup inference (~300 s) and `send_and_receive`
+    // blocks on `rx.recv()` with NO timeout, so the compile completes and
+    // `with_save_model` persists the `.mxr`. The daemon path cannot do this — its
+    // init compile is killed by the 120s readiness gate. After this pre-seeds the
+    // cache, `leindex index` daemons `with_load_model` the `.mxr` and start fast.
+    run_warmup_inner(&EmbeddingClient::new_pipe())
 }
 
 /// Inner warmup logic, separated for testability.
@@ -2633,6 +2639,17 @@ pub fn run_warmup() -> Result<(), SetupError> {
 #[cfg(feature = "onnx")]
 fn run_warmup_inner(client: &crate::search::onnx::EmbeddingClient) -> Result<(), SetupError> {
     println!("  -> Starting MIGraphX warmup pre-compilation...");
+
+    // T4: prune stale MIGraphX cache profile dirs (left by a prior package
+    // version, batch size, or sequence length) so the cache tree holds at most
+    // the one live profile. The worker prunes `.mxr` files within the active
+    // profile on startup; this cleans the sibling profile dirs themselves.
+    if let Some(model) = client.configured_model_name() {
+        let removed = crate::search::onnx::prune_stale_migraphx_profiles(&model);
+        if removed > 0 {
+            println!("  -> Pruned {removed} stale MIGraphX cache profile(s)");
+        }
+    }
 
     // Step 1-2: Ensure worker is spawned and ready.
     // Use embed() which internally calls ensure_worker_ready().

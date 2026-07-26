@@ -13,7 +13,10 @@ mod types;
 mod tests;
 
 // Re-export public types for external callers
-pub use types::{AnalysisResult, CoverageReport, Diagnostics, FileStats, IndexStats};
+pub use types::{
+    AnalysisResult, ComponentStatus, CoverageReport, Diagnostics, FileStats, IndexHealth,
+    IndexPhase, IndexStats,
+};
 // Re-export crate-internal types for sibling modules (index_builder, index_cache, etc.)
 pub(crate) use types::{
     ProjectFileScan, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS, SOURCE_FILE_EXTENSIONS,
@@ -74,6 +77,9 @@ pub struct LeIndex {
 
     /// TF-IDF embedder (None until index_nodes() runs).
     embedder: Option<index_builder::HybridEmbedder>,
+
+    /// Ephemeral state shared by the explicit indexing phases.
+    pub(crate) pipeline: Option<indexing::IndexPipelineState>,
 }
 
 impl LeIndex {
@@ -256,8 +262,14 @@ impl LeIndex {
             project_path
         );
 
-        // Initialize search engine
-        let search_engine = SearchEngine::new();
+        // Initialize search engine, configured with the documented `[search]
+        // neural_weight` knob (previously dead config). VAL-CONFIG.
+        let mut search_engine = SearchEngine::new();
+        search_engine.set_neural_weight(
+            crate::cli::neural_config::LeIndexConfig::load_cached()
+                .search
+                .neural_weight as f32,
+        );
 
         // Initialize cache subsystem
         let cache_dir = storage_path.join("cache");
@@ -292,6 +304,7 @@ impl LeIndex {
                 external_deps_builtin: 0,
             },
             embedder: None,
+            pipeline: None,
         };
 
         // Restore persisted index stats (if any) so diagnostics can report
@@ -463,6 +476,53 @@ impl LeIndex {
         &self.search_engine
     }
 
+    /// Shut down any persistent ONNX daemon spawned during indexing or search.
+    ///
+    /// This should be called by CLI commands after their work is complete, before
+    /// the process exits. The default `Drop` impl for `EmbeddingClient` passes
+    /// `kill_persistent=false`, which leaves daemon workers running for reuse by
+    /// the MCP server. CLI commands are short-lived and have no reason to keep
+    /// the daemon alive, so this method forces a clean shutdown.
+    ///
+    /// This is a no-op when the `onnx` feature is disabled or no worker was
+    /// ever spawned.
+    pub fn shutdown_daemon(&mut self) {
+        #[cfg(feature = "onnx")]
+        if let Some(index_builder::HybridEmbedder::HybridLocal { neural, .. }) =
+            self.embedder.as_ref()
+        {
+            neural.force_shutdown_daemon();
+        }
+    }
+
+    /// Return the current neural enrichment state without starting a worker.
+    pub fn neural_status(&self) -> &'static str {
+        self.embedder
+            .as_ref()
+            .map(index_builder::HybridEmbedder::neural_status)
+            .unwrap_or("absent")
+    }
+
+    /// Return the immutable generation selected for normal reads.
+    pub(crate) fn active_storage_path(&self) -> PathBuf {
+        crate::cli::live_project::LiveProject::resolve(&self.project_path.to_string_lossy())
+            .map(|project| project.active_storage())
+            .unwrap_or_else(|_| self.storage_path.clone())
+    }
+
+    /// Check indexed content in the same storage generation used by hydration.
+    pub(crate) fn active_has_indexed_files(&self) -> bool {
+        let active = self.active_storage_path();
+        if active == self.storage_path {
+            return crate::storage::pdg_store::has_indexed_files(&self.storage, &self.project_id);
+        }
+        crate::storage::schema::Storage::open(active.join("leindex.db"))
+            .ok()
+            .is_some_and(|storage| {
+                crate::storage::pdg_store::has_indexed_files(&storage, &self.project_id)
+            })
+    }
+
     /// Get the PDG, if the project has been indexed.
     #[inline]
     pub fn pdg(&self) -> Option<&ProgramDependenceGraph> {
@@ -498,8 +558,7 @@ impl LeIndex {
     /// Ensure the PDG is loaded from storage (deferred load on first use).
     pub fn ensure_pdg_loaded(&mut self) -> Result<()> {
         if self.pdg.is_none() {
-            let has_content =
-                crate::storage::pdg_store::has_indexed_files(&self.storage, &self.project_id);
+            let has_content = self.active_has_indexed_files();
             if has_content {
                 crate::cli::mcp::request_meta::PDG_LOADS
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -524,9 +583,7 @@ impl LeIndex {
     /// in-memory search index is empty but indexed files already exist.
     pub fn ensure_analysis_context_loaded(&mut self) -> Result<()> {
         self.ensure_pdg_loaded()?;
-        if self.search_engine.is_empty()
-            && crate::storage::pdg_store::has_indexed_files(&self.storage, &self.project_id)
-        {
+        if self.search_engine.is_empty() && self.active_has_indexed_files() {
             self.load_from_storage()?;
         }
         Ok(())
@@ -673,7 +730,12 @@ impl LeIndex {
     /// Load IndexStats from the JSON file in the storage directory.
     /// Returns silently if the file does not exist (first run or pre-feature).
     pub(crate) fn load_stats_from_storage(&mut self) -> Result<()> {
-        let stats_path = self.storage_path.join("index_stats.json");
+        self.load_stats_from_path(&self.storage_path.clone())
+    }
+
+    /// Load IndexStats from an explicit storage directory.
+    pub(crate) fn load_stats_from_path(&mut self, storage_path: &Path) -> Result<()> {
+        let stats_path = storage_path.join("index_stats.json");
         if !stats_path.exists() {
             return Ok(());
         }

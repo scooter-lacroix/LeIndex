@@ -5,6 +5,91 @@ use std::path::PathBuf;
 
 use crate::search::search::SearchResult;
 
+/// Lifecycle state of a published index component.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentStatus {
+    /// Component matches the current live inputs.
+    Fresh,
+    /// Component exists but only a bounded subset has been published.
+    Partial,
+    /// Component exists but live inputs have changed.
+    Stale,
+    /// Component has not been loaded into this process.
+    NotLoaded,
+    /// Component is being initialized.
+    Initializing,
+    /// Last attempt failed while an older generation remains available.
+    Failed,
+    /// Component cannot be provided by this build or environment.
+    Unavailable,
+}
+
+/// Index phase represented by persisted generation health.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexPhase {
+    /// Source inventory.
+    Scan,
+    /// Parser and symbol extraction.
+    Parse,
+    /// PDG construction/publication.
+    Pdg,
+    /// TF-IDF/lexical snapshot publication.
+    Lexical,
+    /// Neural score/vector enrichment.
+    Neural,
+    /// Durable artifact commit.
+    Persist,
+    /// Completed generation.
+    Complete,
+}
+
+/// Small, durable health snapshot for the current generation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexHealth {
+    /// Monotonic generation number.
+    pub generation: u64,
+    /// Last completed/current phase.
+    pub phase: IndexPhase,
+    /// Overall component status.
+    pub status: ComponentStatus,
+    /// Current Git HEAD, if the project is a repository.
+    pub head_oid: Option<String>,
+    /// Current Git tree, if the project is a repository.
+    pub tree_oid: Option<String>,
+    /// Number of source files in the published generation.
+    pub indexed_file_count: usize,
+    /// Number of live dirty source paths.
+    pub dirty_file_count: usize,
+    /// Dirty/untracked source paths absent from the generation.
+    pub changed_unindexed_count: usize,
+    /// Unix timestamp of the last completed generation.
+    pub indexed_at_unix_ms: Option<u64>,
+    /// Phase of the last failed attempt.
+    pub last_failure_phase: Option<IndexPhase>,
+    /// Bounded failure detail.
+    pub last_failure: Option<String>,
+}
+
+impl Default for IndexHealth {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            phase: IndexPhase::Scan,
+            status: ComponentStatus::NotLoaded,
+            head_oid: None,
+            tree_oid: None,
+            indexed_file_count: 0,
+            dirty_file_count: 0,
+            changed_unindexed_count: 0,
+            indexed_at_unix_ms: None,
+            last_failure_phase: None,
+            last_failure: None,
+        }
+    }
+}
+
 // Supported source file extensions for indexing
 pub(crate) const SOURCE_FILE_EXTENSIONS: &[&str] = &[
     // Main languages

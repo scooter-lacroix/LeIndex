@@ -47,32 +47,98 @@ impl LeIndex {
         top_k: usize,
         query_type: Option<crate::search::ranking::QueryType>,
     ) -> Result<Vec<SearchResult>> {
+        self.search_internal(query, top_k, query_type, true)
+    }
+
+    /// Search with request-scoped context without writing that context into
+    /// the persistent query cache.
+    pub(crate) fn search_ephemeral(
+        &mut self,
+        query: &str,
+        top_k: usize,
+        query_type: Option<crate::search::ranking::QueryType>,
+    ) -> Result<Vec<SearchResult>> {
+        self.search_internal(query, top_k, query_type, false)
+    }
+
+    fn search_internal(
+        &mut self,
+        query: &str,
+        top_k: usize,
+        query_type: Option<crate::search::ranking::QueryType>,
+        cache_results: bool,
+    ) -> Result<Vec<SearchResult>> {
         if self.search_engine.is_empty() {
             warn!("Search attempted on empty index");
             return Ok(Vec::new());
         }
 
-        if let Some(cached_results) =
-            self.cached_search_results(query, top_k, query_type.as_ref())?
-        {
-            return Ok(cached_results);
+        if cache_results {
+            if let Some(cached_results) =
+                self.cached_search_results(query, top_k, query_type.as_ref())?
+            {
+                return Ok(cached_results);
+            }
         }
 
-        let query_neural_embedding = self.generate_query_neural_embedding(query);
+        // Derive the effective query type: an explicit caller-provided type
+        // wins; otherwise fall back to the configured [search] search_mode so
+        // the documented config knob actually controls retrieval. This is the
+        // fix for search_mode being a dead string (VAL-CONFIG).
+        let search_config = &crate::cli::neural_config::LeIndexConfig::load_cached().search;
+        let effective_query_type = match query_type {
+            Some(explicit) => Some(explicit),
+            None => crate::cli::neural_config::query_type_for_mode(&search_config.search_mode),
+        };
+        let exact_route = matches!(
+            effective_query_type,
+            Some(crate::search::ranking::QueryType::Exact)
+        );
+        // Exact identifier/text queries stay lexical. In particular, do not
+        // construct either query embedding: this keeps a concrete code-review
+        // lookup independent of TF-IDF vocabulary and neural worker readiness.
+        let query_neural_embedding = if exact_route {
+            None
+        } else {
+            self.generate_query_neural_embedding(query)
+        };
         let neural_available = query_neural_embedding.is_some();
-        let search_cache_key =
-            self.search_cache_key_for(query, top_k, query_type.as_ref(), neural_available);
+        let search_cache_key = self.search_cache_key_for(
+            query,
+            top_k,
+            effective_query_type.as_ref(),
+            neural_available,
+        );
+
+        // Adaptive relevance threshold: pure-neural/semantic matches routinely
+        // score below the hybrid 0.1 cutoff (cosine similarities land lower), so
+        // loosen to 0.05 for Semantic mode. analyze_search already uses 0.05.
+        // ponytail: two fixed values by mode; add a toml knob only if recall tuning is requested.
+        let threshold = match effective_query_type {
+            Some(crate::search::ranking::QueryType::Semantic) => Some(0.05),
+            _ => Some(0.1),
+        };
+
+        // When rerank is enabled, over-fetch candidates so the cross-encoder
+        // sees a wider pool than the final top_k (it can only reorder what was
+        // retrieved). We truncate back to top_k after reranking below.
+        let rerank_enabled = search_config.rerank_enabled && !exact_route;
+        let search_top_k = if rerank_enabled {
+            top_k.max(search_config.rerank_top_n as usize)
+        } else {
+            top_k
+        };
 
         let search_query = SearchQuery {
             query: query.to_string(),
-            top_k,
+            top_k: search_top_k,
             token_budget: None,
-            semantic: true,
+            semantic: !exact_route,
             expand_context: false,
-            query_embedding: Some(self.generate_query_embedding(query)),
+            query_embedding: (!exact_route).then(|| self.generate_query_embedding(query)),
             query_neural_embedding,
-            threshold: Some(0.1), // Added default threshold for better quality
-            query_type,
+            threshold,
+            query_type: effective_query_type,
         };
 
         let mut results = self
@@ -136,34 +202,122 @@ impl LeIndex {
                     result.dependency_count = Some(pdg.neighbors(node_idx).len());
                 }
             }
+            // Cross-encoder rerank of the top-N results (if enabled). Re-reads
+            // each candidate's code via its PDG byte_range so the cross-encoder
+            // scores real content (not just the symbol name) — this is what
+            // closes the natural-language→code gap for conceptual queries.
+            // Re-orders the top-N by the cross-encoder; display scores are
+            // unchanged. (VAL-RERANK.)
+            let rerank_cfg = &crate::cli::neural_config::LeIndexConfig::load_cached().search;
+            if rerank_cfg.rerank_enabled && !exact_route && !results.is_empty() {
+                if let Some(embedder) = self.embedder.as_ref() {
+                    let n = (rerank_cfg.rerank_top_n as usize).min(results.len());
+                    let mut docs: Vec<(String, String, f32)> = Vec::with_capacity(n);
+                    for r in results[..n].iter() {
+                        let content = pdg
+                            .find_by_id(&r.node_id)
+                            .and_then(|idx| pdg.get_node(idx))
+                            .and_then(|node| {
+                                let path = self.resolve_indexed_file_path(&node.file_path);
+                                let bytes = file_cache
+                                    .entry(node.file_path.to_string())
+                                    .or_insert_with(|| std::fs::read(&path).ok())
+                                    .clone();
+                                bytes
+                                    .filter(|b| {
+                                        node.byte_range.0 < node.byte_range.1
+                                            && node.byte_range.1 <= b.len()
+                                    })
+                                    .map(|b| {
+                                        String::from_utf8_lossy(
+                                            &b[node.byte_range.0..node.byte_range.1],
+                                        )
+                                        .to_string()
+                                    })
+                            })
+                            .unwrap_or_else(|| format!("{} {}", r.symbol_name, r.file_path));
+                        docs.push((r.node_id.clone(), content, r.score.overall));
+                    }
+                    match embedder.rerank_blocking(query, docs) {
+                        Some(Ok(reranked)) => {
+                            // reranked is sorted desc by combined_score. Reorder
+                            // the top-N to that order; keep display scores.
+                            let by_id: std::collections::HashMap<String, SearchResult> = results
+                                [..n]
+                                .iter()
+                                .map(|r| (r.node_id.clone(), r.clone()))
+                                .collect();
+                            let mut new_top: Vec<SearchResult> = Vec::with_capacity(n);
+                            for (id, _) in &reranked {
+                                if let Some(r) = by_id.get(id) {
+                                    new_top.push(r.clone());
+                                }
+                            }
+                            // Defensive: any top-N id missing from reranked
+                            // stays in original relative order.
+                            for r in results[..n].iter() {
+                                if !new_top.iter().any(|x| x.node_id == r.node_id) {
+                                    new_top.push(r.clone());
+                                }
+                            }
+                            new_top.extend(results[n..].iter().cloned());
+                            results = new_top;
+                            for (i, r) in results.iter_mut().enumerate() {
+                                r.rank = i + 1;
+                            }
+                            debug!("reranker re-ordered top-{} for '{}'", n, query);
+                        }
+                        Some(Err(e)) => {
+                            tracing::warn!(error = %e, "reranker failed; keeping original order")
+                        }
+                        None => {}
+                    }
+                }
+            }
         }
+
+        // Truncate the over-fetched candidate pool (search_top_k) back to the
+        // requested top_k after reranking.
+        results.truncate(top_k);
 
         debug!("Search for '{}' returned {} results", query, results.len());
 
-        if let Ok(serialized) = bincode::serialize(&results) {
-            let entry = CacheEntry::Binary {
-                metadata: std::collections::HashMap::from([
-                    ("type".to_string(), "search_results".to_string()),
-                    ("query".to_string(), query.to_string()),
-                ]),
-                serialized_data: serialized,
-            };
-            if self
-                .cache
-                .cache_spiller
-                .store_mut()
-                .insert(search_cache_key.clone(), entry)
-                .is_ok()
-            {
-                let _ = self
+        if cache_results {
+            if let Ok(serialized) = bincode::serialize(&results) {
+                let entry = CacheEntry::Binary {
+                    metadata: std::collections::HashMap::from([
+                        ("type".to_string(), "search_results".to_string()),
+                        ("query".to_string(), query.to_string()),
+                    ]),
+                    serialized_data: serialized,
+                };
+                if self
                     .cache
                     .cache_spiller
                     .store_mut()
-                    .persist_key(&search_cache_key);
+                    .insert(search_cache_key.clone(), entry)
+                    .is_ok()
+                {
+                    let _ = self
+                        .cache
+                        .cache_spiller
+                        .store_mut()
+                        .persist_key(&search_cache_key);
+                }
             }
         }
 
         Ok(results)
+    }
+
+    /// A hybrid index must not return a stale TF-IDF-only cache entry before
+    /// giving its configured neural provider a chance to answer. Once the
+    /// provider reports a terminal failure, the persisted fallback is valid
+    /// until the next index generation.
+    fn neural_search_should_be_attempted(&self) -> bool {
+        self.embedder
+            .as_ref()
+            .is_some_and(|embedder| embedder.has_neural() && embedder.neural_status() != "failed")
     }
 
     fn cached_search_results(
@@ -172,11 +326,15 @@ impl LeIndex {
         top_k: usize,
         query_type: Option<&crate::search::ranking::QueryType>,
     ) -> Result<Option<Vec<SearchResult>>> {
-        // Neural availability is part of the persisted cache key. Probe both
-        // variants before generating the query neural embedding so repeated
-        // searches can return immediately even when ONNX would otherwise hit
-        // the 15s query-embedding timeout.
+        // Neural availability is part of the persisted cache key. A live
+        // hybrid provider probes only the neural key; otherwise a stale
+        // TF-IDF-only result would prevent the cold worker from starting.
+        let neural_required = !matches!(query_type, Some(crate::search::ranking::QueryType::Exact))
+            && self.neural_search_should_be_attempted();
         for neural_available in [true, false] {
+            if neural_required && !neural_available {
+                continue;
+            }
             let search_cache_key =
                 self.search_cache_key_for(query, top_k, query_type, neural_available);
             if let Some(CacheEntry::Binary {
@@ -225,22 +383,61 @@ impl LeIndex {
     /// println!("Context: {}", analysis.context.unwrap_or_default());
     /// ```
     pub fn analyze(&mut self, query: &str, token_budget: usize) -> Result<super::AnalysisResult> {
+        self.analyze_internal(query, token_budget, true)
+    }
+
+    /// Analyze with request-scoped context without persisting the expanded
+    /// query or result in the durable analysis cache.
+    pub(crate) fn analyze_ephemeral(
+        &mut self,
+        query: &str,
+        token_budget: usize,
+    ) -> Result<super::AnalysisResult> {
+        self.analyze_internal(query, token_budget, false)
+    }
+
+    fn analyze_internal(
+        &mut self,
+        query: &str,
+        token_budget: usize,
+        cache_results: bool,
+    ) -> Result<super::AnalysisResult> {
         let start_time = std::time::Instant::now();
 
         let analysis_cache_key = self.analysis_cache_key_for(query, token_budget);
-        if let Some(CacheEntry::Analysis {
-            serialized_data, ..
-        }) = self
-            .cache
-            .cache_spiller
-            .store_mut()
-            .get_or_load(&analysis_cache_key)?
-        {
-            if let Ok(mut cached) = bincode::deserialize::<super::AnalysisResult>(&serialized_data)
+        let neural_search_requested = self.neural_search_should_be_attempted();
+        if cache_results {
+            if let Some(CacheEntry::Analysis {
+                serialized_data, ..
+            }) = self
+                .cache
+                .cache_spiller
+                .store_mut()
+                .get_or_load(&analysis_cache_key)?
             {
-                cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
-                debug!("Analysis cache hit for '{}'", query);
-                return Ok(cached);
+                // New entries carry a one-bit provenance marker so a cached
+                // hybrid analysis can be reused without starting another
+                // model request, while an old/raw TF-IDF-only entry cannot
+                // suppress a configured neural attempt.
+                if let Ok((cached_with_neural, mut cached)) =
+                    bincode::deserialize::<(bool, super::AnalysisResult)>(&serialized_data)
+                {
+                    if cached_with_neural || !neural_search_requested {
+                        cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
+                        debug!("Analysis cache hit for '{}'", query);
+                        return Ok(cached);
+                    }
+                } else if !neural_search_requested {
+                    // Preserve compatibility with entries written before the
+                    // provenance marker was introduced.
+                    if let Ok(mut cached) =
+                        bincode::deserialize::<super::AnalysisResult>(&serialized_data)
+                    {
+                        cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
+                        debug!("Analysis cache hit for '{}'", query);
+                        return Ok(cached);
+                    }
+                }
             }
         }
 
@@ -268,27 +465,33 @@ impl LeIndex {
             processing_time_ms: start_time.elapsed().as_millis() as u64,
         };
 
-        if let Ok(serialized) = bincode::serialize(&analysis) {
-            let entry = CacheEntry::Analysis {
-                query: query.to_string(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                serialized_data: serialized,
-            };
-            if self
-                .cache
-                .cache_spiller
-                .store_mut()
-                .insert(analysis_cache_key.clone(), entry)
-                .is_ok()
-            {
-                let _ = self
+        if cache_results {
+            let cached_with_neural = self
+                .embedder
+                .as_ref()
+                .is_some_and(|embedder| embedder.neural_status() == "ready");
+            if let Ok(serialized) = bincode::serialize(&(cached_with_neural, &analysis)) {
+                let entry = CacheEntry::Analysis {
+                    query: query.to_string(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    serialized_data: serialized,
+                };
+                if self
                     .cache
                     .cache_spiller
                     .store_mut()
-                    .persist_key(&analysis_cache_key);
+                    .insert(analysis_cache_key.clone(), entry)
+                    .is_ok()
+                {
+                    let _ = self
+                        .cache
+                        .cache_spiller
+                        .store_mut()
+                        .persist_key(&analysis_cache_key);
+                }
             }
         }
 
@@ -427,18 +630,25 @@ impl LeIndex {
     ///
     /// Uses ONNX (or remote) neural embeddings when available, projecting
     /// the query into the same neural vector space as the indexed nodes.
-    /// Returns `None` when neural embeddings are unavailable (TF-IDF fallback).
-    ///
-    /// The worker must already report readiness; otherwise the query remains
-    /// TF-IDF-only and does not start a model or detached timeout thread.
+    /// Returns `None` only when the configured provider reaches a terminal
+    /// failure/absence; the caller then reports the mandatory TF-IDF result.
+    /// A cold default worker is started and awaited through its explicit
+    /// lifecycle state; model loading/inference are never cancelled by an
+    /// elapsed-time request timeout.
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     pub fn generate_query_neural_embedding(&self, query: &str) -> Option<Vec<f32>> {
         let emb = self.embedder.as_ref()?;
-        if !emb.neural_ready() {
-            debug!("Neural worker not ready; using TF-IDF for this query");
-            return None;
+        match emb.embed_neural_blocking(query) {
+            Some(Ok(embedding)) => Some(embedding),
+            Some(Err(error)) => {
+                debug!("Neural query embedding failed ({error}); using TF-IDF fallback");
+                None
+            }
+            None => {
+                debug!("Neural query embedding unavailable; using TF-IDF fallback");
+                None
+            }
         }
-        emb.embed_neural_blocking(query).and_then(Result::ok)
     }
 
     /// Generate a neural embedding for a query string (no-op without ONNX feature).
@@ -1143,26 +1353,8 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "onnx")]
     #[test]
-    fn unready_neural_query_uses_tfidf_without_starting_a_worker() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let project_path = temp_dir.path().join("project");
-        std::fs::create_dir_all(&project_path).unwrap();
-        let mut index = LeIndex::new(&project_path).unwrap();
-        index.embedder = Some(
-            crate::cli::index_builder::HybridEmbedder::hybrid_local(
-                crate::cli::index_builder::TfIdfEmbedder::build_from_tokens(&[]),
-                None,
-            )
-            .unwrap(),
-        );
-
-        assert_eq!(index.generate_query_neural_embedding("Askpass::new"), None);
-    }
-
-    #[test]
-    fn cached_search_results_probe_fallback_key_before_embedding_is_needed() {
+    fn cached_search_results_use_fallback_key_without_neural_embedder() {
         let temp_dir = tempfile::tempdir().unwrap();
         let project_path = temp_dir.path().join("project");
         std::fs::create_dir_all(&project_path).unwrap();

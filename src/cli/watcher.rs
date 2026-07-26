@@ -1,7 +1,6 @@
 use crate::cli::registry::{ProjectHandle, ProjectWriteGuard};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::PathBuf;
-use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -11,21 +10,6 @@ use tracing::{debug, warn};
 /// incremental reindex. A+ hot-spot cleanup must not alter this value
 /// (VAL-APLUS-029).
 pub const DEBOUNCE_INTERVAL_MS: u64 = 500;
-
-/// Maximum time a single incremental reindex may hold the per-project
-/// write lock. After this elapses the reindex task is detached and a
-/// warning is logged. This hard cap prevents the watcher from starving
-/// concurrent tool calls indefinitely during a large reindex.
-///
-/// The budget is enforced on the reindex execution phase — the
-/// reindex future is wrapped in `tokio::time::timeout` so a runaway
-/// rebuild cannot starve the rest of the server even if the work
-/// itself hangs. Lock acquisition is fail-fast (see
-/// `try_acquire_lock`): the spawn_blocking thread is released
-/// within microseconds if the lock is held, and the outer async
-/// loop's debounce tick (re-entered on `dirty = true`) handles
-/// retries.
-pub const REINDEX_BUDGET_SECS: u64 = 30;
 
 /// Watches project directories and triggers incremental reindex on file changes.
 pub struct IndexWatcher {
@@ -98,75 +82,54 @@ impl IndexWatcher {
             let mut debounce = tokio::time::interval(debounce_interval);
             debounce.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut dirty = false;
+            let (done_tx, mut done_rx) = mpsc::channel::<ReindexOutcome>(1);
+            let mut reindex_active = false;
 
             loop {
                 tokio::select! {
                     Some(_path) = rx.recv() => {
                         dirty = true;
                     }
-                    _ = debounce.tick() => {
+                    Some(outcome) = done_rx.recv() => {
+                        reindex_active = false;
+                        match outcome {
+                            ReindexOutcome::Completed => {}
+                            ReindexOutcome::Skipped => {
+                                warn!("Watcher: skipping reindex; write lock is currently busy");
+                                dirty = true;
+                                debounce.reset();
+                            }
+                            ReindexOutcome::Failed(reason) => {
+                                warn!(
+                                    "Watcher: reindex did not complete cleanly ({}); retrying on next tick",
+                                    reason
+                                );
+                                dirty = true;
+                                debounce.reset();
+                            }
+                        }
+                    }
+                    _ = debounce.tick(), if !reindex_active => {
                         if dirty {
                             dirty = false;
                             debug!("File changes detected, triggering incremental reindex");
-                            // Fail-fast: avoid wasting a spawn_blocking
-                            // threadpool slot when the lock is currently
-                            // busy. This is purely an optimization — the
-                            // inner try_acquire_lock still handles TOCTOU
-                            // races, and Skipped inside spawn_blocking
-                            // preserves dirty for the next debounce tick.
                             if handle.try_write().is_err() {
                                 dirty = true;
                                 debounce.reset();
                                 continue;
                             }
                             let handle_clone = handle.clone();
-                            // Run the budget-wait + reindex on
-                            // `spawn_blocking`. The threadpool impact
-                            // is bounded to one thread per project for
-                            // at most `REINDEX_BUDGET_SECS`. We then
-                            // wrap the join in `tokio::time::timeout`
-                            // so a runaway rebuild cannot pin a worker
-                            // for longer than the budget even if the
-                            // work itself does not honour the in-loop
-                            // budget check. ProjectWriteGuard borrows
-                            // from the handle, so the guard must not
-                            // cross an await point — the entire
-                            // acquire + reindex sequence lives inside
-                            // the spawn_blocking closure.
-                            let reindex_budget = Duration::from_secs(REINDEX_BUDGET_SECS);
+                            // Keep one owned reindex job per project. A
+                            // wall-clock timeout cannot cancel spawn_blocking;
+                            // dropping it only detaches work that still owns
+                            // the write lock. Completion is reported through
+                            // the channel instead, so slow work remains visible
+                            // without duplicate jobs or state races.
                             let blocking = tokio::task::spawn_blocking(move || -> ReindexOutcome {
                                 let mut idx = match try_acquire_lock(&handle_clone) {
                                     LockAcquire::Acquired(g) => g,
-                                    // The lock is currently held by
-                                    // another reindex. Return
-                                    // `Skipped` so the caller marks
-                                    // `dirty = true` and the next
-                                    // debounce tick retries — treating
-                                    // this as success would silently
-                                    // drop the pending changes and
-                                    // leave the index permanently
-                                    // stale. Fail-fast (no sleep
-                                    // loop) so this spawn_blocking
-                                    // thread is released within
-                                    // microseconds instead of pinning
-                                    // a threadpool worker for the
-                                    // full 30s budget.
-                                    LockAcquire::Skipped => {
-                                        return ReindexOutcome::Skipped;
-                                    }
+                                    LockAcquire::Skipped => return ReindexOutcome::Skipped,
                                 };
-                                // Panic-safety wrapper: a panic inside
-                                // the reindex still releases the lock
-                                // when `idx` goes out of scope on
-                                // `Drop`. The outer match returns
-                                // `Failed` for both `Ok(Err(_))` and
-                                // `Err(_)` (panic) so the next
-                                // debounce tick can retry — a panic
-                                // during reindex leaves the
-                                // in-memory project state
-                                // potentially inconsistent and
-                                // should not be reported as a
-                                // clean completion.
                                 let reindex_result = std::panic::catch_unwind(
                                     std::panic::AssertUnwindSafe(|| {
                                         idx.incremental_reindex_from_watcher()
@@ -187,115 +150,24 @@ impl IndexWatcher {
                                                     .downcast_ref::<String>()
                                                     .cloned()
                                             })
-                                            .unwrap_or_else(|| {
-                                                "non-string panic payload".to_string()
-                                            });
-                                        warn!(
-                                            "Auto-reindex panicked: {}; lock will release on drop",
-                                            msg
-                                        );
+                                            .unwrap_or_else(|| "non-string panic payload".to_string());
+                                        warn!("Auto-reindex panicked: {}; lock will release on drop", msg);
                                         ReindexOutcome::Failed(format!("panic: {}", msg))
                                     }
                                 }
                             });
-                            match tokio::time::timeout(reindex_budget, blocking).await {
-                                Ok(Ok(ReindexOutcome::Completed)) => {}
-                                Ok(Ok(ReindexOutcome::Skipped)) => {
-                                    // Lock is currently held by
-                                    // another reindex (fail-fast
-                                    // `try_write` returned
-                                    // `Skipped`). Preserve `dirty`
-                                    // and reset the debounce so the
-                                    // next tick retries instead of
-                                    // silently dropping the changes
-                                    // — without the reset, the
-                                    // `Interval` would fire its
-                                    // already-elapsed next tick on
-                                    // the very next loop iteration,
-                                    // re-spawning a `spawn_blocking`
-                                    // task immediately. The reset
-                                    // caps the re-spawn rate at one
-                                    // per `debounce_interval`.
-                                    warn!(
-                                        "Watcher: skipping reindex; write lock is currently busy"
-                                    );
-                                    dirty = true;
-                                    debounce.reset();
-                                }
-                                Ok(Ok(ReindexOutcome::Failed(reason))) => {
-                                    // The reindex body errored or
-                                    // panicked. The lock is
-                                    // released via `Drop`, but the
-                                    // on-disk / in-memory state is
-                                    // potentially inconsistent —
-                                    // re-arm `dirty` and reset the
-                                    // debounce so the next tick
-                                    // retries with a full rebuild.
-                                    warn!(
-                                        "Watcher: reindex did not complete cleanly ({}); retrying on next tick",
-                                        reason
-                                    );
-                                    dirty = true;
-                                    debounce.reset();
-                                }
-                                Ok(Err(join_err)) => {
-                                    // `spawn_blocking` itself failed
-                                    // (panic inside the task). The
-                                    // lock state is undefined here;
-                                    // surface the error, re-arm
-                                    // `dirty`, and reset the
-                                    // debounce so the next tick
-                                    // retries.
-                                    warn!(
-                                        "Watcher: reindex task join failed: {}",
-                                        join_err
-                                    );
-                                    dirty = true;
-                                    debounce.reset();
-                                }
-                                Err(_) => {
-                                    // Reindex exceeded the budget.
-                                    // `spawn_blocking` is not
-                                    // cancellable, so the detached
-                                    // task continues running and
-                                    // holds the `ProjectWriteGuard`
-                                    // until the reindex body returns
-                                    // — the lock eventually drops on
-                                    // `Drop`. The watcher loop
-                                    // returns to its select arm so a
-                                    // hung reindex cannot stall
-                                    // subsequent debounce ticks.
-                                    //
-                                    // We set `dirty = true` so the
-                                    // next tick retries: the original
-                                    // file change that triggered this
-                                    // reindex is still unserved (the
-                                    // body never completed), and
-                                    // waiting for a *user-driven*
-                                    // file change to re-arm the
-                                    // reindex would leave the index
-                                    // silently stale if no further
-                                    // mutation occurs. The
-                                    // `debounce.reset()` caps the
-                                    // retry rate at one per
-                                    // `debounce_interval` so a
-                                    // permanently-hung reindex (lock
-                                    // held forever by the detached
-                                    // task) cannot spawn a tight
-                                    // loop of `spawn_blocking`
-                                    // retries — each retry's
-                                    // `try_acquire_lock` will fail
-                                    // fast with `Skipped`, releasing
-                                    // the threadpool worker within
-                                    // microseconds.
-                                    warn!(
-                                        "Auto-reindex exceeded {}s budget; detached (lock will drop on reindex completion); retrying on next tick",
-                                        REINDEX_BUDGET_SECS
-                                    );
-                                    dirty = true;
-                                    debounce.reset();
-                                }
-                            }
+                            reindex_active = true;
+                            let done_tx = done_tx.clone();
+                            tokio::spawn(async move {
+                                let outcome = match blocking.await {
+                                    Ok(outcome) => outcome,
+                                    Err(join_err) => {
+                                        warn!("Watcher: reindex task join failed: {}", join_err);
+                                        ReindexOutcome::Failed(join_err.to_string())
+                                    }
+                                };
+                                let _ = done_tx.send(outcome).await;
+                            });
                         }
                     }
                 }
@@ -402,20 +274,20 @@ mod tests {
     /// that returns `Skipped` within microseconds when the lock is
     /// held. The original busy-loop with `std::thread::sleep(backoff)`
     /// could pin a `spawn_blocking` thread for up to
-    /// `REINDEX_BUDGET_SECS` (30s); the round-15 rename keeps the
+    /// while waiting; the round-15 rename keeps the
     /// fail-fast semantics and aligns the function name with the
     /// actual behaviour. The test holds the write lock from the
     /// current thread, calls `try_acquire_lock` from a fresh
     /// thread, and asserts the call returns `Skipped` well under
     /// 1s — a future revert to a budgeted loop would either hang
-    /// for 30s (caught by the test timeout) or take noticeably
+    /// (caught by the test timeout) or take noticeably
     /// longer than 1s (caught by the explicit `Duration` check).
     #[test]
     fn test_try_acquire_lock_is_fail_fast() {
         use crate::cli::leindex::LeIndex;
         use crate::cli::registry::{ProjectHandle, ProjectRwLock};
         use std::sync::Arc;
-        use std::time::Instant;
+        use std::time::{Duration, Instant};
 
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("main.rs"), "fn main() {}\n").unwrap();
@@ -466,7 +338,7 @@ mod tests {
     /// has been rescheduled to `now + period`); advancing by the
     /// full period makes the next tick ready. This is the exact
     /// sequence the watcher body uses when it sets `dirty = true`
-    /// in the Skipped / Failed / join-error / timeout arms.
+    /// in the Skipped / Failed / join-error paths.
     #[tokio::test(start_paused = true)]
     async fn test_debounce_resets_on_dirty_re_arm() {
         use std::time::Duration;
@@ -513,70 +385,5 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(10), debounce.tick())
             .await
             .expect("tick must fire after one full debounce_interval from reset");
-    }
-
-    /// Regression for kilo-code-bot round 17: the reindex-timeout
-    /// `Err(_)` arm previously did NOT set `dirty = true`. The
-    /// rationale was to avoid a cascade of pinned threadpool
-    /// workers while a detached reindex still held the lock — but
-    /// that left the original change silently unserved if no
-    /// further user-driven file change arrived. With the round-16
-    /// `debounce.reset()` cap in place, the cascade risk is gone:
-    /// the retry rate is bounded at one per `debounce_interval`
-    /// (each retry's `try_acquire_lock` fails fast with `Skipped`
-    /// and releases the threadpool worker within microseconds). The
-    /// fix sets `dirty = true` in the timeout arm to match the
-    /// Skipped / Failed / join-error arms.
-    ///
-    /// This is a static structural check: the timeout arm must
-    /// contain both `dirty = true` and `debounce.reset()` so the
-    /// next tick retries the reindex.
-    #[test]
-    fn test_watcher_timeout_arm_sets_dirty_and_resets() {
-        let source = include_str!("watcher.rs");
-
-        // Locate the `Err(_) => {` timeout arm inside the
-        // `tokio::time::timeout(reindex_budget, blocking).await`
-        // match. The arm that does NOT match
-        // `Ok(Ok(ReindexOutcome::Completed))`,
-        // `Ok(Ok(ReindexOutcome::Skipped))`, or
-        // `Ok(Err(join_err))` is the timeout arm.
-        let timeout_arm_marker = "Err(_) => {";
-        let timeout_pos = source
-            .find(timeout_arm_marker)
-            .expect("Err(_) timeout arm must exist in watcher.rs");
-        // Find the next match arm opening (`Ok(Ok(Completed))` or
-        // any other `=>` at the same indent level). Slice from
-        // `timeout_pos` to the next outer closing brace to scope
-        // the search to the timeout arm body.
-        let arm_body_start = timeout_pos + timeout_arm_marker.len();
-        // The arm body ends at the next `}\n                            }`
-        // pattern (close of the match arm + close of the
-        // `tokio::time::timeout(...)` match). Find the close of
-        // the immediate arm by scanning forward for `                            }`
-        // (the match arm closes at the same indent as the match
-        // expression).
-        let arm_body_end_needle = "\
-                            }";
-        let arm_body_end = source[arm_body_start..]
-            .find(arm_body_end_needle)
-            .map(|i| arm_body_start + i)
-            .unwrap_or(source.len());
-        let arm_body = &source[arm_body_start..arm_body_end];
-
-        assert!(
-            arm_body.contains("dirty = true"),
-            "timeout arm must set `dirty = true` so the next tick retries the reindex; \
-             otherwise the original change is silently dropped if no further user file \
-             change arrives. Arm body:\n{}",
-            arm_body
-        );
-        assert!(
-            arm_body.contains("debounce.reset()"),
-            "timeout arm must call `debounce.reset()` to cap the retry rate at one \
-             per `debounce_interval`; without the reset, a tight re-spawn loop is \
-             possible. Arm body:\n{}",
-            arm_body
-        );
     }
 }

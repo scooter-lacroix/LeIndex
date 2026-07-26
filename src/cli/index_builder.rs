@@ -126,6 +126,93 @@ pub(crate) fn tokenize_code(text: &str) -> Vec<String> {
     tokens
 }
 
+/// Return a small, non-redundant slice of doc/comment lines immediately
+/// preceding a symbol. This keeps semantic chunks useful for review language
+/// without creating a second full-file embedding document.
+fn preceding_doc_context(bytes: &[u8], start: usize) -> String {
+    let prefix = String::from_utf8_lossy(&bytes[..start.min(bytes.len())]);
+    let mut lines = Vec::new();
+    for line in prefix.lines().rev() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            if lines.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if trimmed.starts_with("//") || trimmed.starts_with("#") || trimmed.starts_with("/*") {
+            lines.push(line.trim());
+            if lines.len() == 8 {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    lines.reverse();
+    lines.join("\n")
+}
+
+/// Build the bounded semantic text used by both the mandatory lexical index
+/// and the deferred neural enrichment pass. Keeping this in one place makes
+/// the two result layers rank the same node content.
+pub(crate) fn enriched_node_content(
+    pdg: &ProgramDependenceGraph,
+    node_idx: petgraph::graph::NodeIndex,
+    node: &crate::graph::pdg::Node,
+    file_bytes: &[u8],
+    connectivity_config: &crate::graph::pdg::TraversalConfig,
+) -> String {
+    let content = String::from_utf8_lossy(file_bytes);
+    let mut enrichment = format!(
+        "// type:{} lang:{}",
+        match node.node_type {
+            NodeType::Function => "function",
+            NodeType::Class => "class",
+            NodeType::Method => "method",
+            NodeType::Variable => "variable",
+            NodeType::Module => "module",
+            NodeType::External => "external",
+        },
+        node.language,
+    );
+    let callers = pdg.backward_impact(node_idx, connectivity_config);
+    let callees = pdg.forward_impact(node_idx, connectivity_config);
+    enrichment.push_str(&format!(
+        " callers:{} callees:{} complexity:{}",
+        callers.len().min(50),
+        callees.len().min(50),
+        node.complexity,
+    ));
+
+    if !content.is_empty() && node.byte_range.1 > node.byte_range.0 {
+        let content_bytes = content.as_bytes();
+        let start = node.byte_range.0.min(content_bytes.len());
+        let end = node.byte_range.1.min(content_bytes.len());
+        if start < end {
+            let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
+            let doc_context = preceding_doc_context(content_bytes, start);
+            return format!(
+                "{}\n// {} in {}\n{}{}",
+                enrichment,
+                node.name,
+                node.file_path,
+                if doc_context.is_empty() {
+                    String::new()
+                } else {
+                    format!("// review_context:\n{}\n", doc_context)
+                },
+                snippet
+            );
+        }
+    }
+
+    format!(
+        "{}\n// {} in {}\n{}",
+        enrichment, node.name, node.file_path, "// [No source code available]"
+    )
+}
+
 /// TF-IDF based embedding system for code content.
 ///
 /// Produces 768-dimensional vectors by computing TF-IDF scores for the
@@ -382,7 +469,15 @@ impl TfIdfEmbedder {
     /// `.leindex/tfidf_embedder.bin` file. Returns None if the file doesn't exist.
     #[allow(dead_code)]
     pub fn load_from_storage(project_path: &Path) -> Result<Option<Self>> {
-        let path = Self::storage_path(project_path);
+        Self::load_from_artifact_path(&project_path.join(".leindex"))
+    }
+
+    /// Load a persisted TF-IDF embedder from an explicit storage directory.
+    ///
+    /// Generation hydration uses this path so an interrupted write to the
+    /// mutable root cannot change the embedder selected by `CURRENT`.
+    pub(crate) fn load_from_artifact_path(storage_path: &Path) -> Result<Option<Self>> {
+        let path = storage_path.join("tfidf_embedder.bin");
         if !path.exists() {
             return Ok(None);
         }
@@ -430,8 +525,8 @@ impl TfIdfEmbedder {
 #[cfg(feature = "onnx")]
 pub(crate) const NEURAL_EMBEDDING_DIMENSION: usize = 1024;
 
-/// Hybrid embedding backend that always uses TF-IDF as base signal
-/// with optional neural/remote embeddings as enhancement layers
+/// Hybrid embedding backend that always uses TF-IDF as the base signal and
+/// combines configured neural/remote embeddings for semantic retrieval.
 #[derive(Debug, Clone)]
 pub enum HybridEmbedder {
     /// TF-IDF only (base signal always available)
@@ -511,7 +606,7 @@ impl HybridScoringWeights {
 }
 
 impl HybridEmbedder {
-    /// Create a TF-IDF only embedder (default)
+    /// Create an explicit TF-IDF-only embedder for disabled/terminal-failure paths.
     pub fn tfidf_only(embedder: TfIdfEmbedder) -> Self {
         Self::TfIdfOnly(embedder)
     }
@@ -590,12 +685,47 @@ impl HybridEmbedder {
         }
     }
 
+    /// If a GPU provider was requested but the worker fell back to CPU, return
+    /// a reason the caller can act on (skip neural enrichment → TF-IDF only).
+    ///
+    /// Honors the user's intent: a deliberate `cpu` (or `auto`) configuration
+    /// always returns `None` so the CPU neural path stays fully operational;
+    /// only an explicit `migraphx`/`cuda`/`rocm` request that actually degraded
+    /// to CPU is flagged. See [`EmbeddingClient::cpu_fallback_reason`].
+    #[cfg(feature = "onnx")]
+    pub fn cpu_fallback_reason(&self) -> Option<String> {
+        match self {
+            Self::HybridLocal { neural, .. } => neural.cpu_fallback_reason(),
+            _ => None,
+        }
+    }
+
     /// Whether neural inference is already ready for a query.
     ///
-    /// Task 7 will replace this conservative gate with the worker readiness
-    /// handshake. Until then, searches never spawn a model on their hot path.
     pub fn neural_ready(&self) -> bool {
-        false
+        match self {
+            Self::TfIdfOnly(_) => false,
+            #[cfg(feature = "onnx")]
+            Self::HybridLocal { neural, .. } => neural.is_ready(),
+            #[cfg(feature = "remote-embeddings")]
+            Self::HybridRemote { .. } => true,
+        }
+    }
+
+    /// Report the readiness state used by MCP retrieval metadata.
+    pub fn neural_status(&self) -> &'static str {
+        match self {
+            Self::TfIdfOnly(_) => "absent",
+            #[cfg(feature = "onnx")]
+            Self::HybridLocal { neural, .. } => match neural.availability() {
+                crate::search::WorkerAvailability::Ready => "ready",
+                crate::search::WorkerAvailability::Initializing(_) => "initializing",
+                crate::search::WorkerAvailability::Failed(_) => "failed",
+                crate::search::WorkerAvailability::Absent => "absent",
+            },
+            #[cfg(feature = "remote-embeddings")]
+            Self::HybridRemote { .. } => "ready",
+        }
     }
 
     /// Get the neural weight for scoring
@@ -684,6 +814,52 @@ impl HybridEmbedder {
     /// - VAL-CPHASE-019: Emits actionable warning on fallback
     /// - VAL-CPHASE-020: Worker failure does not crash the main daemon
     /// - VAL-CPHASE-021: Fresh worker can be spawned after fallback
+    ///
+    /// Blocking cross-encoder rerank of candidate documents via the worker's
+    /// on-demand reranker (bge-reranker-base). Takes (id, content, initial_score)
+    /// tuples and returns (id, combined_score) ranked by the cross-encoder.
+    /// Returns None when no neural worker is available (TfIdfOnly, or a
+    /// no-onnx build) — caller keeps the original ordering. (VAL-RERANK.)
+    pub fn rerank_blocking(
+        &self,
+        query: &str,
+        docs: Vec<(String, String, f32)>,
+    ) -> Option<Result<Vec<(String, f32)>, String>> {
+        #[cfg(feature = "onnx")]
+        {
+            use leindex_embed::protocol::RerankDocument;
+            return match self {
+                Self::TfIdfOnly(_) => None,
+                Self::HybridLocal { neural, .. } => {
+                    let documents: Vec<RerankDocument> = docs
+                        .into_iter()
+                        .map(|(id, content, initial_score)| RerankDocument {
+                            id,
+                            content,
+                            initial_score,
+                        })
+                        .collect();
+                    match neural.rerank(query, documents) {
+                        Ok(resp) => Some(Ok(resp
+                            .results
+                            .into_iter()
+                            .map(|r| (r.id, r.combined_score))
+                            .collect())),
+                        Err(e) => Some(Err(e.to_string())),
+                    }
+                }
+            };
+        }
+        #[cfg(not(feature = "onnx"))]
+        {
+            let _ = (query, docs);
+            None
+        }
+    }
+
+    /// Embed a single text with the neural embedder (blocking). Returns `None`
+    /// for the TF-IDF-only variant; for the hybrid-local variant returns the
+    /// embedding result, with fallback applied by `embed_with_fallback`.
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     pub fn embed_neural_blocking(&self, text: &str) -> Option<Result<Vec<f32>, String>> {
         match self {
@@ -726,7 +902,8 @@ impl HybridEmbedder {
     /// Generate neural/remote embeddings for a batch of texts (blocking wrapper).
     ///
     /// Returns `Vec<Option<Vec<f32>>>` — one entry per input text.
-    /// `Some(vec)` on success, `None` when neural is unavailable or on fallback.
+    /// `Some(vec)` on success, `None` only when the provider is unavailable or
+    /// the affected request enters the explicit fallback path.
     ///
     /// This batches all texts into a single IPC call to the ONNX worker,
     /// reducing N round-trips to 1 per chunk.
@@ -925,6 +1102,89 @@ pub(crate) fn is_dependency_manifest_name(name: &str) -> bool {
 ///
 /// Oversized files do not count toward the file count or total size limits.
 pub(crate) fn scan_project_files(project_path: &Path) -> Result<ProjectFileScan> {
+    if crate::cli::git::is_worktree(project_path) {
+        if let Ok(scan) = scan_git_project_files(project_path) {
+            return Ok(scan);
+        }
+        tracing::debug!(project = %project_path.display(), "Git inventory unavailable; using non-Git scanner");
+    }
+    scan_non_git_project_files(project_path)
+}
+
+fn scan_git_project_files(project_path: &Path) -> Result<ProjectFileScan> {
+    let project_config = crate::cli::config::ProjectConfig::load(project_path).unwrap_or_default();
+    let limits = &project_config.indexing;
+    let inventory = crate::cli::git::source_inventory(project_path)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let mut source_paths = Vec::new();
+    let mut manifest_paths = Vec::new();
+    let mut total_source_size = 0u64;
+    for path in inventory {
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if is_dependency_manifest_name(file_name) {
+            manifest_paths.push(path);
+            continue;
+        }
+        if project_config.should_exclude(&path) {
+            continue;
+        }
+        let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+            continue;
+        };
+        if !SOURCE_FILE_EXTENSIONS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(ext))
+        {
+            continue;
+        }
+        let size = std::fs::metadata(&path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        if limits.max_file_size > 0 && size > limits.max_file_size {
+            continue;
+        }
+        if limits.max_files > 0 && source_paths.len() >= limits.max_files {
+            break;
+        }
+        if limits.max_total_size > 0
+            && total_source_size.saturating_add(size) > limits.max_total_size
+        {
+            break;
+        }
+        total_source_size = total_source_size.saturating_add(size);
+        source_paths.push(path);
+    }
+    source_paths.sort();
+    manifest_paths.sort();
+    let source_directories = crate::cli::index_freshness::extract_unique_dirs(&source_paths);
+    let manifest_hashes = manifest_paths
+        .iter()
+        .filter_map(|path| {
+            std::fs::read(path).ok().map(|bytes| {
+                (
+                    path.display().to_string(),
+                    blake3::hash(&bytes).to_hex().to_string(),
+                )
+            })
+        })
+        .collect();
+    let manifest_paths_canonical = manifest_paths
+        .iter()
+        .map(|path| path.canonicalize().unwrap_or_else(|_| path.clone()))
+        .collect();
+    Ok(ProjectFileScan {
+        source_paths,
+        manifest_paths,
+        manifest_paths_canonical,
+        source_directories,
+        manifest_hashes,
+    })
+}
+
+fn scan_non_git_project_files(project_path: &Path) -> Result<ProjectFileScan> {
     let project_config = crate::cli::config::ProjectConfig::load(project_path).unwrap_or_default();
     let limits = &project_config.indexing;
 
@@ -1184,6 +1444,48 @@ pub(crate) fn index_nodes_with_embedder(
     embedder: Option<HybridEmbedder>,
     shared_file_cache: Option<FileReadCache>,
 ) -> Result<HybridEmbedder> {
+    index_nodes_with_embedder_inner(
+        pdg,
+        search_engine,
+        file_stats_cache,
+        batch_size,
+        embedder,
+        shared_file_cache,
+        true,
+    )
+}
+
+/// Index the mandatory TF-IDF/search layer without touching the neural
+/// provider. The returned embedder is still suitable for query embedding;
+/// neural rows are appended by the explicit enrichment phase.
+pub(crate) fn index_nodes_tfidf_only(
+    pdg: &ProgramDependenceGraph,
+    search_engine: &mut SearchEngine,
+    file_stats_cache: &mut Option<HashMap<String, FileStats>>,
+    batch_size: usize,
+    embedder: Option<HybridEmbedder>,
+    shared_file_cache: Option<FileReadCache>,
+) -> Result<HybridEmbedder> {
+    index_nodes_with_embedder_inner(
+        pdg,
+        search_engine,
+        file_stats_cache,
+        batch_size,
+        embedder,
+        shared_file_cache,
+        false,
+    )
+}
+
+fn index_nodes_with_embedder_inner(
+    pdg: &ProgramDependenceGraph,
+    search_engine: &mut SearchEngine,
+    file_stats_cache: &mut Option<HashMap<String, FileStats>>,
+    batch_size: usize,
+    embedder: Option<HybridEmbedder>,
+    shared_file_cache: Option<FileReadCache>,
+    _allow_neural: bool,
+) -> Result<HybridEmbedder> {
     *file_stats_cache = None;
 
     let batch_size = batch_size.max(1);
@@ -1202,57 +1504,6 @@ pub(crate) fn index_nodes_with_embedder(
     let mut seen_tokens: HashSet<String> = HashSet::new();
     let mut total_docs = 0usize;
 
-    // Helper: extract enriched node content from file bytes using byte range + PDG metadata.
-    let extract_node_content = |node: &crate::graph::pdg::Node,
-                                node_idx: petgraph::graph::NodeIndex,
-                                file_bytes: &[u8]|
-     -> String {
-        let content = String::from_utf8_lossy(file_bytes);
-        let mut enrichment = format!(
-            "// type:{} lang:{}",
-            match node.node_type {
-                NodeType::Function => "function",
-                NodeType::Class => "class",
-                NodeType::Method => "method",
-                NodeType::Variable => "variable",
-                NodeType::Module => "module",
-                NodeType::External => "external",
-            },
-            node.language,
-        );
-        let callers = pdg.backward_impact(node_idx, &connectivity_config);
-        let callees = pdg.forward_impact(node_idx, &connectivity_config);
-        enrichment.push_str(&format!(
-            " callers:{} callees:{} complexity:{}",
-            callers.len().min(50),
-            callees.len().min(50),
-            node.complexity,
-        ));
-
-        if !content.is_empty() && node.byte_range.1 > node.byte_range.0 {
-            let content_bytes = content.as_bytes();
-            let start = node.byte_range.0.min(content_bytes.len());
-            let end = node.byte_range.1.min(content_bytes.len());
-            if start < end {
-                let snippet = String::from_utf8_lossy(&content_bytes[start..end]);
-                format!(
-                    "{}\n// {} in {}\n{}",
-                    enrichment, node.name, node.file_path, snippet
-                )
-            } else {
-                format!(
-                    "{}\n// {} in {}\n{}",
-                    enrichment, node.name, node.file_path, "// [No source code available]"
-                )
-            }
-        } else {
-            format!(
-                "{}\n// {} in {}\n{}",
-                enrichment, node.name, node.file_path, "// [No source code available]"
-            )
-        }
-    };
-
     // Pass 1: build document frequencies in streaming batches, dropping content immediately.
     for batch in node_indices.chunks(batch_size) {
         for &node_idx in batch {
@@ -1261,7 +1512,8 @@ pub(crate) fn index_nodes_with_embedder(
                     .get_or_read(Path::new(&*node.file_path))
                     .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
 
-                let node_content = extract_node_content(node, node_idx, &file_bytes);
+                let node_content =
+                    enriched_node_content(pdg, node_idx, node, &file_bytes, &connectivity_config);
                 let tokens = tokenize_code(&node_content);
                 seen_tokens.clear();
                 for tok in &tokens {
@@ -1339,21 +1591,19 @@ pub(crate) fn index_nodes_with_embedder(
         // Callers who want tfidf_only should pass an explicit tfidf_only embedder.
         #[cfg(feature = "onnx")]
         {
-            match HybridEmbedder::hybrid_local(tfidf_embedder, None) {
-                Ok(hybrid) => hybrid,
-                Err(e) => {
-                    warn!(
-                        "Failed to create hybrid_local embedder (ONNX), falling back to tfidf_only: {}",
-                        e
-                    );
-                    HybridEmbedder::tfidf_only(TfIdfEmbedder {
-                        vocab: final_scores.iter().map(|(t, _)| t.clone()).collect(),
-                        idf: final_scores.iter().map(|(_, s)| *s).collect(),
-                        dimension: crate::search::search::DEFAULT_EMBEDDING_DIMENSION,
-                        pdg_nodes: pdg.node_count(),
-                        pdg_edges: pdg.edge_count(),
-                    })
+            if _allow_neural {
+                match HybridEmbedder::hybrid_local(tfidf_embedder.clone(), None) {
+                    Ok(hybrid) => hybrid,
+                    Err(e) => {
+                        warn!(
+                            "Failed to create hybrid_local embedder (ONNX), falling back to tfidf_only: {}",
+                            e
+                        );
+                        HybridEmbedder::tfidf_only(tfidf_embedder)
+                    }
                 }
+            } else {
+                HybridEmbedder::tfidf_only(tfidf_embedder)
             }
         }
         #[cfg(not(feature = "onnx"))]
@@ -1367,6 +1617,7 @@ pub(crate) fn index_nodes_with_embedder(
     let mut pruned_count: usize = 0;
     let mut shed_count: usize = 0;
     let mut hoisted_count: usize = 0;
+    let mut external_skipped_count: usize = 0;
 
     // Clear the search engine once before batch processing begins.
     // Each batch will append nodes incrementally via append_nodes().
@@ -1381,12 +1632,25 @@ pub(crate) fn index_nodes_with_embedder(
         let mut neural_pending: Vec<usize> = Vec::new();
         for &node_idx in batch {
             if let Some(node) = pdg.get_node(node_idx) {
+                // Skip external/dependency placeholder nodes. These are
+                // lightweight targets created for unresolved data-flow/import
+                // references (file_path "<external>", name = an arbitrary word
+                // from the source). Indexing them pollutes search results
+                // ("<external>:: which") via common-word lexical matches that
+                // outrank real project symbols. Drop them at this shared choke
+                // point so they never enter the TF-IDF vocab, inverted index,
+                // vector index, or trigram index.
+                if node.node_type == NodeType::External {
+                    external_skipped_count += 1;
+                    continue;
+                }
                 // Re-read and re-tokenize node content for Pass 2
                 let file_bytes = file_cache
                     .get_or_read(Path::new(&*node.file_path))
                     .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
 
-                let node_content = extract_node_content(node, node_idx, &file_bytes);
+                let node_content =
+                    enriched_node_content(pdg, node_idx, node, &file_bytes, &connectivity_config);
 
                 // A+ VAL-APLUS-038: Full content pruning check (now that we have content).
                 let pruning_decision = pruner.evaluate(&node.file_path, &node_content, &node.name);
@@ -1424,12 +1688,15 @@ pub(crate) fn index_nodes_with_embedder(
                 if cached_neural.is_some() {
                     neural_embedding = cached_neural;
                     needs_batch_neural = false;
-                } else if embedder.has_neural() {
-                    // Defer neural embedding to batch call below
+                } else if embedder.has_neural() && _allow_neural {
+                    // Queue neural work for the shared worker. A cold default
+                    // `auto` worker is intentionally started here so the
+                    // published index contains both TF-IDF and neural rows.
                     neural_embedding = None;
                     needs_batch_neural = true;
                 } else {
-                    // No neural backend available
+                    // TF-IDF remains the mandatory searchable baseline when
+                    // this pass explicitly requests lexical-only indexing.
                     work_hoister.store(&node_content, tfidf_embedding.clone(), None);
                     neural_embedding = None;
                     needs_batch_neural = false;
@@ -1507,11 +1774,12 @@ pub(crate) fn index_nodes_with_embedder(
     }
 
     // A+ logging: per-batch stats at info! level (invisible under default WARN).
-    if pruned_count > 0 || shed_count > 0 || hoisted_count > 0 {
+    if pruned_count > 0 || shed_count > 0 || hoisted_count > 0 || external_skipped_count > 0 {
         info!(
             pruned = pruned_count,
             shed = shed_count,
             hoisted = hoisted_count,
+            external_skipped = external_skipped_count,
             admitted = admission_gate.nodes_admitted(),
             "A+ bound-gated indexing stats"
         );
@@ -1528,6 +1796,82 @@ pub(crate) fn index_nodes_with_embedder(
     }
 
     Ok(embedder)
+}
+
+/// Compute neural rows against an already-published TF-IDF index.
+///
+/// The mandatory TF-IDF/PDG generation is published first; this phase then
+/// actively starts the configured neural worker and appends its rows. If the
+/// provider reports a terminal failure, the core generation remains usable.
+#[cfg_attr(
+    not(any(feature = "onnx", feature = "remote-embeddings")),
+    allow(unused_variables)
+)]
+pub(crate) fn enrich_neural_embeddings(
+    pdg: &ProgramDependenceGraph,
+    embedder: &HybridEmbedder,
+    file_cache: &mut FileReadCache,
+) -> Vec<(String, Vec<f32>)> {
+    if !embedder.has_neural() {
+        return Vec::new();
+    }
+
+    #[cfg(not(any(feature = "onnx", feature = "remote-embeddings")))]
+    {
+        Vec::new()
+    }
+
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    {
+        const NEURAL_IPC_BATCH: usize = 256;
+        let connectivity_config = crate::graph::pdg::TraversalConfig {
+            max_depth: Some(1),
+            max_nodes: Some(1000),
+            allowed_edge_types: Some(&[EdgeType::Call, EdgeType::DataDependency]),
+            excluded_node_types: Some(vec![NodeType::External]),
+            min_complexity: None,
+            min_edge_confidence: 0.0,
+        };
+        let mut pending = Vec::with_capacity(NEURAL_IPC_BATCH);
+        let mut rows = Vec::new();
+        for node_idx in pdg.node_indices() {
+            let Some(node) = pdg.get_node(node_idx) else {
+                continue;
+            };
+            let file_bytes = file_cache
+                .get_or_read(Path::new(&*node.file_path))
+                .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
+            let text =
+                enriched_node_content(pdg, node_idx, node, &file_bytes, &connectivity_config);
+            pending.push((node.id.clone(), text));
+            if pending.len() == NEURAL_IPC_BATCH {
+                append_neural_batch(embedder, &pending, &mut rows);
+                pending.clear();
+            }
+        }
+        if !pending.is_empty() {
+            append_neural_batch(embedder, &pending, &mut rows);
+        }
+        rows
+    }
+}
+
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+fn append_neural_batch(
+    embedder: &HybridEmbedder,
+    pending: &[(String, String)],
+    rows: &mut Vec<(String, Vec<f32>)>,
+) {
+    let texts = pending
+        .iter()
+        .map(|(_, text)| text.clone())
+        .collect::<Vec<_>>();
+    let embeddings = embedder.embed_neural_batch_blocking(&texts);
+    for ((node_id, _), embedding) in pending.iter().zip(embeddings) {
+        if let Some(embedding) = embedding.filter(|row| !row.is_empty()) {
+            rows.push((node_id.clone(), embedding));
+        }
+    }
 }
 
 /// Compare current manifest hashes against the persisted scan's hashes.
@@ -1718,11 +2062,14 @@ pub(crate) fn persist_embeddings_to_mmap(
     search_engine: &SearchEngine,
     project_path: &Path,
 ) -> Result<()> {
+    let path = crate::search::vector::mmap_embeddings_path(project_path);
+    if search_engine.is_mmap_backed() && path.is_file() {
+        return Ok(());
+    }
     let embeddings = search_engine.collect_embeddings();
     if embeddings.is_empty() {
         return Ok(());
     }
-    let path = crate::search::vector::mmap_embeddings_path(project_path);
     crate::search::vector::write_mmap_embeddings(&path, &embeddings)
         .map_err(|e| anyhow::anyhow!("Failed to write mmap embeddings: {e}"))?;
     info!(
@@ -1772,10 +2119,18 @@ pub(crate) fn persist_search_snapshot(
 }
 
 /// Try to load previously persisted search metadata.
+#[allow(dead_code)]
 pub(crate) fn try_load_search_snapshot(
     project_path: &Path,
 ) -> Option<crate::search::search::SearchSnapshot> {
-    let path = search_snapshot_path(project_path);
+    try_load_search_snapshot_from_storage(&project_path.join(".leindex"))
+}
+
+/// Try to load search metadata from an explicit storage directory.
+pub(crate) fn try_load_search_snapshot_from_storage(
+    storage_path: &Path,
+) -> Option<crate::search::search::SearchSnapshot> {
+    let path = storage_path.join("search_snapshot.bin");
     if !path.exists() {
         return None;
     }
@@ -1927,7 +2282,15 @@ fn neural_mmap_embeddings_path(project_path: &Path) -> PathBuf {
 pub(crate) fn try_load_neural_mmap_embeddings(
     project_path: &Path,
 ) -> Option<crate::search::vector::MmapEmbeddingIndex> {
-    let path = neural_mmap_embeddings_path(project_path);
+    try_load_neural_mmap_embeddings_from_storage(&project_path.join(".leindex"))
+}
+
+/// Try to load neural embeddings from an explicit storage directory.
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+pub(crate) fn try_load_neural_mmap_embeddings_from_storage(
+    storage_path: &Path,
+) -> Option<crate::search::vector::MmapEmbeddingIndex> {
+    let path = storage_path.join("neural_embeddings.bin");
     if !path.exists() {
         return None;
     }
@@ -2017,7 +2380,14 @@ fn sanitize_for_prefix(s: &str) -> String {
 pub(crate) fn try_load_mmap_embeddings(
     project_path: &Path,
 ) -> Option<crate::search::vector::MmapEmbeddingIndex> {
-    let path = crate::search::vector::mmap_embeddings_path(project_path);
+    try_load_mmap_embeddings_from_storage(&project_path.join(".leindex"))
+}
+
+/// Try to load TF-IDF embeddings from an explicit storage directory.
+pub(crate) fn try_load_mmap_embeddings_from_storage(
+    storage_path: &Path,
+) -> Option<crate::search::vector::MmapEmbeddingIndex> {
+    let path = storage_path.join("embeddings.bin");
     if !path.exists() {
         return None;
     }
@@ -2136,6 +2506,19 @@ mod tests {
     fn test_tokenize_code_empty() {
         let toks = tokenize_code("");
         assert!(toks.is_empty());
+    }
+
+    #[test]
+    fn test_preceding_doc_context_is_bounded_and_ordered() {
+        let source = b"/// first\n/// second\nfn demo() {}\n";
+        let start = source
+            .windows(2)
+            .position(|window| window == b"fn")
+            .unwrap();
+        assert_eq!(
+            preceding_doc_context(source, start),
+            "/// first\n/// second"
+        );
     }
 
     #[test]
@@ -3129,6 +3512,26 @@ mod tests {
                 assert!(has_nonzero, "neural embeddings should have non-zero values");
             }
         }
+    }
+
+    #[test]
+    #[ignore = "requires the configured auto ONNX model and execution provider"]
+    #[cfg(feature = "onnx")]
+    fn test_hybrid_embedder_cold_start_uses_neural_by_default() {
+        let docs: Vec<(String, String)> = vec![(
+            "search".to_string(),
+            "fn route_semantic_search(query: &str) -> bool".to_string(),
+        )];
+        let tfidf_embedder = TfIdfEmbedder::build(&docs);
+        let embedder = HybridEmbedder::hybrid_local(tfidf_embedder, None).unwrap();
+        let result = embedder.embed_neural_blocking("route semantic search");
+        let embedding = result
+            .expect("cold hybrid request must attempt the neural worker")
+            .expect("configured auto neural worker must return an embedding");
+
+        assert_eq!(embedding.len(), NEURAL_EMBEDDING_DIMENSION);
+        assert!(embedding.iter().any(|value| *value != 0.0));
+        assert_eq!(embedder.neural_status(), "ready");
     }
 
     #[test]

@@ -1,13 +1,48 @@
 // Index Freshness — staleness detection logic extracted from LeIndex
 
+use super::leindex::IndexHealth;
 use super::leindex::{ProjectFileScan, DEPENDENCY_MANIFEST_NAMES};
 use crate::cli::memory::CacheEntry;
 use crate::cli::skip_dirs::SKIP_DIRS;
 use crate::storage::schema::Storage;
 use anyhow::Result;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+/// Load the small generation-health snapshot without opening the main index.
+pub(crate) fn load_health(storage_path: &Path) -> Option<IndexHealth> {
+    let bytes = std::fs::read(storage_path.join("index-state.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Persist generation health with an atomic sibling rename.
+pub(crate) fn save_health(storage_path: &Path, health: &IndexHealth) -> Result<()> {
+    std::fs::create_dir_all(storage_path)?;
+    let target = storage_path.join("index-state.json");
+    let next = storage_path.join("index-state.json.next");
+    let bytes = serde_json::to_vec_pretty(health)?;
+    let mut file = std::fs::File::create(&next)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(windows)]
+    {
+        let previous = storage_path.join("index-state.json.previous");
+        let _ = std::fs::remove_file(&previous);
+        if target.exists() {
+            std::fs::rename(&target, &previous)?;
+        }
+        std::fs::rename(&next, &target)?;
+        let _ = std::fs::remove_file(previous);
+    }
+    #[cfg(not(windows))]
+    std::fs::rename(&next, &target)?;
+    #[cfg(unix)]
+    std::fs::File::open(storage_path)?.sync_all()?;
+    Ok(())
+}
 
 const MAX_FAST_INDEXED_FILE_STATS: usize = 10_000;
 
