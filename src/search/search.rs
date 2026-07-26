@@ -13,12 +13,13 @@ use crate::search::hnsw::{HNSWIndex, HNSWParams};
 use crate::search::quantization::int8_hnsw::{Int8HnswIndex, Int8HnswParams};
 use crate::search::query::{MAX_EMBEDDING_DIMENSION, MIN_EMBEDDING_DIMENSION};
 use crate::search::ranking::{HybridScorer, Score};
-use crate::search::vector::VectorIndex;
+use crate::search::vector::{MmapEmbeddingIndex, VectorIndex};
 use lru::LruCache;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 // ============================================================================
 // CONSTANTS & VALIDATION
@@ -390,6 +391,144 @@ impl Default for WorkHoister {
 // VECTOR INDEX IMPLEMENTATION
 // ============================================================================
 
+/// Read-mostly TF-IDF vector index backed by a persisted mmap file.
+///
+/// The base rows stay outside the Rust heap. Mutations are kept in a small
+/// owned delta and base rows are hidden with tombstones until the next index
+/// publication compacts a new mmap generation.
+#[derive(Debug)]
+pub struct MmapVectorIndex {
+    base: Arc<MmapEmbeddingIndex>,
+    rows: HashMap<String, u32>,
+    delta: HashMap<String, Vec<f32>>,
+    tombstones: HashSet<String>,
+    cleared: bool,
+}
+
+impl MmapVectorIndex {
+    fn from_snapshot(base: Arc<MmapEmbeddingIndex>, node_ids: &[String]) -> Result<Self, String> {
+        let mut rows = HashMap::with_capacity(node_ids.len());
+        for node_id in node_ids {
+            if let Some(row) = base.find_node_row(node_id) {
+                rows.insert(node_id.clone(), row);
+            } else {
+                return Err(format!("mmap has no row for snapshot node '{}'", node_id));
+            }
+        }
+        Ok(Self {
+            base,
+            rows,
+            delta: HashMap::new(),
+            tombstones: HashSet::new(),
+            cleared: false,
+        })
+    }
+
+    fn len(&self) -> usize {
+        if self.cleared {
+            return self.delta.len();
+        }
+        self.rows
+            .len()
+            .saturating_sub(self.tombstones.len())
+            .saturating_add(
+                self.delta
+                    .keys()
+                    .filter(|node_id| !self.rows.contains_key(*node_id))
+                    .count(),
+            )
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn dimension(&self) -> usize {
+        self.base.dimension() as usize
+    }
+
+    fn search(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
+        if query.len() != self.dimension() || self.cleared && self.delta.is_empty() {
+            return Vec::new();
+        }
+        let mut results = if self.cleared {
+            Vec::new()
+        } else {
+            self.base
+                .search(
+                    query,
+                    top_k
+                        .saturating_add(self.tombstones.len())
+                        .saturating_add(self.delta.len()),
+                )
+                .into_iter()
+                .filter(|(id, _)| self.rows.contains_key(id) && !self.tombstones.contains(id))
+                .collect::<Vec<_>>()
+        };
+        for (node_id, vector) in &self.delta {
+            if vector.len() == query.len() {
+                results.push((
+                    node_id.clone(),
+                    crate::search::vector::cosine_similarity(query, vector),
+                ));
+            }
+        }
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(top_k);
+        results
+    }
+
+    fn insert(&mut self, node_id: String, vector: Vec<f32>) -> Result<(), VectorIndexError> {
+        if vector.len() != self.dimension() {
+            return Err(VectorIndexError::InsertionFailed(format!(
+                "dimension mismatch: expected {}, got {}",
+                self.dimension(),
+                vector.len()
+            )));
+        }
+        if self.rows.contains_key(&node_id) {
+            self.tombstones.insert(node_id.clone());
+        }
+        self.delta.insert(node_id, vector);
+        Ok(())
+    }
+
+    fn clear(&mut self) {
+        self.delta.clear();
+        self.tombstones.clear();
+        self.cleared = true;
+    }
+
+    fn remove(&mut self, node_id: &str) -> bool {
+        let removed_delta = self.delta.remove(node_id).is_some();
+        let removed_base =
+            self.rows.contains_key(node_id) && self.tombstones.insert(node_id.into());
+        removed_delta || removed_base
+    }
+
+    fn estimated_memory_bytes(&self) -> usize {
+        self.rows.keys().map(String::len).sum::<usize>()
+            + self
+                .delta
+                .iter()
+                .map(|(id, vector)| id.len() + vector.len() * std::mem::size_of::<f32>())
+                .sum::<usize>()
+            + self.tombstones.iter().map(String::len).sum::<usize>()
+            + std::mem::size_of::<Self>()
+    }
+
+    fn embedding(&self, node_id: &str) -> Option<Vec<f32>> {
+        if let Some(vector) = self.delta.get(node_id) {
+            return Some(vector.clone());
+        }
+        if self.cleared || self.tombstones.contains(node_id) {
+            return None;
+        }
+        let row = self.rows.get(node_id).copied()?;
+        self.base.get_embedding_by_row(row)
+    }
+}
+
 /// Vector index implementation
 ///
 /// Enum that wraps either the brute-force VectorIndex or the HNSW-based HNSWIndex.
@@ -397,6 +536,9 @@ impl Default for WorkHoister {
 pub enum VectorIndexImpl {
     /// Brute-force vector index (exact search)
     BruteForce(VectorIndex),
+
+    /// Mmap-backed base rows with a bounded owned delta overlay.
+    Mmap(MmapVectorIndex),
 
     /// HNSW-based approximate nearest neighbor index
     HNSW(Box<HNSWIndex>),
@@ -410,6 +552,7 @@ impl VectorIndexImpl {
     pub fn len(&self) -> usize {
         match self {
             Self::BruteForce(idx) => idx.len(),
+            Self::Mmap(idx) => idx.len(),
             Self::HNSW(idx) => idx.len(),
             Self::HNSWQuantized(idx) => idx.len(),
         }
@@ -420,6 +563,7 @@ impl VectorIndexImpl {
     pub fn is_empty(&self) -> bool {
         match self {
             Self::BruteForce(idx) => idx.is_empty(),
+            Self::Mmap(idx) => idx.is_empty(),
             Self::HNSW(idx) => idx.is_empty(),
             Self::HNSWQuantized(idx) => idx.is_empty(),
         }
@@ -430,6 +574,7 @@ impl VectorIndexImpl {
     pub fn dimension(&self) -> usize {
         match self {
             Self::BruteForce(idx) => idx.dimension(),
+            Self::Mmap(idx) => idx.dimension(),
             Self::HNSW(idx) => idx.dimension(),
             Self::HNSWQuantized(idx) => idx.dimension(),
         }
@@ -439,6 +584,7 @@ impl VectorIndexImpl {
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(String, f32)> {
         match self {
             Self::BruteForce(idx) => idx.search(query, top_k),
+            Self::Mmap(idx) => idx.search(query, top_k),
             Self::HNSW(idx) => idx.search(query, top_k),
             Self::HNSWQuantized(idx) => idx.search(query, top_k),
         }
@@ -450,6 +596,7 @@ impl VectorIndexImpl {
             Self::BruteForce(idx) => idx
                 .insert(node_id, vector)
                 .map_err(|e| VectorIndexError::InsertionFailed(e.to_string())),
+            Self::Mmap(idx) => idx.insert(node_id, vector),
             Self::HNSW(idx) => idx
                 .insert(node_id, vector)
                 .map_err(|e| VectorIndexError::InsertionFailed(e.to_string())),
@@ -463,6 +610,7 @@ impl VectorIndexImpl {
     pub fn clear(&mut self) {
         match self {
             Self::BruteForce(idx) => idx.clear(),
+            Self::Mmap(idx) => idx.clear(),
             Self::HNSW(idx) => idx.clear(),
             Self::HNSWQuantized(idx) => idx.clear(),
         }
@@ -475,8 +623,19 @@ impl VectorIndexImpl {
     pub fn remove(&mut self, node_id: &str) -> bool {
         match self {
             Self::BruteForce(idx) => idx.remove(node_id),
+            Self::Mmap(idx) => idx.remove(node_id),
             Self::HNSW(idx) => idx.remove(node_id),
             Self::HNSWQuantized(idx) => idx.remove(node_id),
+        }
+    }
+
+    /// Return an owned vector for persistence or compatibility callers.
+    pub fn embedding(&self, node_id: &str) -> Option<Vec<f32>> {
+        match self {
+            Self::BruteForce(idx) => idx.get(node_id).cloned(),
+            Self::Mmap(idx) => idx.embedding(node_id),
+            Self::HNSW(idx) => idx.get(node_id).cloned(),
+            Self::HNSWQuantized(_) => None,
         }
     }
 
@@ -491,6 +650,7 @@ impl VectorIndexImpl {
     pub fn estimated_memory_bytes(&self) -> usize {
         match self {
             Self::BruteForce(idx) => (*idx).estimated_memory_bytes(),
+            Self::Mmap(idx) => idx.estimated_memory_bytes(),
             Self::HNSW(idx) => (*idx).estimated_memory_bytes(),
             Self::HNSWQuantized(idx) => (*idx).estimated_memory_bytes(),
         }
@@ -549,7 +709,9 @@ pub struct NodeInfo {
     /// TF-IDF embedding (always present, 768-dim, for hybrid search)
     pub tfidf_embedding: Vec<f32>,
 
-    /// Neural/remote embedding (optional enhancement, for hybrid search)
+    /// Neural/remote embedding for the configured hybrid scorer. This is
+    /// populated during the active neural phase and is absent only when the
+    /// provider is disabled or reaches an explicit terminal failure.
     pub neural_embedding: Option<Vec<f32>>,
 
     /// Complexity score (0-100+, higher = more complex)
@@ -741,10 +903,11 @@ pub struct SearchQuery {
     /// Optional query embedding for semantic search (TF-IDF)
     pub query_embedding: Option<Vec<f32>>,
 
-    /// Optional neural query embedding for deep semantic search.
+    /// Configured neural query embedding for semantic/deep search.
     ///
-    /// Populated when ONNX (or remote) embeddings are available.
-    /// When `None`, neural scoring is skipped and TF-IDF fallback is used.
+    /// Populated after the configured provider reaches `Ready`. When `None`,
+    /// the result metadata records the terminal/disabled state and the
+    /// mandatory TF-IDF score remains available.
     pub query_neural_embedding: Option<Vec<f32>>,
 
     /// Minimum relevance threshold (0.0-1.0)
@@ -930,6 +1093,13 @@ pub struct SearchEngine {
     nodes: Vec<NodeInfo>,
     scorer: HybridScorer,
     vector_index: VectorIndexImpl,
+    /// Lazy-paged ANN over the neural embeddings (built from neural_embeddings
+    /// mmap at search-load). This is the semantic RETRIEVAL signal: its top-K
+    /// hits are unioned into the candidate pool alongside the lexical inverted
+    /// index + the tfidf vector_index. Reuses MmapVectorIndex — same pattern as
+    /// `vector_index` — so no hand-rolled scan. None when no neural mmap is
+    /// loaded (tests, tfidf-only indexes).
+    neural_vector_index: Option<VectorIndexImpl>,
     /// Complexity cache for O(1) lookups (fixes O(n²) bug)
     complexity_cache: HashMap<String, u32>,
     /// Inverted index for O(1) text lookups: token -> set of node IDs
@@ -945,6 +1115,10 @@ pub struct SearchEngine {
     search_cache: LruCache<String, Vec<SearchResult>>,
     /// Tracked byte estimate for the search cache
     search_cache_bytes: usize,
+    /// Configured neural-score weight for the hybrid (None query_type) scoring
+    /// arm. Set from `[search] neural_weight` in leindex.toml via
+    /// `set_neural_weight`. Default 0.4 preserves prior behavior when unset.
+    neural_weight: f32,
 }
 
 const SEARCH_SNAPSHOT_VERSION: u32 = 1;
@@ -1346,6 +1520,8 @@ impl SearchEngine {
             node_tokens: HashMap::new(),
             search_cache: LruCache::new(NonZeroUsize::new(SEARCH_CACHE_MAX_ENTRIES).unwrap()),
             search_cache_bytes: 0,
+            neural_weight: 0.4,
+            neural_vector_index: None,
         }
     }
 
@@ -1386,7 +1562,17 @@ impl SearchEngine {
             node_tokens: HashMap::new(),
             search_cache: LruCache::new(NonZeroUsize::new(SEARCH_CACHE_MAX_ENTRIES).unwrap()),
             search_cache_bytes: 0,
+            neural_weight: 0.4,
+            neural_vector_index: None,
         }
+    }
+
+    /// Set the neural-score weight used by the hybrid (None query_type) scoring
+    /// arm. Loaded from `[search] neural_weight` in leindex.toml by the CLI
+    /// layer (which can read config; this `search` crate cannot, to keep the
+    /// dependency direction cli -> search). Clamped to [0, 1].
+    pub fn set_neural_weight(&mut self, weight: f32) {
+        self.neural_weight = weight.clamp(0.0, 1.0);
     }
 
     /// Index nodes for searching
@@ -1589,6 +1775,46 @@ impl SearchEngine {
         updated
     }
 
+    /// Add or replace neural rows after the TF-IDF index is already queryable.
+    ///
+    /// Neural enrichment is deliberately a separate mutation: the core
+    /// lexical/vector index can be published first, then this bounded delta is
+    /// applied and persisted as a later immutable generation.
+    pub fn update_neural_embeddings(
+        &mut self,
+        embeddings: impl IntoIterator<Item = (String, Vec<f32>)>,
+    ) -> usize {
+        let mut updated = 0;
+        for (node_id, embedding) in embeddings {
+            if embedding.is_empty() {
+                continue;
+            }
+            if let Some(&idx) = self.node_id_to_idx.get(&node_id) {
+                if let Some(node) = self.nodes.get_mut(idx) {
+                    node.neural_embedding = Some(embedding);
+                    updated += 1;
+                }
+            }
+        }
+        if updated > 0 {
+            self.search_cache.clear();
+            self.search_cache_bytes = 0;
+        }
+        updated
+    }
+
+    /// Remove all neural rows while retaining the mandatory lexical index.
+    pub fn clear_neural_embeddings(&mut self) {
+        let mut changed = false;
+        for node in &mut self.nodes {
+            changed |= node.neural_embedding.take().is_some();
+        }
+        if changed {
+            self.search_cache.clear();
+            self.search_cache_bytes = 0;
+        }
+    }
+
     /// Extract signature from node content.
     ///
     /// Returns the first non-empty, non-comment line after the header.
@@ -1786,8 +2012,15 @@ impl SearchEngine {
     pub fn collect_embeddings(&self) -> Vec<(String, Vec<f32>)> {
         self.nodes
             .iter()
-            .filter(|n| !n.tfidf_embedding.is_empty())
-            .map(|n| (n.node_id.clone(), n.tfidf_embedding.clone()))
+            .filter_map(|node| {
+                if !node.tfidf_embedding.is_empty() {
+                    Some((node.node_id.clone(), node.tfidf_embedding.clone()))
+                } else {
+                    self.vector_index
+                        .embedding(&node.node_id)
+                        .map(|embedding| (node.node_id.clone(), embedding))
+                }
+            })
             .collect()
     }
 
@@ -1855,8 +2088,8 @@ impl SearchEngine {
     pub(crate) fn restore_from_search_snapshot(
         &mut self,
         snapshot: SearchSnapshot,
-        tfidf_mmap: &crate::search::vector::MmapEmbeddingIndex,
-        neural_mmap: Option<&crate::search::vector::MmapEmbeddingIndex>,
+        tfidf_mmap: Arc<MmapEmbeddingIndex>,
+        neural_mmap: Option<Arc<MmapEmbeddingIndex>>,
     ) -> Result<usize, String> {
         if snapshot.version != SEARCH_SNAPSHOT_VERSION {
             return Err(format!(
@@ -1886,12 +2119,7 @@ impl SearchEngine {
             ));
         }
 
-        let mut tfidf_by_id: HashMap<String, Vec<f32>> = tfidf_mmap
-            .entries()
-            .map_err(|e| format!("failed to read TF-IDF mmap entries: {}", e))?
-            .into_iter()
-            .collect();
-        if let Some(mmap) = neural_mmap {
+        if let Some(ref mmap) = neural_mmap {
             if mmap.dimension() as usize != NEURAL_EMBEDDING_DIMENSION {
                 return Err(format!(
                     "neural mmap dimension {} != expected {}",
@@ -1901,23 +2129,13 @@ impl SearchEngine {
             }
         }
 
-        let mut neural_by_id: HashMap<String, Vec<f32>> = neural_mmap
-            .map(|mmap| {
-                mmap.entries()
-                    .map(|entries| entries.into_iter().collect())
-                    .map_err(|e| format!("failed to read neural mmap entries: {}", e))
-            })
-            .transpose()?
-            .unwrap_or_default();
-
         let mut nodes = Vec::with_capacity(snapshot.nodes.len());
         let mut missing_tfidf = 0usize;
         for snap in snapshot.nodes {
-            let Some(tfidf_embedding) = tfidf_by_id.remove(&snap.node_id) else {
+            if tfidf_mmap.find_node_row(&snap.node_id).is_none() {
                 missing_tfidf += 1;
                 continue;
-            };
-            let neural_embedding = neural_by_id.remove(&snap.node_id);
+            }
 
             nodes.push(NodeInfo {
                 node_id: snap.node_id,
@@ -1926,8 +2144,10 @@ impl SearchEngine {
                 language: snap.language,
                 content: String::new(),
                 byte_range: snap.byte_range,
-                tfidf_embedding,
-                neural_embedding,
+                // Base vectors remain in the mmap-backed vector index below;
+                // keeping empty per-node vectors avoids a second heap mirror.
+                tfidf_embedding: Vec::new(),
+                neural_embedding: None,
                 complexity: snap.complexity,
                 signature: snap.signature,
                 pre_tokenized: Some(snap.tokens),
@@ -1943,6 +2163,31 @@ impl SearchEngine {
 
         let mut staged = SearchEngine::new();
         staged.append_nodes(nodes);
+        let node_ids = staged
+            .nodes
+            .iter()
+            .map(|node| node.node_id.clone())
+            .collect::<Vec<_>>();
+        staged.vector_index = VectorIndexImpl::Mmap(
+            MmapVectorIndex::from_snapshot(tfidf_mmap, &node_ids)
+                .map_err(|error| format!("failed to build mmap vector index: {error}"))?,
+        );
+        if let Some(mmap) = neural_mmap.as_ref() {
+            staged.restore_neural_embeddings(mmap);
+            // Build the lazy-paged neural ANN — reuses MmapVectorIndex, the
+            // SAME pattern as the tfidf index above. This is the semantic
+            // RETRIEVAL signal: its top-K hits are unioned into the candidate
+            // pool at query time (replaces the brute-force neural scan, which
+            // duplicated this .search() logic). Failure is non-fatal: semantic
+            // retrieval just won't contribute.
+            match MmapVectorIndex::from_snapshot(std::sync::Arc::clone(mmap), &node_ids) {
+                Ok(idx) => staged.neural_vector_index = Some(VectorIndexImpl::Mmap(idx)),
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    "failed to build neural mmap vector index; semantic retrieval disabled"
+                ),
+            }
+        }
 
         if staged.nodes.len() != snapshot.indexed_nodes {
             return Err(format!(
@@ -2000,6 +2245,11 @@ impl SearchEngine {
     /// Return the node IDs currently in the live index.
     pub fn live_node_ids(&self) -> Vec<String> {
         self.node_id_to_idx.keys().cloned().collect()
+    }
+
+    /// Whether the base TF-IDF rows are already resident in an mmap index.
+    pub fn is_mmap_backed(&self) -> bool {
+        matches!(self.vector_index, VectorIndexImpl::Mmap(_))
     }
 
     /// Return the complexity score for a given node.
@@ -2230,6 +2480,25 @@ impl SearchEngine {
 
         // Use inverted index to filter candidates - only check nodes that contain query terms
         // This reduces search complexity from O(N) to O(M) where M is number of matching nodes
+        // Semantic retrieval: query the lazy-paged neural mmap ANN (built at
+        // search-load from neural_embeddings) and union its top-K into the
+        // candidate pool. This reuses MmapVectorIndex::search — the same top-K
+        // mechanism as the tfidf vector_index — so there is no hand-rolled scan,
+        // no per-query O(N) allocation/sort, and no in-memory duplication (the
+        // index is lazy-paged). This is what makes conceptual queries work:
+        // nodes with ZERO lexical overlap but high semantic relevance enter
+        // scoring. Falls back to empty when there is no neural index (tfidf-only)
+        // or no query embedding (Exact route).
+        let neural_candidates: HashSet<String> =
+            match (&query.query_neural_embedding, &self.neural_vector_index) {
+                (Some(q_emb), Some(idx)) => idx
+                    .search(q_emb, (query.top_k * 10).max(100))
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect(),
+                _ => HashSet::new(),
+            };
+
         let candidates = if text_query.query_tokens.is_empty() {
             // No query tokens, check all nodes
             self.nodes.iter().collect::<Vec<_>>()
@@ -2245,34 +2514,32 @@ impl SearchEngine {
                 }
             }
 
-            // If no matches in inverted index, return empty results early
-            if candidate_ids.is_empty() && !query.semantic {
+            // If no matches in inverted index AND no neural/vector hits, return
+            // empty early (unless semantic forces a full scan).
+            if candidate_ids.is_empty()
+                && neural_candidates.is_empty()
+                && vector_results.is_empty()
+                && !query.semantic
+            {
                 return Ok(Vec::new());
             }
 
-            // Convert candidate IDs to node references
-            if candidate_ids.is_empty() {
-                // If no text matches, but we have semantic search, check all nodes
-                // (Optimization: we could limit to just the vector search hits)
+            // Convert candidate IDs to node references.
+            if candidate_ids.is_empty() && neural_candidates.is_empty() && vector_results.is_empty()
+            {
+                // No matches anywhere, but semantic search — scan all nodes.
                 self.nodes.iter().collect()
             } else {
-                // We have text matches. If we also have semantic results, we must include them
-                // even if they don't match keywords.
-                if vector_results.is_empty() {
-                    self.nodes
-                        .iter()
-                        .filter(|node| candidate_ids.contains(node.node_id.as_str()))
-                        .collect()
-                } else {
-                    // Union of text matches and semantic matches
-                    self.nodes
-                        .iter()
-                        .filter(|node| {
-                            candidate_ids.contains(node.node_id.as_str())
-                                || vector_results.contains_key(&node.node_id)
-                        })
-                        .collect()
-                }
+                // Union of lexical (inverted index) + TF-IDF vector hits +
+                // neural top-K. This is the candidate pool compute_score ranks.
+                self.nodes
+                    .iter()
+                    .filter(|node| {
+                        candidate_ids.contains(node.node_id.as_str())
+                            || vector_results.contains_key(&node.node_id)
+                            || neural_candidates.contains(&node.node_id)
+                    })
+                    .collect()
             }
         };
 
@@ -2680,9 +2947,16 @@ impl SearchEngine {
             Some(crate::search::ranking::QueryType::Structural) => (0.3, 0.0, 0.5, 0.2),
             None => {
                 if neural_available {
-                    // Default scorer weights (HybridScorer::for_code):
-                    // tfidf=0.30, neural=0.40, structural=0.15, text=0.15
-                    (0.30, 0.40, 0.15, 0.15)
+                    // Configured neural weight (default 0.4 = prior behavior; set
+                    // from `[search] neural_weight` via set_neural_weight). The
+                    // tuple is renormalized to sum to 1.0 so the 0.1/0.05 result
+                    // threshold keeps its meaning: the non-neural remainder is
+                    // split 0.5/0.25/0.25 (tfidf/structural/text), mirroring the
+                    // original 0.30/0.15/0.15 ratio. nw=0 -> tfidf-dominant,
+                    // nw=1 -> neural-only.
+                    let nw = self.neural_weight;
+                    let rem = 1.0 - nw;
+                    (rem * 0.5, nw, rem * 0.25, rem * 0.25)
                 } else if query.semantic {
                     (0.40, 0.0, 0.20, 0.40)
                 } else {
@@ -2972,8 +3246,26 @@ impl SearchEngine {
     pub fn enable_int8_hnsw(&mut self, params: Option<Int8HnswParams>) {
         let dimension = self.vector_index.dimension();
         let params = params.unwrap_or_default();
-        self.vector_index =
-            VectorIndexImpl::HNSWQuantized(Box::new(Int8HnswIndex::with_params(dimension, params)));
+        let mut index = Int8HnswIndex::with_params(dimension, params);
+        // Re-insert existing nodes' TF-IDF embeddings. The prior implementation
+        // replaced `vector_index` with an EMPTY Int8HnswIndex, silently
+        // discarding every vector inserted during indexing — quantization was
+        // not just unused, it was actively destructive if called. Only nodes
+        // with a populated tfidf_embedding (the active indexing phase) migrate;
+        // mmap-hydrated nodes carry no on-node tfidf and are skipped (their
+        // vectors live in the mmap, a separate efficiency strategy).
+        let vectors = self
+            .nodes
+            .iter()
+            .filter(|n| !n.tfidf_embedding.is_empty())
+            .map(|n| (n.node_id.clone(), n.tfidf_embedding.clone()));
+        let migrated = index.insert_batch(vectors);
+        tracing::debug!(
+            migrated,
+            total_nodes = self.nodes.len(),
+            "enabled int8 HNSW (mmap-hydrated nodes have no on-node tfidf and are skipped)"
+        );
+        self.vector_index = VectorIndexImpl::HNSWQuantized(Box::new(index));
     }
 
     /// Check if the current index is quantized
@@ -3156,6 +3448,23 @@ mod tests {
     }
 
     #[test]
+    fn neural_rows_can_be_published_after_core_index() {
+        let mut engine = SearchEngine::new();
+        engine.index_nodes(create_test_nodes());
+        assert_eq!(engine.collect_neural_embeddings().len(), 0);
+
+        let updated = engine.update_neural_embeddings(vec![
+            ("func1".to_string(), vec![0.25, 0.5]),
+            ("missing".to_string(), vec![1.0, 1.0]),
+        ]);
+        assert_eq!(updated, 1);
+        assert_eq!(engine.collect_neural_embeddings().len(), 1);
+
+        engine.clear_neural_embeddings();
+        assert!(engine.collect_neural_embeddings().is_empty());
+    }
+
+    #[test]
     fn test_index_nodes() {
         let mut engine = SearchEngine::new();
         let nodes = create_test_nodes();
@@ -3197,7 +3506,7 @@ mod tests {
 
         let mut restored = SearchEngine::new();
         let restored_count = restored
-            .restore_from_search_snapshot(snapshot, &mmap, None)
+            .restore_from_search_snapshot(snapshot, Arc::new(mmap), None)
             .unwrap();
 
         assert_eq!(restored_count, 1);
@@ -3221,6 +3530,52 @@ mod tests {
             })
             .unwrap();
         assert_eq!(results[0].node_id, "auth.rs:authenticate_user");
+    }
+
+    #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+    #[test]
+    fn search_snapshot_restores_neural_rows_without_heap_tfidf_copy() {
+        let mut engine = SearchEngine::new();
+        let mut tfidf = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+        tfidf[0] = 1.0;
+        engine.index_nodes(vec![NodeInfo {
+            node_id: "neural-node".to_string(),
+            file_path: "main.rs".to_string(),
+            symbol_name: "neural_node".to_string(),
+            language: "rust".to_string(),
+            content: "// neural_node in main.rs\nfn neural_node() {}".to_string(),
+            byte_range: (0, 44),
+            tfidf_embedding: tfidf,
+            neural_embedding: None,
+            complexity: 1,
+            signature: None,
+            pre_tokenized: Some(vec!["neural".to_string(), "node".to_string()]),
+        }]);
+        let neural = vec![(
+            "neural-node".to_string(),
+            vec![0.5; NEURAL_EMBEDDING_DIMENSION],
+        )];
+        engine.update_neural_embeddings(neural.clone());
+        let snapshot = engine.search_snapshot(1, 0, "neural-fingerprint".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let tfidf_path = dir.path().join("tfidf.bin");
+        let neural_path = dir.path().join("neural.bin");
+        crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+            .unwrap();
+        crate::search::vector::write_mmap_embeddings(&neural_path, &neural).unwrap();
+        let tfidf_mmap = crate::search::vector::MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+        let neural_mmap = crate::search::vector::MmapEmbeddingIndex::open(&neural_path).unwrap();
+
+        let mut restored = SearchEngine::new();
+        restored
+            .restore_from_search_snapshot(
+                snapshot,
+                Arc::new(tfidf_mmap),
+                Some(Arc::new(neural_mmap)),
+            )
+            .unwrap();
+        assert_eq!(restored.collect_neural_embeddings().len(), 1);
+        assert!(restored.nodes[0].tfidf_embedding.is_empty());
     }
 
     #[test]
@@ -3252,7 +3607,7 @@ mod tests {
 
         let mut restored = SearchEngine::new();
         let err = restored
-            .restore_from_search_snapshot(snapshot, &mmap, None)
+            .restore_from_search_snapshot(snapshot, Arc::new(mmap), None)
             .unwrap_err();
         assert!(err.contains("TF-IDF mmap dimension"));
         assert!(restored.is_empty());

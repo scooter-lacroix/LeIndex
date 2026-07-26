@@ -23,7 +23,7 @@ pub mod semantic;
 /// Vector storage and indexing.
 pub mod vector;
 
-/// ONNX Runtime neural embeddings (R15 - optional feature)
+/// ONNX Runtime neural embeddings (enabled by the `onnx` build feature)
 #[cfg(feature = "onnx")]
 pub mod onnx;
 
@@ -40,7 +40,7 @@ pub use semantic::SemanticProcessor;
 pub use vector::VectorIndex;
 
 #[cfg(feature = "onnx")]
-pub use onnx::{ClientError, EmbedResult, EmbeddingClient};
+pub use onnx::{ClientError, EmbedResult, EmbeddingClient, WorkerAvailability};
 
 #[cfg(all(feature = "remote-embeddings", feature = "onnx"))]
 pub use onnx::{

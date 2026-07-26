@@ -20,7 +20,7 @@ pub enum QueryRoute {
     ExactSymbol,
     /// Literal text matching.
     ExactText,
-    /// TF-IDF and optionally ready neural search.
+    /// Mandatory TF-IDF plus configured neural search after the provider is ready.
     Semantic,
     /// PDG-aware analysis.
     DeepPdg,
