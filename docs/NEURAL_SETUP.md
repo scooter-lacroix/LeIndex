@@ -1,14 +1,16 @@
 # Neural Search Setup
 
-LeIndex 1.8.4 combines three signals over the same PDG nodes:
+LeIndex 1.9.0 combines TF-IDF, PDG, and neural signals over the same nodes when
+the ONNX feature is enabled:
 
 - TF-IDF for exact vocabulary and identifier matches
 - Qwen3 embeddings for semantic similarity
 - graph structure for callers, callees, dependencies, and symbol importance
 
-Neural search augments the existing node index. It is not a separate file or
-chunk sidecar, so semantic results retain the file, symbol, and dependency
-context used by LeIndex's navigation and analysis tools.
+Neural scoring is the active semantic companion to the existing node index. It
+is not a separate file or chunk sidecar: semantic results combine neural and
+TF-IDF signals while retaining the file, symbol, and dependency context used by
+LeIndex's navigation and analysis tools.
 
 ## Quick Setup
 
@@ -33,7 +35,7 @@ fallback is reported as a failure.
 Models are never included in GitHub Release archives, crates.io, npm, or PyPI
 artifacts. `leindex setup` owns model provisioning.
 
-The 1.8.4 profile downloads
+The 1.9.0 profile downloads
 [Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) from
 Hugging Face via Hugging Face CLI:
 
@@ -121,10 +123,12 @@ shape, so it uses a stable batch of 8 and sequence length of 128; incomplete
 batches and single queries are padded, then padded outputs are discarded.
 Qwen3 output uses last-unpadded-token pooling followed by L2 normalization.
 
-Hybrid query embedding has a 250 ms default budget. If a worker is cold,
-compiling, unhealthy, or simply over budget, LeIndex returns TF-IDF and
-structural results immediately. Neural scoring resumes when the worker is
-ready; the MCP connection is not sacrificed to an embedding timeout.
+Hybrid indexing and query embedding actively start the configured worker. A
+cold worker is awaited through its explicit initializing → ready/failed state,
+so healthy `auto`/MIGraphX builds contribute neural vectors to the same result.
+If the provider reaches a terminal failure, LeIndex returns the complete
+TF-IDF/PDG core result and reports the neural state; no elapsed-time request
+timeout cancels model loading or inference.
 
 ## Persisted Search State
 
@@ -176,7 +180,6 @@ Useful overrides:
 | `ORT_DYLIB_PATH` | explicit ONNX Runtime library | discovery chain |
 | `LEINDEX_ONNX_INFERENCE_BATCH_SIZE` | maximum inference batch | 32 dynamic, 1 legacy |
 | `LEINDEX_ONNX_SEQUENCE_LEN` | fixed token shape | 128 |
-| `LEINDEX_QUERY_NEURAL_TIMEOUT_MS` | query neural budget | 250 |
 | `LEINDEX_MIGRAPHX_FP16` | enable MIGraphX FP16 | off |
 | `LEINDEX_MIGRAPHX_EXHAUSTIVE_TUNE` | exhaustive MIGraphX tuning | off |
 
@@ -223,11 +226,10 @@ library; the setup smoke test reports provider fallback as an error.
 
 Allow `leindex setup --neural --gpu amd` to finish warmup. Do not delete
 `$LEINDEX_HOME/cache/migraphx` between runs. Retrieval remains available
-through TF-IDF while the neural path is over its query budget.
+through TF-IDF while the neural path initializes.
 
 **Search returned lexical results only**
 
 This is expected when neural setup is disabled, the worker is unavailable, or
-the 250 ms query budget expires. Run `leindex setup --check` and inspect
-diagnostics. Increase `LEINDEX_QUERY_NEURAL_TIMEOUT_MS` only when waiting is
-preferable to the bounded fallback.
+the worker has not reached its ready state. Run `leindex setup --check` and
+inspect diagnostics; the TF-IDF/PDG core remains the complete result path.

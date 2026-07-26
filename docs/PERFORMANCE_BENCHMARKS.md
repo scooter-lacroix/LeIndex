@@ -1,6 +1,73 @@
-# Performance Benchmark Implementation - Phase 4, Task 4.1
+# LeIndex Performance Benchmarks
+
+## 1.9.0 fast-path contract
+
+The release benchmark is the Rust Criterion harness in
+[`benches/mcp_tool_latency.rs`](../benches/mcp_tool_latency.rs). It measures
+the operations that previously exposed the latency cliff: cold/warm live Git
+status, exact symbol grep, scoped text search, and semantic TF-IDF search. The
+enforced fixture contains 20,000 tracked source files plus 20,000 ignored build
+files; Git remains the ignore/submodule boundary oracle.
+
+Run it locally with:
+
+```bash
+cargo bench --all-features --bench mcp_tool_latency -- --noplot
+bash scripts/check-performance.sh
+```
+
+With `LEINDEX_ENFORCE_PERF=1`, the harness performs 100 warm and 10 cold
+samples, writes `target/leindex-performance.json` (override with
+`LEINDEX_PERF_OUTPUT`), and enforces portable p95/RSS/counter thresholds. The
+workflow at `.github/workflows/performance-regression.yml` runs this gate
+weekly and on performance-sensitive changes. Neural throughput is reported but
+not hardware-gated; TF-IDF/PDG availability, readiness visibility, and exact
+route counters are the portable requirements.
+
+The benchmark is a regression detector, not a promise that every workstation
+matches a fixed wall-clock number. Record the generated Criterion output with
+the commit and hardware when changing thresholds.
+
+### Measured 20k/20k smoke (2026-07-21)
+
+The two-sample scale smoke after the live-candidate and catalog fixes produced
+`target/leindex-performance-20k-smoke-final3.json`:
+
+| Operation | p95 | RSS delta | Hydration / PDG / neural |
+|---|---:|---:|---:|
+| Exact symbol (negative lookup) | 22.984 ms | +233 KiB | 0 / 0 / 0 |
+| Scoped exact text | 13.826 ms | 0 | 0 / 0 / 0 |
+| Git status warm | 15.319 ms | +584 KiB | 0 / 0 / 0 |
+| Git status cold | 14.563 ms | 0 | 0 / 0 / 0 |
+| TF-IDF semantic | 74.434 ms | +20.4 MiB | 1 / 0 / 0 |
+
+The fixture intentionally includes 20,000 ignored files. The first run exposed
+that an exact catalog miss scanned the unchanged tree and considered untracked
+`.leindex` artifacts; generation-tree validation, changed-path fallback, and
+the shared skip-directory policy remove that scale cliff. Parsed checkpoints
+are now grouped into deterministic two-hex buckets, preserving per-file
+BLAKE3/path validation while reducing durable setup syncs to at most 256
+artifacts. This is a throughput optimization, not a request timeout.
+
+### Latest enforced 20k/20k gate (2026-07-22)
+
+`target/leindex-performance.json` passes with 100 warm and 10 cold samples:
+
+| Operation | p95 | RSS delta | Hydration / PDG / neural |
+|---|---:|---:|---:|
+| Exact symbol | 22.904 ms | +168 KiB | 0 / 0 / 0 |
+| Exact text | 14.587 ms | +64 KiB | 0 / 0 / 0 |
+| Git status warm | 15.109 ms | +628 KiB | 0 / 0 / 0 |
+| Git status cold | 15.138 ms | 0 | 0 / 0 / 0 |
+| TF-IDF semantic | 15.140 ms | +21.3 MiB | 0 / 0 / 0 |
+
+---
 
 ## Executive Summary
+
+The sections below are historical scanner-only measurements retained for
+comparison. They are not the 1.9.0 MCP latency gate and should not be read as
+current end-to-end indexing numbers.
 
 A comprehensive performance benchmark suite has been successfully implemented to validate LeIndex optimization targets. The benchmarks demonstrate that the system **far exceeds** all performance requirements.
 

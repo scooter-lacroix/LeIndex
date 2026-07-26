@@ -1,11 +1,12 @@
 # LeIndex Installation Guide
 
-Last updated: 2026-07-10 for LeIndex 1.8.4.
+Last updated: 2026-07-21 for LeIndex 1.9.0.
 
 LeIndex is distributed through GitHub release bundles, crates.io, npm, and
-PyPI. TF-IDF search works immediately after the binary is installed. Neural
-search requires one explicit `leindex setup` run so LeIndex can select the
-host provider and download the correct model.
+PyPI. Core TF-IDF retrieval and PDG relationships are published first after
+the binary is installed. Run `leindex setup` once to provision the default
+hybrid neural provider and model; healthy `auto` builds then use all three
+signals for indexing and semantic retrieval.
 
 Model files are never included in a release artifact.
 

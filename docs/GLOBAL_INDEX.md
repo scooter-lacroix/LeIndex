@@ -412,7 +412,6 @@ global_index:
   # Query routing
   query_router:
     max_concurrent_queries: 10
-    query_timeout_seconds: 30
     merge_strategy: "weighted"  # weighted, ranked, simple
 
   # Graceful degradation
@@ -556,20 +555,17 @@ if not check_project_access(user_id, project_id):
 
 **Problem**: Cross-project search taking too long
 
-**Solution**:
-1. Increase query timeout:
-   ```yaml
-   global_index:
-     query_router:
-       query_timeout_seconds: 60  # Increase from 30
-   ```
+**Solution**: Do not mask a slow phase by increasing a timeout. Use the
+route/phase diagnostics first: exact symbol/text requests should stay on the
+live/catalog path, while semantic requests must report TF-IDF and PDG health
+even when neural initialization is unavailable. Enable caching only after the
+slow phase is identified:
 
-2. Enable more aggressive caching:
-   ```yaml
+```yaml
    global_index:
      tier2:
        max_size: 2000  # Increase cache size
-   ```
+```
 
 ### Stale Metadata
 

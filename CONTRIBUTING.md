@@ -7,6 +7,7 @@ Thank you for your interest in contributing to LeIndex! This document provides g
 ## Table of Contents
 
 - [Code of Conduct](#code-of-conduct)
+- [Zero-Tolerance Policy on Discovered Issues](#zero-tolerance-policy-on-discovered-issues)
 - [Getting Started](#getting-started)
 - [Development Workflow](#development-workflow)
 - [Coding Standards](#coding-standards)
@@ -20,6 +21,31 @@ Thank you for your interest in contributing to LeIndex! This document provides g
 ## Code of Conduct
 
 Please read and follow our [Code of Conduct](CODE_OF_CONDUCT.md). We expect all contributors to be respectful and inclusive.
+
+---
+
+## Zero-Tolerance Policy on Discovered Issues
+
+"Pre-existing" is NEVER an acceptable reason to leave an issue unfixed. Every discovered issue (clippy warning, test failure, lint error, build break, type error, code smell) requires complete and thorough investigation and debugging, regardless of whether it predates the current task.
+
+When you encounter an issue:
+1. Investigate the root cause fully, do not guess.
+2. Fix it, even if it is outside the scope of your current task.
+3. If the fix is genuinely high-risk, document it as a tracked GitHub issue rather than silently leaving it.
+4. Never suppress a lint, add a skip marker, or disable a check to make an issue "disappear" without understanding why it exists.
+
+When tests fail, you must first evaluate whether the failure is caused by a structural defect in the test itself (e.g., brittle assertions, missing fixtures, incorrect setup, testing implementation details instead of behavior) or whether the test is functioning correctly and revealing an underlying system issue (e.g., a real bug, a regression, a broken invariant). Only after determining which case applies should you proceed with investigation and remediation:
+- If the test is structurally defective: fix the test so it correctly exercises the intended behavior. Do not delete or disable it.
+- If the test is revealing a real system issue: fix the underlying system so the test passes. Do not weaken the assertion or relax the expected value to make the failure go away.
+- In both cases: investigate thoroughly, document the diagnosis, and verify the fix with the full test suite.
+
+Before completing any task, the full validation suite must pass with zero warnings and zero errors:
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
 
 ---
 

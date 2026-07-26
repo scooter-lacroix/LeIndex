@@ -82,7 +82,11 @@ code navigation tasks. The table below shows the token efficiency advantage:
 
 ### `leindex_index`
 
-Index a project for code search and analysis. Parses all source files, builds the Program Dependence Graph, and creates the semantic search index.
+Start or poll a registry-owned index job. The build parses source files, makes
+the PDG and TF-IDF layers durable, and then actively publishes neural vectors
+when the configured ONNX provider is available.
+The default MCP call returns a job snapshot immediately so transport lifetime
+cannot cancel an in-progress build.
 
 **Parameters:**
 
@@ -97,6 +101,11 @@ Index a project for code search and analysis. Parses all source files, builds th
     "force_reindex": {
       "type": "boolean",
       "description": "If true, re-index even if already indexed (default: false)",
+      "default": false
+    },
+    "wait": {
+      "type": "boolean",
+      "description": "Wait for the owned job to finish instead of returning immediately (default: false)",
       "default": false
     }
   },
@@ -115,7 +124,8 @@ Index a project for code search and analysis. Parses all source files, builds th
     "name": "leindex_index",
     "arguments": {
       "project_path": "/home/user/my-project",
-      "force_reindex": false
+      "force_reindex": false,
+      "wait": false
     }
   }
 }
@@ -131,13 +141,19 @@ Index a project for code search and analysis. Parses all source files, builds th
     "content": [
       {
         "type": "text",
-        "text": "{\n  \"files_parsed\": 156,\n  \"nodes_created\": 2847,\n  \"edges_created\": 3291,\n  \"index_size_bytes\": 2457600,\n  \"indexing_time_ms\": 3420\n}"
+        "text": "{\n  \"job_id\": \"7c8f2a1d-1\",\n  \"status\": \"running\",\n  \"phase\": \"parse\",\n  \"generation\": 0,\n  \"completed_units\": 42,\n  \"total_units\": 156,\n  \"published\": {\"pdg\": false, \"lexical\": false, \"neural\": false}\n}"
       }
     ],
     "isError": false
   }
 }
 ```
+
+Poll by calling `leindex.index` again with the same project and
+`force_reindex: false`; the response is the existing job snapshot. Use
+`wait: true` only when the caller intentionally wants to await `complete` or
+`failed`. A failed attempt leaves the last published generation available and
+reports `last_error`; it is never replaced by a detached, timed-out build.
 
 ---
 
@@ -1339,12 +1355,15 @@ LeIndex uses BLAKE3 file hashes for incremental indexing. On subsequent calls to
 
 ### Scoring Methodology
 
-Search results include a composite score (0.0-1.0) with three components:
-- **Semantic (50%)**: TF-IDF cosine similarity between query and symbol tokens
-- **Text match (30%)**: Direct token overlap ratio
-- **Structural (20%)**: PDG centrality (how connected the symbol is in the dependency graph)
-
-The scoring breakdown is included in every search response.
+Search results use one node-level corpus and expose the signals used for the
+route. Exact identifier/text queries use lexical TF-IDF and exact ranking;
+semantic queries actively use TF-IDF plus neural similarity when the hybrid
+provider is configured; context, impact, and deep analysis add PDG traversal
+over those same nodes. TF-IDF and applicable PDG enrichment are core result
+data and are never cancelled by a wall-clock deadline. A cold neural worker is
+awaited through its lifecycle; terminal provider failure preserves the core
+result. The response metadata reports `tfidf_status`, `pdg_status`, and
+`neural_status`.
 
 ### Project Configuration
 
@@ -1537,13 +1556,19 @@ Every error response includes a structured `data` field with:
 
 ---
 
-## Timeouts and Performance
+## Latency, budgets, and performance
 
-### Default Timeouts
+LeIndex does not cancel correctness-critical MCP work at a wall-clock
+deadline. Indexing is an owned job and remains queryable after a client
+disconnect. Read/status tools return their live/core result first; optional PDG
+traversal accepts bounded `max_latency_ms` plus `allow_partial` and reports
+`pdg_status: "partial"` when the enrichment budget is exhausted. This budget
+never aborts a database transaction, snapshot publication, or index job.
 
-- **HTTP Server**: 300 seconds (5 minutes) for all requests
-- **Indexing**: No arbitrary timeout; use SSE streaming for progress
-- **Search**: Typically completes in <1 second for most queries
+Core retrieval is always TF-IDF plus applicable PDG metadata. With ONNX
+enabled, neural vectors are the default semantic companion and may be
+reported as `ready`, `initializing`, `failed`, `absent`, or `not_used_exact`;
+terminal neural failure never removes the core result.
 
 ### Memory Management
 
@@ -1603,10 +1628,10 @@ Response includes:
 
 ### Performance Tips
 
-1. **Index Once, Search Many**: Indexing is expensive; searches are fast
+1. **Start, then poll**: Call `leindex.index` with the default `wait=false`; poll the returned job rather than retrying a second build
 2. **Use `token_budget`**: Limit context expansion for large codebases (see table above)
 3. **Incremental Re-index**: Set `force_reindex: false` to skip unchanged files
-4. **SSE for Large Projects**: Use streaming for projects with 1000+ files
+4. **SSE for large projects**: Use streaming or job polling for projects with 1000+ files
 5. **Paginate Large Results**: Use `offset`/`limit` on `grep_symbols`, `project_map`, `search`
 6. **Batch Symbol Lookups**: Use `symbols[]` array instead of multiple single calls
 7. **Scope Your Queries**: Use `scope` on `grep_symbols` or `path` on `phase_analysis` to narrow results
@@ -1692,5 +1717,5 @@ Or via the health endpoint:
 
 ```bash
 curl http://localhost:3000/health
-# {"status":"ok","service":"leindex","version":"1.5.2"}
+# {"status":"ok","service":"leindex","version":"1.9.0"}
 ```

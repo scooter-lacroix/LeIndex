@@ -1,4 +1,4 @@
-# LeIndex Architecture (v1.8.4)
+# LeIndex Architecture (v1.9.0)
 
 ## Overview
 
@@ -75,7 +75,7 @@ LeIndex uses a project registry model:
 4. Serve read/analysis/edit-preview requests via CLI, MCP, and HTTP.
 5. Emit telemetry for diagnostics and dashboard metrics.
 
-## Hybrid Search Architecture
+## Core Retrieval and Hybrid Search Architecture
 
 LeIndex has one node-level search corpus. Parsing creates PDG nodes for files,
 symbols, methods, and other code units; both TF-IDF and Qwen3 vectors use those
@@ -95,10 +95,11 @@ maintenance before every query. Changed files update affected nodes through
 incremental indexing; a full compatibility rebuild is reserved for missing,
 stale, or incompatible artifacts.
 
-Candidate generation combines lexical, neural, and structural scores. Neural
-query embedding has a bounded default budget of 250 ms. TF-IDF and graph
-results remain available if the worker is cold, compiling, unavailable, or
-over budget.
+Candidate generation combines lexical, neural, and structural scores. TF-IDF
+and graph results are always available. When ONNX is enabled, semantic requests
+start and await the configured worker through its explicit lifecycle, so a
+healthy cold provider contributes neural scores; terminal failure preserves
+the TF-IDF/PDG core.
 
 ## Embedding Worker
 
