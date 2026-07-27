@@ -141,8 +141,12 @@ fn preceding_doc_context(bytes: &[u8], start: usize) -> String {
             break;
         }
         if trimmed.starts_with("//") || trimmed.starts_with("#") || trimmed.starts_with("/*") {
-            lines.push(line.trim());
-            if lines.len() == 8 {
+            // Conceptual-recall fix: strip comment markers so the doc embeds as
+            // prose (markers add noise tokens that dilute the semantic signal),
+            // and capture the full doc (24 lines, was 8 — long doc comments were
+            // truncated mid-concept, losing the statement of purpose).
+            lines.push(strip_comment_syntax(line.trim()));
+            if lines.len() == 24 {
                 break;
             }
         } else {
