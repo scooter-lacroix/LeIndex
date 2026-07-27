@@ -2623,10 +2623,8 @@ mod tests {
             .windows(2)
             .position(|window| window == b"fn")
             .unwrap();
-        assert_eq!(
-            preceding_doc_context(source, start),
-            "/// first\n/// second"
-        );
+        // Comment markers (`///`) are stripped so the doc embeds as prose.
+        assert_eq!(preceding_doc_context(source, start), "first\nsecond");
     }
 
     #[test]
