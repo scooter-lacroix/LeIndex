@@ -82,6 +82,111 @@ pub struct LeIndex {
     pub(crate) pipeline: Option<indexing::IndexPipelineState>,
 }
 
+/// Cross-process exclusive lock guarding writes to a project's storage.
+///
+/// SQLite WAL permits exactly **one writer**. When two leindex processes write
+/// the same `leindex.db` at once (a second MCP instance, or MCP + CLI), they
+/// contend on the database lock, exhaust the open-retry budget, and can corrupt
+/// the WAL — the failure mode that bricks a generation. This advisory
+/// `flock(2)` serializes writers across processes: a second writer blocks until
+/// the holder drops the guard. `flock` is released automatically on process
+/// death (close of the underlying fd), so a crash can never leave a stale lock.
+///
+/// Readers (search/load) do **not** take this lock, so concurrent reads stay
+/// fast and uncontended. Held for the lifetime of a single write operation
+/// (`index_project_inner` / `incremental_reindex_from_watcher`) via RAII.
+pub(crate) struct ProjectWriteLock {
+    _file: std::fs::File,
+}
+
+impl ProjectWriteLock {
+    /// Acquire an exclusive cross-process write lock for `storage_path`.
+    /// Blocks until the lock becomes available.
+    pub(crate) fn acquire(storage_path: &Path) -> Result<Self> {
+        let lock_path = storage_path.join("index.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            // Lock marker file: create if missing, never clobber if present
+            // (its content is irrelevant — only the fd is flocked).
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!("Failed to open write-lock file at {}", lock_path.display())
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // LOCK_EX blocks until exclusive ownership is obtained. POSIX
+            // guarantees release on close/exec/process-exit, so a holder that
+            // crashes frees the lock automatically (no stale PID file).
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                anyhow::bail!(
+                    "Failed to acquire cross-process write lock at {}: {err}",
+                    lock_path.display()
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            // ponytail: no cross-process lock on non-Unix; concurrent writers are
+            // unprotected. This tool targets Linux/MIGraphX. Add a real primitive
+            // if a non-Unix build is ever shipped.
+            let _ = &lock_path;
+        }
+        Ok(Self { _file: file })
+    }
+
+    /// Non-blocking variant: returns `Ok(Some(guard))` if the lock was free,
+    /// `Ok(None)` if another process holds it. Used by the mutual-exclusion
+    /// self-check; not on the write path (writes use blocking `acquire`).
+    #[cfg(test)]
+    pub(crate) fn try_acquire(storage_path: &Path) -> Result<Option<Self>> {
+        let lock_path = storage_path.join("index.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!("Failed to open write-lock file at {}", lock_path.display())
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                // EWOULDBLOCK / EAGAIN = locked by someone else (expected).
+                // Compare by value (not pattern): on Linux these two errno
+                // constants are identical, which would make an alternation
+                // pattern unreachable.
+                let raw = err.raw_os_error();
+                if raw == Some(libc::EWOULDBLOCK) || raw == Some(libc::EAGAIN) {
+                    return Ok(None);
+                }
+                anyhow::bail!(
+                    "Failed to probe write lock at {}: {err}",
+                    lock_path.display()
+                );
+            }
+        }
+        Ok(Some(Self { _file: file }))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProjectWriteLock {
+    fn drop(&mut self) {
+        use std::os::unix::io::AsRawFd;
+        // Explicit unlock for determinism (the File drop also closes the fd,
+        // which releases flock, but be explicit about intent).
+        let _ = unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 impl LeIndex {
     /// Try to create a directory and verify it is writable.
     fn try_create_dir(path: &Path) -> bool {
@@ -200,18 +305,49 @@ impl LeIndex {
                     std::thread::sleep(delay);
                 }
                 Err(e) => {
+                    // Distinguish transient lock contention (SQLITE_BUSY /
+                    // SQLITE_LOCKED — clears once the other writer finishes) from
+                    // a genuine failure (corrupt DB, disk full). Only the
+                    // contention case is tagged `[transient:lock-contention]` so
+                    // the registry layer can avoid permanently bricking a
+                    // generation on a transient storm (see
+                    // `is_transient_storage_open_failure`). A genuine failure
+                    // still bricks, correctly.
+                    let lower = e.to_string().to_lowercase();
+                    let is_lock_contention =
+                        lower.contains("lock") || lower.contains("busy");
                     return Err(e).with_context(|| {
-                        format!(
-                            "Failed to open storage at {} after {} attempts.\n\
-                             Suggestion: Delete {} and re-index, or check disk space.",
-                            db_path.display(),
-                            max_retries,
-                            db_path.display()
-                        )
+                        if is_lock_contention {
+                            format!(
+                                "Failed to open storage at {} after {} attempts \
+                                 [transient:lock-contention]. Another leindex process \
+                                 likely holds the database; retry once it completes.",
+                                db_path.display(),
+                                max_retries,
+                            )
+                        } else {
+                            format!(
+                                "Failed to open storage at {} after {} attempts.\n\
+                                 Suggestion: Delete {} and re-index, or check disk space.",
+                                db_path.display(),
+                                max_retries,
+                                db_path.display()
+                            )
+                        }
                     });
                 }
             }
         }
+    }
+
+    /// Acquire the cross-process write lock for this project's storage.
+    ///
+    /// Call at the top of any write entry point (`index_project_inner`,
+    /// `incremental_reindex_from_watcher`) and hold the returned guard for the
+    /// duration of the write (RAII releases on drop). Serializes concurrent
+    /// writers across processes to prevent SQLite WAL contention/corruption.
+    fn acquire_write_lock(&self) -> Result<ProjectWriteLock> {
+        ProjectWriteLock::acquire(self.storage_path())
     }
 
     /// Create a new LeIndex instance for a project.

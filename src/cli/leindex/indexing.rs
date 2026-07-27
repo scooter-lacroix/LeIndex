@@ -358,6 +358,10 @@ impl LeIndex {
     }
 
     pub(crate) fn incremental_reindex_from_watcher(&mut self) -> Result<super::IndexStats> {
+        // Serialize concurrent writers across processes (e.g. MCP + CLI) so two
+        // processes never write leindex.db at once. Blocks until exclusive; RAII
+        // releases on return. See `ProjectWriteLock`.
+        let _write_lock = self.acquire_write_lock()?;
         let start_time = std::time::Instant::now();
         let indexed_files =
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
@@ -739,6 +743,12 @@ impl LeIndex {
         force: bool,
         mut cap_guard: Option<&mut MemoryCapGuard>,
     ) -> Result<super::IndexStats> {
+        // Serialize concurrent writers across processes (e.g. a second MCP
+        // instance, or MCP + CLI) so two processes never write leindex.db at
+        // once. Blocks until exclusive; RAII releases on return. Without this,
+        // concurrent writers contend on SQLite WAL (one writer max) and can
+        // corrupt the DB, bricking the generation. See `ProjectWriteLock`.
+        let _write_lock = self.acquire_write_lock()?;
         let start_time = Instant::now();
         let job = JobPaths::new(self.storage_path(), self.checkpoint_generation());
         self.pipeline = Some(IndexPipelineState::new(force, start_time, job.clone()));

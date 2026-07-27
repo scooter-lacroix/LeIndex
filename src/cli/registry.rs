@@ -1002,7 +1002,22 @@ impl ProjectRegistry {
                 let core_published = self
                     .refresh_core_after_index_failure(&project_path, resident_core_generation)
                     .await;
-                mark_index_failure(&project_path, &error.to_string(), core_published);
+                let message = error.to_string();
+                if is_transient_storage_open_failure(&message) {
+                    // A transient lock-contention storm (concurrent writers held
+                    // the database longer than the open-retry budget) must NOT
+                    // permanently brick this generation. The index data is
+                    // intact; the failure clears once the contention does. Leave
+                    // the previous health/status untouched and only surface the
+                    // error to this caller.
+                    warn!(
+                        project = %project_path.display(),
+                        "Transient storage-open failure (lock contention); \
+                         leaving generation status unchanged (not bricking): {message}"
+                    );
+                } else {
+                    mark_index_failure(&project_path, &message, core_published);
+                }
                 return Err(error);
             }
             Err(error) => {
@@ -1205,6 +1220,18 @@ fn restore_latest_generation(storage_path: &Path) -> bool {
         return true;
     }
     false
+}
+
+/// True if `message` is a *transient* storage-open failure (lock contention),
+/// as tagged by `LeIndex::open_storage_with_retry` with the
+/// `[transient:lock-contention]` sentinel.
+///
+/// Such failures clear once the contending writer finishes and must NOT
+/// permanently brick a generation via `mark_index_failure` — the underlying
+/// index data is intact and a retry succeeds. Genuine failures (corrupt DB,
+/// disk full) carry no sentinel and brick as before.
+fn is_transient_storage_open_failure(message: &str) -> bool {
+    message.contains("[transient:lock-contention]")
 }
 
 fn mark_index_failure(project_path: &Path, message: &str, core_published: bool) {
