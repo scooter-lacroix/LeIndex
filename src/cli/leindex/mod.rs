@@ -380,6 +380,11 @@ impl LeIndex {
         query_type: Option<&crate::search::ranking::QueryType>,
         neural_available: bool,
     ) -> String {
+        // Fold every result-affecting config knob + model identity into the key
+        // so a config/model change invalidates the cache (not just a re-index).
+        let cfg = crate::cli::neural_config::LeIndexConfig::load_cached();
+        let rerank_model = std::env::var("LEINDEX_WORKER_RERANK_MODEL")
+            .unwrap_or_else(|_| "qwen3-reranker-0.6b-seq-cls".to_string());
         index_builder::search_cache_key_for(
             &self.project_id,
             &self.project_path,
@@ -388,6 +393,12 @@ impl LeIndex {
             top_k,
             query_type,
             neural_available,
+            &cfg.search.search_mode,
+            cfg.search.neural_weight,
+            cfg.search.rerank_enabled,
+            cfg.search.rerank_top_n,
+            &cfg.neural.model_name,
+            &rerank_model,
         )
     }
 

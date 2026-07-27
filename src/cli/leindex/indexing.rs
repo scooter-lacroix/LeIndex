@@ -1557,8 +1557,16 @@ impl LeIndex {
         {
             neural_embedder = None;
         }
+        // Cache-key fix: a model swap must NOT silently resume the previous
+        // model's embeddings. The checkpoint stores the embedder model_name that
+        // produced its rows; a mismatch forces a full re-embed.
+        let current_embed_model = crate::cli::neural_config::LeIndexConfig::load_cached()
+            .neural
+            .model_name
+            .clone();
         let neural_resume_requested = state.resumed_neural.as_ref().is_some_and(|checkpoint| {
             checkpoint.lexical_hash == lexical_hash
+                && checkpoint.model == current_embed_model
                 && (checkpoint.rows == 0 || checkpoint.mmap_path.is_file())
         });
         let mut neural_rows = 0;
@@ -1621,8 +1629,10 @@ impl LeIndex {
             } else {
                 std::env::var("LEINDEX_NEURAL_PROVIDER").unwrap_or_else(|_| "onnx".to_string())
             },
-            model: std::env::var("LEINDEX_NEURAL_MODEL")
-                .unwrap_or_else(|_| "onnx_hybrid".to_string()),
+            model: crate::cli::neural_config::LeIndexConfig::load_cached()
+                .neural
+                .model_name
+                .clone(),
         };
         let checkpoint_store = state
             .checkpoint_store

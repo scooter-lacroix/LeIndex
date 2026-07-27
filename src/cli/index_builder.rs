@@ -2111,15 +2111,33 @@ pub(crate) fn search_cache_key_for(
     top_k: usize,
     query_type: Option<&crate::search::ranking::QueryType>,
     neural_available: bool,
+    search_mode: &str,
+    neural_weight: f64,
+    rerank_enabled: bool,
+    rerank_top_n: u32,
+    embed_model: &str,
+    rerank_model: &str,
 ) -> String {
+    // v2: widens the key to include every result-affecting config knob + model
+    // identity (search_mode, neural_weight, rerank_enabled/top_n, embedder +
+    // reranker model). v1 keys omitted these, so a config or model change
+    // silently served stale cached results until a re-index changed the node
+    // count. The `v2:` namespace prefix lands in the (sanitized) cache filename
+    // so legacy v1 entries are identifiably stale and sweepable, not silent.
     search_cache_key(&format!(
-        "query:{}:{}:{}:{}:{:?}:neural={}",
+        "v2:query:{}:{}:{}:{}:{:?}:neural={}:mode={}:nw={}:rr={}|{}|{}:embed={}",
         stable_project_cache_id(project_id, project_path),
         index_fingerprint(stats),
         top_k,
         query.trim().to_lowercase(),
         query_type,
         neural_available,
+        search_mode,
+        neural_weight,
+        rerank_enabled,
+        rerank_top_n,
+        rerank_model,
+        embed_model,
     ))
 }
 
