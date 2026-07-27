@@ -201,6 +201,20 @@ fn leading_file_doc(bytes: &[u8]) -> String {
 /// Build the bounded semantic text used by both the mandatory lexical index
 /// and the deferred neural enrichment pass. Keeping this in one place makes
 /// the two result layers rank the same node content.
+/// Whether a node should be excluded from the search index because it is an
+/// external/dependency placeholder.
+///
+/// These lightweight target nodes are created for unresolved data-flow/import
+/// references (file_path "<external>", name = an arbitrary word from the
+/// source). Indexing them pollutes search results ("<external>:: which") via
+/// common-word lexical matches that outrank real project symbols, so external
+/// nodes are dropped at this shared choke point — keeping them out of the
+/// TF-IDF vocab, inverted index, vector index, and trigram index. This is the
+/// filter that excludes external third-party dependency nodes from the index.
+fn is_external_node_excluded(node: &crate::graph::pdg::Node) -> bool {
+    node.node_type == NodeType::External
+}
+
 pub(crate) fn enriched_node_content(
     pdg: &ProgramDependenceGraph,
     node_idx: petgraph::graph::NodeIndex,
@@ -1714,15 +1728,9 @@ fn index_nodes_with_embedder_inner(
         let mut neural_pending: Vec<usize> = Vec::new();
         for &node_idx in batch {
             if let Some(node) = pdg.get_node(node_idx) {
-                // Skip external/dependency placeholder nodes. These are
-                // lightweight targets created for unresolved data-flow/import
-                // references (file_path "<external>", name = an arbitrary word
-                // from the source). Indexing them pollutes search results
-                // ("<external>:: which") via common-word lexical matches that
-                // outrank real project symbols. Drop them at this shared choke
-                // point so they never enter the TF-IDF vocab, inverted index,
-                // vector index, or trigram index.
-                if node.node_type == NodeType::External {
+                // Skip external/dependency placeholder nodes (see
+                // `is_external_node_excluded`) so they never enter any index.
+                if is_external_node_excluded(node) {
                     external_skipped_count += 1;
                     continue;
                 }
