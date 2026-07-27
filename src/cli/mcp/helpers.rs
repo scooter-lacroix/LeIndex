@@ -77,6 +77,7 @@ pub(crate) fn node_type_str(nt: &crate::graph::pdg::NodeType) -> &'static str {
         crate::graph::pdg::NodeType::Variable => "variable",
         crate::graph::pdg::NodeType::Module => "module",
         crate::graph::pdg::NodeType::External => "external",
+        crate::graph::pdg::NodeType::FileSummary => "file_summary",
     }
 }
 

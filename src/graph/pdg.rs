@@ -80,6 +80,29 @@ pub struct Node {
     // the serialization shim below handles backward compat via a skip field.
 }
 
+impl Node {
+    /// Construct a synthetic per-file summary node. (conceptual-recall fix)
+    ///
+    /// `byte_range=(0,0)` (no source snippet); `enriched_node_content` builds
+    /// the embedded text from the file's leading doc + same-file item names.
+    pub fn new_file_summary(file_path: &str, language: &str) -> Self {
+        let stem = std::path::Path::new(file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        Self {
+            id: format!("{}::file_summary", file_path),
+            node_type: NodeType::FileSummary,
+            name: stem,
+            file_path: std::sync::Arc::from(file_path),
+            byte_range: (0, 0),
+            complexity: 0,
+            language: language.to_string(),
+        }
+    }
+}
+
 /// The type of code entity a node represents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum NodeType {
@@ -100,6 +123,12 @@ pub enum NodeType {
 
     /// Imported/referenced symbol not defined in this project
     External,
+
+    /// Synthetic per-file summary node (conceptual-recall fix). Embeds the
+    /// file's leading doc comment + the names of its top-level items as a
+    /// single retrievable unit, so a conceptual NL query can match a file by
+    /// its *purpose* even when no individual function does. `byte_range=(0,0)`.
+    FileSummary,
 }
 
 /// Edge types — now includes Containment for structural (non-semantic) relationships.
@@ -759,6 +788,34 @@ impl ProgramDependenceGraph {
     /// # Returns
     ///
     /// The NodeId assigned to the newly added node.
+    /// Ensure every file represented in the PDG has a `FileSummary` node.
+    /// Idempotent + resume-proof: call once after the PDG is finalized (fresh
+    /// build OR resumed from storage), before embedding. The per-file
+    /// `merge_pdgs` loop only fires for freshly-parsed files; on a resume most
+    /// files are loaded from storage and would otherwise miss their summary.
+    /// (conceptual-recall fix.)
+    pub fn ensure_file_summary_nodes(&mut self) {
+        use std::collections::{HashMap, HashSet};
+        let mut file_lang: HashMap<String, String> = HashMap::new();
+        let mut have_summary: HashSet<String> = HashSet::new();
+        for ni in self.node_indices() {
+            if let Some(n) = self.get_node(ni) {
+                let fp = n.file_path.to_string();
+                if matches!(n.node_type, NodeType::FileSummary) {
+                    have_summary.insert(fp);
+                } else {
+                    file_lang.entry(fp).or_insert_with(|| n.language.clone());
+                }
+            }
+        }
+        for (fp, lang) in file_lang {
+            if !have_summary.contains(&fp) {
+                self.add_node(Node::new_file_summary(&fp, &lang));
+            }
+        }
+    }
+
+    /// Add a node to the graph, returning its stable `NodeId`.
     pub fn add_node(&mut self, node: Node) -> NodeId {
         let id = self.graph.add_node(node.clone());
         self.symbol_index.insert(node.id.clone(), id);

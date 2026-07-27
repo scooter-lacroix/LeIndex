@@ -153,6 +153,47 @@ fn preceding_doc_context(bytes: &[u8], start: usize) -> String {
     lines.join("\n")
 }
 
+/// Strip a leading comment marker (`///`, `//!`, `//`, `/*`, `*/`, `*`, `#`)
+/// from a line, returning the prose content. FileSummary doc text must embed as
+/// descriptive prose, not commented code — comment markers add noise tokens that
+/// dilute the semantic signal (empirically buried summary nodes ~10 ranks).
+fn strip_comment_syntax(line: &str) -> String {
+    let t = line.trim_start();
+    for prefix in ["///", "//!", "//", "/*", "*/", "*", "#"] {
+        if let Some(rest) = t.strip_prefix(prefix) {
+            return rest.trim_start().to_string();
+        }
+    }
+    t.to_string()
+}
+
+/// Forward-scan the leading file-level doc/comment block (`//!`, `///`, `//`,
+/// `#`, `/*`) from the start of the file, with comment markers STRIPPED so the
+/// text embeds as prose. Used to seed FileSummary node text with the file's
+/// stated purpose (the one place a human wrote NL prose naming the concept).
+fn leading_file_doc(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            if lines.is_empty() {
+                continue;
+            }
+            break;
+        }
+        if trimmed.starts_with("//") || trimmed.starts_with("#") || trimmed.starts_with("/*") {
+            lines.push(strip_comment_syntax(line.trim()));
+            if lines.len() == 16 {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+    lines.join("\n")
+}
+
 /// Build the bounded semantic text used by both the mandatory lexical index
 /// and the deferred neural enrichment pass. Keeping this in one place makes
 /// the two result layers rank the same node content.
@@ -173,6 +214,7 @@ pub(crate) fn enriched_node_content(
             NodeType::Variable => "variable",
             NodeType::Module => "module",
             NodeType::External => "external",
+            NodeType::FileSummary => "file_summary",
         },
         node.language,
     );
@@ -184,6 +226,42 @@ pub(crate) fn enriched_node_content(
         callees.len().min(50),
         node.complexity,
     ));
+
+    // FileSummary nodes carry no source snippet (byte_range=(0,0)). Build their
+    // text from the file's leading doc + the names of same-file items, so a
+    // conceptual NL query can match the file by its *purpose* even when no
+    // individual function does. (conceptual-recall fix)
+    if matches!(node.node_type, NodeType::FileSummary) {
+        let doc = leading_file_doc(file_bytes);
+        let mut items: Vec<String> = Vec::new();
+        for ni in pdg.node_indices() {
+            if let Some(n) = pdg.get_node(ni) {
+                if !matches!(n.node_type, NodeType::FileSummary)
+                    && n.file_path == node.file_path
+                    && n.name != node.name
+                {
+                    items.push(n.name.clone());
+                    if items.len() >= 40 {
+                        break;
+                    }
+                }
+            }
+        }
+        let doc_block = if doc.is_empty() {
+            String::new()
+        } else {
+            format!("// file_doc:\n{}\n", doc)
+        };
+        let items_block = if items.is_empty() {
+            String::new()
+        } else {
+            format!("// items:\n{}\n", items.join("\n"))
+        };
+        return format!(
+            "{}\n// {} in {}\n{}{}",
+            enrichment, node.name, node.file_path, doc_block, items_block
+        );
+    }
 
     if !content.is_empty() && node.byte_range.1 > node.byte_range.0 {
         let content_bytes = content.as_bytes();

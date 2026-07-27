@@ -164,6 +164,7 @@ impl LeIndex {
                             crate::graph::pdg::NodeType::Variable => "variable".to_string(),
                             crate::graph::pdg::NodeType::Module => "module".to_string(),
                             crate::graph::pdg::NodeType::External => "external".to_string(),
+                            crate::graph::pdg::NodeType::FileSummary => "file_summary".to_string(),
                         });
 
                         // Compute line number from byte_range, or fall back to
@@ -832,6 +833,7 @@ impl LeIndex {
                             crate::graph::pdg::NodeType::Variable => "variable".to_string(),
                             crate::graph::pdg::NodeType::Module => "module".to_string(),
                             crate::graph::pdg::NodeType::External => "external".to_string(),
+                            crate::graph::pdg::NodeType::FileSummary => "file_summary".to_string(),
                         });
 
                         // Compute line number from byte_range, or fall back to

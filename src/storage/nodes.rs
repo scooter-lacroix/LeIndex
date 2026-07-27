@@ -55,6 +55,8 @@ pub enum NodeType {
     Module,
     /// Imported/referenced symbol not defined in this project
     External,
+    /// Synthetic per-file summary node (mirrors graph::pdg::NodeType::FileSummary)
+    FileSummary,
 }
 
 impl NodeType {
@@ -67,6 +69,7 @@ impl NodeType {
             NodeType::Variable => "variable",
             NodeType::Module => "module",
             NodeType::External => "external",
+            NodeType::FileSummary => "file_summary",
         }
     }
 
@@ -79,6 +82,7 @@ impl NodeType {
             "variable" => Some(NodeType::Variable),
             "module" => Some(NodeType::Module),
             "external" => Some(NodeType::External),
+            "file_summary" => Some(NodeType::FileSummary),
             _ => None,
         }
     }

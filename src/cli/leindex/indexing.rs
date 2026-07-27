@@ -459,6 +459,10 @@ impl LeIndex {
             }
         }
 
+        // Resume-proof FileSummary pass: covers ALL files (the incremental merge
+        // loop only touched changed files; existing files keep/refresh summaries).
+        pdg.ensure_file_summary_nodes();
+
         // Build the set of changed file paths so we only include nodes from
         // those files in the incremental delta.
         let changed_file_set: HashSet<String> = source_file_hashes
@@ -1270,6 +1274,9 @@ impl LeIndex {
                 }
             }
         }
+        // Resume-proof FileSummary pass: covers files loaded from storage on
+        // resume (the merge_pdgs loop above only fires for freshly-parsed files).
+        pdg.ensure_file_summary_nodes();
         if !all_signatures.is_empty() {
             crate::graph::resolve_cross_file_call_edges_for_files(&mut pdg, &all_signatures);
             crate::graph::resolve_cross_file_flow_edges_for_files(&mut pdg, &all_signatures);
