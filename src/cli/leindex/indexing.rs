@@ -358,10 +358,11 @@ impl LeIndex {
     }
 
     pub(crate) fn incremental_reindex_from_watcher(&mut self) -> Result<super::IndexStats> {
-        // Serialize concurrent writers across processes (e.g. MCP + CLI) so two
-        // processes never write leindex.db at once. Blocks until exclusive; RAII
-        // releases on return. See `ProjectWriteLock`.
-        let _write_lock = self.acquire_write_lock()?;
+        // NOTE: the cross-process write lock is acquired by the WATCHER
+        // (non-blocking, skip-on-busy) before calling this fn — see
+        // `try_acquire_write_lock` in mod.rs and watcher.rs. Do not add a
+        // blocking flock here: spawn_blocking cannot be cancelled, so a
+        // blocking acquire held by another process would stall the watcher.
         let start_time = std::time::Instant::now();
         let indexed_files =
             crate::storage::pdg_store::get_indexed_files(&self.storage, &self.project_id)
@@ -748,6 +749,15 @@ impl LeIndex {
         // once. Blocks until exclusive; RAII releases on return. Without this,
         // concurrent writers contend on SQLite WAL (one writer max) and can
         // corrupt the DB, bricking the generation. See `ProjectWriteLock`.
+        //
+        // Scope note: this guards the HEAVY writes (PDG + neural embeddings +
+        // publish) — the contention that actually bricked gen-93. The brief
+        // startup writes in `LeIndex::new` (schema migration, project-metadata
+        // insert) happen before this guard runs; they are idempotent and
+        // serialized by SQLite's own busy_timeout, so they are not a bricking
+        // risk. If startup-write contention is ever observed, extend the lock
+        // to a write-mode `Storage::open` (or make `ProjectWriteLock`
+        // re-entrant so `new()` can also acquire it without self-deadlock).
         let _write_lock = self.acquire_write_lock()?;
         let start_time = Instant::now();
         let job = JobPaths::new(self.storage_path(), self.checkpoint_generation());

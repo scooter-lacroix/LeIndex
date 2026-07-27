@@ -134,7 +134,16 @@ pub fn source_inventory(root: &Path) -> Result<Vec<PathBuf>, GitInventoryError> 
             continue;
         }
         if candidate.is_file() {
-            paths.push(candidate);
+            // `starts_with` above is lexical, but `is_file()` follows
+            // symlinks. A tracked symlink like `leak.rs -> ../outside.rs`
+            // would otherwise let us read+index content outside the project
+            // boundary (the non-Git walker excludes symlinks; this matches).
+            // Canonicalize and re-check against root: allow in-tree symlinks,
+            // reject escapes and broken links.
+            match candidate.canonicalize() {
+                Ok(resolved) if resolved.starts_with(&root) => paths.push(candidate),
+                _ => continue,
+            }
         }
     }
     paths.sort();

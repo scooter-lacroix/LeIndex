@@ -130,6 +130,22 @@ impl IndexWatcher {
                                     LockAcquire::Acquired(g) => g,
                                     LockAcquire::Skipped => return ReindexOutcome::Skipped,
                                 };
+                                // Cross-process guard: skip (not block) if
+                                // another process is already writing this
+                                // project (e.g. a concurrent `leindex index`).
+                                // A blocking flock here would stall the watcher
+                                // — spawn_blocking can't be cancelled, so a held
+                                // lock would leave reindex_active true forever.
+                                // Held via RAII for the whole reindex below.
+                                let _flock = match idx.try_acquire_write_lock() {
+                                    Ok(Some(guard)) => guard,
+                                    Ok(None) => return ReindexOutcome::Skipped,
+                                    Err(e) => {
+                                        return ReindexOutcome::Failed(format!(
+                                            "write-lock probe: {e}"
+                                        ))
+                                    }
+                                };
                                 let reindex_result = std::panic::catch_unwind(
                                     std::panic::AssertUnwindSafe(|| {
                                         idx.incremental_reindex_from_watcher()

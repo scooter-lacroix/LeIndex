@@ -129,20 +129,24 @@ impl ProjectWriteLock {
                 );
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            // ponytail: no cross-process lock on non-Unix; concurrent writers are
-            // unprotected. This tool targets Linux/MIGraphX. Add a real primitive
-            // if a non-Unix build is ever shipped.
-            let _ = &lock_path;
+            // Blocking exclusive LockFileEx. Released automatically when the
+            // handle closes (process death), matching flock semantics.
+            windows_lock::lock(&file, true).map_err(|err| {
+                anyhow::anyhow!(
+                    "Failed to acquire cross-process write lock at {}: {err}",
+                    lock_path.display()
+                )
+            })?;
         }
         Ok(Self { _file: file })
     }
 
     /// Non-blocking variant: returns `Ok(Some(guard))` if the lock was free,
-    /// `Ok(None)` if another process holds it. Used by the mutual-exclusion
-    /// self-check; not on the write path (writes use blocking `acquire`).
-    #[cfg(test)]
+    /// `Ok(None)` if another process holds it. Used by the watcher (skip a
+    /// reindex when another process is already writing) and by the
+    /// mutual-exclusion self-check.
     pub(crate) fn try_acquire(storage_path: &Path) -> Result<Option<Self>> {
         let lock_path = storage_path.join("index.lock");
         let file = std::fs::OpenOptions::new()
@@ -173,17 +177,115 @@ impl ProjectWriteLock {
                 );
             }
         }
+        #[cfg(windows)]
+        {
+            // LOCKFILE_FAIL_IMMEDIATELY: returns ERROR_LOCK_VIOLATION (33) or
+            // ERROR_SHARING_VIOLATION (32) if another process holds it.
+            match windows_lock::lock(&file, false) {
+                Ok(()) => {}
+                Err(err)
+                    if matches!(
+                        err.raw_os_error(),
+                        Some(33) | Some(32) // LOCK_VIOLATION | SHARING_VIOLATION
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(err) => {
+                    anyhow::bail!(
+                        "Failed to probe write lock at {}: {err}",
+                        lock_path.display()
+                    );
+                }
+            }
+        }
         Ok(Some(Self { _file: file }))
     }
 }
 
-#[cfg(unix)]
 impl Drop for ProjectWriteLock {
     fn drop(&mut self) {
-        use std::os::unix::io::AsRawFd;
-        // Explicit unlock for determinism (the File drop also closes the fd,
-        // which releases flock, but be explicit about intent).
-        let _ = unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // Explicit unlock for determinism (the File drop also closes the fd,
+            // which releases flock, but be explicit about intent).
+            let _ = unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        #[cfg(windows)]
+        {
+            windows_lock::unlock(&self._file);
+        }
+    }
+}
+
+/// Windows cross-process file locking via `LockFileEx`/`UnlockFileEx`
+/// (kernel32), used by `ProjectWriteLock` on the Windows release target
+/// (see AGENTS.md: builds Linux/macOS/Windows). No extra crate — raw FFI.
+/// Locks byte `[0, 1)` exclusively; a second exclusive lock on the same byte
+/// blocks (blocking) or fails immediately (try), providing mutual exclusion.
+/// The handle close on `File` drop releases the lock, matching `flock`.
+#[cfg(windows)]
+mod windows_lock {
+    use std::fs::File;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset_low: u32,
+        offset_high: u32,
+        event: usize,
+    }
+
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+
+    extern "system" {
+        fn LockFileEx(
+            handle: usize,
+            flags: u32,
+            reserved: u32,
+            len_low: u32,
+            len_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+        fn UnlockFileEx(
+            handle: usize,
+            reserved: u32,
+            len_low: u32,
+            len_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+
+    /// Lock byte `[0, 1)` exclusively. `blocking = false` adds
+    /// `LOCKFILE_FAIL_IMMEDIATELY`.
+    pub(super) fn lock(file: &File, blocking: bool) -> std::io::Result<()> {
+        let handle = file.as_raw_handle() as usize;
+        let mut overlapped = Overlapped::default();
+        let mut flags = LOCKFILE_EXCLUSIVE_LOCK;
+        if !blocking {
+            flags |= LOCKFILE_FAIL_IMMEDIATELY;
+        }
+        // SAFETY: FFI to kernel32 `LockFileEx` with a valid file handle and a
+        // valid `Overlapped` pointer. Byte range [0,1).
+        let ok = unsafe { LockFileEx(handle, flags, 0, 1, 0, &mut overlapped) };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Release the byte `[0, 1)` lock. Best-effort — the handle close on drop
+    /// also releases it.
+    pub(super) fn unlock(file: &File) {
+        let handle = file.as_raw_handle() as usize;
+        let mut overlapped = Overlapped::default();
+        let _ = unsafe { UnlockFileEx(handle, 0, 1, 0, &mut overlapped) };
     }
 }
 
@@ -314,8 +416,16 @@ impl LeIndex {
                     // `is_transient_storage_open_failure`). A genuine failure
                     // still bricks, correctly.
                     let lower = e.to_string().to_lowercase();
-                    let is_lock_contention =
-                        lower.contains("lock") || lower.contains("busy");
+                    // Whitelist the exact SQLite transient-lock messages
+                    // (SQLITE_BUSY/LOCKED from rusqlite) rather than a loose
+                    // "lock"/"busy" substring. A loose match risks false
+                    // positives (an error mentioning "lock" in prose) that
+                    // would skip mark_index_failure for a genuine failure and
+                    // leave it un-bricked, or false negatives that brick on a
+                    // transient storm.
+                    let is_lock_contention = lower.contains("database is locked")
+                        || lower.contains("database table is locked")
+                        || lower.contains("could not obtain a lock");
                     return Err(e).with_context(|| {
                         if is_lock_contention {
                             format!(
@@ -348,6 +458,15 @@ impl LeIndex {
     /// writers across processes to prevent SQLite WAL contention/corruption.
     fn acquire_write_lock(&self) -> Result<ProjectWriteLock> {
         ProjectWriteLock::acquire(self.storage_path())
+    }
+
+    /// Non-blocking cross-process write lock: `Ok(Some(guard))` if free,
+    /// `Ok(None)` if another process currently holds it. Used by the watcher
+    /// so an in-flight index in another process makes the reindex SKIP (not
+    /// block indefinitely — a blocking flock here would stall the watcher,
+    /// since spawn_blocking can't be cancelled; see watcher.rs).
+    pub(crate) fn try_acquire_write_lock(&self) -> Result<Option<ProjectWriteLock>> {
+        ProjectWriteLock::try_acquire(self.storage_path())
     }
 
     /// Create a new LeIndex instance for a project.

@@ -16,10 +16,7 @@ fn project_write_lock_is_mutually_exclusive() {
 
     // Free initially.
     let probe = ProjectWriteLock::try_acquire(&storage).unwrap();
-    assert!(
-        probe.is_some(),
-        "lock should be free when uncontended"
-    );
+    assert!(probe.is_some(), "lock should be free when uncontended");
     let holder = probe.unwrap();
 
     // Held -> second acquirer denied.

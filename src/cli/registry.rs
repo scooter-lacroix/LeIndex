@@ -198,6 +198,27 @@ impl std::ops::DerefMut for ProjectWriteGuard<'_> {
 /// distinguish read vs write operations.
 pub type ProjectHandle = Arc<ProjectRwLock>;
 
+/// RAII guard that clears a project's `incremental_refresh_guard` flag on drop.
+///
+/// `maybe_incremental_refresh` sets the flag to `true` before spawning the
+/// background index, and must clear it on EVERY exit path — ok, error, OR
+/// panic. If a panic in `index_project` skipped the clear, the flag would stay
+/// `true` forever and permanently disable background refreshes for that
+/// project (kilo CRITICAL). Tokio unwinds a panicking task's stack, so this
+/// Drop runs even on panic.
+struct RefreshGuard {
+    registry: Arc<ProjectRegistry>,
+    path: PathBuf,
+}
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.registry.incremental_refresh_guard.try_lock() {
+            map.insert(self.path.clone(), false);
+        }
+    }
+}
+
 /// Multi-project registry.
 pub struct ProjectRegistry {
     /// Canonical path -> project handle.
@@ -430,6 +451,14 @@ impl ProjectRegistry {
         let path_string = path.to_string_lossy().into_owned();
 
         tokio::spawn(async move {
+            // Panic-safe guard: clears the refresh flag on drop (ok, error, OR
+            // panic). Without this, a panic in `index_project` would leave the
+            // flag `true` and disable all future background refreshes for this
+            // project.
+            let _guard = RefreshGuard {
+                registry: Arc::clone(&registry),
+                path: path.clone(),
+            };
             debug!(
                 project = %path.display(),
                 "Starting background incremental refresh"
@@ -438,13 +467,6 @@ impl ProjectRegistry {
             // Run the incremental index (force_reindex=false means only
             // changed files are re-parsed).
             let result = registry.index_project(Some(&path_string), false).await;
-
-            // Clear the guard.
-            {
-                if let Ok(mut map) = registry.incremental_refresh_guard.try_lock() {
-                    map.insert(path.clone(), false);
-                }
-            }
 
             match result {
                 Ok(stats) => {
@@ -1177,6 +1199,16 @@ impl ProjectRegistry {
 
             // A+ hotspot cleanup: also evict stale-cache entry
             self.stale_cache.write().await.remove(&path);
+
+            // Drop per-project bookkeeping so a reloaded project starts clean.
+            // Without this, `index_jobs` leaks one entry per distinct project
+            // visited (memory growth over a long-lived session), and a stale
+            // `true` in `incremental_refresh_guard` would block future
+            // background refreshes for this path when it is reloaded.
+            self.index_jobs.lock().await.remove(&path);
+            if let Ok(mut guard) = self.incremental_refresh_guard.try_lock() {
+                guard.remove(&path);
+            }
 
             info!(
                 "Evicted LRU project: {} (capacity: {})",
