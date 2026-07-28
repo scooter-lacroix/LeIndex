@@ -526,7 +526,15 @@ impl ProjectRegistry {
             let mut jobs = self.index_jobs.lock().await;
             if let Some(existing) = jobs.get(&canonical).cloned() {
                 let current = existing.snapshot().await;
-                if current.status == JobStatus::Running || !force_reindex {
+                // Reuse an existing job ONLY while it is still Running, to
+                // consolidate concurrent requests onto one in-flight index. A
+                // terminal (Completed/Failed) job must NOT be reused when
+                // force_reindex=false: sources may have changed since it
+                // finished, and reusing it would return the stale snapshot and
+                // never perform the documented incremental refresh (the caller's
+                // index_project() run is itself incremental — cheap if nothing
+                // changed, correct if something did).
+                if current.status == JobStatus::Running {
                     existing
                 } else {
                     let state = Arc::new(IndexJobState::with_state_path(
