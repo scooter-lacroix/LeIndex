@@ -12,15 +12,18 @@ permissions:
   contents: read
 
 jobs:
-  #cargo-audit: scans Cargo.lock for known vulnerabilities in dependencies
+  #cargo-deny: scans Cargo.lock for known vulnerabilities in dependencies.
+  #Switched from rustsec/audit-check (cargo-audit 0.22+ ignores ./audit.toml and
+  #its action exposes no ignore input); cargo-deny reads deny.toml reliably.
   cargo-audit:
     name: Dependency Vulnerability Scan
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          command: check
+          arguments: advisories
 
   #gitleaks: scans commits for hardcoded secrets (API keys, tokens, passwords)
   gitleaks:
