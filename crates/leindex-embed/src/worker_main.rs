@@ -405,9 +405,23 @@ impl SocketLifecycle {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Derive the Failed health from the held state WITHOUT calling
+        // self.failed_health()/self.health(): both re-lock this non-reentrant
+        // Mutex, and we already hold it here -> deadlock. The worker would hang
+        // in shutdown, never releasing its ONNX/GPU session or removing its
+        // socket/PID files (multi-GB process stuck). Read the health straight
+        // off the locked state instead.
+        let mut next_health = match &*state {
+            SocketLifecycleState::Initializing(health)
+            | SocketLifecycleState::Failed(health)
+            | SocketLifecycleState::Ready { health, .. } => health.clone(),
+        };
+        next_health.state = WorkerState::Failed;
+        next_health.phase = "failed".to_string();
+        next_health.error = Some("worker shutting down".to_string());
         let previous = std::mem::replace(
             &mut *state,
-            SocketLifecycleState::Failed(self.failed_health("worker shutting down".to_string())),
+            SocketLifecycleState::Failed(next_health),
         );
         // Dropping the previous Ready{runtime,..} drops the canonical runtime
         // clone; WorkerRuntime::Drop frees the session when this is the last Arc.

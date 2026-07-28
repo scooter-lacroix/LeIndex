@@ -174,6 +174,25 @@ pub(crate) fn is_stale_fast(
         return true;
     }
 
+    // Tree-OID drift: a Git checkout/pull/rebase can move the worktree to a
+    // different revision without bumping mtimes on indexed files whose content
+    // didn't change. Compare the indexed tree OID to the current one so this
+    // index gate agrees with `cmd_diagnostics` (cli.rs) and triggers a
+    // re-index on real tree changes. This fn is TTL-amortized by the registry
+    // stale_cache, so the single `git rev-parse` is acceptable; non-git
+    // projects resolve to None (no-op, no false positive).
+    if let Some(health) = load_health(ctx.storage_path) {
+        if let Some(indexed) = health.tree_oid.as_deref() {
+            if let Some(current) =
+                crate::cli::git::tree_oid(ctx.project_path).ok().flatten()
+            {
+                if indexed != current {
+                    return true;
+                }
+            }
+        }
+    }
+
     let db_time = match ctx
         .storage_path
         .join("leindex.db")
