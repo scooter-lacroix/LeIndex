@@ -23,7 +23,12 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-          arguments: advisories
+          # `command-arguments` (NOT `arguments`): the latter is for cargo-deny
+          # Common Options (--all-features etc.) placed BEFORE the subcommand,
+          # which made the action run `cargo deny advisories check` and fail with
+          # "unrecognized subcommand 'advisories'". `command-arguments` goes after
+          # the subcommand -> `cargo deny check advisories`.
+          command-arguments: advisories
 
   #gitleaks: scans commits for hardcoded secrets (API keys, tokens, passwords)
   gitleaks:
