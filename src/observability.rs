@@ -268,7 +268,10 @@ impl ErrorTracker {
 
     /// Captures an error event.
     ///
-    /// The event is always stored in the local ring buffer for later retrieval.
+    /// The event is appended to the local ring buffer for later retrieval,
+    /// **best-effort**: it is silently dropped if the buffer is at its 1000-entry
+    /// cap or if the lock is poisoned. (In all cases a `tracing::error!` is
+    /// emitted.)
     ///
     /// **STUB:** remote forwarding to Sentry is NOT yet implemented. `SENTRY_DSN`
     /// is parsed and stored, but this method only emits a local `tracing` event

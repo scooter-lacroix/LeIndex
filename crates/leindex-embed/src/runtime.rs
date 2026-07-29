@@ -1664,6 +1664,16 @@ impl WorkerRuntime {
         const RERANK_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\nThinking\n\nAnswer\n\n";
         const RERANK_INSTRUCT: &str =
             "Given a code search query, retrieve the most relevant source code";
+        // Token length of the fixed assistant suffix, so rerank truncation can
+        // preserve it: the Qwen3-Reranker predicts at the suffix position, so
+        // dropping it (as a naive first-N truncation does) scores long
+        // documents from an out-of-distribution prompt. Computed once per call;
+        // add_special = false because the suffix appears mid-template (BOS is
+        // only added at the template start).
+        let rerank_suffix_len: usize = tokenizer
+            .encode(RERANK_SUFFIX, false)
+            .map(|enc| enc.get_ids().len())
+            .unwrap_or(0);
         let pair_texts: Vec<String> = rerank_req
             .documents
             .iter()
@@ -1702,10 +1712,12 @@ impl WorkerRuntime {
                 if let Some(template) = sub_batch.first() {
                     padded.resize(inference_batch_size, template.clone());
                 }
-                let sub_scores = self.run_onnx_rerank_sub_batch(session, &padded)?;
+                let sub_scores =
+                    self.run_onnx_rerank_sub_batch(session, &padded, rerank_suffix_len)?;
                 all_rerank_scores.extend_from_slice(&sub_scores[..sub_batch.len()]);
             } else {
-                let sub_scores = self.run_onnx_rerank_sub_batch(session, sub_batch)?;
+                let sub_scores =
+                    self.run_onnx_rerank_sub_batch(session, sub_batch, rerank_suffix_len)?;
                 all_rerank_scores.extend_from_slice(&sub_scores);
             }
         }
@@ -1743,6 +1755,7 @@ impl WorkerRuntime {
         &self,
         session: &Arc<Mutex<Session>>,
         encodings: &[tokenizers::Encoding],
+        suffix_token_len: usize,
     ) -> Result<Vec<f32>, WorkerError> {
         let batch_size = encodings.len();
         if batch_size == 0 {
@@ -1771,14 +1784,36 @@ impl WorkerRuntime {
         for encoding in encodings {
             let ids = encoding.get_ids();
             let mask = encoding.get_attention_mask();
-            let n = ids.len().min(max_len);
+            let total = ids.len();
+            let n = total.min(max_len);
+            // LEFT padding: Qwen3-Reranker is decoder-style — it must attend up
+            // to the final real token (the assistant position). Real tokens go
+            // at the END, pads at the start.
             for _ in 0..(max_len - n) {
                 input_ids.push(0);
                 attention_mask.push(0);
             }
-            for i in 0..n {
-                input_ids.push(ids[i] as i64);
-                attention_mask.push(mask[i] as i64);
+            if total > max_len && suffix_token_len > 0 && suffix_token_len < max_len {
+                // Input overflows the window. Keep the first (max_len - suffix)
+                // tokens (system+instruct+query+document start) AND the final
+                // `suffix_token_len` tokens (the required assistant suffix the
+                // model predicts on) — truncates the document middle. The prior
+                // code took the first `max_len` tokens, dropping the suffix and
+                // scoring long documents from an out-of-distribution prompt.
+                let front = max_len - suffix_token_len;
+                for i in 0..front {
+                    input_ids.push(ids[i] as i64);
+                    attention_mask.push(mask[i] as i64);
+                }
+                for i in (total - suffix_token_len)..total {
+                    input_ids.push(ids[i] as i64);
+                    attention_mask.push(mask[i] as i64);
+                }
+            } else {
+                for i in 0..n {
+                    input_ids.push(ids[i] as i64);
+                    attention_mask.push(mask[i] as i64);
+                }
             }
         }
 
