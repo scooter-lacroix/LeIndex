@@ -856,14 +856,27 @@ impl LeIndex {
             files: fingerprints,
         };
         let generation = state.job.generation;
-        let (checkpoint_store, resumed_scan) = latest_incomplete_job(self.storage_path())
-            .and_then(|(paths, _)| {
-                let store = CheckpointStore::from_paths(paths);
-                let saved = store.read_scan().ok().flatten()?;
-                (saved.input_hash == scan.input_hash).then_some((store, saved))
-            })
-            .map(|(store, saved)| (store, Some(saved)))
-            .unwrap_or_else(|| (self.checkpoint_store(generation), None));
+        // force_reindex=true must bypass resume entirely. The resume reuses a
+        // prior job's parse/PDG artifacts when the source hash matches — correct
+        // for non-force incremental runs (and crash recovery), but on a forced
+        // rebuild it would re-publish stale artifacts and prevent picking up
+        // parser / indexing-logic changes (the whole point of --force). Note
+        // `latest_incomplete_job` keys on `last_reusable_phase != "complete"`,
+        // and no publication path writes "complete", so a successfully published
+        // job remains forever "resumable" — force therefore has to skip the
+        // lookup rather than rely on a completeness marker.
+        let (checkpoint_store, resumed_scan) = if state.force {
+            (self.checkpoint_store(generation), None)
+        } else {
+            latest_incomplete_job(self.storage_path())
+                .and_then(|(paths, _)| {
+                    let store = CheckpointStore::from_paths(paths);
+                    let saved = store.read_scan().ok().flatten()?;
+                    (saved.input_hash == scan.input_hash).then_some((store, saved))
+                })
+                .map(|(store, saved)| (store, Some(saved)))
+                .unwrap_or_else(|| (self.checkpoint_store(generation), None))
+        };
         state.job = checkpoint_store.paths.clone();
         if resumed_scan.is_none() {
             let scan_hash = checkpoint_store.write_scan(&scan)?;
