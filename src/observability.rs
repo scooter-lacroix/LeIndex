@@ -268,11 +268,17 @@ impl ErrorTracker {
 
     /// Captures an error event.
     ///
-    /// If SENTRY_DSN is configured, the event would be forwarded to Sentry.
-    /// In all cases, the event is stored for later retrieval.
+    /// The event is always stored in the local ring buffer for later retrieval.
+    ///
+    /// **STUB:** remote forwarding to Sentry is NOT yet implemented. `SENTRY_DSN`
+    /// is parsed and stored, but this method only emits a local `tracing` event
+    /// — it does not serialize/POST to the Sentry API. Do not assume configured
+    /// production errors are remotely reported until the transport lands.
     pub fn capture(&self, event: ErrorEvent) {
         if self.dsn.is_some() {
-            // In production, this would serialize and POST to the Sentry API.
+            // TODO(sentry): serialize the ErrorEvent to Sentry's envelope
+            // format and POST to the configured DSN. Until then this only logs
+            // locally — SENTRY_DSN is accepted but unused for remote submission.
             tracing::error!(
                 message = %event.message,
                 trace_id = ?event.trace_id,

@@ -419,10 +419,7 @@ impl SocketLifecycle {
         next_health.state = WorkerState::Failed;
         next_health.phase = "failed".to_string();
         next_health.error = Some("worker shutting down".to_string());
-        let previous = std::mem::replace(
-            &mut *state,
-            SocketLifecycleState::Failed(next_health),
-        );
+        let previous = std::mem::replace(&mut *state, SocketLifecycleState::Failed(next_health));
         // Dropping the previous Ready{runtime,..} drops the canonical runtime
         // clone; WorkerRuntime::Drop frees the session when this is the last Arc.
         drop(previous);

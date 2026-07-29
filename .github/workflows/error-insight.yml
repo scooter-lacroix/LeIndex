@@ -97,19 +97,22 @@ jobs:
 
       - name: Check for Sentry integration
         run: |
-          # The observability module (src/observability.rs) provides
-          # ErrorTracker::capture() which forwards to Sentry when
-          # SENTRY_DSN is configured. This step reports on its status.
+          # The observability module (src/observability.rs) exposes
+          # ErrorTracker::capture(), which records errors to a local ring
+          # buffer and emits a tracing event. Remote forwarding to Sentry is
+          # STUBBED: SENTRY_DSN is parsed but capture() does not yet POST to
+          # the Sentry API. This step reports the real (current) status so
+          # operators are not misled into thinking production errors are
+          # remotely reported.
           if grep -q "SENTRY_DSN" .env.example 2>/dev/null; then
-            echo "Sentry integration is configured in the observability module."
-            echo "Set SENTRY_DSN secret to enable production error tracking."
-            echo "Once enabled, errors flow from Sentry -> GitHub issues via Sentry's"
-            echo "GitHub integration (see Sentry project settings > Integrations)."
+            echo "SENTRY_DSN is wired through config, but the transport is a stub."
+            echo "ErrorTracker::capture() logs locally; remote Sentry submission is NOT yet implemented."
+            echo "Once the transport lands, errors will flow Sentry -> GitHub issues (Sentry > Settings > Integrations)."
           fi
-          echo "Error-to-insight pipeline configured:"
-          echo "  1. Runtime errors -> ErrorTracker::capture() in observability.rs"
+          echo "Error-to-insight pipeline current state:"
+          echo "  1. Runtime errors -> ErrorTracker::capture() in observability.rs (local log + ring buffer; remote forwarding STUBBED)"
           echo "  2. CI failures -> This workflow (daily triage)"
-          echo "  3. Production -> Sentry -> GitHub issues (when SENTRY_DSN set)"
+          echo "  3. Production -> Sentry -> GitHub issues (NOT YET ACTIVE; transport unimplemented)"
 
   # ── Product analytics: usage metrics collection ───────────────────
   # Collects anonymous usage metrics from CI (test counts, build times,
@@ -133,7 +136,7 @@ jobs:
             metrics-cargo-
       - name: Collect build and test metrics
         run: |
-          set -e
+          set -eo pipefail
 
           # Time the full build
           BUILD_START=$(date +%s)
@@ -143,7 +146,7 @@ jobs:
 
           # Time the test suite
           TEST_START=$(date +%s)
-          cargo test --workspace --quiet 2>&1 | tee test-output.txt || true
+          cargo test --workspace --quiet 2>&1 | tee test-output.txt || TESTS_FAILED=1
           TEST_END=$(date +%s)
           TEST_TIME=$((TEST_END - TEST_START))
 
@@ -166,7 +169,18 @@ jobs:
             "repository": "${{ github.repository }}"
           }
           EOF
+
+          # Fail the job if workspace tests failed — but ONLY after the metrics
+          # above are computed and the artifact is written (the upload step runs
+          # via `if: always()`). Previously `|| true` masked test regressions and
+          # the scheduled run reported success with a misleading passed-test
+          # count (pipefail + this gate make regressions visible instead).
+          if [ "${TESTS_FAILED:-0}" = "1" ]; then
+            echo "::error::Workspace tests failed during the metrics run; artifact is partial."
+            exit 1
+          fi
       - name: Upload metrics artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: product-metrics
