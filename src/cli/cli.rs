@@ -1027,21 +1027,21 @@ async fn cmd_diagnostics_impl(project: Option<PathBuf>) -> AnyhowResult<()> {
                 | crate::cli::leindex::ComponentStatus::Failed
         )
     });
-    // A clean worktree is NOT proof of freshness: after `git checkout`/`pull`
-    // of a different revision, `git status` reports no modified/deleted paths
-    // while the persisted index was built from the previous tree. Compare the
-    // indexed tree OID against the current one to catch that drift (falls back
-    // to the dirtiness check when either side is unavailable — non-git or no
-    // saved tree OID).
-    let current_tree_oid = crate::cli::git::tree_oid(leindex.project_path())
-        .ok()
-        .flatten();
-    let tree_drift = match (
-        health.as_ref().and_then(|h| h.tree_oid.as_deref()),
-        current_tree_oid.as_deref(),
-    ) {
-        (Some(indexed), Some(current)) => indexed != current,
-        _ => false,
+    // Tree-OID drift: a clean worktree is NOT proof of freshness — after
+    // `git checkout`/`pull` of a different revision, `git status` reports no
+    // modified/deleted paths while the persisted index was built from the
+    // previous tree. Compare the indexed tree OID against the current one. If
+    // we have a saved tree OID but git itself fails (lock contention, corrupt
+    // repo, permissions), treat it as drift (conservative — report stale
+    // rather than silently miss it, matching is_stale_fast). Only Ok(None)
+    // (non-git) and a missing saved OID fall back to the dirtiness check.
+    let tree_drift = match health.as_ref().and_then(|h| h.tree_oid.as_deref()) {
+        Some(indexed) => match crate::cli::git::tree_oid(leindex.project_path()) {
+            Ok(Some(current)) => indexed != current,
+            Ok(None) => false,
+            Err(_) => true,
+        },
+        None => false,
     };
     let stale = health_stale || !changed.is_empty() || !deleted.is_empty() || tree_drift;
 

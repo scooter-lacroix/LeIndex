@@ -179,14 +179,26 @@ pub(crate) fn is_stale_fast(
     // didn't change. Compare the indexed tree OID to the current one so this
     // index gate agrees with `cmd_diagnostics` (cli.rs) and triggers a
     // re-index on real tree changes. This fn is TTL-amortized by the registry
-    // stale_cache, so the single `git rev-parse` is acceptable; non-git
-    // projects resolve to None (no-op, no false positive).
+    // stale_cache, so the single `git rev-parse` is acceptable.
     if let Some(health) = load_health(ctx.storage_path) {
         if let Some(indexed) = health.tree_oid.as_deref() {
-            if let Some(current) =
-                crate::cli::git::tree_oid(ctx.project_path).ok().flatten()
-            {
-                if indexed != current {
+            match crate::cli::git::tree_oid(ctx.project_path) {
+                Ok(Some(current)) => {
+                    if indexed != current {
+                        return true;
+                    }
+                }
+                Ok(None) => {
+                    // Not a git repo — no tree OID to compare; fall through to
+                    // the mtime/count checks.
+                }
+                Err(_) => {
+                    // Genuine git failure (lock contention, corrupt repo,
+                    // permission error). We can't determine the current tree, so
+                    // don't risk serving stale cached results: treat as stale
+                    // and re-index. (Previously .ok().flatten() collapsed this
+                    // to None and silently skipped the check — a false negative
+                    // under exactly the concurrent-git scenario this guards.)
                     return true;
                 }
             }
