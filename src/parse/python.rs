@@ -1,5 +1,6 @@
 // Python language parser implementation
 
+use crate::cfg_builder;
 use crate::parse::traits::{find_node_by_id, Block, Edge, EdgeType, Parameter, Visibility};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
@@ -501,24 +502,8 @@ fn calculate_complexity(
     }
 }
 
-/// Control flow graph builder
-struct CfgBuilder<'a> {
-    source: &'a [u8],
-    blocks: Vec<Block>,
-    edges: Vec<Edge>,
-    next_block_id: usize,
-}
-
+cfg_builder!();
 impl<'a> CfgBuilder<'a> {
-    fn new(source: &'a [u8]) -> Self {
-        Self {
-            source,
-            blocks: Vec::new(),
-            edges: Vec::new(),
-            next_block_id: 0,
-        }
-    }
-
     fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {
         // Create entry block
         let entry_id = self.create_block();
@@ -557,41 +542,6 @@ impl<'a> CfgBuilder<'a> {
                 }
             }
         }
-
-        Ok(())
-    }
-
-    fn handle_if_statement(
-        &mut self,
-        _node: &tree_sitter::Node<'_>,
-        current_block: usize,
-    ) -> Result<()> {
-        // Create true and false branches
-        let true_block = self.create_block();
-        let false_block = self.create_block();
-        let merge_block = self.create_block();
-
-        // Add edges
-        self.edges.push(Edge {
-            from: current_block,
-            to: true_block,
-            edge_type: EdgeType::TrueBranch,
-        });
-        self.edges.push(Edge {
-            from: current_block,
-            to: false_block,
-            edge_type: EdgeType::FalseBranch,
-        });
-        self.edges.push(Edge {
-            from: true_block,
-            to: merge_block,
-            edge_type: EdgeType::Unconditional,
-        });
-        self.edges.push(Edge {
-            from: false_block,
-            to: merge_block,
-            edge_type: EdgeType::Unconditional,
-        });
 
         Ok(())
     }
@@ -640,31 +590,6 @@ impl<'a> CfgBuilder<'a> {
         });
 
         Ok(())
-    }
-
-    fn create_block(&mut self) -> usize {
-        let id = self.next_block_id;
-        self.next_block_id += 1;
-        self.blocks.push(Block {
-            id,
-            statements: Vec::new(),
-        });
-        id
-    }
-
-    fn add_statement_to_block(&mut self, block_id: usize, statement: String) {
-        if let Some(block) = self.blocks.get_mut(block_id) {
-            block.statements.push(statement);
-        }
-    }
-
-    fn finish(self) -> Graph<Block, Edge> {
-        Graph {
-            blocks: self.blocks,
-            edges: self.edges,
-            entry_block: 0,
-            exit_blocks: vec![self.next_block_id.saturating_sub(1)],
-        }
     }
 }
 
