@@ -188,4 +188,4 @@ docs/optimization/
 jscpd-report/
 
 # Throwaway rewrite scripts
-rewrite.py
+/rewrite.py

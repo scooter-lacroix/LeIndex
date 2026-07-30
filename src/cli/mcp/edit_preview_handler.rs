@@ -69,6 +69,17 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
 
         // Support simple mode: top-level old_text/new_text (or old_str/new_str aliases)
         let changes_val = resolve_changes_from_args(&args);
+        // Reject before any parsing/caching: neither `changes` nor
+        // old_text/new_text was supplied, so there is nothing to preview.
+        let changes_empty = changes_val
+            .as_array()
+            .map(|arr| arr.is_empty())
+            .unwrap_or(true);
+        if changes_empty {
+            return Err(JsonRpcError::invalid_params(
+                "Provide either 'changes' or 'old_text'/'new_text' to preview.",
+            ));
+        }
 
         let project_path_arg = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path_arg).await?;

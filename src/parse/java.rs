@@ -65,7 +65,7 @@ impl JavaParser {
                 Self::push_java_type_signature(node, source, parent_path, "enum", signatures);
                 Self::visit_java_children(node, source, signatures, parent_path);
             }
-            "field_declaration" => Self::extract_java_fields(node, source, signatures),
+            "field_declaration" => Self::extract_java_fields(node, source, signatures, parent_path),
             _ => Self::visit_java_children(node, source, signatures, parent_path),
         }
     }
@@ -122,6 +122,7 @@ impl JavaParser {
         node: &tree_sitter::Node<'_>,
         source: &[u8],
         signatures: &mut Vec<SignatureInfo>,
+        parent_path: &[String],
     ) {
         let type_annotation = node
             .child_by_field_name("type")
@@ -142,7 +143,11 @@ impl JavaParser {
 
             signatures.push(SignatureInfo {
                 name: name.to_string(),
-                qualified_name: name.to_string(),
+                qualified_name: if parent_path.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}.{}", parent_path.join("."), name)
+                },
                 parameters: vec![],
                 return_type: type_annotation.clone(),
                 visibility: extract_visibility(node, source),
@@ -151,7 +156,7 @@ impl JavaParser {
                 docstring: None,
                 calls: vec![],
                 imports: vec![],
-                byte_range: (0, 0),
+                byte_range: (child.start_byte(), child.end_byte()),
                 flow_facts: vec![],
                 cyclomatic_complexity: 0,
             });
