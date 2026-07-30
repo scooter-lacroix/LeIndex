@@ -1426,7 +1426,9 @@ impl LeIndex {
         let rows = 0;
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         let mut rows = rows;
-        let loaded = requested && checkpoint.is_some_and(|checkpoint| checkpoint.rows == 0);
+        // loaded stays false until the mmap restore actually yields rows; a
+        // checkpoint with rows==0 means nothing was loaded, not a successful restore.
+        let loaded = false;
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
         let mut loaded = loaded;
         if requested {
@@ -1504,7 +1506,7 @@ impl LeIndex {
             }
         }
         #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-        if !neural_resume_loaded {
+        if !neural_resume_loaded && neural_rows > 0 {
             index_builder::persist_neural_embeddings_to_mmap(
                 &self.search_engine,
                 &self.project_path,
