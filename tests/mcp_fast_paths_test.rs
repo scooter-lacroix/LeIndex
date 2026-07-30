@@ -153,7 +153,7 @@ async fn current_fast_path_counters(fixture: &GitFixture) -> Vec<(&'static str, 
 }
 
 #[test]
-fn path_metadata_primitives_are_deterministic() {
+fn test_path_metadata_primitives_are_deterministic() {
     let _lock = counter_test_lock();
     PROJECT_HYDRATIONS.store(7, Ordering::Relaxed);
     PDG_LOADS.store(11, Ordering::Relaxed);
@@ -194,7 +194,7 @@ fn path_metadata_primitives_are_deterministic() {
 }
 
 #[test]
-fn exact_route_classifier_is_deterministic() {
+fn test_exact_route_classifier_is_deterministic() {
     assert_eq!(
         classify("Askpass::new", RequestedMode::Auto),
         QueryRoute::ExactSymbol
@@ -218,7 +218,7 @@ fn exact_route_classifier_is_deterministic() {
 }
 
 #[tokio::test]
-async fn request_timing_collector_keeps_causal_phase_measurements() {
+async fn test_request_timing_collector_keeps_causal_phase_measurements() {
     let (_, timings) = collect_request_timings(async {
         record_hydrate_ms(7);
         record_pdg_ms(11);
@@ -232,7 +232,7 @@ async fn request_timing_collector_keeps_causal_phase_measurements() {
 }
 
 #[tokio::test]
-async fn request_timing_collector_accepts_neural_worker_measurements() {
+async fn test_request_timing_collector_accepts_neural_worker_measurements() {
     let (_, timings) = collect_request_timings(async {
         let timing_sink = current_request_timing_sink().expect("request timing sink");
         std::thread::spawn(move || record_neural_ms_to(&timing_sink, 17))
@@ -245,7 +245,7 @@ async fn request_timing_collector_accepts_neural_worker_measurements() {
 }
 
 #[tokio::test]
-async fn current_fast_paths_do_not_hydrate_the_project_before_live_reads() {
+async fn test_current_fast_paths_do_not_hydrate_the_project_before_live_reads() {
     let fixture = GitFixture::new();
 
     for (tool, (hydrations, pdg_loads, neural_requests)) in
@@ -261,7 +261,7 @@ async fn current_fast_paths_do_not_hydrate_the_project_before_live_reads() {
 }
 
 #[tokio::test]
-async fn live_fast_paths_must_not_hydrate_or_load_search_dependencies() {
+async fn test_live_fast_paths_must_not_hydrate_or_load_search_dependencies() {
     let fixture = GitFixture::new();
     let observed = current_fast_path_counters(&fixture).await;
 
@@ -277,7 +277,7 @@ async fn live_fast_paths_must_not_hydrate_or_load_search_dependencies() {
 }
 
 #[tokio::test]
-async fn exact_grep_must_not_request_neural_search() {
+async fn test_exact_grep_must_not_request_neural_search() {
     let _lock = counter_test_lock();
     let (_temp, project_path) = catalog_fixture();
     let registry = Arc::new(ProjectRegistry::new(2));
@@ -302,7 +302,7 @@ async fn exact_grep_must_not_request_neural_search() {
 }
 
 #[tokio::test]
-async fn git_status_does_not_hydrate_when_no_generation_is_resident() {
+async fn test_git_status_does_not_hydrate_when_no_generation_is_resident() {
     let fixture = GitFixture::new();
     let counters = counters_after_call(
         "leindex.git-status",
@@ -368,7 +368,7 @@ fn catalog_fixture() -> (TempDir, std::path::PathBuf) {
 }
 
 #[tokio::test]
-async fn canonical_path_read_symbol_uses_the_same_catalog_key() {
+async fn test_canonical_path_read_symbol_uses_the_same_catalog_key() {
     let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     let registry = Arc::new(ProjectRegistry::new(2));
@@ -400,7 +400,7 @@ async fn canonical_path_read_symbol_uses_the_same_catalog_key() {
 }
 
 #[tokio::test]
-async fn default_project_exact_catalog_grep_does_not_hydrate() {
+async fn test_default_project_exact_catalog_grep_does_not_hydrate() {
     let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     let registry = Arc::new(ProjectRegistry::new(2));
@@ -429,7 +429,7 @@ async fn default_project_exact_catalog_grep_does_not_hydrate() {
 }
 
 #[tokio::test]
-async fn canonical_path_read_symbol_rejects_files_outside_the_project() {
+async fn test_canonical_path_read_symbol_rejects_files_outside_the_project() {
     let (_temp, project) = catalog_fixture();
     let registry = Arc::new(ProjectRegistry::new(2));
     let error = ReadSymbolHandler
@@ -447,7 +447,7 @@ async fn canonical_path_read_symbol_rejects_files_outside_the_project() {
 }
 
 #[tokio::test]
-async fn catalog_rows_cannot_escape_the_live_project_root() {
+async fn test_catalog_rows_cannot_escape_the_live_project_root() {
     let (_temp, project) = catalog_fixture();
     let outside = project.parent().unwrap().join("outside.rs");
     let db_path = project.join(".leindex/leindex.db");
@@ -479,7 +479,7 @@ async fn catalog_rows_cannot_escape_the_live_project_root() {
 }
 
 #[tokio::test]
-async fn default_project_catalog_reads_do_not_hydrate() {
+async fn test_default_project_catalog_reads_do_not_hydrate() {
     let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     let registry = Arc::new(ProjectRegistry::new(2));
@@ -499,7 +499,7 @@ async fn default_project_catalog_reads_do_not_hydrate() {
 }
 
 #[tokio::test]
-async fn stale_catalog_symbol_uses_live_parser_without_hydration() {
+async fn test_stale_catalog_symbol_uses_live_parser_without_hydration() {
     let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     fs::write(
@@ -530,7 +530,7 @@ async fn stale_catalog_symbol_uses_live_parser_without_hydration() {
 }
 
 #[tokio::test]
-async fn stale_unscoped_catalog_symbol_uses_its_validated_candidate() {
+async fn test_stale_unscoped_catalog_symbol_uses_its_validated_candidate() {
     let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     fs::write(
@@ -579,7 +579,7 @@ async fn test_catalog_miss_read_symbol_uses_unscoped_live_inventory_without_hydr
 }
 
 #[tokio::test]
-async fn stale_catalog_file_summary_does_not_attach_stale_pdg_relations() {
+async fn test_stale_catalog_file_summary_does_not_attach_stale_pdg_relations() {
     let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     fs::write(
@@ -607,7 +607,7 @@ async fn stale_catalog_file_summary_does_not_attach_stale_pdg_relations() {
 }
 
 #[tokio::test]
-async fn exact_grep_catalog_miss_uses_live_parser_without_hydration() {
+async fn test_exact_grep_catalog_miss_uses_live_parser_without_hydration() {
     let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();
     fs::write(

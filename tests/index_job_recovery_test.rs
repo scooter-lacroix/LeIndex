@@ -20,7 +20,7 @@ fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 #[test]
-fn resume_each_phase() {
+fn test_resume_each_phase() {
     let temp = tempfile::tempdir().expect("checkpoint tempdir");
     let store = CheckpointStore::new(temp.path(), 7);
     let scan = ScanCheckpoint {
@@ -133,7 +133,7 @@ fn resume_each_phase() {
 }
 
 #[test]
-fn bucketed_parse_artifacts_keep_path_identity() {
+fn test_bucketed_parse_artifacts_keep_path_identity() {
     let temp = tempfile::tempdir().expect("checkpoint tempdir");
     let store = CheckpointStore::new(temp.path(), 8);
     let parsed = ParsedFileCheckpoint {
@@ -158,7 +158,7 @@ fn bucketed_parse_artifacts_keep_path_identity() {
 }
 
 #[test]
-fn lexical_failure_keeps_core_current_and_restart_reuses_checkpoint() {
+fn test_lexical_failure_keeps_core_current_and_restart_reuses_checkpoint() {
     let _env_lock = env_test_lock();
     let temp = tempfile::tempdir().expect("project tempdir");
     std::fs::create_dir_all(temp.path().join("src")).expect("source directory");
@@ -200,7 +200,7 @@ fn lexical_failure_keeps_core_current_and_restart_reuses_checkpoint() {
 }
 
 #[tokio::test]
-async fn registry_hydrates_current_generation_not_mutable_root() {
+async fn test_registry_hydrates_current_generation_not_mutable_root() {
     let temp = tempfile::tempdir().expect("project tempdir");
     std::fs::create_dir_all(temp.path().join("src")).expect("source directory");
     std::fs::write(
@@ -347,7 +347,7 @@ fn make_tiny_rust_project() -> tempfile::TempDir {
 /// The owned, detached task continues to run and reaches `complete` status
 /// independently of the caller that started it.
 #[tokio::test]
-async fn disconnect_survival_job_continues_to_completion() {
+async fn test_disconnect_survival_job_continues_to_completion() {
     let _env_lock = AsyncEnvTestLock::acquire().await;
     let temp = make_tiny_rust_project();
     let registry = Arc::new(ProjectRegistry::new(2));
@@ -408,7 +408,7 @@ async fn disconnect_survival_job_continues_to_completion() {
 /// same project path while a job is running, the second call must return the
 /// same `job_id` rather than starting a second job.
 #[tokio::test]
-async fn concurrent_requests_coalesce_into_single_job() {
+async fn test_concurrent_requests_coalesce_into_single_job() {
     let _env_lock = AsyncEnvTestLock::acquire().await;
     let temp = make_tiny_rust_project();
     let registry = Arc::new(ProjectRegistry::new(2));
@@ -443,7 +443,7 @@ async fn concurrent_requests_coalesce_into_single_job() {
 /// conflict. The `.leindex` storage directory must exist after all calls
 /// complete, and the project must be loaded exactly once.
 #[tokio::test]
-async fn concurrent_first_load_creates_project_once() {
+async fn test_concurrent_first_load_creates_project_once() {
     let _env_lock = AsyncEnvTestLock::acquire().await;
     let temp = make_tiny_rust_project();
 
@@ -505,7 +505,7 @@ async fn concurrent_first_load_creates_project_once() {
 /// (here, the outer JoinHandle on the inner spawned task) must capture the
 /// panic and update the job state with a message containing "panic".
 #[tokio::test]
-async fn panic_during_index_sets_failed_status() {
+async fn test_panic_during_index_sets_failed_status() {
     let _env_lock = AsyncEnvTestLock::acquire().await;
     let _panic_marker = EnvVarGuard::set("LEINDEX_INJECT_PANIC", "1");
 

@@ -173,11 +173,12 @@ async fn find_live_symbol_in_inventory(
     symbol: &str,
 ) -> Result<(LiveParse, CatalogSymbol), JsonRpcError> {
     // A catalog miss without a file hint should still be useful. Git supplies
-    // an ignore-aware candidate list; cap parsing at 20 files so a typo cannot
-    // turn a symbol lookup into a repository scan.
+    // an ignore-aware candidate list; we prefilter by content to find relevant
+    // files before applying a bounded parse cap so a symbol in a later-sorting
+    // file is not reported absent.
     let root = live.root().to_path_buf();
-    let candidates = tokio::task::spawn_blocking(move || {
-        match crate::cli::git::source_inventory(&root) {
+    let candidates =
+        tokio::task::spawn_blocking(move || match crate::cli::git::source_inventory(&root) {
             Ok(paths) => paths,
             Err(crate::cli::git::GitInventoryError::NotRepository) => walkdir::WalkDir::new(&root)
                 .follow_links(false)
@@ -193,21 +194,32 @@ async fn find_live_symbol_in_inventory(
                 .map(|entry| entry.path().to_path_buf())
                 .collect(),
             Err(_) => Vec::new(),
-        }
-        .into_iter()
-        .take(20)
-        .collect::<Vec<_>>()
-    })
-    .await
-    .map_err(|error| {
-        JsonRpcError::internal_error(format!("live symbol inventory failed: {error}"))
-    })?;
+        })
+        .await
+        .map_err(|error| {
+            JsonRpcError::internal_error(format!("live symbol inventory failed: {error}"))
+        })?;
+    // Content prefilter: only parse files whose bytes mention the symbol, so the
+    // bounded parse cap applies to *relevant* files rather than an arbitrary
+    // alphabetical slice — a symbol in a later-sorting file is still found. A
+    // path-name prefilter would be wrong (symbols are not named after their files).
+    let mut parsed_count = 0usize;
     for candidate in candidates {
-        let Ok(parsed) = parse_live_file(candidate).await else {
+        if parsed_count >= 20 {
+            break;
+        }
+        let Ok(bytes) = read_live_bytes(candidate.clone()).await else {
             continue;
         };
-        if let Some(node) = find_live_symbol(&parsed, symbol) {
-            return Ok((parsed, node));
+        if !String::from_utf8_lossy(&bytes).contains(symbol) {
+            continue;
+        }
+        parsed_count += 1;
+        let Ok(live_parsed) = parse_live_file(candidate).await else {
+            continue;
+        };
+        if let Some(node) = find_live_symbol(&live_parsed, symbol) {
+            return Ok((live_parsed, node));
         }
     }
     Err(JsonRpcError::invalid_params(format!(

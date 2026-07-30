@@ -753,6 +753,12 @@ impl ProjectRegistry {
             state.mark_neural_published().await;
         }
         state.complete(generation).await;
+        // Mark the job as complete in the checkpoint state to prevent reuse
+        // of stale artifacts on subsequent force_reindex runs.
+        let storage_root = crate::cli::leindex::resolve_existing_storage_path(path)
+            .unwrap_or_else(|| path.join(".leindex"));
+        let job_paths = crate::cli::index_job::JobPaths::new(&storage_root, generation);
+        let _ = crate::cli::index_job::mark_checkpoint_complete(&job_paths.state(), generation);
     }
 
     async fn preserve_core_after_job_error(
@@ -1156,9 +1162,23 @@ impl ProjectRegistry {
     /// default so that subsequent tool calls that omit `project_path` resolve
     /// to it. The actual `LeIndex` creation happens lazily on first tool call
     /// via `get_or_load()`.
+    /// Set the default project path (canonicalized).
     pub async fn set_default_path(&self, path: PathBuf) {
+        let canonical = path.canonicalize().unwrap_or_else(|err| {
+            // Canonicalization can fail for a transiently-missing mount or a
+            // permission error. Fall back to the raw path rather than panicking:
+            // the caller supplied a real path, and `default_project_path()`
+            // re-canonicalizes on lookup, so a non-canonical stored form degrades
+            // to an extra reload rather than breaking the registry.
+            warn!(
+                "Failed to canonicalize default project path {}: {}",
+                path.display(),
+                err
+            );
+            path.clone()
+        });
         let mut default = self.default_project.write().await;
-        *default = Some(path);
+        *default = Some(canonical);
     }
 
     /// Return the configured default path without creating or hydrating a project.

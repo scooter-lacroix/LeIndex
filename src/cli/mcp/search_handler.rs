@@ -16,6 +16,17 @@ fn classify_search(
 ) {
     use crate::search::query_route::{QueryRoute, RequestedMode};
 
+    // When the caller explicitly requests "prose" mode, bypass the auto-routing
+    // classification that may reclassify a single identifier as ExactSymbol.
+    // Prose mode always uses text scoring, regardless of query shape.
+    if search_mode == "prose" {
+        return (
+            QueryRoute::ExactText,
+            "exact_text",
+            Some(crate::search::ranking::QueryType::Exact),
+        );
+    }
+
     let requested = match search_mode {
         "exact" => RequestedMode::Exact,
         "semantic" | "code" => RequestedMode::Semantic,

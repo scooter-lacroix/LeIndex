@@ -1,5 +1,12 @@
 name: Rollback
 
+# Human-gated emergency rollback. Triggered manually with a version + reason.
+# Performs REVERSIBLE release-state changes (crate yank, GitHub release marked
+# pre-release, npm deprecation) so a bad release stops being installed while a
+# fix is prepared. Every action is individually gated on the relevant secret and
+# reports its result; none of them delete artifacts, so the release can be
+# restored (`cargo unyank`, `gh release edit --latest`, `npm deprecate ''`).
+
 on:
   workflow_dispatch:
     inputs:
@@ -20,14 +27,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Create rollback issue
+
+      - name: Create rollback tracking issue
+        id: issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           ISSUE_URL=$(gh issue create \
             --repo "${{ github.repository }}" \
             --title "Rollback: v${{ inputs.version }} - ${{ inputs.reason }}" \
-            --label "type:bug, P0-critical" \
+            --label "type:bug,P0-critical" \
             --body "## Rollback Initiated
 
           **Version**: v${{ inputs.version }}
@@ -35,31 +44,70 @@ jobs:
           **Initiated by**: ${{ github.actor }}
           **Timestamp**: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          ### Steps
-          1. [ ] Yank crate from crates.io if published
-          2. [ ] Unpublish npm package if published
-          3. [ ] Mark GitHub Release as pre-release/draft
-          4. [ ] Revert the version bump commit on master
-          5. [ ] Publish patch release with fix
-          6. [ ] Close this issue when resolved
+          Automated rollback actions run in the triggering workflow run. Track
+          their status in the job log; this issue is the human audit trail.
 
-          ### Quick Commands
-          \`\`\`bash
-          # Yank from crates.io
-          cargo yank --version ${{ inputs.version }}
-
-          # Revert merge commit (find it first)
-          git log --oneline --grep='${{ inputs.version }}'
-          git revert <commit-hash>
-          \`\`\`" \
-            2>&1)
+          ### Follow-up
+          1. [ ] Ship the fix on master; the release.yml workflow republishes.
+          2. [ ] Restore the release: \`cargo unyank --vers ${{ inputs.version }}\`,
+                \`gh release edit v${{ inputs.version }} --latest\`,
+                \`npm deprecate leindex-mcp@${{ inputs.version }} ''\`.
+          3. [ ] Close this issue when resolved." \
+            2>&1) || ISSUE_URL="(failed to create issue)"
           echo "Created rollback issue: $ISSUE_URL"
+          echo "url=$ISSUE_URL" >> "$GITHUB_OUTPUT"
 
-      - name: Re-trigger release pipeline
+      # crates.io yank prevents NEW dependents from resolving the version;
+      # existing lockfiles keep working. Requires CARGO_REGISTRY_TOKEN.
+      # Reversible via `cargo unyank --vers <version>`.
+      - name: Yank crate from crates.io
+        continue-on-error: true
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "CARGO_REGISTRY_TOKEN not set — skipping crate yank (manual: cargo yank --vers ${{ inputs.version }})"
+            exit 0
+          fi
+          cargo yank leindex --vers "${{ inputs.version }}"
+          echo "::notice::Yanked leindex@${{ inputs.version }} from crates.io"
+
+      # Mark the published GitHub Release as a pre-release so it is no longer
+      # advertised as the latest. Reversible via `gh release edit --latest`.
+      - name: Mark GitHub Release as pre-release
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          echo "To re-release after fix:"
-          echo "1. Fix the issue identified above"
-          echo "2. Push the fix to master with the corrected version"
-          echo "3. The release.yml workflow will automatically publish"
+          if gh release edit "v${{ inputs.version }}" --prerelease \
+               --notes "$(gh release view "v${{ inputs.version }}" --json body -q .body 2>/dev/null || echo '')"$'\n\n'"**Rolled back** (${{ inputs.reason }}): marked pre-release by rollback workflow."; then
+            echo "::notice::Marked release v${{ inputs.version }} as pre-release"
+          else
+            echo "::warning::Could not mark release v${{ inputs.version }} as pre-release (it may not exist)"
+          fi
+
+      # npm deprecate surfaces a warning for anyone installing the version
+      # without removing it. Requires NPM_TOKEN. Reversible with an empty message.
+      - name: Deprecate npm package
+        continue-on-error: true
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "NPM_TOKEN not set — skipping npm deprecation (manual: npm deprecate leindex-mcp@${{ inputs.version }} '<reason>')"
+            exit 0
+          fi
+          npm deprecate "leindex-mcp@${{ inputs.version }}" "Rolled back: ${{ inputs.reason }}. Use the latest version instead."
+          echo "::notice::Deprecated leindex-mcp@${{ inputs.version }} on npm"
+
+      - name: Rollback summary
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "## Rollback v${{ inputs.version }} complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Reason**: ${{ inputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Tracking issue**: ${{ steps.issue.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Performed: crate yank (crates.io, if token set), release marked pre-release (GitHub), npm deprecation (if token set)." >> "$GITHUB_STEP_SUMMARY"
+          echo "To re-release after the fix: push the corrected version to master; release.yml republishes automatically." >> "$GITHUB_STEP_SUMMARY"

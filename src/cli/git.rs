@@ -133,22 +133,21 @@ fn inventory_paths(root: &Path, list_output: &[u8], gitlinks: &[PathBuf]) -> Vec
 }
 
 fn accepted_source_path(candidate: PathBuf, root: &Path, gitlinks: &[PathBuf]) -> Option<PathBuf> {
-    if !candidate.starts_with(root)
+    // Canonicalize first to resolve symlinks; reject if canonical target is outside root.
+    let canonical = candidate.canonicalize().ok()?;
+    if !canonical.starts_with(root)
         || gitlinks
             .iter()
             .any(|gitlink| candidate.starts_with(gitlink))
-        || is_skipped_source_path(&candidate, root)
-        || has_nested_git_boundary(&candidate, root)
-        || !candidate.is_file()
+        || is_skipped_source_path(&canonical, root)
+        || has_nested_git_boundary(&canonical, root)
+        || !canonical.is_file()
     {
         return None;
     }
 
-    candidate
-        .canonicalize()
-        .ok()
-        .filter(|resolved| resolved.starts_with(root))
-        .map(|_| candidate)
+    // Return original candidate (before canonicalization) to preserve caller expectations.
+    Some(candidate)
 }
 
 /// Return worktree files whose contents contain a fixed string.
@@ -362,10 +361,17 @@ pub fn submodule_summaries(root: &Path) -> Result<Vec<GitSubmoduleSummary>, GitI
         if fields.len() < 3 || fields[0] != b"160000" {
             continue;
         }
-        summaries.push(GitSubmoduleSummary {
-            path: top.join(path_bytes(raw_path)),
-            commit_oid: String::from_utf8_lossy(fields[1]).into_owned(),
-        });
+        let gitlink_path = top.join(path_bytes(raw_path));
+        // Canonicalize and filter to only gitlinks within the requested project root.
+        let Some(canonical) = gitlink_path.canonicalize().ok() else {
+            continue;
+        };
+        if canonical.starts_with(root) {
+            summaries.push(GitSubmoduleSummary {
+                path: gitlink_path,
+                commit_oid: String::from_utf8_lossy(fields[1]).into_owned(),
+            });
+        }
     }
     summaries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(summaries)

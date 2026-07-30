@@ -352,6 +352,8 @@ fn changed_paths(status: &GitStatus) -> Vec<(PathBuf, &'static str)> {
         .iter()
         .map(|path| (path, "modified"))
         .chain(status.staged.iter().map(|path| (path, "staged")))
+        // Include conflicted files in the set of changed paths for PDG enrichment.
+        .chain(status.conflicted.iter().map(|path| (path, "conflicted")))
         .filter(|(path, _)| seen.insert((*path).clone()))
         .map(|(path, state)| (path.clone(), state))
         .collect()

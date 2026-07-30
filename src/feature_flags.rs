@@ -54,8 +54,11 @@ impl FeatureFlag {
     /// Returns whether this flag is enabled by default (without env override).
     pub fn default_value(&self) -> bool {
         match self {
-            // These are stable production features, default-on
-            Self::StreamingMcp | Self::GlobalAutoSync => true,
+            // GA production features default ON so the flag acts as a
+            // per-deployment rollout-KILL (explicit `false` disables; unset
+            // follows normal config). Genuinely new/experimental features below
+            // still default off.
+            Self::StreamingMcp | Self::GlobalAutoSync | Self::NeuralSearch => true,
             // Everything else defaults off
             _ => false,
         }
@@ -82,6 +85,15 @@ impl FeatureFlag {
     }
 }
 
+/// Helper to compute the effective neural search enablement flag.
+///
+/// This combines the runtime feature flag (`LEINDEX_FEATURE_NEURAL_SEARCH`)
+/// with the user-level config knob (`leindex.toml` `[neural] enabled`).
+/// Conservative semantics: the config can disable neural (set to false),
+/// but the runtime flag cannot enable what the config disabled.
+pub fn is_neural_enabled(config_value: bool) -> bool {
+    crate::feature_flags::FeatureFlag::NeuralSearch.is_enabled() && config_value
+}
 /// Internal store that caches env-var lookups in a OnceLock for zero-cost reads.
 struct FlagStore {
     values: HashMap<FeatureFlag, bool>,
@@ -157,7 +169,10 @@ mod test {
 
     #[test]
     fn test_default_values() {
-        assert!(!FeatureFlag::NeuralSearch.default_value());
+        // NeuralSearch is a GA feature: its flag defaults ON so it acts as a
+        // per-deployment rollout-KILL (explicit `false` disables; unset follows
+        // normal config) rather than gating a not-yet-released capability.
+        assert!(FeatureFlag::NeuralSearch.default_value());
         assert!(FeatureFlag::StreamingMcp.default_value());
     }
 }

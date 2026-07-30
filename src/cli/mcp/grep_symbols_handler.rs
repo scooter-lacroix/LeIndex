@@ -11,6 +11,7 @@ use crate::graph::pdg::{NodeId, ProgramDependenceGraph};
 use crate::search::query_route::{classify, QueryRoute, RequestedMode};
 use crate::search::ranking::Score;
 use crate::storage::{CatalogReader, CatalogSymbol};
+use regex::Regex;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -169,6 +170,7 @@ fn catalog_symbol_matches(
     scope: Option<&str>,
     pattern_lower: &str,
     type_filter: &str,
+    regex: Option<&Regex>,
 ) -> bool {
     let in_scope = scope.map_or(true, |scope| {
         symbol.file_path.starts_with(scope)
@@ -177,7 +179,10 @@ fn catalog_symbol_matches(
     });
     let type_matches = type_filter == "all" || symbol.node_type == type_filter;
     let name_matches = symbol.symbol_name.to_lowercase().contains(pattern_lower)
-        || symbol.qualified_name.to_lowercase().contains(pattern_lower);
+        || symbol.qualified_name.to_lowercase().contains(pattern_lower)
+        || regex.is_some_and(|re| {
+            re.is_match(&symbol.symbol_name) || re.is_match(&symbol.qualified_name)
+        });
     in_scope && type_matches && name_matches
 }
 
@@ -188,13 +193,24 @@ async fn fresh_catalog_symbols(
     pattern: &str,
     type_filter: &str,
 ) -> Result<(Vec<(CatalogSymbol, Vec<u8>)>, HashSet<PathBuf>), JsonRpcError> {
+    let regex = compiled_symbol_regex(pattern);
     let symbols = match catalog {
         Some(catalog) if is_code_pattern(pattern) => {
-            // Identifier-shaped exact requests should use the indexed equality
-            // path. A leading-wildcard LIKE scan over every catalog row is
-            // the scale cliff on large projects; the live Git candidate path
-            // below handles substring misses without hydrating the catalog.
-            catalog.find_symbol(pattern, None).await.unwrap_or_default()
+            // Identifier-shaped exact requests prefer the indexed equality path
+            // (a leading-wildcard LIKE over every row is a scale cliff on large
+            // projects). Fall back to the indexed substring query when equality
+            // returns nothing, so an unchanged symbol whose name only *contains*
+            // the query (e.g. `auth` -> `authenticate`) is still recovered from
+            // the catalog instead of being missed and routed only to live edits.
+            let exact = catalog.find_symbol(pattern, None).await.unwrap_or_default();
+            if exact.is_empty() {
+                catalog
+                    .find_symbols_matching(pattern)
+                    .await
+                    .unwrap_or_default()
+            } else {
+                exact
+            }
         }
         Some(catalog) => catalog
             .find_symbols_matching(pattern)
@@ -209,7 +225,7 @@ async fn fresh_catalog_symbols(
         symbol.file_path = live
             .file(&symbol.file_path.to_string_lossy())
             .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
-        if !catalog_symbol_matches(&symbol, scope, &pattern_lower, type_filter) {
+        if !catalog_symbol_matches(&symbol, scope, &pattern_lower, type_filter, regex.as_ref()) {
             continue;
         }
         let bytes = read_live_bytes(symbol.file_path.clone()).await?;
@@ -268,6 +284,7 @@ async fn append_live_catalog_matches(
     type_filter: &str,
 ) -> Result<(), JsonRpcError> {
     let pattern_lower = pattern.to_lowercase();
+    let regex = compiled_symbol_regex(pattern);
     for path in paths {
         // Avoid invoking Tree-sitter for every source file when a catalog is
         // missing. A cheap byte-level prefilter keeps the live fallback
@@ -291,7 +308,10 @@ async fn append_live_catalog_matches(
                 || symbol
                     .qualified_name
                     .to_lowercase()
-                    .contains(&pattern_lower);
+                    .contains(&pattern_lower)
+                || regex.as_ref().is_some_and(|re| {
+                    re.is_match(&symbol.symbol_name) || re.is_match(&symbol.qualified_name)
+                });
             if in_scope && type_matches && name_matches {
                 fresh.push((symbol, content.as_bytes().to_vec()));
             }
@@ -466,6 +486,26 @@ fn is_code_pattern(pattern: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '$' | '-'))
 }
 
+/// Compile a case-insensitive regex when `pattern` is regex-shaped (contains an
+/// unambiguous regex metacharacter outside the identifier set). Returns `None`
+/// for plain substring/identifier patterns or un-compilable regexes; callers
+/// then fall back to literal substring matching.
+fn compiled_symbol_regex(pattern: &str) -> Option<Regex> {
+    let regex_shaped = pattern.chars().any(|c| {
+        matches!(
+            c,
+            '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '\\'
+        )
+    });
+    if !regex_shaped {
+        return None;
+    }
+    regex::RegexBuilder::new(pattern)
+        .case_insensitive(true)
+        .build()
+        .ok()
+}
+
 fn live_text_might_match(bytes: &[u8], pattern: &str) -> bool {
     let haystack = String::from_utf8_lossy(bytes).to_ascii_lowercase();
     let pattern = pattern.trim().to_ascii_lowercase();
@@ -622,6 +662,7 @@ fn exact_response(
 ) -> Value {
     let pdg = index.pdg().unwrap();
     let pattern_lower = pattern.to_lowercase();
+    let regex = compiled_symbol_regex(pattern);
     let fetch_limit = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
     let mut candidates = pdg
         .node_indices()
@@ -644,7 +685,10 @@ fn exact_response(
                 1
             } else if node.id.eq_ignore_ascii_case(pattern) {
                 2
-            } else if node.name.to_lowercase().contains(&pattern_lower)
+            } else if regex
+                .as_ref()
+                .is_some_and(|re| re.is_match(&node.name) || re.is_match(&node.id))
+                || node.name.to_lowercase().contains(&pattern_lower)
                 || node.id.to_lowercase().contains(&pattern_lower)
             {
                 3
@@ -1015,23 +1059,36 @@ mod tests {
             byte_range: (0, 0),
         };
 
+        // No regex: substring/equality matching (5th arg = None).
         assert!(catalog_symbol_matches(
             &symbol,
             Some("/project/src/"),
             "handler",
-            "struct"
+            "struct",
+            None
         ));
         assert!(!catalog_symbol_matches(
             &symbol,
             Some("/other/"),
             "handler",
-            "struct"
+            "struct",
+            None
         ));
         assert!(!catalog_symbol_matches(
             &symbol,
             Some("/project/src/"),
             "handler",
-            "function"
+            "function",
+            None
+        ));
+        // Regex path: an anchored regex matches the symbol name (C5 restore).
+        let re = regex::Regex::new("(?i)search").unwrap();
+        assert!(catalog_symbol_matches(
+            &symbol,
+            Some("/project/src/"),
+            "zzz_nomatch",
+            "struct",
+            Some(&re)
         ));
     }
 }

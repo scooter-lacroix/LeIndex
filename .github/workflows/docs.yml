@@ -16,6 +16,10 @@ jobs:
   api-docs:
     name: Generate API Documentation
     runs-on: ubuntu-latest
+    permissions: contents: read, pages: write, id-token: write
+    concurrency:
+      group: docs-pages
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -32,10 +36,7 @@ jobs:
             docs-cargo-
       - name: Generate API documentation
         run: |
-          cargo doc --workspace --no-deps --all-features \
-            -Z unstable-options \
-            --output-format html \
-            2>&1 | tee docs-build.log || true
+          cargo doc --workspace --no-deps
           # Check for broken intra-doc links (warnings)
           if grep -q "warning: unresolved link" docs-build.log; then
             echo "::warning::Broken intra-doc links detected"
@@ -49,6 +50,27 @@ jobs:
         with:
           name: api-docs
           path: target/doc/
+  # ── Deploy documentation to GitHub Pages ──────────────────────────────
+  # Publishes generated API documentation to GitHub Pages on every push to master.
+  deploy:
+    name: Deploy to GitHub Pages
+    runs-on: ubuntu-latest
+    permissions: contents: read, pages: write, id-token: write
+    # Only run on master branch (not PRs)
+    if: github.ref == 'refs/heads/master'
+    concurrency:
+      group: docs-pages
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc/
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
 
   # ── AGENTS.md validation ────────────────────────────────────────────
   # Validates that commands referenced in AGENTS.md are valid by

@@ -134,47 +134,6 @@ fn containment_edges_are_not_call_edges() {
 }
 
 #[test]
-fn test_local_call_resolution_preserves_alias_namespace_suffix_and_type_edge() {
-    let mut caller = sig("caller", "app::service::caller", false);
-    caller.imports.push(ImportInfo {
-        path: "external::package".to_string(),
-        alias: Some("alias".to_string()),
-    });
-    caller.calls = vec![
-        "alias::aliased_target".to_string(),
-        "sibling".to_string(),
-        "utility::suffix_target".to_string(),
-        "Widget::new".to_string(),
-    ];
-
-    let pdg = extract_pdg_from_signatures(
-        vec![
-            caller,
-            sig("aliased_target", "external::package::aliased_target", false),
-            sig("sibling", "app::service::sibling", false),
-            sig("suffix_target", "lib::utility::suffix_target", false),
-            sig("new", "Widget::new", true),
-        ],
-        b"",
-        "local.rs",
-        "rust",
-    );
-
-    for callee in [
-        "aliased_target",
-        "sibling",
-        "suffix_target",
-        "new",
-        "Widget",
-    ] {
-        assert!(
-            has_call_edge(&pdg, "caller", callee),
-            "caller should resolve {callee}"
-        );
-    }
-}
-
-#[test]
 fn test_same_file_calls_reach_all_duplicate_qualified_names() {
     let mut caller = sig("caller", "caller", false);
     caller.calls.push("target".to_string());

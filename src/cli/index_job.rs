@@ -657,6 +657,23 @@ impl IndexJobState {
     }
 }
 
+/// Mark the current indexing job as complete by writing a checkpoint state
+/// with last_reusable_phase = "complete". This prevents the job from being
+/// considered resumable in future force_reindex runs, ensuring that stale
+/// artifacts are not reused.
+pub fn mark_checkpoint_complete(state_path: &Path, generation: u64) -> Result<()> {
+    let state = JobCheckpointState {
+        job_id: format!("index-{}", generation),
+        input_generation: generation.saturating_sub(1),
+        last_reusable_phase: Some("complete".to_string()),
+        updated_at_unix_ms: checkpoint_now_unix_ms(),
+        ..Default::default()
+    };
+    let bytes = serde_json::to_vec_pretty(&state).context("serialize checkpoint state")?;
+    atomic_write(state_path, &bytes)?;
+    Ok(())
+}
+
 /// Generate a per-project job ID that is stable enough for polling while
 /// remaining unique across force-reindex generations.
 pub fn new_job_id(project_path: &std::path::Path) -> String {

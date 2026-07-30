@@ -23,6 +23,26 @@ pub(super) fn injected_phase_failure(phase: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read a checkpoint artifact only when its on-disk blake3 hash matches the
+/// hash recorded in the checkpoint state. Returns `None` when the artifact is
+/// absent or stale (hash mismatch / unreadable). Factored out of `run_scan` so
+/// the parse/lexical/neural resume lookups share one verify path.
+pub(super) fn read_verified_artifact<T>(
+    state: Option<&crate::cli::index_job::JobCheckpointState>,
+    artifact: &str,
+    artifact_path: &std::path::Path,
+    read: impl Fn(&CheckpointStore) -> Result<Option<T>>,
+    store: &CheckpointStore,
+) -> Option<T> {
+    state
+        .and_then(|state| state.artifact_hashes.get(artifact).cloned())
+        .and_then(|expected_hash| {
+            let bytes = std::fs::read(artifact_path).ok()?;
+            (blake3::hash(&bytes).to_hex().as_str() == expected_hash).then_some(())?;
+            read(store).ok().flatten()
+        })
+}
+
 pub(super) fn add_submodule_summary_nodes(
     pdg: &mut crate::graph::pdg::ProgramDependenceGraph,
     project_path: &std::path::Path,

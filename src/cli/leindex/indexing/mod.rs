@@ -828,15 +828,14 @@ impl LeIndex {
             self.checkpoint_state(&checkpoint_store, "scan", scan_hash);
         }
         let checkpoint_state = checkpoint_store.read_state().ok().flatten();
-        let resumed_parse = checkpoint_state
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.artifact_hashes.get("parse").cloned())
-            .and_then(|expected_hash| {
-                let bytes = std::fs::read(checkpoint_store.paths.parse()).ok()?;
-                (blake3::hash(&bytes).to_hex().as_str() == expected_hash).then_some(())?;
-                checkpoint_store.read_parse().ok().flatten()
-            })
-            .filter(|checkpoint| checkpoint.scan_hash == scan.input_hash);
+        let resumed_parse = read_verified_artifact(
+            checkpoint_state.as_ref(),
+            "parse",
+            &checkpoint_store.paths.parse(),
+            CheckpointStore::read_parse,
+            &checkpoint_store,
+        )
+        .filter(|checkpoint| checkpoint.scan_hash == scan.input_hash);
         let resumed_pdg = load_resumed_pdg(
             &checkpoint_store,
             &scan,
@@ -845,23 +844,21 @@ impl LeIndex {
                 .as_ref()
                 .and_then(|checkpoint| checkpoint.artifact_hashes.get("pdg").cloned()),
         );
-        let resumed_lexical = checkpoint_state
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.artifact_hashes.get("lexical").cloned())
-            .and_then(|expected_hash| {
-                let bytes = std::fs::read(checkpoint_store.paths.lexical()).ok()?;
-                (blake3::hash(&bytes).to_hex().as_str() == expected_hash).then_some(())?;
-                checkpoint_store.read_lexical().ok().flatten()
-            })
-            .filter(valid_lexical_checkpoint);
-        let resumed_neural = checkpoint_state
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.artifact_hashes.get("neural").cloned())
-            .and_then(|expected_hash| {
-                let bytes = std::fs::read(checkpoint_store.paths.neural()).ok()?;
-                (blake3::hash(&bytes).to_hex().as_str() == expected_hash).then_some(())?;
-                checkpoint_store.read_neural().ok().flatten()
-            });
+        let resumed_lexical = read_verified_artifact(
+            checkpoint_state.as_ref(),
+            "lexical",
+            &checkpoint_store.paths.lexical(),
+            CheckpointStore::read_lexical,
+            &checkpoint_store,
+        )
+        .filter(valid_lexical_checkpoint);
+        let resumed_neural = read_verified_artifact(
+            checkpoint_state.as_ref(),
+            "neural",
+            &checkpoint_store.paths.neural(),
+            CheckpointStore::read_neural,
+            &checkpoint_store,
+        );
         state.indexed_files = indexed_files;
         state.old_scan = old_scan;
         state.shared_file_cache = Some(shared_file_cache);
@@ -1396,6 +1393,17 @@ impl LeIndex {
         {
             embedder = None;
         }
+        // Feature-flag rollout gate: a deployment can kill neural indexing via
+        // LEINDEX_FEATURE_NEURAL_SEARCH=false even when config enables it.
+        // `is_neural_enabled` ANDs the runtime flag (default-on for this GA
+        // feature) with the config knob, so a disabled config stays disabled.
+        if !crate::feature_flags::is_neural_enabled(
+            crate::cli::neural_config::LeIndexConfig::load_cached()
+                .neural
+                .enabled,
+        ) {
+            embedder = None;
+        }
         Ok(embedder)
     }
 
@@ -1672,8 +1680,15 @@ impl LeIndex {
             return self.load_from_mutable_storage();
         }
 
-        let active_storage = crate::storage::schema::Storage::open(active.join("leindex.db"))
-            .with_context(|| format!("Failed to open active generation at {}", active.display()))?;
+        // Open the published (immutable) generation read-only: no WAL, no DDL,
+        // no `INSERT OR REPLACE schema_version`. Mutating a published snapshot
+        // would (a) make concurrent readers contend as writers and (b) fail on
+        // read-only archived artifacts. See `Storage::open_readonly`.
+        let active_storage =
+            crate::storage::schema::Storage::open_readonly(active.join("leindex.db"))
+                .with_context(|| {
+                    format!("Failed to open active generation at {}", active.display())
+                })?;
         self.load_from_storage_inner_at(false, Some(&active_storage), active)
     }
 

@@ -782,7 +782,7 @@ impl LeIndex {
         if active == self.storage_path {
             return crate::storage::pdg_store::has_indexed_files(&self.storage, &self.project_id);
         }
-        crate::storage::schema::Storage::open(active.join("leindex.db"))
+        crate::storage::schema::Storage::open_readonly(active.join("leindex.db"))
             .ok()
             .is_some_and(|storage| {
                 crate::storage::pdg_store::has_indexed_files(&storage, &self.project_id)

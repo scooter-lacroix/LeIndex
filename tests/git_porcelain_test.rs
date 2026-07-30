@@ -6,7 +6,7 @@ use leindex::cli::git::{
 use std::path::PathBuf;
 
 #[test]
-fn parses_nul_delimited_porcelain_v2_records_without_splitting_paths() {
+fn test_parses_nul_delimited_porcelain_v2_records_without_splitting_paths() {
     let output = b"# branch.oid 0123456789abcdef\0# branch.head feature/perf\0\
 1 .M N... 100644 100644 100644 abc def src/lib.rs\0\
 1 M. N... 100644 100644 100644 abc def src/main.rs\0\
@@ -39,7 +39,7 @@ u UU N... 100644 100644 100644 100644 abc def ghi src/conflict.rs\0\
 }
 
 #[test]
-fn initial_or_detached_headers_have_no_branch_or_head_oid() {
+fn test_initial_or_detached_headers_have_no_branch_or_head_oid() {
     let status = parse_status(b"# branch.oid (initial)\0# branch.head (detached)\0? a b\0");
 
     assert_eq!(status.branch, None);
@@ -48,7 +48,7 @@ fn initial_or_detached_headers_have_no_branch_or_head_oid() {
 }
 
 #[test]
-fn inventory_uses_git_ignore_and_nested_repo_boundaries() {
+fn test_inventory_uses_git_ignore_and_nested_repo_boundaries() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let run = |args: &[&str], cwd: &std::path::Path| {
@@ -100,7 +100,7 @@ fn inventory_uses_git_ignore_and_nested_repo_boundaries() {
 }
 
 #[test]
-fn inventory_from_subdirectory_does_not_treat_outer_worktree_as_nested_repo() {
+fn test_inventory_from_subdirectory_does_not_treat_outer_worktree_as_nested_repo() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let project = root.join("projects/app");
@@ -131,7 +131,7 @@ fn inventory_from_subdirectory_does_not_treat_outer_worktree_as_nested_repo() {
 }
 
 #[test]
-fn source_candidates_prefilters_fixed_string_without_full_inventory() {
+fn test_source_candidates_prefilters_fixed_string_without_full_inventory() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let run = |args: &[&str]| {
@@ -164,7 +164,7 @@ fn source_candidates_prefilters_fixed_string_without_full_inventory() {
 }
 
 #[test]
-fn changed_source_candidates_only_returns_live_edits() {
+fn test_changed_source_candidates_only_returns_live_edits() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path();
     let run = |args: &[&str]| {

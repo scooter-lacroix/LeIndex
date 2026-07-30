@@ -1,7 +1,7 @@
 // Storage schema and database management
 
 use crate::storage::{ProjectMetadata, UniqueProjectId};
-use rusqlite::{Connection, Result as SqliteResult};
+use rusqlite::{Connection, OpenFlags, Result as SqliteResult};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -67,7 +67,35 @@ impl Storage {
     pub fn open<P: AsRef<Path>>(path: P) -> SqliteResult<Self> {
         Self::open_with_config(path, StorageConfig::default())
     }
+    /// Open storage in read-only mode (no WAL, no migrations, no schema init)
+    ///
+    /// This is used for hydrating immutable generations (archived published runs).
+    /// Does NOT enable WAL mode, does NOT run migrations, and does NOT initialize schema.
+    /// The database is assumed to already exist and be fully initialized.
+    pub fn open_readonly<P: AsRef<Path>>(path: P) -> SqliteResult<Self> {
+        // Bind once so the generic `P` is consumed before we borrow it again
+        // for `db_path` below (otherwise `open_with_flags` moves `path`).
+        let path = path.as_ref();
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
 
+        // Short busy timeout so concurrent readers contend briefly, not forever.
+        conn.pragma_update(None, "busy_timeout", 1000)?;
+
+        // Read-only config: no WAL, a thin read cache, shared mmap at OS level.
+        // No migrations, no DDL, no `schema_version` writes — the published
+        // generation is treated as an immutable, already-initialized snapshot.
+        let config = StorageConfig {
+            db_path: path.to_string_lossy().to_string(),
+            wal_enabled: false,
+            cache_size_kib: Some(-2000),
+            mmap_size: Some(PROJECT_STORE_MMAP_SIZE),
+        };
+
+        Ok(Self { conn, config })
+    }
     /// Open storage with custom config
     pub fn open_with_config<P: AsRef<Path>>(path: P, config: StorageConfig) -> SqliteResult<Self> {
         let conn = Connection::open(path)?;

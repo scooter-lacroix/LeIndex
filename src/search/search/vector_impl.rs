@@ -49,12 +49,7 @@ impl MmapVectorIndex {
         self.rows
             .len()
             .saturating_sub(self.tombstones.len())
-            .saturating_add(
-                self.delta
-                    .keys()
-                    .filter(|node_id| !self.rows.contains_key(*node_id))
-                    .count(),
-            )
+            .saturating_add(self.delta.len())
     }
 
     fn is_empty(&self) -> bool {
