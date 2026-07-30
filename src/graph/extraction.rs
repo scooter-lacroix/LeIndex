@@ -505,7 +505,8 @@ fn add_shared_parameter_call_edges(
                     .map(|t| normalize_type_name(t))
                     .filter(|t| !t.is_empty() && !is_excluded_type(t))
                     .collect();
-                let shared: Vec<&String> = a_types.intersection(&b_types).collect();
+                let mut shared: Vec<&String> = a_types.intersection(&b_types).collect();
+                shared.sort();
                 if shared.is_empty() {
                     continue;
                 }
