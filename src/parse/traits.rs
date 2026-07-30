@@ -92,6 +92,13 @@ pub fn calculate_complexity(
     }
 }
 
+/// Strip a call expression down to its callee name by truncating at the first
+/// `(`. The default for most languages; parsers with extra call syntax (optional
+/// chaining in JS/Python, turbofish in Rust) keep their own variant.
+pub fn clean_call_text(raw: &str) -> String {
+    raw.split('(').next().unwrap_or(raw).trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{find_node_by_id, parse_tree};

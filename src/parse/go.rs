@@ -2,6 +2,7 @@
 
 use crate::cfg_builder;
 use crate::parse::traits::calculate_complexity;
+use crate::parse::traits::clean_call_text;
 use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
@@ -329,10 +330,6 @@ fn extract_method_signature(
 /// Extract function calls from a Go node
 fn extract_go_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
-
-    fn clean_call_text(raw: &str) -> String {
-        raw.split('(').next().unwrap_or(raw).trim().to_string()
-    }
 
     fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
         if node.kind() == "call_expression" {

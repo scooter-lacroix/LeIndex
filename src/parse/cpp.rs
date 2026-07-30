@@ -1,7 +1,9 @@
 // C++ language parser implementation
 
 use crate::cfg_builder;
+use crate::cfg_loop_handler;
 use crate::parse::traits::calculate_complexity;
+use crate::parse::traits::clean_call_text;
 use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
@@ -321,10 +323,6 @@ fn extract_cpp_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Import
 fn extract_cpp_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
 
-    fn clean_call_text(raw: &str) -> String {
-        raw.split('(').next().unwrap_or(raw).trim().to_string()
-    }
-
     let mut stack = vec![*node];
     while let Some(current) = stack.pop() {
         match current.kind() {
@@ -449,6 +447,7 @@ const DECISION_KINDS: &[&str] = &[
     "case_statement",
 ];
 cfg_builder!();
+cfg_loop_handler!();
 impl<'a> CfgBuilder<'a> {
     fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {
         let entry_id = self.create_block();
@@ -482,27 +481,6 @@ impl<'a> CfgBuilder<'a> {
                 }
             }
         }
-
-        Ok(())
-    }
-
-    fn handle_loop_statement(
-        &mut self,
-        _node: &tree_sitter::Node<'_>,
-        current_block: usize,
-    ) -> Result<()> {
-        let body_block = self.create_block();
-
-        self.edges.push(Edge {
-            from: current_block,
-            to: body_block,
-            edge_type: EdgeType::Unconditional,
-        });
-        self.edges.push(Edge {
-            from: body_block,
-            to: current_block,
-            edge_type: EdgeType::Loop,
-        });
 
         Ok(())
     }

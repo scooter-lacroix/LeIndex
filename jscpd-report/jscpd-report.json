@@ -1,6 +1,6 @@
 {
   "statistics": {
-    "detectionDate": "2026-07-30T06:11:33.931Z",
+    "detectionDate": "2026-07-30T06:19:24.564Z",
     "formats": {
       "rust": {
         "sources": {
@@ -1541,8 +1541,8 @@
             "newClones": 0
           },
           "src/parse/traits.rs": {
-            "lines": 739,
-            "tokens": 4735,
+            "lines": 746,
+            "tokens": 4788,
             "sources": 1,
             "clones": 0,
             "duplicatedLines": 0,
@@ -1577,26 +1577,26 @@
             "newClones": 0
           },
           "src/parse/scala.rs": {
-            "lines": 457,
-            "tokens": 4239,
+            "lines": 454,
+            "tokens": 4206,
             "sources": 1,
-            "clones": 55,
-            "duplicatedLines": 834,
-            "duplicatedTokens": 8032,
-            "percentage": 182.49,
-            "percentageTokens": 189.48,
+            "clones": 44,
+            "duplicatedLines": 692,
+            "duplicatedTokens": 6268,
+            "percentage": 152.42,
+            "percentageTokens": 149.03,
             "newDuplicatedLines": 0,
             "newClones": 0
           },
           "src/parse/ruby.rs": {
-            "lines": 434,
-            "tokens": 4049,
+            "lines": 414,
+            "tokens": 3877,
             "sources": 1,
-            "clones": 53,
-            "duplicatedLines": 769,
-            "duplicatedTokens": 7349,
-            "percentage": 177.19,
-            "percentageTokens": 181.5,
+            "clones": 52,
+            "duplicatedLines": 741,
+            "duplicatedTokens": 7079,
+            "percentage": 178.99,
+            "percentageTokens": 182.59,
             "newDuplicatedLines": 0,
             "newClones": 0
           },
@@ -1604,11 +1604,11 @@
             "lines": 665,
             "tokens": 5775,
             "sources": 1,
-            "clones": 22,
-            "duplicatedLines": 333,
-            "duplicatedTokens": 2884,
-            "percentage": 50.08,
-            "percentageTokens": 49.94,
+            "clones": 21,
+            "duplicatedLines": 320,
+            "duplicatedTokens": 2752,
+            "percentage": 48.12,
+            "percentageTokens": 47.65,
             "newDuplicatedLines": 0,
             "newClones": 0
           },
@@ -1625,14 +1625,14 @@
             "newClones": 0
           },
           "src/parse/php.rs": {
-            "lines": 558,
-            "tokens": 5207,
+            "lines": 538,
+            "tokens": 5035,
             "sources": 1,
-            "clones": 39,
-            "duplicatedLines": 715,
-            "duplicatedTokens": 6427,
-            "percentage": 128.14,
-            "percentageTokens": 123.43,
+            "clones": 38,
+            "duplicatedLines": 688,
+            "duplicatedTokens": 6143,
+            "percentage": 127.88,
+            "percentageTokens": 122.01,
             "newDuplicatedLines": 0,
             "newClones": 0
           },
@@ -1661,14 +1661,14 @@
             "newClones": 0
           },
           "src/parse/lua.rs": {
-            "lines": 411,
-            "tokens": 3749,
+            "lines": 408,
+            "tokens": 3716,
             "sources": 1,
             "clones": 14,
             "duplicatedLines": 278,
-            "duplicatedTokens": 2570,
-            "percentage": 67.64,
-            "percentageTokens": 68.55,
+            "duplicatedTokens": 2534,
+            "percentage": 68.14,
+            "percentageTokens": 68.19,
             "newDuplicatedLines": 0,
             "newClones": 0
           },
@@ -1709,14 +1709,14 @@
             "newClones": 0
           },
           "src/parse/java.rs": {
-            "lines": 735,
-            "tokens": 6785,
+            "lines": 713,
+            "tokens": 6611,
             "sources": 1,
-            "clones": 29,
-            "duplicatedLines": 448,
-            "duplicatedTokens": 4116,
-            "percentage": 60.95,
-            "percentageTokens": 60.66,
+            "clones": 28,
+            "duplicatedLines": 401,
+            "duplicatedTokens": 3690,
+            "percentage": 56.24,
+            "percentageTokens": 55.82,
             "newDuplicatedLines": 0,
             "newClones": 0
           },
@@ -1733,14 +1733,14 @@
             "newClones": 0
           },
           "src/parse/go.rs": {
-            "lines": 745,
-            "tokens": 6847,
+            "lines": 742,
+            "tokens": 6814,
             "sources": 1,
-            "clones": 33,
-            "duplicatedLines": 450,
-            "duplicatedTokens": 4265,
-            "percentage": 60.4,
-            "percentageTokens": 62.29,
+            "clones": 32,
+            "duplicatedLines": 443,
+            "duplicatedTokens": 4140,
+            "percentage": 59.7,
+            "percentageTokens": 60.76,
             "newDuplicatedLines": 0,
             "newClones": 0
           },
@@ -1829,26 +1829,26 @@
             "newClones": 0
           },
           "src/parse/csharp.rs": {
-            "lines": 662,
-            "tokens": 6069,
+            "lines": 642,
+            "tokens": 5897,
             "sources": 1,
-            "clones": 33,
-            "duplicatedLines": 519,
-            "duplicatedTokens": 4639,
-            "percentage": 78.4,
-            "percentageTokens": 76.44,
+            "clones": 32,
+            "duplicatedLines": 494,
+            "duplicatedTokens": 4364,
+            "percentage": 76.95,
+            "percentageTokens": 74,
             "newDuplicatedLines": 0,
             "newClones": 0
           },
           "src/parse/cpp.rs": {
-            "lines": 626,
-            "tokens": 5756,
+            "lines": 604,
+            "tokens": 5582,
             "sources": 1,
-            "clones": 31,
-            "duplicatedLines": 451,
-            "duplicatedTokens": 4017,
-            "percentage": 72.04,
-            "percentageTokens": 69.79,
+            "clones": 30,
+            "duplicatedLines": 426,
+            "duplicatedTokens": 3792,
+            "percentage": 70.53,
+            "percentageTokens": 67.93,
             "newDuplicatedLines": 0,
             "newClones": 0
           },
@@ -1865,26 +1865,26 @@
             "newClones": 0
           },
           "src/parse/cfg.rs": {
-            "lines": 100,
-            "tokens": 683,
+            "lines": 132,
+            "tokens": 885,
             "sources": 1,
-            "clones": 0,
-            "duplicatedLines": 0,
-            "duplicatedTokens": 0,
-            "percentage": 0,
-            "percentageTokens": 0,
+            "clones": 1,
+            "duplicatedLines": 19,
+            "duplicatedTokens": 151,
+            "percentage": 14.39,
+            "percentageTokens": 17.06,
             "newDuplicatedLines": 0,
             "newClones": 0
           },
           "src/parse/c.rs": {
-            "lines": 307,
-            "tokens": 2923,
+            "lines": 304,
+            "tokens": 2890,
             "sources": 1,
-            "clones": 19,
-            "duplicatedLines": 271,
-            "duplicatedTokens": 2605,
-            "percentage": 88.27,
-            "percentageTokens": 89.12,
+            "clones": 18,
+            "duplicatedLines": 262,
+            "duplicatedTokens": 2471,
+            "percentage": 86.18,
+            "percentageTokens": 85.5,
             "newDuplicatedLines": 0,
             "newClones": 0
           },
@@ -2370,28 +2370,28 @@
           }
         },
         "total": {
-          "lines": 69233,
-          "tokens": 565504,
+          "lines": 69156,
+          "tokens": 564763,
           "sources": 197,
-          "clones": 368,
-          "duplicatedLines": 5169,
-          "duplicatedTokens": 48984,
-          "percentage": 7.47,
-          "percentageTokens": 8.66,
+          "clones": 359,
+          "duplicatedLines": 5017,
+          "duplicatedTokens": 47224,
+          "percentage": 7.25,
+          "percentageTokens": 8.36,
           "newDuplicatedLines": 0,
           "newClones": 0
         }
       }
     },
     "total": {
-      "lines": 69233,
-      "tokens": 565504,
+      "lines": 69156,
+      "tokens": 564763,
       "sources": 197,
-      "clones": 368,
-      "duplicatedLines": 5169,
-      "duplicatedTokens": 48984,
-      "percentage": 7.47,
-      "percentageTokens": 8.66,
+      "clones": 359,
+      "duplicatedLines": 5017,
+      "duplicatedTokens": 47224,
+      "percentage": 7.25,
+      "percentageTokens": 8.36,
       "newDuplicatedLines": 0,
       "newClones": 0
     }
@@ -6976,17 +6976,17 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/scala.rs",
-        "start": 39,
-        "end": 49,
+        "start": 40,
+        "end": 50,
         "startLoc": {
-          "line": 39,
+          "line": 40,
           "column": 6,
-          "position": 379
+          "position": 393
         },
         "endLoc": {
-          "line": 49,
+          "line": 50,
           "column": 6,
-          "position": 515
+          "position": 529
         }
       },
       "secondFile": {
@@ -7012,32 +7012,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/scala.rs",
-        "start": 46,
-        "end": 56,
+        "start": 47,
+        "end": 57,
         "startLoc": {
-          "line": 46,
+          "line": 47,
           "column": 5,
-          "position": 474
+          "position": 488
         },
         "endLoc": {
-          "line": 56,
+          "line": 57,
           "column": 5,
-          "position": 604
+          "position": 618
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 28,
-        "end": 37,
+        "start": 29,
+        "end": 38,
         "startLoc": {
-          "line": 28,
+          "line": 29,
           "column": 14,
-          "position": 218
+          "position": 232
         },
         "endLoc": {
-          "line": 37,
+          "line": 38,
           "column": 8,
-          "position": 347
+          "position": 361
         }
       }
     },
@@ -7048,68 +7048,68 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/scala.rs",
-        "start": 388,
-        "end": 398,
+        "start": 385,
+        "end": 395,
         "startLoc": {
-          "line": 388,
+          "line": 385,
           "column": 21,
-          "position": 3675
+          "position": 3642
         },
         "endLoc": {
-          "line": 398,
+          "line": 395,
           "column": 14,
-          "position": 3765
+          "position": 3732
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 367,
-        "end": 377,
+        "start": 364,
+        "end": 374,
         "startLoc": {
-          "line": 367,
+          "line": 364,
           "column": 23,
-          "position": 3521
+          "position": 3488
         },
         "endLoc": {
-          "line": 377,
+          "line": 374,
           "column": 11,
-          "position": 3611
+          "position": 3578
         }
       }
     },
     {
       "format": "rust",
-      "lines": 9,
-      "fragment": "use crate::cfg_builder;\nuse crate::parse::traits::calculate_complexity;\nuse crate::parse::traits::{find_node_by_id, Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// Ruby language parser with full CodeIntelligence implementation",
+      "lines": 10,
+      "fragment": ";\nuse crate::parse::traits::calculate_complexity;\nuse crate::parse::traits::clean_call_text;\nuse crate::parse::traits::{find_node_by_id, Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// Ruby language parser with full CodeIntelligence implementation",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/ruby.rs",
-        "start": 3,
-        "end": 11,
+        "start": 4,
+        "end": 13,
         "startLoc": {
-          "line": 3,
-          "column": 1,
-          "position": 3
+          "line": 4,
+          "column": 17,
+          "position": 17
         },
         "endLoc": {
-          "line": 11,
+          "line": 13,
           "column": 67,
-          "position": 103
+          "position": 125
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
         "start": 3,
-        "end": 11,
+        "end": 12,
         "startLoc": {
           "line": 3,
-          "column": 1,
-          "position": 3
+          "column": 12,
+          "position": 9
         },
         "endLoc": {
-          "line": 11,
+          "line": 12,
           "column": 68,
-          "position": 103
+          "position": 117
         }
       }
     },
@@ -7120,17 +7120,17 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/ruby.rs",
-        "start": 128,
-        "end": 140,
+        "start": 130,
+        "end": 142,
         "startLoc": {
-          "line": 128,
+          "line": 130,
           "column": 10,
-          "position": 1165
+          "position": 1187
         },
         "endLoc": {
-          "line": 140,
+          "line": 142,
           "column": 5,
-          "position": 1286
+          "position": 1308
         }
       },
       "secondFile": {
@@ -7156,32 +7156,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/ruby.rs",
-        "start": 139,
-        "end": 148,
+        "start": 141,
+        "end": 150,
         "startLoc": {
-          "line": 139,
+          "line": 141,
           "column": 9,
-          "position": 1267
+          "position": 1289
         },
         "endLoc": {
-          "line": 148,
+          "line": 150,
           "column": 5,
-          "position": 1376
+          "position": 1398
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 118,
-        "end": 127,
+        "start": 120,
+        "end": 129,
         "startLoc": {
-          "line": 118,
+          "line": 120,
           "column": 9,
-          "position": 1026
+          "position": 1048
         },
         "endLoc": {
-          "line": 127,
+          "line": 129,
           "column": 8,
-          "position": 1135
+          "position": 1157
         }
       }
     },
@@ -7192,32 +7192,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/ruby.rs",
-        "start": 145,
-        "end": 170,
+        "start": 147,
+        "end": 172,
         "startLoc": {
-          "line": 145,
+          "line": 147,
           "column": 30,
-          "position": 1349
+          "position": 1371
         },
         "endLoc": {
-          "line": 170,
+          "line": 172,
           "column": 21,
-          "position": 1561
+          "position": 1583
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 53,
-        "end": 76,
+        "start": 54,
+        "end": 77,
         "startLoc": {
-          "line": 53,
+          "line": 54,
           "column": 31,
-          "position": 577
+          "position": 591
         },
         "endLoc": {
-          "line": 76,
+          "line": 77,
           "column": 6,
-          "position": 787
+          "position": 801
         }
       }
     },
@@ -7228,68 +7228,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/ruby.rs",
-        "start": 200,
-        "end": 213,
+        "start": 202,
+        "end": 215,
         "startLoc": {
-          "line": 200,
+          "line": 202,
           "column": 13,
-          "position": 1954
+          "position": 1976
         },
         "endLoc": {
-          "line": 213,
+          "line": 215,
           "column": 25,
-          "position": 2041
+          "position": 2063
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 217,
-        "end": 230,
+        "start": 218,
+        "end": 231,
         "startLoc": {
-          "line": 217,
+          "line": 218,
           "column": 13,
-          "position": 2153
+          "position": 2167
         },
         "endLoc": {
-          "line": 230,
+          "line": 231,
           "column": 20,
-          "position": 2240
-        }
-      }
-    },
-    {
-      "format": "rust",
-      "lines": 10,
-      "fragment": "(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {\n    let mut calls = Vec::new();\n\n    fn clean_call_text(raw: &str) -> String {\n        raw.split('(').next().unwrap_or(raw).trim().to_string()\n    }\n\n    fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {\n        match node.kind() {\n            \"call\"",
-      "tokens": 0,
-      "firstFile": {
-        "name": "src/parse/ruby.rs",
-        "start": 252,
-        "end": 261,
-        "startLoc": {
-          "line": 252,
-          "column": 19,
-          "position": 2340
-        },
-        "endLoc": {
-          "line": 261,
-          "column": 7,
-          "position": 2490
-        }
-      },
-      "secondFile": {
-        "name": "src/parse/scala.rs",
-        "start": 230,
-        "end": 239,
-        "startLoc": {
-          "line": 230,
-          "column": 20,
-          "position": 2241
-        },
-        "endLoc": {
-          "line": 239,
-          "column": 18,
-          "position": 2391
+          "position": 2254
         }
       }
     },
@@ -7300,156 +7264,120 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/ruby.rs",
-        "start": 284,
-        "end": 299,
+        "start": 282,
+        "end": 297,
         "startLoc": {
-          "line": 284,
+          "line": 282,
           "column": 17,
-          "position": 2734
+          "position": 2709
         },
         "endLoc": {
-          "line": 299,
+          "line": 297,
           "column": 24,
-          "position": 2831
+          "position": 2806
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 255,
-        "end": 270,
+        "start": 252,
+        "end": 267,
         "startLoc": {
-          "line": 255,
+          "line": 252,
           "column": 17,
-          "position": 2567
+          "position": 2534
         },
         "endLoc": {
-          "line": 270,
+          "line": 267,
           "column": 19,
-          "position": 2664
+          "position": 2631
         }
       }
     },
     {
       "format": "rust",
-      "lines": 16,
-      "fragment": "];\ncfg_builder!();\nimpl<'a> CfgBuilder<'a> {\n    fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {\n        let entry_id = self.create_block();\n        self.build_cfg_recursive(node, entry_id)?;\n        Ok(())\n    }\n\n    fn build_cfg_recursive(\n        &mut self,\n        node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        match node.kind() {\n            \"if\"",
+      "lines": 15,
+      "fragment": "();\nimpl<'a> CfgBuilder<'a> {\n    fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {\n        let entry_id = self.create_block();\n        self.build_cfg_recursive(node, entry_id)?;\n        Ok(())\n    }\n\n    fn build_cfg_recursive(\n        &mut self,\n        node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        match node.kind() {\n            \"if\"",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/ruby.rs",
         "start": 320,
-        "end": 335,
+        "end": 334,
         "startLoc": {
           "line": 320,
-          "column": 6,
-          "position": 3066
+          "column": 18,
+          "position": 3050
         },
         "endLoc": {
-          "line": 335,
+          "line": 334,
           "column": 5,
-          "position": 3217
+          "position": 3197
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 325,
-        "end": 340,
+        "start": 323,
+        "end": 337,
         "startLoc": {
-          "line": 325,
-          "column": 1,
-          "position": 3155
+          "line": 323,
+          "column": 13,
+          "position": 3126
         },
         "endLoc": {
-          "line": 340,
+          "line": 337,
           "column": 16,
-          "position": 3306
+          "position": 3273
         }
       }
     },
     {
       "format": "rust",
-      "lines": 16,
-      "fragment": "(node, current_block)?;\n            }\n            _ => {\n                if let Ok(text) = node.utf8_text(self.source) {\n                    self.add_statement_to_block(current_block, text.to_string());\n                }\n                let mut cursor = node.walk();\n                for child in node.children(&mut cursor) {\n                    self.build_cfg_recursive(&child, current_block)?;\n                }\n            }\n        }\n        Ok(())\n    }\n\n    fn handle_loop_statement",
+      "lines": 15,
+      "fragment": "(node, current_block)?;\n            }\n            _ => {\n                if let Ok(text) = node.utf8_text(self.source) {\n                    self.add_statement_to_block(current_block, text.to_string());\n                }\n                let mut cursor = node.walk();\n                for child in node.children(&mut cursor) {\n                    self.build_cfg_recursive(&child, current_block)?;\n                }\n            }\n        }\n        Ok(())\n    }\n}",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/ruby.rs",
-        "start": 339,
-        "end": 354,
+        "start": 338,
+        "end": 352,
         "startLoc": {
-          "line": 339,
+          "line": 338,
           "column": 22,
-          "position": 3262
+          "position": 3242
         },
         "endLoc": {
-          "line": 354,
-          "column": 22,
-          "position": 3395
-        }
-      },
-      "secondFile": {
-        "name": "src/parse/scala.rs",
-        "start": 350,
-        "end": 367,
-        "startLoc": {
-          "line": 350,
-          "column": 23,
-          "position": 3385
-        },
-        "endLoc": {
-          "line": 367,
-          "column": 23,
-          "position": 3520
-        }
-      }
-    },
-    {
-      "format": "rust",
-      "lines": 19,
-      "fragment": "(\n        &mut self,\n        _node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        let body_block = self.create_block();\n        self.edges.push(Edge {\n            from: current_block,\n            to: body_block,\n            edge_type: EdgeType::Unconditional,\n        });\n        self.edges.push(Edge {\n            from: body_block,\n            to: current_block,\n            edge_type: EdgeType::Loop,\n        });\n        Ok(())\n    }\n}",
-      "tokens": 0,
-      "firstFile": {
-        "name": "src/parse/ruby.rs",
-        "start": 354,
-        "end": 372,
-        "startLoc": {
-          "line": 354,
-          "column": 22,
-          "position": 3396
-        },
-        "endLoc": {
-          "line": 372,
+          "line": 352,
           "column": 2,
-          "position": 3543
+          "position": 3371
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 367,
-        "end": 409,
+        "start": 347,
+        "end": 364,
         "startLoc": {
-          "line": 367,
+          "line": 347,
           "column": 23,
-          "position": 3521
+          "position": 3352
         },
         "endLoc": {
-          "line": 409,
+          "line": 364,
           "column": 3,
-          "position": 3826
+          "position": 3485
         }
       }
     },
     {
       "format": "rust",
-      "lines": 9,
-      "fragment": "use crate::cfg_builder;\nuse crate::parse::traits::calculate_complexity;\nuse crate::parse::traits::{find_node_by_id, Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// Python language parser with full CodeIntelligence implementation",
+      "lines": 8,
+      "fragment": ";\nuse crate::parse::traits::{find_node_by_id, Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// Python language parser with full CodeIntelligence implementation",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/python.rs",
-        "start": 3,
+        "start": 4,
         "end": 11,
         "startLoc": {
-          "line": 3,
-          "column": 1,
-          "position": 3
+          "line": 4,
+          "column": 21,
+          "position": 23
         },
         "endLoc": {
           "line": 11,
@@ -7459,17 +7387,17 @@
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 3,
-        "end": 11,
+        "start": 5,
+        "end": 12,
         "startLoc": {
-          "line": 3,
-          "column": 1,
-          "position": 3
+          "line": 5,
+          "column": 16,
+          "position": 37
         },
         "endLoc": {
-          "line": 11,
+          "line": 12,
           "column": 68,
-          "position": 103
+          "position": 117
         }
       }
     },
@@ -7495,17 +7423,17 @@
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 94,
-        "end": 107,
+        "start": 96,
+        "end": 109,
         "startLoc": {
-          "line": 94,
+          "line": 96,
           "column": 21,
-          "position": 808
+          "position": 830
         },
         "endLoc": {
-          "line": 107,
+          "line": 109,
           "column": 11,
-          "position": 909
+          "position": 931
         }
       }
     },
@@ -7531,17 +7459,17 @@
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 107,
-        "end": 119,
+        "start": 109,
+        "end": 121,
         "startLoc": {
-          "line": 107,
+          "line": 109,
           "column": 2,
-          "position": 911
+          "position": 933
         },
         "endLoc": {
-          "line": 119,
+          "line": 121,
           "column": 5,
-          "position": 1045
+          "position": 1067
         }
       }
     },
@@ -7567,12 +7495,12 @@
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 128,
+        "start": 130,
         "end": 52,
         "startLoc": {
-          "line": 128,
+          "line": 130,
           "column": 9,
-          "position": 1149
+          "position": 1171
         },
         "endLoc": {
           "line": 52,
@@ -7639,17 +7567,17 @@
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 59,
-        "end": 76,
+        "start": 60,
+        "end": 77,
         "startLoc": {
-          "line": 59,
+          "line": 60,
           "column": 9,
-          "position": 642
+          "position": 656
         },
         "endLoc": {
-          "line": 76,
+          "line": 77,
           "column": 6,
-          "position": 787
+          "position": 801
         }
       }
     },
@@ -7675,17 +7603,17 @@
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 175,
-        "end": 192,
+        "start": 176,
+        "end": 193,
         "startLoc": {
-          "line": 175,
+          "line": 176,
           "column": 22,
-          "position": 1629
+          "position": 1643
         },
         "endLoc": {
-          "line": 192,
+          "line": 193,
           "column": 2,
-          "position": 1829
+          "position": 1843
         }
       }
     },
@@ -7711,53 +7639,17 @@
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 217,
-        "end": 230,
+        "start": 218,
+        "end": 231,
         "startLoc": {
-          "line": 217,
+          "line": 218,
           "column": 13,
-          "position": 2153
+          "position": 2167
         },
         "endLoc": {
-          "line": 230,
+          "line": 231,
           "column": 3,
-          "position": 2238
-        }
-      }
-    },
-    {
-      "format": "rust",
-      "lines": 8,
-      "fragment": "(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {\n    let mut calls = Vec::new();\n\n    fn clean_call_text(raw: &str) -> String {\n        raw.split('(')\n            .next()\n            .unwrap_or(raw)\n            .replace",
-      "tokens": 0,
-      "firstFile": {
-        "name": "src/parse/python.rs",
-        "start": 353,
-        "end": 360,
-        "startLoc": {
-          "line": 353,
-          "column": 21,
-          "position": 3110
-        },
-        "endLoc": {
-          "line": 360,
-          "column": 8,
-          "position": 3201
-        }
-      },
-      "secondFile": {
-        "name": "src/parse/scala.rs",
-        "start": 230,
-        "end": 234,
-        "startLoc": {
-          "line": 230,
-          "column": 20,
-          "position": 2241
-        },
-        "endLoc": {
-          "line": 234,
-          "column": 5,
-          "position": 2326
+          "position": 2252
         }
       }
     },
@@ -7783,17 +7675,17 @@
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 278,
-        "end": 288,
+        "start": 275,
+        "end": 285,
         "startLoc": {
-          "line": 278,
+          "line": 275,
           "column": 21,
-          "position": 2808
+          "position": 2775
         },
         "endLoc": {
-          "line": 288,
+          "line": 285,
           "column": 2,
-          "position": 2901
+          "position": 2868
         }
       }
     },
@@ -7819,17 +7711,17 @@
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 330,
-        "end": 340,
+        "start": 327,
+        "end": 337,
         "startLoc": {
-          "line": 330,
+          "line": 327,
           "column": 9,
-          "position": 3224
+          "position": 3191
         },
         "endLoc": {
-          "line": 340,
+          "line": 337,
           "column": 16,
-          "position": 3306
+          "position": 3273
         }
       }
     },
@@ -7855,17 +7747,17 @@
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 357,
-        "end": 372,
+        "start": 354,
+        "end": 369,
         "startLoc": {
-          "line": 357,
+          "line": 354,
           "column": 17,
-          "position": 3448
+          "position": 3415
         },
         "endLoc": {
-          "line": 372,
+          "line": 369,
           "column": 4,
-          "position": 3565
+          "position": 3532
         }
       }
     },
@@ -7891,17 +7783,17 @@
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 374,
-        "end": 393,
+        "start": 371,
+        "end": 390,
         "startLoc": {
-          "line": 374,
+          "line": 371,
           "column": 9,
-          "position": 3580
+          "position": 3547
         },
         "endLoc": {
-          "line": 393,
+          "line": 390,
           "column": 4,
-          "position": 3719
+          "position": 3686
         }
       }
     },
@@ -7943,37 +7835,37 @@
     },
     {
       "format": "rust",
-      "lines": 19,
-      "fragment": "self.edges.push(Edge {\n            from: current_block,\n            to: body_block,\n            edge_type: EdgeType::Unconditional,\n        });\n        self.edges.push(Edge {\n            from: body_block,\n            to: current_block,\n            edge_type: EdgeType::Loop,\n        });\n\n        Ok(())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    use",
+      "lines": 14,
+      "fragment": "self.edges.push(Edge {\n            from: current_block,\n            to: body_block,\n            edge_type: EdgeType::Unconditional,\n        });\n        self.edges.push(Edge {\n            from: body_block,\n            to: current_block,\n            edge_type: EdgeType::Loop,\n        });\n\n        Ok(())\n    }\n}",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/python.rs",
         "start": 555,
-        "end": 573,
+        "end": 568,
         "startLoc": {
           "line": 555,
           "column": 9,
           "position": 4853
         },
         "endLoc": {
-          "line": 573,
-          "column": 4,
-          "position": 4964
+          "line": 568,
+          "column": 2,
+          "position": 4943
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 395,
-        "end": 378,
+        "start": 392,
+        "end": 406,
         "startLoc": {
-          "line": 395,
+          "line": 392,
           "column": 9,
-          "position": 3734
+          "position": 3701
         },
         "endLoc": {
-          "line": 378,
-          "column": 8,
-          "position": 3565
+          "line": 406,
+          "column": 3,
+          "position": 3793
         }
       }
     },
@@ -7984,32 +7876,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 22,
-        "end": 40,
+        "start": 24,
+        "end": 42,
         "startLoc": {
-          "line": 22,
+          "line": 24,
           "column": 5,
-          "position": 157
+          "position": 179
         },
         "endLoc": {
-          "line": 40,
+          "line": 42,
           "column": 22,
-          "position": 312
+          "position": 334
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 22,
-        "end": 40,
+        "start": 24,
+        "end": 42,
         "startLoc": {
-          "line": 22,
+          "line": 24,
           "column": 5,
-          "position": 160
+          "position": 182
         },
         "endLoc": {
-          "line": 40,
+          "line": 42,
           "column": 9,
-          "position": 315
+          "position": 337
         }
       }
     },
@@ -8020,32 +7912,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 45,
-        "end": 53,
+        "start": 47,
+        "end": 55,
         "startLoc": {
-          "line": 45,
+          "line": 47,
           "column": 2,
-          "position": 365
+          "position": 387
         },
         "endLoc": {
-          "line": 53,
+          "line": 55,
           "column": 9,
-          "position": 447
+          "position": 469
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 45,
-        "end": 53,
+        "start": 47,
+        "end": 55,
         "startLoc": {
-          "line": 45,
+          "line": 47,
           "column": 2,
-          "position": 364
+          "position": 386
         },
         "endLoc": {
-          "line": 53,
+          "line": 55,
           "column": 9,
-          "position": 446
+          "position": 468
         }
       }
     },
@@ -8056,32 +7948,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 53,
-        "end": 79,
+        "start": 55,
+        "end": 81,
         "startLoc": {
-          "line": 53,
+          "line": 55,
           "column": 5,
-          "position": 455
+          "position": 477
         },
         "endLoc": {
-          "line": 79,
+          "line": 81,
           "column": 24,
-          "position": 659
+          "position": 681
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 53,
-        "end": 79,
+        "start": 55,
+        "end": 81,
         "startLoc": {
-          "line": 53,
+          "line": 55,
           "column": 5,
-          "position": 454
+          "position": 476
         },
         "endLoc": {
-          "line": 79,
+          "line": 81,
           "column": 9,
-          "position": 658
+          "position": 680
         }
       }
     },
@@ -8092,32 +7984,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 79,
-        "end": 94,
+        "start": 81,
+        "end": 96,
         "startLoc": {
-          "line": 79,
+          "line": 81,
           "column": 2,
-          "position": 661
+          "position": 683
         },
         "endLoc": {
-          "line": 94,
+          "line": 96,
           "column": 12,
-          "position": 801
+          "position": 823
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 45,
-        "end": 60,
+        "start": 47,
+        "end": 62,
         "startLoc": {
-          "line": 45,
+          "line": 47,
           "column": 2,
-          "position": 364
+          "position": 386
         },
         "endLoc": {
-          "line": 60,
+          "line": 62,
           "column": 8,
-          "position": 505
+          "position": 527
         }
       }
     },
@@ -8128,32 +8020,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 94,
-        "end": 107,
+        "start": 96,
+        "end": 109,
         "startLoc": {
-          "line": 94,
+          "line": 96,
           "column": 12,
-          "position": 802
+          "position": 824
         },
         "endLoc": {
-          "line": 107,
+          "line": 109,
           "column": 2,
-          "position": 896
+          "position": 918
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 60,
-        "end": 74,
+        "start": 62,
+        "end": 76,
         "startLoc": {
-          "line": 60,
+          "line": 62,
           "column": 8,
-          "position": 505
+          "position": 527
         },
         "endLoc": {
-          "line": 74,
+          "line": 76,
           "column": 4,
-          "position": 600
+          "position": 622
         }
       }
     },
@@ -8164,32 +8056,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 108,
-        "end": 136,
+        "start": 110,
+        "end": 138,
         "startLoc": {
-          "line": 108,
+          "line": 110,
           "column": 2,
-          "position": 901
+          "position": 923
         },
         "endLoc": {
-          "line": 136,
+          "line": 138,
           "column": 10,
-          "position": 1150
+          "position": 1172
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 79,
-        "end": 107,
+        "start": 81,
+        "end": 109,
         "startLoc": {
-          "line": 79,
+          "line": 81,
           "column": 2,
-          "position": 660
+          "position": 682
         },
         "endLoc": {
-          "line": 107,
+          "line": 109,
           "column": 11,
-          "position": 909
+          "position": 931
         }
       }
     },
@@ -8200,27 +8092,27 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 148,
-        "end": 161,
+        "start": 150,
+        "end": 163,
         "startLoc": {
-          "line": 148,
+          "line": 150,
           "column": 20,
-          "position": 1315
+          "position": 1337
         },
         "endLoc": {
-          "line": 161,
+          "line": 163,
           "column": 4,
-          "position": 1461
+          "position": 1483
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 127,
+        "start": 129,
         "end": 52,
         "startLoc": {
-          "line": 127,
+          "line": 129,
           "column": 21,
-          "position": 1140
+          "position": 1162
         },
         "endLoc": {
           "line": 52,
@@ -8236,32 +8128,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 158,
-        "end": 169,
+        "start": 160,
+        "end": 171,
         "startLoc": {
-          "line": 158,
+          "line": 160,
           "column": 5,
-          "position": 1420
+          "position": 1442
         },
         "endLoc": {
-          "line": 169,
+          "line": 171,
           "column": 5,
-          "position": 1551
+          "position": 1573
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 137,
-        "end": 148,
+        "start": 139,
+        "end": 150,
         "startLoc": {
-          "line": 137,
+          "line": 139,
           "column": 14,
-          "position": 1179
+          "position": 1201
         },
         "endLoc": {
-          "line": 148,
+          "line": 150,
           "column": 8,
-          "position": 1310
+          "position": 1332
         }
       }
     },
@@ -8272,32 +8164,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 169,
-        "end": 191,
+        "start": 171,
+        "end": 193,
         "startLoc": {
-          "line": 169,
+          "line": 171,
           "column": 2,
-          "position": 1564
+          "position": 1586
         },
         "endLoc": {
-          "line": 191,
+          "line": 193,
           "column": 20,
-          "position": 1745
+          "position": 1767
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 56,
-        "end": 76,
+        "start": 57,
+        "end": 77,
         "startLoc": {
-          "line": 56,
+          "line": 57,
           "column": 2,
-          "position": 608
+          "position": 622
         },
         "endLoc": {
-          "line": 76,
+          "line": 77,
           "column": 6,
-          "position": 787
+          "position": 801
         }
       }
     },
@@ -8308,32 +8200,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 191,
-        "end": 205,
+        "start": 193,
+        "end": 207,
         "startLoc": {
-          "line": 191,
+          "line": 193,
           "column": 20,
-          "position": 1746
+          "position": 1768
         },
         "endLoc": {
-          "line": 205,
+          "line": 207,
           "column": 15,
-          "position": 1907
+          "position": 1929
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 175,
-        "end": 189,
+        "start": 176,
+        "end": 190,
         "startLoc": {
-          "line": 175,
+          "line": 176,
           "column": 22,
-          "position": 1629
+          "position": 1643
         },
         "endLoc": {
-          "line": 189,
+          "line": 190,
           "column": 18,
-          "position": 1790
+          "position": 1804
         }
       }
     },
@@ -8344,17 +8236,17 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 211,
-        "end": 222,
+        "start": 213,
+        "end": 224,
         "startLoc": {
-          "line": 211,
+          "line": 213,
           "column": 5,
-          "position": 1988
+          "position": 2010
         },
         "endLoc": {
-          "line": 222,
+          "line": 224,
           "column": 5,
-          "position": 2106
+          "position": 2128
         }
       },
       "secondFile": {
@@ -8380,32 +8272,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 231,
-        "end": 245,
+        "start": 233,
+        "end": 247,
         "startLoc": {
-          "line": 231,
+          "line": 233,
           "column": 15,
-          "position": 2233
+          "position": 2255
         },
         "endLoc": {
-          "line": 245,
+          "line": 247,
           "column": 27,
-          "position": 2329
+          "position": 2351
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 216,
-        "end": 230,
+        "start": 217,
+        "end": 231,
         "startLoc": {
-          "line": 216,
+          "line": 217,
           "column": 18,
-          "position": 2144
+          "position": 2158
         },
         "endLoc": {
-          "line": 230,
+          "line": 231,
           "column": 20,
-          "position": 2240
+          "position": 2254
         }
       }
     },
@@ -8416,68 +8308,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 245,
-        "end": 258,
+        "start": 247,
+        "end": 260,
         "startLoc": {
-          "line": 245,
+          "line": 247,
           "column": 27,
-          "position": 2330
+          "position": 2352
         },
         "endLoc": {
-          "line": 258,
+          "line": 260,
           "column": 9,
-          "position": 2465
+          "position": 2487
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 213,
-        "end": 226,
+        "start": 215,
+        "end": 228,
         "startLoc": {
-          "line": 213,
+          "line": 215,
           "column": 25,
-          "position": 2042
+          "position": 2064
         },
         "endLoc": {
-          "line": 226,
+          "line": 228,
           "column": 9,
-          "position": 2177
-        }
-      }
-    },
-    {
-      "format": "rust",
-      "lines": 10,
-      "fragment": "(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {\n    let mut calls = Vec::new();\n\n    fn clean_call_text(raw: &str) -> String {\n        raw.split('(').next().unwrap_or(raw).trim().to_string()\n    }\n\n    fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {\n        match node.kind() {\n            \"function_call_expression\"",
-      "tokens": 0,
-      "firstFile": {
-        "name": "src/parse/php.rs",
-        "start": 289,
-        "end": 298,
-        "startLoc": {
-          "line": 289,
-          "column": 18,
-          "position": 2696
-        },
-        "endLoc": {
-          "line": 298,
-          "column": 27,
-          "position": 2846
-        }
-      },
-      "secondFile": {
-        "name": "src/parse/scala.rs",
-        "start": 230,
-        "end": 239,
-        "startLoc": {
-          "line": 230,
-          "column": 20,
-          "position": 2241
-        },
-        "endLoc": {
-          "line": 239,
-          "column": 18,
-          "position": 2391
+          "position": 2199
         }
       }
     },
@@ -8488,32 +8344,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 321,
-        "end": 337,
+        "start": 319,
+        "end": 335,
         "startLoc": {
-          "line": 321,
+          "line": 319,
           "column": 21,
-          "position": 3069
+          "position": 3044
         },
         "endLoc": {
-          "line": 337,
+          "line": 335,
           "column": 18,
-          "position": 3169
+          "position": 3144
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 254,
-        "end": 270,
+        "start": 251,
+        "end": 267,
         "startLoc": {
-          "line": 254,
+          "line": 251,
           "column": 21,
-          "position": 2564
+          "position": 2531
         },
         "endLoc": {
-          "line": 270,
+          "line": 267,
           "column": 19,
-          "position": 2664
+          "position": 2631
         }
       }
     },
@@ -8524,63 +8380,63 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 403,
-        "end": 409,
+        "start": 401,
+        "end": 407,
         "startLoc": {
-          "line": 403,
+          "line": 401,
           "column": 23,
-          "position": 3810
+          "position": 3785
         },
         "endLoc": {
-          "line": 409,
+          "line": 407,
           "column": 19,
-          "position": 3927
+          "position": 3902
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 299,
-        "end": 305,
+        "start": 297,
+        "end": 303,
         "startLoc": {
-          "line": 299,
+          "line": 297,
           "column": 24,
-          "position": 2832
+          "position": 2807
         },
         "endLoc": {
-          "line": 305,
+          "line": 303,
           "column": 13,
-          "position": 2949
+          "position": 2924
         }
       }
     },
     {
       "format": "rust",
       "lines": 20,
-      "fragment": ",\n];\ncfg_builder!();\nimpl<'a> CfgBuilder<'a> {\n    fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {\n        let entry_id = self.create_block();\n        self.build_cfg_recursive(node, entry_id)?;\n        Ok(())\n    }\n\n    fn build_cfg_recursive(\n        &mut self,\n        node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        match node.kind() {\n            \"if_statement\" => {\n                self.handle_if_statement(node, current_block)?;\n            }\n            \"for_statement\"",
+      "fragment": "];\ncfg_builder!();\ncfg_loop_handler!();\nimpl<'a> CfgBuilder<'a> {\n    fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {\n        let entry_id = self.create_block();\n        self.build_cfg_recursive(node, entry_id)?;\n        Ok(())\n    }\n\n    fn build_cfg_recursive(\n        &mut self,\n        node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        match node.kind() {\n            \"if_statement\" => {\n                self.handle_if_statement(node, current_block)?;\n            }\n            \"for_statement\"",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 439,
-        "end": 458,
+        "start": 438,
+        "end": 457,
         "startLoc": {
-          "line": 439,
-          "column": 19,
-          "position": 4154
+          "line": 438,
+          "column": 1,
+          "position": 4131
         },
         "endLoc": {
-          "line": 458,
+          "line": 457,
           "column": 16,
-          "position": 4330
+          "position": 4310
         }
       },
       "secondFile": {
-        "name": "src/parse/scala.rs",
-        "start": 324,
+        "name": "src/parse/ruby.rs",
+        "start": 318,
         "end": 500,
         "startLoc": {
-          "line": 324,
-          "column": 14,
-          "position": 3153
+          "line": 318,
+          "column": 6,
+          "position": 3041
         },
         "endLoc": {
           "line": 500,
@@ -8591,37 +8447,37 @@
     },
     {
       "format": "rust",
-      "lines": 42,
-      "fragment": "=> {\n                self.handle_loop_statement(node, current_block)?;\n            }\n            _ => {\n                if let Ok(text) = node.utf8_text(self.source) {\n                    self.add_statement_to_block(current_block, text.to_string());\n                }\n                let mut cursor = node.walk();\n                for child in node.children(&mut cursor) {\n                    self.build_cfg_recursive(&child, current_block)?;\n                }\n            }\n        }\n        Ok(())\n    }\n\n    fn handle_loop_statement(\n        &mut self,\n        _node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        let body_block = self.create_block();\n        self.edges.push(Edge {\n            from: current_block,\n            to: body_block,\n            edge_type: EdgeType::Unconditional,\n        });\n        self.edges.push(Edge {\n            from: body_block,\n            to: current_block,\n            edge_type: EdgeType::Loop,\n        });\n        Ok(())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn test_php_function_extraction",
+      "lines": 23,
+      "fragment": "=> {\n                self.handle_loop_statement(node, current_block)?;\n            }\n            _ => {\n                if let Ok(text) = node.utf8_text(self.source) {\n                    self.add_statement_to_block(current_block, text.to_string());\n                }\n                let mut cursor = node.walk();\n                for child in node.children(&mut cursor) {\n                    self.build_cfg_recursive(&child, current_block)?;\n                }\n            }\n        }\n        Ok(())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn test_php_function_extraction",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/php.rs",
-        "start": 458,
-        "end": 499,
+        "start": 457,
+        "end": 479,
         "startLoc": {
-          "line": 458,
+          "line": 457,
           "column": 2,
-          "position": 4340
+          "position": 4320
         },
         "endLoc": {
-          "line": 499,
+          "line": 479,
           "column": 29,
-          "position": 4656
+          "position": 4484
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 338,
-        "end": 379,
+        "start": 337,
+        "end": 359,
         "startLoc": {
-          "line": 338,
+          "line": 337,
           "column": 2,
-          "position": 3254
+          "position": 3234
         },
         "endLoc": {
-          "line": 379,
+          "line": 359,
           "column": 28,
-          "position": 3570
+          "position": 3398
         }
       }
     },
@@ -8663,37 +8519,37 @@
     },
     {
       "format": "rust",
-      "lines": 9,
-      "fragment": "use crate::cfg_builder;\nuse crate::parse::traits::calculate_complexity;\nuse crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// Lua language parser with full CodeIntelligence implementation",
+      "lines": 10,
+      "fragment": ";\nuse crate::parse::traits::calculate_complexity;\nuse crate::parse::traits::clean_call_text;\nuse crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// Lua language parser with full CodeIntelligence implementation",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/lua.rs",
         "start": 3,
-        "end": 11,
+        "end": 12,
         "startLoc": {
           "line": 3,
-          "column": 1,
-          "position": 3
+          "column": 12,
+          "position": 9
         },
         "endLoc": {
-          "line": 11,
+          "line": 12,
           "column": 66,
-          "position": 100
+          "position": 114
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 3,
-        "end": 11,
+        "start": 4,
+        "end": 13,
         "startLoc": {
-          "line": 3,
-          "column": 1,
-          "position": 3
+          "line": 4,
+          "column": 17,
+          "position": 17
         },
         "endLoc": {
-          "line": 11,
+          "line": 13,
           "column": 66,
-          "position": 100
+          "position": 122
         }
       }
     },
@@ -8704,27 +8560,27 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/lua.rs",
-        "start": 37,
-        "end": 49,
+        "start": 38,
+        "end": 50,
         "startLoc": {
-          "line": 37,
+          "line": 38,
           "column": 20,
-          "position": 349
+          "position": 363
         },
         "endLoc": {
-          "line": 49,
+          "line": 50,
           "column": 4,
-          "position": 512
+          "position": 526
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 37,
+        "start": 38,
         "end": 52,
         "startLoc": {
-          "line": 37,
+          "line": 38,
           "column": 22,
-          "position": 352
+          "position": 366
         },
         "endLoc": {
           "line": 52,
@@ -8740,32 +8596,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/lua.rs",
-        "start": 46,
-        "end": 56,
+        "start": 47,
+        "end": 57,
         "startLoc": {
-          "line": 46,
+          "line": 47,
           "column": 5,
-          "position": 471
+          "position": 485
         },
         "endLoc": {
-          "line": 56,
+          "line": 57,
           "column": 5,
-          "position": 601
+          "position": 615
         }
       },
       "secondFile": {
         "name": "src/parse/lua.rs",
-        "start": 28,
-        "end": 37,
+        "start": 29,
+        "end": 38,
         "startLoc": {
-          "line": 28,
+          "line": 29,
           "column": 14,
-          "position": 215
+          "position": 229
         },
         "endLoc": {
-          "line": 37,
+          "line": 38,
           "column": 8,
-          "position": 344
+          "position": 358
         }
       }
     },
@@ -8776,32 +8632,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/lua.rs",
-        "start": 53,
-        "end": 83,
+        "start": 54,
+        "end": 84,
         "startLoc": {
-          "line": 53,
+          "line": 54,
           "column": 29,
-          "position": 574
+          "position": 588
         },
         "endLoc": {
-          "line": 83,
+          "line": 84,
           "column": 23,
-          "position": 859
+          "position": 873
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 166,
-        "end": 83,
+        "start": 168,
+        "end": 84,
         "startLoc": {
-          "line": 166,
+          "line": 168,
           "column": 29,
-          "position": 1524
+          "position": 1546
         },
         "endLoc": {
-          "line": 83,
+          "line": 84,
           "column": 22,
-          "position": 853
+          "position": 867
         }
       }
     },
@@ -8812,32 +8668,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/lua.rs",
-        "start": 109,
-        "end": 124,
+        "start": 110,
+        "end": 125,
         "startLoc": {
-          "line": 109,
+          "line": 110,
           "column": 5,
-          "position": 1106
+          "position": 1120
         },
         "endLoc": {
-          "line": 124,
+          "line": 125,
           "column": 2,
-          "position": 1205
+          "position": 1219
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 111,
-        "end": 126,
+        "start": 112,
+        "end": 127,
         "startLoc": {
-          "line": 111,
+          "line": 112,
           "column": 12,
-          "position": 1103
+          "position": 1117
         },
         "endLoc": {
-          "line": 126,
+          "line": 127,
           "column": 19,
-          "position": 1202
+          "position": 1216
         }
       }
     },
@@ -8848,32 +8704,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/lua.rs",
-        "start": 134,
-        "end": 149,
+        "start": 135,
+        "end": 150,
         "startLoc": {
-          "line": 134,
+          "line": 135,
           "column": 20,
-          "position": 1280
+          "position": 1294
         },
         "endLoc": {
-          "line": 149,
+          "line": 150,
           "column": 16,
-          "position": 1489
+          "position": 1503
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 175,
-        "end": 185,
+        "start": 176,
+        "end": 187,
         "startLoc": {
-          "line": 175,
+          "line": 176,
           "column": 22,
-          "position": 1629
+          "position": 1643
         },
         "endLoc": {
-          "line": 185,
+          "line": 187,
           "column": 7,
-          "position": 1771
+          "position": 1793
         }
       }
     },
@@ -8884,68 +8740,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/lua.rs",
-        "start": 160,
-        "end": 176,
+        "start": 161,
+        "end": 177,
         "startLoc": {
-          "line": 160,
+          "line": 161,
           "column": 25,
-          "position": 1651
+          "position": 1665
         },
         "endLoc": {
-          "line": 176,
+          "line": 177,
           "column": 18,
-          "position": 1747
+          "position": 1761
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 197,
-        "end": 230,
+        "start": 199,
+        "end": 231,
         "startLoc": {
-          "line": 197,
+          "line": 199,
           "column": 25,
-          "position": 1945
+          "position": 1967
         },
         "endLoc": {
-          "line": 230,
+          "line": 231,
           "column": 20,
-          "position": 2240
-        }
-      }
-    },
-    {
-      "format": "rust",
-      "lines": 10,
-      "fragment": "(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {\n    let mut calls = Vec::new();\n\n    fn clean_call_text(raw: &str) -> String {\n        raw.split('(').next().unwrap_or(raw).trim().to_string()\n    }\n\n    fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {\n        match node.kind() {\n            \"function_call\"",
-      "tokens": 0,
-      "firstFile": {
-        "name": "src/parse/lua.rs",
-        "start": 176,
-        "end": 185,
-        "startLoc": {
-          "line": 176,
-          "column": 18,
-          "position": 1748
-        },
-        "endLoc": {
-          "line": 185,
-          "column": 16,
-          "position": 1898
-        }
-      },
-      "secondFile": {
-        "name": "src/parse/scala.rs",
-        "start": 230,
-        "end": 239,
-        "startLoc": {
-          "line": 230,
-          "column": 20,
-          "position": 2241
-        },
-        "endLoc": {
-          "line": 239,
-          "column": 18,
-          "position": 2391
+          "position": 2254
         }
       }
     },
@@ -8956,32 +8776,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/lua.rs",
-        "start": 190,
-        "end": 216,
+        "start": 187,
+        "end": 213,
         "startLoc": {
-          "line": 190,
+          "line": 187,
           "column": 5,
-          "position": 1959
+          "position": 1926
         },
         "endLoc": {
-          "line": 216,
+          "line": 213,
           "column": 13,
-          "position": 2202
+          "position": 2169
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 316,
-        "end": 275,
+        "start": 314,
+        "end": 272,
         "startLoc": {
-          "line": 316,
+          "line": 314,
           "column": 10,
-          "position": 3023
+          "position": 2998
         },
         "endLoc": {
-          "line": 275,
+          "line": 272,
           "column": 12,
-          "position": 2761
+          "position": 2728
         }
       }
     },
@@ -8992,32 +8812,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/lua.rs",
-        "start": 213,
-        "end": 227,
+        "start": 210,
+        "end": 224,
         "startLoc": {
-          "line": 213,
+          "line": 210,
           "column": 5,
-          "position": 2156
+          "position": 2123
         },
         "endLoc": {
-          "line": 227,
+          "line": 224,
           "column": 11,
-          "position": 2277
+          "position": 2244
         }
       },
       "secondFile": {
         "name": "src/parse/python.rs",
         "start": 392,
-        "end": 315,
+        "end": 313,
         "startLoc": {
           "line": 392,
           "column": 5,
           "position": 3507
         },
         "endLoc": {
-          "line": 315,
+          "line": 313,
           "column": 2,
-          "position": 3023
+          "position": 2998
         }
       }
     },
@@ -9028,27 +8848,27 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/lua.rs",
-        "start": 261,
-        "end": 286,
+        "start": 258,
+        "end": 283,
         "startLoc": {
-          "line": 261,
+          "line": 258,
           "column": 9,
-          "position": 2528
+          "position": 2495
         },
         "endLoc": {
-          "line": 286,
+          "line": 283,
           "column": 19,
-          "position": 2750
+          "position": 2717
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 324,
+        "start": 321,
         "end": 506,
         "startLoc": {
-          "line": 324,
+          "line": 321,
           "column": 14,
-          "position": 3153
+          "position": 3120
         },
         "endLoc": {
           "line": 506,
@@ -9064,68 +8884,68 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/lua.rs",
-        "start": 287,
-        "end": 348,
+        "start": 284,
+        "end": 345,
         "startLoc": {
-          "line": 287,
+          "line": 284,
           "column": 24,
-          "position": 2760
+          "position": 2727
         },
         "endLoc": {
-          "line": 348,
+          "line": 345,
           "column": 24,
-          "position": 3209
+          "position": 3176
         }
       },
       "secondFile": {
         "name": "src/parse/python.rs",
         "start": 504,
-        "end": 409,
+        "end": 406,
         "startLoc": {
           "line": 504,
           "column": 21,
           "position": 4486
         },
         "endLoc": {
-          "line": 409,
+          "line": 406,
           "column": 23,
-          "position": 3828
+          "position": 3795
         }
       }
     },
     {
       "format": "rust",
-      "lines": 28,
-      "fragment": "(\n        &mut self,\n        _node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        let body_block = self.create_block();\n\n        self.edges.push(Edge {\n            from: current_block,\n            to: body_block,\n            edge_type: EdgeType::Unconditional,\n        });\n        self.edges.push(Edge {\n            from: body_block,\n            to: current_block,\n            edge_type: EdgeType::Loop,\n        });\n\n        Ok(())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn test_lua_function",
+      "lines": 27,
+      "fragment": "(\n        &mut self,\n        _node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        let body_block = self.create_block();\n\n        self.edges.push(Edge {\n            from: current_block,\n            to: body_block,\n            edge_type: EdgeType::Unconditional,\n        });\n        self.edges.push(Edge {\n            from: body_block,\n            to: current_block,\n            edge_type: EdgeType::Loop,\n        });\n\n        Ok(())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/lua.rs",
-        "start": 348,
-        "end": 375,
+        "start": 345,
+        "end": 371,
         "startLoc": {
-          "line": 348,
+          "line": 345,
           "column": 24,
-          "position": 3210
+          "position": 3177
         },
         "endLoc": {
-          "line": 375,
-          "column": 18,
-          "position": 3386
+          "line": 371,
+          "column": 8,
+          "position": 3348
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 367,
-        "end": 379,
+        "start": 364,
+        "end": 573,
         "startLoc": {
-          "line": 367,
+          "line": 364,
           "column": 23,
-          "position": 3521
+          "position": 3488
         },
         "endLoc": {
-          "line": 379,
-          "column": 28,
-          "position": 3570
+          "line": 573,
+          "column": 4,
+          "position": 4964
         }
       }
     },
@@ -9583,53 +9403,53 @@
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 110,
-        "end": 119,
+        "start": 112,
+        "end": 121,
         "startLoc": {
-          "line": 110,
+          "line": 112,
           "column": 7,
-          "position": 971
+          "position": 993
         },
         "endLoc": {
-          "line": 119,
+          "line": 121,
           "column": 5,
-          "position": 1045
+          "position": 1067
         }
       }
     },
     {
       "format": "rust",
-      "lines": 9,
-      "fragment": "use crate::cfg_builder;\nuse crate::parse::traits::calculate_complexity;\nuse crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// Java language parser with full CodeIntelligence implementation",
+      "lines": 11,
+      "fragment": "use crate::cfg_builder;\nuse crate::cfg_loop_handler;\nuse crate::parse::traits::calculate_complexity;\nuse crate::parse::traits::clean_call_text;\nuse crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// Java language parser with full CodeIntelligence implementation",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
         "start": 3,
-        "end": 11,
+        "end": 13,
         "startLoc": {
           "line": 3,
           "column": 1,
           "position": 3
         },
         "endLoc": {
-          "line": 11,
+          "line": 13,
           "column": 67,
-          "position": 100
+          "position": 122
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
         "start": 3,
-        "end": 11,
+        "end": 13,
         "startLoc": {
           "line": 3,
           "column": 1,
           "position": 3
         },
         "endLoc": {
-          "line": 11,
+          "line": 13,
           "column": 66,
-          "position": 100
+          "position": 122
         }
       }
     },
@@ -9640,32 +9460,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 159,
-        "end": 171,
+        "start": 161,
+        "end": 173,
         "startLoc": {
-          "line": 159,
+          "line": 161,
           "column": 2,
-          "position": 1432
+          "position": 1454
         },
         "endLoc": {
-          "line": 171,
+          "line": 173,
           "column": 5,
-          "position": 1566
+          "position": 1588
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 107,
-        "end": 119,
+        "start": 109,
+        "end": 121,
         "startLoc": {
-          "line": 107,
+          "line": 109,
           "column": 2,
-          "position": 911
+          "position": 933
         },
         "endLoc": {
-          "line": 119,
+          "line": 121,
           "column": 5,
-          "position": 1045
+          "position": 1067
         }
       }
     },
@@ -9676,27 +9496,27 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 180,
-        "end": 193,
+        "start": 182,
+        "end": 195,
         "startLoc": {
-          "line": 180,
+          "line": 182,
           "column": 21,
-          "position": 1662
+          "position": 1684
         },
         "endLoc": {
-          "line": 193,
+          "line": 195,
           "column": 5,
-          "position": 1808
+          "position": 1830
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 127,
+        "start": 129,
         "end": 52,
         "startLoc": {
-          "line": 127,
+          "line": 129,
           "column": 21,
-          "position": 1140
+          "position": 1162
         },
         "endLoc": {
           "line": 52,
@@ -9712,32 +9532,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 192,
-        "end": 202,
+        "start": 194,
+        "end": 204,
         "startLoc": {
-          "line": 192,
+          "line": 194,
           "column": 9,
-          "position": 1789
+          "position": 1811
         },
         "endLoc": {
-          "line": 202,
+          "line": 204,
           "column": 5,
-          "position": 1899
+          "position": 1921
         }
       },
       "secondFile": {
         "name": "src/parse/java.rs",
-        "start": 170,
-        "end": 180,
+        "start": 172,
+        "end": 182,
         "startLoc": {
-          "line": 170,
+          "line": 172,
           "column": 9,
-          "position": 1547
+          "position": 1569
         },
         "endLoc": {
-          "line": 180,
+          "line": 182,
           "column": 8,
-          "position": 1657
+          "position": 1679
         }
       }
     },
@@ -9748,32 +9568,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 198,
-        "end": 224,
+        "start": 200,
+        "end": 226,
         "startLoc": {
-          "line": 198,
+          "line": 200,
           "column": 30,
-          "position": 1871
+          "position": 1893
         },
         "endLoc": {
-          "line": 224,
+          "line": 226,
           "column": 21,
-          "position": 2093
+          "position": 2115
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 166,
-        "end": 76,
+        "start": 168,
+        "end": 77,
         "startLoc": {
-          "line": 166,
+          "line": 168,
           "column": 29,
-          "position": 1524
+          "position": 1546
         },
         "endLoc": {
-          "line": 76,
+          "line": 77,
           "column": 6,
-          "position": 787
+          "position": 801
         }
       }
     },
@@ -9784,32 +9604,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 224,
-        "end": 238,
+        "start": 226,
+        "end": 240,
         "startLoc": {
-          "line": 224,
+          "line": 226,
           "column": 21,
-          "position": 2094
+          "position": 2116
         },
         "endLoc": {
-          "line": 238,
+          "line": 240,
           "column": 6,
-          "position": 2255
+          "position": 2277
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 175,
-        "end": 189,
+        "start": 176,
+        "end": 190,
         "startLoc": {
-          "line": 175,
+          "line": 176,
           "column": 22,
-          "position": 1629
+          "position": 1643
         },
         "endLoc": {
-          "line": 189,
+          "line": 190,
           "column": 18,
-          "position": 1790
+          "position": 1804
         }
       }
     },
@@ -9820,32 +9640,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 246,
-        "end": 260,
+        "start": 248,
+        "end": 262,
         "startLoc": {
-          "line": 246,
+          "line": 248,
           "column": 6,
-          "position": 2418
+          "position": 2440
         },
         "endLoc": {
-          "line": 260,
+          "line": 262,
           "column": 60,
-          "position": 2507
+          "position": 2529
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 216,
-        "end": 230,
+        "start": 217,
+        "end": 231,
         "startLoc": {
-          "line": 216,
+          "line": 217,
           "column": 5,
-          "position": 2149
+          "position": 2163
         },
         "endLoc": {
-          "line": 230,
+          "line": 231,
           "column": 3,
-          "position": 2238
+          "position": 2252
         }
       }
     },
@@ -9856,32 +9676,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 261,
-        "end": 274,
+        "start": 263,
+        "end": 276,
         "startLoc": {
-          "line": 261,
+          "line": 263,
           "column": 1,
-          "position": 2509
+          "position": 2531
         },
         "endLoc": {
-          "line": 274,
+          "line": 276,
           "column": 8,
-          "position": 2647
+          "position": 2669
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 213,
-        "end": 226,
+        "start": 215,
+        "end": 228,
         "startLoc": {
-          "line": 213,
+          "line": 215,
           "column": 1,
-          "position": 2039
+          "position": 2061
         },
         "endLoc": {
-          "line": 226,
+          "line": 228,
           "column": 9,
-          "position": 2177
+          "position": 2199
         }
       }
     },
@@ -9892,32 +9712,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 307,
-        "end": 325,
+        "start": 309,
+        "end": 327,
         "startLoc": {
-          "line": 307,
+          "line": 309,
           "column": 30,
-          "position": 2892
+          "position": 2914
         },
         "endLoc": {
-          "line": 325,
+          "line": 327,
           "column": 11,
-          "position": 3066
+          "position": 3088
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 213,
-        "end": 279,
+        "start": 215,
+        "end": 281,
         "startLoc": {
-          "line": 213,
+          "line": 215,
           "column": 25,
-          "position": 2042
+          "position": 2064
         },
         "endLoc": {
-          "line": 279,
+          "line": 281,
           "column": 12,
-          "position": 2686
+          "position": 2708
         }
       }
     },
@@ -9928,68 +9748,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 335,
-        "end": 347,
+        "start": 337,
+        "end": 349,
         "startLoc": {
-          "line": 335,
+          "line": 337,
           "column": 9,
-          "position": 3136
+          "position": 3158
         },
         "endLoc": {
-          "line": 347,
+          "line": 349,
           "column": 44,
-          "position": 3213
+          "position": 3235
         }
       },
       "secondFile": {
         "name": "src/parse/java.rs",
-        "start": 294,
-        "end": 306,
+        "start": 296,
+        "end": 308,
         "startLoc": {
-          "line": 294,
+          "line": 296,
           "column": 9,
-          "position": 2810
+          "position": 2832
         },
         "endLoc": {
-          "line": 306,
+          "line": 308,
           "column": 70,
-          "position": 2887
-        }
-      }
-    },
-    {
-      "format": "rust",
-      "lines": 10,
-      "fragment": "(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {\n    let mut calls = Vec::new();\n\n    fn clean_call_text(raw: &str) -> String {\n        raw.split('(').next().unwrap_or(raw).trim().to_string()\n    }\n\n    fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {\n        match node.kind() {\n            \"method_invocation\"",
-      "tokens": 0,
-      "firstFile": {
-        "name": "src/parse/java.rs",
-        "start": 348,
-        "end": 357,
-        "startLoc": {
-          "line": 348,
-          "column": 19,
-          "position": 3218
-        },
-        "endLoc": {
-          "line": 357,
-          "column": 20,
-          "position": 3368
-        }
-      },
-      "secondFile": {
-        "name": "src/parse/scala.rs",
-        "start": 230,
-        "end": 239,
-        "startLoc": {
-          "line": 230,
-          "column": 20,
-          "position": 2241
-        },
-        "endLoc": {
-          "line": 239,
-          "column": 18,
-          "position": 2391
+          "position": 2909
         }
       }
     },
@@ -10000,32 +9784,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 393,
-        "end": 413,
+        "start": 391,
+        "end": 411,
         "startLoc": {
-          "line": 393,
+          "line": 391,
           "column": 17,
-          "position": 3712
+          "position": 3687
         },
         "endLoc": {
-          "line": 413,
+          "line": 411,
           "column": 42,
-          "position": 3865
+          "position": 3840
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 250,
-        "end": 270,
+        "start": 247,
+        "end": 267,
         "startLoc": {
-          "line": 250,
+          "line": 247,
           "column": 2,
-          "position": 2509
+          "position": 2476
         },
         "endLoc": {
-          "line": 270,
+          "line": 267,
           "column": 3,
-          "position": 2662
+          "position": 2629
         }
       }
     },
@@ -10036,32 +9820,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 414,
-        "end": 420,
+        "start": 412,
+        "end": 418,
         "startLoc": {
-          "line": 414,
+          "line": 412,
           "column": 24,
-          "position": 3870
+          "position": 3845
         },
         "endLoc": {
-          "line": 420,
+          "line": 418,
           "column": 19,
-          "position": 3987
+          "position": 3962
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 299,
-        "end": 305,
+        "start": 297,
+        "end": 303,
         "startLoc": {
-          "line": 299,
+          "line": 297,
           "column": 24,
-          "position": 2832
+          "position": 2807
         },
         "endLoc": {
-          "line": 305,
+          "line": 303,
           "column": 13,
-          "position": 2949
+          "position": 2924
         }
       }
     },
@@ -10072,104 +9856,104 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 420,
-        "end": 445,
+        "start": 418,
+        "end": 443,
         "startLoc": {
-          "line": 420,
+          "line": 418,
           "column": 2,
-          "position": 3989
+          "position": 3964
         },
         "endLoc": {
-          "line": 445,
+          "line": 443,
           "column": 44,
-          "position": 4168
+          "position": 4143
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 409,
-        "end": 434,
+        "start": 407,
+        "end": 432,
         "startLoc": {
-          "line": 409,
+          "line": 407,
           "column": 2,
-          "position": 3941
+          "position": 3916
         },
         "endLoc": {
-          "line": 434,
+          "line": 432,
           "column": 6,
-          "position": 4120
+          "position": 4095
         }
       }
     },
     {
       "format": "rust",
-      "lines": 20,
-      "fragment": ",\n];\ncfg_builder!();\nimpl<'a> CfgBuilder<'a> {\n    fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {\n        let entry_id = self.create_block();\n        self.build_cfg_recursive(node, entry_id)?;\n        Ok(())\n    }\n\n    fn build_cfg_recursive(\n        &mut self,\n        node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        match node.kind() {\n            \"if_statement\" => {\n                self.handle_if_statement(node, current_block)?;\n            }\n            \"for_statement\" | \"enhanced_for_statement\"",
+      "lines": 21,
+      "fragment": ",\n];\ncfg_builder!();\ncfg_loop_handler!();\nimpl<'a> CfgBuilder<'a> {\n    fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {\n        let entry_id = self.create_block();\n        self.build_cfg_recursive(node, entry_id)?;\n        Ok(())\n    }\n\n    fn build_cfg_recursive(\n        &mut self,\n        node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        match node.kind() {\n            \"if_statement\" => {\n                self.handle_if_statement(node, current_block)?;\n            }\n            \"for_statement\" | \"enhanced_for_statement\"",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 503,
-        "end": 522,
+        "start": 501,
+        "end": 521,
         "startLoc": {
-          "line": 503,
+          "line": 501,
           "column": 17,
-          "position": 4673
+          "position": 4648
         },
         "endLoc": {
-          "line": 522,
+          "line": 521,
           "column": 25,
-          "position": 4853
+          "position": 4833
         }
       },
       "secondFile": {
-        "name": "src/parse/scala.rs",
-        "start": 324,
-        "end": 458,
+        "name": "src/parse/php.rs",
+        "start": 437,
+        "end": 457,
         "startLoc": {
-          "line": 324,
-          "column": 14,
-          "position": 3153
+          "line": 437,
+          "column": 19,
+          "position": 4129
         },
         "endLoc": {
-          "line": 458,
+          "line": 457,
           "column": 20,
-          "position": 4334
+          "position": 4314
         }
       }
     },
     {
       "format": "rust",
-      "lines": 39,
-      "fragment": "(node, current_block)?;\n            }\n            _ => {\n                if let Ok(text) = node.utf8_text(self.source) {\n                    self.add_statement_to_block(current_block, text.to_string());\n                }\n\n                let mut cursor = node.walk();\n                for child in node.children(&mut cursor) {\n                    self.build_cfg_recursive(&child, current_block)?;\n                }\n            }\n        }\n\n        Ok(())\n    }\n\n    fn handle_loop_statement(\n        &mut self,\n        _node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        let body_block = self.create_block();\n\n        self.edges.push(Edge {\n            from: current_block,\n            to: body_block,\n            edge_type: EdgeType::Unconditional,\n        });\n        self.edges.push(Edge {\n            from: body_block,\n            to: current_block,\n            edge_type: EdgeType::Loop,\n        });\n\n        Ok(())\n    }\n\n    fn handle_switch_statement",
+      "lines": 18,
+      "fragment": "(node, current_block)?;\n            }\n            _ => {\n                if let Ok(text) = node.utf8_text(self.source) {\n                    self.add_statement_to_block(current_block, text.to_string());\n                }\n\n                let mut cursor = node.walk();\n                for child in node.children(&mut cursor) {\n                    self.build_cfg_recursive(&child, current_block)?;\n                }\n            }\n        }\n\n        Ok(())\n    }\n\n    fn handle_switch_statement",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 526,
-        "end": 564,
+        "start": 525,
+        "end": 542,
         "startLoc": {
-          "line": 526,
+          "line": 525,
           "column": 24,
-          "position": 4894
+          "position": 4874
         },
         "endLoc": {
-          "line": 564,
+          "line": 542,
           "column": 24,
-          "position": 5183
+          "position": 5009
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 350,
-        "end": 409,
+        "start": 347,
+        "end": 364,
         "startLoc": {
-          "line": 350,
+          "line": 347,
           "column": 23,
-          "position": 3385
+          "position": 3352
         },
         "endLoc": {
-          "line": 409,
+          "line": 364,
           "column": 23,
-          "position": 3828
+          "position": 3487
         }
       }
     },
@@ -10180,68 +9964,68 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/java.rs",
-        "start": 579,
-        "end": 593,
+        "start": 557,
+        "end": 571,
         "startLoc": {
-          "line": 579,
+          "line": 557,
           "column": 2,
-          "position": 5363
+          "position": 5189
         },
         "endLoc": {
-          "line": 593,
+          "line": 571,
           "column": 2,
-          "position": 5466
+          "position": 5292
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 419,
-        "end": 434,
+        "start": 416,
+        "end": 431,
         "startLoc": {
-          "line": 419,
+          "line": 416,
           "column": 2,
-          "position": 3938
+          "position": 3905
         },
         "endLoc": {
-          "line": 434,
+          "line": 431,
           "column": 3,
-          "position": 4042
+          "position": 4009
         }
       }
     },
     {
       "format": "rust",
-      "lines": 9,
-      "fragment": "use crate::cfg_builder;\nuse crate::parse::traits::calculate_complexity;\nuse crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// Go language parser with full CodeIntelligence implementation",
+      "lines": 10,
+      "fragment": "use crate::cfg_builder;\nuse crate::parse::traits::calculate_complexity;\nuse crate::parse::traits::clean_call_text;\nuse crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// Go language parser with full CodeIntelligence implementation",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
         "start": 3,
-        "end": 11,
+        "end": 12,
         "startLoc": {
           "line": 3,
           "column": 1,
           "position": 3
         },
         "endLoc": {
-          "line": 11,
+          "line": 12,
           "column": 65,
-          "position": 100
+          "position": 114
         }
       },
       "secondFile": {
-        "name": "src/parse/php.rs",
+        "name": "src/parse/lua.rs",
         "start": 3,
-        "end": 11,
+        "end": 13,
         "startLoc": {
           "line": 3,
           "column": 1,
           "position": 3
         },
         "endLoc": {
-          "line": 11,
+          "line": 13,
           "column": 66,
-          "position": 100
+          "position": 122
         }
       }
     },
@@ -10252,32 +10036,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 27,
-        "end": 41,
+        "start": 28,
+        "end": 42,
         "startLoc": {
-          "line": 27,
+          "line": 28,
           "column": 5,
-          "position": 182
+          "position": 196
         },
         "endLoc": {
-          "line": 41,
+          "line": 42,
           "column": 23,
-          "position": 315
+          "position": 329
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 26,
-        "end": 40,
+        "start": 28,
+        "end": 42,
         "startLoc": {
-          "line": 26,
+          "line": 28,
           "column": 5,
-          "position": 182
+          "position": 204
         },
         "endLoc": {
-          "line": 40,
+          "line": 42,
           "column": 9,
-          "position": 315
+          "position": 337
         }
       }
     },
@@ -10288,17 +10072,17 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 34,
-        "end": 42,
+        "start": 35,
+        "end": 43,
         "startLoc": {
-          "line": 34,
+          "line": 35,
           "column": 11,
-          "position": 249
+          "position": 263
         },
         "endLoc": {
-          "line": 42,
+          "line": 43,
           "column": 4,
-          "position": 328
+          "position": 342
         }
       },
       "secondFile": {
@@ -10324,32 +10108,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 51,
-        "end": 59,
+        "start": 52,
+        "end": 60,
         "startLoc": {
-          "line": 51,
+          "line": 52,
           "column": 25,
-          "position": 436
+          "position": 450
         },
         "endLoc": {
-          "line": 59,
+          "line": 60,
           "column": 19,
-          "position": 519
+          "position": 533
         }
       },
       "secondFile": {
         "name": "src/parse/go.rs",
-        "start": 42,
-        "end": 50,
+        "start": 43,
+        "end": 51,
         "startLoc": {
-          "line": 42,
+          "line": 43,
           "column": 27,
-          "position": 334
+          "position": 348
         },
         "endLoc": {
-          "line": 50,
+          "line": 51,
           "column": 21,
-          "position": 417
+          "position": 431
         }
       }
     },
@@ -10360,32 +10144,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 102,
-        "end": 118,
+        "start": 103,
+        "end": 119,
         "startLoc": {
-          "line": 102,
+          "line": 103,
           "column": 21,
-          "position": 929
+          "position": 943
         },
         "endLoc": {
-          "line": 118,
+          "line": 119,
           "column": 9,
-          "position": 1043
+          "position": 1057
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 91,
-        "end": 107,
+        "start": 93,
+        "end": 109,
         "startLoc": {
-          "line": 91,
+          "line": 93,
           "column": 21,
-          "position": 795
+          "position": 817
         },
         "endLoc": {
-          "line": 107,
+          "line": 109,
           "column": 11,
-          "position": 909
+          "position": 931
         }
       }
     },
@@ -10396,32 +10180,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 118,
-        "end": 130,
+        "start": 119,
+        "end": 131,
         "startLoc": {
-          "line": 118,
+          "line": 119,
           "column": 2,
-          "position": 1045
+          "position": 1059
         },
         "endLoc": {
-          "line": 130,
+          "line": 131,
           "column": 3,
-          "position": 1179
+          "position": 1193
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 107,
-        "end": 119,
+        "start": 109,
+        "end": 121,
         "startLoc": {
-          "line": 107,
+          "line": 109,
           "column": 2,
-          "position": 911
+          "position": 933
         },
         "endLoc": {
-          "line": 119,
+          "line": 121,
           "column": 5,
-          "position": 1045
+          "position": 1067
         }
       }
     },
@@ -10432,27 +10216,27 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 139,
-        "end": 152,
+        "start": 140,
+        "end": 153,
         "startLoc": {
-          "line": 139,
+          "line": 140,
           "column": 19,
-          "position": 1275
+          "position": 1289
         },
         "endLoc": {
-          "line": 152,
+          "line": 153,
           "column": 3,
-          "position": 1421
+          "position": 1435
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 127,
+        "start": 129,
         "end": 52,
         "startLoc": {
-          "line": 127,
+          "line": 129,
           "column": 21,
-          "position": 1140
+          "position": 1162
         },
         "endLoc": {
           "line": 52,
@@ -10468,32 +10252,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 151,
-        "end": 161,
+        "start": 152,
+        "end": 162,
         "startLoc": {
-          "line": 151,
+          "line": 152,
           "column": 9,
-          "position": 1402
+          "position": 1416
         },
         "endLoc": {
-          "line": 161,
+          "line": 162,
           "column": 5,
-          "position": 1512
+          "position": 1526
         }
       },
       "secondFile": {
         "name": "src/parse/go.rs",
-        "start": 129,
-        "end": 139,
+        "start": 130,
+        "end": 140,
         "startLoc": {
-          "line": 129,
+          "line": 130,
           "column": 9,
-          "position": 1160
+          "position": 1174
         },
         "endLoc": {
-          "line": 139,
+          "line": 140,
           "column": 8,
-          "position": 1270
+          "position": 1284
         }
       }
     },
@@ -10504,32 +10288,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 157,
-        "end": 183,
+        "start": 158,
+        "end": 184,
         "startLoc": {
-          "line": 157,
+          "line": 158,
           "column": 28,
-          "position": 1484
+          "position": 1498
         },
         "endLoc": {
-          "line": 183,
+          "line": 184,
           "column": 19,
-          "position": 1706
+          "position": 1720
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 166,
-        "end": 76,
+        "start": 168,
+        "end": 77,
         "startLoc": {
-          "line": 166,
+          "line": 168,
           "column": 29,
-          "position": 1524
+          "position": 1546
         },
         "endLoc": {
-          "line": 76,
+          "line": 77,
           "column": 6,
-          "position": 787
+          "position": 801
         }
       }
     },
@@ -10540,32 +10324,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 187,
-        "end": 198,
+        "start": 188,
+        "end": 199,
         "startLoc": {
-          "line": 187,
+          "line": 188,
           "column": 4,
-          "position": 1807
+          "position": 1821
         },
         "endLoc": {
-          "line": 198,
+          "line": 199,
           "column": 14,
-          "position": 1917
+          "position": 1931
         }
       },
       "secondFile": {
         "name": "src/parse/java.rs",
-        "start": 228,
-        "end": 239,
+        "start": 230,
+        "end": 241,
         "startLoc": {
-          "line": 228,
+          "line": 230,
           "column": 4,
-          "position": 2194
+          "position": 2216
         },
         "endLoc": {
-          "line": 239,
+          "line": 241,
           "column": 21,
-          "position": 2304
+          "position": 2326
         }
       }
     },
@@ -10576,32 +10360,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 224,
-        "end": 240,
+        "start": 225,
+        "end": 241,
         "startLoc": {
-          "line": 224,
+          "line": 225,
           "column": 1,
-          "position": 2174
+          "position": 2188
         },
         "endLoc": {
-          "line": 240,
+          "line": 241,
           "column": 22,
-          "position": 2338
+          "position": 2352
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 245,
-        "end": 277,
+        "start": 247,
+        "end": 279,
         "startLoc": {
-          "line": 245,
+          "line": 247,
           "column": 1,
-          "position": 2327
+          "position": 2349
         },
         "endLoc": {
-          "line": 277,
+          "line": 279,
           "column": 24,
-          "position": 2673
+          "position": 2695
         }
       }
     },
@@ -10612,32 +10396,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 272,
-        "end": 279,
+        "start": 273,
+        "end": 280,
         "startLoc": {
-          "line": 272,
+          "line": 273,
           "column": 13,
-          "position": 2575
+          "position": 2589
         },
         "endLoc": {
-          "line": 279,
+          "line": 280,
           "column": 40,
-          "position": 2649
+          "position": 2663
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 216,
-        "end": 223,
+        "start": 218,
+        "end": 225,
         "startLoc": {
-          "line": 216,
+          "line": 218,
           "column": 12,
-          "position": 2070
+          "position": 2092
         },
         "endLoc": {
-          "line": 223,
+          "line": 225,
           "column": 4,
-          "position": 2144
+          "position": 2166
         }
       }
     },
@@ -10648,32 +10432,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 298,
-        "end": 316,
+        "start": 299,
+        "end": 317,
         "startLoc": {
-          "line": 298,
+          "line": 299,
           "column": 2,
-          "position": 2890
+          "position": 2904
         },
         "endLoc": {
-          "line": 316,
+          "line": 317,
           "column": 9,
-          "position": 3022
+          "position": 3036
         }
       },
       "secondFile": {
         "name": "src/parse/go.rs",
-        "start": 237,
-        "end": 254,
+        "start": 238,
+        "end": 255,
         "startLoc": {
-          "line": 237,
+          "line": 238,
           "column": 5,
-          "position": 2324
+          "position": 2338
         },
         "endLoc": {
-          "line": 254,
+          "line": 255,
           "column": 37,
-          "position": 2455
+          "position": 2469
         }
       }
     },
@@ -10684,68 +10468,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 315,
-        "end": 329,
+        "start": 316,
+        "end": 330,
         "startLoc": {
-          "line": 315,
+          "line": 316,
           "column": 7,
-          "position": 3019
+          "position": 3033
         },
         "endLoc": {
-          "line": 329,
+          "line": 330,
           "column": 42,
-          "position": 3106
+          "position": 3120
         }
       },
       "secondFile": {
         "name": "src/parse/java.rs",
-        "start": 333,
-        "end": 306,
+        "start": 335,
+        "end": 308,
         "startLoc": {
-          "line": 333,
+          "line": 335,
           "column": 11,
-          "position": 3126
+          "position": 3148
         },
         "endLoc": {
-          "line": 306,
+          "line": 308,
           "column": 70,
-          "position": 2887
-        }
-      }
-    },
-    {
-      "format": "rust",
-      "lines": 9,
-      "fragment": "(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {\n    let mut calls = Vec::new();\n\n    fn clean_call_text(raw: &str) -> String {\n        raw.split('(').next().unwrap_or(raw).trim().to_string()\n    }\n\n    fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {\n        if",
-      "tokens": 0,
-      "firstFile": {
-        "name": "src/parse/go.rs",
-        "start": 330,
-        "end": 338,
-        "startLoc": {
-          "line": 330,
-          "column": 17,
-          "position": 3111
-        },
-        "endLoc": {
-          "line": 338,
-          "column": 3,
-          "position": 3250
-        }
-      },
-      "secondFile": {
-        "name": "src/parse/scala.rs",
-        "start": 230,
-        "end": 238,
-        "startLoc": {
-          "line": 230,
-          "column": 20,
-          "position": 2241
-        },
-        "endLoc": {
-          "line": 238,
-          "column": 6,
-          "position": 2380
+          "position": 2909
         }
       }
     },
@@ -10756,17 +10504,17 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 338,
-        "end": 359,
+        "start": 335,
+        "end": 356,
         "startLoc": {
-          "line": 338,
+          "line": 335,
           "column": 2,
-          "position": 3262
+          "position": 3229
         },
         "endLoc": {
-          "line": 359,
+          "line": 356,
           "column": 42,
-          "position": 3431
+          "position": 3398
         }
       },
       "secondFile": {
@@ -10792,32 +10540,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 360,
-        "end": 366,
+        "start": 357,
+        "end": 363,
         "startLoc": {
-          "line": 360,
+          "line": 357,
           "column": 22,
-          "position": 3436
+          "position": 3403
         },
         "endLoc": {
-          "line": 366,
+          "line": 363,
           "column": 24,
-          "position": 3553
+          "position": 3520
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 299,
-        "end": 305,
+        "start": 297,
+        "end": 303,
         "startLoc": {
-          "line": 299,
+          "line": 297,
           "column": 24,
-          "position": 2832
+          "position": 2807
         },
         "endLoc": {
-          "line": 305,
+          "line": 303,
           "column": 13,
-          "position": 2949
+          "position": 2924
         }
       }
     },
@@ -10828,32 +10576,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 476,
-        "end": 496,
+        "start": 473,
+        "end": 493,
         "startLoc": {
-          "line": 476,
+          "line": 473,
           "column": 24,
-          "position": 4435
+          "position": 4402
         },
         "endLoc": {
-          "line": 496,
+          "line": 493,
           "column": 3,
-          "position": 4617
+          "position": 4584
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 323,
-        "end": 458,
+        "start": 320,
+        "end": 457,
         "startLoc": {
-          "line": 323,
+          "line": 320,
           "column": 17,
-          "position": 3149
+          "position": 3116
         },
         "endLoc": {
-          "line": 458,
+          "line": 457,
           "column": 2,
-          "position": 4332
+          "position": 4312
         }
       }
     },
@@ -10864,32 +10612,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 500,
-        "end": 517,
+        "start": 497,
+        "end": 514,
         "startLoc": {
-          "line": 500,
+          "line": 497,
           "column": 24,
-          "position": 4648
+          "position": 4615
         },
         "endLoc": {
-          "line": 517,
+          "line": 514,
           "column": 21,
-          "position": 4783
+          "position": 4750
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 350,
-        "end": 367,
+        "start": 347,
+        "end": 364,
         "startLoc": {
-          "line": 350,
+          "line": 347,
           "column": 23,
-          "position": 3385
+          "position": 3352
         },
         "endLoc": {
-          "line": 367,
+          "line": 364,
           "column": 23,
-          "position": 3520
+          "position": 3487
         }
       }
     },
@@ -10900,32 +10648,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 514,
-        "end": 538,
+        "start": 511,
+        "end": 535,
         "startLoc": {
-          "line": 514,
+          "line": 511,
           "column": 9,
-          "position": 4770
+          "position": 4737
         },
         "endLoc": {
-          "line": 538,
+          "line": 535,
           "column": 24,
-          "position": 4937
+          "position": 4904
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 385,
-        "end": 409,
+        "start": 382,
+        "end": 406,
         "startLoc": {
-          "line": 385,
+          "line": 382,
           "column": 9,
-          "position": 3661
+          "position": 3628
         },
         "endLoc": {
-          "line": 409,
+          "line": 406,
           "column": 23,
-          "position": 3828
+          "position": 3795
         }
       }
     },
@@ -10936,32 +10684,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/go.rs",
-        "start": 660,
-        "end": 667,
+        "start": 657,
+        "end": 664,
         "startLoc": {
-          "line": 660,
+          "line": 657,
           "column": 1,
-          "position": 6003
+          "position": 5970
         },
         "endLoc": {
-          "line": 667,
+          "line": 664,
           "column": 6,
-          "position": 6079
+          "position": 6046
         }
       },
       "secondFile": {
         "name": "src/parse/go.rs",
-        "start": 569,
-        "end": 576,
+        "start": 566,
+        "end": 573,
         "startLoc": {
-          "line": 569,
+          "line": 566,
           "column": 1,
-          "position": 5166
+          "position": 5133
         },
         "endLoc": {
-          "line": 576,
+          "line": 573,
           "column": 8,
-          "position": 5242
+          "position": 5209
         }
       }
     },
@@ -11131,17 +10879,17 @@
       },
       "secondFile": {
         "name": "src/parse/go.rs",
-        "start": 672,
-        "end": 685,
+        "start": 669,
+        "end": 682,
         "startLoc": {
-          "line": 672,
+          "line": 669,
           "column": 31,
-          "position": 6108
+          "position": 6075
         },
         "endLoc": {
-          "line": 685,
+          "line": 682,
           "column": 11,
-          "position": 6235
+          "position": 6202
         }
       }
     },
@@ -11167,17 +10915,17 @@
       },
       "secondFile": {
         "name": "src/parse/go.rs",
-        "start": 709,
-        "end": 718,
+        "start": 706,
+        "end": 715,
         "startLoc": {
-          "line": 709,
+          "line": 706,
           "column": 1,
-          "position": 6510
+          "position": 6477
         },
         "endLoc": {
-          "line": 718,
+          "line": 715,
           "column": 4,
-          "position": 6595
+          "position": 6562
         }
       }
     },
@@ -11239,12 +10987,12 @@
       },
       "secondFile": {
         "name": "src/parse/go.rs",
-        "start": 709,
+        "start": 706,
         "end": 39,
         "startLoc": {
-          "line": 709,
+          "line": 706,
           "column": 1,
-          "position": 6510
+          "position": 6477
         },
         "endLoc": {
           "line": 39,
@@ -11275,12 +11023,12 @@
       },
       "secondFile": {
         "name": "src/parse/go.rs",
-        "start": 709,
+        "start": 706,
         "end": 38,
         "startLoc": {
-          "line": 709,
+          "line": 706,
           "column": 1,
-          "position": 6510
+          "position": 6477
         },
         "endLoc": {
           "line": 38,
@@ -11831,37 +11579,37 @@
     },
     {
       "format": "rust",
-      "lines": 9,
-      "fragment": "use crate::cfg_builder;\nuse crate::parse::traits::calculate_complexity;\nuse crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// C# language parser with full CodeIntelligence implementation",
+      "lines": 11,
+      "fragment": "use crate::cfg_builder;\nuse crate::cfg_loop_handler;\nuse crate::parse::traits::calculate_complexity;\nuse crate::parse::traits::clean_call_text;\nuse crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// C# language parser with full CodeIntelligence implementation",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
         "start": 3,
-        "end": 11,
+        "end": 13,
         "startLoc": {
           "line": 3,
           "column": 1,
           "position": 3
         },
         "endLoc": {
-          "line": 11,
+          "line": 13,
           "column": 65,
-          "position": 100
+          "position": 122
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
         "start": 3,
-        "end": 11,
+        "end": 13,
         "startLoc": {
           "line": 3,
           "column": 1,
           "position": 3
         },
         "endLoc": {
-          "line": 11,
+          "line": 13,
           "column": 66,
-          "position": 100
+          "position": 122
         }
       }
     },
@@ -11872,32 +11620,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 27,
-        "end": 41,
+        "start": 29,
+        "end": 43,
         "startLoc": {
-          "line": 27,
+          "line": 29,
           "column": 5,
-          "position": 182
+          "position": 204
         },
         "endLoc": {
-          "line": 41,
+          "line": 43,
           "column": 21,
-          "position": 315
+          "position": 337
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 26,
-        "end": 40,
+        "start": 28,
+        "end": 42,
         "startLoc": {
-          "line": 26,
+          "line": 28,
           "column": 5,
-          "position": 182
+          "position": 204
         },
         "endLoc": {
-          "line": 40,
+          "line": 42,
           "column": 9,
-          "position": 315
+          "position": 337
         }
       }
     },
@@ -11908,32 +11656,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
+        "start": 48,
+        "end": 57,
+        "startLoc": {
+          "line": 48,
+          "column": 17,
+          "position": 388
+        },
+        "endLoc": {
+          "line": 57,
+          "column": 8,
+          "position": 475
+        }
+      },
+      "secondFile": {
+        "name": "src/parse/php.rs",
         "start": 46,
         "end": 55,
         "startLoc": {
           "line": 46,
           "column": 17,
-          "position": 366
+          "position": 382
         },
         "endLoc": {
           "line": 55,
-          "column": 8,
-          "position": 453
-        }
-      },
-      "secondFile": {
-        "name": "src/parse/php.rs",
-        "start": 44,
-        "end": 53,
-        "startLoc": {
-          "line": 44,
-          "column": 17,
-          "position": 360
-        },
-        "endLoc": {
-          "line": 53,
           "column": 9,
-          "position": 446
+          "position": 468
         }
       }
     },
@@ -11944,32 +11692,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 52,
-        "end": 62,
+        "start": 54,
+        "end": 64,
         "startLoc": {
-          "line": 52,
+          "line": 54,
           "column": 25,
-          "position": 420
+          "position": 442
         },
         "endLoc": {
-          "line": 62,
+          "line": 64,
           "column": 8,
-          "position": 511
+          "position": 533
         }
       },
       "secondFile": {
         "name": "src/parse/java.rs",
-        "start": 95,
-        "end": 105,
+        "start": 97,
+        "end": 107,
         "startLoc": {
-          "line": 95,
+          "line": 97,
           "column": 9,
-          "position": 862
+          "position": 884
         },
         "endLoc": {
-          "line": 105,
+          "line": 107,
           "column": 10,
-          "position": 953
+          "position": 975
         }
       }
     },
@@ -11980,32 +11728,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 62,
-        "end": 76,
+        "start": 64,
+        "end": 78,
         "startLoc": {
-          "line": 62,
+          "line": 64,
           "column": 2,
-          "position": 516
+          "position": 538
         },
         "endLoc": {
-          "line": 76,
+          "line": 78,
           "column": 4,
-          "position": 610
+          "position": 632
         }
       },
       "secondFile": {
         "name": "src/parse/java.rs",
-        "start": 144,
-        "end": 156,
+        "start": 146,
+        "end": 158,
         "startLoc": {
-          "line": 144,
+          "line": 146,
           "column": 2,
-          "position": 1327
+          "position": 1349
         },
         "endLoc": {
-          "line": 156,
+          "line": 158,
           "column": 2,
-          "position": 1419
+          "position": 1441
         }
       }
     },
@@ -12016,32 +11764,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 63,
-        "end": 96,
+        "start": 65,
+        "end": 98,
         "startLoc": {
-          "line": 63,
+          "line": 65,
           "column": 2,
-          "position": 530
+          "position": 552
         },
         "endLoc": {
-          "line": 96,
+          "line": 98,
           "column": 12,
-          "position": 810
+          "position": 832
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 61,
-        "end": 105,
+        "start": 63,
+        "end": 107,
         "startLoc": {
-          "line": 61,
+          "line": 63,
           "column": 7,
-          "position": 520
+          "position": 542
         },
         "endLoc": {
-          "line": 105,
+          "line": 107,
           "column": 10,
-          "position": 953
+          "position": 975
         }
       }
     },
@@ -12052,32 +11800,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 96,
-        "end": 110,
+        "start": 98,
+        "end": 112,
         "startLoc": {
-          "line": 96,
+          "line": 98,
           "column": 12,
-          "position": 811
+          "position": 833
         },
         "endLoc": {
-          "line": 110,
+          "line": 112,
           "column": 21,
-          "position": 911
+          "position": 933
         }
       },
       "secondFile": {
         "name": "src/parse/csharp.rs",
-        "start": 62,
-        "end": 157,
+        "start": 64,
+        "end": 159,
         "startLoc": {
-          "line": 62,
+          "line": 64,
           "column": 8,
-          "position": 512
+          "position": 534
         },
         "endLoc": {
-          "line": 157,
+          "line": 159,
           "column": 2,
-          "position": 1421
+          "position": 1443
         }
       }
     },
@@ -12088,32 +11836,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 110,
-        "end": 125,
+        "start": 112,
+        "end": 127,
         "startLoc": {
-          "line": 110,
+          "line": 112,
           "column": 2,
-          "position": 913
+          "position": 935
         },
         "endLoc": {
-          "line": 125,
+          "line": 127,
           "column": 9,
-          "position": 1053
+          "position": 1075
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 45,
-        "end": 105,
+        "start": 47,
+        "end": 107,
         "startLoc": {
-          "line": 45,
+          "line": 47,
           "column": 2,
-          "position": 364
+          "position": 386
         },
         "endLoc": {
-          "line": 105,
+          "line": 107,
           "column": 10,
-          "position": 953
+          "position": 975
         }
       }
     },
@@ -12124,32 +11872,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 125,
-        "end": 139,
+        "start": 127,
+        "end": 141,
         "startLoc": {
-          "line": 125,
+          "line": 127,
           "column": 9,
-          "position": 1054
+          "position": 1076
         },
         "endLoc": {
-          "line": 139,
+          "line": 141,
           "column": 19,
-          "position": 1154
+          "position": 1176
         }
       },
       "secondFile": {
         "name": "src/parse/csharp.rs",
-        "start": 62,
-        "end": 157,
+        "start": 64,
+        "end": 159,
         "startLoc": {
-          "line": 62,
+          "line": 64,
           "column": 8,
-          "position": 512
+          "position": 534
         },
         "endLoc": {
-          "line": 157,
+          "line": 159,
           "column": 2,
-          "position": 1421
+          "position": 1443
         }
       }
     },
@@ -12160,32 +11908,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 139,
-        "end": 154,
+        "start": 141,
+        "end": 156,
         "startLoc": {
-          "line": 139,
+          "line": 141,
           "column": 2,
-          "position": 1156
+          "position": 1178
         },
         "endLoc": {
-          "line": 154,
+          "line": 156,
           "column": 7,
-          "position": 1296
+          "position": 1318
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 45,
-        "end": 105,
+        "start": 47,
+        "end": 107,
         "startLoc": {
-          "line": 45,
+          "line": 47,
           "column": 2,
-          "position": 364
+          "position": 386
         },
         "endLoc": {
-          "line": 105,
+          "line": 107,
           "column": 10,
-          "position": 953
+          "position": 975
         }
       }
     },
@@ -12196,32 +11944,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 154,
-        "end": 168,
+        "start": 156,
+        "end": 170,
         "startLoc": {
-          "line": 154,
+          "line": 156,
           "column": 7,
-          "position": 1297
+          "position": 1319
         },
         "endLoc": {
-          "line": 168,
+          "line": 170,
           "column": 2,
-          "position": 1397
+          "position": 1419
         }
       },
       "secondFile": {
         "name": "src/parse/csharp.rs",
-        "start": 62,
-        "end": 157,
+        "start": 64,
+        "end": 159,
         "startLoc": {
-          "line": 62,
+          "line": 64,
           "column": 8,
-          "position": 512
+          "position": 534
         },
         "endLoc": {
-          "line": 157,
+          "line": 159,
           "column": 2,
-          "position": 1421
+          "position": 1443
         }
       }
     },
@@ -12232,32 +11980,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 165,
-        "end": 182,
+        "start": 167,
+        "end": 184,
         "startLoc": {
-          "line": 165,
+          "line": 167,
           "column": 2,
-          "position": 1387
+          "position": 1409
         },
         "endLoc": {
-          "line": 182,
+          "line": 184,
           "column": 13,
-          "position": 1505
+          "position": 1527
         }
       },
       "secondFile": {
         "name": "src/parse/go.rs",
-        "start": 101,
-        "end": 107,
+        "start": 102,
+        "end": 109,
         "startLoc": {
-          "line": 101,
+          "line": 102,
           "column": 12,
-          "position": 925
+          "position": 939
         },
         "endLoc": {
-          "line": 107,
+          "line": 109,
           "column": 11,
-          "position": 909
+          "position": 931
         }
       }
     },
@@ -12268,32 +12016,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 182,
-        "end": 194,
+        "start": 184,
+        "end": 196,
         "startLoc": {
-          "line": 182,
+          "line": 184,
           "column": 2,
-          "position": 1507
+          "position": 1529
         },
         "endLoc": {
-          "line": 194,
+          "line": 196,
           "column": 7,
-          "position": 1641
+          "position": 1663
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 107,
-        "end": 119,
+        "start": 109,
+        "end": 121,
         "startLoc": {
-          "line": 107,
+          "line": 109,
           "column": 2,
-          "position": 911
+          "position": 933
         },
         "endLoc": {
-          "line": 119,
+          "line": 121,
           "column": 5,
-          "position": 1045
+          "position": 1067
         }
       }
     },
@@ -12304,27 +12052,27 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 202,
-        "end": 215,
+        "start": 204,
+        "end": 217,
         "startLoc": {
-          "line": 202,
+          "line": 204,
           "column": 23,
-          "position": 1736
+          "position": 1758
         },
         "endLoc": {
-          "line": 215,
+          "line": 217,
           "column": 7,
-          "position": 1882
+          "position": 1904
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 127,
+        "start": 129,
         "end": 52,
         "startLoc": {
-          "line": 127,
+          "line": 129,
           "column": 21,
-          "position": 1140
+          "position": 1162
         },
         "endLoc": {
           "line": 52,
@@ -12340,32 +12088,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 214,
-        "end": 223,
+        "start": 216,
+        "end": 225,
         "startLoc": {
-          "line": 214,
+          "line": 216,
           "column": 9,
-          "position": 1863
+          "position": 1885
         },
         "endLoc": {
-          "line": 223,
+          "line": 225,
           "column": 5,
-          "position": 1972
+          "position": 1994
         }
       },
       "secondFile": {
         "name": "src/parse/csharp.rs",
-        "start": 193,
-        "end": 202,
+        "start": 195,
+        "end": 204,
         "startLoc": {
-          "line": 193,
+          "line": 195,
           "column": 9,
-          "position": 1622
+          "position": 1644
         },
         "endLoc": {
-          "line": 202,
+          "line": 204,
           "column": 8,
-          "position": 1731
+          "position": 1753
         }
       }
     },
@@ -12376,32 +12124,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 220,
-        "end": 245,
+        "start": 222,
+        "end": 247,
         "startLoc": {
-          "line": 220,
+          "line": 222,
           "column": 28,
-          "position": 1945
+          "position": 1967
         },
         "endLoc": {
-          "line": 245,
+          "line": 247,
           "column": 23,
-          "position": 2166
+          "position": 2188
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 166,
-        "end": 76,
+        "start": 168,
+        "end": 77,
         "startLoc": {
-          "line": 166,
+          "line": 168,
           "column": 29,
-          "position": 1524
+          "position": 1546
         },
         "endLoc": {
-          "line": 76,
+          "line": 77,
           "column": 6,
-          "position": 787
+          "position": 801
         }
       }
     },
@@ -12412,32 +12160,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 245,
-        "end": 260,
+        "start": 247,
+        "end": 262,
         "startLoc": {
-          "line": 245,
+          "line": 247,
           "column": 23,
-          "position": 2167
+          "position": 2189
         },
         "endLoc": {
-          "line": 260,
+          "line": 262,
           "column": 18,
-          "position": 2377
+          "position": 2399
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 175,
-        "end": 239,
+        "start": 176,
+        "end": 241,
         "startLoc": {
-          "line": 175,
+          "line": 176,
           "column": 22,
-          "position": 1629
+          "position": 1643
         },
         "endLoc": {
-          "line": 239,
+          "line": 241,
           "column": 21,
-          "position": 2304
+          "position": 2326
         }
       }
     },
@@ -12448,68 +12196,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 269,
-        "end": 288,
+        "start": 271,
+        "end": 290,
         "startLoc": {
-          "line": 269,
+          "line": 271,
           "column": 17,
-          "position": 2547
+          "position": 2569
         },
         "endLoc": {
-          "line": 288,
+          "line": 290,
           "column": 68,
-          "position": 2686
+          "position": 2708
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 199,
-        "end": 218,
+        "start": 201,
+        "end": 220,
         "startLoc": {
-          "line": 199,
+          "line": 201,
           "column": 17,
-          "position": 1951
+          "position": 1973
         },
         "endLoc": {
-          "line": 218,
+          "line": 220,
           "column": 4,
-          "position": 2090
-        }
-      }
-    },
-    {
-      "format": "rust",
-      "lines": 10,
-      "fragment": "(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {\n    let mut calls = Vec::new();\n\n    fn clean_call_text(raw: &str) -> String {\n        raw.split('(').next().unwrap_or(raw).trim().to_string()\n    }\n\n    fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {\n        match node.kind() {\n            \"invocation_expression\"",
-      "tokens": 0,
-      "firstFile": {
-        "name": "src/parse/csharp.rs",
-        "start": 370,
-        "end": 379,
-        "startLoc": {
-          "line": 370,
-          "column": 21,
-          "position": 3377
-        },
-        "endLoc": {
-          "line": 379,
-          "column": 24,
-          "position": 3527
-        }
-      },
-      "secondFile": {
-        "name": "src/parse/scala.rs",
-        "start": 230,
-        "end": 239,
-        "startLoc": {
-          "line": 230,
-          "column": 20,
-          "position": 2241
-        },
-        "endLoc": {
-          "line": 239,
-          "column": 18,
-          "position": 2391
+          "position": 2112
         }
       }
     },
@@ -12520,32 +12232,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 387,
-        "end": 399,
+        "start": 385,
+        "end": 397,
         "startLoc": {
-          "line": 387,
+          "line": 385,
           "column": 17,
-          "position": 3616
+          "position": 3591
         },
         "endLoc": {
-          "line": 399,
+          "line": 397,
           "column": 2,
-          "position": 3717
+          "position": 3692
         }
       },
       "secondFile": {
         "name": "src/parse/java.rs",
-        "start": 380,
-        "end": 392,
+        "start": 378,
+        "end": 390,
         "startLoc": {
-          "line": 380,
+          "line": 378,
           "column": 17,
-          "position": 3600
+          "position": 3575
         },
         "endLoc": {
-          "line": 392,
+          "line": 390,
           "column": 34,
-          "position": 3701
+          "position": 3676
         }
       }
     },
@@ -12556,32 +12268,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 391,
-        "end": 412,
+        "start": 389,
+        "end": 410,
         "startLoc": {
-          "line": 391,
+          "line": 389,
           "column": 4,
-          "position": 3662
+          "position": 3637
         },
         "endLoc": {
-          "line": 412,
+          "line": 410,
           "column": 26,
-          "position": 3808
+          "position": 3783
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 316,
-        "end": 270,
+        "start": 314,
+        "end": 267,
         "startLoc": {
-          "line": 316,
+          "line": 314,
           "column": 10,
-          "position": 3023
+          "position": 2998
         },
         "endLoc": {
-          "line": 270,
+          "line": 267,
           "column": 19,
-          "position": 2664
+          "position": 2631
         }
       }
     },
@@ -12592,32 +12304,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 427,
-        "end": 452,
+        "start": 425,
+        "end": 450,
         "startLoc": {
-          "line": 427,
+          "line": 425,
           "column": 2,
-          "position": 4011
+          "position": 3986
         },
         "endLoc": {
-          "line": 452,
+          "line": 450,
           "column": 3,
-          "position": 4190
+          "position": 4165
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 409,
-        "end": 434,
+        "start": 407,
+        "end": 432,
         "startLoc": {
-          "line": 409,
+          "line": 407,
           "column": 2,
-          "position": 3941
+          "position": 3916
         },
         "endLoc": {
-          "line": 434,
+          "line": 432,
           "column": 6,
-          "position": 4120
+          "position": 4095
         }
       }
     },
@@ -12628,32 +12340,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 452,
-        "end": 463,
+        "start": 450,
+        "end": 461,
         "startLoc": {
-          "line": 452,
+          "line": 450,
           "column": 1,
-          "position": 4190
+          "position": 4165
         },
         "endLoc": {
-          "line": 463,
+          "line": 461,
           "column": 11,
-          "position": 4379
+          "position": 4354
         }
       },
       "secondFile": {
         "name": "src/parse/java.rs",
-        "start": 446,
-        "end": 457,
+        "start": 444,
+        "end": 455,
         "startLoc": {
-          "line": 446,
+          "line": 444,
           "column": 1,
-          "position": 4170
+          "position": 4145
         },
         "endLoc": {
-          "line": 457,
+          "line": 455,
           "column": 2,
-          "position": 4359
+          "position": 4334
         }
       }
     },
@@ -12664,68 +12376,68 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 481,
-        "end": 493,
+        "start": 479,
+        "end": 491,
         "startLoc": {
-          "line": 481,
+          "line": 479,
           "column": 5,
-          "position": 4477
+          "position": 4452
         },
         "endLoc": {
-          "line": 493,
+          "line": 491,
           "column": 64,
-          "position": 4575
+          "position": 4550
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 340,
-        "end": 352,
+        "start": 338,
+        "end": 350,
         "startLoc": {
-          "line": 340,
+          "line": 338,
           "column": 5,
-          "position": 3210
+          "position": 3185
         },
         "endLoc": {
-          "line": 352,
+          "line": 350,
           "column": 64,
-          "position": 3308
+          "position": 3283
         }
       }
     },
     {
       "format": "rust",
-      "lines": 68,
-      "fragment": "}\n\nconst DECISION_KINDS: &[&str] = &[\n    \"if_statement\",\n    \"for_statement\",\n    \"foreach_statement\",\n    \"while_statement\",\n    \"switch_statement\",\n];\ncfg_builder!();\nimpl<'a> CfgBuilder<'a> {\n    fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {\n        let entry_id = self.create_block();\n        self.build_cfg_recursive(node, entry_id)?;\n        Ok(())\n    }\n\n    fn build_cfg_recursive(\n        &mut self,\n        node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        match node.kind() {\n            \"if_statement\" => {\n                self.handle_if_statement(node, current_block)?;\n            }\n            \"for_statement\" | \"foreach_statement\" | \"while_statement\" => {\n                self.handle_loop_statement(node, current_block)?;\n            }\n            _ => {\n                if let Ok(text) = node.utf8_text(self.source) {\n                    self.add_statement_to_block(current_block, text.to_string());\n                }\n                let mut cursor = node.walk();\n                for child in node.children(&mut cursor) {\n                    self.build_cfg_recursive(&child, current_block)?;\n                }\n            }\n        }\n        Ok(())\n    }\n\n    fn handle_loop_statement(\n        &mut self,\n        _node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        let body_block = self.create_block();\n        self.edges.push(Edge {\n            from: current_block,\n            to: body_block,\n            edge_type: EdgeType::Unconditional,\n        });\n        self.edges.push(Edge {\n            from: body_block,\n            to: current_block,\n            edge_type: EdgeType::Loop,\n        });\n        Ok(())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn test_csharp_method_extraction",
+      "lines": 50,
+      "fragment": "}\n\nconst DECISION_KINDS: &[&str] = &[\n    \"if_statement\",\n    \"for_statement\",\n    \"foreach_statement\",\n    \"while_statement\",\n    \"switch_statement\",\n];\ncfg_builder!();\ncfg_loop_handler!();\nimpl<'a> CfgBuilder<'a> {\n    fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {\n        let entry_id = self.create_block();\n        self.build_cfg_recursive(node, entry_id)?;\n        Ok(())\n    }\n\n    fn build_cfg_recursive(\n        &mut self,\n        node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        match node.kind() {\n            \"if_statement\" => {\n                self.handle_if_statement(node, current_block)?;\n            }\n            \"for_statement\" | \"foreach_statement\" | \"while_statement\" => {\n                self.handle_loop_statement(node, current_block)?;\n            }\n            _ => {\n                if let Ok(text) = node.utf8_text(self.source) {\n                    self.add_statement_to_block(current_block, text.to_string());\n                }\n                let mut cursor = node.walk();\n                for child in node.children(&mut cursor) {\n                    self.build_cfg_recursive(&child, current_block)?;\n                }\n            }\n        }\n        Ok(())\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn test_csharp_method_extraction",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 537,
-        "end": 604,
+        "start": 535,
+        "end": 584,
         "startLoc": {
-          "line": 537,
+          "line": 535,
           "column": 1,
-          "position": 4936
+          "position": 4911
         },
         "endLoc": {
-          "line": 604,
+          "line": 584,
           "column": 30,
-          "position": 5475
+          "position": 5303
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 432,
-        "end": 379,
+        "start": 430,
+        "end": 359,
         "startLoc": {
-          "line": 432,
+          "line": 430,
           "column": 1,
-          "position": 4117
+          "position": 4092
         },
         "endLoc": {
-          "line": 379,
+          "line": 359,
           "column": 28,
-          "position": 3570
+          "position": 3398
         }
       }
     },
@@ -12736,32 +12448,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 611,
-        "end": 620,
+        "start": 591,
+        "end": 600,
         "startLoc": {
-          "line": 611,
+          "line": 591,
           "column": 13,
-          "position": 5542
+          "position": 5370
         },
         "endLoc": {
-          "line": 620,
+          "line": 600,
           "column": 8,
-          "position": 5654
+          "position": 5482
         }
       },
       "secondFile": {
         "name": "src/parse/java.rs",
-        "start": 620,
-        "end": 629,
+        "start": 598,
+        "end": 607,
         "startLoc": {
-          "line": 620,
+          "line": 598,
           "column": 11,
-          "position": 5630
+          "position": 5456
         },
         "endLoc": {
-          "line": 629,
+          "line": 607,
           "column": 8,
-          "position": 5742
+          "position": 5568
         }
       }
     },
@@ -12772,17 +12484,17 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/csharp.rs",
-        "start": 648,
-        "end": 657,
+        "start": 628,
+        "end": 637,
         "startLoc": {
-          "line": 648,
+          "line": 628,
           "column": 1,
-          "position": 5924
+          "position": 5752
         },
         "endLoc": {
-          "line": 657,
+          "line": 637,
           "column": 4,
-          "position": 6009
+          "position": 5837
         }
       },
       "secondFile": {
@@ -12803,37 +12515,37 @@
     },
     {
       "format": "rust",
-      "lines": 9,
-      "fragment": "use crate::cfg_builder;\nuse crate::parse::traits::calculate_complexity;\nuse crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// C++ language parser with full CodeIntelligence implementation",
+      "lines": 11,
+      "fragment": "use crate::cfg_builder;\nuse crate::cfg_loop_handler;\nuse crate::parse::traits::calculate_complexity;\nuse crate::parse::traits::clean_call_text;\nuse crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};\nuse crate::parse::traits::{\n    CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,\n};\nuse tree_sitter::Parser;\n\n/// C++ language parser with full CodeIntelligence implementation",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
         "start": 3,
-        "end": 11,
+        "end": 13,
         "startLoc": {
           "line": 3,
           "column": 1,
           "position": 3
         },
         "endLoc": {
-          "line": 11,
+          "line": 13,
           "column": 66,
-          "position": 100
+          "position": 122
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
         "start": 3,
-        "end": 11,
+        "end": 13,
         "startLoc": {
           "line": 3,
           "column": 1,
           "position": 3
         },
         "endLoc": {
-          "line": 11,
+          "line": 13,
           "column": 66,
-          "position": 100
+          "position": 122
         }
       }
     },
@@ -12844,32 +12556,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 43,
-        "end": 62,
-        "startLoc": {
-          "line": 43,
-          "column": 2,
-          "position": 370
-        },
-        "endLoc": {
-          "line": 62,
-          "column": 18,
-          "position": 546
-        }
-      },
-      "secondFile": {
-        "name": "src/parse/ruby.rs",
         "start": 45,
         "end": 64,
         "startLoc": {
           "line": 45,
           "column": 2,
-          "position": 364
+          "position": 392
         },
         "endLoc": {
           "line": 64,
+          "column": 18,
+          "position": 568
+        }
+      },
+      "secondFile": {
+        "name": "src/parse/ruby.rs",
+        "start": 47,
+        "end": 66,
+        "startLoc": {
+          "line": 47,
+          "column": 2,
+          "position": 386
+        },
+        "endLoc": {
+          "line": 66,
           "column": 5,
-          "position": 540
+          "position": 562
         }
       }
     },
@@ -12880,32 +12592,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 74,
-        "end": 89,
+        "start": 76,
+        "end": 91,
         "startLoc": {
-          "line": 74,
+          "line": 76,
           "column": 2,
-          "position": 643
+          "position": 665
         },
         "endLoc": {
-          "line": 89,
+          "line": 91,
           "column": 9,
-          "position": 783
+          "position": 805
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 45,
-        "end": 60,
+        "start": 47,
+        "end": 62,
         "startLoc": {
-          "line": 45,
+          "line": 47,
           "column": 2,
-          "position": 364
+          "position": 386
         },
         "endLoc": {
-          "line": 60,
+          "line": 62,
           "column": 8,
-          "position": 504
+          "position": 526
         }
       }
     },
@@ -12916,32 +12628,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 89,
-        "end": 102,
+        "start": 91,
+        "end": 104,
         "startLoc": {
-          "line": 89,
+          "line": 91,
           "column": 9,
-          "position": 784
+          "position": 806
         },
         "endLoc": {
-          "line": 102,
+          "line": 104,
           "column": 2,
-          "position": 893
+          "position": 915
         }
       },
       "secondFile": {
         "name": "src/parse/cpp.rs",
-        "start": 58,
-        "end": 72,
+        "start": 60,
+        "end": 74,
         "startLoc": {
-          "line": 58,
+          "line": 60,
           "column": 8,
-          "position": 511
+          "position": 533
         },
         "endLoc": {
-          "line": 72,
+          "line": 74,
           "column": 24,
-          "position": 621
+          "position": 643
         }
       }
     },
@@ -12952,32 +12664,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 103,
-        "end": 118,
+        "start": 105,
+        "end": 120,
         "startLoc": {
-          "line": 103,
+          "line": 105,
           "column": 2,
-          "position": 898
+          "position": 920
         },
         "endLoc": {
-          "line": 118,
+          "line": 120,
           "column": 7,
-          "position": 1038
+          "position": 1060
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 45,
-        "end": 60,
+        "start": 47,
+        "end": 62,
         "startLoc": {
-          "line": 45,
+          "line": 47,
           "column": 2,
-          "position": 364
+          "position": 386
         },
         "endLoc": {
-          "line": 60,
+          "line": 62,
           "column": 8,
-          "position": 504
+          "position": 526
         }
       }
     },
@@ -12988,32 +12700,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 118,
-        "end": 132,
+        "start": 120,
+        "end": 134,
         "startLoc": {
-          "line": 118,
+          "line": 120,
           "column": 7,
-          "position": 1039
+          "position": 1061
         },
         "endLoc": {
-          "line": 132,
+          "line": 134,
           "column": 23,
-          "position": 1151
+          "position": 1173
         }
       },
       "secondFile": {
         "name": "src/parse/cpp.rs",
-        "start": 58,
-        "end": 103,
+        "start": 60,
+        "end": 105,
         "startLoc": {
-          "line": 58,
+          "line": 60,
           "column": 8,
-          "position": 511
+          "position": 533
         },
         "endLoc": {
-          "line": 103,
+          "line": 105,
           "column": 17,
-          "position": 896
+          "position": 918
         }
       }
     },
@@ -13024,32 +12736,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 125,
-        "end": 137,
+        "start": 127,
+        "end": 139,
         "startLoc": {
-          "line": 125,
+          "line": 127,
           "column": 2,
-          "position": 1119
+          "position": 1141
         },
         "endLoc": {
-          "line": 137,
+          "line": 139,
           "column": 6,
-          "position": 1212
+          "position": 1234
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 101,
-        "end": 113,
+        "start": 103,
+        "end": 115,
         "startLoc": {
-          "line": 101,
+          "line": 103,
           "column": 2,
-          "position": 867
+          "position": 889
         },
         "endLoc": {
-          "line": 113,
+          "line": 115,
           "column": 7,
-          "position": 960
+          "position": 982
         }
       }
     },
@@ -13060,32 +12772,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 162,
-        "end": 174,
+        "start": 164,
+        "end": 176,
         "startLoc": {
-          "line": 162,
+          "line": 164,
           "column": 2,
-          "position": 1447
+          "position": 1469
         },
         "endLoc": {
-          "line": 174,
+          "line": 176,
           "column": 4,
-          "position": 1581
+          "position": 1603
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 107,
-        "end": 119,
+        "start": 109,
+        "end": 121,
         "startLoc": {
-          "line": 107,
+          "line": 109,
           "column": 2,
-          "position": 911
+          "position": 933
         },
         "endLoc": {
-          "line": 119,
+          "line": 121,
           "column": 5,
-          "position": 1045
+          "position": 1067
         }
       }
     },
@@ -13096,27 +12808,27 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 183,
-        "end": 196,
+        "start": 185,
+        "end": 198,
         "startLoc": {
-          "line": 183,
+          "line": 185,
           "column": 20,
-          "position": 1677
+          "position": 1699
         },
         "endLoc": {
-          "line": 196,
+          "line": 198,
           "column": 4,
-          "position": 1823
+          "position": 1845
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 127,
+        "start": 129,
         "end": 52,
         "startLoc": {
-          "line": 127,
+          "line": 129,
           "column": 21,
-          "position": 1140
+          "position": 1162
         },
         "endLoc": {
           "line": 52,
@@ -13132,32 +12844,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 195,
-        "end": 205,
+        "start": 197,
+        "end": 207,
         "startLoc": {
-          "line": 195,
+          "line": 197,
           "column": 9,
-          "position": 1804
+          "position": 1826
         },
         "endLoc": {
-          "line": 205,
+          "line": 207,
           "column": 5,
-          "position": 1914
+          "position": 1936
         }
       },
       "secondFile": {
         "name": "src/parse/cpp.rs",
-        "start": 173,
-        "end": 183,
+        "start": 175,
+        "end": 185,
         "startLoc": {
-          "line": 173,
+          "line": 175,
           "column": 9,
-          "position": 1562
+          "position": 1584
         },
         "endLoc": {
-          "line": 183,
+          "line": 185,
           "column": 8,
-          "position": 1672
+          "position": 1694
         }
       }
     },
@@ -13168,32 +12880,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 201,
-        "end": 227,
+        "start": 203,
+        "end": 229,
         "startLoc": {
-          "line": 201,
+          "line": 203,
           "column": 29,
-          "position": 1886
+          "position": 1908
         },
         "endLoc": {
-          "line": 227,
+          "line": 229,
           "column": 87,
-          "position": 2106
+          "position": 2128
         }
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 166,
-        "end": 76,
+        "start": 168,
+        "end": 77,
         "startLoc": {
-          "line": 166,
+          "line": 168,
           "column": 29,
-          "position": 1524
+          "position": 1546
         },
         "endLoc": {
-          "line": 76,
+          "line": 77,
           "column": 3,
-          "position": 785
+          "position": 799
         }
       }
     },
@@ -13204,32 +12916,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 252,
-        "end": 259,
+        "start": 254,
+        "end": 261,
         "startLoc": {
-          "line": 252,
+          "line": 254,
           "column": 23,
-          "position": 2366
+          "position": 2388
         },
         "endLoc": {
-          "line": 259,
+          "line": 261,
           "column": 6,
-          "position": 2435
+          "position": 2457
         }
       },
       "secondFile": {
         "name": "src/parse/java.rs",
-        "start": 277,
-        "end": 284,
+        "start": 279,
+        "end": 286,
         "startLoc": {
-          "line": 277,
+          "line": 279,
           "column": 24,
-          "position": 2674
+          "position": 2696
         },
         "endLoc": {
-          "line": 284,
+          "line": 286,
           "column": 11,
-          "position": 2743
+          "position": 2765
         }
       }
     },
@@ -13240,32 +12952,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 267,
-        "end": 280,
+        "start": 269,
+        "end": 282,
         "startLoc": {
-          "line": 267,
+          "line": 269,
           "column": 9,
-          "position": 2490
+          "position": 2512
         },
         "endLoc": {
-          "line": 280,
+          "line": 282,
           "column": 43,
-          "position": 2574
+          "position": 2596
         }
       },
       "secondFile": {
         "name": "src/parse/go.rs",
-        "start": 255,
-        "end": 268,
+        "start": 256,
+        "end": 269,
         "startLoc": {
-          "line": 255,
+          "line": 256,
           "column": 9,
-          "position": 2458
+          "position": 2472
         },
         "endLoc": {
-          "line": 268,
+          "line": 269,
           "column": 60,
-          "position": 2542
+          "position": 2556
         }
       }
     },
@@ -13276,68 +12988,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 281,
-        "end": 288,
+        "start": 283,
+        "end": 290,
         "startLoc": {
-          "line": 281,
+          "line": 283,
           "column": 20,
-          "position": 2579
+          "position": 2601
         },
         "endLoc": {
-          "line": 288,
+          "line": 290,
           "column": 13,
-          "position": 2687
+          "position": 2709
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 175,
-        "end": 187,
+        "start": 176,
+        "end": 188,
         "startLoc": {
-          "line": 175,
+          "line": 176,
           "column": 22,
-          "position": 1629
+          "position": 1643
         },
         "endLoc": {
-          "line": 187,
+          "line": 188,
           "column": 5,
-          "position": 1809
-        }
-      }
-    },
-    {
-      "format": "rust",
-      "lines": 8,
-      "fragment": "(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {\n    let mut calls = Vec::new();\n\n    fn clean_call_text(raw: &str) -> String {\n        raw.split('(').next().unwrap_or(raw).trim().to_string()\n    }\n\n    let",
-      "tokens": 0,
-      "firstFile": {
-        "name": "src/parse/cpp.rs",
-        "start": 321,
-        "end": 328,
-        "startLoc": {
-          "line": 321,
-          "column": 18,
-          "position": 3024
-        },
-        "endLoc": {
-          "line": 328,
-          "column": 4,
-          "position": 3122
-        }
-      },
-      "secondFile": {
-        "name": "src/parse/scala.rs",
-        "start": 230,
-        "end": 237,
-        "startLoc": {
-          "line": 230,
-          "column": 20,
-          "position": 2241
-        },
-        "endLoc": {
-          "line": 237,
-          "column": 3,
-          "position": 2339
+          "position": 1823
         }
       }
     },
@@ -13348,32 +13024,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 342,
-        "end": 354,
+        "start": 340,
+        "end": 352,
         "startLoc": {
-          "line": 342,
+          "line": 340,
           "column": 8,
-          "position": 3283
+          "position": 3258
         },
         "endLoc": {
-          "line": 354,
+          "line": 352,
           "column": 8,
-          "position": 3379
+          "position": 3354
         }
       },
       "secondFile": {
         "name": "src/parse/csharp.rs",
-        "start": 390,
-        "end": 402,
+        "start": 388,
+        "end": 400,
         "startLoc": {
-          "line": 390,
+          "line": 388,
           "column": 5,
-          "position": 3641
+          "position": 3616
         },
         "endLoc": {
-          "line": 402,
+          "line": 400,
           "column": 5,
-          "position": 3737
+          "position": 3712
         }
       }
     },
@@ -13384,104 +13060,104 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 423,
-        "end": 430,
+        "start": 421,
+        "end": 428,
         "startLoc": {
-          "line": 423,
+          "line": 421,
           "column": 5,
-          "position": 4019
+          "position": 3994
         },
         "endLoc": {
-          "line": 430,
+          "line": 428,
           "column": 19,
-          "position": 4099
+          "position": 4074
         }
       },
       "secondFile": {
         "name": "src/parse/go.rs",
-        "start": 450,
+        "start": 447,
+        "end": 454,
+        "startLoc": {
+          "line": 447,
+          "column": 5,
+          "position": 4240
+        },
+        "endLoc": {
+          "line": 454,
+          "column": 17,
+          "position": 4320
+        }
+      }
+    },
+    {
+      "format": "rust",
+      "lines": 22,
+      "fragment": ",\n    \"case_statement\",\n];\ncfg_builder!();\ncfg_loop_handler!();\nimpl<'a> CfgBuilder<'a> {\n    fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {\n        let entry_id = self.create_block();\n        self.build_cfg_recursive(node, entry_id)?;\n        Ok(())\n    }\n\n    fn build_cfg_recursive(\n        &mut self,\n        node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        match node.kind() {\n            \"if_statement\" => {\n                self.handle_if_statement(node, current_block)?;\n            }\n            \"for_statement\" | \"while_statement\"",
+      "tokens": 0,
+      "firstFile": {
+        "name": "src/parse/cpp.rs",
+        "start": 446,
+        "end": 467,
+        "startLoc": {
+          "line": 446,
+          "column": 19,
+          "position": 4155
+        },
+        "endLoc": {
+          "line": 467,
+          "column": 18,
+          "position": 4344
+        }
+      },
+      "secondFile": {
+        "name": "src/parse/java.rs",
+        "start": 500,
         "end": 457,
         "startLoc": {
-          "line": 450,
-          "column": 5,
-          "position": 4273
+          "line": 500,
+          "column": 20,
+          "position": 4644
         },
         "endLoc": {
           "line": 457,
-          "column": 17,
-          "position": 4353
+          "column": 20,
+          "position": 4314
         }
       }
     },
     {
       "format": "rust",
-      "lines": 21,
-      "fragment": ",\n    \"case_statement\",\n];\ncfg_builder!();\nimpl<'a> CfgBuilder<'a> {\n    fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {\n        let entry_id = self.create_block();\n        self.build_cfg_recursive(node, entry_id)?;\n        Ok(())\n    }\n\n    fn build_cfg_recursive(\n        &mut self,\n        node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        match node.kind() {\n            \"if_statement\" => {\n                self.handle_if_statement(node, current_block)?;\n            }\n            \"for_statement\" | \"while_statement\"",
+      "lines": 27,
+      "fragment": "=> {\n                self.handle_switch_statement(node, current_block)?;\n            }\n            _ => {\n                if let Ok(text) = node.utf8_text(self.source) {\n                    self.add_statement_to_block(current_block, text.to_string());\n                }\n\n                let mut cursor = node.walk();\n                for child in node.children(&mut cursor) {\n                    self.build_cfg_recursive(&child, current_block)?;\n                }\n            }\n        }\n\n        Ok(())\n    }\n\n    fn handle_switch_statement(\n        &mut self,\n        _node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        let merge_block = self.create_block();\n\n        let mut cursor = _node.walk();\n        for",
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 448,
-        "end": 468,
+        "start": 470,
+        "end": 496,
         "startLoc": {
-          "line": 448,
-          "column": 19,
-          "position": 4180
+          "line": 470,
+          "column": 2,
+          "position": 4373
         },
         "endLoc": {
-          "line": 468,
-          "column": 18,
-          "position": 4364
+          "line": 496,
+          "column": 4,
+          "position": 4592
         }
       },
       "secondFile": {
         "name": "src/parse/java.rs",
-        "start": 502,
-        "end": 458,
+        "start": 524,
+        "end": 550,
         "startLoc": {
-          "line": 502,
-          "column": 20,
-          "position": 4669
-        },
-        "endLoc": {
-          "line": 458,
-          "column": 20,
-          "position": 4334
-        }
-      }
-    },
-    {
-      "format": "rust",
-      "lines": 48,
-      "fragment": "=> {\n                self.handle_switch_statement(node, current_block)?;\n            }\n            _ => {\n                if let Ok(text) = node.utf8_text(self.source) {\n                    self.add_statement_to_block(current_block, text.to_string());\n                }\n\n                let mut cursor = node.walk();\n                for child in node.children(&mut cursor) {\n                    self.build_cfg_recursive(&child, current_block)?;\n                }\n            }\n        }\n\n        Ok(())\n    }\n\n    fn handle_loop_statement(\n        &mut self,\n        _node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        let body_block = self.create_block();\n\n        self.edges.push(Edge {\n            from: current_block,\n            to: body_block,\n            edge_type: EdgeType::Unconditional,\n        });\n        self.edges.push(Edge {\n            from: body_block,\n            to: current_block,\n            edge_type: EdgeType::Loop,\n        });\n\n        Ok(())\n    }\n\n    fn handle_switch_statement(\n        &mut self,\n        _node: &tree_sitter::Node<'_>,\n        current_block: usize,\n    ) -> Result<()> {\n        let merge_block = self.create_block();\n\n        let mut cursor = _node.walk();\n        for",
-      "tokens": 0,
-      "firstFile": {
-        "name": "src/parse/cpp.rs",
-        "start": 471,
-        "end": 518,
-        "startLoc": {
-          "line": 471,
+          "line": 524,
           "column": 2,
-          "position": 4393
+          "position": 4866
         },
         "endLoc": {
-          "line": 518,
+          "line": 550,
           "column": 4,
-          "position": 4766
-        }
-      },
-      "secondFile": {
-        "name": "src/parse/java.rs",
-        "start": 525,
-        "end": 572,
-        "startLoc": {
-          "line": 525,
-          "column": 2,
-          "position": 4886
-        },
-        "endLoc": {
-          "line": 572,
-          "column": 4,
-          "position": 5259
+          "position": 5085
         }
       }
     },
@@ -13492,32 +13168,68 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/cpp.rs",
-        "start": 519,
-        "end": 543,
+        "start": 497,
+        "end": 521,
         "startLoc": {
-          "line": 519,
+          "line": 497,
           "column": 2,
-          "position": 4809
+          "position": 4635
         },
         "endLoc": {
-          "line": 543,
+          "line": 521,
           "column": 29,
-          "position": 4949
+          "position": 4775
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 419,
-        "end": 443,
+        "start": 416,
+        "end": 440,
         "startLoc": {
-          "line": 419,
+          "line": 416,
           "column": 2,
-          "position": 3938
+          "position": 3905
         },
         "endLoc": {
-          "line": 443,
+          "line": 440,
           "column": 20,
-          "position": 4078
+          "position": 4045
+        }
+      }
+    },
+    {
+      "format": "rust",
+      "lines": 20,
+      "fragment": "(\n                &mut self,\n                _node: &tree_sitter::Node<'_>,\n                current_block: usize,\n            ) -> Result<()> {\n                let body_block = self.create_block();\n                self.edges.push(Edge {\n                    from: current_block,\n                    to: body_block,\n                    edge_type: EdgeType::Unconditional,\n                });\n                self.edges.push(Edge {\n                    from: body_block,\n                    to: current_block,\n                    edge_type: EdgeType::Loop,\n                });\n                Ok(())\n            }\n        }\n    }",
+      "tokens": 0,
+      "firstFile": {
+        "name": "src/parse/cfg.rs",
+        "start": 113,
+        "end": 132,
+        "startLoc": {
+          "line": 113,
+          "column": 22,
+          "position": 731
+        },
+        "endLoc": {
+          "line": 132,
+          "column": 2,
+          "position": 882
+        }
+      },
+      "secondFile": {
+        "name": "src/parse/scala.rs",
+        "start": 364,
+        "end": 570,
+        "startLoc": {
+          "line": 364,
+          "column": 23,
+          "position": 3488
+        },
+        "endLoc": {
+          "line": 570,
+          "column": 13,
+          "position": 4946
         }
       }
     },
@@ -13528,32 +13240,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/c.rs",
-        "start": 25,
-        "end": 35,
+        "start": 26,
+        "end": 36,
         "startLoc": {
-          "line": 25,
+          "line": 26,
           "column": 5,
-          "position": 154
+          "position": 168
         },
         "endLoc": {
-          "line": 35,
+          "line": 36,
           "column": 14,
-          "position": 288
+          "position": 302
         }
       },
       "secondFile": {
         "name": "src/parse/cpp.rs",
-        "start": 27,
-        "end": 37,
+        "start": 29,
+        "end": 39,
         "startLoc": {
-          "line": 27,
+          "line": 29,
           "column": 5,
-          "position": 182
+          "position": 204
         },
         "endLoc": {
-          "line": 37,
+          "line": 39,
           "column": 23,
-          "position": 316
+          "position": 338
         }
       }
     },
@@ -13564,32 +13276,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/c.rs",
-        "start": 41,
-        "end": 49,
+        "start": 42,
+        "end": 50,
         "startLoc": {
-          "line": 41,
+          "line": 42,
           "column": 5,
-          "position": 364
+          "position": 378
         },
         "endLoc": {
-          "line": 49,
+          "line": 50,
           "column": 11,
-          "position": 447
+          "position": 461
         }
       },
       "secondFile": {
         "name": "src/parse/go.rs",
-        "start": 65,
-        "end": 73,
+        "start": 66,
+        "end": 74,
         "startLoc": {
-          "line": 65,
+          "line": 66,
           "column": 6,
-          "position": 594
+          "position": 608
         },
         "endLoc": {
-          "line": 73,
+          "line": 74,
           "column": 30,
-          "position": 677
+          "position": 691
         }
       }
     },
@@ -13600,32 +13312,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/c.rs",
-        "start": 42,
-        "end": 53,
+        "start": 43,
+        "end": 54,
         "startLoc": {
-          "line": 42,
+          "line": 43,
           "column": 7,
-          "position": 389
+          "position": 403
         },
         "endLoc": {
-          "line": 53,
+          "line": 54,
           "column": 5,
-          "position": 485
+          "position": 499
         }
       },
       "secondFile": {
         "name": "src/parse/csharp.rs",
-        "start": 50,
-        "end": 105,
+        "start": 52,
+        "end": 107,
         "startLoc": {
-          "line": 50,
+          "line": 52,
           "column": 2,
-          "position": 414
+          "position": 436
         },
         "endLoc": {
-          "line": 105,
+          "line": 107,
           "column": 10,
-          "position": 953
+          "position": 975
         }
       }
     },
@@ -13636,32 +13348,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/c.rs",
-        "start": 53,
-        "end": 67,
+        "start": 54,
+        "end": 68,
         "startLoc": {
-          "line": 53,
+          "line": 54,
           "column": 3,
-          "position": 497
+          "position": 511
         },
         "endLoc": {
-          "line": 67,
+          "line": 68,
           "column": 2,
-          "position": 606
+          "position": 620
         }
       },
       "secondFile": {
         "name": "src/parse/cpp.rs",
-        "start": 58,
-        "end": 103,
+        "start": 60,
+        "end": 105,
         "startLoc": {
-          "line": 58,
+          "line": 60,
           "column": 2,
-          "position": 514
+          "position": 536
         },
         "endLoc": {
-          "line": 103,
+          "line": 105,
           "column": 17,
-          "position": 896
+          "position": 918
         }
       }
     },
@@ -13672,32 +13384,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/c.rs",
-        "start": 66,
-        "end": 88,
+        "start": 67,
+        "end": 89,
         "startLoc": {
-          "line": 66,
+          "line": 67,
           "column": 21,
-          "position": 603
+          "position": 617
         },
         "endLoc": {
-          "line": 88,
+          "line": 89,
           "column": 8,
-          "position": 800
+          "position": 814
         }
       },
       "secondFile": {
         "name": "src/parse/cpp.rs",
-        "start": 140,
-        "end": 162,
+        "start": 142,
+        "end": 164,
         "startLoc": {
-          "line": 140,
+          "line": 142,
           "column": 21,
-          "position": 1248
+          "position": 1270
         },
         "endLoc": {
-          "line": 162,
+          "line": 164,
           "column": 10,
-          "position": 1445
+          "position": 1467
         }
       }
     },
@@ -13708,32 +13420,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/c.rs",
-        "start": 88,
-        "end": 100,
+        "start": 89,
+        "end": 101,
         "startLoc": {
-          "line": 88,
+          "line": 89,
           "column": 2,
-          "position": 802
+          "position": 816
         },
         "endLoc": {
-          "line": 100,
+          "line": 101,
           "column": 2,
-          "position": 936
+          "position": 950
         }
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 107,
-        "end": 119,
+        "start": 109,
+        "end": 121,
         "startLoc": {
-          "line": 107,
+          "line": 109,
           "column": 2,
-          "position": 911
+          "position": 933
         },
         "endLoc": {
-          "line": 119,
+          "line": 121,
           "column": 5,
-          "position": 1045
+          "position": 1067
         }
       }
     },
@@ -13744,32 +13456,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/c.rs",
-        "start": 126,
-        "end": 137,
+        "start": 127,
+        "end": 138,
         "startLoc": {
-          "line": 126,
+          "line": 127,
           "column": 2,
-          "position": 1187
+          "position": 1201
         },
         "endLoc": {
-          "line": 137,
+          "line": 138,
           "column": 2,
-          "position": 1280
+          "position": 1294
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 61,
-        "end": 71,
+        "start": 62,
+        "end": 72,
         "startLoc": {
-          "line": 61,
+          "line": 62,
           "column": 2,
-          "position": 678
+          "position": 692
         },
         "endLoc": {
-          "line": 71,
+          "line": 72,
           "column": 2,
-          "position": 770
+          "position": 784
         }
       }
     },
@@ -13780,32 +13492,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/c.rs",
-        "start": 207,
-        "end": 222,
+        "start": 208,
+        "end": 223,
         "startLoc": {
-          "line": 207,
+          "line": 208,
           "column": 9,
-          "position": 1892
+          "position": 1906
         },
         "endLoc": {
-          "line": 222,
+          "line": 223,
           "column": 3,
-          "position": 1990
+          "position": 2004
         }
       },
       "secondFile": {
         "name": "src/parse/cpp.rs",
-        "start": 265,
-        "end": 268,
+        "start": 267,
+        "end": 269,
         "startLoc": {
-          "line": 265,
+          "line": 267,
           "column": 9,
-          "position": 2476
+          "position": 2498
         },
         "endLoc": {
-          "line": 268,
+          "line": 269,
           "column": 60,
-          "position": 2542
+          "position": 2556
         }
       }
     },
@@ -13816,68 +13528,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/c.rs",
-        "start": 222,
-        "end": 262,
+        "start": 223,
+        "end": 263,
         "startLoc": {
-          "line": 222,
+          "line": 223,
           "column": 18,
-          "position": 1993
+          "position": 2007
         },
         "endLoc": {
-          "line": 262,
+          "line": 263,
           "column": 16,
-          "position": 2437
+          "position": 2451
         }
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 175,
-        "end": 321,
+        "start": 176,
+        "end": 323,
         "startLoc": {
-          "line": 175,
+          "line": 176,
           "column": 22,
-          "position": 1629
+          "position": 1643
         },
         "endLoc": {
-          "line": 321,
+          "line": 323,
           "column": 18,
-          "position": 3023
-        }
-      }
-    },
-    {
-      "format": "rust",
-      "lines": 10,
-      "fragment": "(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {\n    let mut calls = Vec::new();\n\n    fn clean_call_text(raw: &str) -> String {\n        raw.split('(').next().unwrap_or(raw).trim().to_string()\n    }\n\n    let mut stack = vec![*node];\n    while let Some(current) = stack.pop() {\n        if",
-      "tokens": 0,
-      "firstFile": {
-        "name": "src/parse/c.rs",
-        "start": 262,
-        "end": 271,
-        "startLoc": {
-          "line": 262,
-          "column": 16,
-          "position": 2438
-        },
-        "endLoc": {
-          "line": 271,
-          "column": 3,
-          "position": 2572
-        }
-      },
-      "secondFile": {
-        "name": "src/parse/scala.rs",
-        "start": 230,
-        "end": 330,
-        "startLoc": {
-          "line": 230,
-          "column": 20,
-          "position": 2241
-        },
-        "endLoc": {
-          "line": 330,
-          "column": 6,
-          "position": 3158
+          "position": 3045
         }
       }
     },
@@ -13888,32 +13564,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/c.rs",
-        "start": 271,
-        "end": 282,
+        "start": 268,
+        "end": 279,
         "startLoc": {
-          "line": 271,
+          "line": 268,
           "column": 2,
-          "position": 2584
+          "position": 2551
         },
         "endLoc": {
-          "line": 282,
+          "line": 279,
           "column": 4,
-          "position": 2676
+          "position": 2643
         }
       },
       "secondFile": {
         "name": "src/parse/cpp.rs",
-        "start": 331,
-        "end": 341,
+        "start": 329,
+        "end": 339,
         "startLoc": {
-          "line": 331,
+          "line": 329,
           "column": 2,
-          "position": 3173
+          "position": 3148
         },
         "endLoc": {
-          "line": 341,
+          "line": 339,
           "column": 17,
-          "position": 3264
+          "position": 3239
         }
       }
     },
@@ -13924,17 +13600,17 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/c.rs",
-        "start": 272,
-        "end": 282,
+        "start": 269,
+        "end": 279,
         "startLoc": {
-          "line": 272,
+          "line": 269,
           "column": 8,
-          "position": 2599
+          "position": 2566
         },
         "endLoc": {
-          "line": 282,
+          "line": 279,
           "column": 8,
-          "position": 2684
+          "position": 2651
         }
       },
       "secondFile": {
@@ -13960,32 +13636,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/c.rs",
-        "start": 279,
-        "end": 291,
+        "start": 276,
+        "end": 288,
         "startLoc": {
-          "line": 279,
+          "line": 276,
           "column": 13,
-          "position": 2669
+          "position": 2636
         },
         "endLoc": {
-          "line": 291,
+          "line": 288,
           "column": 3,
-          "position": 2759
+          "position": 2726
         }
       },
       "secondFile": {
         "name": "src/parse/cpp.rs",
-        "start": 351,
-        "end": 363,
+        "start": 349,
+        "end": 361,
         "startLoc": {
-          "line": 351,
+          "line": 349,
           "column": 2,
-          "position": 3364
+          "position": 3339
         },
         "endLoc": {
-          "line": 363,
+          "line": 361,
           "column": 43,
-          "position": 3454
+          "position": 3429
         }
       }
     },
@@ -13996,32 +13672,32 @@
       "tokens": 0,
       "firstFile": {
         "name": "src/parse/c.rs",
-        "start": 291,
-        "end": 308,
+        "start": 288,
+        "end": 305,
         "startLoc": {
-          "line": 291,
+          "line": 288,
           "column": 1,
-          "position": 2759
+          "position": 2726
         },
         "endLoc": {
-          "line": 308,
+          "line": 305,
           "column": 2,
-          "position": 2923
+          "position": 2890
         }
       },
       "secondFile": {
         "name": "src/parse/cpp.rs",
-        "start": 420,
-        "end": 466,
+        "start": 418,
+        "end": 463,
         "startLoc": {
-          "line": 420,
+          "line": 418,
           "column": 1,
-          "position": 3968
+          "position": 3943
         },
         "endLoc": {
-          "line": 466,
+          "line": 463,
           "column": 2,
-          "position": 4388
+          "position": 4355
         }
       }
     },
@@ -14047,17 +13723,17 @@
       },
       "secondFile": {
         "name": "src/parse/c.rs",
-        "start": 3,
-        "end": 9,
+        "start": 4,
+        "end": 10,
         "startLoc": {
-          "line": 3,
+          "line": 4,
           "column": 1,
-          "position": 3
+          "position": 17
         },
         "endLoc": {
-          "line": 9,
+          "line": 10,
           "column": 64,
-          "position": 72
+          "position": 86
         }
       }
     },
@@ -14083,17 +13759,17 @@
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 26,
-        "end": 37,
+        "start": 28,
+        "end": 39,
         "startLoc": {
-          "line": 26,
+          "line": 28,
           "column": 5,
-          "position": 182
+          "position": 204
         },
         "endLoc": {
-          "line": 37,
+          "line": 39,
           "column": 12,
-          "position": 289
+          "position": 311
         }
       }
     },
@@ -14119,17 +13795,17 @@
       },
       "secondFile": {
         "name": "src/parse/cpp.rs",
-        "start": 265,
-        "end": 266,
+        "start": 267,
+        "end": 267,
         "startLoc": {
-          "line": 265,
+          "line": 267,
           "column": 12,
-          "position": 2477
+          "position": 2499
         },
         "endLoc": {
-          "line": 266,
+          "line": 267,
           "column": 2,
-          "position": 2539
+          "position": 2553
         }
       }
     },
@@ -14155,17 +13831,17 @@
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 107,
-        "end": 119,
+        "start": 109,
+        "end": 121,
         "startLoc": {
-          "line": 107,
+          "line": 109,
           "column": 2,
-          "position": 911
+          "position": 933
         },
         "endLoc": {
-          "line": 119,
+          "line": 121,
           "column": 5,
-          "position": 1045
+          "position": 1067
         }
       }
     },
@@ -14191,17 +13867,17 @@
       },
       "secondFile": {
         "name": "src/parse/c.rs",
-        "start": 109,
-        "end": 120,
+        "start": 110,
+        "end": 121,
         "startLoc": {
-          "line": 109,
+          "line": 110,
           "column": 18,
-          "position": 1032
+          "position": 1046
         },
         "endLoc": {
-          "line": 120,
+          "line": 121,
           "column": 45,
-          "position": 1142
+          "position": 1156
         }
       }
     },
@@ -14263,17 +13939,17 @@
       },
       "secondFile": {
         "name": "src/parse/c.rs",
-        "start": 121,
-        "end": 151,
+        "start": 122,
+        "end": 152,
         "startLoc": {
-          "line": 121,
+          "line": 122,
           "column": 9,
-          "position": 1145
+          "position": 1159
         },
         "endLoc": {
-          "line": 151,
+          "line": 152,
           "column": 16,
-          "position": 1394
+          "position": 1408
         }
       }
     },
@@ -14299,17 +13975,17 @@
       },
       "secondFile": {
         "name": "src/parse/c.rs",
-        "start": 152,
-        "end": 166,
+        "start": 153,
+        "end": 167,
         "startLoc": {
-          "line": 152,
+          "line": 153,
           "column": 2,
-          "position": 1413
+          "position": 1427
         },
         "endLoc": {
-          "line": 166,
+          "line": 167,
           "column": 27,
-          "position": 1518
+          "position": 1532
         }
       }
     },
@@ -14335,17 +14011,17 @@
       },
       "secondFile": {
         "name": "src/parse/scala.rs",
-        "start": 175,
-        "end": 185,
+        "start": 176,
+        "end": 187,
         "startLoc": {
-          "line": 175,
+          "line": 176,
           "column": 22,
-          "position": 1629
+          "position": 1643
         },
         "endLoc": {
-          "line": 185,
+          "line": 187,
           "column": 7,
-          "position": 1771
+          "position": 1793
         }
       }
     },
@@ -14371,17 +14047,17 @@
       },
       "secondFile": {
         "name": "src/parse/ruby.rs",
-        "start": 195,
-        "end": 230,
+        "start": 197,
+        "end": 231,
         "startLoc": {
-          "line": 195,
+          "line": 197,
           "column": 8,
-          "position": 1938
+          "position": 1960
         },
         "endLoc": {
-          "line": 230,
+          "line": 231,
           "column": 20,
-          "position": 2240
+          "position": 2254
         }
       }
     },
@@ -14407,17 +14083,17 @@
       },
       "secondFile": {
         "name": "src/parse/php.rs",
-        "start": 317,
-        "end": 338,
+        "start": 315,
+        "end": 336,
         "startLoc": {
-          "line": 317,
+          "line": 315,
           "column": 5,
-          "position": 3041
+          "position": 3016
         },
         "endLoc": {
-          "line": 338,
+          "line": 336,
           "column": 30,
-          "position": 3203
+          "position": 3178
         }
       }
     },
@@ -14443,17 +14119,17 @@
       },
       "secondFile": {
         "name": "src/parse/c.rs",
-        "start": 288,
-        "end": 428,
+        "start": 285,
+        "end": 426,
         "startLoc": {
-          "line": 288,
+          "line": 285,
           "column": 5,
-          "position": 2754
+          "position": 2721
         },
         "endLoc": {
-          "line": 428,
+          "line": 426,
           "column": 5,
-          "position": 4087
+          "position": 4062
         }
       }
     },

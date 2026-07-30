@@ -1,6 +1,7 @@
 // JavaScript and TypeScript language parser implementation
 
 use crate::cfg_builder;
+use crate::cfg_loop_handler;
 use crate::parse::traits::calculate_complexity;
 use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use crate::parse::traits::{
@@ -864,6 +865,7 @@ const DECISION_KINDS: &[&str] = &[
     "case",
 ];
 cfg_builder!();
+cfg_loop_handler!();
 impl<'a> CfgBuilder<'a> {
     fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {
         let entry_id = self.create_block();
@@ -897,27 +899,6 @@ impl<'a> CfgBuilder<'a> {
                 }
             }
         }
-
-        Ok(())
-    }
-
-    fn handle_loop_statement(
-        &mut self,
-        _node: &tree_sitter::Node<'_>,
-        current_block: usize,
-    ) -> Result<()> {
-        let body_block = self.create_block();
-
-        self.edges.push(Edge {
-            from: current_block,
-            to: body_block,
-            edge_type: EdgeType::Unconditional,
-        });
-        self.edges.push(Edge {
-            from: body_block,
-            to: current_block,
-            edge_type: EdgeType::Loop,
-        });
 
         Ok(())
     }

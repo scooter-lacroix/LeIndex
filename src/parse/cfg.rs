@@ -99,3 +99,35 @@ macro_rules! cfg_builder {
         }
     };
 }
+
+/// Generate the universal `handle_loop_statement` CFG method (body block +
+/// back-edge). Invoke at module scope in parsers whose grammar has a distinct
+/// loop construct (cpp, csharp, java, javascript, php, ruby, rust). Parsers
+/// without one (go/lua/python/scala handle loops inline in `build_cfg_recursive`)
+/// simply omit this invocation. Requires `Edge`, `EdgeType`, and `Result` in
+/// scope at the invocation site.
+#[macro_export]
+macro_rules! cfg_loop_handler {
+    () => {
+        impl<'a> CfgBuilder<'a> {
+            fn handle_loop_statement(
+                &mut self,
+                _node: &tree_sitter::Node<'_>,
+                current_block: usize,
+            ) -> Result<()> {
+                let body_block = self.create_block();
+                self.edges.push(Edge {
+                    from: current_block,
+                    to: body_block,
+                    edge_type: EdgeType::Unconditional,
+                });
+                self.edges.push(Edge {
+                    from: body_block,
+                    to: current_block,
+                    edge_type: EdgeType::Loop,
+                });
+                Ok(())
+            }
+        }
+    };
+}
