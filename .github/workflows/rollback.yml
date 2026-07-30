@@ -62,6 +62,7 @@ jobs:
       # Reversible via `cargo unyank --vers <version>`.
       - name: Yank crate from crates.io
         continue-on-error: true
+        id: crate-yank
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
@@ -76,6 +77,7 @@ jobs:
       # advertised as the latest. Reversible via `gh release edit --latest`.
       - name: Mark GitHub Release as pre-release
         continue-on-error: true
+        id: pre-release-mark
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -90,6 +92,7 @@ jobs:
       # without removing it. Requires NPM_TOKEN. Reversible with an empty message.
       - name: Deprecate npm package
         continue-on-error: true
+        id: npm-deprecate
         env:
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
@@ -97,7 +100,11 @@ jobs:
             echo "NPM_TOKEN not set — skipping npm deprecation (manual: npm deprecate leindex-mcp@${{ inputs.version }} '<reason>')"
             exit 0
           fi
+          npm_config_userconfig=$(mktemp)
+          echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "$npm_config_userconfig"
+          export NPM_CONFIG_USERCONFIG="$npm_config_userconfig"
           npm deprecate "leindex-mcp@${{ inputs.version }}" "Rolled back: ${{ inputs.reason }}. Use the latest version instead."
+          rm "$npm_config_userconfig"
           echo "::notice::Deprecated leindex-mcp@${{ inputs.version }} on npm"
 
       - name: Rollback summary
@@ -109,5 +116,9 @@ jobs:
           echo "**Reason**: ${{ inputs.reason }}" >> "$GITHUB_STEP_SUMMARY"
           echo "**Tracking issue**: ${{ steps.issue.outputs.url }}" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Performed: crate yank (crates.io, if token set), release marked pre-release (GitHub), npm deprecation (if token set)." >> "$GITHUB_STEP_SUMMARY"
+          echo "Actions performed:" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Crate yank (crates.io): ${{ steps.crate-yank.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Release marked pre-release (GitHub): ${{ steps.pre-release-mark.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- NPM deprecation: ${{ steps.npm-deprecate.outcome }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "To re-release after the fix: push the corrected version to master; release.yml republishes automatically." >> "$GITHUB_STEP_SUMMARY"

@@ -166,13 +166,15 @@ fn edit_response(
     validation: Option<Value>,
 ) -> Value {
     let (nodes, files, breaking) = impact;
+    let mut affected_files: Vec<_> = files.into_iter().collect();
+    affected_files.sort();
     let mut response = serde_json::json!({
         "success": true,
         "changes_applied": changes_applied,
         "file_path": path.to_string_lossy(),
         "edit_region": region,
         "affected_symbols": nodes,
-        "affected_files": files.into_iter().collect::<Vec<_>>(),
+        "affected_files": affected_files,
         "breaking_changes": breaking,
     });
     if let (Some(validation), Some(object)) = (validation, response.as_object_mut()) {

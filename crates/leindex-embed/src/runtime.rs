@@ -434,6 +434,7 @@ fn try_provider_or_cpu(
             tracing::warn!("{}", reason);
             let cpu_builder = Session::builder()?
                 .with_memory_pattern(false)?
+                .with_log_level(LogLevel::Warning)?
                 .with_optimization_level(GraphOptimizationLevel::Level1)?
                 .with_execution_providers([ort::ep::CPU::default().build()])?;
             Ok((cpu_builder, ProviderRuntimeStatus::fallback_to_cpu(reason)))
@@ -461,6 +462,7 @@ fn maybe_missing_ep_fallback(
     );
     let session = Session::builder()?
         .with_memory_pattern(false)?
+        .with_log_level(LogLevel::Warning)?
         .with_optimization_level(GraphOptimizationLevel::Level1)?
         .with_execution_providers([ort::ep::CPU::default().build()])?
         .commit_from_file(model_path)?;

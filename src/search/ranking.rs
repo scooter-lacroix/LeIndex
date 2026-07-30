@@ -169,10 +169,10 @@ impl HybridScorer {
     }
 
     fn recompute_overall(&self, score: &mut Score) {
-        score.overall = score.tfidf * self.tfidf_weight
+        score.overall = (score.tfidf * self.tfidf_weight
             + score.neural * self.neural_weight
             + score.structural * self.structural_weight
-            + score.text_match * self.text_weight;
+            + score.text_match * self.text_weight).clamp(0.0, 1.0);
     }
 
     /// Re-rank results based on query type (legacy method for compatibility)

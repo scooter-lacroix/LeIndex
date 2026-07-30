@@ -63,6 +63,7 @@ impl JavaParser {
             }
             "enum_declaration" => {
                 Self::push_java_type_signature(node, source, parent_path, "enum", signatures);
+                Self::visit_java_children(node, source, signatures, parent_path);
             }
             "field_declaration" => Self::extract_java_fields(node, source, signatures),
             _ => Self::visit_java_children(node, source, signatures, parent_path),

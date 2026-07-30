@@ -2,6 +2,7 @@
 
 use super::*;
 
+/// Persisted metadata needed to hydrate SearchEngine without re-running the
 /// source-content indexing pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SearchSnapshot {

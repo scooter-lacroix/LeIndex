@@ -40,11 +40,14 @@ fn resolve_write_path(file_path: &str, project_root: &Path) -> Result<PathBuf, J
         })?)
     };
 
-    if !canonical.starts_with(project_root) {
+    let canonical_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    if !canonical.starts_with(&canonical_root) {
         return Err(JsonRpcError::invalid_params(format!(
             "File '{}' is outside the project boundary '{}'",
             file_path,
-            project_root.display()
+            canonical_root.display()
         )));
     }
 

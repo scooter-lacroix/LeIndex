@@ -265,13 +265,11 @@ impl HybridEmbedder {
                 .await
                 .ok()?;
                 match result {
-                    EmbedResult::Success(response) => {
-                        if response.count > 0 {
-                            // VAL-CPHASE-016: Write from flat buffer directly
-                            Some(Ok(response.into_vectors().into_iter().next().unwrap()))
-                        } else {
-                            Some(Err("worker returned empty response".to_string()))
-                        }
+                    EmbedResult::Success(response) => match response.into_vectors().into_iter().next() {
+                        // VAL-CPHASE-016: write from flat buffer directly. Presence of the
+                        // vector (not response.count) is the real non-empty contract.
+                        Some(v) => Some(Ok(v)),
+                        None => Some(Err("worker returned empty response".to_string())),
                     }
                     EmbedResult::Fallback { batch_id, error } => {
                         // VAL-CPHASE-018/019: Fallback already logged actionable warning.
@@ -336,6 +334,11 @@ impl HybridEmbedder {
                         Err(e) => Some(Err(e.to_string())),
                     }
                 }
+                // Remote-only embedders provide embeddings, not a local reranker;
+                // reranking is a local-ONNX capability. (Required for match
+                // exhaustiveness under the onnx+remote-embeddings feature combo.)
+                #[cfg(feature = "remote-embeddings")]
+                Self::HybridRemote { .. } => None,
             };
         }
         #[cfg(not(feature = "onnx"))]
@@ -357,14 +360,11 @@ impl HybridEmbedder {
                 let texts = vec![text.to_string()];
                 let result = neural.embed_with_fallback(&texts, NEURAL_EMBEDDING_DIMENSION);
                 match result {
-                    EmbedResult::Success(response) => {
-                        if response.count > 0 {
-                            // VAL-CPHASE-016: Write from flat buffer directly,
-                            // avoiding nested Vec<Vec<f32>> heap mirror
-                            Some(Ok(response.into_vectors().into_iter().next().unwrap()))
-                        } else {
-                            Some(Err("worker returned empty response".to_string()))
-                        }
+                    EmbedResult::Success(response) => match response.into_vectors().into_iter().next() {
+                        // VAL-CPHASE-016: write from flat buffer directly. Presence of the
+                        // vector (not response.count) is the real non-empty contract.
+                        Some(v) => Some(Ok(v)),
+                        None => Some(Err("worker returned empty response".to_string())),
                     }
                     EmbedResult::Fallback { batch_id, error } => {
                         // VAL-CPHASE-018/019: Fallback already logged actionable warning.

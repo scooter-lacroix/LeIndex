@@ -1129,7 +1129,7 @@ fn extract_call_edges_for_nodes(
                 }
 
                 if let Some(target_id) = type_node_target(call_target, node_ids, &last_map) {
-                    if seen.insert((caller_id, target_id)) {
+                    if caller_id != target_id && seen.insert((caller_id, target_id)) {
                         edges.push((caller_id, target_id));
                     }
                 }

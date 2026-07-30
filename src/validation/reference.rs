@@ -156,23 +156,25 @@ impl ReferenceChecker {
     }
 
     fn extract_python_imports(content: &str) -> Vec<String> {
-        content
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                line.strip_prefix("import ")
-                    .map(|rest| rest.split(" as ").next().unwrap_or(rest).trim().to_string())
-                    .or_else(|| {
-                        line.strip_prefix("from ").map(|rest| {
-                            rest.split(" import ")
-                                .next()
-                                .unwrap_or(rest)
-                                .trim()
-                                .to_string()
-                        })
-                    })
-            })
-            .collect()
+        let mut imports = Vec::new();
+        for line in content.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("import ") {
+                // `import a, b, c as d` -> one entry per module (alias removed)
+                for item in rest.split(',') {
+                    let item = item.split(" as ").next().unwrap_or(item).trim();
+                    if !item.is_empty() {
+                        imports.push(item.to_string());
+                    }
+                }
+            } else if let Some(rest) = line.strip_prefix("from ") {
+                // `from pkg import ...` -> the module is before " import "
+                let module = rest.split(" import ").next().unwrap_or(rest).trim();
+                if !module.is_empty() {
+                    imports.push(module.to_string());
+                }
+            }
+        }
+        imports
     }
 
     fn extract_javascript_imports(content: &str) -> Vec<String> {
@@ -207,7 +209,12 @@ impl ReferenceChecker {
         let rest = &line[start + 8..];
         let end = rest.find(')')?;
         let inner = rest[..end].trim();
-        if inner.starts_with('"') || inner.starts_with('\'') {
+        // Require a matching open/close quote pair before slicing, so malformed
+        // or incomplete forms like `require(")` return None instead of panicking
+        // or slicing a non-string value.
+        let mut chars = inner.chars();
+        let first = chars.next()?;
+        if (first == '"' || first == '\'') && inner.ends_with(first) && inner.len() >= 2 {
             return Some(inner[1..inner.len() - 1].to_string());
         }
         None
@@ -229,8 +236,15 @@ impl ReferenceChecker {
         content
             .lines()
             .map(str::trim)
-            .filter(|line| line.starts_with('"') && line.contains('"'))
-            .map(|line| line.trim_matches('"').to_string())
+            .filter_map(|line| {
+                // Single-line `import "pkg"` and each `"pkg"` line inside an
+                // `import (...)` block both reduce to a leading double-quoted path.
+                let path_line = line.strip_prefix("import ").unwrap_or(line);
+                path_line
+                    .strip_prefix('"')
+                    .and_then(|rest| rest.strip_suffix('"'))
+                    .map(|p| p.to_string())
+            })
             .collect()
     }
 

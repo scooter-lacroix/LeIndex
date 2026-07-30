@@ -694,14 +694,21 @@ impl EditEngine {
     }
 
     fn worktree_target_path(session: &WorktreeSession, file_path: &Path) -> PathBuf {
-        if file_path.is_absolute() {
-            let relative = file_path
-                .strip_prefix(session.path())
-                .or_else(|_| file_path.strip_prefix("/"))
-                .unwrap_or(file_path);
-            return session.path().join(relative);
-        }
-        session.path().join(file_path)
+        use std::path::Component;
+        // Re-anchor under the worktree, keeping only Normal components so that
+        // neither a leading root (an absolute path, which would make
+        // `PathBuf::join` discard the session base) nor `..` traversal can write
+        // outside the session worktree. A session-path prefix is stripped first so
+        // legitimate absolute paths inside the worktree are preserved.
+        let stripped = file_path.strip_prefix(session.path()).unwrap_or(file_path);
+        let safe: PathBuf = stripped
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(std::path::Path::new(s).to_path_buf()),
+                _ => None,
+            })
+            .collect();
+        session.path().join(safe)
     }
 
     async fn read_or_materialize_worktree_file(

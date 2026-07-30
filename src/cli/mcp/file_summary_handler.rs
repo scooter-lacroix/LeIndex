@@ -131,14 +131,23 @@ async fn catalog_file_summary(
     let Ok(Some(catalog)) = CatalogReader::open(&db_path, live.root()).await else {
         return Ok((None, false));
     };
-    let Ok(mut symbols) = catalog.symbols_in_file(file).await else {
+    let Ok(symbols) = catalog.symbols_in_file(file).await else {
         return Ok((None, false));
     };
-    for symbol in &mut symbols {
-        symbol.file_path = live
-            .file(&symbol.file_path.to_string_lossy())
-            .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
+    // Resolve each symbol's live path; skip (drop) symbols whose lookup fails
+    // rather than aborting the whole request. All-stale -> empty -> the caller
+    // falls back to live parsing.
+    let mut resolved = Vec::with_capacity(symbols.len());
+    for mut symbol in symbols {
+        match live.file(&symbol.file_path.to_string_lossy()) {
+            Ok(path) => {
+                symbol.file_path = path;
+                resolved.push(symbol);
+            }
+            Err(_) => continue,
+        }
     }
+    let symbols = resolved;
     if symbols.is_empty() {
         return Ok((None, false));
     }

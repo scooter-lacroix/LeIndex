@@ -203,18 +203,27 @@ async fn find_live_symbol_in_inventory(
     // bounded parse cap applies to *relevant* files rather than an arbitrary
     // alphabetical slice — a symbol in a later-sorting file is still found. A
     // path-name prefilter would be wrong (symbols are not named after their files).
-    let mut parsed_count = 0usize;
+    // Content prefilter: only parse files whose bytes mention the symbol, so the
+    // bounded parse cap applies to *relevant* files. `inspected` caps the number
+    // of files READ (a missing symbol otherwise scans the whole tree); `parsed`
+    // caps parsed files. Byte matching via `from_utf8` (no whole-file allocation).
+    let mut parsed = 0usize;
+    let mut inspected = 0usize;
     for candidate in candidates {
-        if parsed_count >= 20 {
+        if parsed >= 20 || inspected >= 200 {
             break;
         }
+        inspected += 1;
         let Ok(bytes) = read_live_bytes(candidate.clone()).await else {
             continue;
         };
-        if !String::from_utf8_lossy(&bytes).contains(symbol) {
+        if !std::str::from_utf8(&bytes)
+            .map(|content| content.contains(symbol))
+            .unwrap_or(false)
+        {
             continue;
         }
-        parsed_count += 1;
+        parsed += 1;
         let Ok(live_parsed) = parse_live_file(candidate).await else {
             continue;
         };

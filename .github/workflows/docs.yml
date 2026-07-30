@@ -16,7 +16,7 @@ jobs:
   api-docs:
     name: Generate API Documentation
     runs-on: ubuntu-latest
-    permissions: contents: read, pages: write, id-token: write
+    permissions: contents: read
     concurrency:
       group: docs-pages
       cancel-in-progress: false
@@ -45,11 +45,10 @@ jobs:
         run: |
           # Verify the CLI binary can generate help text without errors
           cargo build --features cli --release 2>/dev/null || true
-      - name: Upload documentation artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: api-docs
-          path: target/doc/
+-      - name: Upload documentation artifact
+-        uses: actions/upload-pages-artifact@v3
+-        with:
+-          path: target/doc/
   # ── Deploy documentation to GitHub Pages ──────────────────────────────
   # Publishes generated API documentation to GitHub Pages on every push to master.
   deploy:
@@ -57,18 +56,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions: contents: read, pages: write, id-token: write
     # Only run on master branch (not PRs)
-    if: github.ref == 'refs/heads/master'
+    needs: api-docs
     concurrency:
       group: docs-pages
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
       - name: Setup Pages
         uses: actions/configure-pages@v5
-      - name: Upload artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: target/doc/
       - name: Deploy to GitHub Pages
         uses: actions/deploy-pages@v4
 

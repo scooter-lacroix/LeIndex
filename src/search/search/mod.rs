@@ -130,7 +130,6 @@ pub struct SearchEngine {
 
 const SEARCH_SNAPSHOT_VERSION: u32 = 1;
 
-/// Persisted metadata needed to hydrate `SearchEngine` without re-running the
 impl SearchEngine {
     /// Create a new search engine with default 768-dim embeddings
     ///
@@ -794,6 +793,7 @@ impl SearchEngine {
             ));
         }
 
+        let preserved_neural_weight = self.neural_weight;
         let mut staged = SearchEngine::new();
         staged.append_nodes(nodes);
         let node_ids = staged
@@ -837,6 +837,7 @@ impl SearchEngine {
             ));
         }
 
+        staged.neural_weight = preserved_neural_weight;
         *self = staged;
         Ok(self.nodes.len())
     }

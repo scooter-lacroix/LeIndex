@@ -91,7 +91,7 @@ fn parse_phase_selection(value: Option<&Value>) -> Result<PhaseSelection, JsonRp
             })
         }
         Some(Value::Number(number)) => {
-            let Some(phase) = number.as_u64().map(|value| value as u8) else {
+            let Some(phase) = number.as_u64().and_then(|value| u8::try_from(value).ok()) else {
                 return Err(JsonRpcError::invalid_params(
                     "phase must be 1..5 or 'all'".to_string(),
                 ));
@@ -138,12 +138,21 @@ fn phase_target(
     project_root: &Path,
     requested_path: Option<&str>,
 ) -> Result<(PathBuf, Vec<PathBuf>, Option<PathBuf>), JsonRpcError> {
+    let canonical_root = project_root
+        .canonicalize()
+        .map_err(|error| JsonRpcError::invalid_params(format!("project root not accessible: {}", error)))?;
     let target = match requested_path {
         Some(path) => PathBuf::from(path).canonicalize().map_err(|error| {
             JsonRpcError::invalid_params(format!("path must exist and be accessible: {}", error))
         })?,
-        None => project_root.to_path_buf(),
+        None => canonical_root.clone(),
     };
+    if !target.starts_with(&canonical_root) {
+        return Err(JsonRpcError::invalid_params(format!(
+            "phase target is outside the project boundary '{}'",
+            canonical_root.display()
+        )));
+    }
     if target.is_file() {
         let root = target
             .parent()
@@ -174,9 +183,9 @@ fn file_symbols(
         .filter_map(|&node_idx| {
             let node = pdg.get_node(node_idx)?;
             let (start_byte, end_byte) = node.byte_range;
-            let signature = (start_byte < content.len())
-                .then(|| content[start_byte..].lines().next())
-                .flatten()
+            let signature = content
+                .get(start_byte..)
+                .and_then(|rest| rest.lines().next())
                 .map(str::trim)
                 .filter(|line| !line.is_empty() && !line.starts_with("// ["))
                 .map(str::to_owned);

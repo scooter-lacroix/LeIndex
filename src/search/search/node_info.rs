@@ -385,8 +385,7 @@ impl CompactNodeMetadata {
     }
 }
 
-/// engine.incremental_reindex(delta);
-/// ```
+/// Delta describing nodes to remove from and add/update in the text index.
 #[derive(Debug, Default)]
 pub struct TextIndexDelta {
     /// Node IDs to remove from the index.
