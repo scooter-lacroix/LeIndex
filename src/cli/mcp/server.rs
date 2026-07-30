@@ -1186,13 +1186,49 @@ impl McpServer {
 }
 
 #[cfg(unix)]
+/// Read one line (including its trailing `\n`) but abort with an error once it
+/// exceeds `max` bytes — so a peer sending an unbounded line with no newline
+/// cannot exhaust memory before a length check. `Ok(None)` = clean EOF.
+#[cfg(unix)]
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Option<String>> {
+    use tokio::io::AsyncBufReadExt;
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(if out.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&out).into_owned())
+            });
+        }
+        let nl = buf.iter().position(|&b| b == b'\n');
+        let take = nl.map(|i| i + 1).unwrap_or(buf.len());
+        if out.len().saturating_add(take) > max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line exceeds max length",
+            ));
+        }
+        out.extend_from_slice(&buf[..take]);
+        reader.consume(take);
+        if nl.is_some() {
+            return Ok(Some(String::from_utf8_lossy(&out).into_owned()));
+        }
+    }
+}
+#[cfg(unix)]
+
 async fn handle_socket_connection(
     stream: tokio::net::UnixStream,
     session_id: String,
     session_handshakes: Arc<DashMap<Arc<str>, (bool, Instant)>>,
     handshake_complete: Arc<AtomicBool>,
 ) {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 
     debug!("Accepted Unix socket connection (session: {})", session_id);
 
@@ -1205,21 +1241,13 @@ async fn handle_socket_connection(
     const MAX_PAYLOAD_SIZE: usize = 10_485_760; // 10MB max payload size
 
     loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break, // EOF
-            Ok(_) => {
-                if line.len() > MAX_LINE_LENGTH {
-                    debug!(
-                        "Line too long (session {}): {} bytes",
-                        session_id,
-                        line.len()
-                    );
-                    break;
-                }
-            }
+        // Bounded line read: aborts before a peer can exhaust memory with an
+        // oversized line that has no trailing newline.
+        let line = match read_bounded_line(&mut reader, MAX_LINE_LENGTH).await {
+            Ok(Some(line)) => line,
+            Ok(None) => break, // clean EOF
             Err(e) => {
-                debug!("Socket read error (session {}): {}", session_id, e);
+                debug!("Socket read error / line too long (session {}): {}", session_id, e);
                 break;
             }
         };
@@ -1253,23 +1281,13 @@ async fn handle_socket_connection(
 
             // Consume remaining header lines until blank line
             loop {
-                let mut header = String::new();
-                match reader.read_line(&mut header).await {
-                    Ok(0) => break,
-                    Ok(_) => {
-                        if header.len() > MAX_LINE_LENGTH {
-                            debug!(
-                                "Header line too long (session {}): {} bytes",
-                                session_id,
-                                header.len()
-                            );
-                            break;
-                        }
-                        if header.trim().is_empty() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
+                let header = match read_bounded_line(&mut reader, MAX_LINE_LENGTH).await {
+                    Ok(Some(h)) => h,
+                    Ok(None) => break,    // EOF
+                    Err(_) => break,      // oversized header line
+                };
+                if header.trim().is_empty() {
+                    break;
                 }
             }
 

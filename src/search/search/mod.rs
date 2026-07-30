@@ -253,6 +253,9 @@ impl SearchEngine {
         self.node_id_to_idx.clear();
         self.node_tokens.clear();
         self.vector_index.clear();
+        // Also drop the lazy-paged neural ANN so a stale mmap isn't reused
+        // after a full reindex rebuilds the lexical index from scratch.
+        self.neural_vector_index = None;
     }
 
     /// Append nodes to the existing index without clearing.
