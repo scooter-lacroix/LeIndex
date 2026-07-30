@@ -93,6 +93,15 @@ impl Storage {
             cache_size_kib: Some(-2000),
             mmap_size: Some(PROJECT_STORE_MMAP_SIZE),
         };
+        // Apply the read-cache and mmap pragmas (connection-level settings; valid
+        // on a read-only connection) so readers use the same memory profile as the
+        // writer rather than SQLite defaults.
+        if let Some(cache_size_kib) = config.cache_size_kib {
+            conn.pragma_update(None, "cache_size", cache_size_kib)?;
+        }
+        if let Some(mmap_size) = config.mmap_size {
+            conn.pragma_update(None, "mmap_size", mmap_size)?;
+        }
 
         Ok(Self { conn, config })
     }
