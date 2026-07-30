@@ -402,12 +402,17 @@ fn count_call_edges(pdg: &ProgramDependenceGraph) -> usize {
 }
 
 /// Check for a Call-typed edge between two node IDs (not just any adjacency).
-fn has_call_edge_between(pdg: &ProgramDependenceGraph, from: crate::graph::pdg::NodeId, to: crate::graph::pdg::NodeId) -> bool {
+fn has_call_edge_between(
+    pdg: &ProgramDependenceGraph,
+    from: crate::graph::pdg::NodeId,
+    to: crate::graph::pdg::NodeId,
+) -> bool {
     pdg.edge_indices().any(|e| {
-        pdg.edge_endpoints(e).is_some_and(|(s, d)| s == from && d == to)
-            && pdg.get_edge(e).is_some_and(|edge| {
-                edge.edge_type == crate::graph::pdg::EdgeType::Call
-            })
+        pdg.edge_endpoints(e)
+            .is_some_and(|(s, d)| s == from && d == to)
+            && pdg
+                .get_edge(e)
+                .is_some_and(|edge| edge.edge_type == crate::graph::pdg::EdgeType::Call)
     })
 }
 
