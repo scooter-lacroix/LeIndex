@@ -198,3 +198,37 @@ fn changed_source_candidates_only_returns_live_edits() {
     );
     assert!(tree_oid(root).unwrap().is_some());
 }
+
+#[cfg(unix)]
+#[test]
+fn test_live_source_candidates_reject_symlink_escapes() {
+    let temp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {:?}: {:?}", args, output);
+    };
+    run(&["init", "-q"]);
+    std::fs::write(root.join("stable.rs"), "pub fn stable() {}\n").unwrap();
+    run(&["add", "."]);
+    run(&[
+        "-c",
+        "user.email=test@example.com",
+        "-c",
+        "user.name=test",
+        "commit",
+        "-qm",
+        "fixture",
+    ]);
+    let escaped = outside.path().join("escaped.rs");
+    std::fs::write(&escaped, "pub fn escaped() {}\n").unwrap();
+    std::os::unix::fs::symlink(&escaped, root.join("escaped.rs")).unwrap();
+
+    assert!(source_candidates(root, "escaped").unwrap().is_empty());
+    assert!(changed_source_candidates(root).unwrap().is_empty());
+}

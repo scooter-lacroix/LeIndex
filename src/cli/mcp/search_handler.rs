@@ -6,6 +6,119 @@ use serde_json::Value;
 use std::sync::Arc;
 use std::time::Instant;
 
+fn classify_search(
+    query: &str,
+    search_mode: &str,
+) -> (
+    crate::search::query_route::QueryRoute,
+    &'static str,
+    Option<crate::search::ranking::QueryType>,
+) {
+    use crate::search::query_route::{QueryRoute, RequestedMode};
+
+    let requested = match search_mode {
+        "exact" => RequestedMode::Exact,
+        "semantic" | "code" => RequestedMode::Semantic,
+        _ => RequestedMode::Auto,
+    };
+    let route = crate::search::query_route::classify(query, requested);
+    let route_name = match route {
+        QueryRoute::ExactSymbol => "exact_symbol",
+        QueryRoute::ExactText => "exact_text",
+        QueryRoute::Semantic => "semantic",
+        QueryRoute::DeepPdg => "deep_pdg",
+    };
+    let query_type = match route {
+        QueryRoute::ExactSymbol | QueryRoute::ExactText => {
+            Some(crate::search::ranking::QueryType::Exact)
+        }
+        QueryRoute::Semantic | QueryRoute::DeepPdg => Some(if search_mode == "prose" {
+            crate::search::ranking::QueryType::Text
+        } else {
+            crate::search::ranking::QueryType::Semantic
+        }),
+    };
+    (route, route_name, query_type)
+}
+
+fn path_in_scope(file_path: &str, scope: Option<&str>) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    let scope = scope.trim_end_matches(std::path::MAIN_SEPARATOR);
+    if std::path::Path::new(scope).extension().is_some() {
+        file_path == scope
+    } else {
+        file_path == scope
+            || file_path.starts_with(&format!("{}{}", scope, std::path::MAIN_SEPARATOR))
+    }
+}
+
+fn scoped_search(
+    index: &mut crate::cli::leindex::LeIndex,
+    query: &str,
+    top_k: usize,
+    offset: usize,
+    query_type: Option<crate::search::ranking::QueryType>,
+    ephemeral: bool,
+    scope: Option<&str>,
+) -> Result<Vec<crate::search::search::SearchResult>, JsonRpcError> {
+    const MAX_FETCH_K: usize = 1000;
+    let search = |index: &mut crate::cli::leindex::LeIndex, fetch_k| {
+        if ephemeral {
+            index.search_ephemeral(query, fetch_k, query_type)
+        } else {
+            index.search(query, fetch_k, query_type)
+        }
+    };
+    let mut fetch_k = (top_k + offset).min(MAX_FETCH_K);
+    let mut all_results = search(index, fetch_k)
+        .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
+    let mut filtered: Vec<_> = all_results
+        .iter()
+        .filter(|result| path_in_scope(&result.file_path, scope))
+        .cloned()
+        .collect();
+
+    if filtered.is_empty() && scope.is_some() && !all_results.is_empty() {
+        fetch_k = (fetch_k * 10).min(MAX_FETCH_K * 10);
+        if fetch_k > top_k + offset {
+            all_results = search(index, fetch_k)
+                .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
+            filtered = all_results
+                .iter()
+                .filter(|result| path_in_scope(&result.file_path, scope))
+                .cloned()
+                .collect();
+        }
+    }
+    Ok(filtered)
+}
+
+fn retrieval_meta(
+    index: &crate::cli::leindex::LeIndex,
+    route: crate::search::query_route::QueryRoute,
+    route_name: &str,
+    budget: &WorkBudget,
+    started: Instant,
+) -> Value {
+    use crate::search::query_route::QueryRoute;
+
+    serde_json::json!({
+        "tfidf_status": "fresh",
+        "pdg_status": if index.pdg().is_some() { "resident" } else { "not_loaded" },
+        "neural_status": if matches!(route, QueryRoute::ExactSymbol | QueryRoute::ExactText) {
+            "not_used_exact"
+        } else {
+            index.neural_status()
+        },
+        "route": route_name,
+        "partial": budget.elapsed(started),
+        "max_latency_ms": budget.max_latency_ms,
+        "allow_partial": budget.allow_partial
+    })
+}
+
 /// Handler for LeIndex [search
 ///
 /// Performs semantic search on the indexed code.
@@ -119,31 +232,7 @@ to auto-switch/auto-index projects."
             |context| format!("{}\nTask context: {}", query, context),
         );
 
-        let requested_mode = match search_mode {
-            "exact" => crate::search::query_route::RequestedMode::Exact,
-            "semantic" | "code" => crate::search::query_route::RequestedMode::Semantic,
-            "prose" => crate::search::query_route::RequestedMode::Auto,
-            _ => crate::search::query_route::RequestedMode::Auto,
-        };
-        let route = crate::search::query_route::classify(&effective_query, requested_mode);
-        let route_name = match route {
-            crate::search::query_route::QueryRoute::ExactSymbol => "exact_symbol",
-            crate::search::query_route::QueryRoute::ExactText => "exact_text",
-            crate::search::query_route::QueryRoute::Semantic => "semantic",
-            crate::search::query_route::QueryRoute::DeepPdg => "deep_pdg",
-        };
-        let query_type = match route {
-            crate::search::query_route::QueryRoute::ExactSymbol
-            | crate::search::query_route::QueryRoute::ExactText => {
-                Some(crate::search::ranking::QueryType::Exact)
-            }
-            crate::search::query_route::QueryRoute::Semantic
-            | crate::search::query_route::QueryRoute::DeepPdg => Some(if search_mode == "prose" {
-                crate::search::ranking::QueryType::Text
-            } else {
-                crate::search::ranking::QueryType::Semantic
-            }),
-        };
+        let (route, route_name, query_type) = classify_search(&effective_query, search_mode);
 
         let project_path = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path).await?;
@@ -157,52 +246,15 @@ to auto-switch/auto-index projects."
             ));
         }
 
-        const MAX_FETCH_K: usize = 1000;
-        let mut fetch_k = (top_k + offset).min(MAX_FETCH_K);
-        let search = |index: &mut crate::cli::leindex::LeIndex,
-                      query: &str,
-                      top_k: usize,
-                      query_type: Option<crate::search::ranking::QueryType>| {
-            if task_context.is_some() {
-                index.search_ephemeral(query, top_k, query_type)
-            } else {
-                index.search(query, top_k, query_type)
-            }
-        };
-        let mut all_results = search(&mut guard, &effective_query, fetch_k, query_type)
-            .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
-
-        let in_scope = |file_path: &str| match &scope {
-            Some(s) => {
-                let scope_str = s.trim_end_matches(std::path::MAIN_SEPARATOR);
-                if std::path::Path::new(scope_str).extension().is_some() {
-                    file_path == scope_str
-                } else {
-                    file_path.starts_with(&format!("{}{}", scope_str, std::path::MAIN_SEPARATOR))
-                        || file_path == scope_str
-                }
-            }
-            None => true,
-        };
-
-        let mut filtered: Vec<_> = all_results
-            .iter()
-            .filter(|r| in_scope(&r.file_path))
-            .cloned()
-            .collect();
-
-        if filtered.is_empty() && scope.is_some() && !all_results.is_empty() {
-            fetch_k = (fetch_k * 10).min(MAX_FETCH_K * 10);
-            if fetch_k > top_k + offset {
-                all_results = search(&mut guard, &effective_query, fetch_k, query_type)
-                    .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
-                filtered = all_results
-                    .iter()
-                    .filter(|r| in_scope(&r.file_path))
-                    .cloned()
-                    .collect();
-            }
-        }
+        let filtered = scoped_search(
+            &mut guard,
+            &effective_query,
+            top_k,
+            offset,
+            query_type,
+            task_context.is_some(),
+            scope.as_deref(),
+        )?;
 
         let total_filtered = filtered.len();
         let page: Vec<_> = filtered.into_iter().skip(offset).take(top_k).collect();
@@ -221,23 +273,7 @@ to auto-switch/auto-index projects."
                         query,
                         guard.source_file_paths().map(|p| p.len()).unwrap_or(0)
                     ),
-                    "retrieval": {
-                        "tfidf_status": "fresh",
-                        "pdg_status": if guard.pdg().is_some() { "resident" } else { "not_loaded" },
-                        "neural_status": if matches!(
-                            route,
-                            crate::search::query_route::QueryRoute::ExactSymbol
-                                | crate::search::query_route::QueryRoute::ExactText
-                        ) {
-                            "not_used_exact"
-                        } else {
-                            guard.neural_status()
-                        },
-                        "route": route_name,
-                        "partial": budget.elapsed(started),
-                        "max_latency_ms": budget.max_latency_ms,
-                        "allow_partial": budget.allow_partial
-                    }
+                    "retrieval": retrieval_meta(&guard, route, route_name, &budget, started)
                 }),
                 &guard,
             ));
@@ -250,23 +286,7 @@ to auto-switch/auto-index projects."
                 "offset": offset,
                 "count": total_returned,
                 "has_more": offset + total_returned < total_filtered,
-                "retrieval": {
-                    "tfidf_status": "fresh",
-                    "pdg_status": if guard.pdg().is_some() { "resident" } else { "not_loaded" },
-                    "neural_status": if matches!(
-                        route,
-                        crate::search::query_route::QueryRoute::ExactSymbol
-                            | crate::search::query_route::QueryRoute::ExactText
-                    ) {
-                        "not_used_exact"
-                    } else {
-                        guard.neural_status()
-                    },
-                    "route": route_name,
-                    "partial": budget.elapsed(started),
-                    "max_latency_ms": budget.max_latency_ms,
-                    "allow_partial": budget.allow_partial
-                }
+                "retrieval": retrieval_meta(&guard, route, route_name, &budget, started)
             }),
             &guard,
         ))
@@ -301,6 +321,18 @@ mod tests {
                 "zero results should include suggestion"
             );
         }
+    }
+
+    #[test]
+    fn test_path_in_scope_handles_files_and_directories() {
+        let separator = std::path::MAIN_SEPARATOR;
+        let nested = format!("src{separator}cli{separator}main.rs");
+        let sibling = format!("src{separator}lib.rs");
+
+        assert!(path_in_scope(&nested, Some("src")));
+        assert!(!path_in_scope(&sibling, Some(&nested)));
+        assert!(path_in_scope(&nested, Some(&nested)));
+        assert!(path_in_scope(&nested, None));
     }
 
     #[test]

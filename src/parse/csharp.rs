@@ -218,7 +218,7 @@ impl CodeIntelligence for CSharpParser {
             .ok_or_else(|| Error::ParseFailed("Failed to parse C# source".to_string()))?;
 
         let root_node = tree.root_node();
-        let node = find_node_by_id(&root_node, node_id)
+        let node = crate::parse::traits::find_node_by_id(&root_node, node_id)
             .ok_or_else(|| Error::ParseFailed(format!("Node {} not found", node_id)))?;
 
         let mut cfg_builder = CfgBuilder::new(source);
@@ -532,38 +532,6 @@ fn collect_comments_recursive(
     for child in node.children(&mut c) {
         collect_comments_recursive(&child, cursor, source, target_byte, comments_before);
     }
-}
-
-/// Find a node by its ID
-fn find_node_by_id<'a>(
-    node: &'a tree_sitter::Node<'a>,
-    id: usize,
-) -> Option<tree_sitter::Node<'a>> {
-    use std::collections::VecDeque;
-
-    if node.id() == id {
-        return Some(*node);
-    }
-
-    let mut queue: VecDeque<tree_sitter::Node<'a>> = VecDeque::new();
-    let mut cursor = node.walk();
-
-    for child in node.children(&mut cursor) {
-        queue.push_back(child);
-    }
-
-    while let Some(current) = queue.pop_front() {
-        if current.id() == id {
-            return Some(current);
-        }
-
-        let mut child_cursor = current.walk();
-        for child in current.children(&mut child_cursor) {
-            queue.push_back(child);
-        }
-    }
-
-    None
 }
 
 fn calculate_complexity(

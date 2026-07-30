@@ -404,140 +404,144 @@ pub(crate) fn glob_match(path: &str, pattern: &str) -> bool {
     }
 }
 
+fn edit_change_type(item: &Value, index: usize) -> Result<&str, JsonRpcError> {
+    item.get("type")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            if item.get("old_text").is_some() || item.get("old_str").is_some() {
+                Some("replace_text")
+            } else if item.get("old_name").is_some() && item.get("new_name").is_some() {
+                Some("rename_symbol")
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(format!(
+                "changes[{}]: missing 'type' — use 'replace_text' or 'rename_symbol', or provide old_text+new_text",
+                index
+            ))
+        })
+}
+
+fn missing_old_text(index: usize, old_text: &str) -> JsonRpcError {
+    let preview = if old_text.len() > 60 {
+        let safe_end = old_text
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|&index| index <= 60)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &old_text[..safe_end])
+    } else {
+        old_text.to_string()
+    };
+    JsonRpcError::invalid_params_with_suggestion(
+        format!(
+            "changes[{}]: old_text not found in file content: '{}'",
+            index, preview
+        ),
+        "Ensure old_text exactly matches the source. Whitespace-normalised matching is attempted automatically.",
+    )
+}
+
+fn parse_replace_change(
+    item: &Value,
+    index: usize,
+    content: Option<&str>,
+) -> Result<EditChange, JsonRpcError> {
+    let old_text = item
+        .get("old_text")
+        .or_else(|| item.get("old_str"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let new_text = item
+        .get("new_text")
+        .or_else(|| item.get("new_str"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_text'", index))
+        })?;
+    let has_explicit_range = item.get("start_byte").is_some() || item.get("end_byte").is_some();
+    if has_explicit_range {
+        let start = item.get("start_byte").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let end = item
+            .get("end_byte")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(start + old_text.len());
+        return Ok(EditChange::ReplaceText {
+            start,
+            end,
+            new_text: new_text.to_owned(),
+        });
+    }
+    if old_text.is_empty() {
+        return Err(JsonRpcError::invalid_params(format!(
+            "changes[{}]: replace_text requires either 'start_byte'/'end_byte' or non-empty 'old_text'",
+            index
+        )));
+    }
+    let Some(content) = content else {
+        return Ok(EditChange::ReplaceText {
+            start: 0,
+            end: old_text.len(),
+            new_text: new_text.to_owned(),
+        });
+    };
+    let (start, length) = if let Some(position) = content.find(old_text) {
+        (position, old_text.len())
+    } else if let Some((position, length)) = find_normalised_whitespace(content, old_text) {
+        (position, length)
+    } else {
+        return Err(missing_old_text(index, old_text));
+    };
+    Ok(EditChange::ReplaceText {
+        start,
+        end: start + length,
+        new_text: new_text.to_owned(),
+    })
+}
+
+fn parse_rename_change(item: &Value, index: usize) -> Result<EditChange, JsonRpcError> {
+    let old_name = item
+        .get("old_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(format!("changes[{}]: missing 'old_name'", index))
+        })?;
+    let new_name = item
+        .get("new_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_name'", index))
+        })?;
+    Ok(EditChange::RenameSymbol {
+        old_name: old_name.to_owned(),
+        new_name: new_name.to_owned(),
+    })
+}
+
 /// Parse a JSON `changes` array into a Vec<EditChange>.
 pub(crate) fn parse_edit_changes(
     changes_val: &Value,
     content: Option<&str>,
 ) -> Result<Vec<EditChange>, JsonRpcError> {
-    let arr = changes_val
+    let changes = changes_val
         .as_array()
         .ok_or_else(|| JsonRpcError::invalid_params("'changes' must be an array"))?;
-
-    let mut result = Vec::new();
-    for (i, item) in arr.iter().enumerate() {
-        let change_type = item.get("type").and_then(|v| v.as_str())
-            .or_else(|| {
-                if item.get("old_text").is_some() || item.get("old_str").is_some() {
-                    Some("replace_text")
-                } else if item.get("old_name").is_some() && item.get("new_name").is_some() {
-                    Some("rename_symbol")
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                JsonRpcError::invalid_params(format!("changes[{}]: missing 'type' — use 'replace_text' or 'rename_symbol', or provide old_text+new_text", i))
-            })?;
-
-        let change = match change_type {
-            "replace_text" => {
-                let old_text = item
-                    .get("old_text")
-                    .or_else(|| item.get("old_str"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let new_text = item
-                    .get("new_text")
-                    .or_else(|| item.get("new_str"))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_text'", i))
-                    })?;
-
-                let has_explicit_start = item.get("start_byte").is_some();
-                let has_explicit_end = item.get("end_byte").is_some();
-
-                if has_explicit_start || has_explicit_end {
-                    let start =
-                        item.get("start_byte").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                    let end = item
-                        .get("end_byte")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as usize)
-                        .unwrap_or(start + old_text.len());
-                    EditChange::ReplaceText {
-                        start,
-                        end,
-                        new_text: new_text.to_owned(),
-                    }
-                } else if !old_text.is_empty() {
-                    if let Some(content) = content {
-                        if let Some(pos) = content.find(old_text) {
-                            EditChange::ReplaceText {
-                                start: pos,
-                                end: pos + old_text.len(),
-                                new_text: new_text.to_owned(),
-                            }
-                        } else if let Some((pos, matched_len)) =
-                            find_normalised_whitespace(content, old_text)
-                        {
-                            EditChange::ReplaceText {
-                                start: pos,
-                                end: pos + matched_len,
-                                new_text: new_text.to_owned(),
-                            }
-                        } else {
-                            // Safe UTF-8 truncation at character boundaries
-                            let preview = if old_text.len() > 60 {
-                                // Find the last safe character boundary at or before byte 60
-                                let safe_end = old_text
-                                    .char_indices()
-                                    .map(|(idx, _)| idx)
-                                    .take_while(|&idx| idx <= 60)
-                                    .last()
-                                    .unwrap_or(0);
-                                format!("{}...", &old_text[..safe_end])
-                            } else {
-                                old_text.to_string()
-                            };
-                            return Err(JsonRpcError::invalid_params_with_suggestion(
-                                format!("changes[{}]: old_text not found in file content: '{}'", i, preview),
-                                "Ensure old_text exactly matches the source. Whitespace-normalised matching is attempted automatically.",
-                            ));
-                        }
-                    } else {
-                        let start = 0usize;
-                        let end = old_text.len();
-                        EditChange::ReplaceText {
-                            start,
-                            end,
-                            new_text: new_text.to_owned(),
-                        }
-                    }
-                } else {
-                    return Err(JsonRpcError::invalid_params(format!(
-                        "changes[{}]: replace_text requires either 'start_byte'/'end_byte' or non-empty 'old_text'", i
-                    )));
-                }
-            }
-            "rename_symbol" => {
-                let old_name = item
-                    .get("old_name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        JsonRpcError::invalid_params(format!("changes[{}]: missing 'old_name'", i))
-                    })?;
-                let new_name = item
-                    .get("new_name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_name'", i))
-                    })?;
-                EditChange::RenameSymbol {
-                    old_name: old_name.to_owned(),
-                    new_name: new_name.to_owned(),
-                }
-            }
-            other => {
-                return Err(JsonRpcError::invalid_params(format!(
-                    "changes[{}]: unknown type '{}'",
-                    i, other
-                )))
-            }
-        };
-        result.push(change);
-    }
-    Ok(result)
+    changes
+        .iter()
+        .enumerate()
+        .map(|(index, item)| match edit_change_type(item, index)? {
+            "replace_text" => parse_replace_change(item, index, content),
+            "rename_symbol" => parse_rename_change(item, index),
+            other => Err(JsonRpcError::invalid_params(format!(
+                "changes[{}]: unknown type '{}'",
+                index, other
+            ))),
+        })
+        .collect()
 }
 
 /// Apply a Vec<EditChange> to content in memory and return the modified string.

@@ -1,6 +1,6 @@
 // Ruby language parser implementation
 
-use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::parse::traits::{find_node_by_id, Block, Edge, EdgeType, Parameter, Visibility};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
 };
@@ -316,36 +316,6 @@ fn extract_ruby_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<P
 }
 
 /// Find a node by its ID
-fn find_node_by_id<'a>(
-    node: &'a tree_sitter::Node<'a>,
-    id: usize,
-) -> Option<tree_sitter::Node<'a>> {
-    use std::collections::VecDeque;
-
-    if node.id() == id {
-        return Some(*node);
-    }
-
-    let mut queue: VecDeque<tree_sitter::Node<'a>> = VecDeque::new();
-    let mut cursor = node.walk();
-
-    for child in node.children(&mut cursor) {
-        queue.push_back(child);
-    }
-
-    while let Some(current) = queue.pop_front() {
-        if current.id() == id {
-            return Some(current);
-        }
-
-        let mut child_cursor = current.walk();
-        for child in current.children(&mut child_cursor) {
-            queue.push_back(child);
-        }
-    }
-
-    None
-}
 
 fn calculate_complexity(
     node: &tree_sitter::Node<'_>,

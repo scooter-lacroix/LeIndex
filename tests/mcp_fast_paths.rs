@@ -552,6 +552,33 @@ async fn stale_unscoped_catalog_symbol_uses_its_validated_candidate() {
 }
 
 #[tokio::test]
+async fn test_catalog_miss_read_symbol_uses_unscoped_live_inventory_without_hydration() {
+    let _lock = counter_test_lock();
+    let (_temp, project) = catalog_fixture();
+    fs::write(
+        project.join("src/lib.rs"),
+        "pub struct Askpass;\npub fn live_marker() {}\n",
+    )
+    .expect("add symbol absent from catalog");
+    reset_path_counters();
+
+    let response = ReadSymbolHandler
+        .execute(
+            &Arc::new(ProjectRegistry::new(2)),
+            json!({ "project_path": project, "symbol": "live_marker" }),
+        )
+        .await
+        .expect("unscoped live inventory response");
+
+    assert_eq!(response["symbol"], "live_marker");
+    assert_eq!(response["source"], "pub fn live_marker() {}");
+    assert_eq!(response["symbol_index_miss"], true);
+    assert_eq!(PROJECT_HYDRATIONS.load(Ordering::Relaxed), 0);
+    assert_eq!(PDG_LOADS.load(Ordering::Relaxed), 0);
+    assert_eq!(NEURAL_REQUESTS.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
 async fn stale_catalog_file_summary_does_not_attach_stale_pdg_relations() {
     let _lock = counter_test_lock();
     let (_temp, project) = catalog_fixture();

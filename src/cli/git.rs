@@ -64,47 +64,54 @@ pub fn tree_oid(root: &Path) -> Result<Option<String>, GitInventoryError> {
 /// repositories or submodules.
 pub fn source_inventory(root: &Path) -> Result<Vec<PathBuf>, GitInventoryError> {
     let root = root.canonicalize().map_err(GitInventoryError::Io)?;
-    let top_output = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(&root)
-        .output()
-        .map_err(GitInventoryError::Io)?;
-    if !top_output.status.success() {
+    if !git_output(&root, &["rev-parse", "--show-toplevel"])?
+        .status
+        .success()
+    {
         return Err(GitInventoryError::NotRepository);
     }
-    let list_output = Command::new("git")
-        .args([
+
+    let list_output = successful_git_output(
+        &root,
+        &[
             "ls-files",
             "-z",
             "--cached",
             "--others",
             "--exclude-standard",
-        ])
-        .current_dir(&root)
-        .output()
-        .map_err(GitInventoryError::Io)?;
-    if !list_output.status.success() {
-        return Err(GitInventoryError::Failed(
-            String::from_utf8_lossy(&list_output.stderr)
-                .trim()
-                .to_owned(),
-        ));
-    }
-    let stage_output = Command::new("git")
-        .args(["ls-files", "-z", "--stage"])
-        .current_dir(&root)
-        .output()
-        .map_err(GitInventoryError::Io)?;
-    if !stage_output.status.success() {
-        return Err(GitInventoryError::Failed(
-            String::from_utf8_lossy(&stage_output.stderr)
-                .trim()
-                .to_owned(),
-        ));
-    }
+        ],
+    )?;
+    let stage_output = successful_git_output(&root, &["ls-files", "-z", "--stage"])?;
+    let gitlinks = gitlink_paths(&root, &stage_output.stdout);
+    let mut paths = inventory_paths(&root, &list_output.stdout, &gitlinks);
+    paths.sort();
+    paths.dedup();
+    Ok(paths)
+}
 
-    let gitlinks = stage_output
-        .stdout
+fn git_output(root: &Path, arguments: &[&str]) -> Result<std::process::Output, GitInventoryError> {
+    Command::new("git")
+        .args(arguments)
+        .current_dir(root)
+        .output()
+        .map_err(GitInventoryError::Io)
+}
+
+fn successful_git_output(
+    root: &Path,
+    arguments: &[&str],
+) -> Result<std::process::Output, GitInventoryError> {
+    let output = git_output(root, arguments)?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    Err(GitInventoryError::Failed(
+        String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+    ))
+}
+
+fn gitlink_paths(root: &Path, stage_output: &[u8]) -> Vec<PathBuf> {
+    stage_output
         .split(|byte| *byte == b'\0')
         .filter_map(|record| {
             let tab = record.iter().position(|byte| *byte == b'\t')?;
@@ -113,42 +120,35 @@ pub fn source_inventory(root: &Path) -> Result<Vec<PathBuf>, GitInventoryError> 
             (header.split(|byte| *byte == b' ').next() == Some(b"160000".as_slice()))
                 .then(|| root.join(path_bytes(raw_path)))
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
 
-    let mut paths = Vec::new();
-    for raw in list_output.stdout.split(|byte| *byte == b'\0') {
-        if raw.is_empty() {
-            continue;
-        }
-        let candidate = root.join(path_bytes(raw));
-        if !candidate.starts_with(&root) {
-            continue;
-        }
-        if gitlinks
+fn inventory_paths(root: &Path, list_output: &[u8], gitlinks: &[PathBuf]) -> Vec<PathBuf> {
+    list_output
+        .split(|byte| *byte == b'\0')
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| root.join(path_bytes(raw)))
+        .filter_map(|candidate| accepted_source_path(candidate, root, gitlinks))
+        .collect()
+}
+
+fn accepted_source_path(candidate: PathBuf, root: &Path, gitlinks: &[PathBuf]) -> Option<PathBuf> {
+    if !candidate.starts_with(root)
+        || gitlinks
             .iter()
             .any(|gitlink| candidate.starts_with(gitlink))
-        {
-            continue;
-        }
-        if is_skipped_source_path(&candidate, &root) || has_nested_git_boundary(&candidate, &root) {
-            continue;
-        }
-        if candidate.is_file() {
-            // `starts_with` above is lexical, but `is_file()` follows
-            // symlinks. A tracked symlink like `leak.rs -> ../outside.rs`
-            // would otherwise let us read+index content outside the project
-            // boundary (the non-Git walker excludes symlinks; this matches).
-            // Canonicalize and re-check against root: allow in-tree symlinks,
-            // reject escapes and broken links.
-            match candidate.canonicalize() {
-                Ok(resolved) if resolved.starts_with(&root) => paths.push(candidate),
-                _ => continue,
-            }
-        }
+        || is_skipped_source_path(&candidate, root)
+        || has_nested_git_boundary(&candidate, root)
+        || !candidate.is_file()
+    {
+        return None;
     }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
+
+    candidate
+        .canonicalize()
+        .ok()
+        .filter(|resolved| resolved.starts_with(root))
+        .map(|_| candidate)
 }
 
 /// Return worktree files whose contents contain a fixed string.
@@ -201,12 +201,7 @@ pub fn source_candidates(root: &Path, needle: &str) -> Result<Vec<PathBuf>, GitI
         if raw.is_empty() {
             continue;
         }
-        let candidate = root.join(path_bytes(raw));
-        if candidate.starts_with(&root)
-            && candidate.is_file()
-            && !is_skipped_source_path(&candidate, &root)
-            && !has_nested_git_boundary(&candidate, &root)
-        {
+        if let Some(candidate) = accepted_source_path(root.join(path_bytes(raw)), &root, &[]) {
             paths.push(candidate);
         }
     }
@@ -261,12 +256,7 @@ pub fn changed_source_candidates(root: &Path) -> Result<Vec<PathBuf>, GitInvento
         if raw.is_empty() {
             continue;
         }
-        let candidate = root.join(path_bytes(raw));
-        if candidate.starts_with(&root)
-            && candidate.is_file()
-            && !is_skipped_source_path(&candidate, &root)
-            && !has_nested_git_boundary(&candidate, &root)
-        {
+        if let Some(candidate) = accepted_source_path(root.join(path_bytes(raw)), &root, &[]) {
             paths.push(candidate);
         }
     }

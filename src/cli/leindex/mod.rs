@@ -46,37 +46,37 @@ pub(crate) fn resolve_existing_storage_path(project_path: &Path) -> Option<PathB
 /// ```
 pub struct LeIndex {
     /// Project path
-    project_path: PathBuf,
+    pub(crate) project_path: PathBuf,
 
     /// Resolved storage root for index artifacts (may be outside project)
-    storage_path: PathBuf,
+    pub(crate) storage_path: PathBuf,
 
     /// Project identifier (legacy, for backward compatibility)
-    project_id: String,
+    pub(crate) project_id: String,
 
     /// Unique project identifier with BLAKE3-based path hashing
-    unique_id: UniqueProjectId,
+    pub(crate) unique_id: UniqueProjectId,
 
     /// Storage backend
-    storage: Storage,
+    pub(crate) storage: Storage,
 
     /// Search engine
-    search_engine: SearchEngine,
+    pub(crate) search_engine: SearchEngine,
 
     /// Program Dependence Graph
-    pdg: Option<ProgramDependenceGraph>,
+    pub(crate) pdg: Option<ProgramDependenceGraph>,
 
     /// Cache subsystem (spiller, project scan, file stats)
-    cache: crate::cli::index_cache::IndexCache,
+    pub(crate) cache: crate::cli::index_cache::IndexCache,
 
     /// Cached project configuration.
-    project_config: crate::cli::config::ProjectConfig,
+    pub(crate) project_config: crate::cli::config::ProjectConfig,
 
     /// Indexing statistics
-    stats: IndexStats,
+    pub(crate) stats: IndexStats,
 
     /// TF-IDF embedder (None until index_nodes() runs).
-    embedder: Option<index_builder::HybridEmbedder>,
+    pub(crate) embedder: Option<index_builder::HybridEmbedder>,
 
     /// Ephemeral state shared by the explicit indexing phases.
     pub(crate) pipeline: Option<indexing::IndexPipelineState>,

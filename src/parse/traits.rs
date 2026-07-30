@@ -34,6 +34,65 @@ pub enum Error {
     Utf8(#[from] std::str::Utf8Error),
 }
 
+/// Configures a parser and parses source with consistent errors.
+pub fn parse_tree(
+    parser: &mut tree_sitter::Parser,
+    language: &tree_sitter::Language,
+    source: &[u8],
+    language_name: &str,
+) -> Result<tree_sitter::Tree> {
+    parser
+        .set_language(language)
+        .map_err(|error| Error::ParseFailed(error.to_string()))?;
+
+    parser
+        .parse(source, None)
+        .ok_or_else(|| Error::ParseFailed(format!("Failed to parse {language_name} source")))
+}
+
+/// Finds a node by ID using breadth-first traversal.
+pub fn find_node_by_id<'tree>(
+    root: &tree_sitter::Node<'tree>,
+    id: usize,
+) -> Option<tree_sitter::Node<'tree>> {
+    let mut queue = std::collections::VecDeque::from([*root]);
+
+    while let Some(node) = queue.pop_front() {
+        if node.id() == id {
+            return Some(node);
+        }
+
+        let mut cursor = node.walk();
+        queue.extend(node.children(&mut cursor));
+    }
+
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{find_node_by_id, parse_tree};
+
+    #[test]
+    fn test_parse_tree_finds_descendant_and_returns_none_for_missing_id() {
+        let source = b"fn outer() { let answer = 42; }";
+        let language = tree_sitter_rust::LANGUAGE.into();
+        let mut parser = tree_sitter::Parser::new();
+
+        let tree = parse_tree(&mut parser, &language, source, "Rust").expect("Rust source parses");
+        let root = tree.root_node();
+        let function = root.named_child(0).expect("function descendant");
+
+        assert_eq!(
+            find_node_by_id(&root, function.id())
+                .expect("finds descendant")
+                .id(),
+            function.id()
+        );
+        assert!(find_node_by_id(&root, usize::MAX).is_none());
+    }
+}
+
 /// Import information extracted from a file
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ImportInfo {

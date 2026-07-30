@@ -95,6 +95,25 @@ fn build_symbol_entry(pdg: &ProgramDependenceGraph, nid: NodeId, opts: &SymbolEn
     entry
 }
 
+fn paginate_to_char_budget(
+    entries: Vec<Value>,
+    offset: usize,
+    max_results: usize,
+    char_budget: usize,
+) -> Vec<Value> {
+    let mut results = Vec::new();
+    let mut used_chars = 0;
+    for entry in entries.into_iter().skip(offset).take(max_results) {
+        let entry_chars = entry.to_string().len();
+        if used_chars + entry_chars > char_budget {
+            break;
+        }
+        used_chars += entry_chars;
+        results.push(entry);
+    }
+    results
+}
+
 fn build_catalog_symbol_entry(
     symbol: CatalogSymbol,
     opts: &SymbolEntryOpts,
@@ -145,6 +164,199 @@ fn build_catalog_symbol_entry(
     entry
 }
 
+fn catalog_symbol_matches(
+    symbol: &CatalogSymbol,
+    scope: Option<&str>,
+    pattern_lower: &str,
+    type_filter: &str,
+) -> bool {
+    let in_scope = scope.map_or(true, |scope| {
+        symbol.file_path.starts_with(scope)
+            || symbol.file_path
+                == std::path::Path::new(scope.trim_end_matches(std::path::MAIN_SEPARATOR))
+    });
+    let type_matches = type_filter == "all" || symbol.node_type == type_filter;
+    let name_matches = symbol.symbol_name.to_lowercase().contains(pattern_lower)
+        || symbol.qualified_name.to_lowercase().contains(pattern_lower);
+    in_scope && type_matches && name_matches
+}
+
+async fn fresh_catalog_symbols(
+    catalog: Option<&CatalogReader>,
+    live: &LiveProject,
+    scope: Option<&str>,
+    pattern: &str,
+    type_filter: &str,
+) -> Result<(Vec<(CatalogSymbol, Vec<u8>)>, HashSet<PathBuf>), JsonRpcError> {
+    let symbols = match catalog {
+        Some(catalog) if is_code_pattern(pattern) => {
+            // Identifier-shaped exact requests should use the indexed equality
+            // path. A leading-wildcard LIKE scan over every catalog row is
+            // the scale cliff on large projects; the live Git candidate path
+            // below handles substring misses without hydrating the catalog.
+            catalog.find_symbol(pattern, None).await.unwrap_or_default()
+        }
+        Some(catalog) => catalog
+            .find_symbols_matching(pattern)
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let pattern_lower = pattern.to_lowercase();
+    let mut fresh = Vec::new();
+    let mut stale_paths = HashSet::new();
+    for mut symbol in symbols {
+        symbol.file_path = live
+            .file(&symbol.file_path.to_string_lossy())
+            .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
+        if !catalog_symbol_matches(&symbol, scope, &pattern_lower, type_filter) {
+            continue;
+        }
+        let bytes = read_live_bytes(symbol.file_path.clone()).await?;
+        let is_fresh = match catalog {
+            Some(catalog) => catalog_is_fresh(catalog, &symbol.file_path, &bytes).await,
+            None => false,
+        };
+        if is_fresh {
+            fresh.push((symbol, bytes));
+        } else {
+            stale_paths.insert(symbol.file_path);
+        }
+    }
+    Ok((fresh, stale_paths))
+}
+
+async fn catalog_fallback_paths(
+    live: &LiveProject,
+    pattern: &str,
+    catalog_tree_current: bool,
+    has_fresh_symbols: bool,
+    stale_paths: HashSet<PathBuf>,
+) -> Result<(Vec<PathBuf>, bool), JsonRpcError> {
+    if !stale_paths.is_empty() {
+        return Ok((stale_paths.into_iter().collect(), true));
+    }
+    if has_fresh_symbols {
+        return Ok((Vec::new(), false));
+    }
+    let paths = tokio::task::spawn_blocking({
+        let root = live.root().to_path_buf();
+        let pattern = pattern.to_owned();
+        move || match if catalog_tree_current {
+            crate::cli::git::changed_source_candidates(&root)
+        } else {
+            crate::cli::git::source_candidates(&root, &pattern)
+        } {
+            Ok(paths) => Ok(paths),
+            Err(crate::cli::git::GitInventoryError::NotRepository) => {
+                crate::cli::index_builder::scan_project_files(&root).map(|scan| scan.source_paths)
+            }
+            Err(error) => Err(anyhow::anyhow!(error.to_string())),
+        }
+    })
+    .await
+    .map_err(|e| JsonRpcError::internal_error(format!("live scan task failed: {}", e)))?
+    .map_err(|e| JsonRpcError::invalid_params(format!("Cannot scan live project: {}", e)))?;
+    Ok((paths, true))
+}
+
+async fn append_live_catalog_matches(
+    fresh: &mut Vec<(CatalogSymbol, Vec<u8>)>,
+    paths: Vec<PathBuf>,
+    scope: Option<&str>,
+    pattern: &str,
+    type_filter: &str,
+) -> Result<(), JsonRpcError> {
+    let pattern_lower = pattern.to_lowercase();
+    for path in paths {
+        // Avoid invoking Tree-sitter for every source file when a catalog is
+        // missing. A cheap byte-level prefilter keeps the live fallback
+        // bounded by files that can actually contain the requested anchor.
+        let bytes = read_live_bytes(path.clone()).await?;
+        if !live_text_might_match(&bytes, pattern) {
+            continue;
+        }
+        let parsed = match parse_live_file(path).await {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        let content = match std::str::from_utf8(&parsed.bytes) {
+            Ok(content) => content.to_owned(),
+            Err(_) => continue,
+        };
+        for symbol in parsed.symbols {
+            let in_scope = scope.map_or(true, |scope| symbol.file_path.starts_with(scope));
+            let type_matches = type_filter == "all" || symbol.node_type == type_filter;
+            let name_matches = symbol.symbol_name.to_lowercase().contains(&pattern_lower)
+                || symbol
+                    .qualified_name
+                    .to_lowercase()
+                    .contains(&pattern_lower);
+            if in_scope && type_matches && name_matches {
+                fresh.push((symbol, content.as_bytes().to_vec()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn catalog_results(
+    fresh: Vec<(CatalogSymbol, Vec<u8>)>,
+    offset: usize,
+    max_results: usize,
+    char_budget: usize,
+    opts: &SymbolEntryOpts,
+) -> Vec<Value> {
+    let mut results = Vec::new();
+    let mut used_chars = 0;
+    for (symbol, bytes) in fresh.into_iter().skip(offset).take(max_results) {
+        let content = std::str::from_utf8(&bytes).ok();
+        let entry = build_catalog_symbol_entry(symbol, opts, content);
+        let entry_chars = entry.to_string().len();
+        if used_chars + entry_chars > char_budget {
+            break;
+        }
+        used_chars += entry_chars;
+        results.push(entry);
+    }
+    results
+}
+
+fn enrich_catalog_results(pdg: &ProgramDependenceGraph, results: &mut [Value]) {
+    for result in results {
+        let Some(node_id) = result.get("node_id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(node_index) = pdg.find_by_id(node_id) else {
+            continue;
+        };
+        let callers = get_direct_callers(pdg, node_index);
+        let callees = pdg.neighbors(node_index);
+        result["caller_count"] = Value::from(callers.len());
+        result["dependency_count"] = Value::from(callees.len());
+        result["callers"] = Value::Array(
+            callers
+                .iter()
+                .take(50)
+                .filter_map(|id| {
+                    pdg.get_node(*id)
+                        .map(|node| Value::String(node.name.clone()))
+                })
+                .collect(),
+        );
+        result["callees"] = Value::Array(
+            callees
+                .iter()
+                .take(50)
+                .filter_map(|id| {
+                    pdg.get_node(*id)
+                        .map(|node| Value::String(node.name.clone()))
+                })
+                .collect(),
+        );
+    }
+}
+
 async fn catalog_exact_response(
     registry: &Arc<ProjectRegistry>,
     args: &Value,
@@ -189,179 +401,46 @@ async fn catalog_exact_response(
         })
     });
     let scope = resolve_scope(args, live.root())?;
-    let pattern_lower = pattern.to_lowercase();
-    let symbols = match &catalog {
-        Some(catalog) if is_code_pattern(pattern) => {
-            // Identifier-shaped exact requests should use the indexed equality
-            // path. A leading-wildcard LIKE scan over every catalog row is
-            // the scale cliff on large projects; the live Git candidate path
-            // below handles substring misses without hydrating the catalog.
-            catalog.find_symbol(pattern, None).await.unwrap_or_default()
-        }
-        Some(catalog) => catalog
-            .find_symbols_matching(pattern)
-            .await
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
-    let mut fresh = Vec::new();
-    let mut stale_paths = HashSet::new();
-    let mut symbol_index_miss = false;
-    for mut symbol in symbols {
-        symbol.file_path = live
-            .file(&symbol.file_path.to_string_lossy())
-            .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
-        let in_scope = scope.as_ref().map_or(true, |scope| {
-            symbol.file_path.starts_with(scope)
-                || symbol.file_path
-                    == std::path::Path::new(scope.trim_end_matches(std::path::MAIN_SEPARATOR))
-        });
-        let type_matches = type_filter == "all" || symbol.node_type == type_filter;
-        let name_matches = symbol.symbol_name.to_lowercase().contains(&pattern_lower)
-            || symbol
-                .qualified_name
-                .to_lowercase()
-                .contains(&pattern_lower);
-        if !(in_scope && type_matches && name_matches) {
-            continue;
-        }
-        let bytes = read_live_bytes(symbol.file_path.clone()).await?;
-        let is_fresh = match &catalog {
-            Some(catalog) => catalog_is_fresh(catalog, &symbol.file_path, &bytes).await,
-            None => false,
-        };
-        if is_fresh {
-            fresh.push((symbol, bytes));
-        } else {
-            stale_paths.insert(symbol.file_path);
-        }
-    }
+    let (mut fresh, stale_paths) = fresh_catalog_symbols(
+        catalog.as_ref(),
+        &live,
+        scope.as_deref(),
+        pattern,
+        type_filter,
+    )
+    .await?;
 
     // A stale catalog's paths are safe candidates; an empty catalog falls
     // back to the Git-authoritative live inventory, never registry hydration.
-    let paths: Vec<PathBuf> = if stale_paths.is_empty() {
-        if fresh.is_empty() {
-            symbol_index_miss = true;
-            tokio::task::spawn_blocking({
-                let root = live.root().to_path_buf();
-                let pattern = pattern.to_owned();
-                move || match if catalog_tree_current {
-                    crate::cli::git::changed_source_candidates(&root)
-                } else {
-                    crate::cli::git::source_candidates(&root, &pattern)
-                } {
-                    Ok(paths) => Ok(paths),
-                    Err(crate::cli::git::GitInventoryError::NotRepository) => {
-                        crate::cli::index_builder::scan_project_files(&root)
-                            .map(|scan| scan.source_paths)
-                    }
-                    Err(error) => Err(anyhow::anyhow!(error.to_string())),
-                }
-            })
-            .await
-            .map_err(|e| JsonRpcError::internal_error(format!("live scan task failed: {}", e)))?
-            .map_err(|e| JsonRpcError::invalid_params(format!("Cannot scan live project: {}", e)))?
-        } else {
-            Vec::new()
-        }
-    } else {
-        symbol_index_miss = true;
-        stale_paths.into_iter().collect()
-    };
-    if !paths.is_empty() {
-        for path in paths {
-            // Avoid invoking Tree-sitter for every source file when a catalog
-            // is missing. A cheap byte-level prefilter keeps the live fallback
-            // bounded by files that can actually contain the requested anchor.
-            let bytes = read_live_bytes(path.clone()).await?;
-            if !live_text_might_match(&bytes, pattern) {
-                continue;
-            }
-            let parsed = match parse_live_file(path).await {
-                Ok(parsed) => parsed,
-                Err(_) => continue,
-            };
-            let content = match std::str::from_utf8(&parsed.bytes) {
-                Ok(content) => content.to_owned(),
-                Err(_) => continue,
-            };
-            for symbol in parsed.symbols {
-                let in_scope = scope
-                    .as_ref()
-                    .map_or(true, |scope| symbol.file_path.starts_with(scope));
-                let type_matches = type_filter == "all" || symbol.node_type == type_filter;
-                let name_matches = symbol.symbol_name.to_lowercase().contains(&pattern_lower)
-                    || symbol
-                        .qualified_name
-                        .to_lowercase()
-                        .contains(&pattern_lower);
-                if in_scope && type_matches && name_matches {
-                    fresh.push((symbol, content.as_bytes().to_vec()));
-                }
-            }
-        }
-    }
+    let (paths, symbol_index_miss) = catalog_fallback_paths(
+        &live,
+        pattern,
+        catalog_tree_current,
+        !fresh.is_empty(),
+        stale_paths,
+    )
+    .await?;
+    append_live_catalog_matches(&mut fresh, paths, scope.as_deref(), pattern, type_filter).await?;
 
     let total_matches = fresh.len();
-    let char_budget = token_budget * 4;
-    let mut results = Vec::new();
-    let mut used_chars = 0;
-    for (symbol, bytes) in fresh.into_iter().skip(offset).take(max_results) {
-        let content = std::str::from_utf8(&bytes).ok();
-        let entry = build_catalog_symbol_entry(
-            symbol,
-            &SymbolEntryOpts {
-                context_lines,
-                include_source,
-                score: None,
-            },
-            content,
-        );
-        let entry_chars = entry.to_string().len();
-        if used_chars + entry_chars > char_budget {
-            break;
-        }
-        used_chars += entry_chars;
-        results.push(entry);
-    }
+    let mut results = catalog_results(
+        fresh,
+        offset,
+        max_results,
+        token_budget * 4,
+        &SymbolEntryOpts {
+            context_lines,
+            include_source,
+            score: None,
+        },
+    );
     let shown = results.len();
     let mut pdg_status = "not_loaded";
     if let Some(handle) = registry.try_get_loaded(live.root()).await {
         let guard = handle.read().await;
         if let Some(pdg) = guard.pdg() {
             pdg_status = "fresh";
-            for result in &mut results {
-                let Some(node_id) = result.get("node_id").and_then(Value::as_str) else {
-                    continue;
-                };
-                let Some(node_index) = pdg.find_by_id(node_id) else {
-                    continue;
-                };
-                let callers = get_direct_callers(pdg, node_index);
-                let callees = pdg.neighbors(node_index);
-                result["caller_count"] = Value::from(callers.len());
-                result["dependency_count"] = Value::from(callees.len());
-                result["callers"] = Value::Array(
-                    callers
-                        .iter()
-                        .take(50)
-                        .filter_map(|id| {
-                            pdg.get_node(*id)
-                                .map(|node| Value::String(node.name.clone()))
-                        })
-                        .collect(),
-                );
-                result["callees"] = Value::Array(
-                    callees
-                        .iter()
-                        .take(50)
-                        .filter_map(|id| {
-                            pdg.get_node(*id)
-                                .map(|node| Value::String(node.name.clone()))
-                        })
-                        .collect(),
-                );
-            }
+            enrich_catalog_results(pdg, &mut results);
         }
     }
     Ok(Some(serde_json::json!({
@@ -397,6 +476,222 @@ fn live_text_might_match(bytes: &[u8], pattern: &str) -> bool {
         .rsplit_once([':', '.'])
         .map(|(_, tail)| !tail.is_empty() && haystack.contains(tail))
         .unwrap_or(false)
+}
+
+const MAX_CANDIDATE_LIMIT: usize = 1000;
+
+fn response_from_matches(
+    index: &crate::cli::leindex::LeIndex,
+    all_matches: Vec<Value>,
+    offset: usize,
+    max_results: usize,
+    char_budget: usize,
+    mode: &str,
+) -> Value {
+    let total_matches = all_matches.len();
+    let results = paginate_to_char_budget(all_matches, offset, max_results, char_budget);
+    let shown = results.len();
+    wrap_with_meta(
+        serde_json::json!({
+            "results": results,
+            "total_matches": total_matches,
+            "shown": shown,
+            "offset": offset,
+            "mode": mode,
+            "truncated": total_matches.saturating_sub(offset).min(max_results) > shown,
+        }),
+        index,
+    )
+}
+
+fn semantic_matches(
+    pdg: &ProgramDependenceGraph,
+    candidate_results: &[crate::search::search::SearchResult],
+    fetch_limit: usize,
+    scope_prefix: Option<&str>,
+    scope_exact: Option<&str>,
+    type_filter: &str,
+    opts: &SymbolEntryOpts,
+) -> Vec<Value> {
+    let mut matches = Vec::new();
+    for result in candidate_results {
+        if matches.len() >= fetch_limit {
+            break;
+        }
+        let nid = match pdg.find_by_id(&result.node_id) {
+            Some(id) => id,
+            None => continue,
+        };
+        let node = match pdg.get_node(nid) {
+            Some(node) => node,
+            None => continue,
+        };
+        if let Some(prefix) = scope_prefix {
+            if !(node.file_path.starts_with(prefix)
+                || node.file_path.as_ref() == scope_exact.unwrap())
+            {
+                continue;
+            }
+        }
+        if type_filter != "all" && node_type_str(&node.node_type) != type_filter {
+            continue;
+        }
+        if matches!(node.node_type, crate::graph::pdg::NodeType::External)
+            && type_filter != "external"
+        {
+            continue;
+        }
+        matches.push(build_symbol_entry(
+            pdg,
+            nid,
+            &SymbolEntryOpts {
+                context_lines: opts.context_lines,
+                include_source: opts.include_source,
+                score: Some(result.score),
+            },
+        ));
+    }
+    matches
+}
+
+fn semantic_response(
+    index: &mut crate::cli::leindex::LeIndex,
+    pattern: &str,
+    type_filter: &str,
+    scope: Option<&str>,
+    max_results: usize,
+    offset: usize,
+    char_budget: usize,
+    opts: &SymbolEntryOpts,
+) -> Result<Value, JsonRpcError> {
+    let fetch_limit = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
+    let mut candidate_limit = fetch_limit.saturating_mul(5).clamp(50, MAX_CANDIDATE_LIMIT);
+    let mut candidate_results = index
+        .search(pattern, candidate_limit, None)
+        .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
+    let scope_prefix = scope.map(|scope| {
+        let base = scope.trim_end_matches(std::path::MAIN_SEPARATOR);
+        format!("{}{}", base, std::path::MAIN_SEPARATOR)
+    });
+    let scope_exact = scope.map(|scope| scope.trim_end_matches(std::path::MAIN_SEPARATOR));
+    let mut all_matches = Vec::new();
+    for _attempt in 0..2 {
+        index
+            .ensure_pdg_loaded()
+            .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
+        all_matches = semantic_matches(
+            index.pdg().unwrap(),
+            &candidate_results,
+            fetch_limit,
+            scope_prefix.as_deref(),
+            scope_exact,
+            type_filter,
+            opts,
+        );
+        if all_matches.is_empty() && !candidate_results.is_empty() {
+            let expanded = (candidate_limit * 10).min(MAX_CANDIDATE_LIMIT);
+            if expanded > candidate_limit {
+                candidate_limit = expanded;
+                candidate_results = index
+                    .search(pattern, candidate_limit, None)
+                    .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
+                continue;
+            }
+        }
+        break;
+    }
+    Ok(response_from_matches(
+        index,
+        all_matches,
+        offset,
+        max_results,
+        char_budget,
+        "semantic",
+    ))
+}
+
+fn exact_response(
+    index: &crate::cli::leindex::LeIndex,
+    pattern: &str,
+    type_filter: &str,
+    scope: Option<&str>,
+    max_results: usize,
+    offset: usize,
+    char_budget: usize,
+    opts: &SymbolEntryOpts,
+) -> Value {
+    let pdg = index.pdg().unwrap();
+    let pattern_lower = pattern.to_lowercase();
+    let fetch_limit = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
+    let mut candidates = pdg
+        .node_indices()
+        .filter_map(|nid| {
+            let node = pdg.get_node(nid)?;
+            if (matches!(node.node_type, crate::graph::pdg::NodeType::External)
+                && type_filter != "external")
+                || (type_filter != "all" && node_type_str(&node.node_type) != type_filter)
+                || scope.is_some_and(|scope| {
+                    !node.file_path.starts_with(scope)
+                        && node.file_path.as_ref()
+                            != scope.trim_end_matches(std::path::MAIN_SEPARATOR)
+                })
+            {
+                return None;
+            }
+            let rank = if node.id == pattern {
+                0
+            } else if node.name == pattern {
+                1
+            } else if node.id.eq_ignore_ascii_case(pattern) {
+                2
+            } else if node.name.to_lowercase().contains(&pattern_lower)
+                || node.id.to_lowercase().contains(&pattern_lower)
+            {
+                3
+            } else {
+                return None;
+            };
+            Some((rank, node.id.clone(), nid))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+
+    // `seen_ids` uses `String` keys because `PdgNode.id` is a `String`, so
+    // `node.id.clone()` is already optimal (single heap allocation, no indirection).
+    //
+    // `seen_locations` uses `Arc<str>` keys because `PdgNode.file_path` is `Arc<str>`,
+    // so `node.file_path.clone()` is a cheap atomic refcount increment — avoiding the
+    // heap allocation that `to_string()` would incur for every node visited.
+    let mut seen_ids = HashSet::new();
+    let mut seen_locations = HashSet::new();
+    let mut all_matches = Vec::new();
+    for (_, _, nid) in candidates {
+        if all_matches.len() >= fetch_limit {
+            break;
+        }
+        let Some(node) = pdg.get_node(nid) else {
+            continue;
+        };
+        let location_key = (node.file_path.clone(), node.byte_range);
+        let is_duplicate_location =
+            node.byte_range != (0, 0) && seen_locations.contains(&location_key);
+        if seen_ids.contains(&node.id) || is_duplicate_location {
+            continue;
+        }
+        seen_ids.insert(node.id.clone());
+        if node.byte_range != (0, 0) {
+            seen_locations.insert(location_key);
+        }
+        all_matches.push(build_symbol_entry(pdg, nid, opts));
+    }
+    response_from_matches(
+        index,
+        all_matches,
+        offset,
+        max_results,
+        char_budget,
+        "exact",
+    )
 }
 
 /// Handler for LeIndex [grep_symbols — structurally-aware symbol search.
@@ -571,8 +866,6 @@ impl GrepSymbolsHandler {
         let mut index = handle.write().await;
         let scope = resolve_scope(&args, index.project_path())?;
 
-        const MAX_CANDIDATE_LIMIT: usize = 1000;
-
         index
             .ensure_pdg_loaded()
             .map_err(|e| JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e)))?;
@@ -582,131 +875,24 @@ impl GrepSymbolsHandler {
             ));
         }
 
-        let pattern_lower = pattern.to_lowercase();
         let char_budget = token_budget * 4;
-
-        let fetch_limit = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
-
-        // `seen_ids` uses `String` keys because `PdgNode.id` is a `String`, so
-        // `node.id.clone()` is already optimal (single heap allocation, no indirection).
-        //
-        // `seen_locations` uses `Arc<str>` keys because `PdgNode.file_path` is `Arc<str>`,
-        // so `node.file_path.clone()` is a cheap atomic refcount increment — avoiding the
-        // heap allocation that `to_string()` would incur for every node visited.
-        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut seen_locations: std::collections::HashSet<(Arc<str>, (usize, usize))> =
-            std::collections::HashSet::new();
-        let mut all_matches: Vec<Value> = Vec::new();
-
-        let scope_prefix: Option<String> = scope.as_ref().map(|s| {
-            let base = s.trim_end_matches(std::path::MAIN_SEPARATOR);
-            format!("{}{}", base, std::path::MAIN_SEPARATOR)
-        });
-        let scope_exact: Option<String> = scope
-            .as_ref()
-            .map(|s| s.trim_end_matches(std::path::MAIN_SEPARATOR).to_string());
+        let opts = SymbolEntryOpts {
+            context_lines,
+            include_source,
+            score: None,
+        };
 
         if route == QueryRoute::Semantic {
-            let effective_fetch = (max_results + offset).min(MAX_CANDIDATE_LIMIT);
-            let mut candidate_limit = effective_fetch
-                .saturating_mul(5)
-                .clamp(50, MAX_CANDIDATE_LIMIT);
-            let mut candidate_results = index
-                .search(&pattern, candidate_limit, None)
-                .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
-            'semantic_retry: for _attempt in 0..2 {
-                all_matches.clear();
-                seen_ids.clear();
-                seen_locations.clear();
-
-                index.ensure_pdg_loaded().map_err(|e| {
-                    JsonRpcError::indexing_failed(format!("Failed to load PDG: {}", e))
-                })?;
-
-                for result in &candidate_results {
-                    if all_matches.len() >= fetch_limit {
-                        break;
-                    }
-                    let nid = match index.pdg().and_then(|pdg| pdg.find_by_id(&result.node_id)) {
-                        Some(id) => id,
-                        None => continue,
-                    };
-                    let node = match index.pdg().and_then(|pdg| pdg.get_node(nid).cloned()) {
-                        Some(n) => n,
-                        None => continue,
-                    };
-
-                    if let Some(ref prefix) = scope_prefix {
-                        if !(node.file_path.starts_with(prefix)
-                            || node.file_path.as_ref() == scope_exact.as_ref().unwrap().as_str())
-                        {
-                            continue;
-                        }
-                    }
-                    if type_filter != "all" && node_type_str(&node.node_type) != type_filter {
-                        continue;
-                    }
-
-                    if matches!(node.node_type, crate::graph::pdg::NodeType::External)
-                        && type_filter != "external"
-                    {
-                        continue;
-                    }
-
-                    let entry = build_symbol_entry(
-                        index.pdg().unwrap(),
-                        nid,
-                        &SymbolEntryOpts {
-                            context_lines,
-                            include_source,
-                            score: Some(result.score),
-                        },
-                    );
-                    all_matches.push(entry);
-                }
-
-                if all_matches.is_empty() && !candidate_results.is_empty() {
-                    let expanded = (candidate_limit * 10).min(1000);
-                    if expanded > candidate_limit {
-                        candidate_limit = expanded;
-                        candidate_results =
-                            index.search(&pattern, candidate_limit, None).map_err(|e| {
-                                JsonRpcError::search_failed(format!("Search error: {}", e))
-                            })?;
-                        continue 'semantic_retry;
-                    }
-                }
-                break 'semantic_retry;
-            }
-
-            let total_matches = all_matches.len();
-            let paginated: Vec<Value> = all_matches
-                .into_iter()
-                .skip(offset)
-                .take(max_results)
-                .collect();
-
-            let mut truncated_results: Vec<Value> = Vec::new();
-            let mut used_chars: usize = 0;
-            for entry in paginated {
-                let entry_chars = entry.to_string().len();
-                if used_chars + entry_chars > char_budget {
-                    break;
-                }
-                used_chars += entry_chars;
-                truncated_results.push(entry);
-            }
-            let shown = truncated_results.len();
-
-            let mut response = serde_json::json!({
-                "results": truncated_results,
-                "total_matches": total_matches,
-                "shown": shown,
-                "offset": offset,
-                "mode": "semantic",
-                "truncated": total_matches.saturating_sub(offset).min(max_results) > shown,
-            });
-            response = wrap_with_meta(response, &index);
+            let response = semantic_response(
+                &mut index,
+                &pattern,
+                &type_filter,
+                scope.as_deref(),
+                max_results,
+                offset,
+                char_budget,
+                &opts,
+            )?;
             return Ok(annotate_retrieval(
                 response,
                 "semantic",
@@ -716,99 +902,16 @@ impl GrepSymbolsHandler {
             ));
         }
 
-        let pdg = index.pdg().unwrap();
-
-        let mut candidates = pdg
-            .node_indices()
-            .filter_map(|nid| {
-                let node = pdg.get_node(nid)?;
-                if (matches!(node.node_type, crate::graph::pdg::NodeType::External)
-                    && type_filter != "external")
-                    || (type_filter != "all"
-                        && node_type_str(&node.node_type) != type_filter.as_str())
-                    || scope.as_ref().is_some_and(|scope| {
-                        !node.file_path.starts_with(scope.as_str())
-                            && node.file_path.as_ref()
-                                != scope.trim_end_matches(std::path::MAIN_SEPARATOR)
-                    })
-                {
-                    return None;
-                }
-                let rank = if node.id == pattern {
-                    0
-                } else if node.name == pattern {
-                    1
-                } else if node.id.eq_ignore_ascii_case(&pattern) {
-                    2
-                } else if node.name.to_lowercase().contains(&pattern_lower)
-                    || node.id.to_lowercase().contains(&pattern_lower)
-                {
-                    3
-                } else {
-                    return None;
-                };
-                Some((rank, node.id.clone(), nid))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort_unstable_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-
-        for (_, _, nid) in candidates {
-            if all_matches.len() >= fetch_limit {
-                break;
-            }
-            let Some(node) = pdg.get_node(nid) else {
-                continue;
-            };
-            let location_key = (node.file_path.clone(), node.byte_range);
-            let is_duplicate_location =
-                node.byte_range != (0, 0) && seen_locations.contains(&location_key);
-            if seen_ids.contains(&node.id) || is_duplicate_location {
-                continue;
-            }
-            seen_ids.insert(node.id.clone());
-            if node.byte_range != (0, 0) {
-                seen_locations.insert(location_key);
-            }
-            all_matches.push(build_symbol_entry(
-                pdg,
-                nid,
-                &SymbolEntryOpts {
-                    context_lines,
-                    include_source,
-                    score: None,
-                },
-            ));
-        }
-
-        let total_matches = all_matches.len();
-        let paginated: Vec<Value> = all_matches
-            .into_iter()
-            .skip(offset)
-            .take(max_results)
-            .collect();
-
-        let mut truncated_results: Vec<Value> = Vec::new();
-        let mut used_chars: usize = 0;
-        for entry in paginated {
-            let entry_chars = entry.to_string().len();
-            if used_chars + entry_chars > char_budget {
-                break;
-            }
-            used_chars += entry_chars;
-            truncated_results.push(entry);
-        }
-        let shown = truncated_results.len();
-
-        let mut response = serde_json::json!({
-            "results": truncated_results,
-            "total_matches": total_matches,
-            "shown": shown,
-            "offset": offset,
-            "mode": "exact",
-            "truncated": total_matches.saturating_sub(offset).min(max_results) > shown,
-        });
-
-        response = wrap_with_meta(response, &index);
+        let response = exact_response(
+            &index,
+            &pattern,
+            &type_filter,
+            scope.as_deref(),
+            max_results,
+            offset,
+            char_budget,
+            &opts,
+        );
         Ok(annotate_retrieval(
             response,
             "exact",
@@ -881,5 +984,54 @@ mod tests {
             props.get("project_path").is_some(),
             "should have 'project_path'"
         );
+    }
+
+    #[test]
+    fn test_paginate_to_char_budget_preserves_window_order_and_budget() {
+        let entries = vec![
+            serde_json::json!({ "name": "first" }),
+            serde_json::json!({ "name": "second" }),
+            serde_json::json!({ "name": "third" }),
+        ];
+        let budget = entries[1].to_string().len() + entries[2].to_string().len();
+
+        assert_eq!(
+            paginate_to_char_budget(entries.clone(), 1, 3, budget),
+            entries[1..]
+        );
+        assert!(paginate_to_char_budget(entries, 0, 3, 0).is_empty());
+    }
+
+    #[test]
+    fn test_catalog_symbol_matches_scope_type_and_name() {
+        let symbol = CatalogSymbol {
+            node_id: "node".to_string(),
+            symbol_name: "SearchHandler".to_string(),
+            qualified_name: "mcp::SearchHandler".to_string(),
+            file_path: std::path::PathBuf::from("/project/src/handler.rs"),
+            language: "rust".to_string(),
+            node_type: "struct".to_string(),
+            complexity: 0,
+            byte_range: (0, 0),
+        };
+
+        assert!(catalog_symbol_matches(
+            &symbol,
+            Some("/project/src/"),
+            "handler",
+            "struct"
+        ));
+        assert!(!catalog_symbol_matches(
+            &symbol,
+            Some("/other/"),
+            "handler",
+            "struct"
+        ));
+        assert!(!catalog_symbol_matches(
+            &symbol,
+            Some("/project/src/"),
+            "handler",
+            "function"
+        ));
     }
 }

@@ -106,10 +106,24 @@ impl Storage {
 
     /// Initialize database schema
     fn initialize_schema(&mut self) -> SqliteResult<()> {
-        // Initialize project_metadata table first
-        // SQL schema for project_metadata table
-        let project_metadata_schema = r#"
-CREATE TABLE IF NOT EXISTS project_metadata (
+        self.initialize_project_metadata_schema()?;
+        self.initialize_core_tables()?;
+        self.initialize_cache_tables()?;
+        self.initialize_cross_project_tables()?;
+        self.initialize_query_indexes()?;
+        self.initialize_trigram_index_table()
+    }
+
+    fn execute_schema_statements(&self, statements: &[&str]) -> SqliteResult<()> {
+        for statement in statements {
+            self.conn.execute(statement, [])?;
+        }
+        Ok(())
+    }
+
+    fn initialize_project_metadata_schema(&self) -> SqliteResult<()> {
+        self.execute_schema_statements(&[
+            r#"CREATE TABLE IF NOT EXISTS project_metadata (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     unique_project_id TEXT UNIQUE NOT NULL,
     base_name TEXT NOT NULL,
@@ -122,35 +136,22 @@ CREATE TABLE IF NOT EXISTS project_metadata (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_indexed TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(canonical_path)
-)
-"#;
-
-        // SQL indexes for project_metadata table
-        let project_metadata_indexes = [
+)"#,
             "CREATE INDEX IF NOT EXISTS idx_project_metadata_unique_id ON project_metadata(unique_project_id)",
             "CREATE INDEX IF NOT EXISTS idx_project_metadata_canonical_path ON project_metadata(canonical_path)",
             "CREATE INDEX IF NOT EXISTS idx_project_metadata_base_hash ON project_metadata(base_name, path_hash)",
             "CREATE INDEX IF NOT EXISTS idx_project_metadata_base_name ON project_metadata(base_name)",
-        ];
+        ])
+    }
 
-        self.conn.execute(project_metadata_schema, [])?;
-        for index_sql in project_metadata_indexes {
-            self.conn.execute(index_sql, [])?;
-        }
-
-        // Create indexed_files table for incremental indexing
-        self.conn.execute(
+    fn initialize_core_tables(&self) -> SqliteResult<()> {
+        self.execute_schema_statements(&[
             "CREATE TABLE IF NOT EXISTS indexed_files (
                 file_path TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
                 file_hash TEXT NOT NULL,
                 last_indexed INTEGER NOT NULL
             )",
-            [],
-        )?;
-
-        // Create intel_nodes table
-        self.conn.execute(
             "CREATE TABLE IF NOT EXISTS intel_nodes (
                 id INTEGER PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -170,64 +171,77 @@ CREATE TABLE IF NOT EXISTS project_metadata (
                 updated_at INTEGER NOT NULL,
                 embedding_format INTEGER
             )",
-            [],
-        )?;
+        ])?;
+        self.ensure_intel_node_columns()
+    }
 
-        // Migration: Ensure new columns exist for existing databases
-        let columns: Vec<String> = self
-            .conn
+    fn ensure_intel_node_columns(&self) -> SqliteResult<()> {
+        let columns = self.intel_node_column_names()?;
+        for (name, addition, repair) in [
+            (
+                "node_id",
+                "ALTER TABLE intel_nodes ADD COLUMN node_id TEXT DEFAULT ''",
+                Some("UPDATE intel_nodes SET node_id = symbol_name WHERE node_id = ''"),
+            ),
+            (
+                "qualified_name",
+                "ALTER TABLE intel_nodes ADD COLUMN qualified_name TEXT DEFAULT ''",
+                Some(
+                    "UPDATE intel_nodes SET qualified_name = symbol_name WHERE qualified_name = ''",
+                ),
+            ),
+            (
+                "language",
+                "ALTER TABLE intel_nodes ADD COLUMN language TEXT DEFAULT 'unknown'",
+                None,
+            ),
+            (
+                "byte_range_start",
+                "ALTER TABLE intel_nodes ADD COLUMN byte_range_start INTEGER",
+                None,
+            ),
+            (
+                "byte_range_end",
+                "ALTER TABLE intel_nodes ADD COLUMN byte_range_end INTEGER",
+                None,
+            ),
+            (
+                "embedding_format",
+                "ALTER TABLE intel_nodes ADD COLUMN embedding_format INTEGER",
+                None,
+            ),
+        ] {
+            self.ensure_intel_node_column(&columns, name, addition, repair)?;
+        }
+        Ok(())
+    }
+
+    fn intel_node_column_names(&self) -> SqliteResult<Vec<String>> {
+        self.conn
             .prepare("PRAGMA table_info(intel_nodes)")?
             .query_map([], |row| row.get::<_, String>(1))?
-            .collect::<SqliteResult<Vec<_>>>()?;
+            .collect()
+    }
 
-        if !columns.iter().any(|c| c == "node_id") {
-            self.conn.execute(
-                "ALTER TABLE intel_nodes ADD COLUMN node_id TEXT DEFAULT ''",
-                [],
-            )?;
-            // Update node_id with symbol_name for existing records
-            self.conn.execute(
-                "UPDATE intel_nodes SET node_id = symbol_name WHERE node_id = ''",
-                [],
-            )?;
+    fn ensure_intel_node_column(
+        &self,
+        columns: &[String],
+        name: &str,
+        addition: &str,
+        repair: Option<&str>,
+    ) -> SqliteResult<()> {
+        if columns.iter().any(|column| column == name) {
+            return Ok(());
         }
-        if !columns.iter().any(|c| c == "qualified_name") {
-            self.conn.execute(
-                "ALTER TABLE intel_nodes ADD COLUMN qualified_name TEXT DEFAULT ''",
-                [],
-            )?;
-            self.conn.execute(
-                "UPDATE intel_nodes SET qualified_name = symbol_name WHERE qualified_name = ''",
-                [],
-            )?;
+        self.conn.execute(addition, [])?;
+        if let Some(repair) = repair {
+            self.conn.execute(repair, [])?;
         }
-        if !columns.iter().any(|c| c == "language") {
-            self.conn.execute(
-                "ALTER TABLE intel_nodes ADD COLUMN language TEXT DEFAULT 'unknown'",
-                [],
-            )?;
-        }
-        if !columns.iter().any(|c| c == "byte_range_start") {
-            self.conn.execute(
-                "ALTER TABLE intel_nodes ADD COLUMN byte_range_start INTEGER",
-                [],
-            )?;
-        }
-        if !columns.iter().any(|c| c == "byte_range_end") {
-            self.conn.execute(
-                "ALTER TABLE intel_nodes ADD COLUMN byte_range_end INTEGER",
-                [],
-            )?;
-        }
+        Ok(())
+    }
 
-        if !columns.iter().any(|c| c == "embedding_format") {
-            self.conn.execute(
-                "ALTER TABLE intel_nodes ADD COLUMN embedding_format INTEGER",
-                [],
-            )?;
-        }
-        // Create intel_edges table
-        self.conn.execute(
+    fn initialize_cache_tables(&self) -> SqliteResult<()> {
+        self.execute_schema_statements(&[
             "CREATE TABLE IF NOT EXISTS intel_edges (
                 caller_id INTEGER NOT NULL,
                 callee_id INTEGER NOT NULL,
@@ -237,22 +251,12 @@ CREATE TABLE IF NOT EXISTS project_metadata (
                 FOREIGN KEY(callee_id) REFERENCES intel_nodes(id),
                 PRIMARY KEY(caller_id, callee_id, edge_type)
             )",
-            [],
-        )?;
-
-        // Create analysis_cache table
-        self.conn.execute(
             "CREATE TABLE IF NOT EXISTS analysis_cache (
                 node_hash TEXT PRIMARY KEY,
                 cfg_data BLOB,
                 complexity_metrics BLOB,
                 timestamp INTEGER NOT NULL
             )",
-            [],
-        )?;
-
-        // Persistent cache telemetry for cross-session hit-rate tracking.
-        self.conn.execute(
             "CREATE TABLE IF NOT EXISTS cache_telemetry (
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 cache_hits INTEGER NOT NULL DEFAULT 0,
@@ -260,16 +264,13 @@ CREATE TABLE IF NOT EXISTS project_metadata (
                 cache_writes INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
             )",
-            [],
-        )?;
-        self.conn.execute(
             "INSERT OR IGNORE INTO cache_telemetry (id, cache_hits, cache_misses, cache_writes, updated_at)
              VALUES (1, 0, 0, 0, strftime('%s', 'now'))",
-            [],
-        )?;
+        ])
+    }
 
-        // Create global_symbols table (Phase 7: Cross-Project Resolution)
-        self.conn.execute(
+    fn initialize_cross_project_tables(&self) -> SqliteResult<()> {
+        self.execute_schema_statements(&[
             "CREATE TABLE IF NOT EXISTS global_symbols (
                 symbol_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -284,11 +285,6 @@ CREATE TABLE IF NOT EXISTS project_metadata (
                 created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                 UNIQUE(project_id, symbol_name, signature)
             )",
-            [],
-        )?;
-
-        // Create external_refs table (Phase 7: Cross-Project Resolution)
-        self.conn.execute(
             "CREATE TABLE IF NOT EXISTS external_refs (
                 ref_id TEXT PRIMARY KEY,
                 source_project_id TEXT NOT NULL,
@@ -299,11 +295,6 @@ CREATE TABLE IF NOT EXISTS project_metadata (
                 FOREIGN KEY (source_symbol_id) REFERENCES global_symbols(symbol_id),
                 FOREIGN KEY (target_symbol_id) REFERENCES global_symbols(symbol_id)
             )",
-            [],
-        )?;
-
-        // Create project_deps table (Phase 7: Cross-Project Resolution)
-        self.conn.execute(
             "CREATE TABLE IF NOT EXISTS project_deps (
                 dep_id TEXT PRIMARY KEY,
                 project_id TEXT NOT NULL,
@@ -311,83 +302,35 @@ CREATE TABLE IF NOT EXISTS project_metadata (
                 dependency_type TEXT NOT NULL,
                 UNIQUE(project_id, depends_on_project_id)
             )",
-            [],
-        )?;
+        ])
+    }
 
-        // Create indexes for query performance
-        self.conn.execute(
+    fn initialize_query_indexes(&self) -> SqliteResult<()> {
+        self.execute_schema_statements(&[
             "CREATE INDEX IF NOT EXISTS idx_nodes_project ON intel_nodes(project_id)",
-            [],
-        )?;
-        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_nodes_file ON intel_nodes(file_path)",
-            [],
-        )?;
-        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_nodes_symbol ON intel_nodes(symbol_name)",
-            [],
-        )?;
-        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_nodes_hash ON intel_nodes(content_hash)",
-            [],
-        )?;
-        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_nodes_project_file_name ON intel_nodes(project_id, file_path, symbol_name COLLATE NOCASE)",
-            [],
-        )?;
-        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_nodes_project_qualified ON intel_nodes(project_id, qualified_name COLLATE NOCASE)",
-            [],
-        )?;
-
-        // Create indexes for global_symbols (Phase 7)
-        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_global_symbols_name ON global_symbols(symbol_name)",
-            [],
-        )?;
-        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_global_symbols_type ON global_symbols(symbol_type)",
-            [],
-        )?;
-        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_global_symbols_project ON global_symbols(project_id)",
-            [],
-        )?;
-        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_global_symbols_public ON global_symbols(symbol_id) WHERE is_public = 1",
-            [],
-        )?;
-
-        // Create indexes for external_refs (Phase 7)
-        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_external_refs_source ON external_refs(source_symbol_id)",
-            [],
-        )?;
-        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_external_refs_target ON external_refs(target_symbol_id)",
-            [],
-        )?;
-
-        // Create indexes for project_deps (Phase 7)
-        self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_project_deps_project ON project_deps(project_id)",
-            [],
-        )?;
+        ])
+    }
 
-        // Create trigram_index table for accelerated fuzzy node lookup.
-        // Stores the serialized trigram index as a single blob per project.
-        self.conn.execute(
-            "CREATE TABLE IF NOT EXISTS trigram_index (
+    fn initialize_trigram_index_table(&self) -> SqliteResult<()> {
+        self.execute_schema_statements(&["CREATE TABLE IF NOT EXISTS trigram_index (
                 project_id TEXT PRIMARY KEY,
                 index_data BLOB NOT NULL,
                 node_count INTEGER NOT NULL DEFAULT 0,
                 trigram_count INTEGER NOT NULL DEFAULT 0,
                 updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
-            )",
-            [],
-        )?;
-
-        Ok(())
+            )"])
     }
 
     /// Get the underlying connection

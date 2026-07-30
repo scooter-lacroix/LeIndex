@@ -1,6 +1,8 @@
 // Rust language parser implementation
 
-use crate::parse::traits::{Block, Edge, EdgeType, FlowChannel, FlowFact, Parameter, Visibility};
+use crate::parse::traits::{
+    find_node_by_id, Block, Edge, EdgeType, FlowChannel, FlowFact, Parameter, Visibility,
+};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
 };
@@ -78,56 +80,7 @@ impl RustParser {
                     }
                 }
                 "impl_item" => {
-                    let impl_path = node
-                        .child_by_field_name("type")
-                        .and_then(|type_node| type_node.utf8_text(source).ok())
-                        .map(|text| text.split('<').next().unwrap_or(text).trim().to_string())
-                        .filter(|text| !text.is_empty())
-                        .map(|type_name| {
-                            let mut path = parent_path.clone();
-                            path.push(type_name);
-                            path
-                        })
-                        .unwrap_or_else(|| parent_path.clone());
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        if child.kind() == "declaration_list" {
-                            let mut dcursor = child.walk();
-                            for dc in child.children(&mut dcursor) {
-                                if dc.kind() == "function_item" {
-                                    if let Some(mut sig) =
-                                        extract_function_signature(&dc, source, &impl_path)
-                                    {
-                                        // Every function declared in an impl
-                                        // belongs to the implementing type,
-                                        // including associated functions that
-                                        // have no `self` parameter.
-                                        sig.is_method = true;
-                                        // Extract and populate cyclomatic complexity
-                                        let body_node =
-                                            dc.child_by_field_name("body").unwrap_or(dc);
-                                        let complexity_metrics =
-                                            self.extract_complexity(&body_node);
-                                        sig.cyclomatic_complexity =
-                                            complexity_metrics.cyclomatic.max(1) as u32;
-                                        signatures.push(sig);
-                                    }
-                                }
-                            }
-                        } else if child.kind() == "function_item" {
-                            if let Some(mut sig) =
-                                extract_function_signature(&child, source, &impl_path)
-                            {
-                                sig.is_method = true;
-                                // Extract and populate cyclomatic complexity
-                                let body_node = child.child_by_field_name("body").unwrap_or(child);
-                                let complexity_metrics = self.extract_complexity(&body_node);
-                                sig.cyclomatic_complexity =
-                                    complexity_metrics.cyclomatic.max(1) as u32;
-                                signatures.push(sig);
-                            }
-                        }
-                    }
+                    self.extract_impl_definitions(&node, source, &parent_path, &mut signatures);
                 }
                 "trait_item" => {
                     if let Some(name) = node
@@ -201,66 +154,7 @@ impl RustParser {
                     }
                 }
                 "enum_item" => {
-                    if let Some(name) = node
-                        .child_by_field_name("name")
-                        .and_then(|n| n.utf8_text(source).ok())
-                    {
-                        let qualified_name = if parent_path.is_empty() {
-                            name.to_string()
-                        } else {
-                            format!("{}::{}", parent_path.join("::"), name)
-                        };
-
-                        signatures.push(SignatureInfo {
-                            name: name.to_string(),
-                            qualified_name: qualified_name.clone(),
-                            parameters: vec![],
-                            return_type: Some("enum".to_string()),
-                            visibility: extract_visibility(&node, source),
-                            is_async: false,
-                            is_method: false,
-                            docstring: extract_docstring(&node, source),
-                            calls: vec![],
-                            imports: vec![],
-                            byte_range: (node.start_byte(), node.end_byte()),
-                            flow_facts: vec![],
-
-                            cyclomatic_complexity: 0,
-                        });
-
-                        // Enum variants are stable review/search anchors even
-                        // when a derive macro hides their generated code.
-                        if let Some(body) = node.child_by_field_name("body") {
-                            let mut variants = body.walk();
-                            for variant in body.children(&mut variants) {
-                                if variant.kind() != "enum_variant" {
-                                    continue;
-                                }
-                                let Some(variant_name) = variant
-                                    .child_by_field_name("name")
-                                    .and_then(|name| name.utf8_text(source).ok())
-                                else {
-                                    continue;
-                                };
-                                signatures.push(SignatureInfo {
-                                    name: variant_name.to_string(),
-                                    qualified_name: format!("{}::{}", qualified_name, variant_name),
-                                    parameters: vec![],
-                                    return_type: Some("enum_variant".to_string()),
-                                    visibility: extract_visibility(&node, source),
-                                    is_async: false,
-                                    is_method: false,
-                                    docstring: extract_docstring(&variant, source),
-                                    calls: vec![],
-                                    imports: vec![],
-                                    byte_range: (variant.start_byte(), variant.end_byte()),
-                                    flow_facts: vec![],
-
-                                    cyclomatic_complexity: 0,
-                                });
-                            }
-                        }
-                    }
+                    Self::extract_enum_definitions(&node, source, &parent_path, &mut signatures);
                 }
                 "use_declaration" => {
                     if let Some(sig) = extract_import_signature(&node, source, &parent_path) {
@@ -274,6 +168,125 @@ impl RustParser {
         }
 
         signatures
+    }
+
+    fn extract_impl_definitions(
+        &self,
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        parent_path: &[String],
+        signatures: &mut Vec<SignatureInfo>,
+    ) {
+        let impl_path = node
+            .child_by_field_name("type")
+            .and_then(|type_node| type_node.utf8_text(source).ok())
+            .map(|text| text.split('<').next().unwrap_or(text).trim().to_string())
+            .filter(|text| !text.is_empty())
+            .map(|type_name| {
+                let mut path = parent_path.to_vec();
+                path.push(type_name);
+                path
+            })
+            .unwrap_or_else(|| parent_path.to_vec());
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "declaration_list" {
+                let mut declarations = child.walk();
+                for function in child.children(&mut declarations) {
+                    if function.kind() == "function_item" {
+                        self.push_impl_signature(&function, source, &impl_path, signatures);
+                    }
+                }
+            } else if child.kind() == "function_item" {
+                self.push_impl_signature(&child, source, &impl_path, signatures);
+            }
+        }
+    }
+
+    fn push_impl_signature(
+        &self,
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        impl_path: &[String],
+        signatures: &mut Vec<SignatureInfo>,
+    ) {
+        if let Some(mut sig) = extract_function_signature(node, source, impl_path) {
+            // Every function declared in an impl belongs to the implementing type,
+            // including associated functions that have no `self` parameter.
+            sig.is_method = true;
+            let body_node = node.child_by_field_name("body").unwrap_or(*node);
+            let complexity_metrics = self.extract_complexity(&body_node);
+            sig.cyclomatic_complexity = complexity_metrics.cyclomatic.max(1) as u32;
+            signatures.push(sig);
+        }
+    }
+
+    fn extract_enum_definitions(
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        parent_path: &[String],
+        signatures: &mut Vec<SignatureInfo>,
+    ) {
+        let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source).ok())
+        else {
+            return;
+        };
+
+        let qualified_name = if parent_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{}", parent_path.join("::"), name)
+        };
+
+        signatures.push(SignatureInfo {
+            name: name.to_string(),
+            qualified_name: qualified_name.clone(),
+            parameters: vec![],
+            return_type: Some("enum".to_string()),
+            visibility: extract_visibility(node, source),
+            is_async: false,
+            is_method: false,
+            docstring: extract_docstring(node, source),
+            calls: vec![],
+            imports: vec![],
+            byte_range: (node.start_byte(), node.end_byte()),
+            flow_facts: vec![],
+            cyclomatic_complexity: 0,
+        });
+
+        // Enum variants are stable review/search anchors even when a derive macro hides their
+        // generated code.
+        if let Some(body) = node.child_by_field_name("body") {
+            let mut variants = body.walk();
+            for variant in body.children(&mut variants) {
+                if variant.kind() != "enum_variant" {
+                    continue;
+                }
+                let Some(variant_name) = variant
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(source).ok())
+                else {
+                    continue;
+                };
+                signatures.push(SignatureInfo {
+                    name: variant_name.to_string(),
+                    qualified_name: format!("{}::{}", qualified_name, variant_name),
+                    parameters: vec![],
+                    return_type: Some("enum_variant".to_string()),
+                    visibility: extract_visibility(node, source),
+                    is_async: false,
+                    is_method: false,
+                    docstring: extract_docstring(&variant, source),
+                    calls: vec![],
+                    imports: vec![],
+                    byte_range: (variant.start_byte(), variant.end_byte()),
+                    flow_facts: vec![],
+                    cyclomatic_complexity: 0,
+                });
+            }
+        }
     }
 }
 
@@ -495,182 +508,10 @@ fn extract_rust_flow_facts(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<F
         match current.kind() {
             "function_item" if current.id() != node.id() => continue,
             "call_expression" => {
-                let callee = current
-                    .child_by_field_name("function")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .map(clean_flow_label);
-                if let Some(callee) = callee {
-                    if callee == "Command::new" || callee.ends_with("::Command::new") {
-                        if let Some(arg) = expression_arguments(&current, source).first() {
-                            facts.push(FlowFact {
-                                channel: FlowChannel::CommandArgument,
-                                source: clean_flow_label(arg.utf8_text(source).unwrap_or("")),
-                                target: "command".to_string(),
-                                position: Some(0),
-                                byte_range: (arg.start_byte(), arg.end_byte()),
-                            });
-                        }
-                    }
-
-                    let args = expression_arguments(&current, source);
-                    for (position, arg) in args.into_iter().enumerate() {
-                        facts.push(FlowFact {
-                            channel: FlowChannel::Argument,
-                            source: clean_flow_label(arg.utf8_text(source).unwrap_or("")),
-                            target: callee.clone(),
-                            position: Some(position),
-                            byte_range: (arg.start_byte(), arg.end_byte()),
-                        });
-                    }
-
-                    if let Some(channel) = state_channel(&callee) {
-                        let args = expression_arguments(&current, source);
-                        let source_label = args
-                            .first()
-                            .and_then(|arg| arg.utf8_text(source).ok())
-                            .map(clean_flow_label)
-                            .unwrap_or_else(|| callee.clone());
-                        facts.push(FlowFact {
-                            channel,
-                            source: source_label,
-                            target: callee.clone(),
-                            position: Some(0),
-                            byte_range: (current.start_byte(), current.end_byte()),
-                        });
-                    }
-
-                    // Older tree-sitter-rust grammars represent chained calls
-                    // as nested call_expression nodes. Recover command
-                    // channels from the final method segment in that shape.
-                    if let Some(method) = chained_method_name(&callee) {
-                        let args = expression_arguments(&current, source);
-                        match method {
-                            "arg" | "args" => {
-                                for (position, arg) in args.iter().enumerate() {
-                                    facts.push(FlowFact {
-                                        channel: FlowChannel::CommandArgument,
-                                        source: clean_flow_label(
-                                            arg.utf8_text(source).unwrap_or(""),
-                                        ),
-                                        target: "argv".to_string(),
-                                        position: Some(position),
-                                        byte_range: (arg.start_byte(), arg.end_byte()),
-                                    });
-                                }
-                            }
-                            "env" | "envs" => {
-                                let target = args
-                                    .first()
-                                    .and_then(|arg| arg.utf8_text(source).ok())
-                                    .map(clean_flow_label)
-                                    .unwrap_or_else(|| "env".to_string());
-                                let source_label = args
-                                    .get(1)
-                                    .or_else(|| args.first())
-                                    .and_then(|arg| arg.utf8_text(source).ok())
-                                    .map(clean_flow_label)
-                                    .unwrap_or_default();
-                                facts.push(FlowFact {
-                                    channel: FlowChannel::Environment,
-                                    source: source_label,
-                                    target,
-                                    position: Some(0),
-                                    byte_range: (current.start_byte(), current.end_byte()),
-                                });
-                            }
-                            "stdin" => {
-                                let source_label = args
-                                    .first()
-                                    .and_then(|arg| arg.utf8_text(source).ok())
-                                    .map(clean_flow_label)
-                                    .unwrap_or_else(|| "stdin".to_string());
-                                facts.push(FlowFact {
-                                    channel: FlowChannel::Stdin,
-                                    source: source_label.clone(),
-                                    target: source_label,
-                                    position: Some(0),
-                                    byte_range: (current.start_byte(), current.end_byte()),
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                }
+                extract_rust_call_flow_facts(&current, source, &mut facts);
             }
             "method_call_expression" => {
-                let method = current
-                    .child_by_field_name("method")
-                    .or_else(|| current.child_by_field_name("name"))
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .map(clean_flow_label);
-                let receiver = current
-                    .child_by_field_name("receiver")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .map(clean_flow_label)
-                    .unwrap_or_default();
-                let args = method_arguments(&current, source);
-
-                if let Some(method) = method {
-                    match method.as_str() {
-                        "arg" | "args" => {
-                            for (position, arg) in args.iter().enumerate() {
-                                facts.push(FlowFact {
-                                    channel: FlowChannel::CommandArgument,
-                                    source: clean_flow_label(arg.utf8_text(source).unwrap_or("")),
-                                    target: "argv".to_string(),
-                                    position: Some(position),
-                                    byte_range: (arg.start_byte(), arg.end_byte()),
-                                });
-                            }
-                        }
-                        "env" | "envs" => {
-                            let target = args
-                                .first()
-                                .and_then(|arg| arg.utf8_text(source).ok())
-                                .map(clean_flow_label)
-                                .unwrap_or_else(|| "env".to_string());
-                            let source_label = args
-                                .get(1)
-                                .or_else(|| args.first())
-                                .and_then(|arg| arg.utf8_text(source).ok())
-                                .map(clean_flow_label)
-                                .unwrap_or_default();
-                            facts.push(FlowFact {
-                                channel: FlowChannel::Environment,
-                                source: source_label,
-                                target,
-                                position: Some(0),
-                                byte_range: (current.start_byte(), current.end_byte()),
-                            });
-                        }
-                        "stdin" => {
-                            let source_label = args
-                                .first()
-                                .and_then(|arg| arg.utf8_text(source).ok())
-                                .map(clean_flow_label)
-                                .unwrap_or_else(|| "stdin".to_string());
-                            facts.push(FlowFact {
-                                channel: FlowChannel::Stdin,
-                                source: source_label.clone(),
-                                target: source_label,
-                                position: Some(0),
-                                byte_range: (current.start_byte(), current.end_byte()),
-                            });
-                        }
-                        _ => {
-                            if let Some(channel) = state_channel(&method) {
-                                let source_label = receiver.clone();
-                                facts.push(FlowFact {
-                                    channel,
-                                    source: source_label,
-                                    target: method,
-                                    position: None,
-                                    byte_range: (current.start_byte(), current.end_byte()),
-                                });
-                            }
-                        }
-                    }
-                }
+                extract_rust_method_flow_facts(&current, source, &mut facts);
             }
             "return_expression" => {
                 if let Some(value) = current.child_by_field_name("body") {
@@ -684,39 +525,7 @@ fn extract_rust_flow_facts(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<F
                 }
             }
             "let_declaration" => {
-                let pattern = current
-                    .child_by_field_name("pattern")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .map(clean_flow_label);
-                let value = current
-                    .child_by_field_name("value")
-                    .and_then(|n| n.utf8_text(source).ok())
-                    .map(clean_flow_label);
-                if let (Some(pattern), Some(value)) = (pattern, value) {
-                    if value.contains("Command::new") {
-                        if let Some(command) = value
-                            .split("Command::new(")
-                            .nth(1)
-                            .and_then(|rest| rest.split(')').next())
-                        {
-                            facts.push(FlowFact {
-                                channel: FlowChannel::CommandArgument,
-                                source: clean_flow_label(command),
-                                target: pattern,
-                                position: Some(0),
-                                byte_range: (current.start_byte(), current.end_byte()),
-                            });
-                        }
-                    } else if value.contains('(') {
-                        facts.push(FlowFact {
-                            channel: FlowChannel::ReturnValue,
-                            source: value,
-                            target: pattern,
-                            position: None,
-                            byte_range: (current.start_byte(), current.end_byte()),
-                        });
-                    }
-                }
+                extract_rust_let_flow_facts(&current, source, &mut facts);
             }
             "assignment_expression" => {
                 let left = current
@@ -751,6 +560,236 @@ fn extract_rust_flow_facts(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<F
     }
 
     facts
+}
+
+fn extract_rust_call_flow_facts(
+    node: &tree_sitter::Node<'_>,
+    source: &[u8],
+    facts: &mut Vec<FlowFact>,
+) {
+    let callee = node
+        .child_by_field_name("function")
+        .and_then(|name| name.utf8_text(source).ok())
+        .map(clean_flow_label);
+    let Some(callee) = callee else {
+        return;
+    };
+
+    if callee == "Command::new" || callee.ends_with("::Command::new") {
+        if let Some(arg) = expression_arguments(node, source).first() {
+            facts.push(FlowFact {
+                channel: FlowChannel::CommandArgument,
+                source: clean_flow_label(arg.utf8_text(source).unwrap_or("")),
+                target: "command".to_string(),
+                position: Some(0),
+                byte_range: (arg.start_byte(), arg.end_byte()),
+            });
+        }
+    }
+
+    let args = expression_arguments(node, source);
+    for (position, arg) in args.into_iter().enumerate() {
+        facts.push(FlowFact {
+            channel: FlowChannel::Argument,
+            source: clean_flow_label(arg.utf8_text(source).unwrap_or("")),
+            target: callee.clone(),
+            position: Some(position),
+            byte_range: (arg.start_byte(), arg.end_byte()),
+        });
+    }
+
+    if let Some(channel) = state_channel(&callee) {
+        let args = expression_arguments(node, source);
+        let source_label = args
+            .first()
+            .and_then(|arg| arg.utf8_text(source).ok())
+            .map(clean_flow_label)
+            .unwrap_or_else(|| callee.clone());
+        facts.push(FlowFact {
+            channel,
+            source: source_label,
+            target: callee.clone(),
+            position: Some(0),
+            byte_range: (node.start_byte(), node.end_byte()),
+        });
+    }
+
+    // Older tree-sitter-rust grammars represent chained calls as nested call_expression nodes.
+    // Recover command channels from the final method segment in that shape.
+    if let Some(method) = chained_method_name(&callee) {
+        let args = expression_arguments(node, source);
+        match method {
+            "arg" | "args" => {
+                for (position, arg) in args.iter().enumerate() {
+                    facts.push(FlowFact {
+                        channel: FlowChannel::CommandArgument,
+                        source: clean_flow_label(arg.utf8_text(source).unwrap_or("")),
+                        target: "argv".to_string(),
+                        position: Some(position),
+                        byte_range: (arg.start_byte(), arg.end_byte()),
+                    });
+                }
+            }
+            "env" | "envs" => {
+                let target = args
+                    .first()
+                    .and_then(|arg| arg.utf8_text(source).ok())
+                    .map(clean_flow_label)
+                    .unwrap_or_else(|| "env".to_string());
+                let source_label = args
+                    .get(1)
+                    .or_else(|| args.first())
+                    .and_then(|arg| arg.utf8_text(source).ok())
+                    .map(clean_flow_label)
+                    .unwrap_or_default();
+                facts.push(FlowFact {
+                    channel: FlowChannel::Environment,
+                    source: source_label,
+                    target,
+                    position: Some(0),
+                    byte_range: (node.start_byte(), node.end_byte()),
+                });
+            }
+            "stdin" => {
+                let source_label = args
+                    .first()
+                    .and_then(|arg| arg.utf8_text(source).ok())
+                    .map(clean_flow_label)
+                    .unwrap_or_else(|| "stdin".to_string());
+                facts.push(FlowFact {
+                    channel: FlowChannel::Stdin,
+                    source: source_label.clone(),
+                    target: source_label,
+                    position: Some(0),
+                    byte_range: (node.start_byte(), node.end_byte()),
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+fn extract_rust_method_flow_facts(
+    node: &tree_sitter::Node<'_>,
+    source: &[u8],
+    facts: &mut Vec<FlowFact>,
+) {
+    let method = node
+        .child_by_field_name("method")
+        .or_else(|| node.child_by_field_name("name"))
+        .and_then(|name| name.utf8_text(source).ok())
+        .map(clean_flow_label);
+    let receiver = node
+        .child_by_field_name("receiver")
+        .and_then(|receiver| receiver.utf8_text(source).ok())
+        .map(clean_flow_label)
+        .unwrap_or_default();
+    let args = method_arguments(node, source);
+
+    let Some(method) = method else {
+        return;
+    };
+
+    match method.as_str() {
+        "arg" | "args" => {
+            for (position, arg) in args.iter().enumerate() {
+                facts.push(FlowFact {
+                    channel: FlowChannel::CommandArgument,
+                    source: clean_flow_label(arg.utf8_text(source).unwrap_or("")),
+                    target: "argv".to_string(),
+                    position: Some(position),
+                    byte_range: (arg.start_byte(), arg.end_byte()),
+                });
+            }
+        }
+        "env" | "envs" => {
+            let target = args
+                .first()
+                .and_then(|arg| arg.utf8_text(source).ok())
+                .map(clean_flow_label)
+                .unwrap_or_else(|| "env".to_string());
+            let source_label = args
+                .get(1)
+                .or_else(|| args.first())
+                .and_then(|arg| arg.utf8_text(source).ok())
+                .map(clean_flow_label)
+                .unwrap_or_default();
+            facts.push(FlowFact {
+                channel: FlowChannel::Environment,
+                source: source_label,
+                target,
+                position: Some(0),
+                byte_range: (node.start_byte(), node.end_byte()),
+            });
+        }
+        "stdin" => {
+            let source_label = args
+                .first()
+                .and_then(|arg| arg.utf8_text(source).ok())
+                .map(clean_flow_label)
+                .unwrap_or_else(|| "stdin".to_string());
+            facts.push(FlowFact {
+                channel: FlowChannel::Stdin,
+                source: source_label.clone(),
+                target: source_label,
+                position: Some(0),
+                byte_range: (node.start_byte(), node.end_byte()),
+            });
+        }
+        _ => {
+            if let Some(channel) = state_channel(&method) {
+                facts.push(FlowFact {
+                    channel,
+                    source: receiver,
+                    target: method,
+                    position: None,
+                    byte_range: (node.start_byte(), node.end_byte()),
+                });
+            }
+        }
+    }
+}
+
+fn extract_rust_let_flow_facts(
+    node: &tree_sitter::Node<'_>,
+    source: &[u8],
+    facts: &mut Vec<FlowFact>,
+) {
+    let pattern = node
+        .child_by_field_name("pattern")
+        .and_then(|pattern| pattern.utf8_text(source).ok())
+        .map(clean_flow_label);
+    let value = node
+        .child_by_field_name("value")
+        .and_then(|value| value.utf8_text(source).ok())
+        .map(clean_flow_label);
+    let (Some(pattern), Some(value)) = (pattern, value) else {
+        return;
+    };
+
+    if value.contains("Command::new") {
+        if let Some(command) = value
+            .split("Command::new(")
+            .nth(1)
+            .and_then(|rest| rest.split(')').next())
+        {
+            facts.push(FlowFact {
+                channel: FlowChannel::CommandArgument,
+                source: clean_flow_label(command),
+                target: pattern,
+                position: Some(0),
+                byte_range: (node.start_byte(), node.end_byte()),
+            });
+        }
+    } else if value.contains('(') {
+        facts.push(FlowFact {
+            channel: FlowChannel::ReturnValue,
+            source: value,
+            target: pattern,
+            position: None,
+            byte_range: (node.start_byte(), node.end_byte()),
+        });
+    }
 }
 
 fn expression_arguments<'a>(
@@ -827,29 +866,38 @@ fn extract_rust_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String
             .to_string()
     }
 
+    fn extract_call_expression(
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        calls: &mut Vec<String>,
+        clean_call_text: fn(&str) -> String,
+    ) {
+        if let Some(func) = node.child_by_field_name("function") {
+            if let Ok(text) = func.utf8_text(source) {
+                let name = clean_call_text(text);
+                if !name.is_empty() {
+                    calls.push(name);
+                }
+            }
+
+            // Extract the type prefix from scoped calls like Foo::new().
+            if func.kind() == "scoped_identifier" {
+                if let Some(path_node) = func.child_by_field_name("path") {
+                    if let Ok(path_text) = path_node.utf8_text(source) {
+                        if let Some(type_name) = normalize_type_ref(path_text) {
+                            calls.push(type_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut stack = vec![*node];
     while let Some(current) = stack.pop() {
         match current.kind() {
             "call_expression" => {
-                if let Some(func) = current.child_by_field_name("function") {
-                    if let Ok(text) = func.utf8_text(source) {
-                        let name = clean_call_text(text);
-                        if !name.is_empty() {
-                            calls.push(name);
-                        }
-                    }
-
-                    // NEW: extract the type prefix from scoped calls like Foo::new()
-                    if func.kind() == "scoped_identifier" {
-                        if let Some(path_node) = func.child_by_field_name("path") {
-                            if let Ok(path_text) = path_node.utf8_text(source) {
-                                if let Some(type_name) = normalize_type_ref(path_text) {
-                                    calls.push(type_name);
-                                }
-                            }
-                        }
-                    }
-                }
+                extract_call_expression(&current, source, &mut calls, clean_call_text);
             }
             "method_call_expression" => {
                 let receiver = current
@@ -1063,36 +1111,6 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
 }
 
 /// Find a node by its ID
-fn find_node_by_id<'a>(
-    node: &'a tree_sitter::Node<'a>,
-    id: usize,
-) -> Option<tree_sitter::Node<'a>> {
-    use std::collections::VecDeque;
-
-    if node.id() == id {
-        return Some(*node);
-    }
-
-    let mut queue: VecDeque<tree_sitter::Node<'a>> = VecDeque::new();
-    let mut cursor = node.walk();
-
-    for child in node.children(&mut cursor) {
-        queue.push_back(child);
-    }
-
-    while let Some(current) = queue.pop_front() {
-        if current.id() == id {
-            return Some(current);
-        }
-
-        let mut child_cursor = current.walk();
-        for child in current.children(&mut child_cursor) {
-            queue.push_back(child);
-        }
-    }
-
-    None
-}
 
 /// Calculate complexity metrics (iterative to avoid stack overflow on deeply nested code)
 fn calculate_complexity(

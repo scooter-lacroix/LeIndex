@@ -168,6 +168,13 @@ impl HybridScorer {
         }
     }
 
+    fn recompute_overall(&self, score: &mut Score) {
+        score.overall = score.tfidf * self.tfidf_weight
+            + score.neural * self.neural_weight
+            + score.structural * self.structural_weight
+            + score.text_match * self.text_weight;
+    }
+
     /// Re-rank results based on query type (legacy method for compatibility)
     #[deprecated(
         since = "1.6.4",
@@ -190,40 +197,28 @@ impl HybridScorer {
                 for result in &mut ranked {
                     result.score.neural *= 1.2;
                     result.score.tfidf *= 1.1;
-                    result.score.overall = result.score.tfidf * self.tfidf_weight
-                        + result.score.neural * self.neural_weight
-                        + result.score.structural * self.structural_weight
-                        + result.score.text_match * self.text_weight;
+                    self.recompute_overall(&mut result.score);
                 }
             }
             QueryType::Structural => {
                 // Boost structural scores
                 for result in &mut ranked {
                     result.score.structural *= 1.2;
-                    result.score.overall = result.score.tfidf * self.tfidf_weight
-                        + result.score.neural * self.neural_weight
-                        + result.score.structural * self.structural_weight
-                        + result.score.text_match * self.text_weight;
+                    self.recompute_overall(&mut result.score);
                 }
             }
             QueryType::Text => {
                 // Boost text match scores
                 for result in &mut ranked {
                     result.score.text_match *= 1.2;
-                    result.score.overall = result.score.tfidf * self.tfidf_weight
-                        + result.score.neural * self.neural_weight
-                        + result.score.structural * self.structural_weight
-                        + result.score.text_match * self.text_weight;
+                    self.recompute_overall(&mut result.score);
                 }
             }
             QueryType::Exact => {
                 // Boost text match scores even more aggressively for exact mode
                 for result in &mut ranked {
                     result.score.text_match *= 1.5;
-                    result.score.overall = result.score.tfidf * self.tfidf_weight
-                        + result.score.neural * self.neural_weight
-                        + result.score.structural * self.structural_weight
-                        + result.score.text_match * self.text_weight;
+                    self.recompute_overall(&mut result.score);
                 }
             }
         }
@@ -350,5 +345,39 @@ mod tests {
         let score = scorer.score_hybrid(0.8, 0.9, 0.6, 0.4);
         // Prose weights: 0.25 * 0.8 + 0.55 * 0.9 + 0.10 * 0.6 + 0.10 * 0.4 = 0.795
         assert!((score.overall - 0.795).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_rerank_hybrid_recomputes_scores_for_each_query_type() {
+        let scorer = HybridScorer::new();
+
+        for (query_type, expected) in [
+            (QueryType::Semantic, (0.22, 0.36, 0.4, 0.5, 0.345)),
+            (QueryType::Structural, (0.2, 0.3, 0.48, 0.5, 0.327)),
+            (QueryType::Text, (0.2, 0.3, 0.4, 0.6, 0.33)),
+            (QueryType::Exact, (0.2, 0.3, 0.4, 0.75, 0.3525)),
+        ] {
+            let ranked = scorer.rerank_hybrid(
+                vec![ScoreResult {
+                    node_id: String::from("node"),
+                    score: Score {
+                        overall: 0.0,
+                        tfidf: 0.2,
+                        neural: 0.3,
+                        structural: 0.4,
+                        text_match: 0.5,
+                    },
+                    query_type,
+                }],
+                query_type,
+            );
+            let score = ranked[0].score;
+
+            assert!((score.tfidf - expected.0).abs() < f32::EPSILON);
+            assert!((score.neural - expected.1).abs() < f32::EPSILON);
+            assert!((score.structural - expected.2).abs() < f32::EPSILON);
+            assert!((score.text_match - expected.3).abs() < f32::EPSILON);
+            assert!((score.overall - expected.4).abs() < f32::EPSILON);
+        }
     }
 }

@@ -5,9 +5,51 @@ use crate::edit::atomic_write_async;
 use crate::parse::parallel::ParallelParser;
 use once_cell::sync::Lazy;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 static GLOBAL_PARSER: Lazy<ParallelParser> = Lazy::new(|| ParallelParser::new().without_stats());
+
+fn resolve_write_path(file_path: &str, project_root: &Path) -> Result<PathBuf, JsonRpcError> {
+    let path = Path::new(file_path);
+    let resolved = if path.is_relative() {
+        project_root.join(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    let canonical = if resolved.exists() {
+        resolved.canonicalize().map_err(|e| {
+            JsonRpcError::invalid_params(format!("Cannot resolve file path '{}': {}", file_path, e))
+        })?
+    } else {
+        let parent = resolved.parent().ok_or_else(|| {
+            JsonRpcError::invalid_params(format!(
+                "Invalid file path '{}': no parent directory",
+                file_path
+            ))
+        })?;
+        let canonical_parent = parent.canonicalize().map_err(|e| {
+            JsonRpcError::invalid_params(format!(
+                "Cannot resolve parent directory of '{}': {}",
+                file_path, e
+            ))
+        })?;
+        canonical_parent.join(resolved.file_name().ok_or_else(|| {
+            JsonRpcError::invalid_params(format!("Invalid file path '{}': no file name", file_path))
+        })?)
+    };
+
+    if !canonical.starts_with(project_root) {
+        return Err(JsonRpcError::invalid_params(format!(
+            "File '{}' is outside the project boundary '{}'",
+            file_path,
+            project_root.display()
+        )));
+    }
+
+    Ok(canonical)
+}
 
 /// Handler for LeIndex [write — atomic file creation/overwrite with immediate PDG surfacing.
 #[derive(Clone)]
@@ -62,51 +104,7 @@ context (symbols, types) immediately so the model knows how the new file fits in
 
         let abs_path = {
             let guard = handle.read().await;
-            let project_root = guard.project_path();
-
-            let path = std::path::Path::new(&file_path);
-            let resolved = if path.is_relative() {
-                project_root.join(path)
-            } else {
-                path.to_path_buf()
-            };
-
-            let canonical = if resolved.exists() {
-                resolved.canonicalize().map_err(|e| {
-                    JsonRpcError::invalid_params(format!(
-                        "Cannot resolve file path '{}': {}",
-                        file_path, e
-                    ))
-                })?
-            } else {
-                let parent = resolved.parent().ok_or_else(|| {
-                    JsonRpcError::invalid_params(format!(
-                        "Invalid file path '{}': no parent directory",
-                        file_path
-                    ))
-                })?;
-                let canonical_parent = parent.canonicalize().map_err(|e| {
-                    JsonRpcError::invalid_params(format!(
-                        "Cannot resolve parent directory of '{}': {}",
-                        file_path, e
-                    ))
-                })?;
-                canonical_parent.join(resolved.file_name().ok_or_else(|| {
-                    JsonRpcError::invalid_params(format!(
-                        "Invalid file path '{}': no file name",
-                        file_path
-                    ))
-                })?)
-            };
-
-            if !canonical.starts_with(project_root) {
-                return Err(JsonRpcError::invalid_params(format!(
-                    "File '{}' is outside the project boundary '{}'",
-                    file_path,
-                    project_root.display()
-                )));
-            }
-            canonical
+            resolve_write_path(&file_path, guard.project_path())?
         };
         // Registry lock dropped here
 

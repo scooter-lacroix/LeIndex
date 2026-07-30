@@ -4,7 +4,7 @@ use crate::cli::memory::{
     pdg_cache_key, project_scan_cache_key, search_cache_key, CacheEntry, CacheSpiller,
     MemoryConfig, WarmStrategy,
 };
-use crate::graph::pdg::ProgramDependenceGraph;
+use crate::graph::pdg::{NodeId, ProgramDependenceGraph};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -101,61 +101,78 @@ impl IndexCache {
 
     /// Build file statistics cache from PDG.
     pub fn build_file_stats_cache(&mut self, pdg: &ProgramDependenceGraph) {
-        let mut cache: HashMap<String, FileStats> = HashMap::new();
-        // First pass: collect symbol counts and complexity
-        for nid in pdg.node_indices() {
-            if let Some(node) = pdg.get_node(nid) {
-                if matches!(node.node_type, crate::graph::pdg::NodeType::External) {
-                    continue;
-                }
-                let entry = cache
-                    .entry(node.file_path.to_string())
-                    .or_insert_with(|| FileStats {
-                        symbol_count: 0,
-                        total_complexity: 0,
-                        symbol_names: Vec::new(),
-                        outgoing_deps: 0,
-                        incoming_deps: 0,
-                    });
-                entry.symbol_count += 1;
-                entry.total_complexity += node.complexity;
-                if entry.symbol_names.len() < 5 {
-                    entry.symbol_names.push(node.name.clone());
-                }
-            }
-        }
-        // Second pass: compute cross-file dependency degrees
-        let file_paths: Vec<String> = cache.keys().cloned().collect();
-        for file_path in &file_paths {
-            let nodes = pdg.nodes_in_file(file_path);
-            let mut incoming_files = std::collections::HashSet::new();
-            let mut outgoing_files = std::collections::HashSet::new();
-            for nid in &nodes {
-                for dep_id in pdg.neighbors(*nid) {
-                    if let Some(dep) = pdg.get_node(dep_id) {
-                        if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
-                            && dep.file_path.as_ref() != file_path.as_str()
-                        {
-                            outgoing_files.insert(dep.file_path.to_string());
-                        }
-                    }
-                }
-                for dep_id in pdg.predecessors(*nid) {
-                    if let Some(dep) = pdg.get_node(dep_id) {
-                        if !matches!(dep.node_type, crate::graph::pdg::NodeType::External)
-                            && dep.file_path.as_ref() != file_path.as_str()
-                        {
-                            incoming_files.insert(dep.file_path.to_string());
-                        }
-                    }
-                }
-            }
-            if let Some(entry) = cache.get_mut(file_path) {
-                entry.outgoing_deps = outgoing_files.len();
-                entry.incoming_deps = incoming_files.len();
-            }
-        }
+        let mut cache = Self::collect_file_stats(pdg);
+        Self::add_dependency_counts(pdg, &mut cache);
         self.file_stats_cache = Some(cache);
+    }
+
+    fn collect_file_stats(pdg: &ProgramDependenceGraph) -> HashMap<String, FileStats> {
+        let mut cache = HashMap::new();
+        for node_id in pdg.node_indices() {
+            let Some(node) = pdg.get_node(node_id) else {
+                continue;
+            };
+            if matches!(node.node_type, crate::graph::pdg::NodeType::External) {
+                continue;
+            }
+
+            let entry = cache
+                .entry(node.file_path.to_string())
+                .or_insert_with(|| FileStats {
+                    symbol_count: 0,
+                    total_complexity: 0,
+                    symbol_names: Vec::new(),
+                    outgoing_deps: 0,
+                    incoming_deps: 0,
+                });
+            entry.symbol_count += 1;
+            entry.total_complexity += node.complexity;
+            if entry.symbol_names.len() < 5 {
+                entry.symbol_names.push(node.name.clone());
+            }
+        }
+        cache
+    }
+
+    fn add_dependency_counts(pdg: &ProgramDependenceGraph, cache: &mut HashMap<String, FileStats>) {
+        let file_paths: Vec<String> = cache.keys().cloned().collect();
+        for file_path in file_paths {
+            let nodes = pdg.nodes_in_file(&file_path);
+            let outgoing =
+                Self::dependency_files(pdg, &nodes, &file_path, ProgramDependenceGraph::neighbors);
+            let incoming = Self::dependency_files(
+                pdg,
+                &nodes,
+                &file_path,
+                ProgramDependenceGraph::predecessors,
+            );
+            if let Some(entry) = cache.get_mut(&file_path) {
+                entry.outgoing_deps = outgoing.len();
+                entry.incoming_deps = incoming.len();
+            }
+        }
+    }
+
+    fn dependency_files(
+        pdg: &ProgramDependenceGraph,
+        nodes: &[NodeId],
+        file_path: &str,
+        adjacent_nodes: fn(&ProgramDependenceGraph, NodeId) -> Vec<NodeId>,
+    ) -> std::collections::HashSet<String> {
+        let mut files = std::collections::HashSet::new();
+        for node_id in nodes {
+            for dependency_id in adjacent_nodes(pdg, *node_id) {
+                let Some(dependency) = pdg.get_node(dependency_id) else {
+                    continue;
+                };
+                if !matches!(dependency.node_type, crate::graph::pdg::NodeType::External)
+                    && dependency.file_path.as_ref() != file_path
+                {
+                    files.insert(dependency.file_path.to_string());
+                }
+            }
+        }
+        files
     }
 
     /// Get file statistics cache reference.

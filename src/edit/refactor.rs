@@ -116,256 +116,63 @@ impl Refactor {
     /// Synchronous rename implementation — runs on blocking thread pool.
     fn rename_symbol_blocking(pdg: &PDG, old_name: &str, new_name: &str) -> Result<EditResult> {
         // 1. Resolve the PDG symbol candidates and prefer exact symbol hits.
-        let node_ids = pdg.find_all_by_name(old_name);
-        let exact_node = pdg.find_by_symbol(old_name);
-
-        // Collect files containing the symbol definition AND all files that
-        // reference it (call sites, type usages) via PDG forward/backward edges.
-        let mut files: HashSet<PathBuf> = HashSet::new();
-
-        // Use exhaustive traversal for rename — missing any reference would break the build.
-        // High limits ensure completeness for real projects; a post-traversal check warns
-        // if the limit was hit.
-        //
-        // Both forward and backward traversals use the same config:
-        // - Forward: things the symbol depends on (callees, used types) — may contain
-        //   same-name references in those files
-        // - Backward: callers and dependents of the symbol — the primary rename targets
-        // Call edges are caller→callee, so backward_impact reaches callers.
-        let max_nodes_limit = 1_000_000;
-        let traversal_config = crate::graph::pdg::TraversalConfig {
-            max_depth: Some(1000),
-            max_nodes: Some(max_nodes_limit),
-            allowed_edge_types: Some(&[
-                crate::graph::pdg::EdgeType::Call,
-                crate::graph::pdg::EdgeType::DataDependency,
-                crate::graph::pdg::EdgeType::Inheritance,
-            ]),
-            excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
-            min_complexity: None,
-            min_edge_confidence: 0.0,
-        };
-
-        // Collect all matching seed node IDs
-        let mut seed_ids: Vec<_> = node_ids;
-        if let Some(exact) = exact_node {
+        let mut seed_ids = pdg.find_all_by_name(old_name);
+        if let Some(exact) = pdg.find_by_symbol(old_name) {
             if !seed_ids.contains(&exact) {
                 seed_ids.push(exact);
             }
         }
 
-        let mut hit_node_limit = false;
-        // Collect byte ranges from impact traversal for targeted replacements
-        let mut impact_ranges: std::collections::HashMap<String, Vec<(usize, usize)>> =
-            std::collections::HashMap::new();
-
-        // For each seed, collect definition file + forward/backward impact files
-        for node_id in &seed_ids {
-            if let Some(node) = pdg.get_node(*node_id) {
-                if node.node_type != crate::graph::pdg::NodeType::External {
-                    files.insert(PathBuf::from(&*node.file_path));
-
-                    // Add files that reference this symbol via PDG edges
-                    let impacted = pdg.forward_impact(*node_id, &traversal_config);
-                    hit_node_limit |= impacted.len() >= max_nodes_limit;
-                    for imp_id in impacted {
-                        if let Some(imp_node) = pdg.get_node(imp_id) {
-                            if imp_node.node_type != crate::graph::pdg::NodeType::External {
-                                files.insert(PathBuf::from(&*imp_node.file_path));
-                                // Collect byte ranges from impact nodes
-                                if imp_node.byte_range != (0, 0) {
-                                    impact_ranges
-                                        .entry(imp_node.file_path.to_string())
-                                        .or_default()
-                                        .push(imp_node.byte_range);
-                                }
-                            }
-                        }
-                    }
-                    let backward = pdg.backward_impact(*node_id, &traversal_config);
-                    hit_node_limit |= backward.len() >= max_nodes_limit;
-                    for back_id in backward {
-                        if let Some(back_node) = pdg.get_node(back_id) {
-                            if back_node.node_type != crate::graph::pdg::NodeType::External {
-                                files.insert(PathBuf::from(&*back_node.file_path));
-                                // Collect byte ranges from impact nodes
-                                if back_node.byte_range != (0, 0) {
-                                    impact_ranges
-                                        .entry(back_node.file_path.to_string())
-                                        .or_default()
-                                        .push(back_node.byte_range);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // 2. Collect definition + impact files/ranges via exhaustive PDG traversal.
+        // Forward reaches calleles/used types; backward reaches callers (the
+        // primary rename targets). Both use the same exhaustive config below.
+        let (files, impact_ranges, hit_node_limit) = collect_rename_targets(pdg, &seed_ids);
 
         if files.is_empty() {
-            return Ok(EditResult {
-                success: false,
-                changes_applied: 0,
-                files_modified: vec![],
-                modified_contents: None,
-                original_contents: None,
-                error: Some(format!(
-                    "Symbol '{}' was not found in project sources",
-                    old_name
-                )),
-            });
+            return Ok(empty_rename_failure(format!(
+                "Symbol '{}' was not found in project sources",
+                old_name
+            )));
         }
 
-        // Warn if the traversal hit the node limit — some references may have been missed
-        let mut truncation_warning = None;
-        if hit_node_limit {
-            truncation_warning = Some(format!(
+        // Warn if the traversal hit the node limit — some references may have been missed.
+        let truncation_warning = if hit_node_limit {
+            let warning = format!(
                 "Warning: rename traversal hit the node limit ({}). Some references may be missing — verify manually.",
-                max_nodes_limit
-            ));
-            tracing::warn!("{}", truncation_warning.as_ref().unwrap());
-        }
+                RENAME_MAX_NODES
+            );
+            tracing::warn!("{}", warning);
+            Some(warning)
+        } else {
+            None
+        };
 
-        // 4. Apply replace_whole_word to each file (two-phase: collect then write)
-        // Sort files for deterministic processing order
+        // 3. Build per-file byte-range map, then collect all modifications (no writes yet).
+        let matches_by_file = build_matches_by_file(pdg, old_name, &seed_ids);
         let mut sorted_files: Vec<_> = files.into_iter().collect();
         sorted_files.sort();
 
-        let mut total_changes = 0usize;
-        let mut modified_files: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, modified)
-        let mut errors = Vec::new();
-
-        // Phase 1: collect all modifications (no writes yet)
-        let mut pending_writes: Vec<(PathBuf, String, String)> = Vec::new(); // (path, original, modified)
-                                                                             // Cache all PDG nodes matching old_name once — avoids redundant lookups per file.
-                                                                             // Pre-group by file path for O(Files + Matches) instead of O(Files * Matches).
-        let mut matches_by_file: std::collections::HashMap<String, Vec<(usize, usize)>> =
-            std::collections::HashMap::new();
-        for nid in pdg.find_all_by_name(old_name) {
-            if let Some(node) = pdg.get_node(nid) {
-                if node.byte_range != (0, 0) {
-                    matches_by_file
-                        .entry(node.file_path.to_string())
-                        .or_default()
-                        .push(node.byte_range);
-                }
-            }
-        }
-        // Also add seed_ids ranges to the per-file map
-        for node_id in &seed_ids {
-            if let Some(node) = pdg.get_node(*node_id) {
-                if node.byte_range != (0, 0) {
-                    let entry = matches_by_file
-                        .entry(node.file_path.to_string())
-                        .or_default();
-                    if !entry.contains(&node.byte_range) {
-                        entry.push(node.byte_range);
-                    }
-                }
-            }
-        }
-        for file_path in &sorted_files {
-            let original = match std::fs::read_to_string(file_path) {
-                Ok(content) => content,
-                Err(e) => {
-                    errors.push(format!("Failed to read '{}': {}", file_path.display(), e));
-                    continue;
-                }
-            };
-
-            // Look up pre-grouped ranges for this file (includes PDG name matches + traversal impacts)
-            let mut def_ranges: Vec<(usize, usize)> = matches_by_file
-                .get(file_path.to_str().unwrap_or(""))
-                .cloned()
-                .unwrap_or_default();
-            // Also include ranges from traversal impact nodes in this file
-            if let Some(imp_ranges) = impact_ranges.get(file_path.to_str().unwrap_or("")) {
-                for r in imp_ranges {
-                    if !def_ranges.contains(r) {
-                        def_ranges.push(*r);
-                    }
-                }
-            }
-
-            if def_ranges.is_empty() {
-                // No local definition or reference ranges for this file — skip it.
-                // The file was reached via PDG traversal but may not contain the symbol.
-                // Whole-file replacement would risk corrupting unrelated same-name tokens.
-                continue;
-            }
-
-            // Targeted replacement: only replace within expanded windows around definitions
-            let modified = replace_near_definitions(&original, old_name, new_name, &def_ranges);
-            if modified != original {
-                pending_writes.push((file_path.clone(), original, modified));
-            }
-        }
-
-        // If discovery/read failed for any candidate, do not write anything (all-or-nothing).
+        let (pending_writes, errors) = collect_pending_writes(
+            &sorted_files,
+            &matches_by_file,
+            &impact_ranges,
+            old_name,
+            new_name,
+        );
         if !errors.is_empty() {
-            return Ok(EditResult {
-                success: false,
-                changes_applied: 0,
-                files_modified: vec![],
-                modified_contents: None,
-                original_contents: None,
-                error: Some(errors.join("; ")),
-            });
+            return Ok(empty_rename_failure(errors.join("; ")));
         }
 
-        // Phase 2: write all files, rollback on failure
-        for (file_path, original_content, modified) in &pending_writes {
-            match std::fs::write(file_path, modified.as_bytes()) {
-                Ok(()) => {
-                    total_changes += 1;
-                    modified_files.push((
-                        file_path.clone(),
-                        original_content.clone(),
-                        modified.clone(),
-                    ));
-                }
-                Err(e) => {
-                    errors.push(format!("Failed to write '{}': {}", file_path.display(), e));
-                    // Restore the failed file first — write() may have truncated it
-                    if let Err(restore_err) = std::fs::write(file_path, original_content.as_bytes())
-                    {
-                        tracing::error!(
-                            "CRITICAL: Failed to restore failed file '{}' during rollback: {}",
-                            file_path.display(),
-                            restore_err
-                        );
-                    }
-                    // Rollback all previously written files
-                    for (prev_path, prev_original, _prev_modified) in &modified_files {
-                        if let Err(restore_err) =
-                            std::fs::write(prev_path, prev_original.as_bytes())
-                        {
-                            tracing::error!(
-                                "CRITICAL: Failed to restore '{}' during rollback: {}",
-                                prev_path.display(),
-                                restore_err
-                            );
-                        }
-                    }
-                    break;
-                }
-            }
-        }
-
+        // 4. Write all files atomically, rolling back on any failure (all-or-nothing).
+        let (total_changes, modified_files, errors) = apply_writes_with_rollback(pending_writes);
         if !errors.is_empty() {
-            // Rollback was already performed in the loop — return clean zero metrics
-            return Ok(EditResult {
-                success: false,
-                changes_applied: 0,
-                files_modified: vec![],
-                modified_contents: None,
-                original_contents: None,
-                error: Some(errors.join("; ")),
-            });
+            return Ok(empty_rename_failure(errors.join("; ")));
         }
 
         Ok(EditResult {
-            success: errors.is_empty(),
+            // errors is empty here (early-returned otherwise), so success is always true;
+            // the only non-error `error` payload is the optional truncation warning.
+            success: true,
             changes_applied: total_changes,
             files_modified: modified_files.iter().map(|(p, _, _)| p.clone()).collect(),
             modified_contents: Some(
@@ -380,11 +187,7 @@ impl Refactor {
                     .map(|(p, orig, _)| (p.display().to_string(), orig))
                     .collect(),
             ),
-            error: match (errors.is_empty(), &truncation_warning) {
-                (true, None) => None,
-                (true, Some(w)) => Some(w.clone()),
-                (false, _) => Some(errors.join("; ")),
-            },
+            error: truncation_warning,
         })
     }
 
@@ -434,4 +237,225 @@ impl Refactor {
             error: None,
         })
     }
+}
+
+/// Exhaustive traversal cap for rename — high enough that hitting it indicates a
+/// genuinely huge graph; a post-traversal warning then flags possible misses.
+const RENAME_MAX_NODES: usize = 1_000_000;
+
+/// Construct a zero-change failure result carrying only an error message.
+fn empty_rename_failure(error: String) -> EditResult {
+    EditResult {
+        success: false,
+        changes_applied: 0,
+        files_modified: vec![],
+        modified_contents: None,
+        original_contents: None,
+        error: Some(error),
+    }
+}
+
+/// Insert non-external impact nodes' files and byte ranges into the rename target maps.
+/// Shared by forward and backward traversal — both collect the same way.
+fn merge_impact_nodes(
+    pdg: &PDG,
+    ids: &[crate::graph::pdg::NodeId],
+    files: &mut HashSet<PathBuf>,
+    impact_ranges: &mut std::collections::HashMap<String, Vec<(usize, usize)>>,
+) {
+    for &id in ids {
+        if let Some(node) = pdg.get_node(id) {
+            if node.node_type != crate::graph::pdg::NodeType::External {
+                files.insert(PathBuf::from(&*node.file_path));
+                if node.byte_range != (0, 0) {
+                    impact_ranges
+                        .entry(node.file_path.to_string())
+                        .or_default()
+                        .push(node.byte_range);
+                }
+            }
+        }
+    }
+}
+
+/// Traverse forward (callees/used types) and backward (callers) from each seed,
+/// collecting every definition + reference file and the byte ranges to target.
+/// Returns `(files, impact_ranges, hit_node_limit)`.
+fn collect_rename_targets(
+    pdg: &PDG,
+    seed_ids: &[crate::graph::pdg::NodeId],
+) -> (
+    HashSet<PathBuf>,
+    std::collections::HashMap<String, Vec<(usize, usize)>>,
+    bool,
+) {
+    // Exhaustive traversal for rename — missing any reference would break the build.
+    let traversal_config = crate::graph::pdg::TraversalConfig {
+        max_depth: Some(1000),
+        max_nodes: Some(RENAME_MAX_NODES),
+        allowed_edge_types: Some(&[
+            crate::graph::pdg::EdgeType::Call,
+            crate::graph::pdg::EdgeType::DataDependency,
+            crate::graph::pdg::EdgeType::Inheritance,
+        ]),
+        excluded_node_types: Some(vec![crate::graph::pdg::NodeType::External]),
+        min_complexity: None,
+        min_edge_confidence: 0.0,
+    };
+
+    let mut files: HashSet<PathBuf> = HashSet::new();
+    let mut impact_ranges: std::collections::HashMap<String, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    let mut hit_node_limit = false;
+
+    for &node_id in seed_ids {
+        if let Some(node) = pdg.get_node(node_id) {
+            if node.node_type != crate::graph::pdg::NodeType::External {
+                files.insert(PathBuf::from(&*node.file_path));
+
+                let impacted = pdg.forward_impact(node_id, &traversal_config);
+                hit_node_limit |= impacted.len() >= RENAME_MAX_NODES;
+                merge_impact_nodes(pdg, &impacted, &mut files, &mut impact_ranges);
+
+                let backward = pdg.backward_impact(node_id, &traversal_config);
+                hit_node_limit |= backward.len() >= RENAME_MAX_NODES;
+                merge_impact_nodes(pdg, &backward, &mut files, &mut impact_ranges);
+            }
+        }
+    }
+
+    (files, impact_ranges, hit_node_limit)
+}
+
+/// Cache all PDG nodes matching `old_name`, pre-grouped by file path. Combines
+/// name matches with seed definition ranges for O(Files + Matches) lookups.
+fn build_matches_by_file(
+    pdg: &PDG,
+    old_name: &str,
+    seed_ids: &[crate::graph::pdg::NodeId],
+) -> std::collections::HashMap<String, Vec<(usize, usize)>> {
+    let mut matches_by_file: std::collections::HashMap<String, Vec<(usize, usize)>> =
+        std::collections::HashMap::new();
+    for nid in pdg.find_all_by_name(old_name) {
+        if let Some(node) = pdg.get_node(nid) {
+            if node.byte_range != (0, 0) {
+                matches_by_file
+                    .entry(node.file_path.to_string())
+                    .or_default()
+                    .push(node.byte_range);
+            }
+        }
+    }
+    for &node_id in seed_ids {
+        if let Some(node) = pdg.get_node(node_id) {
+            if node.byte_range != (0, 0) {
+                let entry = matches_by_file
+                    .entry(node.file_path.to_string())
+                    .or_default();
+                if !entry.contains(&node.byte_range) {
+                    entry.push(node.byte_range);
+                }
+            }
+        }
+    }
+    matches_by_file
+}
+
+/// Phase 1: read each candidate file, assemble its target byte ranges
+/// (PDG name matches + traversal impacts), and produce targeted replacements.
+/// No writes happen here — all-or-nothing collection.
+fn collect_pending_writes(
+    sorted_files: &[PathBuf],
+    matches_by_file: &std::collections::HashMap<String, Vec<(usize, usize)>>,
+    impact_ranges: &std::collections::HashMap<String, Vec<(usize, usize)>>,
+    old_name: &str,
+    new_name: &str,
+) -> (Vec<(PathBuf, String, String)>, Vec<String>) {
+    let mut pending_writes: Vec<(PathBuf, String, String)> = Vec::new();
+    let mut errors = Vec::new();
+
+    for file_path in sorted_files {
+        let original = match std::fs::read_to_string(file_path) {
+            Ok(content) => content,
+            Err(e) => {
+                errors.push(format!("Failed to read '{}': {}", file_path.display(), e));
+                continue;
+            }
+        };
+
+        // Look up pre-grouped ranges for this file (PDG name matches + traversal impacts).
+        let key = file_path.to_str().unwrap_or("");
+        let mut def_ranges: Vec<(usize, usize)> =
+            matches_by_file.get(key).cloned().unwrap_or_default();
+        if let Some(imp_ranges) = impact_ranges.get(key) {
+            for r in imp_ranges {
+                if !def_ranges.contains(r) {
+                    def_ranges.push(*r);
+                }
+            }
+        }
+
+        if def_ranges.is_empty() {
+            // No local definition/reference ranges — reached via traversal but may
+            // not contain the symbol. Whole-file replacement would risk corrupting
+            // unrelated same-name tokens, so skip.
+            continue;
+        }
+
+        // Targeted replacement: only replace within expanded windows around definitions.
+        let modified = replace_near_definitions(&original, old_name, new_name, &def_ranges);
+        if modified != original {
+            pending_writes.push((file_path.clone(), original, modified));
+        }
+    }
+
+    (pending_writes, errors)
+}
+
+/// Phase 2: write all pending files. On any write failure, restore the failed
+/// file and roll back every previously-written file, then stop. Returns
+/// `(total_changes, modified_files, errors)`.
+fn apply_writes_with_rollback(
+    pending_writes: Vec<(PathBuf, String, String)>,
+) -> (usize, Vec<(PathBuf, String, String)>, Vec<String>) {
+    let mut total_changes = 0usize;
+    let mut modified_files: Vec<(PathBuf, String, String)> = Vec::new();
+    let mut errors = Vec::new();
+
+    for (file_path, original_content, modified) in &pending_writes {
+        match std::fs::write(file_path, modified.as_bytes()) {
+            Ok(()) => {
+                total_changes += 1;
+                modified_files.push((
+                    file_path.clone(),
+                    original_content.clone(),
+                    modified.clone(),
+                ));
+            }
+            Err(e) => {
+                errors.push(format!("Failed to write '{}': {}", file_path.display(), e));
+                // Restore the failed file first — write() may have truncated it.
+                if let Err(restore_err) = std::fs::write(file_path, original_content.as_bytes()) {
+                    tracing::error!(
+                        "CRITICAL: Failed to restore failed file '{}' during rollback: {}",
+                        file_path.display(),
+                        restore_err
+                    );
+                }
+                // Roll back all previously written files.
+                for (prev_path, prev_original, _prev_modified) in &modified_files {
+                    if let Err(restore_err) = std::fs::write(prev_path, prev_original.as_bytes()) {
+                        tracing::error!(
+                            "CRITICAL: Failed to restore '{}' during rollback: {}",
+                            prev_path.display(),
+                            restore_err
+                        );
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    (total_changes, modified_files, errors)
 }

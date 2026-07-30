@@ -213,111 +213,131 @@ fn merge_pdgs_with_keys(
 /// Resolve import edges that point to synthetic external-module nodes
 /// to internal symbols where project context now allows resolution.
 pub fn relink_external_import_edges(pdg: &mut ProgramDependenceGraph, config: &RelinkConfig) {
-    // Build symbol map for all non-external nodes
+    let symbol_map = relink_symbol_map(pdg);
+    let (to_remove, to_add) = collect_relink_plan(pdg, config, &symbol_map);
+    let mut existing_edges = collect_edge_keys(pdg);
+    let external_degree = remove_relinked_edges(pdg, to_remove, &mut existing_edges);
+    add_relinked_edges(pdg, to_add, &mut existing_edges);
+    remove_orphan_external_nodes(pdg, &external_degree);
+}
+
+fn relink_symbol_map(pdg: &ProgramDependenceGraph) -> HashMap<String, Vec<NodeId>> {
     let mut symbol_map: HashMap<String, Vec<NodeId>> = HashMap::new();
-    for node_idx in pdg.node_indices() {
-        let Some(node) = pdg.get_node(node_idx) else {
+    for node_id in pdg.node_indices() {
+        let Some(node) = pdg.get_node(node_id) else {
             continue;
         };
         if matches!(node.node_type, NodeType::External) {
             continue;
         }
         for key in candidate_keys_for_node(node) {
-            symbol_map.entry(key).or_default().push(node_idx);
+            symbol_map.entry(key).or_default().push(node_id);
         }
     }
+    symbol_map
+}
 
-    // Collect edges to relink
-    let edge_indices: Vec<_> = pdg.edge_indices().collect();
+fn collect_relink_plan(
+    pdg: &ProgramDependenceGraph,
+    config: &RelinkConfig,
+    symbol_map: &HashMap<String, Vec<NodeId>>,
+) -> (
+    Vec<(crate::graph::pdg::EdgeId, NodeId, NodeId)>,
+    Vec<(NodeId, NodeId)>,
+) {
     let mut to_remove = Vec::new();
-    let mut to_add: Vec<(NodeId, NodeId)> = Vec::new();
-    let mut existing_edges = collect_edge_keys(pdg);
+    let mut to_add = Vec::new();
 
-    for edge_idx in edge_indices {
-        let Some(edge) = pdg.get_edge(edge_idx) else {
-            continue;
-        };
-        if edge.edge_type != EdgeType::Import {
-            continue;
-        }
-        let Some((from, to)) = pdg.edge_endpoints(edge_idx) else {
-            continue;
-        };
-        let Some(target) = pdg.get_node(to) else {
-            continue;
-        };
-        if !matches!(target.node_type, NodeType::External) {
-            continue;
-        }
-
-        let importer_lang = pdg
-            .get_node(from)
-            .map(|n| n.language.clone())
-            .unwrap_or_default();
-
-        let candidates: Vec<NodeId> = resolve_import_candidates_ranked(
-            &target.name,
-            &symbol_map,
-            pdg,
-            &importer_lang,
-            config,
-        )
-        .into_iter()
-        .filter(|c| *c != from)
-        .take(config.max_candidates)
-        .collect();
-
-        if candidates.is_empty() {
-            continue;
-        }
-
-        // Track the degree of the external node; it becomes orphaned after relink
-        to_remove.push((edge_idx, from, to));
-        for candidate in candidates {
-            to_add.push((from, candidate));
+    for edge_id in pdg.edge_indices() {
+        if let Some((from, to, candidates)) =
+            relink_candidates_for_edge(pdg, edge_id, config, symbol_map)
+        {
+            to_remove.push((edge_id, from, to));
+            to_add.extend(candidates.into_iter().map(|candidate| (from, candidate)));
         }
     }
 
-    // Collect orphan candidates before removal (external nodes that will lose all edges)
-    let mut external_degree: HashMap<NodeId, usize> = HashMap::new();
-    for (_, _, to) in &to_remove {
-        *external_degree.entry(*to).or_insert(0) += 1;
+    (to_remove, to_add)
+}
+
+fn relink_candidates_for_edge(
+    pdg: &ProgramDependenceGraph,
+    edge_id: crate::graph::pdg::EdgeId,
+    config: &RelinkConfig,
+    symbol_map: &HashMap<String, Vec<NodeId>>,
+) -> Option<(NodeId, NodeId, Vec<NodeId>)> {
+    let edge = pdg.get_edge(edge_id)?;
+    if edge.edge_type != EdgeType::Import {
+        return None;
+    }
+    let (from, to) = pdg.edge_endpoints(edge_id)?;
+    let target = pdg.get_node(to)?;
+    if !matches!(target.node_type, NodeType::External) {
+        return None;
     }
 
-    // Remove old edges and update key set
-    for (edge_idx, from, to) in to_remove {
-        if let Some(edge) = pdg.get_edge(edge_idx) {
+    let importer_lang = pdg
+        .get_node(from)
+        .map(|node| node.language.clone())
+        .unwrap_or_default();
+    let candidates =
+        resolve_import_candidates_ranked(&target.name, symbol_map, pdg, &importer_lang, config)
+            .into_iter()
+            .filter(|candidate| *candidate != from)
+            .take(config.max_candidates)
+            .collect::<Vec<_>>();
+    (!candidates.is_empty()).then_some((from, to, candidates))
+}
+
+fn remove_relinked_edges(
+    pdg: &mut ProgramDependenceGraph,
+    to_remove: Vec<(crate::graph::pdg::EdgeId, NodeId, NodeId)>,
+    existing_edges: &mut HashSet<(usize, usize, u8)>,
+) -> HashMap<NodeId, usize> {
+    let mut external_degree = HashMap::new();
+    for (edge_id, from, to) in to_remove {
+        *external_degree.entry(to).or_insert(0) += 1;
+        if let Some(edge) = pdg.get_edge(edge_id) {
             existing_edges.remove(&edge_key(from, to, &edge.edge_type));
         }
-        pdg.remove_edge(edge_idx);
+        pdg.remove_edge(edge_id);
     }
+    external_degree
+}
 
-    // Add new edges
+fn add_relinked_edges(
+    pdg: &mut ProgramDependenceGraph,
+    to_add: Vec<(NodeId, NodeId)>,
+    existing_edges: &mut HashSet<(usize, usize, u8)>,
+) {
     for (from, to) in to_add {
-        let key = edge_key(from, to, &EdgeType::Import);
-        if existing_edges.insert(key) {
+        if existing_edges.insert(edge_key(from, to, &EdgeType::Import)) {
             pdg.add_import_edges(vec![(from, to)]);
         }
     }
+}
 
-    // Clean up orphaned external nodes
-    // Only remove nodes that have no remaining edges
+fn remove_orphan_external_nodes(
+    pdg: &mut ProgramDependenceGraph,
+    external_degree: &HashMap<NodeId, usize>,
+) {
     let orphans: Vec<NodeId> = external_degree
         .keys()
         .copied()
-        .filter(|&nid| {
-            let Some(node) = pdg.get_node(nid) else {
-                return false;
-            };
-            (matches!(node.node_type, NodeType::External)
-                && pdg.predecessors(nid).is_empty()
-                && pdg.neighbors(nid).is_empty())
-        })
+        .filter(|node_id| is_orphan_external_node(pdg, *node_id))
         .collect();
 
-    for nid in orphans {
-        pdg.remove_node(nid);
+    for node_id in orphans {
+        pdg.remove_node(node_id);
     }
+}
+
+fn is_orphan_external_node(pdg: &ProgramDependenceGraph, node_id: NodeId) -> bool {
+    pdg.get_node(node_id).is_some_and(|node| {
+        matches!(node.node_type, NodeType::External)
+            && pdg.predecessors(node_id).is_empty()
+            && pdg.neighbors(node_id).is_empty()
+    })
 }
 
 // ---------------------------------------------------------------------------

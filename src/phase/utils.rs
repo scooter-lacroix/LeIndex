@@ -13,121 +13,100 @@ pub struct CollectedFiles {
 
 /// Collect source files with optional docs based on options.
 pub fn collect_files(root: &Path, options: &PhaseOptions) -> Result<CollectedFiles> {
-    let mut collected = CollectedFiles::default();
-
-    // All file extensions supported by the parse module.
-    // Must stay in sync with crate::parse::grammar::LanguageId::from_extension.
-    let code_exts = [
-        "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", // Main languages
-        "go", "java", "cpp", "cc", "cxx", "c", "h", "hpp", // Systems languages
-        "cs",  // C#
-        "rb", "php", "lua", "scala", "sc", // Scripting languages
-        "sh", "bash", // Shell
-        "json", // Data
-    ];
-
-    // File suffixes that extension() can't match (e.g., ".rs.in" returns "in").
-    let code_suffixes = [".rs.in"];
-
-    // Optional focused-file mode (used by MCP when path points to a single file).
     if !options.focus_files.is_empty() {
-        for raw_path in &options.focus_files {
-            let candidate = if raw_path.is_absolute() {
-                raw_path.clone()
-            } else {
-                root.join(raw_path)
-            };
-
-            if !candidate.is_file() {
-                continue;
-            }
-
-            if let Some(ext) = candidate.extension().and_then(|e| e.to_str()) {
-                let ext = ext.to_ascii_lowercase();
-                if code_exts.contains(&ext.as_str()) {
-                    collected.code_files.push(candidate.clone());
-                } else if options.include_docs && include_docs_extension(&ext, options.docs_mode) {
-                    collected.docs_files.push(candidate.clone());
-                }
-            }
-
-            // Check for multi-dot suffixes that extension() can't match (e.g., .rs.in)
-            if code_suffixes
-                .iter()
-                .any(|s| candidate.to_string_lossy().ends_with(s))
-            {
-                collected.code_files.push(candidate.clone());
-            }
-
-            if collected.code_files.len() >= options.max_files {
-                break;
-            }
-        }
-
-        collected.code_files.sort();
-        collected.code_files.dedup();
-        collected.docs_files.sort();
-        collected.docs_files.dedup();
-
-        if !collected.code_files.is_empty() || !collected.docs_files.is_empty() {
-            return Ok(collected);
+        let focused = collect_focused_files(root, options);
+        if !focused.code_files.is_empty() || !focused.docs_files.is_empty() {
+            return Ok(focused);
         }
     }
 
-    let mut walker = walkdir::WalkDir::new(root).into_iter();
-    while let Some(entry) = walker.next() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
+    Ok(collect_walked_files(root, options))
+}
+
+fn collect_focused_files(root: &Path, options: &PhaseOptions) -> CollectedFiles {
+    let mut collected = CollectedFiles::default();
+    for raw_path in &options.focus_files {
+        let candidate = if raw_path.is_absolute() {
+            raw_path.clone()
+        } else {
+            root.join(raw_path)
         };
-
-        let path = entry.path();
-        let file_name = entry.file_name().to_string_lossy();
-
-        if entry.file_type().is_dir() {
-            if should_skip_dir(&file_name) {
-                walker.skip_current_dir();
-                continue;
-            }
+        if !candidate.is_file() {
             continue;
         }
 
+        classify_file(&candidate, options, &mut collected);
+        if collected.code_files.len() >= options.max_files {
+            break;
+        }
+    }
+    deduplicate_collected_files(&mut collected);
+    collected
+}
+
+fn collect_walked_files(root: &Path, options: &PhaseOptions) -> CollectedFiles {
+    let mut collected = CollectedFiles::default();
+    let mut walker = walkdir::WalkDir::new(root).into_iter();
+
+    while let Some(entry) = walker.next() {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        if entry.file_type().is_dir() {
+            if should_skip_dir(&entry.file_name().to_string_lossy()) {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
         if !entry.file_type().is_file() {
             continue;
         }
 
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            let ext = ext.to_ascii_lowercase();
-            if code_exts.contains(&ext.as_str()) {
-                collected.code_files.push(path.to_path_buf());
-                if collected.code_files.len() >= options.max_files {
-                    break;
-                }
-                continue;
-            }
-
-            if options.include_docs && include_docs_extension(&ext, options.docs_mode) {
-                collected.docs_files.push(path.to_path_buf());
-            }
-        }
-
-        // Check for multi-dot suffixes that extension() can't match (e.g., .rs.in)
-        if code_suffixes
-            .iter()
-            .any(|s| path.to_string_lossy().ends_with(s))
-        {
-            collected.code_files.push(path.to_path_buf());
-            if collected.code_files.len() >= options.max_files {
-                break;
-            }
-        }
-
+        classify_file(path, options, &mut collected);
         if collected.code_files.len() >= options.max_files {
             break;
         }
     }
 
-    Ok(collected)
+    collected
+}
+
+fn classify_file(path: &Path, options: &PhaseOptions, collected: &mut CollectedFiles) {
+    if let Some(extension) = path.extension().and_then(|extension| extension.to_str()) {
+        let extension = extension.to_ascii_lowercase();
+        if is_code_extension(&extension) {
+            collected.code_files.push(path.to_path_buf());
+            return;
+        }
+        if options.include_docs && include_docs_extension(&extension, options.docs_mode) {
+            collected.docs_files.push(path.to_path_buf());
+        }
+    }
+
+    if is_code_suffix(path) {
+        collected.code_files.push(path.to_path_buf());
+    }
+}
+
+fn deduplicate_collected_files(collected: &mut CollectedFiles) {
+    collected.code_files.sort();
+    collected.code_files.dedup();
+    collected.docs_files.sort();
+    collected.docs_files.dedup();
+}
+
+fn is_code_extension(extension: &str) -> bool {
+    [
+        "rs", "py", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "go", "java", "cpp",
+        "cc", "cxx", "c", "h", "hpp", "cs", "rb", "php", "lua", "scala", "sc", "sh", "bash",
+        "json",
+    ]
+    .contains(&extension)
+}
+
+fn is_code_suffix(path: &Path) -> bool {
+    path.to_string_lossy().ends_with(".rs.in")
 }
 
 /// Build (path, hash) inventory for freshness checks.

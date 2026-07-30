@@ -8,6 +8,18 @@ use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+const GLOBAL_SYMBOL_UPSERT_SQL: &str = "INSERT INTO global_symbols (
+    symbol_id, project_id, symbol_name, symbol_type,
+    signature, file_path, byte_range_start, byte_range_end,
+    complexity, is_public
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+ON CONFLICT(project_id, symbol_name, signature) DO UPDATE SET
+    file_path = excluded.file_path,
+    byte_range_start = excluded.byte_range_start,
+    byte_range_end = excluded.byte_range_end,
+    complexity = excluded.complexity,
+    is_public = excluded.is_public";
+
 /// Global symbol identifier (BLAKE3 hash)
 pub type GlobalSymbolId = String;
 
@@ -156,6 +168,46 @@ pub struct ProjectDep {
     pub dependency_type: DepType,
 }
 
+fn global_symbol_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<GlobalSymbol> {
+    Ok(GlobalSymbol {
+        symbol_id: row.get(0)?,
+        project_id: row.get(1)?,
+        symbol_name: row.get(2)?,
+        symbol_type: SymbolType::from_str_name(row.get::<_, String>(3)?.as_str())
+            .unwrap_or(SymbolType::Function),
+        signature: row.get(4)?,
+        file_path: row.get(5)?,
+        byte_range: (
+            row.get::<_, i64>(6)? as usize,
+            row.get::<_, i64>(7)? as usize,
+        ),
+        complexity: row.get::<_, i64>(8)? as u32,
+        is_public: row.get::<_, i64>(9)? == 1,
+    })
+}
+
+fn external_ref_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ExternalRef> {
+    Ok(ExternalRef {
+        ref_id: row.get(0)?,
+        source_project_id: row.get(1)?,
+        source_symbol_id: row.get(2)?,
+        target_project_id: row.get(3)?,
+        target_symbol_id: row.get(4)?,
+        ref_type: RefType::from_str_name(row.get::<_, String>(5)?.as_str())
+            .unwrap_or(RefType::Call),
+    })
+}
+
+fn project_dep_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectDep> {
+    Ok(ProjectDep {
+        dep_id: row.get(0)?,
+        project_id: row.get(1)?,
+        depends_on_project_id: row.get(2)?,
+        dependency_type: DepType::from_str_name(row.get::<_, String>(3)?.as_str())
+            .unwrap_or(DepType::Direct),
+    })
+}
+
 /// Dependency type between projects
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum DepType {
@@ -225,39 +277,27 @@ impl<'a> GlobalSymbolTable<'a> {
         hasher.finalize().to_hex().to_string()
     }
 
+    fn execute_symbol_upsert(&self, symbol: &GlobalSymbol) -> rusqlite::Result<usize> {
+        self.db.conn().execute(
+            GLOBAL_SYMBOL_UPSERT_SQL,
+            params![
+                &symbol.symbol_id,
+                &symbol.project_id,
+                &symbol.symbol_name,
+                symbol.symbol_type.as_str(),
+                &symbol.signature,
+                &symbol.file_path,
+                symbol.byte_range.0 as i64,
+                symbol.byte_range.1 as i64,
+                symbol.complexity as i64,
+                i64::from(symbol.is_public),
+            ],
+        )
+    }
+
     /// Insert or update a global symbol
     pub fn upsert_symbol(&self, symbol: &GlobalSymbol) -> Result<(), GlobalSymbolError> {
-        let byte_start = symbol.byte_range.0 as i64;
-        let byte_end = symbol.byte_range.1 as i64;
-        let is_public = if symbol.is_public { 1 } else { 0 };
-
-        self.db
-            .conn()
-            .execute(
-                "INSERT INTO global_symbols (
-                symbol_id, project_id, symbol_name, symbol_type,
-                signature, file_path, byte_range_start, byte_range_end,
-                complexity, is_public
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            ON CONFLICT(project_id, symbol_name, signature) DO UPDATE SET
-                file_path = excluded.file_path,
-                byte_range_start = excluded.byte_range_start,
-                byte_range_end = excluded.byte_range_end,
-                complexity = excluded.complexity,
-                is_public = excluded.is_public",
-                params![
-                    &symbol.symbol_id,
-                    &symbol.project_id,
-                    &symbol.symbol_name,
-                    symbol.symbol_type.as_str(),
-                    &symbol.signature,
-                    &symbol.file_path,
-                    byte_start,
-                    byte_end,
-                    symbol.complexity as i64,
-                    is_public,
-                ],
-            )
+        self.execute_symbol_upsert(symbol)
             .map_err(GlobalSymbolError::from)?;
 
         Ok(())
@@ -270,35 +310,7 @@ impl<'a> GlobalSymbolTable<'a> {
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for symbol in symbols {
-                let byte_start = symbol.byte_range.0 as i64;
-                let byte_end = symbol.byte_range.1 as i64;
-                let is_public = if symbol.is_public { 1 } else { 0 };
-
-                if let Err(e) = self.db.conn().execute(
-                    "INSERT INTO global_symbols (
-                        symbol_id, project_id, symbol_name, symbol_type,
-                        signature, file_path, byte_range_start, byte_range_end,
-                        complexity, is_public
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-                    ON CONFLICT(project_id, symbol_name, signature) DO UPDATE SET
-                        file_path = excluded.file_path,
-                        byte_range_start = excluded.byte_range_start,
-                        byte_range_end = excluded.byte_range_end,
-                        complexity = excluded.complexity,
-                        is_public = excluded.is_public",
-                    params![
-                        &symbol.symbol_id,
-                        &symbol.project_id,
-                        &symbol.symbol_name,
-                        symbol.symbol_type.as_str(),
-                        &symbol.signature,
-                        &symbol.file_path,
-                        byte_start,
-                        byte_end,
-                        symbol.complexity as i64,
-                        is_public,
-                    ],
-                ) {
+                if let Err(e) = self.execute_symbol_upsert(symbol) {
                     self.db.conn().execute("ROLLBACK", []).ok();
                     return Err::<(), rusqlite::Error>(e);
                 }
@@ -337,23 +349,7 @@ impl<'a> GlobalSymbolTable<'a> {
             .map_err(GlobalSymbolError::from)?;
 
         let symbols = stmt
-            .query_map(params![name], |row| {
-                Ok(GlobalSymbol {
-                    symbol_id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    symbol_name: row.get(2)?,
-                    symbol_type: SymbolType::from_str_name(row.get::<_, String>(3)?.as_str())
-                        .unwrap_or(SymbolType::Function),
-                    signature: row.get(4)?,
-                    file_path: row.get(5)?,
-                    byte_range: (
-                        row.get::<_, i64>(6)? as usize,
-                        row.get::<_, i64>(7)? as usize,
-                    ),
-                    complexity: row.get::<_, i64>(8)? as u32,
-                    is_public: row.get::<_, i64>(9)? == 1,
-                })
-            })
+            .query_map(params![name], global_symbol_from_row)
             .map_err(GlobalSymbolError::from)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(GlobalSymbolError::from)?;
@@ -379,23 +375,7 @@ impl<'a> GlobalSymbolTable<'a> {
             .map_err(GlobalSymbolError::from)?;
 
         let symbols = stmt
-            .query_map(params![name, symbol_type.as_str()], |row| {
-                Ok(GlobalSymbol {
-                    symbol_id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    symbol_name: row.get(2)?,
-                    symbol_type: SymbolType::from_str_name(row.get::<_, String>(3)?.as_str())
-                        .unwrap_or(SymbolType::Function),
-                    signature: row.get(4)?,
-                    file_path: row.get(5)?,
-                    byte_range: (
-                        row.get::<_, i64>(6)? as usize,
-                        row.get::<_, i64>(7)? as usize,
-                    ),
-                    complexity: row.get::<_, i64>(8)? as u32,
-                    is_public: row.get::<_, i64>(9)? == 1,
-                })
-            })
+            .query_map(params![name, symbol_type.as_str()], global_symbol_from_row)
             .map_err(GlobalSymbolError::from)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(GlobalSymbolError::from)?;
@@ -420,23 +400,7 @@ impl<'a> GlobalSymbolTable<'a> {
             .map_err(GlobalSymbolError::from)?;
 
         let result = stmt
-            .query_row(params![symbol_id], |row| {
-                Ok(GlobalSymbol {
-                    symbol_id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    symbol_name: row.get(2)?,
-                    symbol_type: SymbolType::from_str_name(row.get::<_, String>(3)?.as_str())
-                        .unwrap_or(SymbolType::Function),
-                    signature: row.get(4)?,
-                    file_path: row.get(5)?,
-                    byte_range: (
-                        row.get::<_, i64>(6)? as usize,
-                        row.get::<_, i64>(7)? as usize,
-                    ),
-                    complexity: row.get::<_, i64>(8)? as u32,
-                    is_public: row.get::<_, i64>(9)? == 1,
-                })
-            })
+            .query_row(params![symbol_id], global_symbol_from_row)
             .optional()
             .map_err(GlobalSymbolError::from)?;
 
@@ -460,23 +424,7 @@ impl<'a> GlobalSymbolTable<'a> {
             .map_err(GlobalSymbolError::from)?;
 
         let symbols = stmt
-            .query_map(params![project_id], |row| {
-                Ok(GlobalSymbol {
-                    symbol_id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    symbol_name: row.get(2)?,
-                    symbol_type: SymbolType::from_str_name(row.get::<_, String>(3)?.as_str())
-                        .unwrap_or(SymbolType::Function),
-                    signature: row.get(4)?,
-                    file_path: row.get(5)?,
-                    byte_range: (
-                        row.get::<_, i64>(6)? as usize,
-                        row.get::<_, i64>(7)? as usize,
-                    ),
-                    complexity: row.get::<_, i64>(8)? as u32,
-                    is_public: row.get::<_, i64>(9)? == 1,
-                })
-            })
+            .query_map(params![project_id], global_symbol_from_row)
             .map_err(GlobalSymbolError::from)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(GlobalSymbolError::from)?;
@@ -524,17 +472,7 @@ impl<'a> GlobalSymbolTable<'a> {
             .map_err(GlobalSymbolError::from)?;
 
         let refs = stmt
-            .query_map(params![symbol_id], |row| {
-                Ok(ExternalRef {
-                    ref_id: row.get(0)?,
-                    source_project_id: row.get(1)?,
-                    source_symbol_id: row.get(2)?,
-                    target_project_id: row.get(3)?,
-                    target_symbol_id: row.get(4)?,
-                    ref_type: RefType::from_str_name(row.get::<_, String>(5)?.as_str())
-                        .unwrap_or(RefType::Call),
-                })
-            })
+            .query_map(params![symbol_id], external_ref_from_row)
             .map_err(GlobalSymbolError::from)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(GlobalSymbolError::from)?;
@@ -559,17 +497,7 @@ impl<'a> GlobalSymbolTable<'a> {
             .map_err(GlobalSymbolError::from)?;
 
         let refs = stmt
-            .query_map(params![symbol_id], |row| {
-                Ok(ExternalRef {
-                    ref_id: row.get(0)?,
-                    source_project_id: row.get(1)?,
-                    source_symbol_id: row.get(2)?,
-                    target_project_id: row.get(3)?,
-                    target_symbol_id: row.get(4)?,
-                    ref_type: RefType::from_str_name(row.get::<_, String>(5)?.as_str())
-                        .unwrap_or(RefType::Call),
-                })
-            })
+            .query_map(params![symbol_id], external_ref_from_row)
             .map_err(GlobalSymbolError::from)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(GlobalSymbolError::from)?;
@@ -606,15 +534,7 @@ impl<'a> GlobalSymbolTable<'a> {
             .map_err(GlobalSymbolError::from)?;
 
         let deps = stmt
-            .query_map(params![project_id], |row| {
-                Ok(ProjectDep {
-                    dep_id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    depends_on_project_id: row.get(2)?,
-                    dependency_type: DepType::from_str_name(row.get::<_, String>(3)?.as_str())
-                        .unwrap_or(DepType::Direct),
-                })
-            })
+            .query_map(params![project_id], project_dep_from_row)
             .map_err(GlobalSymbolError::from)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(GlobalSymbolError::from)?;
@@ -641,15 +561,7 @@ impl<'a> GlobalSymbolTable<'a> {
             .map_err(GlobalSymbolError::from)?;
 
         let deps = stmt
-            .query_map(params![depends_on_project_id], |row| {
-                Ok(ProjectDep {
-                    dep_id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    depends_on_project_id: row.get(2)?,
-                    dependency_type: DepType::from_str_name(row.get::<_, String>(3)?.as_str())
-                        .unwrap_or(DepType::Direct),
-                })
-            })
+            .query_map(params![depends_on_project_id], project_dep_from_row)
             .map_err(GlobalSymbolError::from)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(GlobalSymbolError::from)?;
@@ -674,23 +586,7 @@ impl<'a> GlobalSymbolTable<'a> {
             .map_err(GlobalSymbolError::from)?;
 
         let symbols = stmt
-            .query_map(params![project_id], |row| {
-                Ok(GlobalSymbol {
-                    symbol_id: row.get(0)?,
-                    project_id: row.get(1)?,
-                    symbol_name: row.get(2)?,
-                    symbol_type: SymbolType::from_str_name(row.get::<_, String>(3)?.as_str())
-                        .unwrap_or(SymbolType::Function),
-                    signature: row.get(4)?,
-                    file_path: row.get(5)?,
-                    byte_range: (
-                        row.get::<_, i64>(6)? as usize,
-                        row.get::<_, i64>(7)? as usize,
-                    ),
-                    complexity: row.get::<_, i64>(8)? as u32,
-                    is_public: row.get::<_, i64>(9)? == 1,
-                })
-            })
+            .query_map(params![project_id], global_symbol_from_row)
             .map_err(GlobalSymbolError::from)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(GlobalSymbolError::from)?;
@@ -752,10 +648,7 @@ mod tests {
         table.upsert_symbol(&symbol).unwrap();
 
         let retrieved = table.get_symbol(&symbol.symbol_id).unwrap();
-        assert!(retrieved.is_some());
-        let retrieved = retrieved.unwrap();
-        assert_eq!(retrieved.symbol_name, "foo");
-        assert_eq!(retrieved.project_id, "test_project");
+        assert_eq!(retrieved, Some(symbol));
     }
 
     #[test]
@@ -792,8 +685,7 @@ mod tests {
         table.upsert_symbols_batch(&symbols).unwrap();
 
         let proj_a_symbols = table.get_project_symbols("proj_a").unwrap();
-        assert_eq!(proj_a_symbols.len(), 1);
-        assert_eq!(proj_a_symbols[0].symbol_name, "foo");
+        assert_eq!(proj_a_symbols, vec![symbols[0].clone()]);
     }
 
     #[test]
@@ -831,6 +723,46 @@ mod tests {
 
         let results = table.resolve_by_name("util").unwrap();
         assert_eq!(results.len(), 2); // Found in both projects
+        assert!(results.contains(&symbol1));
+        assert!(results.contains(&symbol2));
+    }
+
+    #[test]
+    fn test_resolve_by_name_and_type() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db = Storage::open(temp_file.path()).unwrap();
+        let table = GlobalSymbolTable::new(&db);
+
+        let function = GlobalSymbol {
+            symbol_id: GlobalSymbolTable::generate_symbol_id("proj_a", "util", None),
+            project_id: "proj_a".to_string(),
+            symbol_name: "util".to_string(),
+            symbol_type: SymbolType::Function,
+            signature: None,
+            file_path: "src/a.rs".to_string(),
+            byte_range: (0, 50),
+            complexity: 1,
+            is_public: true,
+        };
+        let class = GlobalSymbol {
+            symbol_id: GlobalSymbolTable::generate_symbol_id("proj_b", "util", None),
+            project_id: "proj_b".to_string(),
+            symbol_name: "util".to_string(),
+            symbol_type: SymbolType::Class,
+            signature: None,
+            file_path: "src/b.rs".to_string(),
+            byte_range: (10, 90),
+            complexity: 3,
+            is_public: false,
+        };
+
+        table.upsert_symbol(&function).unwrap();
+        table.upsert_symbol(&class).unwrap();
+
+        let results = table
+            .resolve_by_name_and_type("util", SymbolType::Class)
+            .unwrap();
+        assert_eq!(results, vec![class]);
     }
 
     #[test]
@@ -918,12 +850,10 @@ mod tests {
 
         // Verify we can retrieve the reference
         let outgoing = table.get_outgoing_refs(&source.symbol_id).unwrap();
-        assert_eq!(outgoing.len(), 1);
-        assert_eq!(outgoing[0].target_symbol_id, target.symbol_id);
+        assert_eq!(outgoing, vec![ext_ref.clone()]);
 
         let incoming = table.get_incoming_refs(&target.symbol_id).unwrap();
-        assert_eq!(incoming.len(), 1);
-        assert_eq!(incoming[0].source_symbol_id, source.symbol_id);
+        assert_eq!(incoming, vec![ext_ref]);
     }
 
     #[test]
@@ -942,8 +872,10 @@ mod tests {
         table.add_project_dep(&dep).unwrap();
 
         let deps = table.get_project_deps("proj_a").unwrap();
-        assert_eq!(deps.len(), 1);
-        assert_eq!(deps[0].depends_on_project_id, "proj_b");
+        assert_eq!(deps, vec![dep.clone()]);
+
+        let reverse_deps = table.get_reverse_project_deps("proj_b").unwrap();
+        assert_eq!(reverse_deps, vec![dep]);
     }
 
     #[test]
@@ -980,7 +912,6 @@ mod tests {
         table.upsert_symbol(&private_symbol).unwrap();
 
         let public_symbols = table.find_public_symbols("proj_a").unwrap();
-        assert_eq!(public_symbols.len(), 1);
-        assert_eq!(public_symbols[0].symbol_name, "public_fn");
+        assert_eq!(public_symbols, vec![public_symbol]);
     }
 }

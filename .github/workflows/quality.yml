@@ -59,7 +59,7 @@ jobs:
           lizard \
             src/ \
             crates/leindex-embed/src/ \
-            -CCN 15 \
+            -C 15 \
             -x"*/tests/*" \
             -x"*/target/*" \
             -m \

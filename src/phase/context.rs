@@ -96,93 +96,7 @@ impl PhaseExecutionContext {
         let has_persisted = pdg_exists(&self.storage, &self.project_id).unwrap_or(false);
 
         if options.use_incremental_refresh && has_persisted {
-            let mut pdg = load_pdg(&self.storage, &self.project_id)
-                .context("failed loading cached PDG for incremental phase run")?;
-
-            for path in &freshness.deleted_files {
-                for key in equivalent_file_keys(&self.root, path) {
-                    pdg.remove_file(&key);
-                    if let Err(e) = delete_file_data(&mut self.storage, &self.project_id, &key) {
-                        warn!(
-                            "Phase context: failed to delete file data for '{}' (deleted file): {}",
-                            key, e
-                        );
-                    }
-                }
-            }
-
-            let parse_paths = freshness.changed_files.clone();
-            if !parse_paths.is_empty() {
-                self.parse_results = ParallelParser::new().parse_files(parse_paths);
-                self.signatures_by_file = signatures_from_results(&self.root, &self.parse_results);
-                let source_bytes_map = source_bytes_from_results(&self.root, &self.parse_results);
-
-                let inventory_hashes = freshness
-                    .file_inventory
-                    .iter()
-                    .map(|(path, hash)| {
-                        (
-                            normalize_file_key(&self.root, &path.display().to_string()),
-                            hash.clone(),
-                        )
-                    })
-                    .collect::<HashMap<_, _>>();
-
-                for (file_path, (language, signatures)) in &self.signatures_by_file {
-                    // Parse succeeded: now safe to replace stale file graph/state.
-                    for key in equivalent_file_keys(&self.root, file_path) {
-                        pdg.remove_file(&key);
-                        if let Err(e) = delete_file_data(&mut self.storage, &self.project_id, &key)
-                        {
-                            warn!(
-                                "Phase context: failed to delete file data for '{}' (changed file): {}",
-                                key, e
-                            );
-                        }
-                    }
-
-                    // Use source_bytes from ParsingResult when available, fall back to disk read
-                    let source_bytes_fallback = source_bytes_for_file(&self.root, file_path);
-                    let source_bytes = source_bytes_map
-                        .get(file_path)
-                        .map(|s| s.as_slice())
-                        .unwrap_or_else(|| source_bytes_fallback.as_slice());
-                    let file_pdg = extract_pdg_from_signatures(
-                        signatures.clone(),
-                        source_bytes,
-                        file_path,
-                        language,
-                    );
-                    merge_pdgs(&mut pdg, &file_pdg);
-
-                    let normalized = normalize_file_key(&self.root, file_path);
-                    if let Some(hash) = inventory_hashes.get(&normalized) {
-                        if let Err(e) = update_indexed_file(
-                            &mut self.storage,
-                            &self.project_id,
-                            &normalized,
-                            hash,
-                        ) {
-                            warn!(
-                                "Phase context: failed to update indexed file record for '{}' (incremental): {}",
-                                normalized, e
-                            );
-                        }
-                    }
-                }
-            }
-
-            if !freshness.deleted_files.is_empty() || !self.signatures_by_file.is_empty() {
-                crate::phase::pdg_utils::relink_external_import_edges(
-                    &mut pdg,
-                    &crate::phase::pdg_utils::RelinkConfig::default(),
-                );
-                save_pdg(&mut self.storage, &self.project_id, &pdg)
-                    .context("failed saving refreshed PDG")?;
-            }
-
-            self.pdg = pdg;
-            return Ok(());
+            return self.refresh_persisted_graph(freshness);
         }
 
         // Cold/full path
@@ -241,6 +155,92 @@ impl PhaseExecutionContext {
             }
         }
 
+        Ok(())
+    }
+
+    fn refresh_persisted_graph(&mut self, freshness: &FreshnessState) -> Result<()> {
+        let mut pdg = load_pdg(&self.storage, &self.project_id)
+            .context("failed loading cached PDG for incremental phase run")?;
+
+        for path in &freshness.deleted_files {
+            for key in equivalent_file_keys(&self.root, path) {
+                pdg.remove_file(&key);
+                if let Err(e) = delete_file_data(&mut self.storage, &self.project_id, &key) {
+                    warn!(
+                        "Phase context: failed to delete file data for '{}' (deleted file): {}",
+                        key, e
+                    );
+                }
+            }
+        }
+
+        let parse_paths = freshness.changed_files.clone();
+        if !parse_paths.is_empty() {
+            self.parse_results = ParallelParser::new().parse_files(parse_paths);
+            self.signatures_by_file = signatures_from_results(&self.root, &self.parse_results);
+            let source_bytes_map = source_bytes_from_results(&self.root, &self.parse_results);
+
+            let inventory_hashes = freshness
+                .file_inventory
+                .iter()
+                .map(|(path, hash)| {
+                    (
+                        normalize_file_key(&self.root, &path.display().to_string()),
+                        hash.clone(),
+                    )
+                })
+                .collect::<HashMap<_, _>>();
+
+            for (file_path, (language, signatures)) in &self.signatures_by_file {
+                // Parse succeeded: now safe to replace stale file graph/state.
+                for key in equivalent_file_keys(&self.root, file_path) {
+                    pdg.remove_file(&key);
+                    if let Err(e) = delete_file_data(&mut self.storage, &self.project_id, &key) {
+                        warn!(
+                            "Phase context: failed to delete file data for '{}' (changed file): {}",
+                            key, e
+                        );
+                    }
+                }
+
+                // Use source_bytes from ParsingResult when available, fall back to disk read
+                let source_bytes_fallback = source_bytes_for_file(&self.root, file_path);
+                let source_bytes = source_bytes_map
+                    .get(file_path)
+                    .map(|s| s.as_slice())
+                    .unwrap_or_else(|| source_bytes_fallback.as_slice());
+                let file_pdg = extract_pdg_from_signatures(
+                    signatures.clone(),
+                    source_bytes,
+                    file_path,
+                    language,
+                );
+                merge_pdgs(&mut pdg, &file_pdg);
+
+                let normalized = normalize_file_key(&self.root, file_path);
+                if let Some(hash) = inventory_hashes.get(&normalized) {
+                    if let Err(e) =
+                        update_indexed_file(&mut self.storage, &self.project_id, &normalized, hash)
+                    {
+                        warn!(
+                            "Phase context: failed to update indexed file record for '{}' (incremental): {}",
+                            normalized, e
+                        );
+                    }
+                }
+            }
+        }
+
+        if !freshness.deleted_files.is_empty() || !self.signatures_by_file.is_empty() {
+            crate::phase::pdg_utils::relink_external_import_edges(
+                &mut pdg,
+                &crate::phase::pdg_utils::RelinkConfig::default(),
+            );
+            save_pdg(&mut self.storage, &self.project_id, &pdg)
+                .context("failed saving refreshed PDG")?;
+        }
+
+        self.pdg = pdg;
         Ok(())
     }
 }
@@ -505,6 +505,79 @@ mod tests {
         assert!(
             indexed.is_empty(),
             "failed parse files must not be recorded as indexed"
+        );
+    }
+
+    #[test]
+    fn persisted_refresh_replaces_changed_file_graph_and_updates_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_path_buf();
+        let file = root.join("src/lib.rs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, "pub fn before() {}\n").expect("write initial source");
+
+        let storage = open_storage(&root).expect("open storage");
+        let project_id = project_id(&root);
+        let mut context = PhaseExecutionContext {
+            root: root.clone(),
+            project_id: project_id.clone(),
+            storage,
+            file_inventory: Vec::new(),
+            changed_files: Vec::new(),
+            deleted_files: Vec::new(),
+            parse_results: Vec::new(),
+            signatures_by_file: HashMap::new(),
+            pdg: ProgramDependenceGraph::new(),
+            docs_summary: None,
+            generation_hash: "initial".to_string(),
+        };
+        let initial_freshness = FreshnessState {
+            generation_hash: "initial".to_string(),
+            file_inventory: vec![(file.clone(), "initial-hash".to_string())],
+            changed_files: vec![file.clone()],
+            deleted_files: Vec::new(),
+        };
+        let full_options = PhaseOptions {
+            root: root.clone(),
+            use_incremental_refresh: false,
+            ..PhaseOptions::default()
+        };
+
+        context
+            .load_or_refresh_graph(&full_options, &initial_freshness)
+            .expect("initial full refresh");
+        assert!(pdg_exists(&context.storage, &project_id).expect("persisted graph"));
+
+        std::fs::write(&file, "pub fn after() {}\n").expect("write changed source");
+        let incremental_freshness = FreshnessState {
+            generation_hash: "changed".to_string(),
+            file_inventory: vec![(file.clone(), "changed-hash".to_string())],
+            changed_files: vec![file],
+            deleted_files: Vec::new(),
+        };
+        let incremental_options = PhaseOptions {
+            root,
+            use_incremental_refresh: true,
+            ..PhaseOptions::default()
+        };
+
+        context
+            .load_or_refresh_graph(&incremental_options, &incremental_freshness)
+            .expect("persisted incremental refresh");
+
+        let node_names = context
+            .pdg
+            .node_indices()
+            .filter_map(|id| context.pdg.get_node(id).map(|node| node.name.as_str()))
+            .collect::<Vec<_>>();
+        assert!(node_names.contains(&"after"));
+        assert!(!node_names.contains(&"before"));
+        assert_eq!(
+            get_indexed_files(&context.storage, &project_id)
+                .expect("indexed files")
+                .get("src/lib.rs")
+                .map(String::as_str),
+            Some("changed-hash")
         );
     }
 }

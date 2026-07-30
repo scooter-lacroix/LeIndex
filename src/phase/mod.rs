@@ -106,7 +106,6 @@ pub fn run_phase_analysis(
     let options = options.normalized();
     let context = PhaseExecutionContext::prepare(&options)?;
     let cache = PhaseCache::new(&context.root);
-
     let mut executed_phases = Vec::new();
     let mut cache_hit = false;
 
@@ -117,115 +116,41 @@ pub fn run_phase_analysis(
     let mut phase5_summary = None;
 
     if should_run(1, selection) {
-        if let Some(cached) =
-            cache.load::<Phase1Summary>(&context.project_id, &context.generation_hash, 1)?
-        {
-            phase1_summary = Some(cached.payload);
-            cache_hit = true;
-        } else {
-            let value = phase1::run(&context);
-            cache.save(&context.project_id, &context.generation_hash, 1, &value)?;
-            phase1_summary = Some(value);
-        }
+        let (summary, hit) = run_phase1(&cache, &context)?;
+        phase1_summary = Some(summary);
+        cache_hit |= hit;
         executed_phases.push(1);
     }
-
     if should_run(2, selection) {
-        if let Some(cached) =
-            cache.load::<Phase2Summary>(&context.project_id, &context.generation_hash, 2)?
-        {
-            phase2_summary = Some(cached.payload);
-            cache_hit = true;
-        } else {
-            let value = phase2::run(&context);
-            cache.save(&context.project_id, &context.generation_hash, 2, &value)?;
-            phase2_summary = Some(value);
-        }
+        let (summary, hit) = run_phase2(&cache, &context)?;
+        phase2_summary = Some(summary);
+        cache_hit |= hit;
         executed_phases.push(2);
     }
-
     if should_run(3, selection) {
-        let phase3_key = options_hash_for_phase(3, &options);
-        if let Some(cached) = cache.load_with_options::<Phase3Summary>(
-            &context.project_id,
-            &context.generation_hash,
-            3,
-            phase3_key.as_deref(),
-        )? {
-            phase3_summary = Some(cached.payload);
-            cache_hit = true;
-        } else {
-            let value = phase3::run(&context, &options);
-            cache.save_with_options(
-                &context.project_id,
-                &context.generation_hash,
-                3,
-                phase3_key.as_deref(),
-                &value,
-            )?;
-            phase3_summary = Some(value);
-        }
+        let (summary, hit) = run_phase3(&cache, &context, &options)?;
+        phase3_summary = Some(summary);
+        cache_hit |= hit;
         executed_phases.push(3);
     }
-
     if should_run(4, selection) {
-        let phase4_key = options_hash_for_phase(4, &options);
-        if let Some(cached) = cache.load_with_options::<Phase4Summary>(
-            &context.project_id,
-            &context.generation_hash,
-            4,
-            phase4_key.as_deref(),
-        )? {
-            phase4_summary = Some(cached.payload);
-            cache_hit = true;
-        } else {
-            let value = phase4::run(&context, &options);
-            cache.save_with_options(
-                &context.project_id,
-                &context.generation_hash,
-                4,
-                phase4_key.as_deref(),
-                &value,
-            )?;
-            phase4_summary = Some(value);
-        }
+        let (summary, hit) = run_phase4(&cache, &context, &options)?;
+        phase4_summary = Some(summary);
+        cache_hit |= hit;
         executed_phases.push(4);
     }
-
     if should_run(5, selection) {
-        let p1 = phase1_summary
-            .clone()
-            .unwrap_or_else(|| phase1::run(&context));
-        let p2 = phase2_summary
-            .clone()
-            .unwrap_or_else(|| phase2::run(&context));
-        let p3 = phase3_summary
-            .clone()
-            .unwrap_or_else(|| phase3::run(&context, &options));
-        let p4 = phase4_summary
-            .clone()
-            .unwrap_or_else(|| phase4::run(&context, &options));
-
-        let phase5_key = options_hash_for_phase(5, &options);
-        if let Some(cached) = cache.load_with_options::<Phase5Summary>(
-            &context.project_id,
-            &context.generation_hash,
-            5,
-            phase5_key.as_deref(),
-        )? {
-            phase5_summary = Some(cached.payload);
-            cache_hit = true;
-        } else {
-            let value = phase5::run(&context, &p1, &p2, &p3, &p4);
-            cache.save_with_options(
-                &context.project_id,
-                &context.generation_hash,
-                5,
-                phase5_key.as_deref(),
-                &value,
-            )?;
-            phase5_summary = Some(value);
-        }
+        let (summary, hit) = run_phase5(
+            &cache,
+            &context,
+            &options,
+            phase1_summary.as_ref(),
+            phase2_summary.as_ref(),
+            phase3_summary.as_ref(),
+            phase4_summary.as_ref(),
+        )?;
+        phase5_summary = Some(summary);
+        cache_hit |= hit;
         executed_phases.push(5);
     }
 
@@ -239,7 +164,6 @@ pub fn run_phase_analysis(
         phase5_summary.as_ref(),
         options.max_output_chars,
     );
-
     Ok(PhaseAnalysisReport {
         project_id: context.project_id,
         generation: context.generation_hash,
@@ -254,6 +178,137 @@ pub fn run_phase_analysis(
         phase5: phase5_summary,
         formatted_output,
     })
+}
+
+fn run_phase1(
+    cache: &PhaseCache,
+    context: &PhaseExecutionContext,
+) -> Result<(Phase1Summary, bool)> {
+    if let Some(cached) =
+        cache.load::<Phase1Summary>(&context.project_id, &context.generation_hash, 1)?
+    {
+        return Ok((cached.payload, true));
+    }
+
+    let summary = phase1::run(context);
+    cache.save(&context.project_id, &context.generation_hash, 1, &summary)?;
+    Ok((summary, false))
+}
+
+fn run_phase2(
+    cache: &PhaseCache,
+    context: &PhaseExecutionContext,
+) -> Result<(Phase2Summary, bool)> {
+    if let Some(cached) =
+        cache.load::<Phase2Summary>(&context.project_id, &context.generation_hash, 2)?
+    {
+        return Ok((cached.payload, true));
+    }
+
+    let summary = phase2::run(context);
+    cache.save(&context.project_id, &context.generation_hash, 2, &summary)?;
+    Ok((summary, false))
+}
+
+fn run_phase3(
+    cache: &PhaseCache,
+    context: &PhaseExecutionContext,
+    options: &PhaseOptions,
+) -> Result<(Phase3Summary, bool)> {
+    let key = options_hash_for_phase(3, options);
+    if let Some(cached) = cache.load_with_options::<Phase3Summary>(
+        &context.project_id,
+        &context.generation_hash,
+        3,
+        key.as_deref(),
+    )? {
+        return Ok((cached.payload, true));
+    }
+
+    let summary = phase3::run(context, options);
+    cache.save_with_options(
+        &context.project_id,
+        &context.generation_hash,
+        3,
+        key.as_deref(),
+        &summary,
+    )?;
+    Ok((summary, false))
+}
+
+fn run_phase4(
+    cache: &PhaseCache,
+    context: &PhaseExecutionContext,
+    options: &PhaseOptions,
+) -> Result<(Phase4Summary, bool)> {
+    let key = options_hash_for_phase(4, options);
+    if let Some(cached) = cache.load_with_options::<Phase4Summary>(
+        &context.project_id,
+        &context.generation_hash,
+        4,
+        key.as_deref(),
+    )? {
+        return Ok((cached.payload, true));
+    }
+
+    let summary = phase4::run(context, options);
+    cache.save_with_options(
+        &context.project_id,
+        &context.generation_hash,
+        4,
+        key.as_deref(),
+        &summary,
+    )?;
+    Ok((summary, false))
+}
+
+fn run_phase5(
+    cache: &PhaseCache,
+    context: &PhaseExecutionContext,
+    options: &PhaseOptions,
+    phase1_summary: Option<&Phase1Summary>,
+    phase2_summary: Option<&Phase2Summary>,
+    phase3_summary: Option<&Phase3Summary>,
+    phase4_summary: Option<&Phase4Summary>,
+) -> Result<(Phase5Summary, bool)> {
+    let phase1_summary = phase1_summary
+        .cloned()
+        .unwrap_or_else(|| phase1::run(context));
+    let phase2_summary = phase2_summary
+        .cloned()
+        .unwrap_or_else(|| phase2::run(context));
+    let phase3_summary = phase3_summary
+        .cloned()
+        .unwrap_or_else(|| phase3::run(context, options));
+    let phase4_summary = phase4_summary
+        .cloned()
+        .unwrap_or_else(|| phase4::run(context, options));
+    let key = options_hash_for_phase(5, options);
+
+    if let Some(cached) = cache.load_with_options::<Phase5Summary>(
+        &context.project_id,
+        &context.generation_hash,
+        5,
+        key.as_deref(),
+    )? {
+        return Ok((cached.payload, true));
+    }
+
+    let summary = phase5::run(
+        context,
+        &phase1_summary,
+        &phase2_summary,
+        &phase3_summary,
+        &phase4_summary,
+    );
+    cache.save_with_options(
+        &context.project_id,
+        &context.generation_hash,
+        5,
+        key.as_deref(),
+        &summary,
+    )?;
+    Ok((summary, false))
 }
 
 fn should_run(phase: u8, selection: PhaseSelection) -> bool {

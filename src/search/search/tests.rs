@@ -1,0 +1,997 @@
+use super::*;
+
+pub(super) fn create_test_nodes() -> Vec<NodeInfo> {
+    vec![
+        NodeInfo {
+            node_id: "func1".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "func1".to_string(),
+            language: "rust".to_string(),
+            content: "fn func1() { println!(\"hello\"); }".to_string(),
+            byte_range: (0, 40),
+            tfidf_embedding: vec![1.0, 0.0, 0.0],
+            neural_embedding: None,
+            complexity: 2,
+            signature: None,
+            pre_tokenized: None,
+        },
+        NodeInfo {
+            node_id: "func2".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "func2".to_string(),
+            language: "rust".to_string(),
+            content: "fn func2() { println!(\"world\"); }".to_string(),
+            byte_range: (42, 82),
+            tfidf_embedding: vec![0.0, 1.0, 0.0],
+            neural_embedding: None,
+            complexity: 2,
+            signature: None,
+            pre_tokenized: None,
+        },
+    ]
+}
+
+#[test]
+fn test_search_engine_creation() {
+    let engine = SearchEngine::new();
+    assert_eq!(engine.node_count(), 0);
+    assert!(engine.is_empty());
+}
+
+#[test]
+fn neural_rows_can_be_published_after_core_index() {
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(create_test_nodes());
+    assert_eq!(engine.collect_neural_embeddings().len(), 0);
+
+    let updated = engine.update_neural_embeddings(vec![
+        ("func1".to_string(), vec![0.25, 0.5]),
+        ("missing".to_string(), vec![1.0, 1.0]),
+    ]);
+    assert_eq!(updated, 1);
+    assert_eq!(engine.collect_neural_embeddings().len(), 1);
+
+    engine.clear_neural_embeddings();
+    assert!(engine.collect_neural_embeddings().is_empty());
+}
+
+#[test]
+fn test_index_nodes() {
+    let mut engine = SearchEngine::new();
+    let nodes = create_test_nodes();
+    engine.index_nodes(nodes);
+    assert_eq!(engine.node_count(), 2);
+    assert!(!engine.is_empty());
+}
+
+#[test]
+fn test_search_snapshot_restore_round_trip() {
+    let mut tfidf_embedding = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf_embedding[0] = 1.0;
+
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "// authenticate_user in auth.rs\npub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 57),
+        tfidf_embedding,
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec![
+            "authenticate".to_string(),
+            "user".to_string(),
+            "token".to_string(),
+        ]),
+    }]);
+
+    let snapshot = engine.search_snapshot(1, 0, "test-fingerprint".to_string());
+    let embeddings = engine.collect_embeddings();
+    let dir = tempfile::tempdir().unwrap();
+    let mmap_path = dir.path().join("embeddings.bin");
+    crate::search::vector::write_mmap_embeddings(&mmap_path, &embeddings).unwrap();
+    let mmap = crate::search::vector::MmapEmbeddingIndex::open(&mmap_path).unwrap();
+
+    let mut restored = SearchEngine::new();
+    let restored_count = restored
+        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None)
+        .unwrap();
+
+    assert_eq!(restored_count, 1);
+    assert!(restored.validate_coherence().is_ok());
+    assert_eq!(
+        restored.nodes[0].signature.as_deref(),
+        Some("pub fn authenticate_user() {}")
+    );
+
+    let results = restored
+        .search(SearchQuery {
+            query: "authenticate token".to_string(),
+            top_k: 5,
+            token_budget: None,
+            semantic: true,
+            expand_context: false,
+            query_embedding: Some(embeddings[0].1.clone()),
+            query_neural_embedding: None,
+            threshold: None,
+            query_type: None,
+        })
+        .unwrap();
+    assert_eq!(results[0].node_id, "auth.rs:authenticate_user");
+}
+
+#[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+#[test]
+fn search_snapshot_restores_neural_rows_without_heap_tfidf_copy() {
+    let mut engine = SearchEngine::new();
+    let mut tfidf = vec![0.0; DEFAULT_EMBEDDING_DIMENSION];
+    tfidf[0] = 1.0;
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "neural-node".to_string(),
+        file_path: "main.rs".to_string(),
+        symbol_name: "neural_node".to_string(),
+        language: "rust".to_string(),
+        content: "// neural_node in main.rs\nfn neural_node() {}".to_string(),
+        byte_range: (0, 44),
+        tfidf_embedding: tfidf,
+        neural_embedding: None,
+        complexity: 1,
+        signature: None,
+        pre_tokenized: Some(vec!["neural".to_string(), "node".to_string()]),
+    }]);
+    let neural = vec![(
+        "neural-node".to_string(),
+        vec![0.5; NEURAL_EMBEDDING_DIMENSION],
+    )];
+    engine.update_neural_embeddings(neural.clone());
+    let snapshot = engine.search_snapshot(1, 0, "neural-fingerprint".to_string());
+    let dir = tempfile::tempdir().unwrap();
+    let tfidf_path = dir.path().join("tfidf.bin");
+    let neural_path = dir.path().join("neural.bin");
+    crate::search::vector::write_mmap_embeddings(&tfidf_path, &engine.collect_embeddings())
+        .unwrap();
+    crate::search::vector::write_mmap_embeddings(&neural_path, &neural).unwrap();
+    let tfidf_mmap = crate::search::vector::MmapEmbeddingIndex::open(&tfidf_path).unwrap();
+    let neural_mmap = crate::search::vector::MmapEmbeddingIndex::open(&neural_path).unwrap();
+
+    let mut restored = SearchEngine::new();
+    restored
+        .restore_from_search_snapshot(snapshot, Arc::new(tfidf_mmap), Some(Arc::new(neural_mmap)))
+        .unwrap();
+    assert_eq!(restored.collect_neural_embeddings().len(), 1);
+    assert!(restored.nodes[0].tfidf_embedding.is_empty());
+}
+
+#[test]
+fn test_search_snapshot_restore_rejects_wrong_tfidf_dimension() {
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "auth.rs:authenticate_user".to_string(),
+        file_path: "auth.rs".to_string(),
+        symbol_name: "authenticate_user".to_string(),
+        language: "rust".to_string(),
+        content: "pub fn authenticate_user() {}".to_string(),
+        byte_range: (0, 29),
+        tfidf_embedding: vec![1.0, 0.0, 0.0],
+        neural_embedding: None,
+        complexity: 3,
+        signature: None,
+        pre_tokenized: Some(vec!["authenticate".to_string(), "user".to_string()]),
+    }]);
+
+    let snapshot = engine.search_snapshot(1, 0, "test-fingerprint".to_string());
+    let dir = tempfile::tempdir().unwrap();
+    let mmap_path = dir.path().join("bad_embeddings.bin");
+    crate::search::vector::write_mmap_embeddings(
+        &mmap_path,
+        &[("auth.rs:authenticate_user".to_string(), vec![1.0, 0.0, 0.0])],
+    )
+    .unwrap();
+    let mmap = crate::search::vector::MmapEmbeddingIndex::open(&mmap_path).unwrap();
+
+    let mut restored = SearchEngine::new();
+    let err = restored
+        .restore_from_search_snapshot(snapshot, Arc::new(mmap), None)
+        .unwrap_err();
+    assert!(err.contains("TF-IDF mmap dimension"));
+    assert!(restored.is_empty());
+}
+
+#[test]
+fn test_search_empty_index() {
+    let mut engine = SearchEngine::new();
+    let query = SearchQuery {
+        query: "test".to_string(),
+        top_k: 10,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: None,
+        query_type: None,
+    };
+    let results = engine.search(query).unwrap();
+    assert!(results.is_empty());
+}
+
+#[test]
+fn test_semantic_search_empty_index() {
+    let engine = SearchEngine::new();
+    let results = engine.semantic_search(&[0.1, 0.2, 0.3], 10).unwrap();
+    assert!(results.is_empty());
+}
+
+#[test]
+fn test_search_with_results() {
+    let mut engine = SearchEngine::new();
+    let nodes = create_test_nodes();
+    engine.index_nodes(nodes);
+
+    let query = SearchQuery {
+        query: "func1".to_string(),
+        top_k: 10,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: None,
+        query_type: None,
+    };
+    let results = engine.search(query).unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0].node_id, "func1");
+}
+
+#[test]
+fn test_semantic_search() {
+    let mut engine = SearchEngine::with_dimension(3);
+    let nodes = create_test_nodes();
+    engine.index_nodes(nodes);
+
+    // Search with query vector similar to func1
+    let results = engine.semantic_search(&[1.0, 0.0, 0.0], 1).unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0].node_id, "func1");
+}
+
+#[test]
+fn test_dimension_validation() {
+    let engine = SearchEngine::with_dimension(128);
+    assert_eq!(engine.vector_index().dimension(), 128);
+}
+
+#[test]
+fn test_dimension_mismatch_error() {
+    let mut engine = SearchEngine::with_dimension(3);
+    let nodes = create_test_nodes();
+    engine.index_nodes(nodes);
+
+    // Try searching with wrong dimension
+    let result = engine.semantic_search(&[0.1, 0.2], 10);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_hnsw_enable() {
+    let mut engine = SearchEngine::with_dimension(128);
+    engine.enable_hnsw(None);
+    assert!(engine.vector_index().is_hnsw_enabled());
+}
+
+#[test]
+fn test_top_k_limit() {
+    let mut engine = SearchEngine::new();
+    let nodes = create_test_nodes();
+    engine.index_nodes(nodes);
+
+    let query = SearchQuery {
+        query: "fn".to_string(),
+        top_k: 1,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: None,
+        query_type: None,
+    };
+    let results = engine.search(query).unwrap();
+    assert_eq!(results.len(), 1);
+}
+
+#[test]
+fn test_relevance_threshold() {
+    let mut engine = SearchEngine::new();
+    let nodes = create_test_nodes();
+    engine.index_nodes(nodes);
+
+    let query = SearchQuery {
+        query: "nonexistent".to_string(),
+        top_k: 10,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: Some(0.5),
+        query_type: None,
+    };
+    let results = engine.search(query).unwrap();
+    assert!(results.is_empty());
+}
+
+#[test]
+fn test_node_id_to_idx_populated() {
+    let mut engine = SearchEngine::new();
+    let nodes = create_test_nodes();
+    engine.index_nodes(nodes);
+
+    // Verify node_id_to_idx is populated with correct indices
+    assert_eq!(engine.node_id_to_idx.len(), 2);
+    assert_eq!(engine.node_id_to_idx.get("func1"), Some(&0));
+    assert_eq!(engine.node_id_to_idx.get("func2"), Some(&1));
+}
+
+#[test]
+fn test_node_id_to_idx_o1_lookup_in_semantic_search() {
+    let mut engine = SearchEngine::with_dimension(3);
+    let nodes = create_test_nodes();
+    engine.index_nodes(nodes);
+
+    // Verify semantic_search uses node_id_to_idx for O(1) lookup
+    // by checking that results are still correct after optimization
+    let results = engine.semantic_search(&[1.0, 0.0, 0.0], 10).unwrap();
+    assert!(!results.is_empty());
+
+    // The top result should be func1 (closest to query vector)
+    assert_eq!(results[0].node_id, "func1");
+    assert_eq!(results[0].entry_type, EntryType::Function);
+
+    // Verify all results have correct entry type
+    for entry in &results {
+        assert_eq!(entry.entry_type, EntryType::Function);
+    }
+}
+
+#[test]
+fn test_node_id_to_idx_cleared_on_reindex() {
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(create_test_nodes());
+    assert_eq!(engine.node_id_to_idx.len(), 2);
+
+    // Re-index with different nodes - should clear and repopulate
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "new_func".to_string(),
+        file_path: "new.rs".to_string(),
+        symbol_name: "new_func".to_string(),
+        language: "rust".to_string(),
+        content: "fn new_func() {}".to_string(),
+        byte_range: (0, 18),
+        tfidf_embedding: vec![],
+        neural_embedding: None,
+        complexity: 1,
+        signature: None,
+        pre_tokenized: None,
+    }]);
+    assert_eq!(engine.node_id_to_idx.len(), 1);
+    assert_eq!(engine.node_id_to_idx.get("new_func"), Some(&0));
+    assert_eq!(engine.node_id_to_idx.get("func1"), None);
+}
+
+#[test]
+fn test_content_cleared_after_indexing() {
+    // T13: Verify that NodeInfo.content is cleared after index_nodes()
+    // to reduce memory footprint. The inverted index (text_index) preserves
+    // all token information for search.
+    let mut engine = SearchEngine::new();
+    let nodes = create_test_nodes();
+    engine.index_nodes(nodes);
+
+    // Content should be empty (cleared) for all nodes
+    for node in &engine.nodes {
+        assert!(
+            node.content.is_empty(),
+            "Node {} content should be cleared after indexing, but got: {:?}",
+            node.node_id,
+            node.content
+        );
+    }
+
+    // But text search should still work via inverted index
+    let query = SearchQuery {
+        query: "func1".to_string(),
+        top_k: 10,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: None,
+        query_type: None,
+    };
+    let results = engine.search(query).unwrap();
+    assert!(
+        !results.is_empty(),
+        "Search should still find results via inverted index after content cleared"
+    );
+    assert_eq!(results[0].node_id, "func1");
+
+    // Also verify text_index is populated
+    assert!(
+        !engine.text_index.is_empty(),
+        "text_index should be populated"
+    );
+    assert!(
+        engine.text_index.contains_key("func1"),
+        "text_index should contain 'func1' token"
+    );
+    assert!(
+        engine.text_index.contains_key("func2"),
+        "text_index should contain 'func2' token"
+    );
+}
+
+#[test]
+fn test_node_tokens_populated() {
+    // T14: Verify that node_tokens cache is populated during index_nodes()
+    let mut engine = SearchEngine::new();
+    let nodes = create_test_nodes();
+    engine.index_nodes(nodes);
+
+    // node_tokens should have an entry for each node
+    assert_eq!(engine.node_tokens.len(), 2);
+    assert!(engine.node_tokens.contains_key("func1"));
+    assert!(engine.node_tokens.contains_key("func2"));
+
+    // Verify tokens contain expected normalized content
+    let func1_tokens = engine.node_tokens.get("func1").unwrap();
+    assert!(
+        func1_tokens.contains("func1"),
+        "func1 tokens should contain 'func1', got: {:?}",
+        func1_tokens
+    );
+
+    let func2_tokens = engine.node_tokens.get("func2").unwrap();
+    assert!(
+        func2_tokens.contains("func2"),
+        "func2 tokens should contain 'func2', got: {:?}",
+        func2_tokens
+    );
+}
+
+#[test]
+fn test_node_tokens_cleared_on_reindex() {
+    // T14: Verify node_tokens is cleared when re-indexing
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(create_test_nodes());
+    assert_eq!(engine.node_tokens.len(), 2);
+
+    // Re-index with different nodes
+    engine.index_nodes(vec![NodeInfo {
+        node_id: "new_func".to_string(),
+        file_path: "test.rs".to_string(),
+        symbol_name: "new_func".to_string(),
+        language: "rust".to_string(),
+        content: "fn new_func() {}".to_string(),
+        byte_range: (0, 18),
+        tfidf_embedding: vec![],
+        neural_embedding: None,
+        complexity: 1,
+        signature: None,
+        pre_tokenized: None,
+    }]);
+    assert_eq!(engine.node_tokens.len(), 1);
+    assert!(engine.node_tokens.contains_key("new_func"));
+    assert!(!engine.node_tokens.contains_key("func1"));
+}
+
+#[test]
+fn test_node_tokens_used_in_scoring() {
+    // T14: Verify that scoring uses cached tokens (no re-tokenization)
+    // by checking that search results are correct after content is cleared.
+    // This implicitly tests that calculate_text_score_optimized uses node_tokens.
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(create_test_nodes());
+
+    // Content is cleared (T13), but tokens are cached (T14)
+    for node in &engine.nodes {
+        assert!(node.content.is_empty());
+    }
+
+    // Search for a term that appears in content — should still find it via cached tokens
+    let query = SearchQuery {
+        query: "println hello".to_string(),
+        top_k: 10,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: None,
+        query_type: None,
+    };
+    let results = engine.search(query).unwrap();
+
+    // Should find results since "println" and "hello" appear in node content and tokens are cached
+    assert!(
+        !results.is_empty(),
+        "Search should find results using cached node_tokens even after content is cleared"
+    );
+    // func1 contains both "println" and "hello", should be top result
+    assert_eq!(results[0].node_id, "func1");
+}
+
+// ----------------------------------------------------------------
+// T28: Incremental reindex tests
+// ----------------------------------------------------------------
+
+#[test]
+fn test_incremental_reindex_add_nodes() {
+    // T28: Adding nodes via incremental_reindex should update all indexes
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(create_test_nodes());
+    assert_eq!(engine.node_count(), 2);
+
+    let delta = TextIndexDelta {
+        removed_node_ids: vec![],
+        updated_nodes: vec![NodeInfo {
+            node_id: "func3".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "func3".to_string(),
+            language: "rust".to_string(),
+            content: "fn func3() { db_query(); }".to_string(),
+            byte_range: (100, 130),
+            tfidf_embedding: vec![0.0, 0.0, 1.0],
+            neural_embedding: None,
+            complexity: 3,
+            signature: None,
+            pre_tokenized: None,
+        }],
+    };
+    engine.incremental_reindex(delta);
+
+    // Should now have 3 nodes
+    assert_eq!(engine.node_count(), 3);
+    assert_eq!(engine.node_id_to_idx.len(), 3);
+    assert_eq!(engine.node_tokens.len(), 3);
+    assert_eq!(engine.complexity_cache.len(), 3);
+
+    // Search should find the new node
+    let query = SearchQuery {
+        query: "func3".to_string(),
+        top_k: 10,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: None,
+        query_type: None,
+    };
+    let results = engine.search(query).unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0].node_id, "func3");
+
+    // text_index should contain "func3" token
+    assert!(engine.text_index.contains_key("func3"));
+    // "db" and "query" tokens should also be indexed
+    assert!(engine.text_index.contains_key("query"));
+}
+
+#[test]
+fn test_incremental_reindex_remove_nodes() {
+    // T28: Removing nodes via incremental_reindex should clean up all indexes
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(create_test_nodes());
+    assert_eq!(engine.node_count(), 2);
+
+    let delta = TextIndexDelta {
+        removed_node_ids: vec!["func1".to_string()],
+        updated_nodes: vec![],
+    };
+    engine.incremental_reindex(delta);
+
+    // Should now have 1 node
+    assert_eq!(engine.node_count(), 1);
+    assert_eq!(engine.node_id_to_idx.len(), 1);
+    assert!(!engine.node_id_to_idx.contains_key("func1"));
+    assert!(engine.node_id_to_idx.contains_key("func2"));
+
+    // func1's tokens should be removed from text_index
+    // "func1" token should no longer map to func1
+    if let Some(ids) = engine.text_index.get("func1") {
+        assert!(
+            !ids.contains("func1"),
+            "func1 should be removed from text_index"
+        );
+    }
+
+    // node_tokens should not contain func1
+    assert!(!engine.node_tokens.contains_key("func1"));
+    assert!(engine.node_tokens.contains_key("func2"));
+
+    // Search for func1 should not find it
+    let query = SearchQuery {
+        query: "func1".to_string(),
+        top_k: 10,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: None,
+        query_type: None,
+    };
+    let results = engine.search(query).unwrap();
+    assert!(
+        results.is_empty(),
+        "func1 should not be found after removal"
+    );
+}
+
+#[test]
+fn test_incremental_reindex_update_existing_node() {
+    // T28: Updating an existing node should replace it correctly
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(create_test_nodes());
+
+    // Update func1 with new content
+    let delta = TextIndexDelta {
+        removed_node_ids: vec![],
+        updated_nodes: vec![NodeInfo {
+            node_id: "func1".to_string(),
+            file_path: "updated.rs".to_string(),
+            symbol_name: "func1_renamed".to_string(),
+            language: "rust".to_string(),
+            content: "fn func1_renamed() { new_logic(); }".to_string(),
+            byte_range: (0, 35),
+            tfidf_embedding: vec![0.5, 0.5, 0.0],
+            neural_embedding: None,
+            complexity: 5,
+            signature: None,
+            pre_tokenized: None,
+        }],
+    };
+    engine.incremental_reindex(delta);
+
+    // Should still have 2 nodes
+    assert_eq!(engine.node_count(), 2);
+
+    // Complexity cache should reflect the update
+    assert_eq!(engine.complexity_cache.get("func1"), Some(&5));
+
+    // New tokens should be indexed
+    assert!(engine.node_tokens.get("func1").unwrap().contains("logic"));
+    assert!(engine.text_index.contains_key("logic"));
+
+    // Search for new content should work
+    let query = SearchQuery {
+        query: "new_logic".to_string(),
+        top_k: 10,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: None,
+        query_type: None,
+    };
+    let results = engine.search(query).unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0].node_id, "func1");
+}
+
+#[test]
+fn test_incremental_reindex_combined_add_remove() {
+    // T28: Combined add and remove in one delta
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(create_test_nodes());
+
+    let delta = TextIndexDelta {
+        removed_node_ids: vec!["func1".to_string()],
+        updated_nodes: vec![
+            NodeInfo {
+                node_id: "func3".to_string(),
+                file_path: "new.rs".to_string(),
+                symbol_name: "func3".to_string(),
+                language: "rust".to_string(),
+                content: "fn func3() {}".to_string(),
+                byte_range: (0, 14),
+                tfidf_embedding: vec![],
+                neural_embedding: None,
+                complexity: 1,
+                signature: None,
+                pre_tokenized: None,
+            },
+            NodeInfo {
+                node_id: "func4".to_string(),
+                file_path: "new.rs".to_string(),
+                symbol_name: "func4".to_string(),
+                language: "rust".to_string(),
+                content: "fn func4() { helper(); }".to_string(),
+                byte_range: (15, 40),
+                tfidf_embedding: vec![],
+                neural_embedding: None,
+                complexity: 2,
+                signature: None,
+                pre_tokenized: None,
+            },
+        ],
+    };
+    engine.incremental_reindex(delta);
+
+    // Should have func2 (original) + func3 + func4 = 3 nodes
+    assert_eq!(engine.node_count(), 3);
+    assert_eq!(engine.node_id_to_idx.len(), 3);
+
+    // func1 should be gone
+    assert!(!engine.node_id_to_idx.contains_key("func1"));
+    // func2, func3, func4 should exist
+    assert!(engine.node_id_to_idx.contains_key("func2"));
+    assert!(engine.node_id_to_idx.contains_key("func3"));
+    assert!(engine.node_id_to_idx.contains_key("func4"));
+
+    // Search for func2 should still work
+    let query = SearchQuery {
+        query: "func2".to_string(),
+        top_k: 10,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: None,
+        query_type: None,
+    };
+    let results = engine.search(query).unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0].node_id, "func2");
+}
+
+#[test]
+fn test_incremental_reindex_empty_delta() {
+    // T28: Empty delta should not change anything
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(create_test_nodes());
+
+    let delta = TextIndexDelta {
+        removed_node_ids: vec![],
+        updated_nodes: vec![],
+    };
+    engine.incremental_reindex(delta);
+
+    assert_eq!(engine.node_count(), 2);
+    assert_eq!(engine.node_id_to_idx.len(), 2);
+}
+
+#[test]
+fn test_incremental_reindex_removes_empty_token_sets() {
+    // T28: When removing the last node for a token, the token entry should be removed
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(vec![
+        NodeInfo {
+            node_id: "unique1".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "unique1".to_string(),
+            language: "rust".to_string(),
+            content: "fn unique1() { zebra(); }".to_string(),
+            byte_range: (0, 25),
+            tfidf_embedding: vec![],
+            neural_embedding: None,
+            complexity: 1,
+            signature: None,
+            pre_tokenized: None,
+        },
+        NodeInfo {
+            node_id: "unique2".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "unique2".to_string(),
+            language: "rust".to_string(),
+            content: "fn unique2() { apple(); }".to_string(),
+            byte_range: (26, 52),
+            tfidf_embedding: vec![],
+            neural_embedding: None,
+            complexity: 1,
+            signature: None,
+            pre_tokenized: None,
+        },
+    ]);
+
+    // "zebra" token should exist and map to unique1 only
+    assert!(engine.text_index.contains_key("zebra"));
+
+    // Remove unique1 — "zebra" token set should be cleaned up entirely
+    let delta = TextIndexDelta {
+        removed_node_ids: vec!["unique1".to_string()],
+        updated_nodes: vec![],
+    };
+    engine.incremental_reindex(delta);
+
+    // "zebra" token should no longer exist in text_index (no remaining nodes have it)
+    assert!(
+        !engine.text_index.contains_key("zebra"),
+        "Token with no remaining nodes should be removed from text_index"
+    );
+
+    // "apple" should still exist
+    assert!(engine.text_index.contains_key("apple"));
+}
+
+#[test]
+fn test_incremental_reindex_correctness_vs_full_rebuild() {
+    // T28: Incremental reindex should produce identical results to a full rebuild
+    let mut engine_inc = SearchEngine::new();
+    let mut engine_full = SearchEngine::new();
+
+    // Start with same initial nodes
+    let initial = create_test_nodes();
+    engine_inc.index_nodes(initial.clone());
+    engine_full.index_nodes(initial);
+
+    // Apply delta incrementally
+    let delta = TextIndexDelta {
+        removed_node_ids: vec!["func1".to_string()],
+        updated_nodes: vec![NodeInfo {
+            node_id: "func3".to_string(),
+            file_path: "new.rs".to_string(),
+            symbol_name: "func3".to_string(),
+            language: "rust".to_string(),
+            content: "fn func3() { compute(); }".to_string(),
+            byte_range: (0, 25),
+            tfidf_embedding: vec![1.0, 1.0, 0.0],
+            neural_embedding: None,
+            complexity: 4,
+            signature: None,
+            pre_tokenized: None,
+        }],
+    };
+    engine_inc.incremental_reindex(delta);
+
+    // Apply same changes via full rebuild
+    engine_full.index_nodes(vec![
+        NodeInfo {
+            node_id: "func2".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "func2".to_string(),
+            language: "rust".to_string(),
+            content: "fn func2() { println!(\"world\"); }".to_string(),
+            byte_range: (42, 82),
+            tfidf_embedding: vec![0.0, 1.0, 0.0],
+            neural_embedding: None,
+            complexity: 2,
+            signature: None,
+            pre_tokenized: None,
+        },
+        NodeInfo {
+            node_id: "func3".to_string(),
+            file_path: "new.rs".to_string(),
+            symbol_name: "func3".to_string(),
+            language: "rust".to_string(),
+            content: "fn func3() { compute(); }".to_string(),
+            byte_range: (0, 25),
+            tfidf_embedding: vec![1.0, 1.0, 0.0],
+            neural_embedding: None,
+            complexity: 4,
+            signature: None,
+            pre_tokenized: None,
+        },
+    ]);
+
+    // Both engines should have same node count
+    assert_eq!(engine_inc.node_count(), engine_full.node_count());
+
+    // Both should have same node_ids
+    let inc_ids: std::collections::BTreeSet<_> =
+        engine_inc.nodes.iter().map(|n| n.node_id.clone()).collect();
+    let full_ids: std::collections::BTreeSet<_> = engine_full
+        .nodes
+        .iter()
+        .map(|n| n.node_id.clone())
+        .collect();
+    assert_eq!(inc_ids, full_ids);
+
+    // Search should produce same results
+    let query = SearchQuery {
+        query: "func2".to_string(),
+        top_k: 10,
+        token_budget: None,
+        semantic: false,
+        expand_context: false,
+        query_embedding: None,
+        query_neural_embedding: None,
+        threshold: None,
+        query_type: None,
+    };
+    let inc_results = engine_inc.search(query.clone()).unwrap();
+    let full_results = engine_full.search(query).unwrap();
+    assert_eq!(inc_results.len(), full_results.len());
+    if !inc_results.is_empty() {
+        assert_eq!(inc_results[0].node_id, full_results[0].node_id);
+    }
+
+    // Semantic search should also produce same results
+    let inc_sem = engine_inc.semantic_search(&[1.0, 1.0, 0.0], 10).unwrap();
+    let full_sem = engine_full.semantic_search(&[1.0, 1.0, 0.0], 10).unwrap();
+    assert_eq!(inc_sem.len(), full_sem.len());
+    if !inc_sem.is_empty() {
+        assert_eq!(inc_sem[0].node_id, full_sem[0].node_id);
+    }
+}
+
+#[test]
+fn test_incremental_reindex_semantic_search_after_update() {
+    // T28: Semantic search should work correctly after incremental update
+    let mut engine = SearchEngine::with_dimension(3);
+    engine.index_nodes(create_test_nodes());
+
+    // Add a new node with a distinct embedding
+    let delta = TextIndexDelta {
+        removed_node_ids: vec![],
+        updated_nodes: vec![NodeInfo {
+            node_id: "func3".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "func3".to_string(),
+            language: "rust".to_string(),
+            content: "fn func3() {}".to_string(),
+            byte_range: (0, 14),
+            tfidf_embedding: vec![0.1, 0.1, 0.9],
+            neural_embedding: None,
+            complexity: 1,
+            signature: None,
+            pre_tokenized: None,
+        }],
+    };
+    engine.incremental_reindex(delta);
+
+    // Search for vec close to func3's embedding
+    let results = engine.semantic_search(&[0.1, 0.1, 0.9], 1).unwrap();
+    assert!(!results.is_empty());
+    assert_eq!(results[0].node_id, "func3");
+}
+
+#[test]
+fn test_incremental_reindex_node_id_to_idx_consistency() {
+    // T28: node_id_to_idx should be consistent after multiple incremental updates
+    let mut engine = SearchEngine::new();
+    engine.index_nodes(create_test_nodes());
+
+    // Add func3
+    engine.incremental_reindex(TextIndexDelta {
+        removed_node_ids: vec![],
+        updated_nodes: vec![NodeInfo {
+            node_id: "func3".to_string(),
+            file_path: "test.rs".to_string(),
+            symbol_name: "func3".to_string(),
+            language: "rust".to_string(),
+            content: "fn func3() {}".to_string(),
+            byte_range: (0, 14),
+            tfidf_embedding: vec![],
+            neural_embedding: None,
+            complexity: 1,
+            signature: None,
+            pre_tokenized: None,
+        }],
+    });
+
+    // Remove func1 (swap-remove may swap func3 into func1's slot)
+    engine.incremental_reindex(TextIndexDelta {
+        removed_node_ids: vec!["func1".to_string()],
+        updated_nodes: vec![],
+    });
+
+    // Verify all indices are consistent
+    assert_eq!(engine.node_id_to_idx.len(), engine.nodes.len());
+    for (idx, node) in engine.nodes.iter().enumerate() {
+        assert_eq!(
+            engine.node_id_to_idx.get(&node.node_id),
+            Some(&idx),
+            "node_id_to_idx mismatch for node {}",
+            node.node_id
+        );
+    }
+}

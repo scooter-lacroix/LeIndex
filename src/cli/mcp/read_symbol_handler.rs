@@ -67,124 +67,31 @@ impl ReadSymbolHandler {
                 e
             ))
         })?;
-        let mut file = file_hint
+        let file = file_hint
             .map(|raw| live.file(raw))
             .transpose()
             .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
-        let mut source_stale = false;
-
-        let db_path = live.active_storage().join("leindex.db");
-        if db_path.is_file() {
-            if let Ok(Some(catalog)) = CatalogReader::open(&db_path, live.root()).await {
-                if let Ok(symbols) = catalog.find_symbol(&symbol, file.as_deref()).await {
-                    if let Some(mut node) = symbols.into_iter().next() {
-                        node.file_path = live
-                            .file(&node.file_path.to_string_lossy())
-                            .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
-                        let bytes = read_live_bytes(node.file_path.clone()).await?;
-                        if catalog_is_fresh(&catalog, &node.file_path, &bytes).await {
-                            let relations = resident_relations(
-                                registry,
-                                &live,
-                                &node,
-                                include_dependencies,
-                                false,
-                                budget,
-                                started,
-                            )
-                            .await;
-                            return symbol_response(
-                                node,
-                                bytes,
-                                token_budget,
-                                false,
-                                relations,
-                                budget,
-                            );
-                        }
-                        // A stale catalog still supplies a vetted in-root source
-                        // candidate; parse it live instead of hydrating a PDG.
-                        source_stale = true;
-                        file = Some(node.file_path);
-                    }
-                }
+        let (file, source_stale) = match catalog_lookup(&live, &symbol, file.as_deref()).await? {
+            CatalogLookup::Fresh { node, bytes } => {
+                let relations = resident_relations(
+                    registry,
+                    &live,
+                    &node,
+                    include_dependencies,
+                    false,
+                    budget,
+                    started,
+                )
+                .await;
+                return symbol_response(node, bytes, token_budget, false, relations, budget);
             }
-        }
+            CatalogLookup::Stale { file } => (Some(file), true),
+            CatalogLookup::Miss => (file, false),
+        };
 
-        let (parsed, node) = if let Some(file) = file {
-            let parsed = parse_live_file(file).await?;
-            let node = parsed
-                .symbols
-                .iter()
-                .find(|node| {
-                    node.symbol_name.eq_ignore_ascii_case(&symbol)
-                        || node.qualified_name.eq_ignore_ascii_case(&symbol)
-                })
-                .cloned()
-                .ok_or_else(|| {
-                    JsonRpcError::invalid_params(format!(
-                        "Symbol '{}' not found in live source",
-                        symbol
-                    ))
-                })?;
-            (parsed, node)
-        } else {
-            // A catalog miss without a file hint should still be useful. Git
-            // supplies an ignore-aware candidate list; cap parsing at 20 files
-            // so a typo cannot turn a symbol lookup into a repository scan.
-            let root = live.root().to_path_buf();
-            let candidates = tokio::task::spawn_blocking(move || {
-                match crate::cli::git::source_inventory(&root) {
-                    Ok(paths) => paths,
-                    Err(crate::cli::git::GitInventoryError::NotRepository) => {
-                        walkdir::WalkDir::new(&root)
-                            .follow_links(false)
-                            .into_iter()
-                            .filter_entry(|entry| {
-                                let name = entry.file_name().to_string_lossy();
-                                !crate::cli::skip_dirs::SKIP_DIRS
-                                    .iter()
-                                    .any(|skip| name == *skip)
-                            })
-                            .filter_map(Result::ok)
-                            .filter(|entry| entry.file_type().is_file())
-                            .map(|entry| entry.path().to_path_buf())
-                            .collect()
-                    }
-                    Err(_) => Vec::new(),
-                }
-                .into_iter()
-                .take(20)
-                .collect::<Vec<_>>()
-            })
-            .await
-            .map_err(|error| {
-                JsonRpcError::internal_error(format!("live symbol inventory failed: {error}"))
-            })?;
-            let mut found = None;
-            for candidate in candidates {
-                let Ok(parsed) = parse_live_file(candidate).await else {
-                    continue;
-                };
-                if let Some(node) = parsed
-                    .symbols
-                    .iter()
-                    .find(|node| {
-                        node.symbol_name.eq_ignore_ascii_case(&symbol)
-                            || node.qualified_name.eq_ignore_ascii_case(&symbol)
-                    })
-                    .cloned()
-                {
-                    found = Some((parsed, node));
-                    break;
-                }
-            }
-            found.ok_or_else(|| {
-                JsonRpcError::invalid_params(format!(
-                    "Symbol '{}' not found in the first 20 live source candidates",
-                    symbol
-                ))
-            })?
+        let (parsed, node) = match file {
+            Some(file) => parse_live_symbol(file, &symbol).await?,
+            None => find_live_symbol_in_inventory(&live, &symbol).await?,
         };
         let relations = resident_relations(
             registry,
@@ -198,6 +105,115 @@ impl ReadSymbolHandler {
         .await;
         symbol_response(node, parsed.bytes, token_budget, true, relations, budget)
     }
+}
+
+enum CatalogLookup {
+    Fresh { node: CatalogSymbol, bytes: Vec<u8> },
+    Stale { file: PathBuf },
+    Miss,
+}
+
+async fn catalog_lookup(
+    live: &LiveProject,
+    symbol: &str,
+    file: Option<&Path>,
+) -> Result<CatalogLookup, JsonRpcError> {
+    let db_path = live.active_storage().join("leindex.db");
+    if !db_path.is_file() {
+        return Ok(CatalogLookup::Miss);
+    }
+    let Ok(Some(catalog)) = CatalogReader::open(&db_path, live.root()).await else {
+        return Ok(CatalogLookup::Miss);
+    };
+    let Ok(symbols) = catalog.find_symbol(symbol, file).await else {
+        return Ok(CatalogLookup::Miss);
+    };
+    let Some(mut node) = symbols.into_iter().next() else {
+        return Ok(CatalogLookup::Miss);
+    };
+    node.file_path = live
+        .file(&node.file_path.to_string_lossy())
+        .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
+    let bytes = read_live_bytes(node.file_path.clone()).await?;
+    if catalog_is_fresh(&catalog, &node.file_path, &bytes).await {
+        Ok(CatalogLookup::Fresh { node, bytes })
+    } else {
+        // A stale catalog still supplies a vetted in-root source candidate;
+        // parse it live instead of hydrating a PDG.
+        Ok(CatalogLookup::Stale {
+            file: node.file_path,
+        })
+    }
+}
+
+async fn parse_live_symbol(
+    file: PathBuf,
+    symbol: &str,
+) -> Result<(LiveParse, CatalogSymbol), JsonRpcError> {
+    let parsed = parse_live_file(file).await?;
+    let node = find_live_symbol(&parsed, symbol).ok_or_else(|| {
+        JsonRpcError::invalid_params(format!("Symbol '{}' not found in live source", symbol))
+    })?;
+    Ok((parsed, node))
+}
+
+fn find_live_symbol(parsed: &LiveParse, symbol: &str) -> Option<CatalogSymbol> {
+    parsed
+        .symbols
+        .iter()
+        .find(|node| {
+            node.symbol_name.eq_ignore_ascii_case(symbol)
+                || node.qualified_name.eq_ignore_ascii_case(symbol)
+        })
+        .cloned()
+}
+
+async fn find_live_symbol_in_inventory(
+    live: &LiveProject,
+    symbol: &str,
+) -> Result<(LiveParse, CatalogSymbol), JsonRpcError> {
+    // A catalog miss without a file hint should still be useful. Git supplies
+    // an ignore-aware candidate list; cap parsing at 20 files so a typo cannot
+    // turn a symbol lookup into a repository scan.
+    let root = live.root().to_path_buf();
+    let candidates = tokio::task::spawn_blocking(move || {
+        match crate::cli::git::source_inventory(&root) {
+            Ok(paths) => paths,
+            Err(crate::cli::git::GitInventoryError::NotRepository) => walkdir::WalkDir::new(&root)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|entry| {
+                    let name = entry.file_name().to_string_lossy();
+                    !crate::cli::skip_dirs::SKIP_DIRS
+                        .iter()
+                        .any(|skip| name == *skip)
+                })
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_type().is_file())
+                .map(|entry| entry.path().to_path_buf())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+        .into_iter()
+        .take(20)
+        .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|error| {
+        JsonRpcError::internal_error(format!("live symbol inventory failed: {error}"))
+    })?;
+    for candidate in candidates {
+        let Ok(parsed) = parse_live_file(candidate).await else {
+            continue;
+        };
+        if let Some(node) = find_live_symbol(&parsed, symbol) {
+            return Ok((parsed, node));
+        }
+    }
+    Err(JsonRpcError::invalid_params(format!(
+        "Symbol '{}' not found in the first 20 live source candidates",
+        symbol
+    )))
 }
 
 fn symbol_response(
@@ -428,33 +444,9 @@ async fn resident_relations(
             pdg_status: "partial",
         };
     }
-    let callees: Vec<Value> = pdg
-        .neighbors(node_id)
-        .iter()
-        .filter_map(|&id| {
-            let dependency = pdg.get_node(id)?;
-            let file = live.file(&dependency.file_path).ok()?;
-            Some(serde_json::json!({
-                "name": dependency.name,
-                "type": super::helpers::node_type_str(&dependency.node_type),
-                "file": file,
-            }))
-        })
-        .take(20)
-        .collect();
-    let callers: Vec<Value> = super::helpers::get_direct_callers(pdg, node_id)
-        .iter()
-        .filter_map(|&id| {
-            let caller = pdg.get_node(id)?;
-            let file = live.file(&caller.file_path).ok()?;
-            Some(serde_json::json!({
-                "name": caller.name,
-                "type": super::helpers::node_type_str(&caller.node_type),
-                "file": file,
-            }))
-        })
-        .take(20)
-        .collect();
+    let callees = relation_nodes_to_json(pdg, live, pdg.neighbors(node_id));
+    let callers =
+        relation_nodes_to_json(pdg, live, super::helpers::get_direct_callers(pdg, node_id));
     ResidentRelations {
         dependencies: if include_dependencies {
             callees.clone()
@@ -469,6 +461,26 @@ async fn resident_relations(
             "fresh"
         },
     }
+}
+
+fn relation_nodes_to_json(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    live: &LiveProject,
+    node_ids: impl IntoIterator<Item = crate::graph::pdg::NodeId>,
+) -> Vec<Value> {
+    node_ids
+        .into_iter()
+        .filter_map(|id| {
+            let node = pdg.get_node(id)?;
+            let file = live.file(&node.file_path).ok()?;
+            Some(serde_json::json!({
+                "name": node.name,
+                "type": super::helpers::node_type_str(&node.node_type),
+                "file": file,
+            }))
+        })
+        .take(20)
+        .collect()
 }
 
 #[cfg(test)]
