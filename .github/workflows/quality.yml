@@ -62,19 +62,16 @@ jobs:
         run: pip install lizard
       - name: Run complexity analysis
         run: |
-          # Main crate (src/): STRICT — fail if any function has CCN > 15.
-          lizard src/ -C 15 -x"*/tests/*" -x"*/target/*" -m -H./complexity-report.html \
-            || (echo "::error::Cyclomatic complexity threshold exceeded in src/ (CCN > 15)" && exit 1)
-          # Optional ONNX worker runtime (crates/leindex-embed): BASELINED at CCN <= 30.
-          # The leindex-embed ONNX runtime ships three pre-existing high-CCN
-          # session/inference functions (build_session CCN 21, run_onnx_embed_sub_batch
-          # CCN 30, run_onnx_rerank_sub_batch CCN 25). They are tightly coupled to ORT
-          # tensor/session APIs and an automated refactor left the file structurally
-          # broken, so they are baselined rather than risk the worker inference path.
-          # Staged reduction: 30 (current) -> 25 -> 20 -> 15 as the functions are
-          # carefully decomposed with compile-verified (`--features onnx`) tests.
-          lizard crates/leindex-embed/src/ -C 30 -x"*/tests/*" -x"*/target/*" \
-            || (echo "::error::Cyclomatic complexity threshold exceeded in leindex-embed (CCN > 30)" && exit 1)
+          # Analyze all Rust source files, fail if any function has CCN > 15.
+          lizard \
+            src/ \
+            crates/leindex-embed/src/ \
+            -C 15 \
+            -x"*/tests/*" \
+            -x"*/target/*" \
+            -m \
+            -H./complexity-report.html \
+            || (echo "::error::Cyclomatic complexity threshold exceeded (CCN > 15)" && exit 1)
       - name: Upload complexity report
         if: always()
         uses: actions/upload-artifact@v4

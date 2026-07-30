@@ -343,7 +343,7 @@ fn wait_accept_retry(error: &io::Error, delay: Duration) {
 enum SocketLifecycleState {
     Initializing(HealthResponse),
     Ready {
-        runtime: WorkerRuntime,
+        runtime: Box<WorkerRuntime>,
         health: HealthResponse,
     },
     Failed(HealthResponse),
@@ -368,7 +368,7 @@ impl SocketLifecycle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match &*state {
-            SocketLifecycleState::Ready { runtime, .. } => Some(runtime.clone()),
+            SocketLifecycleState::Ready { runtime, .. } => Some((**runtime).clone()),
             SocketLifecycleState::Initializing(_) | SocketLifecycleState::Failed(_) => None,
         }
     }
@@ -406,7 +406,10 @@ impl SocketLifecycle {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *state = SocketLifecycleState::Ready { runtime, health };
+        *state = SocketLifecycleState::Ready {
+            runtime: Box::new(runtime),
+            health,
+        };
     }
 
     fn set_failed(&self, health: HealthResponse) {
