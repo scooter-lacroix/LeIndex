@@ -1288,6 +1288,11 @@ pub(crate) fn enrich_neural_embeddings(
             let Some(node) = pdg.get_node(node_idx) else {
                 continue;
             };
+            // Match build_indexed_node's inclusion rule: external/excluded nodes
+            // never enter the lexical index, so don't send them to the neural batch.
+            if is_external_node_excluded(node) {
+                continue;
+            }
             let file_bytes = file_cache
                 .get_or_read(Path::new(&*node.file_path))
                 .unwrap_or_else(|_| std::sync::Arc::new(Vec::new()));
