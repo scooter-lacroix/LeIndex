@@ -142,9 +142,21 @@ fn phase_target(
         JsonRpcError::invalid_params(format!("project root not accessible: {}", error))
     })?;
     let target = match requested_path {
-        Some(path) => PathBuf::from(path).canonicalize().map_err(|error| {
-            JsonRpcError::invalid_params(format!("path must exist and be accessible: {}", error))
-        })?,
+        Some(path) => {
+            // Relative paths resolve against the project root (not the CWD) before
+            // canonicalization, then the containment check below rejects escapes.
+            let base = if std::path::Path::new(path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                canonical_root.join(path)
+            };
+            base.canonicalize().map_err(|error| {
+                JsonRpcError::invalid_params(format!(
+                    "path must exist and be accessible: {}",
+                    error
+                ))
+            })?
+        }
         None => canonical_root.clone(),
     };
     if !target.starts_with(&canonical_root) {

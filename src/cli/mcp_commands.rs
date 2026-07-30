@@ -150,7 +150,7 @@ enum StdioInput {
 
 fn read_stdio_input(reader: &mut impl BufRead) -> io::Result<StdioInput> {
     let mut line = String::new();
-    if reader.read_line(&mut line).unwrap_or(0) == 0 {
+    if reader.read_line(&mut line)? == 0 {
         return Ok(StdioInput::End);
     }
     let line = line.trim_end();
@@ -229,7 +229,7 @@ async fn response_for_payload(payload: &str) -> Option<(String, bool)> {
 
 fn write_stdio_response(writer: &mut impl Write, response: &str, framed: bool) -> io::Result<()> {
     if framed {
-        writeln!(
+        write!(
             writer,
             "Content-Length: {}\r\n\r\n{}",
             response.len(),

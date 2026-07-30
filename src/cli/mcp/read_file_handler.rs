@@ -115,7 +115,7 @@ async fn read_visible_content(
     let end_line_raw = extract_usize(args, "end_line", total_lines)?;
     let end_line = end_line_raw
         .min(total_lines)
-        .min(start_line + max_lines - 1);
+        .min(start_line.saturating_add(max_lines).saturating_sub(1));
 
     if total_lines > 0 && start_line > total_lines {
         return Err(JsonRpcError::invalid_params(format!(

@@ -167,8 +167,11 @@ impl ReferenceChecker {
                     }
                 }
             } else if let Some(rest) = line.strip_prefix("from ") {
-                // `from pkg import ...` -> the module is before " import "
+                // `from pkg import ...` -> the module is before " import ". Strip
+                // leading dots so relative imports (`.foo`, `..bar`) match the
+                // module name in the PDG instead of being rejected as `.foo`.
                 let module = rest.split(" import ").next().unwrap_or(rest).trim();
+                let module = module.trim_start_matches('.');
                 if !module.is_empty() {
                     imports.push(module.to_string());
                 }
@@ -188,6 +191,13 @@ impl ReferenceChecker {
                 if let Some(path) = Self::javascript_require_import(line) {
                     imports.push(path);
                 }
+            } else if let Some(rest) = line.strip_prefix("import ") {
+                // Side-effect / bare import: import './polyfill' (no 'from').
+                if !rest.contains(" from ") {
+                    if let Some(path) = Self::first_quoted(rest) {
+                        imports.push(path);
+                    }
+                }
             }
         }
         imports
@@ -202,6 +212,22 @@ impl ReferenceChecker {
         }
         let end = rest[1..].find(quote)?;
         Some(rest[1..end + 1].to_string())
+    }
+
+    /// Extract the first single- or double-quoted string in `s` (matching quotes).
+    fn first_quoted(s: &str) -> Option<String> {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let q = bytes[i];
+            if q == b'"' || q == b'\'' {
+                if let Some(end) = s[i + 1..].as_bytes().iter().position(|&c| c == q) {
+                    return Some(s[i + 1..i + 1 + end].to_string());
+                }
+            }
+            i += 1;
+        }
+        None
     }
 
     fn javascript_require_import(line: &str) -> Option<String> {
@@ -237,13 +263,11 @@ impl ReferenceChecker {
             .lines()
             .map(str::trim)
             .filter_map(|line| {
-                // Single-line `import "pkg"` and each `"pkg"` line inside an
-                // `import (...)` block both reduce to a leading double-quoted path.
+                // Single-line `import "pkg"`, `import alias "pkg"`, blank `_ "pkg"`,
+                // and each `"pkg"` line inside an `import (...)` block all carry a
+                // double-quoted path — extract the first quoted segment.
                 let path_line = line.strip_prefix("import ").unwrap_or(line);
-                path_line
-                    .strip_prefix('"')
-                    .and_then(|rest| rest.strip_suffix('"'))
-                    .map(|p| p.to_string())
+                Self::first_quoted(path_line)
             })
             .collect()
     }

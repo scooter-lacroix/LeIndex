@@ -315,7 +315,9 @@ fn extract_ruby_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<P
     parameters
 }
 
-const DECISION_KINDS: &[&str] = &["if", "unless", "when", "while", "until", "for", "elsif", "rescue"];
+const DECISION_KINDS: &[&str] = &[
+    "if", "unless", "when", "while", "until", "for", "elsif", "rescue",
+];
 cfg_builder!();
 cfg_loop_handler!();
 impl<'a> CfgBuilder<'a> {
