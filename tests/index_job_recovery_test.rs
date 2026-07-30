@@ -16,7 +16,7 @@ fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("test env lock")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[test]
