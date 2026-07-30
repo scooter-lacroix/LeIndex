@@ -1221,7 +1221,6 @@ async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 #[cfg(unix)]
-
 async fn handle_socket_connection(
     stream: tokio::net::UnixStream,
     session_id: String,

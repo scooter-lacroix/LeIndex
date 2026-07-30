@@ -221,7 +221,7 @@ impl ReferenceChecker {
         while i < bytes.len() {
             let q = bytes[i];
             if q == b'"' || q == b'\'' {
-                if let Some(end) = s[i + 1..].as_bytes().iter().position(|&c| c == q) {
+                if let Some(end) = s[i + 1..].find(char::from(q)) {
                     return Some(s[i + 1..i + 1 + end].to_string());
                 }
             }

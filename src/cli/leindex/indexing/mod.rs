@@ -1467,6 +1467,21 @@ impl LeIndex {
         )
     }
 
+    /// Persist the neural mmap only when embeddings were freshly produced
+    /// (not resumed) AND there are rows to write — never persist an empty mmap.
+    /// Extracted from run_neural to keep that function's branch count bounded.
+    #[allow(unused_variables)] // params used only under onnx/remote-embeddings
+    fn persist_neural_mmap(&self, neural_resume_loaded: bool, neural_rows: usize) -> Result<()> {
+        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
+        if !neural_resume_loaded && neural_rows > 0 {
+            index_builder::persist_neural_embeddings_to_mmap(
+                &self.search_engine,
+                &self.project_path,
+            )?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn run_neural(
         &mut self,
         _job: &JobPaths,
@@ -1505,13 +1520,7 @@ impl LeIndex {
                 neural_rows = self.search_engine.update_neural_embeddings(rows);
             }
         }
-        #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
-        if !neural_resume_loaded && neural_rows > 0 {
-            index_builder::persist_neural_embeddings_to_mmap(
-                &self.search_engine,
-                &self.project_path,
-            )?;
-        }
+        self.persist_neural_mmap(neural_resume_loaded, neural_rows)?;
         self.persist_neural_snapshot(&state, neural_rows, neural_embedder)?;
         let neural_checkpoint = NeuralCheckpoint {
             lexical_hash,
