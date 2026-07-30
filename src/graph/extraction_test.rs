@@ -401,6 +401,16 @@ fn count_call_edges(pdg: &ProgramDependenceGraph) -> usize {
         .count()
 }
 
+/// Check for a Call-typed edge between two node IDs (not just any adjacency).
+fn has_call_edge_between(pdg: &ProgramDependenceGraph, from: crate::graph::pdg::NodeId, to: crate::graph::pdg::NodeId) -> bool {
+    pdg.edge_indices().any(|e| {
+        pdg.edge_endpoints(e).is_some_and(|(s, d)| s == from && d == to)
+            && pdg.get_edge(e).is_some_and(|edge| {
+                edge.edge_type == crate::graph::pdg::EdgeType::Call
+            })
+    })
+}
+
 /// Helper: check if a Call edge exists from caller to callee
 fn has_call_edge(pdg: &ProgramDependenceGraph, caller_name: &str, callee_name: &str) -> bool {
     let caller_nid = pdg.node_indices().find(|&n| {
@@ -415,10 +425,7 @@ fn has_call_edge(pdg: &ProgramDependenceGraph, caller_name: &str, callee_name: &
     });
 
     match (caller_nid, callee_nid) {
-        (Some(c), Some(d)) => {
-            // Check if there's a Call edge from c to d
-            pdg.neighbors(c).contains(&d)
-        }
+        (Some(c), Some(d)) => has_call_edge_between(pdg, c, d),
         _ => false,
     }
 }
@@ -441,7 +448,7 @@ fn has_call_edge_from_file(
     });
 
     match (caller_nid, callee_nid) {
-        (Some(c), Some(d)) => pdg.neighbors(c).contains(&d),
+        (Some(c), Some(d)) => has_call_edge_between(pdg, c, d),
         _ => false,
     }
 }
@@ -465,7 +472,7 @@ fn has_call_edge_between_files(
     });
 
     match (caller_nid, callee_nid) {
-        (Some(c), Some(d)) => pdg.neighbors(c).contains(&d),
+        (Some(c), Some(d)) => has_call_edge_between(pdg, c, d),
         _ => false,
     }
 }
