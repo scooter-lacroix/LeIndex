@@ -935,7 +935,7 @@ fn fuzzy_find_node(
 
     let is_event_loop_query = EVENT_LOOP_ALIASES
         .iter()
-        .any(|alias| query_lower.contains(alias));
+        .any(|alias| query_lower == *alias || query_lower.split_whitespace().any(|w| w == *alias));
     let candidates = fuzzy_candidate_nodes(pdg, &query_lower, is_event_loop_query);
     let mut best_match = None;
 

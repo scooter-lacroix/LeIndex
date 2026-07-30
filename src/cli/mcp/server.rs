@@ -1247,7 +1247,10 @@ async fn handle_socket_connection(
             Ok(Some(line)) => line,
             Ok(None) => break, // clean EOF
             Err(e) => {
-                debug!("Socket read error / line too long (session {}): {}", session_id, e);
+                debug!(
+                    "Socket read error / line too long (session {}): {}",
+                    session_id, e
+                );
                 break;
             }
         };
@@ -1283,8 +1286,8 @@ async fn handle_socket_connection(
             loop {
                 let header = match read_bounded_line(&mut reader, MAX_LINE_LENGTH).await {
                     Ok(Some(h)) => h,
-                    Ok(None) => break,    // EOF
-                    Err(_) => break,      // oversized header line
+                    Ok(None) => break, // EOF
+                    Err(_) => break,   // oversized header line
                 };
                 if header.trim().is_empty() {
                     break;

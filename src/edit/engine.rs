@@ -1169,10 +1169,7 @@ impl WorktreeManager {
         parts.next()?.parse::<u32>().ok()?;
         let timestamp_millis = parts.next()?.parse::<i64>().ok()?;
         parts.next()?;
-        chrono::DateTime::<chrono::Utc>::from_timestamp(
-            timestamp_millis / 1000,
-            ((timestamp_millis % 1000) * 1_000_000) as u32,
-        )
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_millis)
     }
 }
 

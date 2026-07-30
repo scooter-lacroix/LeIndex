@@ -133,7 +133,12 @@ fn infer_class_nodes_and_containment(
 
     let mut containment = Vec::new();
 
-    for (class_name, method_nids) in &class_methods {
+    // Iterate in sorted class-name order so inferred inheritance/containment
+    // edges (and any node creation) are deterministic across runs.
+    let mut class_names: Vec<&String> = class_methods.keys().collect();
+    class_names.sort();
+    for class_name in class_names {
+        let method_nids = &class_methods[class_name];
         let already_exists = node_ids.contains_key(class_name)
             || node_ids.keys().any(|k| normalize_symbol(k) == *class_name);
 

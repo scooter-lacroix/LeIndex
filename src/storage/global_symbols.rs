@@ -14,6 +14,7 @@ const GLOBAL_SYMBOL_UPSERT_SQL: &str = "INSERT INTO global_symbols (
     complexity, is_public
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
 ON CONFLICT(project_id, symbol_name, signature) DO UPDATE SET
+    symbol_type = excluded.symbol_type,
     file_path = excluded.file_path,
     byte_range_start = excluded.byte_range_start,
     byte_range_end = excluded.byte_range_end,
