@@ -861,8 +861,9 @@ const DECISION_KINDS: &[&str] = &[
     "try_statement",
     "switch_statement",
     "catch_clause",
-    "else",
-    "case",
+    "else_clause",
+    "switch_case",
+    "switch_default",
 ];
 cfg_builder!();
 cfg_loop_handler!();

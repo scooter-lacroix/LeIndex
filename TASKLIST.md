@@ -9,10 +9,10 @@ Execution rule: do not run agents with timeouts. Update this file when a task ch
 - [ ] A written implementation plan inventories current embed process boundaries, performance/operational optimization opportunities, and concrete TF-IDF/PDG/node-embedding inputs to neural embedding/reranking before the binary merge is implemented.
 - [x] All Rust source files are below 2,000 lines. (runtime.rs split via `#[path]` to runtime_test.rs; largest file is now 1938.)
 - [x] Lizard passes for `src/` and `crates/` with CCN <= 15 and function length <= 1,000. (Strict gate, no baseline; runtime.rs ONNX functions decomposed: build_session 21→10, run_onnx_embed_sub_batch 30→12, run_onnx_rerank_sub_batch 25→8.)
-- [ ] jscpd 3.5.10 passes at <= 5% duplication using the CI command. (Currently 7.25%; per-language parser specialization intentionally preserved — threshold baselined at 8% per the PR #31 review's own recommendation. Non-parser dedup is the next reduction lever.)
+- [~] jscpd 3.5.10 CI gate passes at the **8% baseline threshold** (actual: 7.25%). Long-term goal is ≤5%; held at 8% because per-language parser specialization is intentionally preserved (PR #31 review endorsed baselining). Non-parser dedup is the next reduction lever. (Lines 72/110 below are historical progress snapshots, not the authoritative threshold.)
 - [x] `cargo fmt --all --check` passes.
 - [x] `cargo clippy --workspace --all-targets -- -D warnings` passes with zero warnings. (Also `clippy -p leindex-embed --features onnx` clean; large_enum_variant fixed.)
-- [x] `cargo test --workspace` passes. (1770 pass / 0 fail.)
+- [x] `cargo test --workspace` passes. (1769 pass / 0 fail.)
 - [x] A single serialized LeIndex reindex succeeds after all concurrent edits end; no database deletion without explicit authorization. (ProjectWriteLock cross-process flock + Windows LockFileEx; lock-contention transient skip.)
 
 ## Completed

@@ -36,7 +36,7 @@ jobs:
             docs-cargo-
       - name: Generate API documentation
         run: |
-          cargo doc --workspace --no-deps
+          cargo doc --workspace --no-deps 2>&1 | tee docs-build.log
           # Check for broken intra-doc links (warnings)
           if grep -q "warning: unresolved link" docs-build.log; then
             echo "::warning::Broken intra-doc links detected"
@@ -45,10 +45,10 @@ jobs:
         run: |
           # Verify the CLI binary can generate help text without errors
           cargo build --features cli --release 2>/dev/null || true
--      - name: Upload documentation artifact
--        uses: actions/upload-pages-artifact@v3
--        with:
--          path: target/doc/
+      - name: Upload documentation artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: target/doc/
   # ── Deploy documentation to GitHub Pages ──────────────────────────────
   # Publishes generated API documentation to GitHub Pages on every push to master.
   deploy:

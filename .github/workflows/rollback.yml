@@ -5,7 +5,8 @@ name: Rollback
 # pre-release, npm deprecation) so a bad release stops being installed while a
 # fix is prepared. Every action is individually gated on the relevant secret and
 # reports its result; none of them delete artifacts, so the release can be
-# restored (`cargo unyank`, `gh release edit --latest`, `npm deprecate ''`).
+# restored (`gh release edit --latest`, `npm deprecate ''`). Note: a crates.io
+# yank is irreversible via the CLI — republish a fixed version to restore availability.
 
 on:
   workflow_dispatch:
@@ -49,8 +50,9 @@ jobs:
 
           ### Follow-up
           1. [ ] Ship the fix on master; the release.yml workflow republishes.
-          2. [ ] Restore the release: \`cargo unyank --vers ${{ inputs.version }}\`,
-                \`gh release edit v${{ inputs.version }} --latest\`,
+          2. [ ] Restore the release: a yanked crates.io version cannot be
+                un-yanked, so publish the fixed version to restore availability;
+                \`gh release edit v${{ inputs.version }} --latest\`;
                 \`npm deprecate leindex-mcp@${{ inputs.version }} ''\`.
           3. [ ] Close this issue when resolved." \
             2>&1) || ISSUE_URL="(failed to create issue)"
@@ -59,7 +61,7 @@ jobs:
 
       # crates.io yank prevents NEW dependents from resolving the version;
       # existing lockfiles keep working. Requires CARGO_REGISTRY_TOKEN.
-      # Reversible via `cargo unyank --vers <version>`.
+      # Irreversible: republish a fixed version to restore availability.
       - name: Yank crate from crates.io
         continue-on-error: true
         id: crate-yank
@@ -81,8 +83,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release edit "v${{ inputs.version }}" --prerelease \
-               --notes "$(gh release view "v${{ inputs.version }}" --json body -q .body 2>/dev/null || echo '')"$'\n\n'"**Rolled back** (${{ inputs.reason }}): marked pre-release by rollback workflow."; then
+          if gh release edit "v${{ inputs.version }}" --prerelease; then
             echo "::notice::Marked release v${{ inputs.version }} as pre-release"
           else
             echo "::warning::Could not mark release v${{ inputs.version }} as pre-release (it may not exist)"

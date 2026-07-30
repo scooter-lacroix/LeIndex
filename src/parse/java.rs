@@ -55,19 +55,39 @@ impl JavaParser {
             }
             "class_declaration" => {
                 Self::push_java_type_signature(node, source, parent_path, "class", signatures);
-                Self::visit_java_children(node, source, signatures, parent_path);
+                let child_path = Self::java_type_child_path(node, source, parent_path);
+                Self::visit_java_children(node, source, signatures, &child_path);
             }
             "interface_declaration" => {
                 Self::push_java_type_signature(node, source, parent_path, "interface", signatures);
-                Self::visit_java_children(node, source, signatures, parent_path);
+                let child_path = Self::java_type_child_path(node, source, parent_path);
+                Self::visit_java_children(node, source, signatures, &child_path);
             }
             "enum_declaration" => {
                 Self::push_java_type_signature(node, source, parent_path, "enum", signatures);
-                Self::visit_java_children(node, source, signatures, parent_path);
+                let child_path = Self::java_type_child_path(node, source, parent_path);
+                Self::visit_java_children(node, source, signatures, &child_path);
             }
             "field_declaration" => Self::extract_java_fields(node, source, signatures, parent_path),
             _ => Self::visit_java_children(node, source, signatures, parent_path),
         }
+    }
+
+    /// Build the child traversal path by appending this type's simple name,
+    /// so members nested in a class/interface/enum get parent-qualified names.
+    fn java_type_child_path(
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        parent_path: &[String],
+    ) -> Vec<String> {
+        let mut path = parent_path.to_vec();
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+        {
+            path.push(name.trim().to_string());
+        }
+        path
     }
 
     fn visit_java_children(

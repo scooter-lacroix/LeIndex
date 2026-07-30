@@ -434,7 +434,9 @@ const DECISION_KINDS: &[&str] = &[
     "for_statement",
     "foreach_statement",
     "while_statement",
+    "do_statement",
     "switch_statement",
+    "else_if_clause",
 ];
 cfg_builder!();
 cfg_loop_handler!();

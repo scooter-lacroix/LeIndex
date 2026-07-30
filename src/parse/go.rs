@@ -467,7 +467,6 @@ const DECISION_KINDS: &[&str] = &[
     "if_statement",
     "for_statement",
     "range_clause",
-    "go_statement",
     "select_statement",
     "switch_statement",
     "type_switch_statement",

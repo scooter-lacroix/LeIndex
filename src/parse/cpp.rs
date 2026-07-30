@@ -443,7 +443,6 @@ const DECISION_KINDS: &[&str] = &[
     "for_statement",
     "while_statement",
     "do_statement",
-    "switch_statement",
     "case_statement",
 ];
 cfg_builder!();

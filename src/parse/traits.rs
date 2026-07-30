@@ -81,7 +81,10 @@ pub fn calculate_complexity(
     decision_kinds: &[&str],
 ) {
     metrics.nesting_depth = metrics.nesting_depth.max(depth);
-    metrics.line_count = std::cmp::max(metrics.line_count, 1);
+    // line_count: the symbol's own line span (set once, on the top node).
+    if depth == 0 {
+        metrics.line_count = node.end_position().row - node.start_position().row + 1;
+    }
     if decision_kinds.contains(&node.kind()) {
         metrics.cyclomatic += 1;
     }

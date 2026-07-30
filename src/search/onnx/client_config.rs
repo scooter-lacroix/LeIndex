@@ -11,7 +11,7 @@ pub(super) fn embed_daemon_enabled() -> bool {
                 "0" | "false" | "no" | "off"
             )
         })
-        .unwrap_or(true)
+        .unwrap_or(cfg!(unix))
 }
 
 /// Maximum response frame size in bytes.

@@ -539,6 +539,7 @@ const DECISION_KINDS: &[&str] = &[
     "for_statement",
     "foreach_statement",
     "while_statement",
+    "do_statement",
     "switch_statement",
 ];
 cfg_builder!();
