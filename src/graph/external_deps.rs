@@ -725,13 +725,30 @@ impl ExternalDependencyRegistry {
             return;
         }
 
-        let version = value_raw
-            .trim()
-            .split(',')
-            .next()
-            .map(unquote)
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "*".to_string());
+        // Poetry deps may use an inline table: `package = { version = "1.2.3", ... }`.
+        // Extract the quoted `version` field from the table; otherwise the simple
+        // `name = "1.2.3"` constraint form.
+        let value_trim = value_raw.trim();
+        let version = if value_trim.starts_with('{') {
+            value_trim
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .split(',')
+                .find_map(|field| {
+                    let field = field.trim();
+                    let rest = field.strip_prefix("version")?;
+                    unquote(rest.trim_start_matches(['=', ' ']).trim()).into()
+                })
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "*".to_string())
+        } else {
+            value_trim
+                .split(',')
+                .next()
+                .map(unquote)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "*".to_string())
+        };
         self.insert(ExternalDependency {
             name: name.to_string(),
             version,
