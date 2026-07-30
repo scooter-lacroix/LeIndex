@@ -1,6 +1,7 @@
 // Scala language parser implementation
 
 use crate::cfg_builder;
+use crate::parse::traits::calculate_complexity;
 use crate::parse::traits::{find_node_by_id, Block, Edge, EdgeType, Parameter, Visibility};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
@@ -67,7 +68,7 @@ impl CodeIntelligence for ScalaParser {
             line_count: 0,
             token_count: 0,
         };
-        calculate_complexity(node, &mut complexity, 0);
+        calculate_complexity(node, &mut complexity, 0, DECISION_KINDS);
         complexity
     }
 }
@@ -313,37 +314,15 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
     None
 }
 
-/// Find a node by its ID
-
 /// Calculate complexity metrics for a node
-fn calculate_complexity(
-    node: &tree_sitter::Node<'_>,
-    metrics: &mut ComplexityMetrics,
-    depth: usize,
-) {
-    metrics.nesting_depth = metrics.nesting_depth.max(depth);
-    metrics.line_count = std::cmp::max(metrics.line_count, 1);
-
-    // Scala control flow structures
-    match node.kind() {
-        "if_expression" | "while_expression" | "for_expression" | "match_expression"
-        | "try_expression" => {
-            metrics.cyclomatic += 1;
-        }
-        "case_clause" => {
-            metrics.cyclomatic += 1;
-        }
-        _ => {}
-    }
-
-    metrics.token_count += node.child_count();
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        calculate_complexity(&child, metrics, depth + 1);
-    }
-}
-
+const DECISION_KINDS: &[&str] = &[
+    "if_expression",
+    "while_expression",
+    "for_expression",
+    "match_expression",
+    "try_expression",
+    "case_clause",
+];
 cfg_builder!();
 impl<'a> CfgBuilder<'a> {
     fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {

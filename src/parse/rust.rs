@@ -1111,8 +1111,6 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
     None
 }
 
-/// Find a node by its ID
-
 /// Calculate complexity metrics (iterative to avoid stack overflow on deeply nested code)
 fn calculate_complexity(
     node: &tree_sitter::Node<'_>,
@@ -1120,7 +1118,6 @@ fn calculate_complexity(
     depth: usize,
 ) {
     // Use a stack-based approach with explicit traversal to avoid recursion
-    // Stack holds (node, depth) pairs
     let mut stack: Vec<(tree_sitter::Node<'_>, usize)> = Vec::new();
     stack.push((*node, depth));
 
@@ -1158,14 +1155,12 @@ fn calculate_complexity(
 
         metrics.token_count += current_node.child_count();
 
-        // Push children onto stack in reverse order to process them left-to-right
         let mut cursor = current_node.walk();
         let mut children: Vec<tree_sitter::Node<'_>> = current_node.children(&mut cursor).collect();
         children.reverse(); // Reverse to maintain left-to-right processing order
 
         for child in children {
-            // Skip nested function_item nodes that appear inside a block (function body).
-            // Top-level function_items (children of source_file) are always traversed.
+            // Skip nested function_item nodes inside a block (function body).
             if child.kind() == "function_item" && current_node.kind() == "block" {
                 continue;
             }
@@ -1173,7 +1168,6 @@ fn calculate_complexity(
         }
     }
 }
-
 cfg_builder!();
 impl<'a> CfgBuilder<'a> {
     fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {

@@ -69,6 +69,29 @@ pub fn find_node_by_id<'tree>(
     None
 }
 
+/// Compute cyclomatic-complexity metrics for a node and its descendants.
+///
+/// The skeleton (nesting depth, line floor, token/child count, recursion) is
+/// universal; only the set of node kinds that count as decision points varies
+/// per language, supplied via `decision_kinds`.
+pub fn calculate_complexity(
+    node: &tree_sitter::Node<'_>,
+    metrics: &mut ComplexityMetrics,
+    depth: usize,
+    decision_kinds: &[&str],
+) {
+    metrics.nesting_depth = metrics.nesting_depth.max(depth);
+    metrics.line_count = std::cmp::max(metrics.line_count, 1);
+    if decision_kinds.contains(&node.kind()) {
+        metrics.cyclomatic += 1;
+    }
+    metrics.token_count += node.child_count();
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        calculate_complexity(&child, metrics, depth + 1, decision_kinds);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{find_node_by_id, parse_tree};

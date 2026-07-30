@@ -1,6 +1,7 @@
 // Lua language parser implementation
 
 use crate::cfg_builder;
+use crate::parse::traits::calculate_complexity;
 use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
@@ -67,7 +68,7 @@ impl CodeIntelligence for LuaParser {
             line_count: 0,
             token_count: 0,
         };
-        calculate_complexity(node, &mut complexity, 0);
+        calculate_complexity(node, &mut complexity, 0, DECISION_KINDS);
         complexity
     }
 }
@@ -252,35 +253,13 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
 }
 
 /// Calculate complexity metrics for a node
-fn calculate_complexity(
-    node: &tree_sitter::Node<'_>,
-    metrics: &mut ComplexityMetrics,
-    depth: usize,
-) {
-    // Update nesting depth
-    metrics.nesting_depth = metrics.nesting_depth.max(depth);
-
-    // Count lines using the node's byte range
-    metrics.line_count = std::cmp::max(metrics.line_count, 1);
-
-    // Count control flow structures (increase cyclomatic complexity)
-    match node.kind() {
-        "if_statement" | "while_statement" | "for_statement" | "repeat_statement" | "elseif" => {
-            metrics.cyclomatic += 1;
-        }
-        _ => {}
-    }
-
-    // Count tokens (rough estimate)
-    metrics.token_count += node.child_count();
-
-    // Recursively process children
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        calculate_complexity(&child, metrics, depth + 1);
-    }
-}
-
+const DECISION_KINDS: &[&str] = &[
+    "if_statement",
+    "while_statement",
+    "for_statement",
+    "repeat_statement",
+    "elseif",
+];
 cfg_builder!();
 impl<'a> CfgBuilder<'a> {
     fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {

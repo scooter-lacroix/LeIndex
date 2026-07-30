@@ -1,6 +1,7 @@
 // PHP language parser implementation
 
 use crate::cfg_builder;
+use crate::parse::traits::calculate_complexity;
 use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
@@ -182,7 +183,7 @@ impl CodeIntelligence for PhpParser {
             token_count: 0,
         };
 
-        calculate_complexity(node, &mut complexity, 0);
+        calculate_complexity(node, &mut complexity, 0, DECISION_KINDS);
         complexity
     }
 }
@@ -430,27 +431,13 @@ fn extract_php_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<Pa
     parameters
 }
 
-fn calculate_complexity(
-    node: &tree_sitter::Node<'_>,
-    metrics: &mut ComplexityMetrics,
-    depth: usize,
-) {
-    metrics.nesting_depth = metrics.nesting_depth.max(depth);
-    metrics.line_count = std::cmp::max(metrics.line_count, 1);
-    match node.kind() {
-        "if_statement" | "for_statement" | "foreach_statement" | "while_statement"
-        | "switch_statement" => {
-            metrics.cyclomatic += 1;
-        }
-        _ => {}
-    }
-    metrics.token_count += node.child_count();
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        calculate_complexity(&child, metrics, depth + 1);
-    }
-}
-
+const DECISION_KINDS: &[&str] = &[
+    "if_statement",
+    "for_statement",
+    "foreach_statement",
+    "while_statement",
+    "switch_statement",
+];
 cfg_builder!();
 impl<'a> CfgBuilder<'a> {
     fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {
