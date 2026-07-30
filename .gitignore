@@ -183,3 +183,9 @@ docs/optimization/
 /leindex.toml
 /config/leindex.toml
 /logs/
+
+# Generated duplicate-detection report
+jscpd-report/
+
+# Throwaway rewrite scripts
+rewrite.py
