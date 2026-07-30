@@ -162,10 +162,11 @@ impl TfIdfEmbedder {
             *tf_map.entry(tok.as_str()).or_insert(0.0) += 1.0;
         }
 
-        // Compute TF-IDF for each vocab position
-        for (i, (word, idf_val)) in self.vocab.iter().zip(self.idf.iter()).enumerate() {
+        // Compute TF-IDF in lockstep over the output vector so a mismatched
+        // persisted vocabulary/dimension can't index out of bounds.
+        for (slot, (word, idf_val)) in vec.iter_mut().zip(self.vocab.iter().zip(self.idf.iter())) {
             if let Some(&count) = tf_map.get(word.as_str()) {
-                vec[i] = (count / total) * idf_val;
+                *slot = (count / total) * idf_val;
             }
         }
 
@@ -198,9 +199,9 @@ impl TfIdfEmbedder {
             *tf_map.entry(tok.as_str()).or_insert(0.0) += 1.0;
         }
 
-        for (i, (word, idf_val)) in self.vocab.iter().zip(self.idf.iter()).enumerate() {
+        for (slot, (word, idf_val)) in vec.iter_mut().zip(self.vocab.iter().zip(self.idf.iter())) {
             if let Some(&count) = tf_map.get(word.as_str()) {
-                vec[i] = (count / total) * idf_val;
+                *slot = (count / total) * idf_val;
             }
         }
 

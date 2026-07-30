@@ -265,11 +265,13 @@ impl HybridEmbedder {
                 .await
                 .ok()?;
                 match result {
-                    EmbedResult::Success(response) => match response.into_vectors().into_iter().next() {
-                        // VAL-CPHASE-016: write from flat buffer directly. Presence of the
-                        // vector (not response.count) is the real non-empty contract.
-                        Some(v) => Some(Ok(v)),
-                        None => Some(Err("worker returned empty response".to_string())),
+                    EmbedResult::Success(response) => {
+                        match response.into_vectors().into_iter().next() {
+                            // VAL-CPHASE-016: write from flat buffer directly. Presence of the
+                            // vector (not response.count) is the real non-empty contract.
+                            Some(v) => Some(Ok(v)),
+                            None => Some(Err("worker returned empty response".to_string())),
+                        }
                     }
                     EmbedResult::Fallback { batch_id, error } => {
                         // VAL-CPHASE-018/019: Fallback already logged actionable warning.
@@ -312,6 +314,8 @@ impl HybridEmbedder {
         docs: Vec<(String, String, f32)>,
     ) -> Option<Result<Vec<(String, f32)>, String>> {
         #[cfg(feature = "onnx")]
+        #[allow(clippy::needless_return)]
+        // return is required so the cfg(not(onnx)) fallthrough block can follow
         {
             use leindex_embed::protocol::RerankDocument;
             return match self {
@@ -360,11 +364,13 @@ impl HybridEmbedder {
                 let texts = vec![text.to_string()];
                 let result = neural.embed_with_fallback(&texts, NEURAL_EMBEDDING_DIMENSION);
                 match result {
-                    EmbedResult::Success(response) => match response.into_vectors().into_iter().next() {
-                        // VAL-CPHASE-016: write from flat buffer directly. Presence of the
-                        // vector (not response.count) is the real non-empty contract.
-                        Some(v) => Some(Ok(v)),
-                        None => Some(Err("worker returned empty response".to_string())),
+                    EmbedResult::Success(response) => {
+                        match response.into_vectors().into_iter().next() {
+                            // VAL-CPHASE-016: write from flat buffer directly. Presence of the
+                            // vector (not response.count) is the real non-empty contract.
+                            Some(v) => Some(Ok(v)),
+                            None => Some(Err("worker returned empty response".to_string())),
+                        }
                     }
                     EmbedResult::Fallback { batch_id, error } => {
                         // VAL-CPHASE-018/019: Fallback already logged actionable warning.

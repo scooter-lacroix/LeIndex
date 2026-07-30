@@ -138,9 +138,9 @@ fn phase_target(
     project_root: &Path,
     requested_path: Option<&str>,
 ) -> Result<(PathBuf, Vec<PathBuf>, Option<PathBuf>), JsonRpcError> {
-    let canonical_root = project_root
-        .canonicalize()
-        .map_err(|error| JsonRpcError::invalid_params(format!("project root not accessible: {}", error)))?;
+    let canonical_root = project_root.canonicalize().map_err(|error| {
+        JsonRpcError::invalid_params(format!("project root not accessible: {}", error))
+    })?;
     let target = match requested_path {
         Some(path) => PathBuf::from(path).canonicalize().map_err(|error| {
             JsonRpcError::invalid_params(format!("path must exist and be accessible: {}", error))

@@ -208,12 +208,10 @@ async fn find_live_symbol_in_inventory(
     // of files READ (a missing symbol otherwise scans the whole tree); `parsed`
     // caps parsed files. Byte matching via `from_utf8` (no whole-file allocation).
     let mut parsed = 0usize;
-    let mut inspected = 0usize;
-    for candidate in candidates {
+    for (inspected, candidate) in candidates.into_iter().enumerate() {
         if parsed >= 20 || inspected >= 200 {
             break;
         }
-        inspected += 1;
         let Ok(bytes) = read_live_bytes(candidate.clone()).await else {
             continue;
         };
