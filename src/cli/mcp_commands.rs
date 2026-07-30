@@ -761,7 +761,7 @@ mod tests {
     fn test_write_stdio_response_preserves_framed_wire_format() {
         let mut output = Vec::new();
         write_stdio_response(&mut output, "{}", true).unwrap();
-        assert_eq!(output, b"Content-Length: 2\r\n\r\n{}\n");
+        assert_eq!(output, b"Content-Length: 2\r\n\r\n{}");
     }
 
     #[test]
@@ -779,6 +779,6 @@ mod tests {
         }
         let mut output = Vec::new();
         write_stdio_response(&mut output, "{}", framed_responses).unwrap();
-        assert_eq!(output, b"Content-Length: 2\r\n\r\n{}\n");
+        assert_eq!(output, b"Content-Length: 2\r\n\r\n{}");
     }
 }
