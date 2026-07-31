@@ -201,7 +201,14 @@ pub fn migraphx_cache_path(model_name: &str) -> std::path::PathBuf {
 /// profile on startup; this prunes the sibling profile dirs themselves, so the
 /// cache tree never grows past one live profile. Returns the number removed.
 pub fn prune_stale_migraphx_profiles(model_name: &str) -> usize {
-    let current = migraphx_cache_path(model_name);
+    // Resolve the real cache path directly. Never fall back to the
+    // `/tmp/leindex-migraphx-cache-unresolved` sentinel used by
+    // migraphx_cache_path — pruning against that sentinel's parent (/tmp)
+    // would delete arbitrary sibling directories.
+    let current = match migraphx_model_cache_path(Some(model_name)) {
+        Some(path) => path,
+        None => return 0,
+    };
     let Some(parent) = current.parent() else {
         return 0;
     };

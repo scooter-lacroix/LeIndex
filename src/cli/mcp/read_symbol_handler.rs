@@ -200,13 +200,12 @@ async fn find_live_symbol_in_inventory(
             JsonRpcError::internal_error(format!("live symbol inventory failed: {error}"))
         })?;
     // Content prefilter: only parse files whose bytes mention the symbol, so the
-    // bounded parse cap applies to *relevant* files rather than an arbitrary
-    // alphabetical slice — a symbol in a later-sorting file is still found. A
-    // path-name prefilter would be wrong (symbols are not named after their files).
-    // Content prefilter: only parse files whose bytes mention the symbol, so the
     // bounded parse cap applies to *relevant* files. `inspected` caps the number
     // of files READ (a missing symbol otherwise scans the whole tree); `parsed`
     // caps parsed files. Byte matching via `from_utf8` (no whole-file allocation).
+    // Case-insensitive so differently-cased declarations are not skipped
+    // (consistent with the eq_ignore_ascii_case catalog fallback).
+    let symbol_lower = symbol.to_ascii_lowercase();
     let mut parsed = 0usize;
     for (inspected, candidate) in candidates.into_iter().enumerate() {
         if parsed >= 20 || inspected >= 200 {
@@ -216,7 +215,7 @@ async fn find_live_symbol_in_inventory(
             continue;
         };
         if !std::str::from_utf8(&bytes)
-            .map(|content| content.contains(symbol))
+            .map(|content| content.to_ascii_lowercase().contains(&symbol_lower))
             .unwrap_or(false)
         {
             continue;
@@ -230,7 +229,7 @@ async fn find_live_symbol_in_inventory(
         }
     }
     Err(JsonRpcError::invalid_params(format!(
-        "Symbol '{}' not found in the first 20 live source candidates",
+        "Symbol '{}' not found: scanned up to 200 live source candidates and parsed up to 20",
         symbol
     )))
 }

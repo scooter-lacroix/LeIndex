@@ -1382,6 +1382,7 @@ pub(crate) fn detect_changed_manifests(
                 || path_str.contains("/dist/")
                 || path_str.contains("\\dist\\")
                 || path_str.contains("/target/")
+                || path_str.contains("\\target\\")
                 || path_str.contains(".cache");
             if !skip {
                 changed.push(mp.clone());
@@ -1448,20 +1449,18 @@ pub(crate) fn files_importing_from_manifests(
 // ============================================================================
 
 pub(crate) fn index_fingerprint(stats: &IndexStats) -> String {
-    // Include all numeric stats so that any content change invalidates
-    // the search cache. Previously only pdg_nodes/pdg_edges/indexed_nodes
-    // were used, which meant modifying a file (replacing one function with
-    // another) produced the same fingerprint and stale cached search
-    // results were returned (VAL-INDEX-005).
+    // Content-derived counters so that any content change invalidates the
+    // search cache (VAL-INDEX-005). indexing_time_ms is intentionally excluded:
+    // it is nondeterministic and would make the fingerprint (and thus the
+    // search/analysis cache keys) unstable across identical indexing runs.
     format!(
-        "{}:{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}:{}",
         stats.total_files,
         stats.files_parsed,
         stats.total_signatures,
         stats.pdg_nodes,
         stats.pdg_edges,
         stats.indexed_nodes,
-        stats.indexing_time_ms,
     )
 }
 
