@@ -208,9 +208,6 @@ fn leading_file_doc(bytes: &[u8]) -> String {
     lines.join("\n")
 }
 
-/// Build the bounded semantic text used by both the mandatory lexical index
-/// and the deferred neural enrichment pass. Keeping this in one place makes
-/// the two result layers rank the same node content.
 /// Whether a node should be excluded from the search index because it is an
 /// external/dependency placeholder.
 ///
@@ -225,6 +222,9 @@ fn is_external_node_excluded(node: &crate::graph::pdg::Node) -> bool {
     node.node_type == NodeType::External
 }
 
+/// Build the bounded semantic text used by both the mandatory lexical index
+/// and the deferred neural enrichment pass. Keeping this in one place makes
+/// the two result layers rank the same node content.
 pub(crate) fn enriched_node_content(
     pdg: &ProgramDependenceGraph,
     node_idx: petgraph::graph::NodeIndex,

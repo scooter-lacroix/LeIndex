@@ -294,15 +294,6 @@ impl HybridEmbedder {
         }
     }
 
-    /// Generate neural/remote embedding for text (blocking wrapper for sync contexts)
-    ///
-    /// Uses `embed_with_fallback` for retry-once semantics:
-    /// - VAL-CPHASE-017: Retries once on worker failure
-    /// - VAL-CPHASE-018: Falls back to TF-IDF for the affected batch after second failure
-    /// - VAL-CPHASE-019: Emits actionable warning on fallback
-    /// - VAL-CPHASE-020: Worker failure does not crash the main daemon
-    /// - VAL-CPHASE-021: Fresh worker can be spawned after fallback
-    ///
     /// Blocking cross-encoder rerank of candidate documents via the worker's
     /// on-demand reranker (bge-reranker-base). Takes (id, content, initial_score)
     /// tuples and returns (id, combined_score) ranked by the cross-encoder.
