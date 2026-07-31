@@ -62,7 +62,7 @@ jobs:
         run: pip install lizard
       - name: Run complexity analysis
         run: |
-          # Analyze all Rust source files, fail if any function has CCN > 15.
+          # Generate the browsable HTML report (lizard -o always exits 0).
           lizard \
             src/ \
             crates/leindex-embed/src/ \
@@ -70,7 +70,17 @@ jobs:
             -x"*/tests/*" \
             -x"*/target/*" \
             -m \
-            -H./complexity-report.html \
+            -o ./complexity-report.html
+          # Enforce the gate: -i 0 makes lizard exit non-zero on any CCN > 15
+          # (lizard's -o report mode always exits 0, so the gate is a separate run).
+          lizard \
+            src/ \
+            crates/leindex-embed/src/ \
+            -C 15 \
+            -x"*/tests/*" \
+            -x"*/target/*" \
+            -m \
+            -i 0 \
             || (echo "::error::Cyclomatic complexity threshold exceeded (CCN > 15)" && exit 1)
       - name: Upload complexity report
         if: always()
