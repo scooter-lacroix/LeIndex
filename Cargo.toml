@@ -328,9 +328,9 @@ dialoguer = { version = "0.11", optional = true }
 sha2 = { version = "0.10", optional = true }
 
 # Server feature dependencies (axum 0.7)
-axum = { version = "0.7", features = ["ws"], optional = true }
+axum = { version = "0.8", features = ["ws"], optional = true }
 tower = { version = "0.5", features = ["full"], optional = true }
-tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
+tower-http = { version = "0.6", features = ["cors", "trace"], optional = true }
 futures = { version = "0.3", optional = true }
 tokio-tungstenite = { version = "0.24", optional = true }
 
