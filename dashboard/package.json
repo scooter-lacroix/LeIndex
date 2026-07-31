@@ -18,7 +18,7 @@
   },
   "devDependencies": {
     "@types/react": "^19.2.17",
-    "@types/react-dom": "^18.2.0",
+    "@types/react-dom": "^19.2.3",
     "bun-types": "latest",
     "typescript": "^7.0.2"
   }
