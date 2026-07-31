@@ -1,0 +1,61 @@
+name: Security
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  schedule:
+    - cron: '0 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  #cargo-deny: scans Cargo.lock for known vulnerabilities in dependencies.
+  #Switched from rustsec/audit-check (cargo-audit 0.22+ ignores ./audit.toml and
+  #its action exposes no ignore input); cargo-deny reads deny.toml reliably.
+  cargo-audit:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          # `command-arguments` (NOT `arguments`): the latter is for cargo-deny
+          # Common Options (--all-features etc.) placed BEFORE the subcommand,
+          # which made the action run `cargo deny advisories check` and fail with
+          # "unrecognized subcommand 'advisories'". `command-arguments` goes after
+          # the subcommand -> `cargo deny check advisories`.
+          command-arguments: advisories
+
+  #gitleaks: scans commits for hardcoded secrets (API keys, tokens, passwords)
+  gitleaks:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  #branch-protection: verifies master branch has protection rules
+  branch-protection:
+    name: Branch Protection Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify branch protection
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PROTECTION=$(gh api repos/${{ github.repository }}/branches/master/protection 2>/dev/null || echo "")
+          if [ -z "$PROTECTION" ]; then
+            echo "::warning::Branch protection is not configured for master. Enable via GitHub Settings > Branches."
+          else
+            echo "Branch protection is configured."
+          fi

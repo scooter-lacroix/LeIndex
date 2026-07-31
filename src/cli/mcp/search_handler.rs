@@ -1,8 +1,157 @@
-use super::helpers::{extract_string, extract_usize, resolve_scope, wrap_with_meta};
+use super::helpers::{extract_bool, extract_string, extract_usize, resolve_scope, wrap_with_meta};
 use super::protocol::JsonRpcError;
+use super::request_meta::WorkBudget;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Instant;
+
+fn classify_search(
+    query: &str,
+    search_mode: &str,
+) -> (
+    crate::search::query_route::QueryRoute,
+    &'static str,
+    Option<crate::search::ranking::QueryType>,
+) {
+    use crate::search::query_route::{QueryRoute, RequestedMode};
+
+    // When the caller explicitly requests "prose" mode, bypass the auto-routing
+    // classification that may reclassify a single identifier as ExactSymbol.
+    // Prose mode always uses text scoring, regardless of query shape.
+    if search_mode == "prose" {
+        return (
+            QueryRoute::ExactText,
+            "exact_text",
+            Some(crate::search::ranking::QueryType::Exact),
+        );
+    }
+
+    let requested = match search_mode {
+        "exact" => RequestedMode::Exact,
+        "semantic" | "code" => RequestedMode::Semantic,
+        _ => RequestedMode::Auto,
+    };
+    let route = crate::search::query_route::classify(query, requested);
+    let route_name = match route {
+        QueryRoute::ExactSymbol => "exact_symbol",
+        QueryRoute::ExactText => "exact_text",
+        QueryRoute::Semantic => "semantic",
+        QueryRoute::DeepPdg => "deep_pdg",
+    };
+    let query_type = match route {
+        QueryRoute::ExactSymbol | QueryRoute::ExactText => {
+            Some(crate::search::ranking::QueryType::Exact)
+        }
+        QueryRoute::Semantic | QueryRoute::DeepPdg => Some(if search_mode == "prose" {
+            crate::search::ranking::QueryType::Text
+        } else {
+            crate::search::ranking::QueryType::Semantic
+        }),
+    };
+    (route, route_name, query_type)
+}
+
+fn path_in_scope(file_path: &str, scope: Option<&str>, project_root: &std::path::Path) -> bool {
+    let Some(scope) = scope else {
+        return true;
+    };
+    let normalize = |path: &str| path.replace('\\', "/").trim_end_matches('/').to_string();
+    let project_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let scope = normalize(scope);
+    let scope_path = std::path::Path::new(&scope);
+    let scope_is_directory = scope.ends_with('/')
+        || scope.ends_with('\\')
+        || if scope_path.is_absolute() {
+            scope_path.is_dir()
+        } else {
+            project_root.join(scope_path).is_dir()
+        };
+    let absolute_scope = if scope_path.is_absolute() {
+        scope
+    } else {
+        normalize(&project_root.join(scope_path).to_string_lossy())
+    };
+    let file_path = normalize(file_path);
+    let absolute_file_path = if std::path::Path::new(&file_path).is_absolute() {
+        file_path
+    } else {
+        normalize(&project_root.join(&file_path).to_string_lossy())
+    };
+    absolute_file_path == absolute_scope
+        || (scope_is_directory && absolute_file_path.starts_with(&format!("{absolute_scope}/")))
+}
+
+fn scoped_search(
+    index: &mut crate::cli::leindex::LeIndex,
+    query: &str,
+    top_k: usize,
+    offset: usize,
+    query_type: Option<crate::search::ranking::QueryType>,
+    ephemeral: bool,
+    scope: Option<&str>,
+    project_root: &std::path::Path,
+) -> Result<Vec<crate::search::search::SearchResult>, JsonRpcError> {
+    const MAX_FETCH_K: usize = 10_000;
+    let search = |index: &mut crate::cli::leindex::LeIndex, fetch_k| {
+        if ephemeral {
+            index.search_ephemeral(query, fetch_k, query_type)
+        } else {
+            index.search(query, fetch_k, query_type)
+        }
+    };
+    let required = offset.saturating_add(top_k);
+    let mut fetch_k = required.clamp(1, MAX_FETCH_K);
+    let mut all_results = search(index, fetch_k)
+        .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
+    let mut filtered: Vec<_> = all_results
+        .iter()
+        .filter(|result| path_in_scope(&result.file_path, scope, project_root))
+        .cloned()
+        .collect();
+
+    while filtered.len() < required && all_results.len() >= fetch_k && fetch_k < MAX_FETCH_K {
+        let next_fetch_k = fetch_k.saturating_mul(2).min(MAX_FETCH_K);
+        if next_fetch_k == fetch_k {
+            break;
+        }
+        fetch_k = next_fetch_k;
+        all_results = search(index, fetch_k)
+            .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
+        filtered = all_results
+            .iter()
+            .filter(|result| path_in_scope(&result.file_path, scope, project_root))
+            .cloned()
+            .collect();
+    }
+    Ok(filtered)
+}
+
+fn retrieval_meta(
+    index: &crate::cli::leindex::LeIndex,
+    route: crate::search::query_route::QueryRoute,
+    route_name: &str,
+    budget: &WorkBudget,
+    started: Instant,
+) -> Value {
+    use crate::search::query_route::QueryRoute;
+
+    serde_json::json!({
+        "tfidf_status": "fresh",
+        "pdg_status": if index.pdg().is_some() { "resident" } else { "not_loaded" },
+        "neural_status": if matches!(route, QueryRoute::ExactSymbol | QueryRoute::ExactText) {
+            "not_used_exact"
+        } else {
+            index.neural_status()
+        },
+        "route": route_name,
+        "partial": budget.elapsed(started),
+        "max_latency_ms": budget.max_latency_ms,
+        "allow_partial": budget.allow_partial
+    })
+}
 
 /// Handler for LeIndex [search
 ///
@@ -67,6 +216,23 @@ to auto-switch/auto-index projects."
         'exact' prioritizes exact symbol name matches (higher text/structural weights), \
         'semantic' prioritizes conceptual relevance (higher TF-IDF semantic weights).",
                     "default": "code"
+                },
+                "task_context": {
+                    "type": "string",
+                    "description": "Optional bounded review/task context used for this retrieval only",
+                    "maxLength": 2000
+                },
+                "max_latency_ms": {
+                    "type": "integer",
+                    "description": "Optional enrichment budget; never cancels the search (default: 500)",
+                    "default": 500,
+                    "minimum": 0,
+                    "maximum": 60000
+                },
+                "allow_partial": {
+                    "type": "boolean",
+                    "description": "Return core TF-IDF results when optional enrichment exceeds the budget",
+                    "default": true
                 }
             },
             "required": ["query"]
@@ -86,41 +252,25 @@ to auto-switch/auto-index projects."
             .get("search_mode")
             .and_then(|v| v.as_str())
             .unwrap_or("code");
-
-        // Resolve query type
-        let query_type = match search_mode {
-            "prose" => Some(crate::search::ranking::QueryType::Text),
-            "code" => Some(crate::search::ranking::QueryType::Semantic),
-            "exact" => Some(crate::search::ranking::QueryType::Exact),
-            "semantic" => Some(crate::search::ranking::QueryType::Semantic),
-            "auto" => {
-                let q_lower = query.to_lowercase();
-                let prose_keywords = [
-                    "how", "what", "where", "why", "who", "when", "can", "is", "explain",
-                    "describe", "find", "show",
-                ];
-                let is_natural_language = q_lower.split_whitespace().count() > 3
-                    || prose_keywords.iter().any(|k| q_lower.contains(k));
-
-                if is_natural_language {
-                    Some(crate::search::ranking::QueryType::Text)
-                } else {
-                    Some(crate::search::ranking::QueryType::Semantic)
-                }
-            }
-            _ => Some(crate::search::ranking::QueryType::Semantic),
+        let task_context = args
+            .get("task_context")
+            .and_then(Value::as_str)
+            .map(|context| context.chars().take(2000).collect::<String>());
+        let budget = WorkBudget {
+            max_latency_ms: extract_usize(&args, "max_latency_ms", 500)?.min(60000) as u64,
+            allow_partial: extract_bool(&args, "allow_partial", true),
         };
+        let started = Instant::now();
+        let effective_query = task_context.as_deref().map_or_else(
+            || query.clone(),
+            |context| format!("{}\nTask context: {}", query, context),
+        );
+
+        let (route, route_name, query_type) = classify_search(&effective_query, search_mode);
 
         let project_path = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path).await?;
         let mut guard = handle.write().await;
-
-        if let Err(e) = guard.ensure_pdg_loaded() {
-            tracing::warn!(
-                "Failed to load PDG for semantic search; continuing without enrichment: {}",
-                e
-            );
-        }
 
         let scope = resolve_scope(&args, guard.project_path())?;
 
@@ -130,44 +280,17 @@ to auto-switch/auto-index projects."
             ));
         }
 
-        const MAX_FETCH_K: usize = 1000;
-        let mut fetch_k = (top_k + offset).min(MAX_FETCH_K);
-        let mut all_results = guard
-            .search(&query, fetch_k, query_type)
-            .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
-
-        let in_scope = |file_path: &str| match &scope {
-            Some(s) => {
-                let scope_str = s.trim_end_matches(std::path::MAIN_SEPARATOR);
-                if std::path::Path::new(scope_str).extension().is_some() {
-                    file_path == scope_str
-                } else {
-                    file_path.starts_with(&format!("{}{}", scope_str, std::path::MAIN_SEPARATOR))
-                        || file_path == scope_str
-                }
-            }
-            None => true,
-        };
-
-        let mut filtered: Vec<_> = all_results
-            .iter()
-            .filter(|r| in_scope(&r.file_path))
-            .cloned()
-            .collect();
-
-        if filtered.is_empty() && scope.is_some() && !all_results.is_empty() {
-            fetch_k = (fetch_k * 10).min(MAX_FETCH_K * 10);
-            if fetch_k > top_k + offset {
-                all_results = guard
-                    .search(&query, fetch_k, query_type)
-                    .map_err(|e| JsonRpcError::search_failed(format!("Search error: {}", e)))?;
-                filtered = all_results
-                    .iter()
-                    .filter(|r| in_scope(&r.file_path))
-                    .cloned()
-                    .collect();
-            }
-        }
+        let project_root = guard.project_path().to_path_buf();
+        let filtered = scoped_search(
+            &mut guard,
+            &effective_query,
+            top_k,
+            offset,
+            query_type,
+            task_context.is_some(),
+            scope.as_deref(),
+            &project_root,
+        )?;
 
         let total_filtered = filtered.len();
         let page: Vec<_> = filtered.into_iter().skip(offset).take(top_k).collect();
@@ -185,7 +308,8 @@ to auto-switch/auto-index projects."
                         Try: rephrase query, use different keywords, or try LeIndex [Grep Symbols] for exact symbol names.",
                         query,
                         guard.source_file_paths().map(|p| p.len()).unwrap_or(0)
-                    )
+                    ),
+                    "retrieval": retrieval_meta(&guard, route, route_name, &budget, started)
                 }),
                 &guard,
             ));
@@ -197,7 +321,8 @@ to auto-switch/auto-index projects."
                     JsonRpcError::internal_error(format!("Serialization error: {}", e)))?,
                 "offset": offset,
                 "count": total_returned,
-                "has_more": offset + total_returned < total_filtered
+                "has_more": offset + total_returned < total_filtered,
+                "retrieval": retrieval_meta(&guard, route, route_name, &budget, started)
             }),
             &guard,
         ))
@@ -232,6 +357,52 @@ mod tests {
                 "zero results should include suggestion"
             );
         }
+    }
+
+    fn directory_root() -> &'static std::path::Path {
+        std::path::Path::new(".")
+    }
+
+    #[test]
+    fn test_path_in_scope_handles_files_and_directories() {
+        let separator = std::path::MAIN_SEPARATOR;
+        let nested = format!("src{separator}cli{separator}main.rs");
+        let sibling = format!("src{separator}lib.rs");
+
+        assert!(path_in_scope(&nested, Some("src"), directory_root()));
+        assert!(path_in_scope(
+            "src\\cli\\main.rs",
+            Some("src"),
+            directory_root()
+        ));
+        assert!(!path_in_scope(&sibling, Some(&nested), directory_root()));
+        assert!(path_in_scope(&nested, Some(&nested), directory_root()));
+        assert!(path_in_scope(&nested, None, directory_root()));
+    }
+
+    #[test]
+    fn test_path_in_scope_preserves_file_and_dotted_directory_boundaries() {
+        let directory = tempdir().unwrap();
+        let dotted_dir = directory.path().join("docs.v1");
+        std::fs::create_dir(&dotted_dir).unwrap();
+        let extensionless_file = directory.path().join("Makefile");
+        std::fs::write(&extensionless_file, b"all:\n").unwrap();
+
+        let dotted_dir = dotted_dir.to_string_lossy().replace('\\', "/");
+        let extensionless_file = extensionless_file.to_string_lossy().replace('\\', "/");
+        let dotted_child = format!("{dotted_dir}/guide.md");
+        let false_file_child = format!("{extensionless_file}/nested.rs");
+
+        assert!(path_in_scope(
+            &dotted_child,
+            Some(&dotted_dir),
+            directory.path()
+        ));
+        assert!(!path_in_scope(
+            &false_file_child,
+            Some(&extensionless_file),
+            directory.path()
+        ));
     }
 
     #[test]

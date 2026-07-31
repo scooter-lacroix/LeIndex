@@ -1,8 +1,8 @@
 //! Impact analysis for edit changes
 
 use crate::edit::ResolvedEditChange;
-use crate::graph::pdg::{NodeId, NodeType, TraversalConfig};
 use crate::graph::ProgramDependenceGraph;
+use crate::graph::pdg::{NodeId, NodeType, TraversalConfig};
 use crate::validation::ValidationError;
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -276,8 +276,8 @@ impl ImpactAnalyzer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::pdg::{EdgeMetadata, EdgeType};
     use crate::graph::Node;
+    use crate::graph::pdg::{EdgeMetadata, EdgeType};
 
     #[test]
     fn test_location_new() {
@@ -432,6 +432,8 @@ mod tests {
                     call_count: None,
                     confidence: None,
                     variable_name: None,
+                    channel: None,
+                    position: None,
                 },
             },
         );
@@ -444,6 +446,8 @@ mod tests {
                     call_count: None,
                     confidence: None,
                     variable_name: None,
+                    channel: None,
+                    position: None,
                 },
             },
         );

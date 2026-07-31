@@ -32,102 +32,104 @@ use std::arch::x86_64::*;
 ///   (32-byte alignment is ideal but not required - we use unaligned loads)
 #[target_feature(enable = "avx2")]
 pub unsafe fn dot_product_adc(query: &[f32], qvec: &Int8QuantizedVector, query_sum: f32) -> f32 {
-    let q_slice = qvec.as_slice();
-    let dimension = qvec.len();
+    unsafe {
+        let q_slice = qvec.as_slice();
+        let dimension = qvec.len();
 
-    // Process 16 elements at a time (2 AVX2 registers of 8 f32 each)
-    let n_chunks = dimension / 16;
+        // Process 16 elements at a time (2 AVX2 registers of 8 f32 each)
+        let n_chunks = dimension / 16;
 
-    // Initialize accumulators to zero
-    let mut acc0 = _mm256_setzero_ps();
-    let mut acc1 = _mm256_setzero_ps();
+        // Initialize accumulators to zero
+        let mut acc0 = _mm256_setzero_ps();
+        let mut acc1 = _mm256_setzero_ps();
 
-    for i in 0..n_chunks {
-        // Software prefetching for large dimensions (>1536)
-        // Prefetch data 4 iterations ahead to hide memory latency
-        if dimension > 1536 && i + 4 < n_chunks {
-            let prefetch_ptr = q_slice.as_ptr().add((i + 4) * 16);
-            _mm_prefetch(prefetch_ptr, _MM_HINT_T0);
+        for i in 0..n_chunks {
+            // Software prefetching for large dimensions (>1536)
+            // Prefetch data 4 iterations ahead to hide memory latency
+            if dimension > 1536 && i + 4 < n_chunks {
+                let prefetch_ptr = q_slice.as_ptr().add((i + 4) * 16);
+                _mm_prefetch(prefetch_ptr, _MM_HINT_T0);
+            }
+
+            // Load 16 i8 values (128-bit)
+            // Using unaligned load - the slice may not be 16-byte aligned
+            let i8_ptr = q_slice.as_ptr().add(i * 16) as *const __m128i;
+            let i8_vec = _mm_loadu_si128(i8_ptr);
+
+            // Widen i8 -> i16 (256-bit)
+            // PMOVSXBW: Packed Move with Sign Extend (Byte to Word)
+            let i16_vec = _mm256_cvtepi8_epi16(i8_vec);
+
+            // Extract low and high 128-bit halves
+            let low_i16 = _mm256_extracti128_si256(i16_vec, 0);
+            let high_i16 = _mm256_extracti128_si256(i16_vec, 1);
+
+            // Widen i16 -> i32 (256-bit for each half)
+            // PMOVSXWD: Packed Move with Sign Extend (Word to Doubleword)
+            let low_i32 = _mm256_cvtepi16_epi32(low_i16);
+            let high_i32 = _mm256_cvtepi16_epi32(high_i16);
+
+            // Convert i32 -> f32
+            // CVTDQ2PS: Convert Packed Doubleword Integers to Packed Single-Precision Floats
+            let low_f32 = _mm256_cvtepi32_ps(low_i32);
+            let high_f32 = _mm256_cvtepi32_ps(high_i32);
+
+            // Load corresponding query values (8 f32 each)
+            let q_ptr = query.as_ptr().add(i * 16);
+            let q_low = _mm256_loadu_ps(q_ptr);
+            let q_high = _mm256_loadu_ps(q_ptr.add(8));
+
+            // Multiply-accumulate: acc += query * quantized
+            // FMA: Fused Multiply-Add (if available)
+            acc0 = _mm256_fmadd_ps(q_low, low_f32, acc0);
+            acc1 = _mm256_fmadd_ps(q_high, high_f32, acc1);
         }
 
-        // Load 16 i8 values (128-bit)
-        // Using unaligned load - the slice may not be 16-byte aligned
-        let i8_ptr = q_slice.as_ptr().add(i * 16) as *const __m128i;
-        let i8_vec = _mm_loadu_si128(i8_ptr);
+        // Combine the two accumulators
+        let sum01 = _mm256_add_ps(acc0, acc1);
 
-        // Widen i8 -> i16 (256-bit)
-        // PMOVSXBW: Packed Move with Sign Extend (Byte to Word)
-        let i16_vec = _mm256_cvtepi8_epi16(i8_vec);
+        // Horizontal sum of 8 floats in sum01
+        // Strategy: reduce 8 -> 4 -> 2 -> 1
 
-        // Extract low and high 128-bit halves
-        let low_i16 = _mm256_extracti128_si256(i16_vec, 0);
-        let high_i16 = _mm256_extracti128_si256(i16_vec, 1);
+        // Extract lower 128 bits
+        let low128 = _mm256_castps256_ps128(sum01);
+        let high128 = _mm256_extractf128_ps(sum01, 1);
 
-        // Widen i16 -> i32 (256-bit for each half)
-        // PMOVSXWD: Packed Move with Sign Extend (Word to Doubleword)
-        let low_i32 = _mm256_cvtepi16_epi32(low_i16);
-        let high_i32 = _mm256_cvtepi16_epi32(high_i16);
+        // Add lower and upper halves
+        let sum128 = _mm_add_ps(low128, high128);
 
-        // Convert i32 -> f32
-        // CVTDQ2PS: Convert Packed Doubleword Integers to Packed Single-Precision Floats
-        let low_f32 = _mm256_cvtepi32_ps(low_i32);
-        let high_f32 = _mm256_cvtepi32_ps(high_i32);
+        // Horizontal sum of 4 floats
+        // [a, b, c, d] -> [a+b, c+d, a+b, c+d]
+        let shuffled = _mm_movehl_ps(sum128, sum128);
+        let sum64 = _mm_add_ps(sum128, shuffled);
 
-        // Load corresponding query values (8 f32 each)
-        let q_ptr = query.as_ptr().add(i * 16);
-        let q_low = _mm256_loadu_ps(q_ptr);
-        let q_high = _mm256_loadu_ps(q_ptr.add(8));
+        // [a+b, c+d, ...] -> [a+b+c+d, ...]
+        let shuffled2 = _mm_shuffle_ps(sum64, sum64, 0x01);
+        let sum32 = _mm_add_ss(sum64, shuffled2);
 
-        // Multiply-accumulate: acc += query * quantized
-        // FMA: Fused Multiply-Add (if available)
-        acc0 = _mm256_fmadd_ps(q_low, low_f32, acc0);
-        acc1 = _mm256_fmadd_ps(q_high, high_f32, acc1);
+        // Extract the final sum
+        let mut total = _mm_cvtss_f32(sum32);
+
+        // Handle remainder (dimensions not divisible by 16)
+        // SAFETY: We use get_unchecked here for performance in the hot loop.
+        // The safety invariant is: 0 <= i < q_slice.len()
+        // - The loop starts at n_chunks * 16, which is <= dimension
+        // - The loop iterates through query which has exactly 'dimension' elements
+        // - q_slice comes from qvec which also has exactly 'dimension' elements
+        // - Therefore i is always in bounds [0, dimension) for both slices
+        for (i, &q_val) in query.iter().enumerate().skip(n_chunks * 16) {
+            debug_assert!(
+                i < q_slice.len(),
+                "Index {} out of bounds for q_slice of len {}",
+                i,
+                q_slice.len()
+            );
+            total += q_val * (*q_slice.get_unchecked(i) as f32);
+        }
+
+        // Apply ADC correction: (dot - bias * ΣQ) / scale
+        (total - qvec.metadata.bias * query_sum) / qvec.metadata.scale
     }
-
-    // Combine the two accumulators
-    let sum01 = _mm256_add_ps(acc0, acc1);
-
-    // Horizontal sum of 8 floats in sum01
-    // Strategy: reduce 8 -> 4 -> 2 -> 1
-
-    // Extract lower 128 bits
-    let low128 = _mm256_castps256_ps128(sum01);
-    let high128 = _mm256_extractf128_ps(sum01, 1);
-
-    // Add lower and upper halves
-    let sum128 = _mm_add_ps(low128, high128);
-
-    // Horizontal sum of 4 floats
-    // [a, b, c, d] -> [a+b, c+d, a+b, c+d]
-    let shuffled = _mm_movehl_ps(sum128, sum128);
-    let sum64 = _mm_add_ps(sum128, shuffled);
-
-    // [a+b, c+d, ...] -> [a+b+c+d, ...]
-    let shuffled2 = _mm_shuffle_ps(sum64, sum64, 0x01);
-    let sum32 = _mm_add_ss(sum64, shuffled2);
-
-    // Extract the final sum
-    let mut total = _mm_cvtss_f32(sum32);
-
-    // Handle remainder (dimensions not divisible by 16)
-    // SAFETY: We use get_unchecked here for performance in the hot loop.
-    // The safety invariant is: 0 <= i < q_slice.len()
-    // - The loop starts at n_chunks * 16, which is <= dimension
-    // - The loop iterates through query which has exactly 'dimension' elements
-    // - q_slice comes from qvec which also has exactly 'dimension' elements
-    // - Therefore i is always in bounds [0, dimension) for both slices
-    for (i, &q_val) in query.iter().enumerate().skip(n_chunks * 16) {
-        debug_assert!(
-            i < q_slice.len(),
-            "Index {} out of bounds for q_slice of len {}",
-            i,
-            q_slice.len()
-        );
-        total += q_val * (*q_slice.get_unchecked(i) as f32);
-    }
-
-    // Apply ADC correction: (dot - bias * ΣQ) / scale
-    (total - qvec.metadata.bias * query_sum) / qvec.metadata.scale
 }
 
 /// Compute asymmetric squared L2 distance using AVX2
@@ -143,8 +145,10 @@ pub unsafe fn l2_squared_distance(
     query_sum: f32,
     query_norm_sq: f32,
 ) -> f32 {
-    let dot_adc = dot_product_adc(query, qvec, query_sum);
-    (query_norm_sq + qvec.metadata.squared_sum - 2.0 * dot_adc).max(0.0)
+    unsafe {
+        let dot_adc = dot_product_adc(query, qvec, query_sum);
+        (query_norm_sq + qvec.metadata.squared_sum - 2.0 * dot_adc).max(0.0)
+    }
 }
 
 #[cfg(test)]

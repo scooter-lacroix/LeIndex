@@ -123,7 +123,6 @@ global_index:
   # Query routing
   query_router:
     max_concurrent_queries: 10
-    query_timeout_seconds: 30
     merge_strategy: "weighted"  # weighted, ranked, simple
 
   # Graceful degradation
@@ -324,7 +323,6 @@ export LEINDEX_GLOBAL_INDEX_TIER2_STALE_ALLOWED=true
 
 # Query router
 export LEINDEX_GLOBAL_INDEX_QUERY_ROUTER_MAX_CONCURRENT_QUERIES=20
-export LEINDEX_GLOBAL_INDEX_QUERY_ROUTER_QUERY_TIMEOUT_SECONDS=60
 export LEINDEX_GLOBAL_INDEX_QUERY_ROUTER_MERGE_STRATEGY="ranked"
 
 # Graceful degradation

@@ -14,7 +14,8 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 #[test]
 fn model_resolver_fails_on_missing_model() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("LEINDEX_MODEL_PATH");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
 
     let result = ModelResolver::resolve("nonexistent-model-xyz-abc");
     let error = result.expect_err("missing model must fail");
@@ -26,15 +27,19 @@ fn model_resolver_fails_on_missing_model() {
 fn missing_env_override_falls_through() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let temp_dir = tempfile::tempdir().unwrap();
-    std::env::set_var(
-        "LEINDEX_MODEL_PATH",
-        temp_dir.path().join("missing").to_str().unwrap(),
-    );
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::set_var(
+            "LEINDEX_MODEL_PATH",
+            temp_dir.path().join("missing").to_str().unwrap(),
+        )
+    };
 
     let result = ModelResolver::resolve("nonexistent-env-fallthrough-model");
     assert!(result.is_err());
 
-    std::env::remove_var("LEINDEX_MODEL_PATH");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
 }
 
 #[test]
@@ -46,7 +51,8 @@ fn setup_managed_directory_resolves_model_and_tokenizer() {
     fs::write(&model_path, b"test model").unwrap();
     fs::write(&tokenizer_path, b"{}").unwrap();
 
-    std::env::set_var("LEINDEX_MODEL_PATH", model_dir.path());
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LEINDEX_MODEL_PATH", model_dir.path()) };
     assert_eq!(
         ModelResolver::resolve("qwen3-embed-0.6b-dynamic").unwrap(),
         model_path
@@ -56,7 +62,8 @@ fn setup_managed_directory_resolves_model_and_tokenizer() {
         tokenizer_path
     );
 
-    std::env::remove_var("LEINDEX_MODEL_PATH");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
 }
 
 #[test]
@@ -66,7 +73,8 @@ fn explicit_model_override_has_highest_precedence() {
     let explicit_model = explicit_dir.path().join("precedence-test.onnx");
     fs::write(&explicit_model, b"explicit model").unwrap();
 
-    std::env::set_var("LEINDEX_MODEL_PATH", explicit_dir.path());
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LEINDEX_MODEL_PATH", explicit_dir.path()) };
     let resolved = ModelResolver::resolve("precedence-test").unwrap();
     assert_eq!(resolved, explicit_model);
     assert_eq!(
@@ -75,5 +83,6 @@ fn explicit_model_override_has_highest_precedence() {
         "explicit setup/development override should be reported"
     );
 
-    std::env::remove_var("LEINDEX_MODEL_PATH");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
 }

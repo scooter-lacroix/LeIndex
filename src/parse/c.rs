@@ -1,5 +1,6 @@
 // C language parser implementation
 
+use crate::parse::traits::clean_call_text;
 use crate::parse::traits::{Block, Edge, Visibility};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
@@ -58,6 +59,8 @@ impl CParser {
                                 calls: vec![],
                                 imports: vec![],
                                 byte_range: (node.start_byte(), node.end_byte()),
+                                flow_facts: vec![],
+
                                 cyclomatic_complexity: 0,
                             });
                         }
@@ -211,6 +214,8 @@ fn extract_function_signature(
 
         imports: vec![],
         byte_range: (node.start_byte(), node.end_byte()),
+        flow_facts: vec![],
+
         cyclomatic_complexity: 0,
     })
 }
@@ -257,10 +262,6 @@ fn extract_c_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportIn
 
 fn extract_c_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
-
-    fn clean_call_text(raw: &str) -> String {
-        raw.split('(').next().unwrap_or(raw).trim().to_string()
-    }
 
     let mut stack = vec![*node];
     while let Some(current) = stack.pop() {

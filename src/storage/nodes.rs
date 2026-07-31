@@ -1,7 +1,7 @@
 // Node persistence operations
 
 use crate::storage::schema::Storage;
-use rusqlite::{params, OptionalExtension, Result as SqliteResult};
+use rusqlite::{OptionalExtension, Result as SqliteResult, params};
 use serde::{Deserialize, Serialize};
 
 /// Node record for database storage
@@ -55,6 +55,8 @@ pub enum NodeType {
     Module,
     /// Imported/referenced symbol not defined in this project
     External,
+    /// Synthetic per-file summary node (mirrors graph::pdg::NodeType::FileSummary)
+    FileSummary,
 }
 
 impl NodeType {
@@ -67,6 +69,7 @@ impl NodeType {
             NodeType::Variable => "variable",
             NodeType::Module => "module",
             NodeType::External => "external",
+            NodeType::FileSummary => "file_summary",
         }
     }
 
@@ -79,6 +82,7 @@ impl NodeType {
             "variable" => Some(NodeType::Variable),
             "module" => Some(NodeType::Module),
             "external" => Some(NodeType::External),
+            "file_summary" => Some(NodeType::FileSummary),
             _ => None,
         }
     }
@@ -93,6 +97,87 @@ impl<'a> NodeStore<'a> {
     /// Create a new node store
     pub fn new(storage: &'a mut Storage) -> Self {
         Self { storage }
+    }
+
+    fn node_metadata_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> SqliteResult<(
+        Option<i64>,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        NodeType,
+        Option<String>,
+        Option<i32>,
+    )> {
+        Ok((
+            Some(row.get(0)?),
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            NodeType::from_str_name(&row.get::<_, String>(7)?).unwrap_or(NodeType::Function),
+            row.get(8)?,
+            row.get(9)?,
+        ))
+    }
+
+    fn node_storage_from_row(
+        row: &rusqlite::Row<'_>,
+    ) -> SqliteResult<(
+        String,
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<i64>,
+        Option<i32>,
+    )> {
+        Ok((
+            row.get(10)?,
+            row.get(11)?,
+            row.get(12)?,
+            row.get(13)?,
+            row.get(14)?,
+        ))
+    }
+
+    fn node_from_row(row: &rusqlite::Row<'_>) -> SqliteResult<NodeRecord> {
+        let (
+            id,
+            project_id,
+            file_path,
+            node_id,
+            symbol_name,
+            qualified_name,
+            language,
+            node_type,
+            signature,
+            complexity,
+        ) = Self::node_metadata_from_row(row)?;
+        let (content_hash, embedding, byte_range_start, byte_range_end, embedding_format) =
+            Self::node_storage_from_row(row)?;
+
+        Ok(NodeRecord {
+            id,
+            project_id,
+            file_path,
+            node_id,
+            symbol_name,
+            qualified_name,
+            language,
+            node_type,
+            signature,
+            complexity,
+            content_hash,
+            embedding,
+            byte_range_start,
+            byte_range_end,
+            embedding_format,
+        })
     }
 
     /// Insert a node record
@@ -165,26 +250,7 @@ impl<'a> NodeStore<'a> {
              FROM intel_nodes WHERE id = ?1"
         )?;
 
-        let result = stmt.query_row(params![id], |row| {
-            Ok(NodeRecord {
-                id: Some(row.get(0)?),
-                project_id: row.get(1)?,
-                file_path: row.get(2)?,
-                node_id: row.get(3)?,
-                symbol_name: row.get(4)?,
-                qualified_name: row.get(5)?,
-                language: row.get(6)?,
-                node_type: NodeType::from_str_name(&row.get::<_, String>(7)?)
-                    .unwrap_or(NodeType::Function),
-                signature: row.get(8)?,
-                complexity: row.get(9)?,
-                content_hash: row.get(10)?,
-                embedding: row.get(11)?,
-                byte_range_start: row.get(12)?,
-                byte_range_end: row.get(13)?,
-                embedding_format: row.get(14)?,
-            })
-        });
+        let result = stmt.query_row(params![id], Self::node_from_row);
 
         result.optional()
     }
@@ -196,26 +262,7 @@ impl<'a> NodeStore<'a> {
              FROM intel_nodes WHERE content_hash = ?1"
         )?;
 
-        let result = stmt.query_row(params![hash], |row| {
-            Ok(NodeRecord {
-                id: Some(row.get(0)?),
-                project_id: row.get(1)?,
-                file_path: row.get(2)?,
-                node_id: row.get(3)?,
-                symbol_name: row.get(4)?,
-                qualified_name: row.get(5)?,
-                language: row.get(6)?,
-                node_type: NodeType::from_str_name(&row.get::<_, String>(7)?)
-                    .unwrap_or(NodeType::Function),
-                signature: row.get(8)?,
-                complexity: row.get(9)?,
-                content_hash: row.get(10)?,
-                embedding: row.get(11)?,
-                byte_range_start: row.get(12)?,
-                byte_range_end: row.get(13)?,
-                embedding_format: row.get(14)?,
-            })
-        });
+        let result = stmt.query_row(params![hash], Self::node_from_row);
 
         result.optional()
     }
@@ -228,26 +275,7 @@ impl<'a> NodeStore<'a> {
         )?;
 
         let nodes = stmt
-            .query_map(params![file_path], |row| {
-                Ok(NodeRecord {
-                    id: Some(row.get(0)?),
-                    project_id: row.get(1)?,
-                    file_path: row.get(2)?,
-                    node_id: row.get(3)?,
-                    symbol_name: row.get(4)?,
-                    qualified_name: row.get(5)?,
-                    language: row.get(6)?,
-                    node_type: NodeType::from_str_name(&row.get::<_, String>(7)?)
-                        .unwrap_or(NodeType::Function),
-                    signature: row.get(8)?,
-                    complexity: row.get(9)?,
-                    content_hash: row.get(10)?,
-                    embedding: row.get(11)?,
-                    byte_range_start: row.get(12)?,
-                    byte_range_end: row.get(13)?,
-                    embedding_format: row.get(14)?,
-                })
-            })?
+            .query_map(params![file_path], Self::node_from_row)?
             .collect::<SqliteResult<Vec<_>>>()?;
 
         Ok(nodes)

@@ -8,6 +8,9 @@
 /// Core parsing traits and types for the LeIndex parsing engine.
 pub mod traits;
 
+/// Shared CFG builder primitives used by every language parser.
+pub(crate) mod cfg;
+
 /// Lazy-loaded grammar cache for memory-efficient parsing.
 pub mod grammar;
 

@@ -1,0 +1,27 @@
+! LeIndex Observability (OTEL) Tracing and Metrics Configuration
+!
+! OpenTelemetry integration for distributed tracing, metrics collection,
+! and deployment observability. Enable at runtime via RUST_LOG and OTEL
+! environment variables (see docs/OBSERVABILITY.md).
+!
+! This file documents the OTEL configuration surface that the tracing
+! infrastructure in src/observability.rs connects to.
+
+[tracing]
+# OpenTelemetry exporter endpoint (OTLP gRPC)
+# Set OTEL_EXPORTER_OTLP_ENDPOINT to point to your collector:
+#   export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+
+[metrics]
+# Prometheus metrics endpoint
+# Set LEINDEX_METRICS_ENDPOINT to enable:
+#   export LEINDEX_METRICS_ENDPOINT=0.0.0.0:9090
+
+[error_tracking]
+# Sentry DSN for error tracking with source maps
+# Set SENTRY_DSN to enable:
+#   export SENTRY_DSN=https://<key>@sentry.io/<project>
+
+[alerting]
+# Alert routing configuration
+# See .github/workflows/observability.yml for deployment notification integration

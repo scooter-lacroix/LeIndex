@@ -12,7 +12,9 @@
 
 **Understand large codebases instantly.**
 
-LeIndex is a semantic code search engine that lets you search code by **meaning**, not just keywords.
+LeIndex is a code intelligence engine whose TF-IDF lexical index and PDG
+relationships make exact and structural retrieval fast; the default ONNX
+`auto` provider adds neural similarity over those same nodes.
 
 Instead of hunting through files with grep or hoping variable names match your query, you can ask things like:
 
@@ -115,9 +117,9 @@ install the matching ONNX Runtime, and provision
 [Qwen3 Embedding](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) from
 Hugging Face via Hugging Face CLI. Models are stored under `~/.leindex/models/`
 and are never included in PyPI artifacts. CPU/CUDA use dynamic batches up to
-32; MIGraphX uses a warmed, cached 8-by-128 profile. Hybrid queries use a
-250 ms neural budget with immediate TF-IDF/structural fallback. TF-IDF search
-works immediately without setup. See [docs/NEURAL_SETUP.md](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/NEURAL_SETUP.md)
+32; MIGraphX uses a warmed, cached 8-by-128 profile. Indexing and semantic
+queries start/await the configured neural worker when ONNX is enabled; core
+TF-IDF/PDG results remain available on terminal provider failure. See [docs/NEURAL_SETUP.md](https://github.com/scooter-lacroix/LeIndex/blob/master/docs/NEURAL_SETUP.md)
 for CPU/GPU/AMD/NVIDIA paths and troubleshooting.
 
 **Option 2: cargo (recommended for Rust users)**
@@ -183,7 +185,8 @@ Modern AI coding tools struggle with large codebases because they lack global st
 
 LeIndex provides that missing layer.
 
-It builds a semantic index of your repository that both developers and AI assistants can query to understand:
+It builds one shared TF-IDF + PDG + neural index of your repository when ONNX
+is enabled; the neural vectors attach to those same nodes:
 
 - where logic lives
 - how components interact
@@ -210,7 +213,9 @@ LeIndex MCP → src/http/request_validator.rs
 
 ## How It Works
 
-LeIndex builds a semantic index of your codebase using embeddings and structural analysis (tree-sitter parsing + program dependence graphs).
+LeIndex builds one node-level index using tree-sitter symbols, TF-IDF lexical
+vectors, program-dependence-graph structure, and (with ONNX enabled) neural
+embeddings from the configured worker.
 
 This allows queries to match:
 
@@ -228,8 +233,8 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 
 ## Features
 
-- **Semantic search** — find code by meaning, not keywords
-- **PDG analysis** — program dependence graph for structural understanding
+- **Core hybrid retrieval** — TF-IDF lexical matching plus PDG structure
+- **Hybrid neural scoring** — local ONNX similarity over the same symbols with TF-IDF/PDG fallback
 - **5-phase analysis** — additive multi-pass codebase analysis pipeline
 - **Cross-project indexing** — search across multiple repos at once
 - **20 MCP tools** — read, analyze, edit preview/apply, rename, impact analysis
@@ -557,6 +562,12 @@ leindex dashboard                     # Launch dashboard UI
 | `LeIndex [Symbol Lookup]` | Symbol definition + callers/callees |
 | `LeIndex [Text Search]` | PRIMARY text search (replaces `Grep`/`rg`) |
 | `LeIndex [Write]` | Create or overwrite a file |
+
+`leindex.index` returns an owned `job_id` and phase/status snapshot immediately
+(`wait=false`); poll that job or pass `wait=true` when an explicit blocking
+call is needed. Requests never cancel indexing or publication at a wall-clock
+deadline. Retrieval responses expose core TF-IDF and PDG status plus the
+configured neural provider state.
 
 MCP tool names returned by `tools/list` are the exact strings emitted
 by each handler (e.g. `leindex.index`, `leindex.search`,

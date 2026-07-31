@@ -1,0 +1,52 @@
+# LeIndex configuration template.
+#
+# This is a TEMPLATE — copy to ~/.leindex/config/leindex.toml and edit for your
+# machine. You normally do NOT write this by hand: `leindex setup` discovers your
+# ONNX Runtime / model / GPU and writes the real file automatically. This template
+# documents the schema so the committed example never contains a user's personal
+# paths (no home directories, no absolute library paths).
+#
+# Path: $LEINDEX_HOME/config/leindex.toml  (default $LEINDEX_HOME = ~/.leindex)
+
+# ── Neural embeddings ───────────────────────────────────────────────────────
+[neural]
+# Master switch. false => TF-IDF/PDG lexical search only (no worker spawned).
+enabled = true
+
+# Execution provider for ONNX inference:
+#   "cpu"      CPU only — always available, slowest. Fully supported.
+#   "cuda"     NVIDIA CUDA.
+#   "migraphx" AMD MIGraphX (ROCm). Requires ORT >= 1.24 with the MIGraphX EP
+#              compiled in (ABI-compatible with the pinned ort crate).
+#   "auto"     pick the best available (MIGraphX -> CUDA -> CPU).
+execution_provider = "auto"
+
+# Absolute path to libonnxruntime.so discovered by `leindex setup`.
+# Leave unset to let the discovery chain search (env ORT_DYLIB_PATH -> this ->
+# ~/.leindex/lib -> binary sibling -> pip site-packages -> system). A stale path
+# (e.g. after an ORT upgrade) auto-resolves to the newest compatible version in
+# the same directory; discovery prefers ONNX Runtime >= 1.24 for MIGraphX.
+# EXAMPLE (do not commit a real path):
+# ort_dylib_path = "/opt/onnxruntime/lib/libonnxruntime.so"
+# ort_version = "1.27.1"
+
+# Directory holding model artifacts (ONNX model, tokenizer, checksums).
+model_dir = "~/.leindex/models"
+
+# Model stem to load from model_dir. The "-dynamic" suffix enables dynamic batch
+# /sequence shapes (more flexible, longer MIGraphX cold compile).
+model_name = "qwen3-embed-0.6b-dynamic"
+
+# ── Search ──────────────────────────────────────────────────────────────────
+[search]
+# "hybrid" (lexical + neural), "text" (lexical only), or "neural" (neural only).
+search_mode = "hybrid"
+# Neural score weight in hybrid mode (0.0-1.0).
+neural_weight = 0.6
+
+# ── Indexing pipeline ───────────────────────────────────────────────────────
+[indexing]
+# Texts per embedding IPC batch.
+batch_size = 500
+# Cap on source files indexed per run.
+max_files = 50000

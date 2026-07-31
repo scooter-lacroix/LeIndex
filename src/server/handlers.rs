@@ -2,10 +2,10 @@
 
 use crate::storage::Storage;
 use axum::{
-    extract::{ws::WebSocketUpgrade, Path, Query, State},
+    Json, Router,
+    extract::{Path, Query, State, ws::WebSocketUpgrade},
     http::StatusCode,
     response::IntoResponse,
-    Json, Router,
 };
 use futures::stream::StreamExt;
 use serde::Deserialize;
@@ -73,6 +73,29 @@ impl AppState {
     }
 }
 
+fn row_to_codebase_response(
+    row: &rusqlite::Row<'_>,
+    last_indexed: Option<String>,
+) -> rusqlite::Result<CodebaseResponse> {
+    Ok(CodebaseResponse {
+        id: row.get(0)?,
+        unique_project_id: row.get(0)?,
+        base_name: row.get(1)?,
+        path_hash: row.get(2)?,
+        instance: row.get(3)?,
+        project_path: row.get(4)?,
+        display_name: row.get(5)?,
+        project_type: "Rust".to_string(),
+        last_indexed: last_indexed.unwrap_or_else(|| "Unknown".to_string()),
+        file_count: row.get(6)?,
+        node_count: row.get(7)?,
+        edge_count: row.get(8)?,
+        is_valid: true,
+        is_clone: row.get(9)?,
+        cloned_from: row.get(10)?,
+    })
+}
+
 /// GET /api/codebases - List all registered projects
 pub async fn list_codebases(
     State(state): State<AppState>,
@@ -128,28 +151,7 @@ pub async fn list_codebases(
         })?;
 
     let projects = stmt
-        .query_map([], |row| {
-            let last_indexed: Option<String> = row.get(11).ok();
-            let last_indexed_str = last_indexed.unwrap_or_else(|| "Unknown".to_string());
-
-            Ok(CodebaseResponse {
-                id: row.get::<_, String>(0)?,
-                unique_project_id: row.get::<_, String>(0)?,
-                base_name: row.get(1)?,
-                path_hash: row.get(2)?,
-                instance: row.get(3)?,
-                project_path: row.get(4)?,
-                display_name: row.get(5)?,
-                project_type: "Rust".to_string(), // Default for now
-                last_indexed: last_indexed_str,
-                file_count: row.get(6)?,
-                node_count: row.get(7)?,
-                edge_count: row.get(8)?,
-                is_valid: true,
-                is_clone: row.get(9)?,
-                cloned_from: row.get(10)?,
-            })
-        })
+        .query_map([], |row| row_to_codebase_response(row, row.get(11).ok()))
         .map_err(|e| {
             error!("Failed to execute query: {}", e);
             ApiError::internal(format!("Database execution error: {}", e))
@@ -231,56 +233,10 @@ pub async fn get_codebase(
         error!("Failed to read get_codebase row: {}", e);
         ApiError::internal(format!("Database row read error: {}", e))
     })? {
-        Some(CodebaseResponse {
-            id: row.get::<_, String>(0).map_err(|e| {
-                ApiError::internal(format!("Failed to read codebase id column: {}", e))
-            })?,
-            unique_project_id: row.get::<_, String>(0).map_err(|e| {
-                ApiError::internal(format!(
-                    "Failed to read codebase unique_project_id column: {}",
-                    e
-                ))
-            })?,
-            base_name: row.get(1).map_err(|e| {
-                ApiError::internal(format!("Failed to read codebase base_name column: {}", e))
-            })?,
-            path_hash: row.get(2).map_err(|e| {
-                ApiError::internal(format!("Failed to read codebase path_hash column: {}", e))
-            })?,
-            instance: row.get(3).map_err(|e| {
-                ApiError::internal(format!("Failed to read codebase instance column: {}", e))
-            })?,
-            project_path: row.get(4).map_err(|e| {
-                ApiError::internal(format!(
-                    "Failed to read codebase project_path column: {}",
-                    e
-                ))
-            })?,
-            display_name: row.get(5).map_err(|e| {
-                ApiError::internal(format!(
-                    "Failed to read codebase display_name column: {}",
-                    e
-                ))
-            })?,
-            project_type: "Rust".to_string(),
-            last_indexed: "Unknown".to_string(),
-            file_count: row.get(6).map_err(|e| {
-                ApiError::internal(format!("Failed to read codebase file_count column: {}", e))
-            })?,
-            node_count: row.get(7).map_err(|e| {
-                ApiError::internal(format!("Failed to read codebase node_count column: {}", e))
-            })?,
-            edge_count: row.get(8).map_err(|e| {
-                ApiError::internal(format!("Failed to read codebase edge_count column: {}", e))
-            })?,
-            is_valid: true,
-            is_clone: row.get(9).map_err(|e| {
-                ApiError::internal(format!("Failed to read codebase is_clone column: {}", e))
-            })?,
-            cloned_from: row.get(10).map_err(|e| {
-                ApiError::internal(format!("Failed to read codebase cloned_from column: {}", e))
-            })?,
-        })
+        Some(row_to_codebase_response(row, None).map_err(|e| {
+            error!("Failed to read get_codebase row: {}", e);
+            ApiError::internal(format!("Database row read error: {}", e))
+        })?)
     } else {
         None
     };
@@ -298,19 +254,10 @@ pub async fn refresh_codebase(
     Ok(StatusCode::ACCEPTED)
 }
 
-/// GET /api/dashboard/overview - Aggregate dashboard metrics.
-pub async fn dashboard_overview(
-    State(state): State<AppState>,
-) -> ApiResult<Json<DashboardOverviewResponse>> {
-    info!("Building dashboard overview");
-
-    let storage = state.storage.lock().map_err(|e| {
-        error!("Failed to acquire storage lock: {}", e);
-        ApiError::internal(format!("Storage lock error: {}", e))
-    })?;
-    let conn = storage.conn();
-
-    let mut codebase_stmt = conn
+fn query_codebase_metrics(
+    conn: &rusqlite::Connection,
+) -> ApiResult<Vec<DashboardCodebaseMetricsResponse>> {
+    let mut stmt = conn
         .prepare(
             r#"
             SELECT
@@ -365,7 +312,7 @@ pub async fn dashboard_overview(
             ApiError::internal(format!("Database query error: {}", e))
         })?;
 
-    let codebases = codebase_stmt
+    let codebases = stmt
         .query_map([], |row| {
             Ok(DashboardCodebaseMetricsResponse {
                 id: row.get(0)?,
@@ -389,11 +336,13 @@ pub async fn dashboard_overview(
             ApiError::internal(format!("Result collection error: {}", e))
         })?;
 
-    let total_files = codebases.iter().map(|c| c.file_count).sum::<i64>();
-    let total_nodes = codebases.iter().map(|c| c.node_count).sum::<i64>();
-    let total_edges = codebases.iter().map(|c| c.edge_count).sum::<i64>();
+    Ok(codebases)
+}
 
-    let mut lang_stmt = conn
+fn query_language_distribution(
+    conn: &rusqlite::Connection,
+) -> ApiResult<Vec<LanguageDistributionResponse>> {
+    let mut stmt = conn
         .prepare(
             r#"
             SELECT language, COUNT(*) AS count
@@ -408,7 +357,7 @@ pub async fn dashboard_overview(
             ApiError::internal(format!("Database query error: {}", e))
         })?;
 
-    let language_distribution = lang_stmt
+    let languages = stmt
         .query_map([], |row| {
             Ok(LanguageDistributionResponse {
                 language: row.get(0)?,
@@ -424,6 +373,43 @@ pub async fn dashboard_overview(
             error!("Failed to collect language distribution: {}", e);
             ApiError::internal(format!("Result collection error: {}", e))
         })?;
+
+    Ok(languages)
+}
+
+fn compute_cache_temperature(
+    estimated_hit_rate: Option<f64>,
+    analysis_cache_entries: i64,
+) -> String {
+    match estimated_hit_rate {
+        Some(rate) if rate >= 0.75 => "hot",
+        Some(rate) if rate >= 0.35 => "warm",
+        Some(_) => "cold",
+        None if analysis_cache_entries > 0 => "warm",
+        None => "cold",
+    }
+    .to_string()
+}
+
+/// GET /api/dashboard/overview - Aggregate dashboard metrics.
+pub async fn dashboard_overview(
+    State(state): State<AppState>,
+) -> ApiResult<Json<DashboardOverviewResponse>> {
+    info!("Building dashboard overview");
+
+    let storage = state.storage.lock().map_err(|e| {
+        error!("Failed to acquire storage lock: {}", e);
+        ApiError::internal(format!("Storage lock error: {}", e))
+    })?;
+    let conn = storage.conn();
+
+    let codebases = query_codebase_metrics(conn)?;
+
+    let total_files = codebases.iter().map(|c| c.file_count).sum::<i64>();
+    let total_nodes = codebases.iter().map(|c| c.node_count).sum::<i64>();
+    let total_edges = codebases.iter().map(|c| c.edge_count).sum::<i64>();
+
+    let language_distribution = query_language_distribution(conn)?;
 
     let analysis_cache_entries: i64 = conn
         .query_row("SELECT COUNT(*) FROM analysis_cache", [], |row| row.get(0))
@@ -447,14 +433,7 @@ pub async fn dashboard_overview(
         }
     });
 
-    let temperature = match estimated_hit_rate {
-        Some(rate) if rate >= 0.75 => "hot",
-        Some(rate) if rate >= 0.35 => "warm",
-        Some(_) => "cold",
-        None if analysis_cache_entries > 0 => "warm",
-        None => "cold",
-    }
-    .to_string();
+    let temperature = compute_cache_temperature(estimated_hit_rate, analysis_cache_entries);
 
     let external_refs: i64 = conn
         .query_row("SELECT COUNT(*) FROM external_refs", [], |row| row.get(0))
@@ -504,22 +483,8 @@ pub async fn dashboard_overview(
     }))
 }
 
-/// GET /api/codebases/:id/graph - Get dependency graph data
-pub async fn get_graph(
-    Path(id): Path<String>,
-    State(state): State<AppState>,
-) -> ApiResult<Json<GraphDataResponse>> {
-    info!("Getting graph for codebase: {}", id);
-
-    let storage = state.storage.lock().map_err(|e| {
-        error!("Failed to acquire storage lock: {}", e);
-        ApiError::internal(format!("Storage lock error: {}", e))
-    })?;
-
-    let conn = storage.conn();
-
-    // Query nodes from intel_nodes table
-    let mut node_stmt = conn
+fn query_graph_nodes(conn: &rusqlite::Connection, id: &str) -> ApiResult<Vec<GraphNodeResponse>> {
+    let mut stmt = conn
         .prepare(
             r#"
             SELECT
@@ -540,8 +505,8 @@ pub async fn get_graph(
             ApiError::internal(format!("Database query error: {}", e))
         })?;
 
-    let nodes = node_stmt
-        .query_map([&id], |row| {
+    let nodes = stmt
+        .query_map([id], |row| {
             Ok(GraphNodeResponse {
                 id: row.get::<_, i64>(0)?.to_string(),
                 name: row.get(4)?,
@@ -566,8 +531,11 @@ pub async fn get_graph(
             ApiError::internal(format!("Result collection error: {}", e))
         })?;
 
-    // Query edges from intel_edges table
-    let mut edge_stmt = conn
+    Ok(nodes)
+}
+
+fn query_graph_links(conn: &rusqlite::Connection, id: &str) -> ApiResult<Vec<GraphLinkResponse>> {
+    let mut stmt = conn
         .prepare(
             r#"
             SELECT
@@ -584,8 +552,8 @@ pub async fn get_graph(
             ApiError::internal(format!("Database query error: {}", e))
         })?;
 
-    let links = edge_stmt
-        .query_map([&id], |row| {
+    let links = stmt
+        .query_map([id], |row| {
             Ok(GraphLinkResponse {
                 source: row.get::<_, i64>(0)?.to_string(),
                 target: row.get::<_, i64>(1)?.to_string(),
@@ -602,6 +570,27 @@ pub async fn get_graph(
             error!("Failed to collect edge results: {}", e);
             ApiError::internal(format!("Result collection error: {}", e))
         })?;
+
+    Ok(links)
+}
+
+/// GET /api/codebases/:id/graph - Get dependency graph data
+pub async fn get_graph(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> ApiResult<Json<GraphDataResponse>> {
+    info!("Getting graph for codebase: {}", id);
+
+    let storage = state.storage.lock().map_err(|e| {
+        error!("Failed to acquire storage lock: {}", e);
+        ApiError::internal(format!("Storage lock error: {}", e))
+    })?;
+
+    let conn = storage.conn();
+
+    let nodes = query_graph_nodes(conn, &id)?;
+
+    let links = query_graph_links(conn, &id)?;
 
     info!(
         "Retrieved {} nodes and {} links for codebase {}",
@@ -922,5 +911,24 @@ mod tests {
         };
         assert!(query.q.is_none());
         assert!(query.limit.is_none());
+    }
+
+    #[test]
+    fn test_row_to_codebase_response_uses_unknown_for_missing_last_indexed() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT 'project-1', 'project', 'hash', 1, '/tmp/project', 'Project', 2, 3, 4, 0, NULL",
+            )
+            .unwrap();
+
+        let codebase = stmt
+            .query_row([], |row| row_to_codebase_response(row, None))
+            .unwrap();
+
+        assert_eq!(codebase.id, "project-1");
+        assert_eq!(codebase.last_indexed, "Unknown");
+        assert_eq!(codebase.file_count, 2);
+        assert!(!codebase.is_clone);
     }
 }

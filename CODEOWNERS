@@ -1,0 +1,28 @@
+# Code ownership for LeIndex
+# See https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+# Default owner for everything
+*                           @scooter-lacroix
+
+# Core source code
+/src/                       @scooter-lacroix
+/crates/                    @scooter-lacroix
+
+# CI and release pipeline
+/.github/                   @scooter-lacroix
+/.github/workflows/         @scooter-lacroix
+
+# Documentation
+/README.md                  @scooter-lacroix
+/CHANGELOG.md               @scooter-lacroix
+/CONTRIBUTING.md            @scooter-lacroix
+/AGENTS.md                  @scooter-lacroix
+/ARCHITECTURE.md            @scooter-lacroix
+/docs/                      @scooter-lacroix
+
+# Package metadata
+/Cargo.toml                 @scooter-lacroix
+/packages/                  @scooter-lacroix
+
+# Dashboard
+/dashboard/                 @scooter-lacroix

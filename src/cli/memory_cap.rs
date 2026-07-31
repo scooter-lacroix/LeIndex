@@ -5,7 +5,7 @@
 // - `MemoryCapGuard`: periodic checker that warns at 90% and errors at 100% of a cap
 // - `apply_hard_limit()`: sets RLIMIT_AS as a hard ceiling (Linux-only)
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use tracing::{info, warn};
 
 /// Read the current RSS (Resident Set Size) in megabytes.
@@ -157,7 +157,8 @@ impl MemoryCapGuard {
                     bail!(
                         "Memory cap exceeded: RSS is {} MB, cap is {} MB. \
                          Indexing stopped gracefully. Increase --max-memory or index a smaller project.",
-                        rss, self.cap_mb
+                        rss,
+                        self.cap_mb
                     );
                 }
                 if rss > self.warn_threshold_mb && !self.warned {
@@ -180,7 +181,6 @@ impl MemoryCapGuard {
     }
 
     /// Get the configured cap in MB.
-    #[allow(dead_code)]
     pub fn cap_mb(&self) -> u64 {
         self.cap_mb
     }

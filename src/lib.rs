@@ -65,6 +65,12 @@ pub mod edit;
 #[cfg(feature = "validation")]
 pub mod validation;
 
+// Feature flag infrastructure (always available)
+pub mod feature_flags;
+
+// Observability infrastructure (always available)
+pub mod observability;
+
 // Re-exports for backward compatibility
 // Users can use either `leindex::parse` or `leindex::leparse`
 

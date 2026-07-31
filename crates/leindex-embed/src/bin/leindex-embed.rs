@@ -23,7 +23,7 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use leindex_embed::protocol::{self, BatchId, EmbedRequest, Frame, MsgType};
-    use leindex_embed::runtime::{WorkerRuntime, DEFAULT_IDLE_TIMEOUT_SECS};
+    use leindex_embed::runtime::{DEFAULT_IDLE_TIMEOUT_SECS, WorkerRuntime};
     use std::io::Cursor;
     use std::time::Duration;
 

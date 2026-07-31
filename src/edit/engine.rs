@@ -556,100 +556,116 @@ impl EditEngine {
 
     /// Analyze impact of an edit using forward PDG traversal.
     pub(crate) async fn analyze_impact(&self, request: &EditRequest) -> Result<ImpactAnalysis> {
-        let mut affected_nodes: Vec<String> = Vec::new();
-        let mut affected_files: std::collections::HashSet<PathBuf> =
-            std::collections::HashSet::new();
-        affected_files.insert(request.file_path.clone());
+        let mut affected_nodes = Vec::new();
+        let mut affected_files = std::collections::HashSet::from([request.file_path.clone()]);
         let mut breaking_changes = Vec::new();
 
-        // Check each change for impact
         for change in &request.changes {
             match change {
-                EditChange::RenameSymbol {
+                EditChange::RenameSymbol { old_name, .. } => self.analyze_rename_impact(
                     old_name,
-                    new_name: _,
-                } => {
-                    if let Some(node_id) = self.pdg.find_by_symbol(old_name) {
-                        affected_nodes.push(old_name.clone());
-                        // Forward impact: all nodes reachable from this one
-                        let forward = self.pdg.forward_impact(
-                            node_id,
-                            &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
-                        );
-                        for dep_id in forward {
-                            if let Some(dep_node) = self.pdg.get_node(dep_id) {
-                                affected_nodes.push(dep_node.name.clone());
-                                affected_files.insert(PathBuf::from(&*dep_node.file_path));
-                            }
-                        }
-                        // Backward impact: callers that reference this symbol (rename risk)
-                        let backward = self.pdg.backward_impact(
-                            node_id,
-                            &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
-                        );
-                        if !backward.is_empty() {
-                            breaking_changes.push(format!(
-                                "Renaming '{}' may break {} caller(s)",
-                                old_name,
-                                backward.len()
-                            ));
-                            for bid in backward {
-                                if let Some(bn) = self.pdg.get_node(bid) {
-                                    affected_files.insert(PathBuf::from(&*bn.file_path));
-                                }
-                            }
-                        }
-                    } else {
-                        breaking_changes.push(format!(
-                            "Symbol '{}' not found in PDG — rename may miss references",
-                            old_name
-                        ));
-                    }
-                }
-                EditChange::ReplaceText { .. } => {
-                    // Text replacement is low impact unless it touches a symbol boundary
-                }
+                    &mut affected_nodes,
+                    &mut affected_files,
+                    &mut breaking_changes,
+                ),
+                EditChange::ReplaceText { .. } => {}
                 EditChange::ExtractFunction { function_name, .. } => {
                     breaking_changes.push(format!(
                         "Extracting function '{}' — verify no name collision",
                         function_name
-                    ));
+                    ))
                 }
                 EditChange::InlineVariable { variable_name } => {
                     if let Some(node_id) = self.pdg.find_by_symbol(variable_name) {
                         affected_nodes.push(variable_name.clone());
-                        let forward = self.pdg.forward_impact(
+                        self.record_forward_impact(
                             node_id,
-                            &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
+                            &mut affected_nodes,
+                            &mut affected_files,
                         );
-                        for dep_id in forward {
-                            if let Some(dep_node) = self.pdg.get_node(dep_id) {
-                                affected_nodes.push(dep_node.name.clone());
-                                affected_files.insert(PathBuf::from(&*dep_node.file_path));
-                            }
-                        }
                     }
                 }
             }
         }
 
-        let affected_files_vec: Vec<PathBuf> = affected_files.into_iter().collect();
+        let affected_files: Vec<PathBuf> = affected_files.into_iter().collect();
+        Ok(ImpactAnalysis {
+            risk_level: Self::impact_risk_level(&affected_nodes, &affected_files),
+            affected_nodes,
+            affected_files,
+            breaking_changes,
+        })
+    }
 
-        // Calculate risk level based on blast radius
-        let risk_level = if affected_nodes.len() > 5 || affected_files_vec.len() > 3 {
+    fn analyze_rename_impact(
+        &self,
+        old_name: &str,
+        affected_nodes: &mut Vec<String>,
+        affected_files: &mut std::collections::HashSet<PathBuf>,
+        breaking_changes: &mut Vec<String>,
+    ) {
+        let Some(node_id) = self.pdg.find_by_symbol(old_name) else {
+            breaking_changes.push(format!(
+                "Symbol '{}' not found in PDG — rename may miss references",
+                old_name
+            ));
+            return;
+        };
+
+        affected_nodes.push(old_name.to_string());
+        self.record_forward_impact(node_id, affected_nodes, affected_files);
+        let backward = self.pdg.backward_impact(
+            node_id,
+            &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
+        );
+        if !backward.is_empty() {
+            breaking_changes.push(format!(
+                "Renaming '{}' may break {} caller(s)",
+                old_name,
+                backward.len()
+            ));
+            self.record_affected_files(backward, affected_files);
+        }
+    }
+
+    fn record_forward_impact(
+        &self,
+        node_id: crate::graph::pdg::NodeId,
+        affected_nodes: &mut Vec<String>,
+        affected_files: &mut std::collections::HashSet<PathBuf>,
+    ) {
+        let forward = self.pdg.forward_impact(
+            node_id,
+            &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
+        );
+        for dependency_id in forward {
+            if let Some(dependency) = self.pdg.get_node(dependency_id) {
+                affected_nodes.push(dependency.name.clone());
+                affected_files.insert(PathBuf::from(&*dependency.file_path));
+            }
+        }
+    }
+
+    fn impact_risk_level(affected_nodes: &[String], affected_files: &[PathBuf]) -> RiskLevel {
+        if affected_nodes.len() > 5 || affected_files.len() > 3 {
             RiskLevel::High
-        } else if affected_nodes.len() > 1 || affected_files_vec.len() > 1 {
+        } else if affected_nodes.len() > 1 || affected_files.len() > 1 {
             RiskLevel::Medium
         } else {
             RiskLevel::Low
-        };
+        }
+    }
 
-        Ok(ImpactAnalysis {
-            affected_nodes,
-            affected_files: affected_files_vec,
-            breaking_changes,
-            risk_level,
-        })
+    fn record_affected_files(
+        &self,
+        node_ids: Vec<crate::graph::pdg::NodeId>,
+        affected_files: &mut std::collections::HashSet<PathBuf>,
+    ) {
+        for node_id in node_ids {
+            if let Some(node) = self.pdg.get_node(node_id) {
+                affected_files.insert(PathBuf::from(&*node.file_path));
+            }
+        }
     }
 
     /// Apply a single change to a file in the worktree session's path.
@@ -659,71 +675,88 @@ impl EditEngine {
         file_path: &Path,
         change: &EditChange,
     ) -> Result<bool> {
-        // Resolve the file path within the worktree
-        let target_path = if file_path.is_absolute() {
-            // Map absolute path into worktree, preserving directory structure.
-            // Try stripping common prefixes; fall back to the full relative path.
-            let rel = file_path
-                .strip_prefix(session.path())
-                .or_else(|_| file_path.strip_prefix("/"))
-                .unwrap_or(file_path);
-            session.path().join(rel)
-        } else {
-            session.path().join(file_path)
-        };
-
-        // Always materialize/read the target in the worktree to keep edits isolated.
-        let content = if tokio::fs::try_exists(&target_path)
-            .await
-            .map_err(|e| EditError::Generic(format!("Failed to check {:?}: {}", target_path, e)))?
-        {
-            tokio::fs::read_to_string(&target_path).await.map_err(|e| {
-                EditError::Generic(format!("Failed to read {:?}: {}", target_path, e))
-            })?
-        } else if tokio::fs::try_exists(file_path)
-            .await
-            .map_err(|e| EditError::Generic(format!("Failed to check {:?}: {}", file_path, e)))?
-        {
-            let source = tokio::fs::read_to_string(file_path).await.map_err(|e| {
-                EditError::Generic(format!("Failed to read {:?}: {}", file_path, e))
-            })?;
-            if let Some(parent) = target_path.parent() {
-                tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                    EditError::Generic(format!("Failed to create worktree dir {:?}: {}", parent, e))
-                })?;
-            }
-            tokio::fs::write(&target_path, source.as_bytes())
-                .await
-                .map_err(|e| {
-                    EditError::Generic(format!(
-                        "Failed to materialize worktree file {:?}: {}",
-                        target_path, e
-                    ))
-                })?;
-            source
-        } else {
-            return Err(EditError::FileNotFound(file_path.to_path_buf()));
-        };
-
+        let target_path = Self::worktree_target_path(session, file_path);
+        let content = Self::read_or_materialize_worktree_file(&target_path, file_path).await?;
         let modified = self.apply_change_to_string(&content, change)?;
 
         if modified == content {
-            return Ok(false); // No change
+            return Ok(false);
         }
 
-        // Write modified content back into worktree only.
-        if let Some(parent) = target_path.parent() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                EditError::Generic(format!("Failed to create worktree dir {:?}: {}", parent, e))
-            })?;
-        }
+        Self::ensure_worktree_parent(&target_path).await?;
         tokio::fs::write(&target_path, modified.as_bytes())
             .await
-            .map_err(|e| EditError::Generic(format!("Failed to write {:?}: {}", target_path, e)))?;
-
+            .map_err(|error| {
+                EditError::Generic(format!("Failed to write {:?}: {}", target_path, error))
+            })?;
         session.track_file(file_path.to_path_buf(), target_path);
-
         Ok(true)
+    }
+
+    fn worktree_target_path(session: &WorktreeSession, file_path: &Path) -> PathBuf {
+        use std::path::Component;
+        // Re-anchor under the worktree, keeping only Normal components so that
+        // neither a leading root (an absolute path, which would make
+        // `PathBuf::join` discard the session base) nor `..` traversal can write
+        // outside the session worktree. A session-path prefix is stripped first so
+        // legitimate absolute paths inside the worktree are preserved.
+        let stripped = file_path.strip_prefix(session.path()).unwrap_or(file_path);
+        let safe: PathBuf = stripped
+            .components()
+            .filter_map(|c| match c {
+                Component::Normal(s) => Some(std::path::Path::new(s).to_path_buf()),
+                _ => None,
+            })
+            .collect();
+        session.path().join(safe)
+    }
+
+    async fn read_or_materialize_worktree_file(
+        target_path: &Path,
+        source_path: &Path,
+    ) -> Result<String> {
+        if Self::worktree_file_exists(target_path).await? {
+            return Self::read_worktree_file(target_path).await;
+        }
+        if !Self::worktree_file_exists(source_path).await? {
+            return Err(EditError::FileNotFound(source_path.to_path_buf()));
+        }
+
+        let source = Self::read_worktree_file(source_path).await?;
+        Self::ensure_worktree_parent(target_path).await?;
+        tokio::fs::write(target_path, source.as_bytes())
+            .await
+            .map_err(|error| {
+                EditError::Generic(format!(
+                    "Failed to materialize worktree file {:?}: {}",
+                    target_path, error
+                ))
+            })?;
+        Ok(source)
+    }
+
+    async fn worktree_file_exists(path: &Path) -> Result<bool> {
+        tokio::fs::try_exists(path)
+            .await
+            .map_err(|error| EditError::Generic(format!("Failed to check {:?}: {}", path, error)))
+    }
+
+    async fn read_worktree_file(path: &Path) -> Result<String> {
+        tokio::fs::read_to_string(path)
+            .await
+            .map_err(|error| EditError::Generic(format!("Failed to read {:?}: {}", path, error)))
+    }
+
+    async fn ensure_worktree_parent(path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|error| {
+                EditError::Generic(format!(
+                    "Failed to create worktree dir {:?}: {}",
+                    parent, error
+                ))
+            })?;
+        }
+        Ok(())
     }
 
     /// Read file content from disk.
@@ -1065,81 +1098,78 @@ impl WorktreeManager {
     ///
     /// Returns the number of worktree directories removed.
     pub async fn cleanup_old(&self, older_than: chrono::Duration) -> Result<usize> {
-        if !tokio::fs::try_exists(&self.base_path).await.map_err(|e| {
-            EditError::WorktreeError(format!(
-                "Failed to check worktree base directory '{}': {}",
-                self.base_path.display(),
-                e
-            ))
-        })? {
+        if !tokio::fs::try_exists(&self.base_path)
+            .await
+            .map_err(|error| {
+                EditError::WorktreeError(format!(
+                    "Failed to check worktree base directory '{}': {}",
+                    self.base_path.display(),
+                    error
+                ))
+            })?
+        {
             return Ok(0);
         }
 
         let cutoff_time = chrono::Utc::now() - older_than;
         let mut removed_count = 0;
+        let mut entries = tokio::fs::read_dir(&self.base_path)
+            .await
+            .map_err(|error| {
+                EditError::WorktreeError(format!(
+                    "Failed to read worktree base directory '{}': {}",
+                    self.base_path.display(),
+                    error
+                ))
+            })?;
 
-        let mut entries = tokio::fs::read_dir(&self.base_path).await.map_err(|e| {
+        while let Some(entry) = entries.next_entry().await.map_err(|error| {
             EditError::WorktreeError(format!(
-                "Failed to read worktree base directory '{}': {}",
-                self.base_path.display(),
-                e
+                "Failed to read worktree directory entry: {}",
+                error
             ))
-        })?;
-
-        while let Some(entry) = entries.next_entry().await.map_err(|e| {
-            EditError::WorktreeError(format!("Failed to read worktree directory entry: {}", e))
         })? {
             let path = entry.path();
-            let file_type = entry.file_type().await.map_err(|e| {
-                EditError::WorktreeError(format!("Failed to read worktree directory entry: {}", e))
+            let file_type = entry.file_type().await.map_err(|error| {
+                EditError::WorktreeError(format!(
+                    "Failed to read worktree directory entry: {}",
+                    error
+                ))
             })?;
-            if file_type.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    // Session names end with timestamp-pid: prefix-1234567890123-1234
-                    // Validate all three parts before treating as a session directory
-                    // Session names: {prefix}-{timestamp_millis}-{pid}-{attempt}
-                    // Use rsplitn to extract the numeric segments from the right
-                    let mut parts = name.rsplitn(4, '-');
-                    let attempt_part = parts.next();
-                    let pid_part = parts.next();
-                    let ts_part = parts.next();
-                    let prefix_part = parts.next();
-                    if let (Some(_attempt_str), Some(pid_str), Some(timestamp_str), Some(_prefix)) =
-                        (attempt_part, pid_part, ts_part, prefix_part)
-                    {
-                        if _attempt_str.parse::<u32>().is_ok()
-                            && pid_str.parse::<u32>().is_ok()
-                            && timestamp_str.parse::<i64>().is_ok()
-                        {
-                            let timestamp_millis = timestamp_str.parse::<i64>().unwrap();
-                            let session_time = chrono::DateTime::<chrono::Utc>::from_timestamp(
-                                timestamp_millis / 1000,
-                                ((timestamp_millis % 1000) * 1_000_000) as u32,
-                            );
+            if !file_type.is_dir() {
+                continue;
+            }
 
-                            if let Some(session_time) = session_time {
-                                if session_time < cutoff_time {
-                                    // Remove the old worktree directory
-                                    match tokio::fs::remove_dir_all(&path).await {
-                                        Ok(_) => removed_count += 1,
-                                        Err(e) => {
-                                            // Log but don't fail - continue cleaning up others
-                                            tracing::warn!(
-                                                "Failed to remove old worktree '{}': {}",
-                                                path.display(),
-                                                e
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(session_time) = Self::session_time_from_name(name) else {
+                continue;
+            };
+            if session_time >= cutoff_time {
+                continue;
+            }
+
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(_) => removed_count += 1,
+                Err(error) => tracing::warn!(
+                    "Failed to remove old worktree '{}': {}",
+                    path.display(),
+                    error
+                ),
             }
         }
 
         Ok(removed_count)
+    }
+
+    fn session_time_from_name(name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        let mut parts = name.rsplitn(4, '-');
+        parts.next()?.parse::<u32>().ok()?;
+        parts.next()?.parse::<u32>().ok()?;
+        let timestamp_millis = parts.next()?.parse::<i64>().ok()?;
+        parts.next()?;
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(timestamp_millis)
     }
 }
 
@@ -1224,167 +1254,169 @@ impl WorktreeSession {
             path,
             tracked_files,
         } = session;
-
         let mut staged_entries: Vec<(PathBuf, PathBuf)> = tracked_files.into_iter().collect();
-        staged_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        staged_entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let backups = Self::prepare_merge_entries(&staged_entries)?;
 
-        // Phase 1 (prepare): create directories and prepare backup paths.
-        // This phase does not modify any existing files.
-        let mut backups: Vec<(PathBuf, PathBuf, bool)> = Vec::new(); // (original, backup_path, file_existed)
+        for (written, (original, staged)) in staged_entries.iter().enumerate() {
+            let (_, backup_path, file_existed) = &backups[written];
+            if let Err(error) =
+                Self::apply_staged_file(original, staged, backup_path, *file_existed)
+            {
+                Self::rollback_merge(&backups[..written], &path);
+                return Err(error);
+            }
+        }
 
-        for (original, staged) in &staged_entries {
+        Self::cleanup_merged_files(&backups, &path);
+        Ok(())
+    }
+
+    fn prepare_merge_entries(
+        staged_entries: &[(PathBuf, PathBuf)],
+    ) -> Result<Vec<(PathBuf, PathBuf, bool)>> {
+        let mut backups = Vec::new();
+        for (original, staged) in staged_entries {
             let file_existed = original.exists();
             let backup_path = PathBuf::from(format!("{}.leindex_bak", original.display()));
-            backups.push((original.clone(), backup_path, file_existed));
-
-            // Create destination directory if needed
-            if let Some(parent) = original.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| {
-                    EditError::WorktreeError(format!(
-                        "Failed to create destination directory '{}': {}",
-                        parent.display(),
-                        e
-                    ))
-                })?;
-            }
-
-            // Ensure staged file exists
+            Self::ensure_merge_destination(original)?;
             if !staged.exists() {
                 return Err(EditError::WorktreeError(format!(
                     "Staged file '{}' does not exist",
                     staged.display()
                 )));
             }
+            backups.push((original.clone(), backup_path, file_existed));
         }
+        Ok(backups)
+    }
 
-        // Phase 2 (apply): For each file, use atomic rename operations for safety.
-        // Process files in reverse order during rollback.
-        for (written, (original, staged)) in staged_entries.iter().enumerate() {
-            let backup_path = &backups[written].1;
-            let file_existed = backups[written].2;
+    fn ensure_merge_destination(original: &Path) -> Result<()> {
+        if let Some(parent) = original.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                EditError::WorktreeError(format!(
+                    "Failed to create destination directory '{}': {}",
+                    parent.display(),
+                    error
+                ))
+            })?;
+        }
+        Ok(())
+    }
 
-            // Step 1: Backup original file by renaming (atomic)
-            // Fallback to copy+remove if rename fails (cross-device)
-            if file_existed {
-                let backup_result = std::fs::rename(original, backup_path);
-                if let Err(e) = backup_result {
-                    // Check if it's a cross-device error
-                    if is_cross_device_error(&e) {
-                        // Fallback to copy + remove for cross-device moves
-                        if let Err(copy_err) = std::fs::copy(original, backup_path) {
-                            // Roll back previously processed files
-                            Self::rollback_merge(&backups[..written], &path);
-                            return Err(EditError::WorktreeError(format!(
-                                "Failed to backup original file '{}' to '{}' (cross-device copy failed): {}",
-                                original.display(),
-                                backup_path.display(),
-                                copy_err
-                            )));
-                        }
-                        if let Err(remove_err) = std::fs::remove_file(original) {
-                            // Roll back previously processed files
-                            Self::rollback_merge(&backups[..written], &path);
-                            return Err(EditError::WorktreeError(format!(
-                                "Failed to remove original file '{}' after cross-device backup: {}",
-                                original.display(),
-                                remove_err
-                            )));
-                        }
-                    } else {
-                        // Roll back previously processed files
-                        Self::rollback_merge(&backups[..written], &path);
-                        return Err(EditError::WorktreeError(format!(
-                            "Failed to backup original file '{}' to '{}': {}",
-                            original.display(),
-                            backup_path.display(),
-                            e
-                        )));
-                    }
-                }
+    fn apply_staged_file(
+        original: &Path,
+        staged: &Path,
+        backup_path: &Path,
+        file_existed: bool,
+    ) -> Result<()> {
+        if file_existed {
+            Self::backup_original_file(original, backup_path)?;
+        }
+        Self::move_staged_file(original, staged, backup_path, file_existed)
+    }
+
+    fn backup_original_file(original: &Path, backup_path: &Path) -> Result<()> {
+        if let Err(error) = std::fs::rename(original, backup_path) {
+            if !is_cross_device_error(&error) {
+                return Err(EditError::WorktreeError(format!(
+                    "Failed to backup original file '{}' to '{}': {}",
+                    original.display(),
+                    backup_path.display(),
+                    error
+                )));
             }
 
-            // Step 2: Rename staged file to original (atomic)
-            // Fallback to copy+remove if rename fails (cross-device)
-            let move_result = std::fs::rename(staged, original);
-            if let Err(e) = move_result {
-                // Check if it's a cross-device error
-                if is_cross_device_error(&e) {
-                    // Fallback to copy + remove for cross-device moves
-                    if let Err(copy_err) = std::fs::copy(staged, original) {
-                        // Restore backup if it was created
-                        if file_existed && backup_path.exists() {
-                            if let Err(restore_err) = std::fs::rename(backup_path, original) {
-                                tracing::error!(
-                                    "CRITICAL: Failed to restore '{}' from backup during rollback: {}",
-                                    original.display(),
-                                    restore_err
-                                );
-                            }
-                        }
+            std::fs::copy(original, backup_path).map_err(|copy_error| {
+                EditError::WorktreeError(format!(
+                    "Failed to backup original file '{}' to '{}' (cross-device copy failed): {}",
+                    original.display(),
+                    backup_path.display(),
+                    copy_error
+                ))
+            })?;
+            std::fs::remove_file(original).map_err(|remove_error| {
+                EditError::WorktreeError(format!(
+                    "Failed to remove original file '{}' after cross-device backup: {}",
+                    original.display(),
+                    remove_error
+                ))
+            })?;
+        }
+        Ok(())
+    }
 
-                        // Roll back previously processed files
-                        Self::rollback_merge(&backups[..written], &path);
+    fn move_staged_file(
+        original: &Path,
+        staged: &Path,
+        backup_path: &Path,
+        file_existed: bool,
+    ) -> Result<()> {
+        if let Err(error) = std::fs::rename(staged, original) {
+            if !is_cross_device_error(&error) {
+                Self::restore_merge_backup(original, backup_path, file_existed);
+                return Err(EditError::WorktreeError(format!(
+                    "Failed to merge staged file '{}' into '{}': {}",
+                    staged.display(),
+                    original.display(),
+                    error
+                )));
+            }
 
-                        return Err(EditError::WorktreeError(format!(
-                            "Failed to move staged file '{}' to '{}' (cross-device copy failed): {}",
-                            staged.display(),
-                            original.display(),
-                            copy_err
-                        )));
-                    }
-                    if let Err(remove_err) = std::fs::remove_file(staged) {
-                        tracing::warn!(
-                            "Failed to remove staged file '{}' after cross-device move: {}",
-                            staged.display(),
-                            remove_err
-                        );
-                    }
-                } else {
-                    // Restore backup if it was created
-                    if file_existed && backup_path.exists() {
-                        if let Err(restore_err) = std::fs::rename(backup_path, original) {
-                            tracing::error!(
-                                "CRITICAL: Failed to restore '{}' from backup during rollback: {}",
-                                original.display(),
-                                restore_err
-                            );
-                        }
-                    }
-
-                    // Roll back previously processed files
-                    Self::rollback_merge(&backups[..written], &path);
-
-                    return Err(EditError::WorktreeError(format!(
-                        "Failed to merge staged file '{}' into '{}': {}",
-                        staged.display(),
-                        original.display(),
-                        e
-                    )));
-                }
+            if let Err(copy_error) = std::fs::copy(staged, original) {
+                Self::restore_merge_backup(original, backup_path, file_existed);
+                return Err(EditError::WorktreeError(format!(
+                    "Failed to move staged file '{}' to '{}' (cross-device copy failed): {}",
+                    staged.display(),
+                    original.display(),
+                    copy_error
+                )));
+            }
+            if let Err(remove_error) = std::fs::remove_file(staged) {
+                tracing::warn!(
+                    "Failed to remove staged file '{}' after cross-device move: {}",
+                    staged.display(),
+                    remove_error
+                );
             }
         }
+        Ok(())
+    }
 
-        // Phase 3 (cleanup): remove backup files and worktree directory
-        for (_original, backup_path, file_existed) in &backups {
+    fn restore_merge_backup(original: &Path, backup_path: &Path, file_existed: bool) {
+        if file_existed && backup_path.exists() {
+            if let Err(error) = std::fs::rename(backup_path, original) {
+                tracing::error!(
+                    "CRITICAL: Failed to restore '{}' from backup during rollback: {}",
+                    original.display(),
+                    error
+                );
+            }
+        }
+    }
+
+    fn cleanup_merged_files(backups: &[(PathBuf, PathBuf, bool)], path: &Path) {
+        for (_, backup_path, file_existed) in backups {
             if *file_existed && backup_path.exists() {
-                if let Err(e) = std::fs::remove_file(backup_path) {
+                if let Err(error) = std::fs::remove_file(backup_path) {
                     tracing::warn!(
                         "Failed to remove backup file '{}': {}",
                         backup_path.display(),
-                        e
+                        error
                     );
                 }
             }
         }
 
-        // Remove the worktree directory
         if path.exists() {
-            if let Err(e) = std::fs::remove_dir_all(&path) {
-                // Post-commit cleanup failure — log but don't fail the merge
-                tracing::warn!("Failed to clean up worktree '{}': {}", path.display(), e);
+            if let Err(error) = std::fs::remove_dir_all(path) {
+                tracing::warn!(
+                    "Failed to clean up worktree '{}': {}",
+                    path.display(),
+                    error
+                );
             }
         }
-        Ok(())
     }
 
     /// Roll back merge by restoring backup files

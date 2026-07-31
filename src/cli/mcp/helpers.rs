@@ -1,5 +1,7 @@
 use super::protocol::JsonRpcError;
-use crate::edit::{replace_whole_word, EditChange};
+use crate::cli::leindex::{ComponentStatus, IndexHealth, SOURCE_FILE_EXTENSIONS};
+use crate::cli::skip_dirs::SKIP_DIRS;
+use crate::edit::{EditChange, replace_whole_word};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -48,11 +50,14 @@ pub(crate) fn validate_file_within_project(
     file_path: &str,
     project_root: &std::path::Path,
 ) -> Result<PathBuf, JsonRpcError> {
-    let canonical = std::path::Path::new(file_path)
-        .canonicalize()
-        .map_err(|e| {
-            JsonRpcError::invalid_params(format!("Cannot resolve file path '{}': {}", file_path, e))
-        })?;
+    let candidate = if std::path::Path::new(file_path).is_absolute() {
+        PathBuf::from(file_path)
+    } else {
+        project_root.join(file_path)
+    };
+    let canonical = candidate.canonicalize().map_err(|e| {
+        JsonRpcError::invalid_params(format!("Cannot resolve file path '{}': {}", file_path, e))
+    })?;
     if !canonical.starts_with(project_root) {
         return Err(JsonRpcError::invalid_params(format!(
             "File '{}' is outside the project boundary '{}'",
@@ -72,6 +77,7 @@ pub(crate) fn node_type_str(nt: &crate::graph::pdg::NodeType) -> &'static str {
         crate::graph::pdg::NodeType::Variable => "variable",
         crate::graph::pdg::NodeType::Module => "module",
         crate::graph::pdg::NodeType::External => "external",
+        crate::graph::pdg::NodeType::FileSummary => "file_summary",
     }
 }
 
@@ -112,17 +118,206 @@ pub(crate) fn resolve_scope(
 }
 
 /// Attach meta information to tool responses about index staleness and context.
-pub(crate) fn wrap_with_meta(mut result: Value, index: &crate::cli::leindex::LeIndex) -> Value {
-    let stale = index.is_stale_fast();
+pub(crate) fn wrap_with_meta(result: Value, index: &crate::cli::leindex::LeIndex) -> Value {
+    // Git porcelain is the cheapest authoritative live delta for a worktree;
+    // use it once per response to avoid turning a persisted health snapshot
+    // into a stale Boolean that survives an editor save.
+    let live_dirty = crate::cli::git::status(index.project_path())
+        .ok()
+        .map(|status| {
+            status.modified.len()
+                + status.staged.len()
+                + status.untracked.len()
+                + status.deleted.len()
+        })
+        .unwrap_or(0);
+    wrap_live_with_meta_dirty(result, index.project_path(), live_dirty)
+}
+
+/// Attach the same compact freshness badge to a live-only response. This path
+/// reads the tiny health snapshot but never constructs a `LeIndex`.
+pub(crate) fn wrap_live_with_meta(result: Value, project_root: &std::path::Path) -> Value {
+    let live_dirty = crate::cli::git::status(project_root)
+        .ok()
+        .map(|status| {
+            status.modified.len()
+                + status.staged.len()
+                + status.untracked.len()
+                + status.deleted.len()
+        })
+        .unwrap_or(0);
+    wrap_live_with_meta_dirty(result, project_root, live_dirty)
+}
+
+/// Determine whether the index is genuinely stale by checking if dirty files
+/// affect actual indexed source files.
+///
+/// Returns `false` when:
+/// - The index health is `Fresh` and the tree OID matches the current git tree
+/// - Dirty files are only untracked files without source extensions
+/// - Dirty files are inside skipped directories (`.leindex/`, `target/`, etc.)
+///
+/// Returns `true` only when dirty files include tracked source files that
+/// differ from what was indexed.
+pub(crate) fn is_index_genuinely_stale(health: &Option<IndexHealth>, project_root: &Path) -> bool {
+    let Some(health) = health else {
+        // No health info at all means we can't confirm freshness.
+        return true;
+    };
+
+    // If health status is explicitly Stale/Partial/Failed, trust it.
+    if matches!(
+        health.status,
+        ComponentStatus::Stale | ComponentStatus::Partial | ComponentStatus::Failed
+    ) {
+        return true;
+    }
+
+    // If the index is Fresh and the tree OID matches the current git HEAD tree,
+    // the index is current even if there are uncommitted changes to unrelated
+    // files.
+    if health.status == ComponentStatus::Fresh {
+        if let Some(indexed_tree_oid) = &health.tree_oid {
+            if let Ok(Some(current_tree_oid)) = crate::cli::git::tree_oid(project_root) {
+                if indexed_tree_oid == &current_tree_oid {
+                    return false;
+                }
+            }
+        }
+    }
+
+    // Check whether the dirty files actually affect source files that were
+    // previously indexed. Get the git status to inspect individual paths.
+    let git_status = match crate::cli::git::status(project_root) {
+        Ok(status) => status,
+        Err(_) => {
+            // If we can't get git status, fall back to the dirty count from
+            // health.
+            return health.dirty_file_count > 0;
+        }
+    };
+
+    // Collect all dirty paths (modified, staged, deleted, conflicted).
+    // Untracked files are checked separately - they only count as stale if
+    // they have source extensions.
+    let dirty_tracked: Vec<&PathBuf> = git_status
+        .modified
+        .iter()
+        .chain(&git_status.staged)
+        .chain(&git_status.deleted)
+        .chain(&git_status.conflicted)
+        .collect();
+
+    // If any tracked file is dirty, the index is genuinely stale (these are
+    // files that were potentially indexed and have changed).
+    if !dirty_tracked.is_empty() {
+        // But only count files with source extensions or that are known
+        // indexed files.
+        let has_source_changes = dirty_tracked
+            .iter()
+            .any(|path| is_source_file(path) && !is_in_skip_dir(path));
+        if has_source_changes {
+            return true;
+        }
+    }
+
+    // Check untracked files: only stale if they have source extensions and
+    // are not in skip directories.
+    git_status
+        .untracked
+        .iter()
+        .any(|path| is_source_file(path) && !is_in_skip_dir(path))
+}
+
+/// Check if a path has a source file extension.
+fn is_source_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| SOURCE_FILE_EXTENSIONS.contains(&ext))
+}
+
+/// Check if a path resides inside a skip directory.
+fn is_in_skip_dir(path: &Path) -> bool {
+    path.components().any(|component| {
+        component
+            .as_os_str()
+            .to_str()
+            .is_some_and(|name| SKIP_DIRS.contains(&name))
+    })
+}
+
+pub(crate) fn wrap_live_with_meta_dirty(
+    mut result: Value,
+    project_root: &std::path::Path,
+    live_dirty: usize,
+) -> Value {
+    let storage_path = crate::cli::leindex::resolve_existing_storage_path(project_root)
+        .unwrap_or_else(|| project_root.join(".leindex"));
+    let health = crate::cli::index_freshness::load_health(&storage_path);
+    let freshness = health
+        .as_ref()
+        .map(|health| {
+            let age_ms = health.indexed_at_unix_ms.and_then(|indexed_at| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_millis() as u64;
+                Some(now.saturating_sub(indexed_at))
+            });
+            serde_json::json!({
+                "generation": health.generation,
+                "status": health.status,
+                "phase": health.phase,
+                "head_oid": health.head_oid,
+                "tree_oid": health.tree_oid,
+                "indexed_file_count": health.indexed_file_count,
+                "dirty_file_count": health.dirty_file_count.max(live_dirty),
+                "changed_unindexed_count": health.changed_unindexed_count.max(live_dirty),
+                "age_ms": age_ms,
+                "last_failure_phase": health.last_failure_phase,
+                "last_failure": health.last_failure,
+            })
+        })
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "generation": Value::Null,
+                "status": "not_loaded",
+                "phase": Value::Null,
+                "head_oid": Value::Null,
+                "tree_oid": Value::Null,
+                "indexed_file_count": 0,
+                "dirty_file_count": live_dirty,
+                "changed_unindexed_count": live_dirty,
+                "age_ms": Value::Null,
+                "last_failure_phase": Value::Null,
+                "last_failure": Value::Null,
+            })
+        });
     if let Some(obj) = result.as_object_mut() {
-        if stale {
-            obj.insert(
-                "_warning".to_string(),
-                Value::String(
-                    "Index may be stale. Call LeIndex [Index] with force_reindex=true for fresh results."
-                        .to_string(),
-                ),
-            );
+        let stale = is_index_genuinely_stale(&health, project_root);
+        {
+            let mut freshness = freshness;
+            if stale {
+                if let Some(freshness_obj) = freshness.as_object_mut() {
+                    freshness_obj.insert(
+                        "warning".to_string(),
+                        Value::String(
+                            if health.is_none() {
+                                "No indexed generation is loaded; exact live results remain usable."
+                            } else {
+                                "Index may be stale; run leindex.index with force_reindex=true to refresh."
+                            }
+                            .to_string(),
+                        ),
+                    );
+                }
+            }
+            let meta = obj
+                .entry("_meta".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(meta_obj) = meta.as_object_mut() {
+                meta_obj.insert("freshness".to_string(), freshness);
+            }
         }
     }
     result
@@ -207,140 +402,144 @@ pub(crate) fn glob_match(path: &str, pattern: &str) -> bool {
     }
 }
 
+fn edit_change_type(item: &Value, index: usize) -> Result<&str, JsonRpcError> {
+    item.get("type")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            if item.get("old_text").is_some() || item.get("old_str").is_some() {
+                Some("replace_text")
+            } else if item.get("old_name").is_some() && item.get("new_name").is_some() {
+                Some("rename_symbol")
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(format!(
+                "changes[{}]: missing 'type' — use 'replace_text' or 'rename_symbol', or provide old_text+new_text",
+                index
+            ))
+        })
+}
+
+fn missing_old_text(index: usize, old_text: &str) -> JsonRpcError {
+    let preview = if old_text.len() > 60 {
+        let safe_end = old_text
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|&index| index <= 60)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &old_text[..safe_end])
+    } else {
+        old_text.to_string()
+    };
+    JsonRpcError::invalid_params_with_suggestion(
+        format!(
+            "changes[{}]: old_text not found in file content: '{}'",
+            index, preview
+        ),
+        "Ensure old_text exactly matches the source. Whitespace-normalised matching is attempted automatically.",
+    )
+}
+
+fn parse_replace_change(
+    item: &Value,
+    index: usize,
+    content: Option<&str>,
+) -> Result<EditChange, JsonRpcError> {
+    let old_text = item
+        .get("old_text")
+        .or_else(|| item.get("old_str"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let new_text = item
+        .get("new_text")
+        .or_else(|| item.get("new_str"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_text'", index))
+        })?;
+    let has_explicit_range = item.get("start_byte").is_some() || item.get("end_byte").is_some();
+    if has_explicit_range {
+        let start = item.get("start_byte").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let end = item
+            .get("end_byte")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(start + old_text.len());
+        return Ok(EditChange::ReplaceText {
+            start,
+            end,
+            new_text: new_text.to_owned(),
+        });
+    }
+    if old_text.is_empty() {
+        return Err(JsonRpcError::invalid_params(format!(
+            "changes[{}]: replace_text requires either 'start_byte'/'end_byte' or non-empty 'old_text'",
+            index
+        )));
+    }
+    let Some(content) = content else {
+        return Ok(EditChange::ReplaceText {
+            start: 0,
+            end: old_text.len(),
+            new_text: new_text.to_owned(),
+        });
+    };
+    let (start, length) = if let Some(position) = content.find(old_text) {
+        (position, old_text.len())
+    } else if let Some((position, length)) = find_normalised_whitespace(content, old_text) {
+        (position, length)
+    } else {
+        return Err(missing_old_text(index, old_text));
+    };
+    Ok(EditChange::ReplaceText {
+        start,
+        end: start + length,
+        new_text: new_text.to_owned(),
+    })
+}
+
+fn parse_rename_change(item: &Value, index: usize) -> Result<EditChange, JsonRpcError> {
+    let old_name = item
+        .get("old_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(format!("changes[{}]: missing 'old_name'", index))
+        })?;
+    let new_name = item
+        .get("new_name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_name'", index))
+        })?;
+    Ok(EditChange::RenameSymbol {
+        old_name: old_name.to_owned(),
+        new_name: new_name.to_owned(),
+    })
+}
+
 /// Parse a JSON `changes` array into a Vec<EditChange>.
 pub(crate) fn parse_edit_changes(
     changes_val: &Value,
     content: Option<&str>,
 ) -> Result<Vec<EditChange>, JsonRpcError> {
-    let arr = changes_val
+    let changes = changes_val
         .as_array()
         .ok_or_else(|| JsonRpcError::invalid_params("'changes' must be an array"))?;
-
-    let mut result = Vec::new();
-    for (i, item) in arr.iter().enumerate() {
-        let change_type = item.get("type").and_then(|v| v.as_str())
-            .or_else(|| {
-                if item.get("old_text").is_some() || item.get("old_str").is_some() {
-                    Some("replace_text")
-                } else if item.get("old_name").is_some() && item.get("new_name").is_some() {
-                    Some("rename_symbol")
-                } else {
-                    None
-                }
-            })
-            .ok_or_else(|| {
-                JsonRpcError::invalid_params(format!("changes[{}]: missing 'type' — use 'replace_text' or 'rename_symbol', or provide old_text+new_text", i))
-            })?;
-
-        let change = match change_type {
-            "replace_text" => {
-                let old_text = item
-                    .get("old_text")
-                    .or_else(|| item.get("old_str"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let new_text = item
-                    .get("new_text")
-                    .or_else(|| item.get("new_str"))
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_text'", i))
-                    })?;
-
-                let has_explicit_start = item.get("start_byte").is_some();
-                let has_explicit_end = item.get("end_byte").is_some();
-
-                if has_explicit_start || has_explicit_end {
-                    let start =
-                        item.get("start_byte").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                    let end = item
-                        .get("end_byte")
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v as usize)
-                        .unwrap_or(start + old_text.len());
-                    EditChange::ReplaceText {
-                        start,
-                        end,
-                        new_text: new_text.to_owned(),
-                    }
-                } else if !old_text.is_empty() {
-                    if let Some(content) = content {
-                        if let Some(pos) = content.find(old_text) {
-                            EditChange::ReplaceText {
-                                start: pos,
-                                end: pos + old_text.len(),
-                                new_text: new_text.to_owned(),
-                            }
-                        } else if let Some((pos, matched_len)) =
-                            find_normalised_whitespace(content, old_text)
-                        {
-                            EditChange::ReplaceText {
-                                start: pos,
-                                end: pos + matched_len,
-                                new_text: new_text.to_owned(),
-                            }
-                        } else {
-                            // Safe UTF-8 truncation at character boundaries
-                            let preview = if old_text.len() > 60 {
-                                // Find the last safe character boundary at or before byte 60
-                                let safe_end = old_text
-                                    .char_indices()
-                                    .map(|(idx, _)| idx)
-                                    .take_while(|&idx| idx <= 60)
-                                    .last()
-                                    .unwrap_or(0);
-                                format!("{}...", &old_text[..safe_end])
-                            } else {
-                                old_text.to_string()
-                            };
-                            return Err(JsonRpcError::invalid_params_with_suggestion(
-                                format!("changes[{}]: old_text not found in file content: '{}'", i, preview),
-                                "Ensure old_text exactly matches the source. Whitespace-normalised matching is attempted automatically.",
-                            ));
-                        }
-                    } else {
-                        let start = 0usize;
-                        let end = old_text.len();
-                        EditChange::ReplaceText {
-                            start,
-                            end,
-                            new_text: new_text.to_owned(),
-                        }
-                    }
-                } else {
-                    return Err(JsonRpcError::invalid_params(format!(
-                        "changes[{}]: replace_text requires either 'start_byte'/'end_byte' or non-empty 'old_text'", i
-                    )));
-                }
-            }
-            "rename_symbol" => {
-                let old_name = item
-                    .get("old_name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        JsonRpcError::invalid_params(format!("changes[{}]: missing 'old_name'", i))
-                    })?;
-                let new_name = item
-                    .get("new_name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        JsonRpcError::invalid_params(format!("changes[{}]: missing 'new_name'", i))
-                    })?;
-                EditChange::RenameSymbol {
-                    old_name: old_name.to_owned(),
-                    new_name: new_name.to_owned(),
-                }
-            }
-            other => {
-                return Err(JsonRpcError::invalid_params(format!(
-                    "changes[{}]: unknown type '{}'",
-                    i, other
-                )))
-            }
-        };
-        result.push(change);
-    }
-    Ok(result)
+    changes
+        .iter()
+        .enumerate()
+        .map(|(index, item)| match edit_change_type(item, index)? {
+            "replace_text" => parse_replace_change(item, index, content),
+            "rename_symbol" => parse_rename_change(item, index),
+            other => Err(JsonRpcError::invalid_params(format!(
+                "changes[{}]: unknown type '{}'",
+                index, other
+            ))),
+        })
+        .collect()
 }
 
 /// Apply a Vec<EditChange> to content in memory and return the modified string.

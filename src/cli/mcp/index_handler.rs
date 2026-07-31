@@ -1,4 +1,4 @@
-use super::helpers::{extract_bool, extract_string, wrap_with_meta};
+use super::helpers::{extract_bool, extract_string};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
@@ -23,9 +23,9 @@ impl IndexHandler {
 
     /// Returns the description of this RPC method
     pub fn description(&self) -> &str {
-        "Index a project. Auto-indexes on first use; returns cached stats on repeat calls. \
-Use force_reindex=true only to rebuild after external file changes. All other tools \
-also accept project_path and auto-index, so explicit indexing is optional."
+        "Start or poll a registry-owned project index job. Returns immediately by default; \
+use wait=true only when an interactive caller explicitly wants to wait. Core PDG and TF-IDF \
+results publish first, then the configured neural worker is actively evaluated for hybrid rows."
     }
 
     /// Returns the JSON schema for the arguments of this RPC method
@@ -42,6 +42,11 @@ also accept project_path and auto-index, so explicit indexing is optional."
                     "description": "If true, re-index even if already indexed (default: false). \
         Also accepts compatibility strings: 'true'/'false', '1'/'0', 'yes'/'no'.",
                     "default": false
+                },
+                "wait": {
+                    "type": "boolean",
+                    "description": "Wait for completion instead of returning a pollable job snapshot (default: false)",
+                    "default": false
                 }
             },
             "required": ["project_path"]
@@ -56,31 +61,11 @@ also accept project_path and auto-index, so explicit indexing is optional."
     ) -> Result<Value, JsonRpcError> {
         let project_path = extract_string(&args, "project_path")?;
         let force_reindex = extract_bool(&args, "force_reindex", false);
-
-        if !force_reindex {
-            // Auto-index-if-needed path: registry handles everything.
-            // If the project is already indexed AND not stale, return cached
-            // stats immediately. If stale, fall through to index_project()
-            // which performs an incremental reindex (VAL-INDEX-005).
-            let handle = registry.get_or_create(Some(&project_path)).await?;
-            let index = handle.read().await;
-            if index.is_indexed() && !index.is_stale_fast() {
-                return serde_json::to_value(index.get_stats())
-                    .map(|v| wrap_with_meta(v, &index))
-                    .map_err(|e| {
-                        JsonRpcError::internal_error(format!("Serialization error: {}", e))
-                    });
-            }
-        }
-
-        let stats = registry
-            .index_project(Some(&project_path), force_reindex)
+        let wait = extract_bool(&args, "wait", false);
+        let snapshot = registry
+            .start_index_job(Some(&project_path), force_reindex, wait)
             .await?;
-
-        let index = registry.get_or_create(Some(&project_path)).await?;
-        let idx = index.read().await;
-        serde_json::to_value(stats)
-            .map(|v| wrap_with_meta(v, &idx))
+        serde_json::to_value(snapshot)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
     }
 }

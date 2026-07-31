@@ -77,6 +77,37 @@ pub struct SearchConfig {
     /// Neural score weight in hybrid mode (0.0-1.0).
     #[serde(default = "default_neural_weight")]
     pub neural_weight: f64,
+
+    /// Enable cross-encoder re-ranking of the top-N search results with the
+    /// on-demand reranker (bge-reranker-base). Improves semantic accuracy for
+    /// conceptual queries at the cost of ~1-2s added latency (CPU, top-N only).
+    #[serde(default)]
+    pub rerank_enabled: bool,
+
+    /// Number of top results to re-rank. Re-ranking more improves recall at the
+    /// top but costs more latency (one cross-encoder pass per candidate).
+    #[serde(default = "default_rerank_top_n")]
+    pub rerank_top_n: u32,
+}
+
+/// Map a configured `search_mode` string to the default `QueryType` used when a
+/// caller does not pass an explicit one.
+///
+/// - `hybrid` -> `None` (the composite default scoring arm: tfidf+neural+struct+text)
+/// - `text`   -> `Text`   (lexical-only weighting)
+/// - `neural` -> `Semantic` (neural-favoring weighting; degrades to tfidf-dominant
+///   if no neural embeddings are indexed — see compute_score's
+///   Semantic+!neural_available arm)
+///
+/// Unknown strings fall back to `None` (hybrid) rather than panicking on a user
+/// typo. This is the single bridge between the `[search] search_mode` config
+/// string and the ranking engine's `QueryType`.
+pub fn query_type_for_mode(search_mode: &str) -> Option<crate::search::ranking::QueryType> {
+    match search_mode {
+        "text" => Some(crate::search::ranking::QueryType::Text),
+        "neural" => Some(crate::search::ranking::QueryType::Semantic),
+        _ => None, // "hybrid" and unknown -> composite default
+    }
 }
 
 /// Indexing pipeline configuration ([indexing] section).
@@ -111,6 +142,8 @@ impl Default for SearchConfig {
         Self {
             search_mode: default_search_mode(),
             neural_weight: default_neural_weight(),
+            rerank_enabled: false,
+            rerank_top_n: default_rerank_top_n(),
         }
     }
 }
@@ -144,6 +177,14 @@ fn default_search_mode() -> String {
 
 fn default_neural_weight() -> f64 {
     0.3
+}
+
+fn default_rerank_top_n() -> u32 {
+    // ponytail: 80 (was 20). Wider cross-encoder pool so conceptual queries
+    // whose ideal node ranks 21-80 in dense retrieval reach the reranker.
+    // Cross-encoder rerank literature plateaus ~100-200; 80 is the sweet spot.
+    // Revisit if rerank latency regresses.
+    80
 }
 
 fn default_batch_size() -> u64 {
@@ -206,6 +247,23 @@ impl LeIndexConfig {
     /// Read config from TOML file. Returns Default if not present.
     pub fn load() -> Result<Self, ConfigError> {
         Self::load_from_path(&config_file_path().ok_or(ConfigError::NoHomeDir)?)
+    }
+
+    /// Process-wide cached config read. Reads leindex.toml once on first access,
+    /// then serves the cached value; falls back to `Default` on error. Use this
+    /// on hot paths (query/index) so the documented `[search]` knobs are read
+    /// without re-reading the file per call.
+    pub fn load_cached() -> &'static LeIndexConfig {
+        static CACHED: std::sync::OnceLock<LeIndexConfig> = std::sync::OnceLock::new();
+        CACHED.get_or_init(|| {
+            Self::load().unwrap_or_else(|err| {
+                tracing::warn!(
+                    error = %err,
+                    "failed to load leindex.toml for caching; using defaults"
+                );
+                LeIndexConfig::default()
+            })
+        })
     }
 
     /// Load from explicit path.
@@ -294,7 +352,10 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigError::NoHomeDir => {
-                write!(f, "Cannot resolve LeIndex home directory. Set LEINDEX_HOME or ensure HOME is set.")
+                write!(
+                    f,
+                    "Cannot resolve LeIndex home directory. Set LEINDEX_HOME or ensure HOME is set."
+                )
             }
             ConfigError::Io(path, msg) => {
                 write!(f, "I/O error on {}: {}", path.display(), msg)

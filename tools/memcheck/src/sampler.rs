@@ -54,22 +54,14 @@ pub fn sample(pid: u32, worker_name: Option<&str>) -> anyhow::Result<MemorySampl
     })
 }
 
-/// Read a fast sample — VmRSS only, no smaps overhead.
-///
-/// Useful for high-frequency sampling where the mapped-file / anon
-/// breakdown is not needed on every tick.
-///
-/// If `worker_name` is `Some`, also discovers and samples any child process
-/// with that name.
-#[allow(dead_code)]
-pub fn sample_fast(pid: u32, worker_name: Option<&str>) -> anyhow::Result<MemorySample> {
+/// Fast sample (VmRSS only) — used by high-frequency sampling tests.
+#[cfg(test)]
+fn sample_fast(pid: u32, worker_name: Option<&str>) -> anyhow::Result<MemorySample> {
     let rss = read_vm_rss(pid)?;
-
     let worker_rss = match worker_name {
         Some(name) => find_child_worker_rss(pid, name),
         None => 0,
     };
-
     Ok(MemorySample {
         rss_kib: rss,
         mapped_file_kib: 0,

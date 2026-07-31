@@ -4,9 +4,9 @@
 // without losing batch identity, payload ordering, dimensions, or error identity.
 
 use leindex_embed::protocol::{
-    embed_request_frame, embed_response_frame, error_frame, rerank_request_frame,
-    rerank_response_frame, BatchId, EmbedRequest, EmbedResponse, ErrorKind, Frame, MsgType,
-    Request, RerankDocument, RerankRequest, RerankResponse, Response, WorkerError,
+    BatchId, EmbedRequest, EmbedResponse, ErrorKind, Frame, MsgType, Request, RerankDocument,
+    RerankRequest, RerankResponse, Response, WorkerError, embed_request_frame,
+    embed_response_frame, error_frame, rerank_request_frame, rerank_response_frame,
 };
 
 /// Helper: encode a frame to wire bytes and decode it back.

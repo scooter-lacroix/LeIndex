@@ -4,7 +4,7 @@
 //! in the lerecherche crate. It implements Zvec-style quantization.
 
 pub use super::quantization::{
-    batch_quantize, dequantize_value, quantization_error, Dequantize, Quantize,
+    Dequantize, Quantize, batch_quantize, dequantize_value, quantization_error,
 };
 pub use super::vector::{Int8QuantizedVector, Int8QuantizedVectorMetadata, SimdBlock};
 

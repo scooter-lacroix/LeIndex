@@ -7,14 +7,14 @@
 //            VAL-BPHASE-025, VAL-BPHASE-041, VAL-BPHASE-042, VAL-BPHASE-043
 
 use leindex::cli::mcp::edit_cache::{
-    EditCache, EditCacheEntry, EDIT_CACHE_MAX_ENTRY_BYTES, EDIT_CACHE_TOTAL_CAP_BYTES,
+    EDIT_CACHE_MAX_ENTRY_BYTES, EDIT_CACHE_TOTAL_CAP_BYTES, EditCache, EditCacheEntry,
 };
 use leindex::edit::EditChange;
 use leindex::search::search::{
-    NodeInfo, SearchEngine, SearchQuery, TextIndexDelta, SEARCH_CACHE_MAX_BYTES,
-    SEARCH_CACHE_MAX_ENTRIES,
+    NodeInfo, SEARCH_CACHE_MAX_BYTES, SEARCH_CACHE_MAX_ENTRIES, SearchEngine, SearchQuery,
+    TextIndexDelta,
 };
-use leindex::search::vector::{write_mmap_embeddings, MmapEmbeddingIndex};
+use leindex::search::vector::{MmapEmbeddingIndex, write_mmap_embeddings};
 
 // ============================================================================
 // Helpers

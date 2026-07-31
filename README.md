@@ -96,8 +96,9 @@ Every tool call is **context-aware** — not atomic. When you look up a symbol, 
 ### Install
 
 LeIndex ships three first-class install paths. Pick one, then run `leindex setup`
-to enable neural (semantic) search. TF-IDF (keyword) search works immediately
-without setup.
+to provision the default hybrid neural path. TF-IDF retrieval and PDG
+relationships are always built first and remain queryable if a provider is
+unavailable.
 
 **Option 1: cargo (recommended for Rust users)**
 
@@ -151,9 +152,11 @@ ORT `lib/`), copies it into `~/.leindex/` and `~/.cargo/bin/`, then runs
 `leindex setup --check` to report status. Models are never shipped in release
 artifacts; the explicit `leindex setup` command downloads the correct model.
 
-> **Neural vs. TF-IDF**: TF-IDF (keyword) search works out of the box with no
-> setup. `leindex setup` enables neural (semantic) search by installing ONNX
-> Runtime and downloading the embedding model. See
+> **Core plus neural**: TF-IDF and PDG structural retrieval are mandatory
+> LeIndex result layers. With ONNX enabled, the default `auto` provider starts
+> and awaits the neural worker during indexing and semantic retrieval, so
+> results use all three signals. A terminal provider failure preserves the
+> complete TF-IDF/PDG result. See
 > [docs/NEURAL_SETUP.md](docs/NEURAL_SETUP.md) for CPU/GPU/AMD/NVIDIA paths and
 > troubleshooting.
 
@@ -198,7 +201,8 @@ Modern AI coding tools struggle with large codebases because they lack global st
 
 LeIndex provides that missing layer.
 
-It builds a semantic index of your repository that both developers and AI assistants can query to understand:
+It builds one shared TF-IDF + PDG + neural index of your repository when ONNX
+is enabled; the neural vectors are attached to those same nodes:
 
 - where logic lives
 - how components interact
@@ -225,7 +229,11 @@ LeIndex MCP → src/http/request_validator.rs
 
 ## How It Works
 
-LeIndex builds a semantic index of your codebase using embeddings and structural analysis (tree-sitter parsing + program dependence graphs).
+LeIndex builds one node-level index of your codebase: tree-sitter symbols feed
+the core TF-IDF lexical corpus and Program Dependence Graph (PDG); the
+configured neural worker is actively evaluated for the same nodes and joined
+to semantic scoring after it reaches `Ready` (terminal failure preserves the
+TF-IDF/PDG core).
 
 This allows queries to match:
 
@@ -243,8 +251,8 @@ Codebase → Tree-sitter Parser → PDG Builder → Semantic Index → Query Eng
 
 ## Features
 
-- **Semantic search** — find code by meaning, not keywords
-- **PDG analysis** — program dependence graph for structural understanding
+- **Core hybrid retrieval** — TF-IDF lexical matching plus PDG structure on every applicable result
+- **Hybrid neural scoring** — local ONNX similarity over the same symbols, with TF-IDF/PDG fallback
 - **5-phase analysis** — additive multi-pass codebase analysis pipeline
 - **Cross-project indexing** — search across multiple repos at once
 - **20 MCP tools** — read, analyze, edit preview/apply, rename, impact analysis
@@ -321,6 +329,13 @@ leindex tools list
 leindex tools help leindex-project-map
 leindex tools run leindex-project-map --args '{"path":"src","depth":2}'
 ```
+
+`leindex.index` is an owned start/poll job. Its default response is a
+`job_id` plus phase/status snapshot (`wait=false`); poll with the same
+`job_id` or pass `wait=true` for an explicit blocking CLI-style call. MCP
+requests do not cancel indexing, persistence, or publication at a wall-clock
+deadline. Every applicable retrieval response reports core `tfidf_status` and
+`pdg_status`; `neural_status` reports the configured neural provider state.
 
 <details>
 <summary><b>Zed IDE</b></summary>
@@ -615,7 +630,7 @@ Local models provide:
 - No API costs
 - Zero network latency
 - Provider-aware batching: dynamic up to 32 on CPU/CUDA, stable batches of 8 on MIGraphX
-- A 250 ms neural query budget with immediate TF-IDF/structural fallback
+- Default hybrid query enrichment: cold `auto` workers are started and awaited; TF-IDF/PDG remain the mandatory core result
 - Resident worker reuse while keeping ONNX memory outside the main process
 
 The worker binary (`leindex-embed`) is built alongside the main binary and is

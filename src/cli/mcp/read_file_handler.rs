@@ -1,8 +1,9 @@
 use super::helpers::{
     extract_bool, extract_string, extract_usize, get_direct_callers, node_type_str,
-    validate_file_within_project, wrap_with_meta,
+    validate_file_within_project, wrap_live_with_meta, wrap_with_meta,
 };
 use super::protocol::JsonRpcError;
+use crate::cli::live_project::LiveProject;
 use crate::cli::registry::ProjectRegistry;
 use crate::graph::pdg::ProgramDependenceGraph;
 use serde_json::Value;
@@ -37,6 +38,193 @@ fn byte_to_line_end(offsets: &[usize], byte_pos: usize, total_lines: usize) -> u
         .min(total_lines.max(1))
 }
 
+const LANGUAGE_BY_EXTENSION: &[(&str, &str)] = &[
+    ("rs", "rust"),
+    ("py", "python"),
+    ("js", "javascript"),
+    ("mjs", "javascript"),
+    ("cjs", "javascript"),
+    ("ts", "typescript"),
+    ("mts", "typescript"),
+    ("cts", "typescript"),
+    ("tsx", "typescriptreact"),
+    ("jsx", "javascriptreact"),
+    ("go", "go"),
+    ("java", "java"),
+    ("c", "c"),
+    ("h", "c"),
+    ("cpp", "cpp"),
+    ("hpp", "cpp"),
+    ("cc", "cpp"),
+    ("rb", "ruby"),
+    ("php", "php"),
+    ("swift", "swift"),
+    ("kt", "kotlin"),
+    ("cs", "csharp"),
+    ("lua", "lua"),
+    ("zig", "zig"),
+    ("md", "markdown"),
+    ("json", "json"),
+    ("yaml", "yaml"),
+    ("yml", "yaml"),
+    ("toml", "toml"),
+    ("html", "html"),
+    ("css", "css"),
+    ("scss", "scss"),
+    ("sql", "sql"),
+    ("sh", "shell"),
+    ("bash", "shell"),
+];
+
+fn detect_language(extension: &str) -> &str {
+    LANGUAGE_BY_EXTENSION
+        .iter()
+        .find(|(known_extension, _)| *known_extension == extension)
+        .map_or(extension, |(_, language)| *language)
+}
+
+async fn resolve_project_root(
+    registry: &Arc<ProjectRegistry>,
+    args: &Value,
+) -> Result<PathBuf, JsonRpcError> {
+    if let Some(project_path) = args.get("project_path").and_then(|value| value.as_str()) {
+        return LiveProject::resolve(project_path)
+            .map(|project| project.root().to_path_buf())
+            .map_err(|error| JsonRpcError::invalid_params(error.to_string()));
+    }
+
+    registry.default_project_path().await
+}
+
+async fn read_visible_content(
+    resolved_file_path: &Path,
+    args: &Value,
+    start_line: usize,
+    max_lines: usize,
+) -> Result<(String, usize, usize, String), JsonRpcError> {
+    let content = tokio::fs::read_to_string(resolved_file_path)
+        .await
+        .map_err(|error| {
+            JsonRpcError::invalid_params(format!(
+                "Cannot read file '{}': {}",
+                resolved_file_path.display(),
+                error
+            ))
+        })?;
+    let total_lines = content.lines().count();
+    let end_line_raw = extract_usize(args, "end_line", total_lines)?;
+    let end_line = end_line_raw
+        .min(total_lines)
+        .min(start_line.saturating_add(max_lines).saturating_sub(1));
+
+    if total_lines > 0 && start_line > total_lines {
+        return Err(JsonRpcError::invalid_params(format!(
+            "start_line {} exceeds total lines {}",
+            start_line, total_lines
+        )));
+    }
+    if total_lines > 0 && end_line < start_line {
+        return Err(JsonRpcError::invalid_params(format!(
+            "end_line {} precedes start_line {}",
+            end_line_raw, start_line
+        )));
+    }
+
+    let visible_lines: Vec<String> = if total_lines == 0 {
+        Vec::new()
+    } else {
+        content
+            .lines()
+            .skip(start_line - 1)
+            .take(end_line.min(total_lines) - (start_line - 1))
+            .enumerate()
+            .map(|(index, line)| format!("{}: {}", start_line + index, line))
+            .collect()
+    };
+    Ok((content, total_lines, end_line, visible_lines.join("\n")))
+}
+
+fn visible_byte_range(
+    line_offsets: &[usize],
+    start_line: usize,
+    end_line: usize,
+    total_lines: usize,
+    content_len: usize,
+) -> (usize, usize) {
+    (
+        line_offsets.get(start_line - 1).copied().unwrap_or(0),
+        line_offsets
+            .get(end_line.min(total_lines))
+            .copied()
+            .unwrap_or(content_len),
+    )
+}
+
+fn build_symbol_map(
+    pdg: &ProgramDependenceGraph,
+    file_path: &str,
+    line_offsets: &[usize],
+    start_line: usize,
+    end_line: usize,
+    total_lines: usize,
+    content_len: usize,
+    include_symbol_map: bool,
+) -> Vec<Value> {
+    if !include_symbol_map {
+        return Vec::new();
+    }
+
+    let (visible_start_byte, visible_end_byte) =
+        visible_byte_range(line_offsets, start_line, end_line, total_lines, content_len);
+    let mut symbols = Vec::new();
+
+    for nid in pdg.nodes_in_file(file_path) {
+        let Some(node) = pdg.get_node(nid) else {
+            continue;
+        };
+        let (sym_start, sym_end) = node.byte_range;
+        if sym_end <= visible_start_byte || sym_start >= visible_end_byte {
+            continue;
+        }
+
+        let line_start = byte_to_line_start(line_offsets, sym_start, total_lines);
+        let line_end = byte_to_line_end(line_offsets, sym_end, total_lines);
+        let caller_count = get_direct_callers(pdg, nid).len();
+        let dep_count = pdg.neighbors(nid).len();
+        let callers = get_direct_callers(pdg, nid)
+            .iter()
+            .filter_map(|&cid| pdg.get_node(cid).map(|n| n.name.clone()))
+            .take(5)
+            .collect::<Vec<_>>();
+        let callees = pdg
+            .neighbors(nid)
+            .iter()
+            .filter_map(|&did| pdg.get_node(did).map(|n| n.name.clone()))
+            .take(5)
+            .collect::<Vec<_>>();
+
+        symbols.push(serde_json::json!({
+            "name": node.name,
+            "type": node_type_str(&node.node_type),
+            "line_start": line_start,
+            "line_end": line_end,
+            "complexity": node.complexity,
+            "caller_count": caller_count,
+            "dependency_count": dep_count,
+            "callers": callers,
+            "callees": callees,
+        }));
+    }
+
+    symbols.sort_by_key(|symbol| {
+        symbol
+            .get("line_start")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+    });
+    symbols
+}
+
 fn build_pdg_enrichment(
     pdg: &ProgramDependenceGraph,
     file_path: &str,
@@ -50,66 +238,25 @@ fn build_pdg_enrichment(
     let nodes = pdg.nodes_in_file(file_path);
     let mut dep_line_offsets_cache: HashMap<Arc<str>, Vec<usize>> = HashMap::new();
 
-    let symbol_map = if include_symbol_map {
-        let visible_start_byte = file_line_offsets.get(start_line - 1).copied().unwrap_or(0);
-        let visible_end_byte = file_line_offsets
-            .get(end_line.min(total_lines))
-            .copied()
-            .unwrap_or(content.len());
-
-        let mut symbols: Vec<Value> = Vec::new();
-        for &nid in &nodes {
-            let Some(node) = pdg.get_node(nid) else {
-                continue;
-            };
-            let (sym_start, sym_end) = node.byte_range;
-
-            if sym_end <= visible_start_byte || sym_start >= visible_end_byte {
-                continue;
-            }
-
-            let line_start = byte_to_line_start(&file_line_offsets, sym_start, total_lines);
-            let line_end = byte_to_line_end(&file_line_offsets, sym_end, total_lines);
-
-            let caller_count = get_direct_callers(pdg, nid).len();
-            let dep_count = pdg.neighbors(nid).len();
-            let callers: Vec<String> = get_direct_callers(pdg, nid)
-                .iter()
-                .filter_map(|&cid| pdg.get_node(cid).map(|n| n.name.clone()))
-                .take(5)
-                .collect();
-            let callees: Vec<String> = pdg
-                .neighbors(nid)
-                .iter()
-                .filter_map(|&did| pdg.get_node(did).map(|n| n.name.clone()))
-                .take(5)
-                .collect();
-
-            symbols.push(serde_json::json!({
-                "name": node.name,
-                "type": node_type_str(&node.node_type),
-                "line_start": line_start,
-                "line_end": line_end,
-                "complexity": node.complexity,
-                "caller_count": caller_count,
-                "dependency_count": dep_count,
-                "callers": callers,
-                "callees": callees,
-            }));
-        }
-
-        symbols.sort_by_key(|s| s.get("line_start").and_then(|v| v.as_u64()).unwrap_or(0));
-        symbols
-    } else {
-        Vec::new()
-    };
+    let symbol_map = build_symbol_map(
+        pdg,
+        file_path,
+        &file_line_offsets,
+        start_line,
+        end_line,
+        total_lines,
+        content.len(),
+        include_symbol_map,
+    );
 
     let context = {
-        let visible_start_byte = file_line_offsets.get(start_line - 1).copied().unwrap_or(0);
-        let visible_end_byte = file_line_offsets
-            .get(end_line.min(total_lines))
-            .copied()
-            .unwrap_or(content.len());
+        let (visible_start_byte, visible_end_byte) = visible_byte_range(
+            &file_line_offsets,
+            start_line,
+            end_line,
+            total_lines,
+            content.len(),
+        );
 
         let mut symbols_here: Vec<String> = Vec::new();
         let mut imports_from: std::collections::BTreeSet<String> =
@@ -239,121 +386,35 @@ Works for any text file including configs and docs."
         let max_lines = extract_usize(&args, "max_lines", 500)?.min(2000);
         let include_symbol_map = extract_bool(&args, "include_symbol_map", false);
 
-        // Try to get project handle for boundary validation and PDG, but don't require it
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
-        let maybe_handle = if project_path.is_some() {
-            Some(registry.get_or_create(project_path).await?)
-        } else {
-            registry.get_or_create(project_path).await.ok()
-        };
+        // Resolve and validate against the live project without creating or
+        // hydrating a registry entry. Resident PDG data is enrichment only;
+        // an exact file read must remain useful before any index exists.
+        let project_root = resolve_project_root(registry, &args).await?;
+        let resolved_file_path = validate_file_within_project(&file_path, &project_root)?;
+        let maybe_handle = registry.try_get_loaded(&project_root).await;
 
-        let resolved_file_path = if let Some(ref handle) = maybe_handle {
-            let guard = handle.read().await;
-            validate_file_within_project(&file_path, guard.project_path())?
-        } else {
-            PathBuf::from(&file_path)
-        };
-
-        // Read file content — works for any text file
-        let content = tokio::fs::read_to_string(&resolved_file_path)
-            .await
-            .map_err(|e| {
-                JsonRpcError::invalid_params(format!(
-                    "Cannot read file '{}': {}",
-                    resolved_file_path.display(),
-                    e
-                ))
-            })?;
-
-        let total_lines = content.lines().count();
-
-        // Resolve end_line
-        let end_line_raw = extract_usize(&args, "end_line", total_lines)?;
-        let end_line = end_line_raw
-            .min(total_lines)
-            .min(start_line + max_lines - 1);
-
-        if total_lines > 0 && start_line > total_lines {
-            return Err(JsonRpcError::invalid_params(format!(
-                "start_line {} exceeds total lines {}",
-                start_line, total_lines
-            )));
-        }
-
-        if total_lines > 0 && end_line < start_line {
-            return Err(JsonRpcError::invalid_params(format!(
-                "end_line {} precedes start_line {}",
-                end_line_raw, start_line
-            )));
-        }
-
-        // Build numbered content (1-indexed)
-        let visible_lines: Vec<String> = if total_lines == 0 {
-            Vec::new()
-        } else {
-            content
-                .lines()
-                .skip(start_line - 1)
-                .take(end_line.min(total_lines) - (start_line - 1))
-                .enumerate()
-                .map(|(i, line)| format!("{}: {}", start_line + i, line))
-                .collect()
-        };
-        let content_str = visible_lines.join("\n");
+        let (content, total_lines, end_line, content_str) =
+            read_visible_content(&resolved_file_path, &args, start_line, max_lines).await?;
 
         // Detect language from extension (case-insensitive)
         let ext_lower = Path::new(&file_path)
             .extension()
-            .and_then(|e| e.to_str())
-            .map(|ext| ext.to_ascii_lowercase());
-        let language = ext_lower
-            .as_deref()
-            .map(|ext| match ext {
-                "rs" => "rust",
-                "py" => "python",
-                "js" | "mjs" | "cjs" => "javascript",
-                "ts" | "mts" | "cts" => "typescript",
-                "tsx" => "typescriptreact",
-                "jsx" => "javascriptreact",
-                "go" => "go",
-                "java" => "java",
-                "c" | "h" => "c",
-                "cpp" | "hpp" | "cc" => "cpp",
-                "rb" => "ruby",
-                "php" => "php",
-                "swift" => "swift",
-                "kt" => "kotlin",
-                "cs" => "csharp",
-                "lua" => "lua",
-                "zig" => "zig",
-                "md" => "markdown",
-                "json" => "json",
-                "yaml" | "yml" => "yaml",
-                "toml" => "toml",
-                "html" => "html",
-                "css" => "css",
-                "scss" => "scss",
-                "sql" => "sql",
-                "sh" | "bash" => "shell",
-                other => other,
-            })
-            .unwrap_or("text");
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.to_ascii_lowercase());
+        let language = ext_lower.as_deref().map(detect_language).unwrap_or("text");
 
         let pdg_snapshot = if let Some(ref handle) = maybe_handle {
-            let mut guard = handle.write().await;
-            if let Err(e) = guard.ensure_pdg_loaded() {
-                tracing::warn!(
-                    "PDG load failed for enrichment, degrading gracefully: {}",
-                    e
-                );
-                None
-            } else {
-                guard.pdg().cloned()
-            }
+            let guard = handle.read().await;
+            guard.pdg().cloned()
         } else {
             None
         };
 
+        let pdg_status = if pdg_snapshot.is_some() {
+            "fresh"
+        } else {
+            "not_loaded"
+        };
         let enrichment_file_path = resolved_file_path.to_string_lossy().to_string();
         let (symbol_map, context) = if let Some(pdg) = pdg_snapshot {
             tokio::task::spawn_blocking(move || {
@@ -392,8 +453,14 @@ Works for any text file including configs and docs."
             result["context"] = ctx;
         }
 
+        result["retrieval"] = serde_json::json!({
+            "tfidf_status": "not_used_exact",
+            "pdg_status": pdg_status,
+            "neural_status": "not_used_exact"
+        });
+
         // Verbose symbol map only when explicitly requested
-        if include_symbol_map && !symbol_map.is_empty() {
+        if !symbol_map.is_empty() {
             result["symbol_map"] = serde_json::json!(symbol_map);
         }
 
@@ -401,6 +468,8 @@ Works for any text file including configs and docs."
         if let Some(ref handle) = maybe_handle {
             let guard = handle.read().await;
             result = wrap_with_meta(result, &guard);
+        } else {
+            result = wrap_live_with_meta(result, &project_root);
         }
 
         Ok(result)

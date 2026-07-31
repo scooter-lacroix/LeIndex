@@ -371,15 +371,6 @@ fn diff_phases_rules(_diff: &DiffResult) -> RegressionRules {
     }
 }
 
-/// Resolve the canonical paths for baselines and budgets relative to the
-/// workspace root.
-#[allow(dead_code)]
-pub fn resolve_memory_paths(workspace_root: &Path) -> (PathBuf, PathBuf) {
-    let baselines_dir = workspace_root.join("docs/memory/baselines");
-    let budget_path = workspace_root.join("docs/memory/budgets/current.json");
-    (baselines_dir, budget_path)
-}
-
 /// Find the workspace root by walking up from a starting directory.
 pub fn find_workspace_root(start: &Path) -> Result<PathBuf> {
     let mut dir = start;

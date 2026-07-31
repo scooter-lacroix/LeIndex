@@ -1,0 +1,36 @@
+name: performance-regression
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * 1"
+  push:
+    branches: [master]
+    paths:
+      - "src/cli/**"
+      - "src/search/**"
+      - "src/graph/**"
+      - "src/storage/**"
+      - "crates/leindex-embed/**"
+      - "benches/mcp_tool_latency.rs"
+      - "scripts/check-performance.sh"
+
+jobs:
+  performance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build release benchmark
+        run: cargo bench --all-features --bench mcp_tool_latency --no-run
+      - name: Run performance gate
+        run: bash scripts/check-performance.sh
+      - name: Upload performance report and Criterion output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leindex-performance
+          path: |
+            target/leindex-performance.json
+            target/criterion/mcp_tool_latency
+          if-no-files-found: ignore

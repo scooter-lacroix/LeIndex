@@ -1,5 +1,9 @@
 // Java language parser implementation
 
+use crate::cfg_builder;
+use crate::cfg_loop_handler;
+use crate::parse::traits::calculate_complexity;
+use crate::parse::traits::clean_call_text;
 use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
@@ -28,162 +32,155 @@ impl JavaParser {
         root: tree_sitter::Node<'_>,
     ) -> Vec<SignatureInfo> {
         let mut signatures = Vec::new();
+        Self::visit_java_node(&root, source, &mut signatures, &[]);
+        signatures
+    }
 
-        fn visit_node(
-            node: &tree_sitter::Node<'_>,
-            source: &[u8],
-            signatures: &mut Vec<SignatureInfo>,
-            parent_path: &[String],
-        ) {
-            match node.kind() {
-                "method_declaration" => {
-                    if let Some(sig) = extract_method_signature(node, source, parent_path) {
-                        signatures.push(sig);
-                    }
-                    // Don't recurse into method bodies
-                }
-                "constructor_declaration" => {
-                    if let Some(sig) = extract_constructor_signature(node, source, parent_path) {
-                        signatures.push(sig);
-                    }
-                }
-                "class_declaration" => {
-                    if let Some(name) = node
-                        .child_by_field_name("name")
-                        .and_then(|n| n.utf8_text(source).ok())
-                    {
-                        let qualified_name = if parent_path.is_empty() {
-                            name.to_string()
-                        } else {
-                            format!("{}.{}", parent_path.join("."), name)
-                        };
-
-                        signatures.push(SignatureInfo {
-                            name: name.to_string(),
-                            qualified_name,
-                            parameters: vec![],
-                            return_type: Some("class".to_string()),
-                            visibility: extract_visibility(node, source),
-                            is_async: false,
-                            is_method: false,
-                            docstring: extract_docstring(node, source),
-                            calls: vec![],
-                            imports: vec![],
-                            byte_range: (node.start_byte(), node.end_byte()),
-                            cyclomatic_complexity: 0,
-                        });
-                    }
-
-                    // Recurse to extract class methods
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        visit_node(&child, source, signatures, parent_path);
-                    }
-                }
-                "interface_declaration" => {
-                    if let Some(name) = node
-                        .child_by_field_name("name")
-                        .and_then(|n| n.utf8_text(source).ok())
-                    {
-                        let qualified_name = if parent_path.is_empty() {
-                            name.to_string()
-                        } else {
-                            format!("{}.{}", parent_path.join("."), name)
-                        };
-
-                        signatures.push(SignatureInfo {
-                            name: name.to_string(),
-                            qualified_name,
-                            parameters: vec![],
-                            return_type: Some("interface".to_string()),
-                            visibility: extract_visibility(node, source),
-                            is_async: false,
-                            is_method: false,
-                            docstring: extract_docstring(node, source),
-                            calls: vec![],
-                            imports: vec![],
-                            byte_range: (node.start_byte(), node.end_byte()),
-                            cyclomatic_complexity: 0,
-                        });
-                    }
-
-                    // Recurse to extract interface methods
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        visit_node(&child, source, signatures, parent_path);
-                    }
-                }
-                "enum_declaration" => {
-                    if let Some(name) = node
-                        .child_by_field_name("name")
-                        .and_then(|n| n.utf8_text(source).ok())
-                    {
-                        let qualified_name = if parent_path.is_empty() {
-                            name.to_string()
-                        } else {
-                            format!("{}.{}", parent_path.join("."), name)
-                        };
-
-                        signatures.push(SignatureInfo {
-                            name: name.to_string(),
-                            qualified_name,
-                            parameters: vec![],
-                            return_type: Some("enum".to_string()),
-                            visibility: extract_visibility(node, source),
-                            is_async: false,
-                            is_method: false,
-                            docstring: extract_docstring(node, source),
-                            calls: vec![],
-                            imports: vec![],
-                            byte_range: (node.start_byte(), node.end_byte()),
-                            cyclomatic_complexity: 0,
-                        });
-                    }
-                }
-                "field_declaration" => {
-                    // Extract field declarations as signatures
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        if child.kind() == "variable_declarator" {
-                            if let Some(name) = child
-                                .child_by_field_name("name")
-                                .and_then(|n| n.utf8_text(source).ok())
-                            {
-                                // Get type from parent
-                                let type_annotation = node
-                                    .child_by_field_name("type")
-                                    .and_then(|t| t.utf8_text(source).ok())
-                                    .map(|s| s.trim().to_string());
-
-                                signatures.push(SignatureInfo {
-                                    name: name.to_string(),
-                                    qualified_name: name.to_string(),
-                                    parameters: vec![],
-                                    return_type: type_annotation,
-                                    visibility: extract_visibility(node, source),
-                                    is_async: false,
-                                    is_method: false,
-                                    docstring: None,
-                                    calls: vec![],
-                                    imports: vec![],
-                                    byte_range: (0, 0),
-                                    cyclomatic_complexity: 0,
-                                });
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        visit_node(&child, source, signatures, parent_path);
-                    }
+    fn visit_java_node(
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        signatures: &mut Vec<SignatureInfo>,
+        parent_path: &[String],
+    ) {
+        match node.kind() {
+            "method_declaration" => {
+                if let Some(signature) = extract_method_signature(node, source, parent_path) {
+                    signatures.push(signature);
                 }
             }
+            "constructor_declaration" => {
+                if let Some(signature) = extract_constructor_signature(node, source, parent_path) {
+                    signatures.push(signature);
+                }
+            }
+            "class_declaration" => {
+                Self::push_java_type_signature(node, source, parent_path, "class", signatures);
+                let child_path = Self::java_type_child_path(node, source, parent_path);
+                Self::visit_java_children(node, source, signatures, &child_path);
+            }
+            "interface_declaration" => {
+                Self::push_java_type_signature(node, source, parent_path, "interface", signatures);
+                let child_path = Self::java_type_child_path(node, source, parent_path);
+                Self::visit_java_children(node, source, signatures, &child_path);
+            }
+            "enum_declaration" => {
+                Self::push_java_type_signature(node, source, parent_path, "enum", signatures);
+                let child_path = Self::java_type_child_path(node, source, parent_path);
+                Self::visit_java_children(node, source, signatures, &child_path);
+            }
+            "field_declaration" => Self::extract_java_fields(node, source, signatures, parent_path),
+            _ => Self::visit_java_children(node, source, signatures, parent_path),
         }
+    }
 
-        visit_node(&root, source, &mut signatures, &[]);
-        signatures
+    /// Build the child traversal path by appending this type's simple name,
+    /// so members nested in a class/interface/enum get parent-qualified names.
+    fn java_type_child_path(
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        parent_path: &[String],
+    ) -> Vec<String> {
+        let mut path = parent_path.to_vec();
+        if let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source).ok())
+        {
+            path.push(name.trim().to_string());
+        }
+        path
+    }
+
+    fn visit_java_children(
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        signatures: &mut Vec<SignatureInfo>,
+        parent_path: &[String],
+    ) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::visit_java_node(&child, source, signatures, parent_path);
+        }
+    }
+
+    fn push_java_type_signature(
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        parent_path: &[String],
+        type_name: &str,
+        signatures: &mut Vec<SignatureInfo>,
+    ) {
+        let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source).ok())
+        else {
+            return;
+        };
+        let qualified_name = if parent_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}.{}", parent_path.join("."), name)
+        };
+
+        signatures.push(SignatureInfo {
+            name: name.to_string(),
+            qualified_name,
+            parameters: vec![],
+            return_type: Some(type_name.to_string()),
+            visibility: extract_visibility(node, source),
+            is_async: false,
+            is_method: false,
+            docstring: extract_docstring(node, source),
+            calls: vec![],
+            imports: vec![],
+            byte_range: (node.start_byte(), node.end_byte()),
+            flow_facts: vec![],
+            cyclomatic_complexity: 0,
+        });
+    }
+
+    fn extract_java_fields(
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        signatures: &mut Vec<SignatureInfo>,
+        parent_path: &[String],
+    ) {
+        let type_annotation = node
+            .child_by_field_name("type")
+            .and_then(|type_node| type_node.utf8_text(source).ok())
+            .map(|text| text.trim().to_string());
+        let mut cursor = node.walk();
+
+        for child in node.children(&mut cursor) {
+            if child.kind() != "variable_declarator" {
+                continue;
+            }
+            let Some(name) = child
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source).ok())
+            else {
+                continue;
+            };
+
+            signatures.push(SignatureInfo {
+                name: name.to_string(),
+                qualified_name: if parent_path.is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{}.{}", parent_path.join("."), name)
+                },
+                parameters: vec![],
+                return_type: type_annotation.clone(),
+                visibility: extract_visibility(node, source),
+                is_async: false,
+                is_method: false,
+                docstring: None,
+                calls: vec![],
+                imports: vec![],
+                byte_range: (child.start_byte(), child.end_byte()),
+                flow_facts: vec![],
+                cyclomatic_complexity: 0,
+            });
+        }
     }
 }
 
@@ -230,7 +227,7 @@ impl CodeIntelligence for JavaParser {
 
         let root_node = tree.root_node();
 
-        let node = find_node_by_id(&root_node, node_id)
+        let node = crate::parse::traits::find_node_by_id(&root_node, node_id)
             .ok_or_else(|| Error::ParseFailed(format!("Node {} not found", node_id)))?;
 
         let mut cfg_builder = CfgBuilder::new(source);
@@ -247,7 +244,7 @@ impl CodeIntelligence for JavaParser {
             token_count: 0,
         };
 
-        calculate_complexity(node, &mut complexity, 0);
+        calculate_complexity(node, &mut complexity, 0, DECISION_KINDS);
         complexity
     }
 }
@@ -328,6 +325,8 @@ fn extract_method_signature(
 
         imports: vec![],
         byte_range: (node.start_byte(), node.end_byte()),
+        flow_facts: vec![],
+
         cyclomatic_complexity: 0,
     })
 }
@@ -367,6 +366,8 @@ fn extract_constructor_signature(
 
         imports: vec![],
         byte_range: (node.start_byte(), node.end_byte()),
+        flow_facts: vec![],
+
         cyclomatic_complexity: 0,
     })
 }
@@ -374,10 +375,6 @@ fn extract_constructor_signature(
 /// Extract function calls from a Java node
 fn extract_java_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
-
-    fn clean_call_text(raw: &str) -> String {
-        raw.split('(').next().unwrap_or(raw).trim().to_string()
-    }
 
     fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
         match node.kind() {
@@ -519,86 +516,19 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
     None
 }
 
-/// Find a node by its ID
-fn find_node_by_id<'a>(
-    node: &'a tree_sitter::Node<'a>,
-    id: usize,
-) -> Option<tree_sitter::Node<'a>> {
-    use std::collections::VecDeque;
-
-    if node.id() == id {
-        return Some(*node);
-    }
-
-    let mut queue: VecDeque<tree_sitter::Node<'a>> = VecDeque::new();
-    let mut cursor = node.walk();
-
-    for child in node.children(&mut cursor) {
-        queue.push_back(child);
-    }
-
-    while let Some(current) = queue.pop_front() {
-        if current.id() == id {
-            return Some(current);
-        }
-
-        let mut child_cursor = current.walk();
-        for child in current.children(&mut child_cursor) {
-            queue.push_back(child);
-        }
-    }
-
-    None
-}
-
 /// Calculate complexity metrics
-fn calculate_complexity(
-    node: &tree_sitter::Node<'_>,
-    metrics: &mut ComplexityMetrics,
-    depth: usize,
-) {
-    metrics.nesting_depth = metrics.nesting_depth.max(depth);
-    metrics.line_count = std::cmp::max(metrics.line_count, 1);
-
-    match node.kind() {
-        "if_statement"
-        | "for_statement"
-        | "enhanced_for_statement"
-        | "while_statement"
-        | "do_statement"
-        | "switch_expression"
-        | "case_statement" => {
-            metrics.cyclomatic += 1;
-        }
-        _ => {}
-    }
-
-    metrics.token_count += node.child_count();
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        calculate_complexity(&child, metrics, depth + 1);
-    }
-}
-
-/// Control flow graph builder
-struct CfgBuilder<'a> {
-    source: &'a [u8],
-    blocks: Vec<Block>,
-    edges: Vec<Edge>,
-    next_block_id: usize,
-}
-
+const DECISION_KINDS: &[&str] = &[
+    "if_statement",
+    "for_statement",
+    "enhanced_for_statement",
+    "while_statement",
+    "do_statement",
+    "switch_expression",
+    "case_statement",
+];
+cfg_builder!();
+cfg_loop_handler!();
 impl<'a> CfgBuilder<'a> {
-    fn new(source: &'a [u8]) -> Self {
-        Self {
-            source,
-            blocks: Vec::new(),
-            edges: Vec::new(),
-            next_block_id: 0,
-        }
-    }
-
     fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {
         let entry_id = self.create_block();
         self.build_cfg_recursive(node, entry_id)?;
@@ -631,60 +561,6 @@ impl<'a> CfgBuilder<'a> {
                 }
             }
         }
-
-        Ok(())
-    }
-
-    fn handle_if_statement(
-        &mut self,
-        _node: &tree_sitter::Node<'_>,
-        current_block: usize,
-    ) -> Result<()> {
-        let true_block = self.create_block();
-        let false_block = self.create_block();
-        let merge_block = self.create_block();
-
-        self.edges.push(Edge {
-            from: current_block,
-            to: true_block,
-            edge_type: EdgeType::TrueBranch,
-        });
-        self.edges.push(Edge {
-            from: current_block,
-            to: false_block,
-            edge_type: EdgeType::FalseBranch,
-        });
-        self.edges.push(Edge {
-            from: true_block,
-            to: merge_block,
-            edge_type: EdgeType::Unconditional,
-        });
-        self.edges.push(Edge {
-            from: false_block,
-            to: merge_block,
-            edge_type: EdgeType::Unconditional,
-        });
-
-        Ok(())
-    }
-
-    fn handle_loop_statement(
-        &mut self,
-        _node: &tree_sitter::Node<'_>,
-        current_block: usize,
-    ) -> Result<()> {
-        let body_block = self.create_block();
-
-        self.edges.push(Edge {
-            from: current_block,
-            to: body_block,
-            edge_type: EdgeType::Unconditional,
-        });
-        self.edges.push(Edge {
-            from: body_block,
-            to: current_block,
-            edge_type: EdgeType::Loop,
-        });
 
         Ok(())
     }
@@ -730,31 +606,6 @@ impl<'a> CfgBuilder<'a> {
         }
 
         Ok(())
-    }
-
-    fn create_block(&mut self) -> usize {
-        let id = self.next_block_id;
-        self.next_block_id += 1;
-        self.blocks.push(Block {
-            id,
-            statements: Vec::new(),
-        });
-        id
-    }
-
-    fn add_statement_to_block(&mut self, block_id: usize, statement: String) {
-        if let Some(block) = self.blocks.get_mut(block_id) {
-            block.statements.push(statement);
-        }
-    }
-
-    fn finish(self) -> Graph<Block, Edge> {
-        Graph {
-            blocks: self.blocks,
-            edges: self.edges,
-            entry_block: 0,
-            exit_blocks: vec![self.next_block_id.saturating_sub(1)],
-        }
     }
 }
 

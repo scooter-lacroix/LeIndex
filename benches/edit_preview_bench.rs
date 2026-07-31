@@ -10,7 +10,7 @@
 //! cargo bench --bench edit_preview_bench
 //! ```
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use leindex::edit::ResolvedEditChange;
 use std::path::{Path, PathBuf};
 

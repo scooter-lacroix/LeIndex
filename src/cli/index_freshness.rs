@@ -1,13 +1,48 @@
 // Index Freshness — staleness detection logic extracted from LeIndex
 
-use super::leindex::{ProjectFileScan, DEPENDENCY_MANIFEST_NAMES};
+use super::leindex::IndexHealth;
+use super::leindex::{DEPENDENCY_MANIFEST_NAMES, ProjectFileScan};
 use crate::cli::memory::CacheEntry;
 use crate::cli::skip_dirs::SKIP_DIRS;
 use crate::storage::schema::Storage;
 use anyhow::Result;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
+
+/// Load the small generation-health snapshot without opening the main index.
+pub(crate) fn load_health(storage_path: &Path) -> Option<IndexHealth> {
+    let bytes = std::fs::read(storage_path.join("index-state.json")).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Persist generation health with an atomic sibling rename.
+pub(crate) fn save_health(storage_path: &Path, health: &IndexHealth) -> Result<()> {
+    std::fs::create_dir_all(storage_path)?;
+    let target = storage_path.join("index-state.json");
+    let next = storage_path.join("index-state.json.next");
+    let bytes = serde_json::to_vec_pretty(health)?;
+    let mut file = std::fs::File::create(&next)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    #[cfg(windows)]
+    {
+        let previous = storage_path.join("index-state.json.previous");
+        let _ = std::fs::remove_file(&previous);
+        if target.exists() {
+            std::fs::rename(&target, &previous)?;
+        }
+        std::fs::rename(&next, &target)?;
+        let _ = std::fs::remove_file(previous);
+    }
+    #[cfg(not(windows))]
+    std::fs::rename(&next, &target)?;
+    #[cfg(unix)]
+    std::fs::File::open(storage_path)?.sync_all()?;
+    Ok(())
+}
 
 const MAX_FAST_INDEXED_FILE_STATS: usize = 10_000;
 
@@ -134,9 +169,39 @@ pub(crate) fn is_stale_fast(
 ) -> bool {
     let indexed_files = crate::storage::pdg_store::get_indexed_files(ctx.storage, ctx.project_id)
         .unwrap_or_default();
-
     if indexed_files.is_empty() {
         return true;
+    }
+
+    // Tree-OID drift: a Git checkout/pull/rebase can move the worktree to a
+    // different revision without bumping mtimes on indexed files whose content
+    // didn't change. Compare the indexed tree OID to the current one so this
+    // index gate agrees with `cmd_diagnostics` (cli.rs) and triggers a
+    // re-index on real tree changes. This fn is TTL-amortized by the registry
+    // stale_cache, so the single `git rev-parse` is acceptable.
+    if let Some(health) = load_health(ctx.storage_path) {
+        if let Some(indexed) = health.tree_oid.as_deref() {
+            match crate::cli::git::tree_oid(ctx.project_path) {
+                Ok(Some(current)) => {
+                    if indexed != current {
+                        return true;
+                    }
+                }
+                Ok(None) => {
+                    // Not a git repo — no tree OID to compare; fall through to
+                    // the mtime/count checks.
+                }
+                Err(_) => {
+                    // Genuine git failure (lock contention, corrupt repo,
+                    // permission error). We can't determine the current tree, so
+                    // don't risk serving stale cached results: treat as stale
+                    // and re-index. (Previously .ok().flatten() collapsed this
+                    // to None and silently skipped the check — a false negative
+                    // under exactly the concurrent-git scenario this guards.)
+                    return true;
+                }
+            }
+        }
     }
 
     let db_time = match ctx
@@ -145,235 +210,134 @@ pub(crate) fn is_stale_fast(
         .metadata()
         .and_then(|m| m.modified())
     {
-        Ok(t) => t,
+        Ok(time) => time,
         Err(_) => return true,
     };
 
-    let mut cold_manifest_paths: Option<Vec<PathBuf>> = None;
-    let mut cached_manifest_paths: Option<Vec<PathBuf>> = None;
-    let mut cached_scan: Option<ProjectFileScan> = None;
-    if ctx.project_scan.is_none() {
-        let cache_key = crate::cli::memory::project_scan_cache_key(ctx.project_id);
-        if let Some(entry) = ctx.cache_spiller.store().peek(&cache_key) {
-            if let CacheEntry::Binary {
-                serialized_data, ..
-            } = entry
-            {
-                if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(serialized_data) {
-                    cached_manifest_paths = Some(scan.manifest_paths.clone());
-                    cached_scan = Some(scan);
-                }
-            }
-        } else if let Ok(CacheEntry::Binary {
-            serialized_data, ..
-        }) = ctx.cache_spiller.store().load_from_disk(&cache_key)
-        {
-            if let Ok(scan) = bincode::deserialize::<ProjectFileScan>(&serialized_data) {
-                cached_manifest_paths = Some(scan.manifest_paths.clone());
-                cached_scan = Some(scan);
-            }
+    let cached_scan = if ctx.project_scan.is_none() {
+        match load_cached_or_scan(ctx, scan_fn) {
+            Some(scan) => Some(scan),
+            None => return true,
         }
-        if cached_scan.is_none() {
-            match scan_fn() {
-                Ok(scan) => {
-                    cold_manifest_paths = Some(scan.manifest_paths.clone());
-                    cached_scan = Some(scan);
-                }
-                Err(_) => return true,
-            }
-        }
-    }
-    // Source count mismatch: O(1) check that catches file additions or
-    // deletions even when directory mtimes are not updated reliably.
-    let source_count = if let Some(scan) = ctx.project_scan {
-        Some(scan.source_paths.len())
     } else {
-        cached_scan.as_ref().map(|scan| scan.source_paths.len())
+        None
     };
-    if let Some(count) = source_count {
-        if count != indexed_files.len() {
-            return true;
-        }
-    }
-    // Directory mtime sentinel check
-    let source_dirs: Vec<PathBuf> = if let Some(scan) = ctx.project_scan {
-        scan.source_directories.clone()
-    } else if let Some(scan) = cached_scan.as_ref() {
-        scan.source_directories.clone()
-    } else {
-        let mut dirs: Vec<PathBuf> = indexed_files
-            .keys()
-            .filter_map(|p| PathBuf::from(p).parent().map(|d| d.to_path_buf()))
-            .collect();
-        dirs.sort();
-        dirs.dedup();
-        dirs
-    };
-    for dir in &source_dirs {
-        let full_path = if dir.is_absolute() {
-            dir.clone()
-        } else {
-            ctx.project_path.join(dir)
-        };
-        match std::fs::metadata(&full_path) {
-            Ok(metadata) => {
-                if let Ok(modified) = metadata.modified() {
-                    if modified > db_time {
-                        return true;
-                    }
-                }
-            }
-            Err(_) => {
-                return true;
-            }
-        }
-    }
+    let scan = ctx.project_scan.or(cached_scan.as_ref());
 
-    // Check indexed source files for deletion or modification. Keep the fast
-    // path bounded: on very large projects or slow filesystems, stat()ing every
-    // file here can dominate every tool call. Returning stale is conservative;
-    // the caller can run the authoritative hash-based freshness check.
-    if should_skip_fast_file_stat_scan(indexed_files.len()) {
+    if scan.is_some_and(|scan| scan.source_paths.len() != indexed_files.len())
+        || source_directories_are_stale(ctx, scan, &indexed_files, db_time)
+        || indexed_files_are_stale(ctx, &indexed_files, db_time)
+        || manifests_are_stale(ctx, ctx.project_scan, scan, db_time)
+    {
         return true;
-    }
-
-    // Using >= instead of > catches same-second modifications (where the
-    // file mtime equals the DB mtime). This may produce false positives
-    // (files indexed in the same second as the DB write), but those are
-    // resolved by the authoritative check_freshness() hash comparison
-    // that the caller runs when is_stale_fast returns true.
-    for indexed_path in indexed_files.keys() {
-        let full_path = ctx.project_path.join(indexed_path);
-        match std::fs::metadata(&full_path) {
-            Ok(metadata) => match metadata.modified() {
-                Ok(modified) if modified >= db_time => return true,
-                Ok(_) => {}
-                Err(_) => return true,
-            },
-            Err(_) => return true,
-        }
-    }
-
-    // Check manifest file mtimes
-    let manifest_paths: Vec<PathBuf> = if let Some(scan) = ctx.project_scan {
-        scan.manifest_paths.clone()
-    } else if let Some(ref paths) = cached_manifest_paths {
-        paths.clone()
-    } else if let Some(ref paths) = cold_manifest_paths {
-        paths.clone()
-    } else {
-        Vec::new()
-    };
-
-    // The list-based check below covers every manifest already
-    // discovered by the project scan (Cargo.toml, package.json,
-    // pyproject.toml, etc.). The historical walkdir block that
-    // re-walked the project tree here was both redundant with this
-    // check AND responsible for adding hundreds of stat() calls
-    // on every tool call when the stale cache TTL expired.
-    //
-    // However, the cached list only carries manifests that
-    // existed during the previous scan. A user who adds a brand-
-    // new manifest after the index was built (whether at the
-    // project root or in a monorepo subdirectory such as
-    // `packages/api/package.json`) would not be caught by the
-    // source-count check (no new source file was indexed), the
-    // directory-mtime check (the manifest's parent dir may not
-    // be in `source_dirs`), the source-file sample check, or the
-    // cached manifest list. The check below is a bounded-depth
-    // walkdir (`max_depth(5)`, skipping dotfile dirs and the
-    // shared SKIP_DIRS list) that looks only for files whose
-    // name is in `DEPENDENCY_MANIFEST_NAMES`. The walk short-
-    // circuits at the first new manifest, so the common case
-    // (no new manifest) costs O(number of directories up to
-    // depth 5) which is on the order of a few thousand
-    // directory entries for a large monorepo, comparable to
-    // one `cargo build` directory traversal. We also keep the
-    // root-only fast path above (it does the same canonicalize
-    // check in O(14) without touching walkdir) for the common
-    // case of a single-package project.
-    //
-    // Build the membership set. Fast path: when the scan has
-    // pre-canonicalized manifest paths (populated by the scanner
-    // at scan time), use them directly as a HashSet — zero
-    // syscalls on the freshness-check hot path. Slow path:
-    // legacy scans (empty `manifest_paths_canonical`) or cold/
-    // cached paths without a scan fall back to
-    // `build_already_listed`, which canonicalizes on the fly.
-    // The per-call canonicalize cost is O(N) stat/readlink
-    // syscalls where N is the number of manifests — in a large
-    // monorepo with hundreds of package manifests this was the
-    // dominant fixed cost of the freshness fast path before
-    // the round-18 optimization.
-    let already_listed: std::collections::HashSet<PathBuf> = if let Some(scan) = ctx.project_scan {
-        if !scan.manifest_paths_canonical.is_empty() {
-            scan.manifest_paths_canonical.iter().cloned().collect()
-        } else {
-            build_already_listed(ctx.project_path, &scan.manifest_paths)
-        }
-    } else {
-        build_already_listed(ctx.project_path, &manifest_paths)
-    };
-    // Root-level fast path: O(N) stat, no walkdir. Common case
-    // for single-package projects.
-    //
-    // The list of names must be a subset of
-    // `DEPENDENCY_MANIFEST_NAMES` — every name we check here
-    // must also be a name the scanner records in
-    // `ProjectFileScan::manifest_paths`, otherwise the cached
-    // `already_listed` set will never contain it and the fast
-    // path will mark the index stale on every tool call (the
-    // stale flag is then cleared by the next `leindex.index`,
-    // which records the same manifest, which the *next* tool
-    // call still treats as new — an infinite loop). The
-    // previous literal list included `setup.py`, `setup.cfg`,
-    // `build.gradle`, `build.gradle.kts`, `pom.xml`, and
-    // `Pipfile`, none of which the scanner records, so any
-    // project with one of those files at the root reported
-    // stale forever. Reuse `DEPENDENCY_MANIFEST_NAMES`
-    // directly so the two lists can never drift.
-    let new_root_manifest = find_new_root_manifest(ctx.project_path, &already_listed);
-    if new_root_manifest {
-        return true;
-    }
-    // Nested-manifest slow path: bounded-depth walkdir that
-    // catches monorepo cases like `packages/api/package.json`
-    // where the manifest is not at the project root. We walk
-    // up to depth 5 (covers repos like
-    // `repo/services/auth/config/Cargo.toml`) and skip
-    // dotfile / build / cache / VCS directories via the shared
-    // SKIP_DIRS list. The walk short-circuits at the first
-    // new manifest, so the common case (no new manifest)
-    // completes after visiting every directory entry up to
-    // depth 5 — on the order of a few thousand `metadata()`
-    // calls, comparable to one `cargo build` traversal. A
-    // walkdir iteration error is treated the same as the full
-    // scan in `index_builder::scan_project_files`: skipped
-    // silently and we move to the next entry. Permission
-    // errors or vanished paths do not flip the verdict to
-    // stale by themselves; we only return `true` when a
-    // candidate manifest is actually present and not in the
-    // cached list.
-    if find_new_nested_manifest(ctx.project_path, &already_listed) {
-        return true;
-    }
-
-    for manifest_path in &manifest_paths {
-        match std::fs::metadata(manifest_path) {
-            Ok(metadata) => {
-                if let Ok(modified) = metadata.modified() {
-                    if modified > db_time {
-                        return true;
-                    }
-                }
-            }
-            Err(_) => {
-                return true;
-            }
-        }
     }
 
     false
+}
+
+fn load_cached_or_scan(
+    ctx: &FreshnessContext<'_>,
+    scan_fn: impl Fn() -> Result<ProjectFileScan>,
+) -> Option<ProjectFileScan> {
+    let cache_key = crate::cli::memory::project_scan_cache_key(ctx.project_id);
+    let cached_scan = match ctx.cache_spiller.store().peek(&cache_key) {
+        Some(CacheEntry::Binary {
+            serialized_data, ..
+        }) => bincode::deserialize::<ProjectFileScan>(serialized_data).ok(),
+        Some(_) => None,
+        None => match ctx.cache_spiller.store().load_from_disk(&cache_key) {
+            Ok(CacheEntry::Binary {
+                serialized_data, ..
+            }) => bincode::deserialize::<ProjectFileScan>(&serialized_data).ok(),
+            _ => None,
+        },
+    };
+    cached_scan.or_else(|| scan_fn().ok())
+}
+
+fn source_directories_are_stale(
+    ctx: &FreshnessContext<'_>,
+    scan: Option<&ProjectFileScan>,
+    indexed_files: &HashMap<String, String>,
+    db_time: std::time::SystemTime,
+) -> bool {
+    let source_dirs = scan.map_or_else(
+        || {
+            let source_paths = indexed_files.keys().map(PathBuf::from).collect::<Vec<_>>();
+            extract_unique_dirs(&source_paths)
+        },
+        |scan| scan.source_directories.clone(),
+    );
+
+    source_dirs.into_iter().any(|dir| {
+        let full_path = if dir.is_absolute() {
+            dir
+        } else {
+            ctx.project_path.join(dir)
+        };
+        match std::fs::metadata(full_path) {
+            Ok(metadata) => metadata.modified().is_ok_and(|modified| modified > db_time),
+            Err(_) => true,
+        }
+    })
+}
+
+fn indexed_files_are_stale(
+    ctx: &FreshnessContext<'_>,
+    indexed_files: &HashMap<String, String>,
+    db_time: std::time::SystemTime,
+) -> bool {
+    // Skip the expensive per-file stat scan for large projects (10,000+ files).
+    // Return false (inconclusive) to defer to the authoritative hash-based
+    // freshness check rather than falsely declaring staleness. The caller
+    // (`is_stale_fast`) ORs this with other fast checks; when all return false,
+    // the caller proceeds to the authoritative path. When any fast check returns
+    // true, the caller initiates a reindex (which also runs the authoritative
+    // check). So returning false here means "this fast check found nothing
+    // stale" and the other checks + authoritative path still run.
+    if should_skip_fast_file_stat_scan(indexed_files.len()) {
+        return false;
+    }
+    indexed_files.keys().any(|indexed_path| {
+        match std::fs::metadata(ctx.project_path.join(indexed_path)) {
+            Ok(metadata) => metadata
+                .modified()
+                .map_or(true, |modified| modified >= db_time),
+            Err(_) => true,
+        }
+    })
+}
+
+fn manifests_are_stale(
+    ctx: &FreshnessContext<'_>,
+    direct_scan: Option<&ProjectFileScan>,
+    scan: Option<&ProjectFileScan>,
+    db_time: std::time::SystemTime,
+) -> bool {
+    let manifest_paths = scan.map_or_else(Vec::new, |scan| scan.manifest_paths.clone());
+    let already_listed = match direct_scan {
+        Some(scan) if !scan.manifest_paths_canonical.is_empty() => {
+            scan.manifest_paths_canonical.iter().cloned().collect()
+        }
+        Some(scan) => build_already_listed(ctx.project_path, &scan.manifest_paths),
+        None => build_already_listed(ctx.project_path, &manifest_paths),
+    };
+
+    find_new_root_manifest(ctx.project_path, &already_listed)
+        || find_new_nested_manifest(ctx.project_path, &already_listed)
+        || manifest_paths.iter().any(|manifest_path| {
+            // Resolve relative manifest paths against the project root so
+            // the mtime check is correct regardless of the process CWD.
+            let resolved = if std::path::Path::new(manifest_path).is_absolute() {
+                std::path::PathBuf::from(manifest_path)
+            } else {
+                ctx.project_path.join(manifest_path)
+            };
+            match std::fs::metadata(&resolved) {
+                Ok(metadata) => metadata.modified().is_ok_and(|modified| modified > db_time),
+                Err(_) => true,
+            }
+        })
 }
 
 /// Check whether the project root contains a manifest that is

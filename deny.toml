@@ -1,0 +1,26 @@
+# cargo-deny config — used by the CI `Security / Dependency Vulnerability Scan`
+# workflow (EmbarkStudios/cargo-deny-action, runs `cargo deny check advisories`).
+# cargo-deny reads this reliably from the repo root (cargo-audit 0.22+ ignores
+# ./audit.toml, and its GH action exposes no ignore input, so cargo-deny is the
+# robust choice for config-driven advisory suppression).
+
+[advisories]
+version = 2
+# All reachable (default-build) vulnerabilities are fixed via cargo update:
+#   bytes (RUSTSEC-2026-0007), anyhow (2026-0190), memmap2 (2026-0186),
+#   rand (2026-0097, both 0.8 + 0.9), lru (2026-0002, bumped 0.12 -> 0.16).
+# The 5 below live ONLY in the opt-in `turso` feature's subtree
+# (libsql 0.5.0 -> rustls 0.22/webpki 0.102 + tonic -> quinn-proto) — NOT compiled
+# into default/`full` builds, so unreachable in shipped artifacts.
+# Real fix: bump libsql 0.5.0 -> 0.9.x (multi-minor Turso API migration, separate
+# effort). Remove these ignores when `turso` is next stabilized.
+ignore = [
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102.8 via opt-in libsql/turso feature (not in default build); bump libsql to resolve" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102.8 via opt-in libsql/turso feature (not in default build); bump libsql to resolve" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102.8 via opt-in libsql/turso feature (not in default build); bump libsql to resolve" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102.8 via opt-in libsql/turso feature (not in default build); bump libsql to resolve" },
+    { id = "RUSTSEC-2026-0185", reason = "quinn-proto via opt-in libsql/turso feature -> tonic (not in default build); bump libsql to resolve" },
+]
+# Parity with prior cargo-audit behavior: unmaintained crates (bincode,
+# number_prefix, paste, rustls-pemfile) are reported but do not fail the gate.
+unmaintained = "none"

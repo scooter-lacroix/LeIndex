@@ -85,14 +85,20 @@ pub mod cli;
 pub mod config;
 /// Error types and error handling logic.
 pub mod errors;
+/// Live Git porcelain-v2 status operations.
+pub mod git;
 /// Indexing pipeline: project parsing, PDG building, search indexing.
 pub mod index_builder;
 /// Cache subsystem: CacheSpiller, project scan, file stats cache.
 pub mod index_cache;
 /// Staleness detection: is_stale_fast, check_freshness, check_manifest_stale.
 pub mod index_freshness;
+/// Registry-owned resumable indexing job state.
+pub mod index_job;
 /// Core orchestration logic for indexing and search.
 pub mod leindex;
+/// Canonical project identity for live, non-hydrating MCP reads.
+pub mod live_project;
 /// Memory management and cache orchestration.
 pub mod memory;
 /// Memory cap enforcement (RSS monitoring and hard limits).
@@ -122,7 +128,7 @@ pub use memory::{MemoryConfig as MemoryManagementConfig, MemoryManager};
 
 #[cfg(feature = "mcp-server")]
 pub use mcp::{
-    error_codes, JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpServer, McpServerConfig,
+    JsonRpcError, JsonRpcRequest, JsonRpcResponse, McpServer, McpServerConfig, error_codes,
 };
 #[cfg(feature = "mcp-server")]
 pub use registry::ProjectRegistry;

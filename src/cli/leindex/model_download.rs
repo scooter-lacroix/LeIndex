@@ -233,11 +233,7 @@ pub fn find_curl() -> Option<&'static str> {
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
-    if ok {
-        Some(candidate)
-    } else {
-        None
-    }
+    if ok { Some(candidate) } else { None }
 }
 
 /// Heuristic to classify a curl failure as a network/connectivity problem.
@@ -297,17 +293,10 @@ fn curl_download_args() -> [&'static str; 12] {
 
 /// Outcome of a single file download.
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields are surfaced via the public API for callers/tests.
+// Fields are surfaced via the public API for callers/tests.
 pub struct DownloadOutcome {
     /// Final path of the downloaded file.
     pub path: PathBuf,
-    /// Computed SHA256 of the downloaded bytes (lowercase hex), if available.
-    pub sha256: Option<String>,
-    /// Number of attempts used (1 = first try succeeded).
-    pub attempts: u32,
-    /// True if the manifest (already on disk before this download) verifies
-    /// the file. The caller can use this to surface "checksum OK" messaging.
-    pub verified: bool,
 }
 
 /// Download one model file to `dest_dir`, retrying on transient failures.
@@ -412,7 +401,7 @@ pub fn download_file_with_retry(
             .map(|c| parse_checksums(&c))
             .unwrap_or_default();
 
-        let verified = match (sha.as_ref(), manifest_now.get(file.local)) {
+        match (sha.as_ref(), manifest_now.get(file.local)) {
             (Some(actual), Some(expected)) if actual == expected => true,
             (Some(actual), Some(expected)) => {
                 let _ = std::fs::remove_file(&tmp_dest);
@@ -439,12 +428,7 @@ pub fn download_file_with_retry(
             let _ = e;
         }
 
-        return Ok(DownloadOutcome {
-            path: dest,
-            sha256: sha,
-            attempts: attempt,
-            verified,
-        });
+        return Ok(DownloadOutcome { path: dest });
     }
 
     // All retries exhausted.

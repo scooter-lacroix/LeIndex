@@ -13,21 +13,29 @@ mod types;
 mod tests;
 
 // Re-export public types for external callers
-pub use types::{AnalysisResult, CoverageReport, Diagnostics, FileStats, IndexStats};
+pub use types::{
+    AnalysisResult, ComponentStatus, CoverageReport, Diagnostics, FileStats, IndexHealth,
+    IndexPhase, IndexStats,
+};
 // Re-export crate-internal types for sibling modules (index_builder, index_cache, etc.)
 pub(crate) use types::{
-    ProjectFileScan, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS, SOURCE_FILE_EXTENSIONS,
+    DEPENDENCY_MANIFEST_NAMES, ProjectFileScan, SKIP_DIRS, SOURCE_FILE_EXTENSIONS,
 };
 
 use crate::cli::index_builder;
 use crate::cli::memory::WarmStrategy;
 use crate::graph::pdg::ProgramDependenceGraph;
 use crate::search::search::SearchEngine;
-use crate::storage::{schema::Storage, UniqueProjectId};
+use crate::storage::{UniqueProjectId, schema::Storage};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
+
+/// Find existing index storage without creating a directory or opening SQLite.
+pub(crate) fn resolve_existing_storage_path(project_path: &Path) -> Option<PathBuf> {
+    LeIndex::resolve_existing_storage_path(project_path)
+}
 
 /// LeIndex - Main orchestration struct for the entire LeIndex system.
 ///
@@ -38,37 +46,247 @@ use tracing::{info, warn};
 /// ```
 pub struct LeIndex {
     /// Project path
-    project_path: PathBuf,
+    pub(crate) project_path: PathBuf,
 
     /// Resolved storage root for index artifacts (may be outside project)
-    storage_path: PathBuf,
+    pub(crate) storage_path: PathBuf,
 
     /// Project identifier (legacy, for backward compatibility)
-    project_id: String,
+    pub(crate) project_id: String,
 
     /// Unique project identifier with BLAKE3-based path hashing
-    unique_id: UniqueProjectId,
+    pub(crate) unique_id: UniqueProjectId,
 
     /// Storage backend
-    storage: Storage,
+    pub(crate) storage: Storage,
 
     /// Search engine
-    search_engine: SearchEngine,
+    pub(crate) search_engine: SearchEngine,
 
     /// Program Dependence Graph
-    pdg: Option<ProgramDependenceGraph>,
+    pub(crate) pdg: Option<ProgramDependenceGraph>,
 
     /// Cache subsystem (spiller, project scan, file stats)
-    cache: crate::cli::index_cache::IndexCache,
+    pub(crate) cache: crate::cli::index_cache::IndexCache,
 
     /// Cached project configuration.
-    project_config: crate::cli::config::ProjectConfig,
+    pub(crate) project_config: crate::cli::config::ProjectConfig,
 
     /// Indexing statistics
-    stats: IndexStats,
+    pub(crate) stats: IndexStats,
 
     /// TF-IDF embedder (None until index_nodes() runs).
-    embedder: Option<index_builder::HybridEmbedder>,
+    pub(crate) embedder: Option<index_builder::HybridEmbedder>,
+
+    /// Ephemeral state shared by the explicit indexing phases.
+    pub(crate) pipeline: Option<indexing::IndexPipelineState>,
+}
+
+/// Cross-process exclusive lock guarding writes to a project's storage.
+///
+/// SQLite WAL permits exactly **one writer**. When two leindex processes write
+/// the same `leindex.db` at once (a second MCP instance, or MCP + CLI), they
+/// contend on the database lock, exhaust the open-retry budget, and can corrupt
+/// the WAL — the failure mode that bricks a generation. This advisory
+/// `flock(2)` serializes writers across processes: a second writer blocks until
+/// the holder drops the guard. `flock` is released automatically on process
+/// death (close of the underlying fd), so a crash can never leave a stale lock.
+///
+/// Readers (search/load) do **not** take this lock, so concurrent reads stay
+/// fast and uncontended. Held for the lifetime of a single write operation
+/// (`index_project_inner` / `incremental_reindex_from_watcher`) via RAII.
+pub(crate) struct ProjectWriteLock {
+    _file: std::fs::File,
+}
+
+impl ProjectWriteLock {
+    /// Acquire an exclusive cross-process write lock for `storage_path`.
+    /// Blocks until the lock becomes available.
+    pub(crate) fn acquire(storage_path: &Path) -> Result<Self> {
+        let lock_path = storage_path.join("index.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            // Lock marker file: create if missing, never clobber if present
+            // (its content is irrelevant — only the fd is flocked).
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!("Failed to open write-lock file at {}", lock_path.display())
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // LOCK_EX blocks until exclusive ownership is obtained. POSIX
+            // guarantees release on close/exec/process-exit, so a holder that
+            // crashes frees the lock automatically (no stale PID file).
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                anyhow::bail!(
+                    "Failed to acquire cross-process write lock at {}: {err}",
+                    lock_path.display()
+                );
+            }
+        }
+        #[cfg(windows)]
+        {
+            // Blocking exclusive LockFileEx. Released automatically when the
+            // handle closes (process death), matching flock semantics.
+            windows_lock::lock(&file, true).map_err(|err| {
+                anyhow::anyhow!(
+                    "Failed to acquire cross-process write lock at {}: {err}",
+                    lock_path.display()
+                )
+            })?;
+        }
+        Ok(Self { _file: file })
+    }
+
+    /// Non-blocking variant: returns `Ok(Some(guard))` if the lock was free,
+    /// `Ok(None)` if another process holds it. Used by the watcher (skip a
+    /// reindex when another process is already writing) and by the
+    /// mutual-exclusion self-check.
+    pub(crate) fn try_acquire(storage_path: &Path) -> Result<Option<Self>> {
+        let lock_path = storage_path.join("index.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| {
+                format!("Failed to open write-lock file at {}", lock_path.display())
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                // EWOULDBLOCK / EAGAIN = locked by someone else (expected).
+                // Compare by value (not pattern): on Linux these two errno
+                // constants are identical, which would make an alternation
+                // pattern unreachable.
+                let raw = err.raw_os_error();
+                if raw == Some(libc::EWOULDBLOCK) || raw == Some(libc::EAGAIN) {
+                    return Ok(None);
+                }
+                anyhow::bail!(
+                    "Failed to probe write lock at {}: {err}",
+                    lock_path.display()
+                );
+            }
+        }
+        #[cfg(windows)]
+        {
+            // LOCKFILE_FAIL_IMMEDIATELY: returns ERROR_LOCK_VIOLATION (33) or
+            // ERROR_SHARING_VIOLATION (32) if another process holds it.
+            match windows_lock::lock(&file, false) {
+                Ok(()) => {}
+                Err(err)
+                    if matches!(
+                        err.raw_os_error(),
+                        Some(33) | Some(32) // LOCK_VIOLATION | SHARING_VIOLATION
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(err) => {
+                    anyhow::bail!(
+                        "Failed to probe write lock at {}: {err}",
+                        lock_path.display()
+                    );
+                }
+            }
+        }
+        Ok(Some(Self { _file: file }))
+    }
+}
+
+impl Drop for ProjectWriteLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            // Explicit unlock for determinism (the File drop also closes the fd,
+            // which releases flock, but be explicit about intent).
+            let _ = unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+        }
+        #[cfg(windows)]
+        {
+            windows_lock::unlock(&self._file);
+        }
+    }
+}
+
+/// Windows cross-process file locking via `LockFileEx`/`UnlockFileEx`
+/// (kernel32), used by `ProjectWriteLock` on the Windows release target
+/// (see AGENTS.md: builds Linux/macOS/Windows). No extra crate — raw FFI.
+/// Locks byte `[0, 1)` exclusively; a second exclusive lock on the same byte
+/// blocks (blocking) or fails immediately (try), providing mutual exclusion.
+/// The handle close on `File` drop releases the lock, matching `flock`.
+#[cfg(windows)]
+mod windows_lock {
+    use std::fs::File;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset_low: u32,
+        offset_high: u32,
+        event: usize,
+    }
+
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+    const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+
+    extern "system" {
+        fn LockFileEx(
+            handle: usize,
+            flags: u32,
+            reserved: u32,
+            len_low: u32,
+            len_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+        fn UnlockFileEx(
+            handle: usize,
+            reserved: u32,
+            len_low: u32,
+            len_high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+
+    /// Lock byte `[0, 1)` exclusively. `blocking = false` adds
+    /// `LOCKFILE_FAIL_IMMEDIATELY`.
+    pub(super) fn lock(file: &File, blocking: bool) -> std::io::Result<()> {
+        let handle = file.as_raw_handle() as usize;
+        let mut overlapped = Overlapped::default();
+        let mut flags = LOCKFILE_EXCLUSIVE_LOCK;
+        if !blocking {
+            flags |= LOCKFILE_FAIL_IMMEDIATELY;
+        }
+        // SAFETY: FFI to kernel32 `LockFileEx` with a valid file handle and a
+        // valid `Overlapped` pointer. Byte range [0,1).
+        let ok = unsafe { LockFileEx(handle, flags, 0, 1, 0, &mut overlapped) };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Release the byte `[0, 1)` lock. Best-effort — the handle close on drop
+    /// also releases it.
+    pub(super) fn unlock(file: &File) {
+        let handle = file.as_raw_handle() as usize;
+        let mut overlapped = Overlapped::default();
+        let _ = unsafe { UnlockFileEx(handle, 0, 1, 0, &mut overlapped) };
+    }
 }
 
 impl LeIndex {
@@ -80,8 +298,37 @@ impl LeIndex {
                 .unwrap_or(false)
     }
 
+    /// Find an existing storage directory without creating or modifying it.
+    pub(crate) fn resolve_existing_storage_path(project_path: &Path) -> Option<PathBuf> {
+        let path_hash = &blake3::hash(project_path.to_string_lossy().as_bytes()).to_hex()[..12];
+        let dir_name = project_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown");
+        let in_project = project_path.join(".leindex");
+        let env_path = std::env::var("LEINDEX_HOME")
+            .ok()
+            .map(|home| PathBuf::from(home).join(format!("{}-{}", dir_name, path_hash)));
+        let xdg_dir = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join("leindex")
+            .join(format!("{}-{}", dir_name, path_hash));
+        let tmp_path = std::env::temp_dir()
+            .join("leindex")
+            .join(format!("{}-{}", dir_name, path_hash));
+        std::iter::once(in_project)
+            .chain(env_path)
+            .chain([xdg_dir, tmp_path])
+            .find(|candidate| candidate.is_dir())
+    }
+
     /// Resolve the storage directory (in-project → LEINDEX_HOME → XDG → tmp).
     fn resolve_storage_path(project_path: &Path) -> Result<PathBuf> {
+        if let Some(existing) = Self::resolve_existing_storage_path(project_path) {
+            if Self::try_create_dir(&existing) {
+                return Ok(existing);
+            }
+        }
         let path_hash = &blake3::hash(project_path.to_string_lossy().as_bytes()).to_hex()[..12];
         let dir_name = project_path
             .file_name()
@@ -160,18 +407,66 @@ impl LeIndex {
                     std::thread::sleep(delay);
                 }
                 Err(e) => {
+                    // Distinguish transient lock contention (SQLITE_BUSY /
+                    // SQLITE_LOCKED — clears once the other writer finishes) from
+                    // a genuine failure (corrupt DB, disk full). Only the
+                    // contention case is tagged `[transient:lock-contention]` so
+                    // the registry layer can avoid permanently bricking a
+                    // generation on a transient storm (see
+                    // `is_transient_storage_open_failure`). A genuine failure
+                    // still bricks, correctly.
+                    let lower = e.to_string().to_lowercase();
+                    // Whitelist the exact SQLite transient-lock messages
+                    // (SQLITE_BUSY/LOCKED from rusqlite) rather than a loose
+                    // "lock"/"busy" substring. A loose match risks false
+                    // positives (an error mentioning "lock" in prose) that
+                    // would skip mark_index_failure for a genuine failure and
+                    // leave it un-bricked, or false negatives that brick on a
+                    // transient storm.
+                    let is_lock_contention = lower.contains("database is locked")
+                        || lower.contains("database table is locked")
+                        || lower.contains("could not obtain a lock");
                     return Err(e).with_context(|| {
-                        format!(
-                            "Failed to open storage at {} after {} attempts.\n\
-                             Suggestion: Delete {} and re-index, or check disk space.",
-                            db_path.display(),
-                            max_retries,
-                            db_path.display()
-                        )
+                        if is_lock_contention {
+                            format!(
+                                "Failed to open storage at {} after {} attempts \
+                                 [transient:lock-contention]. Another leindex process \
+                                 likely holds the database; retry once it completes.",
+                                db_path.display(),
+                                max_retries,
+                            )
+                        } else {
+                            format!(
+                                "Failed to open storage at {} after {} attempts.\n\
+                                 Suggestion: Delete {} and re-index, or check disk space.",
+                                db_path.display(),
+                                max_retries,
+                                db_path.display()
+                            )
+                        }
                     });
                 }
             }
         }
+    }
+
+    /// Acquire the cross-process write lock for this project's storage.
+    ///
+    /// Call at the top of any write entry point (`index_project_inner`,
+    /// `incremental_reindex_from_watcher`) and hold the returned guard for the
+    /// duration of the write (RAII releases on drop). Serializes concurrent
+    /// writers across processes to prevent SQLite WAL contention/corruption.
+    fn acquire_write_lock(&self) -> Result<ProjectWriteLock> {
+        ProjectWriteLock::acquire(self.storage_path())
+    }
+
+    /// Non-blocking cross-process write lock: `Ok(Some(guard))` if free,
+    /// `Ok(None)` if another process currently holds it. Used by the watcher
+    /// so an in-flight index in another process makes the reindex SKIP (not
+    /// block indefinitely — a blocking flock here would stall the watcher,
+    /// since spawn_blocking can't be cancelled; see watcher.rs).
+    pub(crate) fn try_acquire_write_lock(&self) -> Result<Option<ProjectWriteLock>> {
+        ProjectWriteLock::try_acquire(self.storage_path())
     }
 
     /// Create a new LeIndex instance for a project.
@@ -222,8 +517,14 @@ impl LeIndex {
             project_path
         );
 
-        // Initialize search engine
-        let search_engine = SearchEngine::new();
+        // Initialize search engine, configured with the documented `[search]
+        // neural_weight` knob (previously dead config). VAL-CONFIG.
+        let mut search_engine = SearchEngine::new();
+        search_engine.set_neural_weight(
+            crate::cli::neural_config::LeIndexConfig::load_cached()
+                .search
+                .neural_weight as f32,
+        );
 
         // Initialize cache subsystem
         let cache_dir = storage_path.join("cache");
@@ -258,6 +559,7 @@ impl LeIndex {
                 external_deps_builtin: 0,
             },
             embedder: None,
+            pipeline: None,
         };
 
         // Restore persisted index stats (if any) so diagnostics can report
@@ -333,6 +635,11 @@ impl LeIndex {
         query_type: Option<&crate::search::ranking::QueryType>,
         neural_available: bool,
     ) -> String {
+        // Fold every result-affecting config knob + model identity into the key
+        // so a config/model change invalidates the cache (not just a re-index).
+        let cfg = crate::cli::neural_config::LeIndexConfig::load_cached();
+        let rerank_model = std::env::var("LEINDEX_WORKER_RERANK_MODEL")
+            .unwrap_or_else(|_| "qwen3-reranker-0.6b-seq-cls".to_string());
         index_builder::search_cache_key_for(
             &self.project_id,
             &self.project_path,
@@ -341,6 +648,12 @@ impl LeIndex {
             top_k,
             query_type,
             neural_available,
+            &cfg.search.search_mode,
+            cfg.search.neural_weight,
+            cfg.search.rerank_enabled,
+            cfg.search.rerank_top_n,
+            &cfg.neural.model_name,
+            &rerank_model,
         )
     }
 
@@ -371,17 +684,6 @@ impl LeIndex {
     fn check_manifest_stale(&self) -> bool {
         let ctx = self.freshness_context();
         crate::cli::index_freshness::check_manifest_stale(&ctx, || self.scan_project_files())
-    }
-
-    /// Given changed manifests, find source files importing from those packages.
-    #[allow(dead_code)]
-    fn files_importing_from_manifests(
-        &self,
-        changed_manifests: &[PathBuf],
-        all_source_paths: &[PathBuf],
-        pdg: &ProgramDependenceGraph,
-    ) -> Vec<PathBuf> {
-        index_builder::files_importing_from_manifests(changed_manifests, all_source_paths, pdg)
     }
 
     /// Fast-path freshness check: O(1) for indexed files, O(D) for source
@@ -429,6 +731,53 @@ impl LeIndex {
         &self.search_engine
     }
 
+    /// Shut down any persistent ONNX daemon spawned during indexing or search.
+    ///
+    /// This should be called by CLI commands after their work is complete, before
+    /// the process exits. The default `Drop` impl for `EmbeddingClient` passes
+    /// `kill_persistent=false`, which leaves daemon workers running for reuse by
+    /// the MCP server. CLI commands are short-lived and have no reason to keep
+    /// the daemon alive, so this method forces a clean shutdown.
+    ///
+    /// This is a no-op when the `onnx` feature is disabled or no worker was
+    /// ever spawned.
+    pub fn shutdown_daemon(&mut self) {
+        #[cfg(feature = "onnx")]
+        if let Some(index_builder::HybridEmbedder::HybridLocal { neural, .. }) =
+            self.embedder.as_ref()
+        {
+            neural.force_shutdown_daemon();
+        }
+    }
+
+    /// Return the current neural enrichment state without starting a worker.
+    pub fn neural_status(&self) -> &'static str {
+        self.embedder
+            .as_ref()
+            .map(index_builder::HybridEmbedder::neural_status)
+            .unwrap_or("absent")
+    }
+
+    /// Return the immutable generation selected for normal reads.
+    pub(crate) fn active_storage_path(&self) -> PathBuf {
+        crate::cli::live_project::LiveProject::resolve(&self.project_path.to_string_lossy())
+            .map(|project| project.active_storage())
+            .unwrap_or_else(|_| self.storage_path.clone())
+    }
+
+    /// Check indexed content in the same storage generation used by hydration.
+    pub(crate) fn active_has_indexed_files(&self) -> bool {
+        let active = self.active_storage_path();
+        if active == self.storage_path {
+            return crate::storage::pdg_store::has_indexed_files(&self.storage, &self.project_id);
+        }
+        crate::storage::schema::Storage::open_readonly(active.join("leindex.db"))
+            .ok()
+            .is_some_and(|storage| {
+                crate::storage::pdg_store::has_indexed_files(&storage, &self.project_id)
+            })
+    }
+
     /// Get the PDG, if the project has been indexed.
     #[inline]
     pub fn pdg(&self) -> Option<&ProgramDependenceGraph> {
@@ -464,10 +813,20 @@ impl LeIndex {
     /// Ensure the PDG is loaded from storage (deferred load on first use).
     pub fn ensure_pdg_loaded(&mut self) -> Result<()> {
         if self.pdg.is_none() {
-            let has_content =
-                crate::storage::pdg_store::has_indexed_files(&self.storage, &self.project_id);
+            let has_content = self.active_has_indexed_files();
             if has_content {
-                self.load_from_storage()?;
+                crate::cli::mcp::request_meta::PDG_LOADS
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let pdg_load_started = std::time::Instant::now();
+                let result = self.load_from_storage();
+                let pdg_ms = pdg_load_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                tracing::debug!(
+                    project = %self.project_path.display(),
+                    pdg_ms,
+                    "PDG load attempt complete"
+                );
+                crate::cli::mcp::request_meta::record_pdg_ms(pdg_ms);
+                result?;
             }
         }
         Ok(())
@@ -479,9 +838,7 @@ impl LeIndex {
     /// in-memory search index is empty but indexed files already exist.
     pub fn ensure_analysis_context_loaded(&mut self) -> Result<()> {
         self.ensure_pdg_loaded()?;
-        if self.search_engine.is_empty()
-            && crate::storage::pdg_store::has_indexed_files(&self.storage, &self.project_id)
-        {
+        if self.search_engine.is_empty() && self.active_has_indexed_files() {
             self.load_from_storage()?;
         }
         Ok(())
@@ -628,7 +985,12 @@ impl LeIndex {
     /// Load IndexStats from the JSON file in the storage directory.
     /// Returns silently if the file does not exist (first run or pre-feature).
     pub(crate) fn load_stats_from_storage(&mut self) -> Result<()> {
-        let stats_path = self.storage_path.join("index_stats.json");
+        self.load_stats_from_path(&self.storage_path.clone())
+    }
+
+    /// Load IndexStats from an explicit storage directory.
+    pub(crate) fn load_stats_from_path(&mut self, storage_path: &Path) -> Result<()> {
+        let stats_path = storage_path.join("index_stats.json");
         if !stats_path.exists() {
             return Ok(());
         }

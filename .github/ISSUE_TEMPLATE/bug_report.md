@@ -2,7 +2,7 @@
 name: Bug Report
 about: Report a bug or unexpected behavior in LeIndex
 title: "[Bug] "
-labels: bug
+labels: ["type:bug", "state:needs-triage"]
 assignees: ''
 ---
 
@@ -32,6 +32,26 @@ What actually happened. Include error messages or unexpected output.
 - **LeIndex version:** (`leindex --version`)
 - **Rust version:** (`rustc --version`, if building from source)
 - **Install method:** (curl installer / cargo install / from source)
+
+## Priority
+
+- [ ] P0-critical (blocks release, data loss, security)
+- [ ] P1-high (should fix before next release)
+- [ ] P2-medium (should fix in current milestone)
+- [x] P3-low (backlog)
+
+## Affected Area
+
+- [ ] area:parse (tree-sitter parsing)
+- [ ] area:search (search engine)
+- [ ] area:graph (dependency graph)
+- [ ] area:storage (SQLite/libSQL)
+- [ ] area:cli (command-line interface)
+- [ ] area:mcp (MCP server)
+- [ ] area:edit (code editing)
+- [ ] area:onnx (neural embeddings)
+- [ ] area:packaging (distribution)
+- [ ] area:infra (CI/CD)
 
 ## Logs / Output
 

@@ -184,12 +184,53 @@ fn leindex_home() -> Option<PathBuf> {
 }
 
 /// Read `ort_dylib_path` from `~/.leindex/config/leindex.toml` if present.
+///
+/// When the configured path exists on disk, it is returned as-is. When the
+/// exact path is stale (e.g., ORT was upgraded from 1.27.1 to 1.23.2 and the
+/// old `.so` was removed), `resolve_config_ort_path` searches the same
+/// directory for the closest matching `libonnxruntime.so.*` so LeIndex
+/// automatically picks up the new version without requiring a config update.
 fn read_config_ort_path() -> Option<PathBuf> {
+    // VAL-DAEMON-002: In production, the runtime path uses load_cached()
+    // (via RuntimeConfig::from_env). This function is also called from
+    // discover_candidates() which may be called multiple times; use load()
+    // directly here so tests that vary LEINDEX_HOME work correctly.
+    // The OnceLock in RuntimeConfig::from_env is the primary caching win.
     crate::config::LeIndexConfig::load()
         .ok()
         .and_then(|cfg| cfg.neural.ort_dylib_path)
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
+        .and_then(|path| resolve_config_ort_path(&path))
+}
+
+/// Resolve a configured ORT dylib path, falling back to a sibling search
+/// when the exact path no longer exists (version mismatch after ORT upgrade).
+fn resolve_config_ort_path(config_path: &Path) -> Option<PathBuf> {
+    if config_path.exists() {
+        return Some(config_path.to_path_buf());
+    }
+    // The exact path is stale (version mismatch, e.g. ORT was upgraded). Look
+    // for any libonnxruntime.so.* in the same directory and prefer a
+    // migraphx-ABI-compatible version (>= MIN_ORT_VERSION), newest first.
+    let parent = config_path.parent()?;
+    let prefix = "libonnxruntime.so";
+    let mut versioned: Vec<PathBuf> = Vec::new();
+    let entries = std::fs::read_dir(parent).ok()?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        // Prefer exact .so over versioned .so.X.Y.Z.
+        if name_str == prefix {
+            return Some(entry.path());
+        }
+        if name_str.starts_with(prefix) && !name_str.ends_with(".debug") {
+            versioned.push(entry.path());
+        }
+    }
+    pick_best_ort_lib(&versioned)
 }
 
 /// Look for the first matching ORT library file in `dir`.
@@ -205,7 +246,7 @@ fn find_lib_in_dir(dir: &Path) -> Option<PathBuf> {
 
     // Fall back to versioned pip-wheel runtime libraries (e.g.
     // `libonnxruntime.so.1.25.0`) which have no unversioned symlink.
-    let mut matches = std::fs::read_dir(dir)
+    let matches: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -215,28 +256,56 @@ fn find_lib_in_dir(dir: &Path) -> Option<PathBuf> {
                 .map(is_ort_runtime_lib_name)
                 .unwrap_or(false)
         })
-        .collect::<Vec<_>>();
-
-    matches.sort_by(|a, b| {
-        let a_name = a
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        let b_name = b
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        ort_runtime_version_key(a_name).cmp(&ort_runtime_version_key(b_name))
-    });
-    matches.pop()
+        .collect();
+    // Prefer migraphx-ABI-compatible runtimes (>= MIN_ORT_VERSION), newest first.
+    pick_best_ort_lib(&matches)
 }
 
-#[cfg(any(feature = "onnx", test))]
-fn ort_runtime_version_key(name: &str) -> Vec<u64> {
-    name.split(|c: char| !c.is_ascii_digit())
+/// Minimum ONNX Runtime version whose MIGraphX provider-options struct ABI is
+/// compatible with the pinned `ort` crate (2.0.0-rc.12). ORT < 1.24 exposes a
+/// `OrtMIGraphXProviderOptions` layout this crate mismatches, so populating the
+/// save/load-model fields triggers a silent `Failed to parse provider option
+/// "migraphx_exhaustive_tune"` error and a CPU fallback. Discovery PREFERS
+/// candidates at or above this floor; older runtimes remain usable for the CPU
+/// provider but are deprioritized (and rejected up-front by `build_session`'s
+/// migraphx pre-flight when migraphx is requested).
+const MIN_ORT_VERSION: (u64, u64, u64) = (1, 24, 0);
+
+/// Parse a `major.minor.patch` tuple from an ORT library filename
+/// (e.g. `libonnxruntime.so.1.27.1` -> `(1, 27, 1)`). `None` if the name does
+/// not encode three leading numeric components.
+fn parse_ort_version_tuple(name: &str) -> Option<(u64, u64, u64)> {
+    let digits: Vec<u64> = name
+        .split(|c: char| !c.is_ascii_digit())
         .filter(|part| !part.is_empty())
         .filter_map(|part| part.parse::<u64>().ok())
-        .collect()
+        .collect();
+    match digits.as_slice() {
+        [major, minor, patch, ..] => Some((*major, *minor, *patch)),
+        _ => None,
+    }
+}
+
+/// Pick the best ORT library from `paths`: prefer versions >= `MIN_ORT_VERSION`
+/// (newest first), then older versions (newest first). Paths with an unparseable
+/// version sort last. This is what keeps LeIndex working across ORT upgrades —
+/// any future install >= 1.24 wins over an older leftover without a config edit.
+fn pick_best_ort_lib(paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut keyed: Vec<(bool, (u64, u64, u64), PathBuf)> = paths
+        .iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            let version = parse_ort_version_tuple(name).unwrap_or((0, 0, 0));
+            (version >= MIN_ORT_VERSION, version, path.clone())
+        })
+        .collect();
+    // Sort: ge-floor first, then newest version. `true > false` so the `b.cmp(a)`
+    // ordering on the bool puts ge-floor entries first.
+    keyed.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
+    keyed.into_iter().next().map(|(_, _, path)| path)
 }
 
 /// Discover the running worker binary's directory (siblings of `current_exe`).
@@ -244,6 +313,156 @@ fn binary_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
+/// Resolve the LeIndex cache directory (`~/.leindex/cache/` or `$LEINDEX_HOME/cache/`).
+#[cfg(any(feature = "onnx", test))]
+fn leindex_cache_dir() -> Option<PathBuf> {
+    leindex_home().map(|h| h.join("cache"))
+}
+
+/// Path to the persistent ORT pip-path cache file.
+#[cfg(any(feature = "onnx", test))]
+fn ort_pip_cache_path() -> Option<PathBuf> {
+    leindex_cache_dir().map(|d| d.join("ort_pip_path"))
+}
+
+/// Write the discovered pip ORT library path to the cache file so Python is
+/// never spawned again on subsequent runs.
+#[cfg(any(feature = "onnx", test))]
+fn write_ort_pip_cache(path: &Path) {
+    let Some(cache_path) = ort_pip_cache_path() else {
+        return;
+    };
+    if let Some(parent) = cache_path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+    let _ = std::fs::write(&cache_path, path.display().to_string());
+}
+
+/// Read a cached pip ORT library path from the cache file. Returns `None`
+/// when the cache does not exist or the cached path no longer exists on disk.
+#[cfg(any(feature = "onnx", test))]
+fn read_ort_pip_cache() -> Option<PathBuf> {
+    let cache_path = ort_pip_cache_path()?;
+    let cached = std::fs::read_to_string(&cache_path).ok()?;
+    let trimmed = cached.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    // Only trust the cache if the file still exists.
+    if path.is_file() { Some(path) } else { None }
+}
+
+/// User site-packages directories to scan for ORT.
+///
+/// Scans `~/.local/lib/python*/site-packages/onnxruntime/capi/` which is
+/// where pip `--user` installs and virtualenv installs typically place the
+/// package.
+#[cfg(any(feature = "onnx", test))]
+fn user_site_packages_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    // ~/.local/lib/python*/site-packages/onnxruntime/capi/
+    if let Some(home) = dirs::home_dir() {
+        let local_lib = home.join(".local").join("lib");
+        if let Ok(entries) = std::fs::read_dir(&local_lib) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                // Look for python*/site-packages/onnxruntime/capi/
+                let capi = path.join("site-packages").join("onnxruntime").join("capi");
+                if capi.is_dir() {
+                    dirs.push(capi);
+                }
+            }
+        }
+    }
+
+    dirs
+}
+
+/// System site-packages directories to scan for ORT.
+///
+/// Scans common system Python site-packages locations.
+#[cfg(any(feature = "onnx", test))]
+fn system_site_packages_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    // /usr/local/lib/python*/site-packages/onnxruntime/capi/
+    // /usr/lib/python*/site-packages/onnxruntime/capi/
+    for prefix in ["/usr/local/lib", "/usr/lib"] {
+        let lib = PathBuf::from(prefix);
+        if let Ok(entries) = std::fs::read_dir(&lib) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.starts_with("python") {
+                    let capi = path.join("site-packages").join("onnxruntime").join("capi");
+                    if capi.is_dir() {
+                        dirs.push(capi);
+                    }
+                    // Also check dist-packages (Debian/Ubuntu)
+                    let dist_capi = path.join("dist-packages").join("onnxruntime").join("capi");
+                    if dist_capi.is_dir() {
+                        dirs.push(dist_capi);
+                    }
+                }
+            }
+        }
+    }
+
+    dirs
+}
+
+/// Discover the ORT pip library by directly scanning filesystem site-packages
+/// directories, avoiding a Python subprocess spawn entirely.
+///
+/// VAL-DAEMON-001: This function checks filesystem paths before any
+/// `python_one_line()` call. It also consults the file-based cache at
+/// `~/.leindex/cache/ort_pip_path` so Python is spawned at most once across
+/// all runs.
+#[cfg(any(feature = "onnx", test))]
+pub fn discover_pip_lib_filesystem() -> Option<PathBuf> {
+    // 1. Check file-based cache first (instant, avoids even a directory scan).
+    if let Some(cached) = read_ort_pip_cache() {
+        tracing::debug!("ORT pip path loaded from cache: {}", cached.display());
+        return find_lib_in_dir_with(&cached).or(Some(cached));
+    }
+
+    // 2. Scan user site-packages (~/.local/lib/python*/site-packages/...)
+    for dir in user_site_packages_dirs() {
+        if let Some(path) = find_lib_in_dir(&dir) {
+            write_ort_pip_cache(&path);
+            tracing::debug!(
+                "ORT pip path found via user site-packages scan: {}",
+                path.display()
+            );
+            return Some(path);
+        }
+    }
+
+    // 3. Scan system site-packages
+    for dir in system_site_packages_dirs() {
+        if let Some(path) = find_lib_in_dir(&dir) {
+            write_ort_pip_cache(&path);
+            tracing::debug!(
+                "ORT pip path found via system site-packages scan: {}",
+                path.display()
+            );
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+/// Helper: try `find_lib_in_dir` on a path, returning the result.
+#[cfg(any(feature = "onnx", test))]
+fn find_lib_in_dir_with(dir: &Path) -> Option<PathBuf> {
+    find_lib_in_dir(dir)
 }
 
 /// Run a Python one-liner and capture its stdout. Returns `None` if python is
@@ -276,20 +495,35 @@ fn python_one_line(program: &str) -> Option<String> {
     None
 }
 
-/// Locate `site-packages/onnxruntime/capi/libonnxruntime.*` via Python discovery.
+/// Locate `site-packages/onnxruntime/capi/libonnxruntime.*`.
+///
+/// VAL-DAEMON-001: Tries filesystem path scanning first
+/// (`discover_pip_lib_filesystem`), which covers user and system
+/// site-packages. Only if that fails does it fall back to spawning a Python
+/// subprocess via `python_one_line()`. The Python result is then cached to
+/// `~/.leindex/cache/ort_pip_path` so Python is never spawned again.
 #[cfg(feature = "onnx")]
 fn discover_pip_lib() -> Option<PathBuf> {
-    // Ask Python for the directory of `onnxruntime.capi` and scan it for the
-    // platform-specific library name. This is robust against venv vs system
-    // installs and against the `--user` install layout where dist-info and the
-    // package live side-by-side under site-packages.
+    // VAL-DAEMON-001: filesystem scan first (no subprocess).
+    if let Some(path) = discover_pip_lib_filesystem() {
+        return Some(path);
+    }
+
+    // Last resort: spawn Python to locate the capi directory.
     let program = "import os,onnxruntime.capi as c; print(os.path.dirname(c.__file__))";
     let capi_dir = python_one_line(program)?;
     let dir = PathBuf::from(capi_dir);
     if !dir.is_dir() {
         return None;
     }
-    find_lib_in_dir(&dir)
+    let path = find_lib_in_dir(&dir)?;
+    // Cache the result so Python is never spawned again.
+    write_ort_pip_cache(&path);
+    tracing::debug!(
+        "ORT pip path found via Python subprocess (cached for future runs): {}",
+        path.display()
+    );
+    Some(path)
 }
 
 /// System library directories probed as the final fallback.
@@ -539,57 +773,74 @@ mod tests {
     fn test_discover_candidates_includes_env_var() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(ORT_DYLIB_ENV, tmp.path().join("env.so"));
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(ORT_DYLIB_ENV, tmp.path().join("env.so")) };
 
         let candidates = discover_candidates();
-        assert!(candidates
-            .iter()
-            .any(|(s, p)| *s == DiscoverySource::EnvVar && p == &tmp.path().join("env.so")));
+        assert!(
+            candidates
+                .iter()
+                .any(|(s, p)| *s == DiscoverySource::EnvVar && p == &tmp.path().join("env.so"))
+        );
 
-        std::env::remove_var(ORT_DYLIB_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
     }
 
     #[test]
     fn test_discover_candidates_excludes_empty_env() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
-        std::env::set_var(ORT_DYLIB_ENV, "");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(ORT_DYLIB_ENV, "") };
         let candidates = discover_candidates();
-        assert!(!candidates
-            .iter()
-            .any(|(s, _)| *s == DiscoverySource::EnvVar));
-        std::env::remove_var(ORT_DYLIB_ENV);
+        assert!(
+            !candidates
+                .iter()
+                .any(|(s, _)| *s == DiscoverySource::EnvVar)
+        );
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
     }
 
     #[test]
     fn test_discover_candidates_includes_user_lib() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
-        std::env::remove_var(ORT_DYLIB_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
 
         let candidates = discover_candidates();
         let expected = tmp.path().join("lib").join(ort_lib_names()[0]);
-        assert!(candidates
-            .iter()
-            .any(|(s, p)| *s == DiscoverySource::UserLib && p == &expected));
+        assert!(
+            candidates
+                .iter()
+                .any(|(s, p)| *s == DiscoverySource::UserLib && p == &expected)
+        );
 
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[test]
     fn test_discover_candidates_includes_bundle_lib_next_to_bin() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
-        std::env::remove_var(ORT_DYLIB_ENV);
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
 
         let candidates = discover_candidates();
 
         if let Some(bin_dir) = binary_dir() {
             if let Some(bundle_root) = bin_dir.parent() {
                 let expected = bundle_root.join("lib").join(ort_lib_names()[0]);
-                assert!(candidates
-                    .iter()
-                    .any(|(s, p)| *s == DiscoverySource::Sibling && p == &expected));
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|(s, p)| *s == DiscoverySource::Sibling && p == &expected)
+                );
             }
         }
     }
@@ -597,8 +848,10 @@ mod tests {
     #[test]
     fn test_discover_candidates_includes_system_paths() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
-        std::env::remove_var(ORT_DYLIB_ENV);
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
 
         // System paths now live in `system_candidates()` (final fallback,
         // tried after pip), not in `discover_candidates()`.
@@ -606,9 +859,11 @@ mod tests {
         // System paths should be present at minimum on Unix.
         #[cfg(unix)]
         {
-            assert!(candidates
-                .iter()
-                .any(|(s, p)| *s == DiscoverySource::System && p.starts_with("/usr/local/lib")));
+            assert!(
+                candidates
+                    .iter()
+                    .any(|(s, p)| *s == DiscoverySource::System && p.starts_with("/usr/local/lib"))
+            );
         }
     }
 
@@ -616,28 +871,40 @@ mod tests {
     fn test_read_config_ort_path_returns_value() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
+
+        // Create the library file so resolve_config_ort_path succeeds.
+        let lib_dir = tmp.path().join("ort");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        let lib_path = lib_dir.join("libonnxruntime.so");
+        std::fs::write(&lib_path, b"fake").unwrap();
 
         let cfg_dir = tmp.path().join("config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         let cfg_path = cfg_dir.join("leindex.toml");
         std::fs::write(
             &cfg_path,
-            "[neural]\nenabled = true\nort_dylib_path = \"/some/path/libonnxruntime.so\"\nmodel_dir = \"~/.leindex/models\"\n",
+            format!(
+                "[neural]\nenabled = true\nort_dylib_path = \"{}\"\nmodel_dir = \"~/.leindex/models\"\n",
+                lib_path.display()
+            ),
         )
         .unwrap();
 
         let parsed = read_config_ort_path();
-        assert_eq!(parsed, Some(PathBuf::from("/some/path/libonnxruntime.so")));
+        assert_eq!(parsed, Some(lib_path));
 
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[test]
     fn test_read_config_ort_path_returns_none_when_missing() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
 
         // No config file
         assert_eq!(read_config_ort_path(), None);
@@ -652,29 +919,79 @@ mod tests {
         .unwrap();
         assert_eq!(read_config_ort_path(), None);
 
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[test]
     fn test_read_config_ort_path_handles_single_quotes() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
+
+        // Create the library file so resolve_config_ort_path succeeds.
+        let lib_dir = tmp.path().join("quote");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        let lib_path = lib_dir.join("libonnxruntime.so");
+        std::fs::write(&lib_path, b"fake").unwrap();
 
         let cfg_dir = tmp.path().join("config");
         std::fs::create_dir_all(&cfg_dir).unwrap();
         std::fs::write(
             cfg_dir.join("leindex.toml"),
-            "[neural]\nort_dylib_path = '/quote/libonnxruntime.so'\n",
+            format!("[neural]\nort_dylib_path = '{}'\n", lib_path.display()),
         )
         .unwrap();
 
-        assert_eq!(
-            read_config_ort_path(),
-            Some(PathBuf::from("/quote/libonnxruntime.so"))
-        );
+        assert_eq!(read_config_ort_path(), Some(lib_path));
 
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_resolve_config_ort_path_finds_versioned_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("capi");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Simulate ORT 1.23.2 installed (no unversioned symlink).
+        let actual = dir.join("libonnxruntime.so.1.23.2");
+        std::fs::write(&actual, b"fake").unwrap();
+
+        // Configured path points at old 1.27.1 that no longer exists.
+        let stale = dir.join("libonnxruntime.so.1.27.1");
+        let resolved = resolve_config_ort_path(&stale);
+        assert_eq!(resolved, Some(actual));
+    }
+
+    #[test]
+    fn test_resolve_config_ort_path_prefers_exact_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("lib");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let exact = dir.join("libonnxruntime.so");
+        std::fs::write(&exact, b"fake").unwrap();
+        let versioned = dir.join("libonnxruntime.so.1.25.0");
+        std::fs::write(&versioned, b"fake").unwrap();
+
+        // Config references a stale versioned path.
+        let stale = dir.join("libonnxruntime.so.1.27.1");
+        let resolved = resolve_config_ort_path(&stale);
+        assert_eq!(resolved, Some(exact));
+    }
+
+    #[test]
+    fn test_resolve_config_ort_path_returns_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let existing = tmp.path().join("libonnxruntime.so");
+        std::fs::write(&existing, b"fake").unwrap();
+
+        let resolved = resolve_config_ort_path(&existing);
+        assert_eq!(resolved, Some(existing));
     }
 
     #[test]
@@ -809,14 +1126,16 @@ mod tests {
         let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let fake_lib = make_fake_lib(tmp.path());
-        std::env::set_var(ORT_DYLIB_ENV, &fake_lib);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(ORT_DYLIB_ENV, &fake_lib) };
 
         // Snapshot LAST_OUTCOME: it must remain unchanged across the call.
         let before = last_outcome();
         let outcome = discover_path_only();
         let after = last_outcome();
 
-        std::env::remove_var(ORT_DYLIB_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
 
         let outcome = outcome.expect("discover_path_only should find the env candidate");
         assert_eq!(outcome.source, DiscoverySource::EnvVar);
@@ -835,16 +1154,46 @@ mod tests {
         let _g = ENV_TEST_LOCK.lock().unwrap();
         // Ensure env var is unset and LEINDEX_HOME points to an empty temp
         // dir so user-lib and config-file lookups also miss.
-        std::env::remove_var(ORT_DYLIB_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
 
         // We cannot fully prevent pip/system fallbacks in this environment
         // (system ORT may exist on the dev machine), so we only assert that
         // the function is callable and returns a deterministic Option.
         let _ = discover_path_only();
 
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
+    }
+
+    // ── VAL-DAEMON-001: filesystem-first ORT discovery tests ─────────────
+
+    #[test]
+    fn test_discover_pip_lib_filesystem_returns_none_when_no_site_packages() {
+        // When no site-packages/onnxruntime/capi/ directory exists, the
+        // filesystem scan should return None.
+        let _ = discover_pip_lib_filesystem();
+        // This test just verifies the function is callable. On the test
+        // machine, there may or may not be a real ORT pip install; both
+        // outcomes are valid.
+    }
+
+    #[test]
+    fn test_user_site_packages_dirs_is_callable() {
+        // Sanity check: the helper function is callable and returns a Vec.
+        let dirs = user_site_packages_dirs();
+        // It's fine if the Vec is empty (no ORT pip install on this machine).
+        let _ = dirs;
+    }
+
+    #[test]
+    fn test_system_site_packages_dirs_is_callable() {
+        // Sanity check: the helper function is callable and returns a Vec.
+        let dirs = system_site_packages_dirs();
+        let _ = dirs;
     }
 
     // Tests that actually invoke ort::init_from() require a real libonnxruntime

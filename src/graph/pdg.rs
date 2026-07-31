@@ -80,6 +80,29 @@ pub struct Node {
     // the serialization shim below handles backward compat via a skip field.
 }
 
+impl Node {
+    /// Construct a synthetic per-file summary node. (conceptual-recall fix)
+    ///
+    /// `byte_range=(0,0)` (no source snippet); `enriched_node_content` builds
+    /// the embedded text from the file's leading doc + same-file item names.
+    pub fn new_file_summary(file_path: &str, language: &str) -> Self {
+        let stem = std::path::Path::new(file_path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        Self {
+            id: format!("{}::file_summary", file_path),
+            node_type: NodeType::FileSummary,
+            name: stem,
+            file_path: std::sync::Arc::from(file_path),
+            byte_range: (0, 0),
+            complexity: 0,
+            language: language.to_string(),
+        }
+    }
+}
+
 /// The type of code entity a node represents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum NodeType {
@@ -100,6 +123,12 @@ pub enum NodeType {
 
     /// Imported/referenced symbol not defined in this project
     External,
+
+    /// Synthetic per-file summary node (conceptual-recall fix). Embeds the
+    /// file's leading doc comment + the names of its top-level items as a
+    /// single retrievable unit, so a conceptual NL query can match a file by
+    /// its *purpose* even when no individual function does. `byte_range=(0,0)`.
+    FileSummary,
 }
 
 /// Edge types — now includes Containment for structural (non-semantic) relationships.
@@ -121,6 +150,14 @@ pub enum EdgeType {
     /// Structural containment: Class contains Method, Module contains Function.
     /// NOT a semantic dependency. Exclude from impact traversal by default.
     Containment,
+    /// A state transition such as install result → verification → registry write.
+    StateTransition,
+    /// An argument passed to an external command (`argv`).
+    CommandArgument,
+    /// An environment variable passed to an external command.
+    Environment,
+    /// Bytes or a value passed to command standard input.
+    Stdin,
 }
 
 /// An edge in the Program Dependence Graph representing a relationship between nodes.
@@ -165,6 +202,15 @@ pub struct EdgeMetadata {
     /// relationship is inferred rather than explicitly declared. Higher
     /// values indicate stronger evidence for the relationship.
     pub confidence: Option<f32>,
+
+    /// Flow channel (`argument`, `env`, `stdin`, etc.) when the edge was
+    /// extracted from a source-level flow fact.
+    #[serde(default)]
+    pub channel: Option<String>,
+
+    /// Argument ordinal for call/data-flow edges.
+    #[serde(default)]
+    pub position: Option<usize>,
 }
 
 impl EdgeMetadata {
@@ -177,6 +223,8 @@ impl EdgeMetadata {
             call_count: None,
             variable_name: None,
             confidence: None,
+            channel: None,
+            position: None,
         }
     }
 
@@ -195,6 +243,8 @@ impl EdgeMetadata {
             call_count: None,
             variable_name: None,
             confidence: Some(confidence),
+            channel: None,
+            position: None,
         }
     }
 
@@ -213,6 +263,8 @@ impl EdgeMetadata {
             call_count: None,
             variable_name: Some(name),
             confidence: None,
+            channel: None,
+            position: None,
         }
     }
 }
@@ -261,7 +313,14 @@ impl TraversalConfig {
         Self {
             max_depth: Some(3),
             max_nodes: Some(50),
-            allowed_edge_types: Some(&[EdgeType::Call, EdgeType::DataDependency]),
+            allowed_edge_types: Some(&[
+                EdgeType::Call,
+                EdgeType::DataDependency,
+                EdgeType::StateTransition,
+                EdgeType::CommandArgument,
+                EdgeType::Environment,
+                EdgeType::Stdin,
+            ]),
             excluded_node_types: Some(vec![NodeType::Module]),
             min_complexity: None,
             min_edge_confidence: 0.5,
@@ -277,6 +336,10 @@ impl TraversalConfig {
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
+                EdgeType::StateTransition,
+                EdgeType::CommandArgument,
+                EdgeType::Environment,
+                EdgeType::Stdin,
             ]),
             excluded_node_types: None,
             min_complexity: None,
@@ -293,6 +356,10 @@ impl TraversalConfig {
                 EdgeType::Call,
                 EdgeType::DataDependency,
                 EdgeType::Inheritance,
+                EdgeType::StateTransition,
+                EdgeType::CommandArgument,
+                EdgeType::Environment,
+                EdgeType::Stdin,
             ]),
             excluded_node_types: None,
             min_complexity: None,
@@ -500,94 +567,114 @@ impl SerializablePDG {
 
     fn to_pdg(&self) -> Result<ProgramDependenceGraph, String> {
         let mut pdg = ProgramDependenceGraph::new();
-        let mut index_map: HashMap<u32, NodeId> = HashMap::new();
+        let index_map = self.restore_nodes(&mut pdg);
+        self.restore_indexes(&mut pdg, &index_map);
+        self.restore_edges(&mut pdg, &index_map)?;
+        self.restore_embeddings(&mut pdg);
+        Self::rebuild_name_file_index(&mut pdg);
 
-        for sn in &self.nodes {
-            let id = pdg.graph.add_node(sn.node.clone());
-            index_map.insert(sn.index, id);
-        }
-
-        for (sym, old_idx) in &self.symbol_index {
-            if let Some(&nid) = index_map.get(old_idx) {
-                pdg.symbol_index.insert(sym.clone(), nid);
-            }
-        }
-        for (fp, old_idxs) in &self.file_index {
-            let nids: Vec<NodeId> = old_idxs
-                .iter()
-                .filter_map(|i| index_map.get(i).copied())
-                .collect();
-            if !nids.is_empty() {
-                pdg.file_index.insert(fp.clone(), nids);
-            }
-        }
-        for (name, old_idxs) in &self.name_index {
-            let nids: Vec<NodeId> = old_idxs
-                .iter()
-                .filter_map(|i| index_map.get(i).copied())
-                .collect();
-            if !nids.is_empty() {
-                pdg.name_index.insert(name.clone(), nids);
-            }
-        }
-        for (name_lc, old_idxs) in &self.name_lower_index {
-            let nids: Vec<NodeId> = old_idxs
-                .iter()
-                .filter_map(|i| index_map.get(i).copied())
-                .collect();
-            if !nids.is_empty() {
-                pdg.name_lower_index.insert(name_lc.clone(), nids);
-            }
-        }
-
-        // Backward compat: rebuild name/lower indices from nodes if absent
-        if pdg.name_index.is_empty() {
-            for nid in pdg.graph.node_indices() {
-                if let Some(node) = pdg.graph.node_weight(nid) {
-                    pdg.name_index
-                        .entry(node.name.clone())
-                        .or_default()
-                        .push(nid);
-                    pdg.name_lower_index
-                        .entry(node.name.to_lowercase())
-                        .or_default()
-                        .push(nid);
-                }
-            }
-        }
-
-        for se in &self.edges {
-            let src = index_map
-                .get(&se.source)
-                .ok_or_else(|| format!("Missing source {}", se.source))?;
-            let tgt = index_map
-                .get(&se.target)
-                .ok_or_else(|| format!("Missing target {}", se.target))?;
-            pdg.graph.add_edge(*src, *tgt, se.edge.clone());
-        }
-
-        // Restore embeddings from serialized data
-        for (node_id, embedding) in &self.embeddings {
-            pdg.embedding_store.insert(node_id, embedding.clone());
-        }
-
-        // Rebuild name_file_index from nodes (not serialized separately)
-        for nid in pdg.graph.node_indices() {
-            if let Some(node) = pdg.graph.node_weight(nid) {
-                pdg.name_file_index
-                    .insert((node.name.clone(), node.file_path.to_string()), nid);
-            }
-        }
-
-        // Rebuild trigram index from nodes only if not already populated.
-        // When loading from SQLite storage, load_trigram_index() + set_trigram_index()
-        // is preferred (faster for large PDGs). This rebuild serves as fallback for
-        // bincode deserialization or when the persisted index is missing/corrupted.
         if pdg.trigram_index.is_empty() {
             pdg.rebuild_trigram_index();
         }
 
         Ok(pdg)
+    }
+
+    fn restore_nodes(&self, pdg: &mut ProgramDependenceGraph) -> HashMap<u32, NodeId> {
+        self.nodes
+            .iter()
+            .map(|serialized| {
+                let node_id = pdg.graph.add_node(serialized.node.clone());
+                (serialized.index, node_id)
+            })
+            .collect()
+    }
+
+    fn restore_indexes(&self, pdg: &mut ProgramDependenceGraph, index_map: &HashMap<u32, NodeId>) {
+        Self::restore_symbol_index(&mut pdg.symbol_index, &self.symbol_index, index_map);
+        Self::restore_node_index(&mut pdg.file_index, &self.file_index, index_map);
+        Self::restore_node_index(&mut pdg.name_index, &self.name_index, index_map);
+        Self::restore_node_index(&mut pdg.name_lower_index, &self.name_lower_index, index_map);
+
+        if pdg.name_index.is_empty() {
+            Self::rebuild_name_indexes(pdg);
+        }
+    }
+
+    fn restore_symbol_index(
+        destination: &mut HashMap<String, NodeId>,
+        source: &HashMap<String, u32>,
+        index_map: &HashMap<u32, NodeId>,
+    ) {
+        for (symbol, old_index) in source {
+            if let Some(&node_id) = index_map.get(old_index) {
+                destination.insert(symbol.clone(), node_id);
+            }
+        }
+    }
+
+    fn restore_node_index(
+        destination: &mut HashMap<String, Vec<NodeId>>,
+        source: &HashMap<String, Vec<u32>>,
+        index_map: &HashMap<u32, NodeId>,
+    ) {
+        for (name, old_indices) in source {
+            let node_ids: Vec<NodeId> = old_indices
+                .iter()
+                .filter_map(|index| index_map.get(index).copied())
+                .collect();
+            if !node_ids.is_empty() {
+                destination.insert(name.clone(), node_ids);
+            }
+        }
+    }
+
+    fn rebuild_name_indexes(pdg: &mut ProgramDependenceGraph) {
+        for node_id in pdg.graph.node_indices() {
+            if let Some(node) = pdg.graph.node_weight(node_id) {
+                pdg.name_index
+                    .entry(node.name.clone())
+                    .or_default()
+                    .push(node_id);
+                pdg.name_lower_index
+                    .entry(node.name.to_lowercase())
+                    .or_default()
+                    .push(node_id);
+            }
+        }
+    }
+
+    fn restore_edges(
+        &self,
+        pdg: &mut ProgramDependenceGraph,
+        index_map: &HashMap<u32, NodeId>,
+    ) -> Result<(), String> {
+        for serialized in &self.edges {
+            let source = index_map
+                .get(&serialized.source)
+                .ok_or_else(|| format!("Missing source {}", serialized.source))?;
+            let target = index_map
+                .get(&serialized.target)
+                .ok_or_else(|| format!("Missing target {}", serialized.target))?;
+            pdg.graph
+                .add_edge(*source, *target, serialized.edge.clone());
+        }
+        Ok(())
+    }
+
+    fn restore_embeddings(&self, pdg: &mut ProgramDependenceGraph) {
+        for (node_id, embedding) in &self.embeddings {
+            pdg.embedding_store.insert(node_id, embedding.clone());
+        }
+    }
+
+    fn rebuild_name_file_index(pdg: &mut ProgramDependenceGraph) {
+        for node_id in pdg.graph.node_indices() {
+            if let Some(node) = pdg.graph.node_weight(node_id) {
+                pdg.name_file_index
+                    .insert((node.name.clone(), node.file_path.to_string()), node_id);
+            }
+        }
     }
 }
 
@@ -721,6 +808,34 @@ impl ProgramDependenceGraph {
     /// # Returns
     ///
     /// The NodeId assigned to the newly added node.
+    /// Ensure every file represented in the PDG has a `FileSummary` node.
+    /// Idempotent + resume-proof: call once after the PDG is finalized (fresh
+    /// build OR resumed from storage), before embedding. The per-file
+    /// `merge_pdgs` loop only fires for freshly-parsed files; on a resume most
+    /// files are loaded from storage and would otherwise miss their summary.
+    /// (conceptual-recall fix.)
+    pub fn ensure_file_summary_nodes(&mut self) {
+        use std::collections::{HashMap, HashSet};
+        let mut file_lang: HashMap<String, String> = HashMap::new();
+        let mut have_summary: HashSet<String> = HashSet::new();
+        for ni in self.node_indices() {
+            if let Some(n) = self.get_node(ni) {
+                let fp = n.file_path.to_string();
+                if matches!(n.node_type, NodeType::FileSummary) {
+                    have_summary.insert(fp);
+                } else {
+                    file_lang.entry(fp).or_insert_with(|| n.language.clone());
+                }
+            }
+        }
+        for (fp, lang) in file_lang {
+            if !have_summary.contains(&fp) {
+                self.add_node(Node::new_file_summary(&fp, &lang));
+            }
+        }
+    }
+
+    /// Add a node to the graph, returning its stable `NodeId`.
     pub fn add_node(&mut self, node: Node) -> NodeId {
         let id = self.graph.add_node(node.clone());
         self.symbol_index.insert(node.id.clone(), id);
@@ -1065,70 +1180,68 @@ impl ProgramDependenceGraph {
     /// Find by name with optional file hint.
     /// All lookups are index-backed — no O(n) scans.
     pub fn find_by_name_in_file(&self, name: &str, file_hint: Option<&str>) -> Option<NodeId> {
-        // 0. O(1) exact lookup via name_file_index when file hint is provided
-        if let Some(fp) = file_hint {
-            if let Some(&nid) = self
+        if let Some(file_path) = file_hint {
+            if let Some(&node_id) = self
                 .name_file_index
-                .get(&(name.to_string(), fp.to_string()))
+                .get(&(name.to_string(), file_path.to_string()))
             {
-                return Some(nid);
+                return Some(node_id);
             }
         }
 
-        // 1. Exact match via name_index
-        let candidates = self.name_index.get(name).cloned().unwrap_or_default();
-        if !candidates.is_empty() {
-            if let Some(fp) = file_hint {
-                if let Some(&nid) = candidates.iter().find(|&&nid| {
-                    self.get_node(nid)
-                        .map(|n| n.file_path.as_ref() == fp)
-                        .unwrap_or(false)
-                }) {
-                    return Some(nid);
-                }
-            }
-            return Some(candidates[0]);
+        if let Some(node_id) = self
+            .name_index
+            .get(name)
+            .and_then(|candidates| self.select_name_candidate(candidates, file_hint))
+        {
+            return Some(node_id);
         }
 
-        // 2. Case-insensitive match via name_lower_index (O(k) not O(n))
         let name_lower = name.to_lowercase();
-        let ci_candidates = self
-            .name_lower_index
+        self.name_lower_index
             .get(&name_lower)
-            .cloned()
-            .unwrap_or_default();
-        if !ci_candidates.is_empty() {
-            if let Some(fp) = file_hint {
-                if let Some(&nid) = ci_candidates.iter().find(|&&nid| {
-                    self.get_node(nid)
-                        .map(|n| n.file_path.as_ref() == fp)
-                        .unwrap_or(false)
-                }) {
-                    return Some(nid);
-                }
-            }
-            return Some(ci_candidates[0]);
-        }
+            .and_then(|candidates| self.select_name_candidate(candidates, file_hint))
+            .or_else(|| self.find_substring_name_match(&name_lower, file_hint))
+    }
 
-        // 3. Substring match — unavoidably O(n), but only reached as last resort.
-        // Scoped to file when hint provided.
-        let search_space: Box<dyn Iterator<Item = NodeId>> = if let Some(fp) = file_hint {
-            Box::new(self.nodes_in_file(fp).into_iter())
-        } else {
-            Box::new(self.graph.node_indices())
-        };
-
-        for nid in search_space {
-            if let Some(node) = self.graph.node_weight(nid) {
-                if node.name.to_lowercase().contains(&name_lower)
-                    || node.id.to_lowercase().contains(&name_lower)
-                {
-                    return Some(nid);
-                }
+    fn select_name_candidate(
+        &self,
+        candidates: &[NodeId],
+        file_hint: Option<&str>,
+    ) -> Option<NodeId> {
+        if let Some(file_path) = file_hint {
+            if let Some(node_id) = candidates.iter().copied().find(|node_id| {
+                self.get_node(*node_id)
+                    .is_some_and(|node| node.file_path.as_ref() == file_path)
+            }) {
+                return Some(node_id);
             }
         }
+        candidates.first().copied()
+    }
 
-        None
+    fn find_substring_name_match(
+        &self,
+        name_lower: &str,
+        file_hint: Option<&str>,
+    ) -> Option<NodeId> {
+        match file_hint {
+            Some(file_path) => self
+                .nodes_in_file(file_path)
+                .into_iter()
+                .find(|node_id| self.node_contains_name(*node_id, name_lower)),
+            None => self
+                .graph
+                .node_indices()
+                .find(|node_id| self.node_contains_name(*node_id, name_lower)),
+        }
+    }
+
+    fn node_contains_name(&self, node_id: NodeId, name_lower: &str) -> bool {
+        self.graph.node_weight(node_id).is_some_and(|node| {
+            node.name.to_lowercase().contains(name_lower)
+                || node.id.to_lowercase().contains(name_lower)
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -1194,6 +1307,8 @@ impl ProgramDependenceGraph {
                         call_count: None,
                         variable_name: Some(var_name),
                         confidence: Some(confidence),
+                        channel: None,
+                        position: None,
                     },
                 },
             );
@@ -1299,6 +1414,54 @@ impl ProgramDependenceGraph {
     /// Forward impact: nodes reachable FROM `start` following outgoing edges.
     pub fn forward_impact(&self, start: NodeId, config: &TraversalConfig) -> Vec<NodeId> {
         self.bfs_directed(start, config, Direction::Forward)
+    }
+
+    /// Forward impact from many roots using one visited set.
+    pub fn forward_impact_multi_source(
+        &self,
+        starts: &HashSet<NodeId>,
+        config: &TraversalConfig,
+    ) -> Vec<NodeId> {
+        let mut visited = starts.clone();
+        let mut ordered_starts = starts.iter().copied().collect::<Vec<_>>();
+        ordered_starts.sort_by_key(|id| id.index());
+        let mut queue: VecDeque<(NodeId, usize)> =
+            ordered_starts.into_iter().map(|id| (id, 0)).collect();
+        let mut result = Vec::new();
+
+        while let Some((current, depth)) = queue.pop_front() {
+            if let Some(max_nodes) = config.max_nodes {
+                if result.len() >= max_nodes {
+                    break;
+                }
+            }
+            if !starts.contains(&current)
+                && self
+                    .graph
+                    .node_weight(current)
+                    .is_some_and(|node| config.node_should_collect(node))
+            {
+                result.push(current);
+            }
+            if config.max_depth.is_some_and(|max_depth| depth >= max_depth) {
+                continue;
+            }
+
+            let mut scratch = self.bfs_scratch.lock().unwrap();
+            scratch.clear();
+            scratch.extend(
+                self.graph
+                    .edges(current)
+                    .filter(|edge| config.edge_allowed(edge.weight()))
+                    .map(|edge| edge.target()),
+            );
+            for &neighbor in scratch.iter() {
+                if visited.insert(neighbor) {
+                    queue.push_back((neighbor, depth + 1));
+                }
+            }
+        }
+        result
     }
 
     /// Backward impact: nodes that can reach `start` following incoming edges.
@@ -1533,439 +1696,5 @@ enum Direction {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn make_node(id: &str, name: &str, file: &str, ntype: NodeType) -> Node {
-        Node {
-            id: id.to_string(),
-            node_type: ntype,
-            name: name.to_string(),
-            file_path: Arc::from(file),
-            byte_range: (0, 10),
-            complexity: 2,
-            language: "rust".to_string(),
-        }
-    }
-
-    #[test]
-    fn traversal_respects_max_nodes() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let n: Vec<NodeId> = (0..10)
-            .map(|i| {
-                pdg.add_node(make_node(
-                    &format!("n{i}"),
-                    &format!("n{i}"),
-                    "f.rs",
-                    NodeType::Function,
-                ))
-            })
-            .collect();
-        // Chain: n0 → n1 → n2 → ... → n9
-        for i in 0..9 {
-            pdg.add_call_edges(vec![(n[i], n[i + 1])]);
-        }
-        let config = TraversalConfig {
-            max_depth: None,
-            max_nodes: Some(3),
-            ..TraversalConfig::for_impact_analysis()
-        };
-        let result = pdg.forward_impact(n[0], &config);
-        assert!(result.len() <= 3, "Should respect max_nodes cap");
-    }
-
-    #[test]
-    fn traversal_filters_containment_edges() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let cls = pdg.add_node(make_node("f:MyClass", "MyClass", "f.rs", NodeType::Class));
-        let method = pdg.add_node(make_node("f:MyClass::foo", "foo", "f.rs", NodeType::Method));
-        let callee = pdg.add_node(make_node("f:bar", "bar", "f.rs", NodeType::Function));
-        pdg.add_containment_edges(vec![(cls, method)]);
-        pdg.add_call_edges(vec![(method, callee)]);
-
-        // With default semantic config, containment edges should not be traversed
-        let config = TraversalConfig::for_semantic_analysis();
-        let result = pdg.forward_impact(cls, &config);
-        // Should not reach callee via containment→method→call chain
-        // because containment is filtered — cls can only reach method
-        // if containment is allowed; method→callee only if call is allowed
-        // With semantic_analysis: Call allowed but Containment not → cls reaches nothing
-        assert!(
-            !result.contains(&callee) || result.contains(&method),
-            "Containment edges should be filtered from semantic traversal"
-        );
-    }
-
-    #[test]
-    fn find_by_name_in_file_no_scan_needed() {
-        let mut pdg = ProgramDependenceGraph::new();
-        for i in 0..1000 {
-            pdg.add_node(make_node(
-                &format!("f:func{i}"),
-                &format!("func{i}"),
-                "f.rs",
-                NodeType::Function,
-            ));
-        }
-        // Case-insensitive lookup should use name_lower_index, not scan
-        let result = pdg.find_by_name_in_file("FUNC42", None);
-        assert!(result.is_some());
-    }
-
-    #[test]
-    fn name_file_index_provides_o1_lookup() {
-        let mut pdg = ProgramDependenceGraph::new();
-
-        // Add nodes with same name in different files
-        let a = pdg.add_node(make_node("a.rs:foo", "foo", "a.rs", NodeType::Function));
-        let b = pdg.add_node(make_node("b.rs:foo", "foo", "b.rs", NodeType::Function));
-        let c = pdg.add_node(make_node("c.rs:foo", "foo", "c.rs", NodeType::Function));
-
-        // Direct name_file_index lookup with file hint returns correct node
-        assert_eq!(pdg.find_by_name_in_file("foo", Some("a.rs")), Some(a));
-        assert_eq!(pdg.find_by_name_in_file("foo", Some("b.rs")), Some(b));
-        assert_eq!(pdg.find_by_name_in_file("foo", Some("c.rs")), Some(c));
-
-        // Non-existent file returns None for exact match but falls through
-        assert_eq!(pdg.find_by_name_in_file("foo", Some("z.rs")), Some(a));
-    }
-
-    #[test]
-    fn name_file_index_maintained_on_remove() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let a = pdg.add_node(make_node("a.rs:foo", "foo", "a.rs", NodeType::Function));
-        let b = pdg.add_node(make_node("b.rs:bar", "bar", "b.rs", NodeType::Function));
-
-        // Verify lookups work before removal
-        assert_eq!(pdg.find_by_name_in_file("foo", Some("a.rs")), Some(a));
-        assert_eq!(pdg.find_by_name_in_file("bar", Some("b.rs")), Some(b));
-
-        // Remove node a
-        pdg.remove_node(a);
-
-        // name_file_index should no longer find removed node
-        assert_eq!(pdg.find_by_name_in_file("foo", Some("a.rs")), None);
-        assert!(!pdg.file_index.contains_key("a.rs"));
-        assert!(!pdg.name_index.contains_key("foo"));
-        assert!(!pdg.name_lower_index.contains_key("foo"));
-        // b should still be found
-        assert_eq!(pdg.find_by_name_in_file("bar", Some("b.rs")), Some(b));
-        assert!(pdg.file_index.contains_key("b.rs"));
-        assert!(pdg.name_index.contains_key("bar"));
-        assert!(pdg.name_lower_index.contains_key("bar"));
-    }
-
-    #[test]
-    fn containment_edge_type_is_separate_from_call() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let cls = pdg.add_node(make_node("f:C", "C", "f.rs", NodeType::Class));
-        let m = pdg.add_node(make_node("f:C::m", "m", "f.rs", NodeType::Method));
-        pdg.add_containment_edges(vec![(cls, m)]);
-
-        let containment_count = pdg
-            .edge_indices()
-            .filter_map(|e| pdg.get_edge(e))
-            .filter(|e| e.edge_type == EdgeType::Containment)
-            .count();
-        let call_count = pdg
-            .edge_indices()
-            .filter_map(|e| pdg.get_edge(e))
-            .filter(|e| e.edge_type == EdgeType::Call)
-            .count();
-
-        assert_eq!(containment_count, 1);
-        assert_eq!(call_count, 0);
-    }
-
-    #[test]
-    fn confidence_filtering_works() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let n1 = pdg.add_node(make_node("f:a", "a", "f.rs", NodeType::Function));
-        let n2 = pdg.add_node(make_node("f:b", "b", "f.rs", NodeType::Function));
-        pdg.add_data_flow_edges(vec![(n1, n2, "T".to_string(), 0.3)]);
-
-        // Low confidence edge should be filtered when min_edge_confidence = 0.5
-        let config = TraversalConfig {
-            max_depth: Some(5),
-            max_nodes: Some(100),
-            allowed_edge_types: Some(&[EdgeType::DataDependency]),
-            excluded_node_types: None,
-            min_complexity: None,
-            min_edge_confidence: 0.5,
-        };
-        let result = pdg.forward_impact(n1, &config);
-        assert!(
-            !result.contains(&n2),
-            "Low confidence edge should be filtered"
-        );
-    }
-
-    #[test]
-    fn backward_traversal_works() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let n: Vec<NodeId> = (0..5)
-            .map(|i| {
-                pdg.add_node(make_node(
-                    &format!("f:n{i}"),
-                    &format!("n{i}"),
-                    "f.rs",
-                    NodeType::Function,
-                ))
-            })
-            .collect();
-        // Chain: n0 → n1 → n2 → n3 → n4
-        for i in 0..4 {
-            pdg.add_call_edges(vec![(n[i], n[i + 1])]);
-        }
-
-        let config = TraversalConfig::for_impact_analysis();
-        let backward = pdg.backward_impact(n[4], &config);
-        assert!(backward.contains(&n[0]));
-        assert!(backward.contains(&n[1]));
-        assert!(backward.contains(&n[2]));
-        assert!(backward.contains(&n[3]));
-    }
-
-    #[test]
-    fn bidirectional_traversal_works() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let n1 = pdg.add_node(make_node("f:a", "a", "f.rs", NodeType::Function));
-        let n2 = pdg.add_node(make_node("f:b", "b", "f.rs", NodeType::Function));
-        let n3 = pdg.add_node(make_node("f:c", "c", "f.rs", NodeType::Function));
-        // n1 → n2 and n2 → n3 (n2 is in the middle)
-        pdg.add_call_edges(vec![(n1, n2), (n2, n3)]);
-
-        let config = TraversalConfig::for_impact_analysis();
-        let bidirectional = pdg.bidirectional_impact(n2, &config);
-        assert!(bidirectional.contains(&n1), "Should reach backward");
-        assert!(bidirectional.contains(&n3), "Should reach forward");
-        assert!(
-            !bidirectional.contains(&n2),
-            "Should not include start node"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // EmbeddingStore integration tests
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn embedding_store_field_initialized_on_new_pdg() {
-        let pdg = ProgramDependenceGraph::new();
-        assert!(pdg.embedding_store.is_empty());
-        assert_eq!(pdg.embedding_count(), 0);
-    }
-
-    #[test]
-    fn set_and_get_embedding_roundtrip() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let n1 = pdg.add_node(make_node("f:foo", "foo", "f.rs", NodeType::Function));
-
-        // Store embedding via PDG accessor
-        let emb = vec![0.1, 0.2, 0.3, 0.4];
-        pdg.set_embedding("f:foo", emb.clone());
-
-        // Retrieve via PDG accessor
-        assert_eq!(pdg.get_embedding("f:foo"), Some(&emb));
-        assert_eq!(pdg.embedding_count(), 1);
-
-        // Node should still exist
-        assert!(pdg.get_node(n1).is_some());
-    }
-
-    #[test]
-    fn remove_node_cleans_up_embedding() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let n1 = pdg.add_node(make_node("f:foo", "foo", "f.rs", NodeType::Function));
-        pdg.set_embedding("f:foo", vec![0.5, 0.6]);
-
-        assert_eq!(pdg.embedding_count(), 1);
-
-        // Remove node should also remove embedding
-        let removed = pdg.remove_node(n1);
-        assert!(removed.is_some());
-        assert_eq!(pdg.embedding_count(), 0);
-        assert!(pdg.get_embedding("f:foo").is_none());
-    }
-
-    #[test]
-    fn remove_file_cleans_up_all_embeddings() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let n1 = pdg.add_node(make_node("f:a", "a", "src/lib.rs", NodeType::Function));
-        let n2 = pdg.add_node(make_node("f:b", "b", "src/lib.rs", NodeType::Function));
-        let n3 = pdg.add_node(make_node("f:c", "c", "src/other.rs", NodeType::Function));
-
-        pdg.set_embedding("f:a", vec![1.0]);
-        pdg.set_embedding("f:b", vec![2.0]);
-        pdg.set_embedding("f:c", vec![3.0]);
-
-        assert_eq!(pdg.embedding_count(), 3);
-
-        // Remove file src/lib.rs — should clean up a and b embeddings
-        pdg.remove_file("src/lib.rs");
-
-        assert!(
-            pdg.get_embedding("f:a").is_none(),
-            "a's embedding should be removed"
-        );
-        assert!(
-            pdg.get_embedding("f:b").is_none(),
-            "b's embedding should be removed"
-        );
-        assert_eq!(
-            pdg.get_embedding("f:c"),
-            Some(&vec![3.0]),
-            "c's embedding should remain"
-        );
-        assert_eq!(pdg.embedding_count(), 1);
-
-        // n1 and n2 should be gone, n3 should remain
-        assert!(pdg.get_node(n1).is_none());
-        assert!(pdg.get_node(n2).is_none());
-        assert!(pdg.get_node(n3).is_some());
-    }
-
-    #[test]
-    fn embedding_store_overwrite() {
-        let mut pdg = ProgramDependenceGraph::new();
-        pdg.add_node(make_node("f:foo", "foo", "f.rs", NodeType::Function));
-
-        pdg.set_embedding("f:foo", vec![1.0, 2.0]);
-        assert_eq!(pdg.get_embedding("f:foo"), Some(&vec![1.0, 2.0]));
-
-        // Overwrite
-        pdg.set_embedding("f:foo", vec![3.0, 4.0]);
-        assert_eq!(pdg.get_embedding("f:foo"), Some(&vec![3.0, 4.0]));
-        assert_eq!(
-            pdg.embedding_count(),
-            1,
-            "Should still have 1 embedding after overwrite"
-        );
-    }
-
-    #[test]
-    fn serialization_preserves_embeddings() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let n1 = pdg.add_node(make_node("f:foo", "foo", "f.rs", NodeType::Function));
-        let n2 = pdg.add_node(make_node("f:bar", "bar", "f.rs", NodeType::Function));
-        pdg.add_call_edges(vec![(n1, n2)]);
-        pdg.set_embedding("f:foo", vec![0.1, 0.2, 0.3]);
-        pdg.set_embedding("f:bar", vec![0.4, 0.5, 0.6]);
-
-        // Serialize
-        let bytes = pdg.serialize().expect("Serialization should succeed");
-
-        // Deserialize
-        let restored =
-            ProgramDependenceGraph::deserialize(&bytes).expect("Deserialization should succeed");
-
-        // Verify embeddings survived the round-trip
-        assert_eq!(restored.get_embedding("f:foo"), Some(&vec![0.1, 0.2, 0.3]));
-        assert_eq!(restored.get_embedding("f:bar"), Some(&vec![0.4, 0.5, 0.6]));
-        assert_eq!(restored.embedding_count(), 2);
-    }
-
-    #[test]
-    fn deserialization_backward_compat_no_embeddings() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let n1 = pdg.add_node(make_node("f:foo", "foo", "f.rs", NodeType::Function));
-        pdg.add_call_edges(vec![(n1, n1)]);
-
-        // Manually serialize without embeddings (simulate old format)
-        let old_format = SerializablePDG {
-            nodes: pdg
-                .graph
-                .node_indices()
-                .map(|idx| SerializableNode {
-                    index: idx.index() as u32,
-                    node: pdg.graph[idx].clone(),
-                })
-                .collect(),
-            edges: pdg
-                .graph
-                .edge_indices()
-                .map(|eidx| {
-                    let (source, target) = pdg.graph.edge_endpoints(eidx).unwrap();
-                    SerializableEdge {
-                        source: source.index() as u32,
-                        target: target.index() as u32,
-                        edge: pdg.graph[eidx].clone(),
-                    }
-                })
-                .collect(),
-            symbol_index: pdg
-                .symbol_index
-                .iter()
-                .map(|(k, v)| (k.clone(), v.index() as u32))
-                .collect(),
-            file_index: pdg
-                .file_index
-                .iter()
-                .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
-                .collect(),
-            name_index: pdg
-                .name_index
-                .iter()
-                .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
-                .collect(),
-            name_lower_index: pdg
-                .name_lower_index
-                .iter()
-                .map(|(k, v)| (k.clone(), v.iter().map(|id| id.index() as u32).collect()))
-                .collect(),
-            embeddings: HashMap::new(), // No embeddings — simulates old format
-        };
-
-        let bytes = bincode::serialize(&old_format).expect("Serialize old format");
-        let restored = ProgramDependenceGraph::deserialize(&bytes)
-            .expect("Should deserialize old format without error");
-
-        assert_eq!(restored.embedding_count(), 0);
-        assert_eq!(restored.node_count(), 1);
-    }
-
-    #[test]
-    fn bulk_import_edges_helper() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let a = pdg.add_node(make_node("mod:a", "a", "a.rs", NodeType::Module));
-        let b = pdg.add_node(make_node("mod:b", "b", "b.rs", NodeType::Module));
-        let c = pdg.add_node(make_node("mod:c", "c", "c.rs", NodeType::Module));
-
-        pdg.add_import_edges(vec![(a, b), (a, c)]);
-
-        let import_count = pdg
-            .edge_indices()
-            .filter_map(|e| pdg.get_edge(e))
-            .filter(|e| e.edge_type == EdgeType::Import)
-            .count();
-        assert_eq!(import_count, 2, "Should have 2 import edges");
-    }
-
-    #[test]
-    fn bulk_inheritance_edges_with_confidence() {
-        let mut pdg = ProgramDependenceGraph::new();
-        let child = pdg.add_node(make_node("f:Child", "Child", "f.rs", NodeType::Class));
-        let parent = pdg.add_node(make_node("f:Parent", "Parent", "f.rs", NodeType::Class));
-
-        pdg.add_inheritance_edges(vec![(child, parent, 0.85)]);
-
-        // Verify edge was created with correct type and confidence
-        let edges: Vec<_> = pdg
-            .edge_indices()
-            .filter_map(|e| {
-                let edge = pdg.get_edge(e)?;
-                if edge.edge_type == EdgeType::Inheritance {
-                    Some((pdg.edge_endpoints(e).unwrap(), edge.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        assert_eq!(edges.len(), 1);
-        let ((src, tgt), edge) = &edges[0];
-        assert_eq!(*src, child);
-        assert_eq!(*tgt, parent);
-        assert_eq!(edge.metadata.confidence, Some(0.85));
-    }
-}
+#[path = "pdg_test.rs"]
+mod tests;

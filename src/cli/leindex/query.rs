@@ -12,26 +12,6 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
-/// Default wall-clock budget for generating one query neural embedding.
-///
-/// Fast GPU paths should complete inside this budget. Slow or misconfigured
-/// providers fall back to TF-IDF instead of making every search wait seconds.
-#[allow(dead_code)]
-const DEFAULT_QUERY_EMBED_TIMEOUT_MS: u64 = 250;
-#[allow(dead_code)]
-const QUERY_EMBED_TIMEOUT_ENV: &str = "LEINDEX_QUERY_NEURAL_TIMEOUT_MS";
-
-#[allow(dead_code)]
-fn query_neural_timeout() -> std::time::Duration {
-    let timeout_ms = std::env::var(QUERY_EMBED_TIMEOUT_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|&v| v > 0)
-        .unwrap_or(DEFAULT_QUERY_EMBED_TIMEOUT_MS);
-
-    std::time::Duration::from_millis(timeout_ms)
-}
-
 impl LeIndex {
     fn resolve_indexed_file_path(&self, file_path: &str) -> PathBuf {
         let path = Path::new(file_path);
@@ -67,100 +47,144 @@ impl LeIndex {
         top_k: usize,
         query_type: Option<crate::search::ranking::QueryType>,
     ) -> Result<Vec<SearchResult>> {
-        if self.search_engine.is_empty() {
-            warn!("Search attempted on empty index");
-            return Ok(Vec::new());
-        }
+        self.search_internal(query, top_k, query_type, true)
+    }
 
-        if let Some(cached_results) =
-            self.cached_search_results(query, top_k, query_type.as_ref())?
-        {
-            return Ok(cached_results);
-        }
+    /// Search with request-scoped context without writing that context into
+    /// the persistent query cache.
+    pub(crate) fn search_ephemeral(
+        &mut self,
+        query: &str,
+        top_k: usize,
+        query_type: Option<crate::search::ranking::QueryType>,
+    ) -> Result<Vec<SearchResult>> {
+        self.search_internal(query, top_k, query_type, false)
+    }
 
-        let query_neural_embedding = self.generate_query_neural_embedding(query);
-        let neural_available = query_neural_embedding.is_some();
-        let search_cache_key =
-            self.search_cache_key_for(query, top_k, query_type.as_ref(), neural_available);
+    fn enrich_results_with_pdg_metadata(
+        &self,
+        results: &mut [SearchResult],
+        pdg: &ProgramDependenceGraph,
+        file_cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+    ) {
+        for result in results {
+            if let Some(node_idx) = pdg.find_by_id(&result.node_id) {
+                if let Some(node) = pdg.get_node(node_idx) {
+                    result.symbol_type = Some(match node.node_type {
+                        crate::graph::pdg::NodeType::Function => "function".to_string(),
+                        crate::graph::pdg::NodeType::Class => "class".to_string(),
+                        crate::graph::pdg::NodeType::Method => "method".to_string(),
+                        crate::graph::pdg::NodeType::Variable => "variable".to_string(),
+                        crate::graph::pdg::NodeType::Module => "module".to_string(),
+                        crate::graph::pdg::NodeType::External => "external".to_string(),
+                        crate::graph::pdg::NodeType::FileSummary => "file_summary".to_string(),
+                    });
 
-        let search_query = SearchQuery {
-            query: query.to_string(),
-            top_k,
-            token_budget: None,
-            semantic: true,
-            expand_context: false,
-            query_embedding: Some(self.generate_query_embedding(query)),
-            query_neural_embedding,
-            threshold: Some(0.1), // Added default threshold for better quality
-            query_type,
-        };
-
-        let mut results = self
-            .search_engine
-            .search(search_query)
-            .context("Search operation failed")?;
-
-        // Enrich results with PDG metadata: symbol_type, caller_count, dependency_count, line_number.
-        // These require the in-memory PDG which is available here but not in lerecherche.
-        if let Some(pdg) = &self.pdg {
-            // Cache file contents to avoid re-reading the same file for multiple results
-            let mut file_cache: std::collections::HashMap<String, Option<Vec<u8>>> =
-                std::collections::HashMap::new();
-
-            for result in &mut results {
-                // Look up the PDG node by its string ID
-                if let Some(node_idx) = pdg.find_by_id(&result.node_id) {
-                    if let Some(node) = pdg.get_node(node_idx) {
-                        result.symbol_type = Some(match node.node_type {
-                            crate::graph::pdg::NodeType::Function => "function".to_string(),
-                            crate::graph::pdg::NodeType::Class => "class".to_string(),
-                            crate::graph::pdg::NodeType::Method => "method".to_string(),
-                            crate::graph::pdg::NodeType::Variable => "variable".to_string(),
-                            crate::graph::pdg::NodeType::Module => "module".to_string(),
-                            crate::graph::pdg::NodeType::External => "external".to_string(),
-                        });
-
-                        // Compute line number from byte_range, or fall back to
-                        // searching for the symbol name in the file content
-                        let file_path_str = node.file_path.to_string();
-                        let needs_line = result.line_number.is_none();
-                        if needs_line {
-                            let abs_path = self.resolve_indexed_file_path(&file_path_str);
-                            let content = file_cache
-                                .entry(file_path_str.clone())
-                                .or_insert_with(|| std::fs::read(abs_path).ok());
-                            if let Some(content) = content.as_ref() {
-                                if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
-                                    // Compute from byte_range
-                                    let byte_offset = node.byte_range.0.min(content.len());
-                                    let line_num = content[..byte_offset]
-                                        .iter()
-                                        .filter(|&&b| b == b'\n')
-                                        .count()
-                                        + 1;
+                    let file_path_str = node.file_path.to_string();
+                    if result.line_number.is_none() {
+                        let abs_path = self.resolve_indexed_file_path(&file_path_str);
+                        let content = file_cache
+                            .entry(file_path_str.clone())
+                            .or_insert_with(|| std::fs::read(abs_path).ok());
+                        if let Some(content) = content.as_ref() {
+                            if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
+                                let byte_offset = node.byte_range.0.min(content.len());
+                                let line_num = content[..byte_offset]
+                                    .iter()
+                                    .filter(|&&b| b == b'\n')
+                                    .count()
+                                    + 1;
+                                result.line_number = Some(line_num);
+                            } else if !node.name.is_empty() {
+                                if let Some(pos) = find_subsequence(content, node.name.as_bytes()) {
+                                    let line_num =
+                                        content[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
                                     result.line_number = Some(line_num);
-                                } else if !node.name.is_empty() {
-                                    // Fallback: find the symbol name in the file content
-                                    let name_bytes = node.name.as_bytes();
-                                    if let Some(pos) = find_subsequence(content, name_bytes) {
-                                        let line_num =
-                                            content[..pos].iter().filter(|&&b| b == b'\n').count()
-                                                + 1;
-                                        result.line_number = Some(line_num);
-                                    }
                                 }
                             }
                         }
                     }
-                    result.caller_count = Some(pdg.predecessor_count(node_idx));
-                    result.dependency_count = Some(pdg.neighbors(node_idx).len());
+                }
+                result.caller_count = Some(pdg.predecessor_count(node_idx));
+                result.dependency_count = Some(pdg.neighbors(node_idx).len());
+            }
+        }
+    }
+
+    fn rerank_results(
+        &self,
+        results: &mut Vec<SearchResult>,
+        query: &str,
+        pdg: &ProgramDependenceGraph,
+        file_cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+        exact_route: bool,
+    ) {
+        let rerank_cfg = &crate::cli::neural_config::LeIndexConfig::load_cached().search;
+        if rerank_cfg.rerank_enabled && !exact_route && !results.is_empty() {
+            if let Some(embedder) = self.embedder.as_ref() {
+                let n = (rerank_cfg.rerank_top_n as usize).min(results.len());
+                let mut docs: Vec<(String, String, f32)> = Vec::with_capacity(n);
+                for result in results[..n].iter() {
+                    let content = pdg
+                        .find_by_id(&result.node_id)
+                        .and_then(|idx| pdg.get_node(idx))
+                        .and_then(|node| {
+                            let path = self.resolve_indexed_file_path(&node.file_path);
+                            let bytes = file_cache
+                                .entry(node.file_path.to_string())
+                                .or_insert_with(|| std::fs::read(&path).ok());
+                            bytes
+                                .as_ref()
+                                .filter(|bytes| {
+                                    node.byte_range.0 < node.byte_range.1
+                                        && node.byte_range.1 <= bytes.len()
+                                })
+                                .map(|bytes| {
+                                    String::from_utf8_lossy(
+                                        &bytes[node.byte_range.0..node.byte_range.1],
+                                    )
+                                    .to_string()
+                                })
+                        })
+                        .unwrap_or_else(|| format!("{} {}", result.symbol_name, result.file_path));
+                    docs.push((result.node_id.clone(), content, result.score.overall));
+                }
+
+                match embedder.rerank_blocking(query, docs) {
+                    Some(Ok(reranked)) => {
+                        let by_id: std::collections::HashMap<String, SearchResult> = results[..n]
+                            .iter()
+                            .map(|result| (result.node_id.clone(), result.clone()))
+                            .collect();
+                        let mut new_top: Vec<SearchResult> = Vec::with_capacity(n);
+                        for (id, _) in &reranked {
+                            if let Some(result) = by_id.get(id) {
+                                new_top.push(result.clone());
+                            }
+                        }
+                        for result in results[..n].iter() {
+                            if !new_top.iter().any(|item| item.node_id == result.node_id) {
+                                new_top.push(result.clone());
+                            }
+                        }
+                        new_top.extend(results[n..].iter().cloned());
+                        *results = new_top;
+                        for (index, result) in results.iter_mut().enumerate() {
+                            result.rank = index + 1;
+                        }
+                        debug!("reranker re-ordered top-{} for '{}'", n, query);
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(error = %error, "reranker failed; keeping original order")
+                    }
+                    None => {}
                 }
             }
         }
+    }
 
-        debug!("Search for '{}' returned {} results", query, results.len());
-
-        if let Ok(serialized) = bincode::serialize(&results) {
+    fn cache_search_results(&mut self, results: &[SearchResult], key: &str, query: &str) {
+        if let Ok(serialized) = bincode::serialize(results) {
             let entry = CacheEntry::Binary {
                 metadata: std::collections::HashMap::from([
                     ("type".to_string(), "search_results".to_string()),
@@ -172,18 +196,126 @@ impl LeIndex {
                 .cache
                 .cache_spiller
                 .store_mut()
-                .insert(search_cache_key.clone(), entry)
+                .insert(key.to_string(), entry)
                 .is_ok()
             {
-                let _ = self
-                    .cache
-                    .cache_spiller
-                    .store_mut()
-                    .persist_key(&search_cache_key);
+                let _ = self.cache.cache_spiller.store_mut().persist_key(key);
+            }
+        }
+    }
+
+    fn search_internal(
+        &mut self,
+        query: &str,
+        top_k: usize,
+        query_type: Option<crate::search::ranking::QueryType>,
+        cache_results: bool,
+    ) -> Result<Vec<SearchResult>> {
+        if self.search_engine.is_empty() {
+            warn!("Search attempted on empty index");
+            return Ok(Vec::new());
+        }
+
+        if cache_results {
+            if let Some(cached_results) =
+                self.cached_search_results(query, top_k, query_type.as_ref())?
+            {
+                return Ok(cached_results);
             }
         }
 
+        // Derive the effective query type: an explicit caller-provided type
+        // wins; otherwise fall back to the configured [search] search_mode so
+        // the documented config knob actually controls retrieval. This is the
+        // fix for search_mode being a dead string (VAL-CONFIG).
+        let search_config = &crate::cli::neural_config::LeIndexConfig::load_cached().search;
+        let effective_query_type = match query_type {
+            Some(explicit) => Some(explicit),
+            None => crate::cli::neural_config::query_type_for_mode(&search_config.search_mode),
+        };
+        let exact_route = matches!(
+            effective_query_type,
+            Some(crate::search::ranking::QueryType::Exact)
+        );
+        // Exact identifier/text queries stay lexical. In particular, do not
+        // construct either query embedding: this keeps a concrete code-review
+        // lookup independent of TF-IDF vocabulary and neural worker readiness.
+        let query_neural_embedding = if exact_route {
+            None
+        } else {
+            self.generate_query_neural_embedding(query)
+        };
+        let neural_available = query_neural_embedding.is_some();
+        let search_cache_key = self.search_cache_key_for(
+            query,
+            top_k,
+            effective_query_type.as_ref(),
+            neural_available,
+        );
+
+        // Adaptive relevance threshold: pure-neural/semantic matches routinely
+        // score below the hybrid 0.1 cutoff (cosine similarities land lower), so
+        // loosen to 0.05 for Semantic mode. analyze_search already uses 0.05.
+        // ponytail: two fixed values by mode; add a toml knob only if recall tuning is requested.
+        let threshold = match effective_query_type {
+            Some(crate::search::ranking::QueryType::Semantic) => Some(0.05),
+            _ => Some(0.1),
+        };
+
+        // When rerank is enabled, over-fetch candidates so the cross-encoder
+        // sees a wider pool than the final top_k (it can only reorder what was
+        // retrieved). We truncate back to top_k after reranking below.
+        let rerank_enabled = search_config.rerank_enabled && !exact_route;
+        let search_top_k = if rerank_enabled {
+            top_k.max(search_config.rerank_top_n as usize)
+        } else {
+            top_k
+        };
+
+        let search_query = SearchQuery {
+            query: query.to_string(),
+            top_k: search_top_k,
+            token_budget: None,
+            semantic: !exact_route,
+            expand_context: false,
+            query_embedding: (!exact_route).then(|| self.generate_query_embedding(query)),
+            query_neural_embedding,
+            threshold,
+            query_type: effective_query_type,
+        };
+
+        let mut results = self
+            .search_engine
+            .search(search_query)
+            .context("Search operation failed")?;
+
+        if let Some(pdg) = &self.pdg {
+            let mut file_cache = std::collections::HashMap::new();
+            self.enrich_results_with_pdg_metadata(&mut results, pdg, &mut file_cache);
+            self.rerank_results(&mut results, query, pdg, &mut file_cache, exact_route);
+        }
+
+        // Truncate the over-fetched candidate pool (search_top_k) back to the
+        // requested top_k after reranking.
+        results.truncate(top_k);
+
+        debug!("Search for '{}' returned {} results", query, results.len());
+
+        if cache_results {
+            self.cache_search_results(&results, &search_cache_key, query);
+        }
+
         Ok(results)
+    }
+
+    /// A hybrid index must not return a stale TF-IDF-only cache entry before
+    /// giving its configured neural provider a chance to answer. Once the
+    /// provider reports a terminal failure, the persisted fallback is valid
+    /// until the next index generation.
+    fn neural_search_should_be_attempted(&self) -> bool {
+        self.embedder
+            .as_ref()
+            .is_some_and(|embedder| embedder.has_neural() && embedder.neural_status() != "failed")
     }
 
     fn cached_search_results(
@@ -192,11 +324,15 @@ impl LeIndex {
         top_k: usize,
         query_type: Option<&crate::search::ranking::QueryType>,
     ) -> Result<Option<Vec<SearchResult>>> {
-        // Neural availability is part of the persisted cache key. Probe both
-        // variants before generating the query neural embedding so repeated
-        // searches can return immediately even when ONNX would otherwise hit
-        // the 15s query-embedding timeout.
+        // Neural availability is part of the persisted cache key. A live
+        // hybrid provider probes only the neural key; otherwise a stale
+        // TF-IDF-only result would prevent the cold worker from starting.
+        let neural_required = !matches!(query_type, Some(crate::search::ranking::QueryType::Exact))
+            && self.neural_search_should_be_attempted();
         for neural_available in [true, false] {
+            if neural_required && !neural_available {
+                continue;
+            }
             let search_cache_key =
                 self.search_cache_key_for(query, top_k, query_type, neural_available);
             if let Some(CacheEntry::Binary {
@@ -245,22 +381,61 @@ impl LeIndex {
     /// println!("Context: {}", analysis.context.unwrap_or_default());
     /// ```
     pub fn analyze(&mut self, query: &str, token_budget: usize) -> Result<super::AnalysisResult> {
+        self.analyze_internal(query, token_budget, true)
+    }
+
+    /// Analyze with request-scoped context without persisting the expanded
+    /// query or result in the durable analysis cache.
+    pub(crate) fn analyze_ephemeral(
+        &mut self,
+        query: &str,
+        token_budget: usize,
+    ) -> Result<super::AnalysisResult> {
+        self.analyze_internal(query, token_budget, false)
+    }
+
+    fn analyze_internal(
+        &mut self,
+        query: &str,
+        token_budget: usize,
+        cache_results: bool,
+    ) -> Result<super::AnalysisResult> {
         let start_time = std::time::Instant::now();
 
         let analysis_cache_key = self.analysis_cache_key_for(query, token_budget);
-        if let Some(CacheEntry::Analysis {
-            serialized_data, ..
-        }) = self
-            .cache
-            .cache_spiller
-            .store_mut()
-            .get_or_load(&analysis_cache_key)?
-        {
-            if let Ok(mut cached) = bincode::deserialize::<super::AnalysisResult>(&serialized_data)
+        let neural_search_requested = self.neural_search_should_be_attempted();
+        if cache_results {
+            if let Some(CacheEntry::Analysis {
+                serialized_data, ..
+            }) = self
+                .cache
+                .cache_spiller
+                .store_mut()
+                .get_or_load(&analysis_cache_key)?
             {
-                cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
-                debug!("Analysis cache hit for '{}'", query);
-                return Ok(cached);
+                // New entries carry a one-bit provenance marker so a cached
+                // hybrid analysis can be reused without starting another
+                // model request, while an old/raw TF-IDF-only entry cannot
+                // suppress a configured neural attempt.
+                if let Ok((cached_with_neural, mut cached)) =
+                    bincode::deserialize::<(bool, super::AnalysisResult)>(&serialized_data)
+                {
+                    if cached_with_neural || !neural_search_requested {
+                        cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
+                        debug!("Analysis cache hit for '{}'", query);
+                        return Ok(cached);
+                    }
+                } else if !neural_search_requested {
+                    // Preserve compatibility with entries written before the
+                    // provenance marker was introduced.
+                    if let Ok(mut cached) =
+                        bincode::deserialize::<super::AnalysisResult>(&serialized_data)
+                    {
+                        cached.processing_time_ms = start_time.elapsed().as_millis() as u64;
+                        debug!("Analysis cache hit for '{}'", query);
+                        return Ok(cached);
+                    }
+                }
             }
         }
 
@@ -288,27 +463,33 @@ impl LeIndex {
             processing_time_ms: start_time.elapsed().as_millis() as u64,
         };
 
-        if let Ok(serialized) = bincode::serialize(&analysis) {
-            let entry = CacheEntry::Analysis {
-                query: query.to_string(),
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-                serialized_data: serialized,
-            };
-            if self
-                .cache
-                .cache_spiller
-                .store_mut()
-                .insert(analysis_cache_key.clone(), entry)
-                .is_ok()
-            {
-                let _ = self
+        if cache_results {
+            let cached_with_neural = self
+                .embedder
+                .as_ref()
+                .is_some_and(|embedder| embedder.neural_status() == "ready");
+            if let Ok(serialized) = bincode::serialize(&(cached_with_neural, &analysis)) {
+                let entry = CacheEntry::Analysis {
+                    query: query.to_string(),
+                    timestamp: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    serialized_data: serialized,
+                };
+                if self
                     .cache
                     .cache_spiller
                     .store_mut()
-                    .persist_key(&analysis_cache_key);
+                    .insert(analysis_cache_key.clone(), entry)
+                    .is_ok()
+                {
+                    let _ = self
+                        .cache
+                        .cache_spiller
+                        .store_mut()
+                        .persist_key(&analysis_cache_key);
+                }
             }
         }
 
@@ -447,53 +628,22 @@ impl LeIndex {
     ///
     /// Uses ONNX (or remote) neural embeddings when available, projecting
     /// the query into the same neural vector space as the indexed nodes.
-    /// Returns `None` when neural embeddings are unavailable (TF-IDF fallback).
-    ///
-    /// A subsecond timeout prevents slow or misconfigured ONNX providers from
-    /// hanging the search path. When the timeout fires the function logs a
-    /// warning and returns `None`, causing the caller to fall back to TF-IDF.
+    /// Returns `None` only when the configured provider reaches a terminal
+    /// failure/absence; the caller then reports the mandatory TF-IDF result.
+    /// A cold default worker is started and awaited through its explicit
+    /// lifecycle state; model loading/inference are never cancelled by an
+    /// elapsed-time request timeout.
     #[cfg(any(feature = "onnx", feature = "remote-embeddings"))]
     pub fn generate_query_neural_embedding(&self, query: &str) -> Option<Vec<f32>> {
         let emb = self.embedder.as_ref()?;
-
-        // Channel-based timeout pattern: spawn a detached worker thread that
-        // runs the (potentially very slow) blocking embedding call, then wait
-        // on the receiver with a bounded timeout.  If the timeout fires we
-        // proceed without the neural embedding; the worker thread is left to
-        // complete (or be killed at process exit) since we cannot cancel
-        // ONNX inference mid-flight.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let emb_clone = emb.clone();
-        let query_owned = query.to_string();
-        std::thread::spawn(move || {
-            let _ = tx.send(emb_clone.embed_neural_blocking(&query_owned));
-        });
-
-        let timeout = query_neural_timeout();
-        match rx.recv_timeout(timeout) {
-            Ok(Some(Ok(vec))) => Some(vec),
-            Ok(Some(Err(e))) => {
-                debug!(
-                    "Neural embedding failed for query, using TF-IDF fallback: {}",
-                    e
-                );
+        match emb.embed_neural_blocking(query) {
+            Some(Ok(embedding)) => Some(embedding),
+            Some(Err(error)) => {
+                debug!("Neural query embedding failed ({error}); using TF-IDF fallback");
                 None
             }
-            Ok(None) => None, // TF-IDF only mode, no neural available
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                warn!(
-                    timeout_ms = timeout.as_millis() as u64,
-                    "Neural query embedding timed out after {}ms, using TF-IDF fallback",
-                    timeout.as_millis()
-                );
-                eprintln!(
-                    "warning: neural query embedding timed out after {}ms; using TF-IDF fallback",
-                    timeout.as_millis()
-                );
-                None
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                warn!("Neural embedding thread panicked or disconnected, using TF-IDF fallback");
+            None => {
+                debug!("Neural query embedding unavailable; using TF-IDF fallback");
                 None
             }
         }
@@ -516,213 +666,130 @@ impl LeIndex {
     /// 2. Extracts key technical terms and searches with those
     /// 3. Merges and deduplicates results, prioritizing source code files
     fn analyze_search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
-        // Primary search with the full query
         let primary_neural_embedding = self.generate_query_neural_embedding(query);
         let try_additional_neural = primary_neural_embedding.is_some();
+        let primary_results = self
+            .search_engine
+            .search(self.analysis_search_query(query, primary_neural_embedding))
+            .context("Search for analysis failed")?;
 
-        let primary_query = SearchQuery {
+        let key_terms = extract_analysis_keywords(query);
+        let secondary_results = self.optional_analysis_search(
+            &key_terms,
+            key_terms != query.to_lowercase() && !key_terms.is_empty(),
+            try_additional_neural,
+        );
+        let stemmed_terms = extract_stemmed_keywords(query);
+        let stemmed_results = self.optional_analysis_search(
+            &stemmed_terms,
+            !stemmed_terms.is_empty() && stemmed_terms != key_terms,
+            try_additional_neural,
+        );
+
+        let mut final_results =
+            Self::merge_analysis_results(primary_results, secondary_results, stemmed_results);
+        if let Some(pdg) = &self.pdg {
+            let mut file_cache = std::collections::HashMap::new();
+            self.enrich_results_with_pdg_metadata(&mut final_results, pdg, &mut file_cache);
+        }
+        Ok(final_results)
+    }
+
+    fn analysis_search_query(
+        &self,
+        query: &str,
+        query_neural_embedding: Option<Vec<f32>>,
+    ) -> SearchQuery {
+        SearchQuery {
             query: query.to_string(),
             top_k: 15,
             token_budget: None,
             semantic: true,
             expand_context: false,
             query_embedding: Some(self.generate_query_embedding(query)),
-            query_neural_embedding: primary_neural_embedding,
+            query_neural_embedding,
             threshold: Some(0.05),
             query_type: Some(crate::search::ranking::QueryType::Semantic),
-        };
+        }
+    }
 
-        let primary_results = self
-            .search_engine
-            .search(primary_query)
-            .context("Search for analysis failed")?;
+    fn optional_analysis_search(
+        &mut self,
+        query: &str,
+        should_search: bool,
+        try_neural: bool,
+    ) -> Vec<SearchResult> {
+        if !should_search {
+            return Vec::new();
+        }
+        let neural_embedding = try_neural
+            .then(|| self.generate_query_neural_embedding(query))
+            .flatten();
+        self.search_engine
+            .search(self.analysis_search_query(query, neural_embedding))
+            .unwrap_or_default()
+    }
 
-        // Extract key terms from the query for a secondary search.
-        // This helps find relevant code that doesn't contain the exact
-        // query words but contains related technical terms.
-        let key_terms = extract_analysis_keywords(query);
-
-        // Only do secondary search if key terms differ significantly from original
-        let secondary_results = if key_terms != query.to_lowercase() && !key_terms.is_empty() {
-            let secondary_query = SearchQuery {
-                query: key_terms.clone(),
-                top_k: 15,
-                token_budget: None,
-                semantic: true,
-                expand_context: false,
-                query_embedding: Some(self.generate_query_embedding(&key_terms)),
-                query_neural_embedding: if try_additional_neural {
-                    self.generate_query_neural_embedding(&key_terms)
-                } else {
-                    None
-                },
-                threshold: Some(0.05),
-                query_type: Some(crate::search::ranking::QueryType::Semantic),
-            };
-
-            self.search_engine
-                .search(secondary_query)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Third search: use stemmed keywords to find related code.
-        // For example, "scoring" → "score" to find score_hybrid, calculate_text_score, etc.
-        let stemmed_terms = extract_stemmed_keywords(query);
-        let stemmed_results = if !stemmed_terms.is_empty() && stemmed_terms != key_terms {
-            let stemmed_query = SearchQuery {
-                query: stemmed_terms.clone(),
-                top_k: 15,
-                token_budget: None,
-                semantic: true,
-                expand_context: false,
-                query_embedding: Some(self.generate_query_embedding(&stemmed_terms)),
-                query_neural_embedding: if try_additional_neural {
-                    self.generate_query_neural_embedding(&stemmed_terms)
-                } else {
-                    None
-                },
-                threshold: Some(0.05),
-                query_type: Some(crate::search::ranking::QueryType::Semantic),
-            };
-
-            self.search_engine.search(stemmed_query).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Merge results: deduplicate by node_id, keeping the highest score.
-        // Apply source code prioritization: boost source files, penalize
-        // non-source files (docs, scripts, configs).
+    fn merge_analysis_results(
+        primary_results: Vec<SearchResult>,
+        secondary_results: Vec<SearchResult>,
+        stemmed_results: Vec<SearchResult>,
+    ) -> Vec<SearchResult> {
         let mut merged: std::collections::HashMap<String, SearchResult> =
             std::collections::HashMap::new();
-
         for result in primary_results
             .into_iter()
             .chain(secondary_results)
             .chain(stemmed_results)
         {
-            let node_id = result.node_id.clone();
-            let new_score = result.score.overall;
-            match merged.entry(node_id) {
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    // Keep the result with the higher overall score
-                    if new_score > e.get().score.overall {
-                        e.insert(result);
-                    }
+            match merged.entry(result.node_id.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut entry)
+                    if result.score.overall > entry.get().score.overall =>
+                {
+                    entry.insert(result);
                 }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(result);
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(result);
                 }
+                _ => {}
             }
         }
 
         let mut results: Vec<SearchResult> = merged.into_values().collect();
-
-        // Apply source code prioritization
         for result in &mut results {
             if !is_source_code_file(&result.file_path) {
-                // Penalize non-source files (docs, scripts, configs)
                 result.score.overall *= 0.3;
             }
         }
+        Self::sort_results_by_score(&mut results);
 
-        // Apply diversity boost: ensure results from different files
-        // get representation. Group by file path and apply a small penalty
-        // to results from files that already have many entries, so that
-        // results from a variety of files appear in the top 10.
-        let mut file_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        // Sort first by score to establish ranking order
-        results.sort_by(|a, b| {
-            b.score
-                .overall
-                .partial_cmp(&a.score.overall)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let mut file_counts = std::collections::HashMap::new();
         for result in &mut results {
             let count = file_counts.get(&result.file_path).copied().unwrap_or(0);
-            // Apply diminishing returns: each additional result from the
-            // same file gets a 10% penalty
             if count > 0 {
-                result.score.overall *= (0.9_f32).powi(count as i32);
+                result.score.overall *= (0.9_f32).powi(count);
             }
             *file_counts.entry(result.file_path.clone()).or_default() += 1;
         }
 
-        // Sort by adjusted score
-        results.sort_by(|a, b| {
-            b.score
-                .overall
-                .partial_cmp(&a.score.overall)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Take top 10 and re-rank
+        Self::sort_results_by_score(&mut results);
         let mut final_results: Vec<SearchResult> = results.into_iter().take(10).collect();
-        for (i, result) in final_results.iter_mut().enumerate() {
-            result.rank = i + 1;
+        for (index, result) in final_results.iter_mut().enumerate() {
+            result.rank = index + 1;
         }
-
-        // Enrich with PDG metadata (same as regular search)
-        if let Some(pdg) = &self.pdg {
-            let mut file_cache: std::collections::HashMap<String, Option<Vec<u8>>> =
-                std::collections::HashMap::new();
-
-            for result in &mut final_results {
-                if let Some(node_idx) = pdg.find_by_id(&result.node_id) {
-                    if let Some(node) = pdg.get_node(node_idx) {
-                        result.symbol_type = Some(match node.node_type {
-                            crate::graph::pdg::NodeType::Function => "function".to_string(),
-                            crate::graph::pdg::NodeType::Class => "class".to_string(),
-                            crate::graph::pdg::NodeType::Method => "method".to_string(),
-                            crate::graph::pdg::NodeType::Variable => "variable".to_string(),
-                            crate::graph::pdg::NodeType::Module => "module".to_string(),
-                            crate::graph::pdg::NodeType::External => "external".to_string(),
-                        });
-
-                        // Compute line number from byte_range, or fall back to
-                        // searching for the symbol name in the file content
-                        let file_path_str = node.file_path.to_string();
-                        let needs_line = result.line_number.is_none();
-                        if needs_line {
-                            let abs_path = self.resolve_indexed_file_path(&file_path_str);
-                            let content = file_cache
-                                .entry(file_path_str.clone())
-                                .or_insert_with(|| std::fs::read(abs_path).ok());
-
-                            if let Some(content) = content.as_ref() {
-                                if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
-                                    let byte_offset = node.byte_range.0.min(content.len());
-                                    let line_num = content[..byte_offset]
-                                        .iter()
-                                        .filter(|&&b| b == b'\n')
-                                        .count()
-                                        + 1;
-                                    result.line_number = Some(line_num);
-                                } else if !node.name.is_empty() {
-                                    let name_bytes = node.name.as_bytes();
-                                    if let Some(pos) = find_subsequence(content, name_bytes) {
-                                        let line_num =
-                                            content[..pos].iter().filter(|&&b| b == b'\n').count()
-                                                + 1;
-                                        result.line_number = Some(line_num);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    result.caller_count = Some(pdg.predecessor_count(node_idx));
-                    result.dependency_count = Some(pdg.neighbors(node_idx).len());
-                }
-            }
-        }
-
-        Ok(final_results)
+        final_results
     }
 
-    /// Expand context using PDG traversal
+    fn sort_results_by_score(results: &mut [SearchResult]) {
+        results.sort_by(|left, right| {
+            right
+                .score
+                .overall
+                .partial_cmp(&left.score.overall)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
     fn expand_context(
         &self,
         pdg: &ProgramDependenceGraph,
@@ -837,127 +904,133 @@ fn generate_deterministic_embedding(symbol_name: &str) -> Vec<f32> {
     embedding
 }
 
-/// On-demand fuzzy node discovery for event-loop-heavy files.
-///
-/// When exact lookup fails, this function scans the PDG for nodes whose
-/// name or ID contains the query as a case-insensitive substring. This
-/// ensures that winit event-loop entrypoints (e.g., `run_event_loop`,
-/// `EventLoop::run`, `main`) are discoverable even when the user's query
-/// doesn't exactly match the symbol name.
-///
-/// Returns the best-matching NodeId, preferring:
-/// 1. Nodes whose name contains the query as a substring
-/// 2. Nodes whose ID contains the query as a substring
-/// 3. Higher-complexity nodes (event loops tend to be complex)
+// On-demand fuzzy node discovery for event-loop-heavy files.
+//
+// When exact lookup fails, this function scans the PDG for nodes whose
+// name or ID contains the query as a case-insensitive substring. This
+// ensures that winit event-loop entrypoints (e.g., `run_event_loop`,
+// `EventLoop::run`, `main`) are discoverable even when the user's query
+// doesn't exactly match the symbol name.
+//
+// Returns the best-matching NodeId, preferring name, then ID, then
+// higher-complexity event-loop aliases.
+const EVENT_LOOP_ALIASES: &[&str] = &[
+    "run",
+    "main",
+    "event_loop",
+    "event loop",
+    "winit",
+    "app_runner",
+];
+const MAX_FUZZY_FALLBACK_SCAN: usize = 10_000;
+
 fn fuzzy_find_node(
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
     query: &str,
 ) -> Option<crate::graph::pdg::NodeId> {
-    const NAME_MATCH_SCORE: usize = 100;
-    const ID_MATCH_SCORE: usize = 50;
-    const ALIAS_MATCH_SCORE: usize = 25;
-    const COMPLEXITY_SCORE_CAP: u32 = 50;
-    const MAX_FALLBACK_SCAN: usize = 10_000;
-
     let query_lower = query.to_lowercase();
-
-    // Empty query matches nothing — not a wildcard.
     if query_lower.is_empty() {
         return None;
     }
 
-    let event_loop_aliases: &[&str] = &[
-        "run",
-        "main",
-        "event_loop",
-        "event loop",
-        "winit",
-        "app_runner",
-    ];
-
-    let is_event_loop_query = event_loop_aliases
+    let is_event_loop_query = EVENT_LOOP_ALIASES
         .iter()
-        .any(|alias| query_lower.contains(alias));
+        .any(|alias| query_lower == *alias || query_lower.split_whitespace().any(|w| w == *alias));
+    let candidates = fuzzy_candidate_nodes(pdg, &query_lower, is_event_loop_query);
+    let mut best_match = None;
 
-    let mut best_match: Option<(crate::graph::pdg::NodeId, usize)> = None;
-
-    let mut score_node = |node_id: crate::graph::pdg::NodeId, node: &crate::graph::pdg::Node| {
-        let name_lower = node.name.to_lowercase();
-
-        let score = if name_lower.contains(&query_lower) {
-            NAME_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
-        } else {
-            let id_lower = node.id.to_lowercase();
-            if id_lower.contains(&query_lower) {
-                ID_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
-            } else if is_event_loop_query
-                && event_loop_aliases
-                    .iter()
-                    .any(|alias| name_lower.contains(alias))
-            {
-                ALIAS_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
-            } else {
-                return;
-            }
+    for node_id in candidates {
+        let Some(node) = pdg.get_node(node_id) else {
+            continue;
         };
-
-        match &best_match {
-            None => best_match = Some((node_id, score)),
-            Some((_, best_score)) if score > *best_score => {
-                best_match = Some((node_id, score));
-            }
-            _ => {}
-        }
-    };
-
-    let candidate_indices = pdg.trigram_index().query(&query_lower);
-
-    if is_event_loop_query {
-        // Query trigram index for each alias, collect union of candidates
-        let mut alias_candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for alias in event_loop_aliases {
-            if let Some(indices) = pdg.trigram_index().query(alias) {
-                alias_candidates.extend(indices.iter());
-            }
-        }
-        if alias_candidates.is_empty() {
-            // No trigram hits for any alias — fall back to full scan (bounded)
-            for (scanned, node_id) in pdg.node_indices().enumerate() {
-                if scanned >= MAX_FALLBACK_SCAN {
-                    break;
-                }
-                if let Some(node) = pdg.get_node(node_id) {
-                    score_node(node_id, node);
-                }
-            }
-        } else {
-            for &node_idx in &alias_candidates {
-                let node_id = crate::graph::pdg::NodeId::new(node_idx as usize);
-                if let Some(node) = pdg.get_node(node_id) {
-                    score_node(node_id, node);
-                }
-            }
-        }
-    } else if let Some(indices) = candidate_indices {
-        for node_idx in indices {
-            let node_id = crate::graph::pdg::NodeId::new(node_idx as usize);
-            if let Some(node) = pdg.get_node(node_id) {
-                score_node(node_id, node);
-            }
-        }
-    } else {
-        // No trigram index — fall back to full scan (bounded)
-        for (scanned, node_id) in pdg.node_indices().enumerate() {
-            if scanned >= MAX_FALLBACK_SCAN {
-                break;
-            }
-            if let Some(node) = pdg.get_node(node_id) {
-                score_node(node_id, node);
-            }
+        let Some(score) = fuzzy_node_score(node, &query_lower, is_event_loop_query) else {
+            continue;
+        };
+        if best_match
+            .as_ref()
+            .is_none_or(|(_, best_score)| score > *best_score)
+        {
+            best_match = Some((node_id, score));
         }
     }
 
-    best_match.map(|(nid, _)| nid)
+    best_match.map(|(node_id, _)| node_id)
+}
+
+fn fuzzy_candidate_nodes(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    query: &str,
+    is_event_loop_query: bool,
+) -> Vec<crate::graph::pdg::NodeId> {
+    if is_event_loop_query {
+        return event_loop_candidate_nodes(pdg);
+    }
+
+    pdg.trigram_index()
+        .query(query)
+        .map(|indices| {
+            indices
+                .iter()
+                .map(|index| crate::graph::pdg::NodeId::new(*index as usize))
+                .collect()
+        })
+        .unwrap_or_else(|| bounded_node_indices(pdg))
+}
+
+fn event_loop_candidate_nodes(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+) -> Vec<crate::graph::pdg::NodeId> {
+    let mut candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for alias in EVENT_LOOP_ALIASES {
+        if let Some(indices) = pdg.trigram_index().query(alias) {
+            candidates.extend(indices.iter());
+        }
+    }
+
+    if candidates.is_empty() {
+        return bounded_node_indices(pdg);
+    }
+
+    let mut candidates: Vec<_> = candidates.into_iter().collect();
+    candidates.sort_unstable();
+    candidates
+        .into_iter()
+        .map(|index| crate::graph::pdg::NodeId::new(index as usize))
+        .collect()
+}
+
+fn bounded_node_indices(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+) -> Vec<crate::graph::pdg::NodeId> {
+    pdg.node_indices().take(MAX_FUZZY_FALLBACK_SCAN).collect()
+}
+
+fn fuzzy_node_score(
+    node: &crate::graph::pdg::Node,
+    query: &str,
+    is_event_loop_query: bool,
+) -> Option<usize> {
+    const NAME_MATCH_SCORE: usize = 100;
+    const ID_MATCH_SCORE: usize = 50;
+    const ALIAS_MATCH_SCORE: usize = 25;
+    const COMPLEXITY_SCORE_CAP: u32 = 50;
+
+    let name_lower = node.name.to_lowercase();
+    let base_score = if name_lower.contains(query) {
+        NAME_MATCH_SCORE
+    } else if node.id.to_lowercase().contains(query) {
+        ID_MATCH_SCORE
+    } else if is_event_loop_query
+        && EVENT_LOOP_ALIASES
+            .iter()
+            .any(|alias| name_lower.contains(alias))
+    {
+        ALIAS_MATCH_SCORE
+    } else {
+        return None;
+    };
+
+    Some(base_score + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize)
 }
 
 /// Extract stemmed technical terms from a natural language query.
@@ -1178,15 +1251,9 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        query_neural_timeout, simple_stem, LeIndex, DEFAULT_QUERY_EMBED_TIMEOUT_MS,
-        QUERY_EMBED_TIMEOUT_ENV,
-    };
+    use super::{LeIndex, simple_stem};
     use crate::cli::memory::CacheEntry;
     use crate::search::{ranking::Score, search::SearchResult};
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn cached_result(node_id: &str) -> SearchResult {
         SearchResult {
@@ -1208,51 +1275,7 @@ mod tests {
     }
 
     #[test]
-    fn query_neural_timeout_defaults_to_subsecond_budget() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(QUERY_EMBED_TIMEOUT_ENV);
-
-        let timeout = query_neural_timeout();
-
-        assert_eq!(
-            timeout,
-            std::time::Duration::from_millis(DEFAULT_QUERY_EMBED_TIMEOUT_MS)
-        );
-        assert!(timeout < std::time::Duration::from_secs(1));
-    }
-
-    #[test]
-    fn query_neural_timeout_uses_positive_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var(QUERY_EMBED_TIMEOUT_ENV, "42");
-
-        let timeout = query_neural_timeout();
-
-        std::env::remove_var(QUERY_EMBED_TIMEOUT_ENV);
-        assert_eq!(timeout, std::time::Duration::from_millis(42));
-    }
-
-    #[test]
-    fn query_neural_timeout_rejects_zero_and_bad_values() {
-        let _guard = ENV_LOCK.lock().unwrap();
-
-        std::env::set_var(QUERY_EMBED_TIMEOUT_ENV, "0");
-        assert_eq!(
-            query_neural_timeout(),
-            std::time::Duration::from_millis(DEFAULT_QUERY_EMBED_TIMEOUT_MS)
-        );
-
-        std::env::set_var(QUERY_EMBED_TIMEOUT_ENV, "nope");
-        assert_eq!(
-            query_neural_timeout(),
-            std::time::Duration::from_millis(DEFAULT_QUERY_EMBED_TIMEOUT_MS)
-        );
-
-        std::env::remove_var(QUERY_EMBED_TIMEOUT_ENV);
-    }
-
-    #[test]
-    fn cached_search_results_probe_fallback_key_before_embedding_is_needed() {
+    fn cached_search_results_use_fallback_key_without_neural_embedder() {
         let temp_dir = tempfile::tempdir().unwrap();
         let project_path = temp_dir.path().join("project");
         std::fs::create_dir_all(&project_path).unwrap();

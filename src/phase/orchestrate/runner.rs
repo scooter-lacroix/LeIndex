@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::phase::{run_phase_analysis, PhaseAnalysisReport, PhaseOptions, PhaseSelection};
+use crate::phase::{PhaseAnalysisReport, PhaseOptions, PhaseSelection, run_phase_analysis};
 
 /// Abstraction for phase-analysis execution, enabling test doubles.
 pub trait PhaseRunner {

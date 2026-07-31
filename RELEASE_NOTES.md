@@ -1,4 +1,51 @@
-# LeIndex 1.8.4 Release Notes
+# LeIndex 1.9.0 Release Notes
+
+Release date: 2026-07-21
+
+LeIndex 1.9.0 makes the fast path the default: live Git/catalog reads no
+longer hydrate a whole project, exact lookups bypass embedding work, and every
+semantic result keeps TF-IDF and PDG context at its root. Neural vectors remain
+part of the default semantic path. Model startup is observable and awaited by
+state; terminal provider failure keeps the complete TF-IDF/PDG core retrieval
+available.
+
+## Reliability and latency
+
+- MCP indexing is a registry-owned single-flight job. `leindex.index` returns a
+  `job_id` and phase snapshot by default; polling or `wait=true` observes the
+  same job, and a disconnected request cannot cancel persistence or publication.
+- Request timeouts no longer interrupt correctness-critical tool calls. Health
+  snapshots record generation, phase, Git head/tree, indexed/dirty counts,
+  age, and the last failed phase in every applicable response's `_meta`.
+- Git status uses one porcelain-v2 parse and returns native status before
+  resident PDG enrichment. Git inventory honors ignore rules and excludes
+  nested repositories/submodules from the root scan.
+- Read-only catalog access is bounded and validates canonical paths and file
+  hashes before returning exact symbols, file summaries, or grep fallback data.
+- Mmap embeddings use an ID-to-row map and snapshot hydration avoids cloning
+  the full vector corpus into heap memory.
+
+## Core retrieval quality
+
+- TF-IDF lexical retrieval and PDG relationships are mandatory core layers for
+  applicable search, context, deep-analysis, status, and symbol responses.
+  Responses report `tfidf_status` and `pdg_status` explicitly.
+- Exact identifiers and text use deterministic lexical routing with no query
+  neural request. Natural-language searches use the same TF-IDF/PDG nodes and
+  add neural scores only after the worker reports ready.
+- Rust extraction now preserves nested modules, impl methods (including
+  associated functions), enum variants, byte ranges, and qualified names.
+  Hybrid node chunks include bounded nearby documentation/review context.
+- Request-scoped task context is ephemeral and never pollutes durable search or
+  analysis caches. Optional traversal budgets return `partial` metadata rather
+  than cancelling an owning operation.
+
+## Distribution
+
+Cargo, worker, installer, npm, dashboard, pi, PyPI, lockfile, and runtime
+version surfaces are aligned at `1.9.0`.
+
+---
 
 Release date: 2026-07-10
 

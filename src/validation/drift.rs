@@ -1,8 +1,8 @@
 //! Semantic drift detection for signature changes and API breakage
 
 use crate::edit::ResolvedEditChange;
-use crate::graph::pdg::NodeType;
 use crate::graph::ProgramDependenceGraph;
+use crate::graph::pdg::NodeType;
 use crate::parse::traits::{CodeIntelligence, SignatureInfo};
 use crate::validation::Location;
 use crate::validation::ValidationError;
@@ -562,6 +562,8 @@ mod tests {
             calls: vec![],
             imports: vec![],
             byte_range: (0, 14),
+            flow_facts: vec![],
+
             cyclomatic_complexity: 0,
         };
 

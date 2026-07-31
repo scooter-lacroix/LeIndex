@@ -15,8 +15,8 @@ use anyhow::{Context, Result};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Canonical phase names in execution order (VAL-MEASURE-002, VAL-CPHASE-036).
@@ -56,6 +56,47 @@ pub struct WorkloadConfig {
     /// Path to the leindex-embed worker binary (for worker-active phases).
     /// If None, worker-active phases are skipped.
     pub worker_binary: Option<PathBuf>,
+}
+
+/// Copy fixture source files into a disposable directory, excluding its index.
+pub fn copy_fixture_source(source: &Path) -> Result<tempfile::TempDir> {
+    let destination = tempfile::tempdir().context("failed to create isolated fixture directory")?;
+    copy_fixture_contents(source, destination.path())?;
+    Ok(destination)
+}
+
+fn copy_fixture_contents(source: &Path, destination: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(source)
+        .with_context(|| format!("failed to read fixture directory {}", source.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", source.display()))?;
+        if entry.file_name() == ".leindex" {
+            continue;
+        }
+
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", source_path.display()))?
+            .is_dir()
+        {
+            std::fs::create_dir_all(&destination_path)
+                .with_context(|| format!("failed to create {}", destination_path.display()))?;
+            copy_fixture_contents(&source_path, &destination_path)?;
+        } else {
+            std::fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Run the full canonical workload and return per-phase reports.
@@ -291,7 +332,9 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
         .context("failed to write initialized notification to MCP stdin")?;
     stdin_pipe.flush().context("failed to flush MCP stdin")?;
 
-    // Send the search request directly so stdin stays open during sampling.
+    // Send an explicit semantic request directly so stdin stays open during
+    // sampling. This is a real hybrid request: TF-IDF/PDG remain core while
+    // the default auto provider starts and evaluates neural embeddings.
     //
     // Previously this used a background thread that moved stdin_pipe and
     // stdout_reader. When the thread finished (after reading the response),
@@ -303,7 +346,7 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
     // the response afterwards.
     let fixture_path = config.fixture.display().to_string();
     let search_request = format!(
-        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"search","arguments":{{"query":"function","project_path":"{}"}}}}}}"#,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"leindex.search","arguments":{{"query":"how does this project route requests","search_mode":"semantic","project_path":"{}"}}}}}}"#,
         fixture_path.replace('\\', "\\\\").replace('"', "\\\"")
     );
     if let Err(e) = stdin_pipe.write_all(format!("{}\n", search_request).as_bytes()) {
@@ -327,9 +370,9 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
         Some(WORKER_BINARY_NAME),
     )?;
 
-    // Read the search response now that sampling is complete.
-    // Use a short timeout via a background thread so we don't block forever
-    // if the MCP server never responds.
+    // Read the search response now that sampling is complete. The background
+    // reader reports EOF/transport errors through the channel; no elapsed-time
+    // cancellation hides a slow model initialization or inference failure.
     let (tx, rx) = std::sync::mpsc::channel();
     let search_handle = std::thread::spawn(move || {
         let mut search_response = String::new();
@@ -342,23 +385,24 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
         let _ = tx.send(search_response);
     });
 
-    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-        Ok(response) => {
-            if config.verbose {
-                eprintln!("memcheck: MCP search response: {}", response.trim());
-            }
-        }
-        Err(_) => {
-            eprintln!("memcheck: WARNING: embed_active search response timed out, detaching");
-        }
+    let response = rx
+        .recv()
+        .context("MCP search response reader disconnected")?;
+    if config.verbose {
+        eprintln!("memcheck: MCP search response: {}", response.trim());
     }
-    drop(search_handle);
+    search_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("MCP search response reader panicked"))?;
     drop(stdin_pipe);
 
     if config.verbose {
         eprintln!(
             "memcheck: phase 'embed_active' complete — main_rss_max: {} KiB, worker_rss_max: {} KiB, combined_rss_max: {} KiB, samples: {}",
-            report.rss_max_kib, report.worker_rss_max_kib, report.combined_rss_max_kib, report.sample_count
+            report.rss_max_kib,
+            report.worker_rss_max_kib,
+            report.combined_rss_max_kib,
+            report.sample_count
         );
     }
 
@@ -379,7 +423,12 @@ fn run_command_phase(
     }
 
     let mut cmd = build_cmd(&config.binary, &config.fixture);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Drain stdout/stderr to prevent pipe buffer deadlock. The OS pipe
+    // buffer is typically 64KB; without draining, the child process
+    // blocks on write once the buffer is full, causing an indefinite hang.
+    cmd.current_dir(&config.fixture)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     if config.verbose {
         eprintln!("  command: {:?}", cmd);
@@ -389,6 +438,30 @@ fn run_command_phase(
         .spawn()
         .with_context(|| format!("failed to launch {} command", phase_name))?;
     let pid = child.id();
+
+    // Spawn drain threads for stdout and stderr to prevent pipe deadlock.
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let stderr = child.stderr.take().expect("stderr was piped");
+    let stdout_handle = std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            match line {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    let stderr_handle = std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            match line {
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
 
     let start = Instant::now();
     let _sample_interval = config.sample_interval;
@@ -422,6 +495,24 @@ fn run_command_phase(
         .join()
         .map_err(|_| anyhow::anyhow!("sampler thread panicked"))?;
 
+    // Join drain threads so they don't outlive the phase.
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+
+    // Clean up any leindex-embed daemon the command spawned. Command phases
+    // invoke one-shot CLI subcommands (index, search, reindex) that may start
+    // a persistent ONNX worker daemon. Without this cleanup, the daemon
+    // survives the command's exit and leaks as an orphan process.
+    let worker_pids = find_worker_pids(pid, WORKER_BINARY_NAME);
+    if !worker_pids.is_empty() && config.verbose {
+        eprintln!(
+            "memcheck: phase '{}' cleaning up {} orphaned worker process(es)",
+            phase_name,
+            worker_pids.len()
+        );
+    }
+    cleanup_command_phase_workers(&worker_pids);
+
     let duration = start.elapsed();
 
     if !status.success() {
@@ -449,10 +540,9 @@ fn run_command_phase(
 /// Launch a leindex process that stays alive (MCP stdio mode).
 fn launch_mcp_process(config: &WorkloadConfig) -> Result<Child> {
     let mut cmd = Command::new(&config.binary);
-    cmd.arg("--project")
-        .arg(&config.fixture)
-        .arg("mcp")
+    cmd.arg("mcp")
         .arg("--stdio")
+        .current_dir(std::env::temp_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -503,6 +593,61 @@ fn reap_worker_processes(worker_pids: &[u32]) {
         // already exited between our scan and the kill.
         unsafe {
             let _ = libc::kill(worker_pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+/// Kill orphaned worker processes spawned by a command phase, using
+/// SIGTERM followed by SIGKILL after a 3-second grace period.
+///
+/// This mirrors the `shutdown_worker_handle` SIGTERM→wait→SIGKILL escalation
+/// used in the main crate's EmbeddingClient. SIGTERM gives the worker a
+/// chance to flush its ONNX runtime state gracefully; SIGKILL ensures
+/// termination even if the worker is wedged.
+fn cleanup_command_phase_workers(worker_pids: &[u32]) {
+    if worker_pids.is_empty() {
+        return;
+    }
+
+    // Phase 1: SIGTERM all workers.
+    for &worker_pid in worker_pids {
+        // SAFETY: kill(pid, SIGTERM) is a scalar syscall.
+        unsafe {
+            let _ = libc::kill(worker_pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+
+    // Phase 2: Wait up to 3 seconds for graceful exit.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let checked: Vec<u32> = worker_pids.to_vec();
+    let mut exited = Vec::new();
+    while Instant::now() < deadline && exited.len() < checked.len() {
+        for &worker_pid in &checked {
+            if exited.contains(&worker_pid) {
+                continue;
+            }
+            // Check if the process has exited by sending signal 0 (no-op).
+            // SAFETY: kill(pid, 0) checks existence without sending a signal.
+            let alive = unsafe {
+                libc::kill(worker_pid as libc::pid_t, 0) == 0
+                    && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+            };
+            if !alive {
+                exited.push(worker_pid);
+            }
+        }
+        if exited.len() < checked.len() {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    // Phase 3: SIGKILL any survivors.
+    for &worker_pid in &checked {
+        if !exited.contains(&worker_pid) {
+            // SAFETY: kill(pid, SIGKILL) is a scalar syscall.
+            unsafe {
+                let _ = libc::kill(worker_pid as libc::pid_t, libc::SIGKILL);
+            }
         }
     }
 }
@@ -714,6 +859,27 @@ mod tests {
     #[test]
     fn test_canonical_phases_count() {
         assert_eq!(CANONICAL_PHASES.len(), 9);
+    }
+
+    #[test]
+    fn test_copy_fixture_source_excludes_root_leindex() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("src")).unwrap();
+        std::fs::create_dir_all(source.path().join(".leindex")).unwrap();
+        std::fs::write(source.path().join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        std::fs::write(source.path().join(".leindex/index.db"), "source index").unwrap();
+
+        let isolated = copy_fixture_source(source.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(isolated.path().join("src/lib.rs")).unwrap(),
+            "pub fn fixture() {}\n"
+        );
+        assert!(!isolated.path().join(".leindex").exists());
+        assert_eq!(
+            std::fs::read_to_string(source.path().join(".leindex/index.db")).unwrap(),
+            "source index"
+        );
     }
 
     #[test]

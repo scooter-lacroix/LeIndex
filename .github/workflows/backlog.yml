@@ -1,0 +1,36 @@
+name: Backlog Health
+
+on:
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    name: Mark Stale Issues and PRs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+          days-before-stale: 60
+          days-before-close: 14
+          stale-issue-label: 'state:blocked'
+          stale-pr-label: 'state:blocked'
+          exempt-issue-labels: 'P0-critical,P1-high,state:needs-triage,good-first-issue,help wanted'
+          exempt-pr-labels: 'P0-critical,P1-high'
+          stale-issue-message: |
+            This issue has been inactive for 60 days and is being marked stale.
+            It will be closed in 14 days unless there is activity.
+            Comment to keep it open, or close it manually.
+          stale-pr-message: |
+            This PR has been inactive for 60 days and is being marked stale.
+            It will be closed in 14 days unless there is activity.
+            Rebase and push to keep it open.
+          close-issue-message: 'Closed due to inactivity. Reopen if still relevant.'
+          close-pr-message: 'Closed due to inactivity. Reopen with a fresh branch if still needed.'
+          operations-per-run: 30

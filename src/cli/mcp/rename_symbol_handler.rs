@@ -1,11 +1,186 @@
 use super::helpers::{extract_bool, extract_string, make_diff, wrap_with_meta};
 use super::protocol::JsonRpcError;
 use crate::cli::registry::ProjectRegistry;
-use crate::edit::{atomic_write, replace_whole_word, ResolvedEditChange};
+use crate::edit::{ResolvedEditChange, atomic_write, replace_whole_word};
 use crate::validation::validation_to_json;
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+type RenamePlan = (Vec<Value>, Vec<String>, Vec<(String, String, String)>);
+type RenameArgs = (String, String, Option<String>, bool, Option<String>);
+
+fn rename_args(args: &Value) -> Result<RenameArgs, JsonRpcError> {
+    Ok((
+        extract_string(args, "old_name")?,
+        extract_string(args, "new_name")?,
+        args.get("scope").and_then(Value::as_str).map(str::to_owned),
+        extract_bool(args, "preview_only", true),
+        args.get("project_path")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    ))
+}
+
+fn reference_files(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    old_name: &str,
+    new_name: &str,
+    scope: Option<&str>,
+) -> Result<Vec<String>, JsonRpcError> {
+    let node_id = pdg
+        .find_by_symbol(old_name)
+        .or_else(|| pdg.find_by_name(old_name))
+        .or_else(|| pdg.find_by_name_in_file(old_name, None))
+        .ok_or_else(|| {
+            JsonRpcError::invalid_params(format!(
+                "Symbol '{}' not found in project index. The index uses short symbol names \
+                (e.g., 'health_check', not 'ClassName.health_check'). \
+                Try LeIndex [Grep Symbols] to find the exact name.",
+                old_name
+            ))
+        })?;
+    let conflict = pdg
+        .find_by_symbol(new_name)
+        .or_else(|| pdg.find_by_name(new_name))
+        .or_else(|| pdg.find_by_name_in_file(new_name, None));
+    if conflict.is_some() {
+        return Err(JsonRpcError::invalid_params(format!(
+            "Rename conflict: symbol '{}' already exists in the project index. \
+            Renaming '{}' to '{}' would create a duplicate. \
+            Use LeIndex [Grep Symbols] to inspect '{}'.",
+            new_name, old_name, new_name, new_name
+        )));
+    }
+
+    let mut files = std::collections::HashSet::new();
+    if let Some(node) = pdg.get_node(node_id) {
+        files.insert(node.file_path.to_string());
+    }
+    for reference in pdg.backward_impact(
+        node_id,
+        &crate::graph::pdg::TraversalConfig {
+            max_depth: Some(5),
+            ..crate::graph::pdg::TraversalConfig::for_impact_analysis()
+        },
+    ) {
+        if let Some(node) = pdg.get_node(reference) {
+            files.insert(node.file_path.to_string());
+        }
+    }
+    for reference in pdg.find_all_by_name(old_name) {
+        if let Some(node) = pdg.get_node(reference) {
+            files.insert(node.file_path.to_string());
+        }
+    }
+    Ok(files
+        .into_iter()
+        .filter(|file| scope.is_none_or(|scope| file.starts_with(scope)))
+        .collect())
+}
+
+fn build_rename_plan(
+    files: Vec<String>,
+    old_name: &str,
+    new_name: &str,
+) -> Result<RenamePlan, String> {
+    let mut diffs = Vec::new();
+    let mut files_to_modify = Vec::new();
+    let mut contents = Vec::new();
+    for file_path in files {
+        let original = std::fs::read_to_string(&file_path)
+            .map_err(|error| format!("Failed reading '{}': {}", file_path, error))?;
+        let modified = replace_whole_word(&original, old_name, new_name);
+        if modified != original {
+            let diff = make_diff(&original, &modified, &file_path);
+            diffs.push(serde_json::json!({
+                "file": file_path,
+                "diff": diff.to_json(),
+                "diff_text": crate::cli::mcp::output::render_unified_diff(&diff, false),
+            }));
+            files_to_modify.push(file_path.clone());
+            contents.push((file_path, original, modified));
+        }
+    }
+    Ok((diffs, files_to_modify, contents))
+}
+
+fn apply_rename_plan(contents: Vec<(String, String, String)>) -> Result<(), String> {
+    let mut written: Vec<(String, String)> = Vec::new();
+    for (file_path, original, modified) in contents {
+        if let Err(error) = atomic_write(std::path::Path::new(&file_path), modified.as_bytes()) {
+            for (written_path, original_content) in written.into_iter().rev() {
+                let _ = atomic_write(
+                    std::path::Path::new(&written_path),
+                    original_content.as_bytes(),
+                );
+            }
+            return Err(format!("Failed writing '{}': {}", file_path, error));
+        }
+        written.push((file_path, original));
+    }
+    Ok(())
+}
+
+fn validate_rename_plan(
+    validator: Option<crate::validation::LogicValidator>,
+    contents: &[(String, String, String)],
+    preview_only: bool,
+) -> Result<Option<Value>, JsonRpcError> {
+    let Some(validator) = validator else {
+        return Ok(None);
+    };
+    let changes: Vec<ResolvedEditChange> = contents
+        .iter()
+        .map(|(path, original, modified)| {
+            ResolvedEditChange::new(PathBuf::from(path), original.clone(), modified.clone())
+                .with_edit_type(crate::edit::EditType::Rename)
+        })
+        .collect();
+    let result = match validator.validate_changes(&changes) {
+        Ok(result) => result,
+        Err(error) => {
+            tracing::warn!("Rename validation check failed: {}", error);
+            return Ok(None);
+        }
+    };
+    let validation = validation_to_json(&result);
+    if result.has_errors() && !preview_only {
+        let count = |key| validation[key].as_array().map_or(0, std::vec::Vec::len);
+        return Err(JsonRpcError::invalid_params(format!(
+            "Rename rejected — validation found errors. Files unchanged.\n\n\
+             Syntax errors: {}\nReference issues: {}\nSemantic drift: {}\n\n\
+             Details: {}",
+            count("syntax_errors"),
+            count("reference_issues"),
+            count("semantic_drift"),
+            validation
+        )));
+    }
+    Ok(Some(validation))
+}
+
+fn rename_response(
+    old_name: String,
+    new_name: String,
+    preview_only: bool,
+    files: Vec<String>,
+    diffs: Vec<Value>,
+    validation: Option<Value>,
+) -> Value {
+    let mut response = serde_json::json!({
+        "old_name": old_name,
+        "new_name": new_name,
+        "files_affected": files.len(),
+        "preview_only": preview_only,
+        "diffs": diffs,
+        "applied": !preview_only
+    });
+    if let (Some(validation), Some(object)) = (validation, response.as_object_mut()) {
+        object.insert("validation".to_string(), validation);
+    }
+    response
+}
 
 /// Handler for LeIndex [rename_symbol — rename a symbol across all files.
 #[derive(Clone)]
@@ -63,16 +238,8 @@ Grep + multi-file Edit with a single atomic operation."
         registry: &Arc<ProjectRegistry>,
         args: Value,
     ) -> Result<Value, JsonRpcError> {
-        let old_name = extract_string(&args, "old_name")?;
-        let new_name = extract_string(&args, "new_name")?;
-        let scope = args
-            .get("scope")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned);
-        let preview_only = extract_bool(&args, "preview_only", true);
-        let project_path = args.get("project_path").and_then(|v| v.as_str());
-
-        let handle = registry.get_or_create(project_path).await?;
+        let (old_name, new_name, scope, preview_only, project_path) = rename_args(&args)?;
+        let handle = registry.get_or_create(project_path.as_deref()).await?;
         let mut index = handle.write().await;
         index
             .ensure_pdg_loaded()
@@ -81,112 +248,19 @@ Grep + multi-file Edit with a single atomic operation."
             JsonRpcError::project_not_indexed(index.project_path().display().to_string())
         })?;
 
-        // Collect all files containing references to old_name
-        let mut ref_files: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        // Resolve old_name to PDG node using multiple strategies:
-        // 1. Exact ID match ("file_path:qualified_name")
-        // 2. Name-based match ("health_check")
-        // 3. Fuzzy case-insensitive substring match
-        let node_id = pdg
-            .find_by_symbol(&old_name)
-            .or_else(|| pdg.find_by_name(&old_name))
-            .or_else(|| pdg.find_by_name_in_file(&old_name, None));
-
-        if let Some(node_id) = node_id {
-            // --- Name conflict check ---
-            // Reject rename if new_name already exists as a symbol in the PDG,
-            // which would create an ambiguous binding or break references.
-            let name_conflict = pdg
-                .find_by_symbol(&new_name)
-                .or_else(|| pdg.find_by_name(&new_name))
-                .or_else(|| pdg.find_by_name_in_file(&new_name, None));
-            if name_conflict.is_some() {
-                return Err(JsonRpcError::invalid_params(format!(
-                    "Rename conflict: symbol '{}' already exists in the project index. \
-                    Renaming '{}' to '{}' would create a duplicate. \
-                    Use LeIndex [Grep Symbols] to inspect '{}'.",
-                    new_name, old_name, new_name, new_name
-                )));
-            }
-
-            // The definition file
-            if let Some(n) = pdg.get_node(node_id) {
-                ref_files.insert(n.file_path.to_string());
-            }
-            // Include all known incoming references, not just direct call edges.
-            // This captures call, data, and transitive usage relationships.
-            for ref_id in pdg.backward_impact(
-                node_id,
-                &crate::graph::pdg::TraversalConfig {
-                    max_depth: Some(5),
-                    ..crate::graph::pdg::TraversalConfig::for_impact_analysis()
-                },
-            ) {
-                if let Some(dn) = pdg.get_node(ref_id) {
-                    ref_files.insert(dn.file_path.to_string());
-                }
-            }
-            // Also include files where the old_name appears in other symbols' IDs
-            // (e.g., imports or references that aren't captured as direct callers)
-            for nid in pdg.find_all_by_name(&old_name) {
-                if let Some(n) = pdg.get_node(nid) {
-                    ref_files.insert(n.file_path.to_string());
-                }
-            }
-        } else {
-            return Err(JsonRpcError::invalid_params(format!(
-                "Symbol '{}' not found in project index. The index uses short symbol names \
-                (e.g., 'health_check', not 'ClassName.health_check'). \
-                Try LeIndex [Grep Symbols] to find the exact name.",
-                old_name
-            )));
-        }
-
-        // Apply scope filter
-        let filtered_files: Vec<String> = ref_files
-            .into_iter()
-            .filter(|f| {
-                scope
-                    .as_ref()
-                    .map(|s| f.starts_with(s.as_str()))
-                    .unwrap_or(true)
-            })
-            .collect();
+        let filtered_files = reference_files(pdg, &old_name, &new_name, scope.as_deref())?;
 
         // Release the mutex before spawning blocking I/O.
         // All PDG data has been extracted into filtered_files above.
         drop(index);
 
-        // Generate per-file diffs (file I/O — offload to blocking thread)
-        let (diffs, files_to_modify, file_contents) = tokio::task::spawn_blocking({
-            let old_name = old_name.clone();
-            let new_name = new_name.clone();
-            #[allow(clippy::type_complexity)]
-            move || -> Result<(Vec<Value>, Vec<String>, Vec<(String, String, String)>), String> {
-                let mut diffs: Vec<Value> = Vec::new();
-                let mut files_to_modify: Vec<String> = Vec::new();
-                let mut file_contents: Vec<(String, String, String)> = Vec::new(); // (path, original, modified)
-                for file_path in &filtered_files {
-                    let original = std::fs::read_to_string(file_path)
-                        .map_err(|e| format!("Failed reading '{}': {}", file_path, e))?;
-                    let modified = replace_whole_word(&original, &old_name, &new_name);
-                    if modified != original {
-                        let diff = make_diff(&original, &modified, file_path);
-                        diffs.push(serde_json::json!({
-                            "file": file_path,
-                            "diff": diff.to_json(),
-                            "diff_text": crate::cli::mcp::output::render_unified_diff(&diff, false),
-                        }));
-                        files_to_modify.push(file_path.clone());
-                        file_contents.push((file_path.clone(), original, modified));
-                    }
-                }
-                Ok((diffs, files_to_modify, file_contents))
-            }
+        let plan_old_name = old_name.clone();
+        let plan_new_name = new_name.clone();
+        let (diffs, files_to_modify, file_contents) = tokio::task::spawn_blocking(move || {
+            build_rename_plan(filtered_files, &plan_old_name, &plan_new_name)
         })
         .await
-        .map_err(|e| JsonRpcError::internal_error(format!("Rename task failed: {}", e)))?
+        .map_err(|error| JsonRpcError::internal_error(format!("Rename task failed: {}", error)))?
         .map_err(JsonRpcError::internal_error)?;
 
         // --- Syntax validation via LogicValidator ---
@@ -194,90 +268,17 @@ Grep + multi-file Edit with a single atomic operation."
         // For non-preview renames, reject if validation finds errors.
         // For preview renames, include validation results as warnings.
         let validation_json = {
-            let idx = handle.read().await;
-            match idx.create_validator() {
-                Some(validator) => {
-                    // Build ResolvedEditChanges from the proposed file modifications
-                    let resolved: Vec<ResolvedEditChange> = file_contents
-                        .iter()
-                        .map(|(path, original, modified)| {
-                            let mut change = ResolvedEditChange::new(
-                                PathBuf::from(path),
-                                original.clone(),
-                                modified.clone(),
-                            );
-                            change = change.with_edit_type(crate::edit::EditType::Rename);
-                            change
-                        })
-                        .collect();
-
-                    match validator.validate_changes(&resolved) {
-                        Ok(result) => {
-                            let has_errors = result.has_errors();
-                            let v_json = validation_to_json(&result);
-
-                            if has_errors && !preview_only {
-                                // Build detailed error response — reject the rename
-                                let syn_errs = v_json["syntax_errors"]
-                                    .as_array()
-                                    .map(|a| a.len())
-                                    .unwrap_or(0);
-                                let ref_issues = v_json["reference_issues"]
-                                    .as_array()
-                                    .map(|a| a.len())
-                                    .unwrap_or(0);
-                                let drift = v_json["semantic_drift"]
-                                    .as_array()
-                                    .map(|a| a.len())
-                                    .unwrap_or(0);
-                                return Err(JsonRpcError::invalid_params(format!(
-                                    "Rename rejected — validation found errors. Files unchanged.\n\
-                                     Syntax errors: {}\nReference issues: {}\nSemantic drift: {}\n\
-                                     Details: {}",
-                                    syn_errs, ref_issues, drift, v_json
-                                )));
-                            }
-
-                            // Include validation in response (warnings or preview mode)
-                            Some(v_json)
-                        }
-                        Err(e) => {
-                            // Validation itself failed — log warning but don't block
-                            tracing::warn!("Rename validation check failed: {}", e);
-                            None
-                        }
-                    }
-                }
-                None => None,
-            }
+            let index = handle.read().await;
+            validate_rename_plan(index.create_validator(), &file_contents, preview_only)?
         };
 
         if !preview_only {
-            // Apply changes to all files (file I/O — offload to blocking thread)
-            // IMPORTANT: Write the validated buffers from file_contents instead of recomputing.
-            // If files change between validation and write, recomputing would corrupt data.
-            let validated_contents = file_contents;
-            tokio::task::spawn_blocking(move || {
-                let mut written: Vec<(String, String)> = Vec::new();
-                for (file_path, original, modified) in validated_contents {
-                    if let Err(e) =
-                        atomic_write(std::path::Path::new(&file_path), modified.as_bytes())
-                    {
-                        for (written_path, original_content) in written.into_iter().rev() {
-                            let _ = atomic_write(
-                                std::path::Path::new(&written_path),
-                                original_content.as_bytes(),
-                            );
-                        }
-                        return Err(format!("Failed writing '{}': {}", file_path, e));
-                    }
-                    written.push((file_path, original));
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|e| JsonRpcError::internal_error(format!("Rename apply task failed: {}", e)))?
-            .map_err(JsonRpcError::internal_error)?;
+            tokio::task::spawn_blocking(move || apply_rename_plan(file_contents))
+                .await
+                .map_err(|error| {
+                    JsonRpcError::internal_error(format!("Rename apply task failed: {}", error))
+                })?
+                .map_err(JsonRpcError::internal_error)?;
 
             // Invalidate the registry's staleness cache so the next
             // read tool re-runs `is_stale_fast` instead of reusing
@@ -297,21 +298,14 @@ Grep + multi-file Edit with a single atomic operation."
             registry.invalidate_stale_cache(&project_root).await;
         }
 
-        let mut response_data = serde_json::json!({
-            "old_name": old_name,
-            "new_name": new_name,
-            "files_affected": files_to_modify.len(),
-            "preview_only": preview_only,
-            "diffs": diffs,
-            "applied": !preview_only
-        });
-
-        // Include validation results in response
-        if let Some(validation) = validation_json {
-            if let Some(obj) = response_data.as_object_mut() {
-                obj.insert("validation".to_string(), validation);
-            }
-        }
+        let response_data = rename_response(
+            old_name,
+            new_name,
+            preview_only,
+            files_to_modify,
+            diffs,
+            validation_json,
+        );
 
         // Re-acquire the lock for wrap_with_meta (released before spawn_blocking)
         let index = handle.read().await;

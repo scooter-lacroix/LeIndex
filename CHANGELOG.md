@@ -2,6 +2,37 @@
 
 All notable changes to the LeIndex project are documented in this file.
 
+## [1.9.0] - 2026-07-21 - Fast Core Retrieval and Owned Index Jobs
+
+### Added
+
+- Registry-owned single-flight index jobs with phase snapshots, polling, and
+  durable generation health metadata.
+- Live Git porcelain-v2 inventory/status paths, bounded read-only catalog
+  lookups, exact lexical routing, and ephemeral task-context retrieval.
+- Rust nested-module/impl/enum extraction, bounded documentation context, and
+  first-class TF-IDF/PDG/neural readiness metadata on MCP results.
+- Criterion MCP latency benchmark harness and a scheduled performance smoke
+  workflow.
+
+### Changed
+
+- TF-IDF and PDG remain mandatory result layers; ONNX-enabled builds now
+  actively start/await the configured neural worker for hybrid indexing and
+  semantic retrieval, with terminal neural failure falling back to the core.
+- MCP tool calls no longer cancel indexing or persistence at a wall-clock
+  timeout. Indexing remains owned and queryable after transport disconnects.
+- Git status, diagnostics, exact reads, mmap hydration, and search startup no
+  longer force eager project hydration or whole-vector heap copies.
+- Version parity across all published metadata and installers is `1.9.0`.
+
+### Fixed
+
+- Prevented model startup and daemon spawn-lock contention from blocking the
+  Unix socket bind and unrelated exact/core requests.
+- Preserved prior generations on index failure and exposed the failed phase
+  instead of leaving stale warnings without actionable health data.
+
 ## [1.8.4] - 2026-07-10 - Fast Hybrid Retrieval and Reliable Local Embeddings
 
 ### Added
@@ -17,7 +48,7 @@ All notable changes to the LeIndex project are documented in this file.
 - **Hybrid retrieval remains node-level**: TF-IDF, neural embeddings, and PDG structural signals continue to index and rank code nodes rather than a separate file/chunk sidecar. Semantic scoring augments symbol, context, impact, and traversal tools without reducing their graph coverage.
 - **Batched neural indexing**: CPU and CUDA use dynamic batches of up to 32 with real-size final batches. MIGraphX uses one stable 8-row shape, padding only the final batch or query and discarding padded outputs. Every provider supplies `position_ids`, caps inputs at 128 tokens by default, and preserves request order through IPC.
 - **Correct Qwen3 embeddings**: Runtime pooling now selects the final unpadded token and L2-normalizes it, matching the model contract. The previous mean-pooling path produced embeddings that were valid tensors but semantically incorrect for Qwen3.
-- **Bounded query latency**: Hybrid search gives neural query embedding 250 ms by default. If the worker is cold, compiling, unavailable, or over budget, TF-IDF and structural retrieval return immediately instead of holding the request for seconds. `LEINDEX_QUERY_NEURAL_TIMEOUT_MS` adjusts the budget.
+- **Readiness-gated query enrichment**: Hybrid search uses neural query scoring only after the worker reports ready. TF-IDF and structural retrieval remain the complete core path while neural setup is cold, compiling, unavailable, or unhealthy.
 - **Incremental loading**: Unchanged projects load persisted snapshots and mmap vectors directly. Incremental indexing only updates changed PDG nodes; maintenance is performed when the fingerprint or stored artifacts require it.
 - **MIGraphX execution**: MIGraphX sessions use ORT graph optimization level 3, a persistent model/version/batch/sequence cache under `$LEINDEX_HOME/cache/migraphx`, stable input shapes, and setup warmup so compilation is not repeated by each command.
 - **Version parity**: Cargo, shell installers, root/npm/dashboard/pi package metadata, PyPI metadata, and runtime constants are aligned at `1.8.4`.

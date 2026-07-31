@@ -3,9 +3,7 @@
 #[cfg(feature = "parse")]
 use crate::parse::traits::{Block, Edge, Parameter, Visibility};
 #[cfg(feature = "parse")]
-use crate::parse::traits::{
-    CodeIntelligence, Error, Graph, ImportInfo, Result, SignatureInfo,
-};
+use crate::parse::traits::{CodeIntelligence, Error, Graph, ImportInfo, Result, SignatureInfo};
 #[cfg(feature = "parse")]
 use tree_sitter::Parser;
 
@@ -56,10 +54,14 @@ impl CodeIntelligence for SwiftParser {
         let tree = parser
             .parse(source, None)
             .ok_or_else(|| Error::ParseFailed("Failed to parse Swift source".to_string()))?;
-        
+
         // Find the function/method with the given node_id
-        fn find_node_by_id<'a>(root: &'a tree_sitter::Node<'a>, target_id: usize) -> Option<tree_sitter::Node<'a>> {
-            let mut queue: std::collections::VecDeque<tree_sitter::Node<'a>> = std::collections::VecDeque::new();
+        fn find_node_by_id<'a>(
+            root: &'a tree_sitter::Node<'a>,
+            target_id: usize,
+        ) -> Option<tree_sitter::Node<'a>> {
+            let mut queue: std::collections::VecDeque<tree_sitter::Node<'a>> =
+                std::collections::VecDeque::new();
             queue.push_back(*root);
 
             while let Some(current) = queue.pop_front() {
@@ -75,7 +77,7 @@ impl CodeIntelligence for SwiftParser {
 
             None
         }
-        
+
         if let Some(found) = find_node_by_id(&tree.root_node(), node_id) {
             return extract_swift_cfg(&found, source);
         }
@@ -83,7 +85,10 @@ impl CodeIntelligence for SwiftParser {
         Err(Error::ParseFailed("Node not found".to_string()))
     }
 
-    fn extract_complexity(&self, node: &tree_sitter::Node<'_>) -> crate::parse::traits::ComplexityMetrics {
+    fn extract_complexity(
+        &self,
+        node: &tree_sitter::Node<'_>,
+    ) -> crate::parse::traits::ComplexityMetrics {
         let mut complexity = crate::parse::traits::ComplexityMetrics {
             cyclomatic: 1,
             nesting_depth: 0,
@@ -128,7 +133,7 @@ fn visit_swift(
                 } else {
                     format!("{}::{}", parent_path.join("::"), name)
                 };
-                
+
                 signatures.push(SignatureInfo {
                     name: name.clone(),
                     qualified_name,
@@ -141,6 +146,8 @@ fn visit_swift(
                     calls: vec![],
                     imports: Vec::new(),
                     byte_range: (node.start_byte(), node.end_byte()),
+                    flow_facts: vec![],
+
                     cyclomatic_complexity: 0,
                 });
             }
@@ -150,7 +157,7 @@ fn visit_swift(
                 let name = name_node.utf8_text(source).unwrap_or("unknown").to_string();
                 let mut new_path = parent_path.to_vec();
                 new_path.push(name.clone());
-                
+
                 for child in node.children(&mut node.walk()) {
                     visit_swift(&child, source, signatures, &new_path);
                 }

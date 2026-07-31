@@ -5,7 +5,7 @@
 
 use crate::graph::pdg::{EdgeId, NodeId, ProgramDependenceGraph};
 use crate::storage::global_symbols::{GlobalSymbol, GlobalSymbolId};
-use crate::storage::pdg_store::{load_pdg, PdgStoreError};
+use crate::storage::pdg_store::{PdgStoreError, load_pdg};
 use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 

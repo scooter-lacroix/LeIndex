@@ -33,6 +33,8 @@ pub mod helpers;
 pub mod output;
 /// MCP protocol definitions and JSON-RPC types.
 pub mod protocol;
+/// Request budgets, timing metadata, and causal-path counters.
+pub mod request_meta;
 
 /// Handler for LeIndex [Context] — PDG-based context expansion.
 pub mod context_handler;
@@ -81,8 +83,8 @@ pub mod server;
 pub mod sse;
 
 pub use protocol::{
-    error_codes, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
-    JsonRpcResponse, NotificationType,
+    JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    NotificationType, error_codes,
 };
 pub use server::{McpServer, McpServerConfig};
 

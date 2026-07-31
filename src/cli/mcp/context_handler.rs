@@ -1,5 +1,6 @@
-use super::helpers::{extract_string, extract_usize, wrap_with_meta};
+use super::helpers::{extract_bool, extract_string, extract_usize, wrap_with_meta};
 use super::protocol::JsonRpcError;
+use super::request_meta::WorkBudget;
 use crate::cli::registry::ProjectRegistry;
 use serde_json::Value;
 use std::sync::Arc;
@@ -47,6 +48,18 @@ without reading the entire file. Accepts project_path to auto-switch between pro
                     "default": 2000,
                     "minimum": 100,
                     "maximum": 100000
+                },
+                "max_latency_ms": {
+                    "type": "integer",
+                    "description": "Optional enrichment budget; elapsed work returns partial PDG context (default: 1500)",
+                    "default": 1500,
+                    "minimum": 0,
+                    "maximum": 60000
+                },
+                "allow_partial": {
+                    "type": "boolean",
+                    "description": "Allow bounded PDG context when the enrichment budget is reached",
+                    "default": true
                 }
             },
             "required": ["node_id"]
@@ -61,6 +74,11 @@ without reading the entire file. Accepts project_path to auto-switch between pro
     ) -> Result<Value, JsonRpcError> {
         let node_id = extract_string(&args, "node_id")?;
         let token_budget = extract_usize(&args, "token_budget", 2000)?;
+        let budget = WorkBudget {
+            max_latency_ms: extract_usize(&args, "max_latency_ms", 1500)? as u64,
+            allow_partial: extract_bool(&args, "allow_partial", true),
+        };
+        let started = std::time::Instant::now();
 
         let project_path = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path).await?;
@@ -87,8 +105,23 @@ without reading the entire file. Accepts project_path to auto-switch between pro
                 }
             })?;
 
+        let partial = budget.elapsed(started);
         serde_json::to_value(result)
             .map_err(|e| JsonRpcError::internal_error(format!("Serialization error: {}", e)))
-            .map(|v| wrap_with_meta(v, &guard))
+            .map(|mut v| {
+                if let Some(object) = v.as_object_mut() {
+                    object.insert(
+                        "retrieval".to_string(),
+                        serde_json::json!({
+                            "tfidf_status": "fresh",
+                            "pdg_status": if partial { "partial" } else { "fresh" },
+                            "max_latency_ms": budget.max_latency_ms,
+                            "allow_partial": budget.allow_partial,
+                            "neural_status": guard.neural_status()
+                        }),
+                    );
+                }
+                wrap_with_meta(v, &guard)
+            })
     }
 }

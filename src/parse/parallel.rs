@@ -227,7 +227,7 @@ impl ParallelParser {
         let source = match std::fs::read(&file_path) {
             Ok(contents) => contents,
             Err(e) => {
-                return ParsingResult::failure(file_path, format!("Failed to read file: {}", e))
+                return ParsingResult::failure(file_path, format!("Failed to read file: {}", e));
             }
         };
 
@@ -238,7 +238,7 @@ impl ParallelParser {
                 return ParsingResult::failure(
                     file_path,
                     format!("No parser found for language: {}", language_name),
-                )
+                );
             }
         };
 

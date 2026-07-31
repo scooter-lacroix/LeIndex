@@ -115,6 +115,8 @@ mod tests {
                     call_count: None,
                     confidence: None,
                     variable_name: None,
+                    channel: None,
+                    position: None,
                 },
             },
         );
@@ -127,6 +129,8 @@ mod tests {
                     call_count: None,
                     confidence: None,
                     variable_name: None,
+                    channel: None,
+                    position: None,
                 },
             },
         );

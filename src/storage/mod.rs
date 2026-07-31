@@ -7,6 +7,8 @@
 
 /// Storage analytics and metrics.
 pub mod analytics;
+/// Bounded read-only catalog queries for exact MCP reads.
+pub mod catalog;
 /// Cross-project reference resolution and graph merging.
 pub mod cross_project;
 /// Storage and retrieval of graph edges.
@@ -30,6 +32,7 @@ pub mod schema;
 pub mod turso_config;
 
 pub use analytics::Analytics;
+pub use catalog::{CatalogReader, CatalogSymbol};
 pub use cross_project::{CrossProjectResolver, MergeError, ResolutionError, ResolvedSymbol};
 pub use edges::{EdgeRecord, EdgeStore};
 pub use global_symbols::{
@@ -38,13 +41,13 @@ pub use global_symbols::{
 };
 pub use nodes::{NodeRecord, NodeStore};
 pub use pdg_store::{
-    delete_pdg, load_pdg, pdg_exists, save_pdg, PdgStoreError, Result as PdgStoreResult,
+    PdgStoreError, Result as PdgStoreResult, delete_pdg, load_pdg, pdg_exists, save_pdg,
 };
 pub use project_id::UniqueProjectId;
 pub use project_metadata::{ProjectMetadata, ProjectMetadataError};
 pub use salsa::{IncrementalCache, NodeHash};
 pub use schema::{
-    Storage, StorageConfig, StoragePool, StoragePoolError, StorageRole, DEFAULT_READER_POOL_SIZE,
+    DEFAULT_READER_POOL_SIZE, Storage, StorageConfig, StoragePool, StoragePoolError, StorageRole,
 };
 
 #[cfg(feature = "turso")]

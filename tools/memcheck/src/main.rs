@@ -104,9 +104,10 @@ fn main() -> Result<()> {
         }
     }
 
+    let isolated_fixture = workload::copy_fixture_source(&fixture)?;
     let config = workload::WorkloadConfig {
         binary,
-        fixture: fixture.clone(),
+        fixture: isolated_fixture.path().to_path_buf(),
         sample_interval: std::time::Duration::from_millis(args.sample_interval_ms),
         verbose: args.verbose,
         worker_binary: Some(

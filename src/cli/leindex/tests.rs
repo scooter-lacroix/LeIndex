@@ -1,6 +1,40 @@
 use super::*;
 use tempfile::tempdir;
 
+#[cfg(unix)]
+#[test]
+fn project_write_lock_is_mutually_exclusive() {
+    // The cross-process write lock must deny a second acquirer while held.
+    // This exercises the real kernel flock: a held LOCK_EX (fd A) makes a
+    // concurrent LOCK_EX|LOCK_NB (fd B) return EWOULDBLOCK. flock enforces
+    // exclusion across independent opens regardless of process boundary, so a
+    // same-process check proves the serialization the SQLite WAL-corruption
+    // fix depends on. If this fails, concurrent writers can corrupt the DB.
+    let dir = tempdir().unwrap();
+    let storage = dir.path().join(".leindex");
+    std::fs::create_dir_all(&storage).unwrap();
+
+    // Free initially.
+    let probe = ProjectWriteLock::try_acquire(&storage).unwrap();
+    assert!(probe.is_some(), "lock should be free when uncontended");
+    let holder = probe.unwrap();
+
+    // Held -> second acquirer denied.
+    let denied = ProjectWriteLock::try_acquire(&storage).unwrap();
+    assert!(
+        denied.is_none(),
+        "second acquirer must be denied while the lock is held"
+    );
+
+    // Released -> acquirer succeeds again.
+    drop(holder);
+    let reacquired = ProjectWriteLock::try_acquire(&storage).unwrap();
+    assert!(
+        reacquired.is_some(),
+        "lock must be free again after the holder drops"
+    );
+}
+
 #[test]
 fn test_project_scan_excludes_lockfiles_from_source_but_keeps_manifests() {
     let dir = tempdir().unwrap();
@@ -19,18 +53,21 @@ fn test_project_scan_excludes_lockfiles_from_source_but_keeps_manifests() {
     let mut index = LeIndex::new(dir.path()).unwrap();
     let scan = index.get_project_scan(true).unwrap();
 
-    assert!(scan
-        .source_paths
-        .iter()
-        .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("main.rs")));
-    assert!(scan
-        .source_paths
-        .iter()
-        .all(|path| path.file_name().and_then(|name| name.to_str()) != Some("package-lock.json")));
-    assert!(scan
-        .manifest_paths
-        .iter()
-        .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("package.json")));
+    assert!(
+        scan.source_paths
+            .iter()
+            .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("main.rs"))
+    );
+    assert!(
+        scan.source_paths.iter().all(
+            |path| path.file_name().and_then(|name| name.to_str()) != Some("package-lock.json")
+        )
+    );
+    assert!(
+        scan.manifest_paths
+            .iter()
+            .any(|path| path.file_name().and_then(|name| name.to_str()) == Some("package.json"))
+    );
     assert!(scan.manifest_paths.iter().any(|path| {
         path.file_name().and_then(|name| name.to_str()) == Some("package-lock.json")
     }));

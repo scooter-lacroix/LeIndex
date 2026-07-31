@@ -47,7 +47,7 @@ fn val_ort_015_runtime_discovers_and_loads_ort_dylib() {
     // Disable any explicit override so we exercise the full discovery chain
     // (env -> config -> user_lib -> sibling -> pip -> system paths).
     let saved = std::env::var("ORT_DYLIB_PATH").ok();
-    std::env::remove_var("ORT_DYLIB_PATH");
+    unsafe { std::env::remove_var("ORT_DYLIB_PATH") };
 
     let init = leindex_embed::discover_and_init();
     match &init {
@@ -87,7 +87,7 @@ fn val_ort_015_runtime_discovers_and_loads_ort_dylib() {
     }
 
     if let Some(v) = saved {
-        std::env::set_var("ORT_DYLIB_PATH", v);
+        unsafe { std::env::set_var("ORT_DYLIB_PATH", v) };
     }
 }
 
