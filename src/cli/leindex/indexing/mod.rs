@@ -213,7 +213,7 @@ impl LeIndex {
         &self,
         staging: &std::path::Path,
         target: &std::path::Path,
-        generations: &std::path::Path,
+        _generations: &std::path::Path,
         generation: u64,
     ) -> Result<()> {
         // Rename the complete directory once. Readers either see no new
@@ -226,7 +226,7 @@ impl LeIndex {
             )
         })?;
         #[cfg(unix)]
-        std::fs::File::open(generations)?.sync_all()?;
+        std::fs::File::open(_generations)?.sync_all()?;
         let current = self.storage_path().join("CURRENT");
         let next = self.storage_path().join("CURRENT.next");
         let mut current_file = std::fs::File::create(&next)?;
