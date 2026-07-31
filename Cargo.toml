@@ -332,7 +332,7 @@ axum = { version = "0.7", features = ["ws"], optional = true }
 tower = { version = "0.5", features = ["full"], optional = true }
 tower-http = { version = "0.5", features = ["cors", "trace"], optional = true }
 futures = { version = "0.3", optional = true }
-tokio-tungstenite = { version = "0.21", optional = true }
+tokio-tungstenite = { version = "0.24", optional = true }
 
 # Shared async/streaming dependencies (used by both mcp-server and server features)
 tokio-stream = { version = "0.1", optional = true }
