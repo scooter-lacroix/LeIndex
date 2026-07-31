@@ -342,30 +342,28 @@ fn test_val_measure_011_missing_baseline_enforces_ceiling() {
 
 #[test]
 fn test_val_measure_012_xtask_memcheck_entrypoint() {
-    // Verify the xtask binary accepts the memcheck subcommand
+    // Verify the xtask binary accepts the memcheck subcommand.
+    // Uses `cargo run` instead of a hardcoded binary path to respect
+    // CARGO_TARGET_DIR, platform executable suffix, and ensure a fresh build.
     let root = workspace_root();
-    let xtask_bin = root.join("target/debug/xtask");
+    assert!(root.join("Cargo.toml").exists(), "workspace root not found");
 
-    // Build xtask if needed
-    if !xtask_bin.exists() {
-        let status = std::process::Command::new("cargo")
-            .args(["build", "-p", "xtask"])
-            .current_dir(&root)
-            .status()
-            .expect("failed to build xtask");
-        assert!(status.success(), "xtask build failed");
-    }
-
-    // Test --help shows memcheck subcommand
-    let output = std::process::Command::new(&xtask_bin)
-        .arg("--help")
+    let output = std::process::Command::new("cargo")
+        .args(["run", "--quiet", "-p", "xtask", "--", "memcheck", "--help"])
+        .current_dir(&root)
         .output()
-        .expect("failed to run xtask --help");
+        .expect("failed to run cargo xtask memcheck --help");
+
+    assert!(
+        output.status.success(),
+        "xtask memcheck --help failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout.contains("memcheck"),
-        "xtask --help should mention memcheck subcommand"
+        "xtask memcheck --help should mention memcheck"
     );
 }
 

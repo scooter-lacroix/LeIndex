@@ -543,6 +543,13 @@ pub struct ProgressEvent {
 }
 
 impl ProgressEvent {
+    fn now_ms() -> u64 {
+        let duration = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        duration.as_millis() as u64
+    }
+
     /// Create a new progress event
     pub fn progress(
         stage: impl Into<String>,
@@ -556,12 +563,7 @@ impl ProgressEvent {
             current,
             total,
             message: Some(message.into()),
-            timestamp_ms: {
-                let duration = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap();
-                duration.as_millis() as u64
-            },
+            timestamp_ms: Self::now_ms(),
         }
     }
 
@@ -573,12 +575,7 @@ impl ProgressEvent {
             current: 0,
             total: 0,
             message: Some(message.into()),
-            timestamp_ms: {
-                let duration = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap();
-                duration.as_millis() as u64
-            },
+            timestamp_ms: Self::now_ms(),
         }
     }
 
@@ -590,12 +587,7 @@ impl ProgressEvent {
             current: 0,
             total: 0,
             message: Some(message.into()),
-            timestamp_ms: {
-                let duration = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap();
-                duration.as_millis() as u64
-            },
+            timestamp_ms: Self::now_ms(),
         }
     }
 }
@@ -653,6 +645,17 @@ pub mod error_codes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_progress_event_constructors_set_timestamp() {
+        let events = [
+            ProgressEvent::progress("indexing", 1, 2, "Running"),
+            ProgressEvent::complete("indexing", "Done"),
+            ProgressEvent::error("Failed"),
+        ];
+
+        assert!(events.iter().all(|event| event.timestamp_ms > 0));
+    }
 
     #[test]
     fn test_jsonrpc_request_valid() {

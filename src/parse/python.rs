@@ -1,6 +1,8 @@
 // Python language parser implementation
 
-use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};
+use crate::cfg_builder;
+use crate::parse::traits::calculate_complexity;
+use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility, find_node_by_id};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
 };
@@ -182,7 +184,7 @@ impl CodeIntelligence for PythonParser {
             token_count: 0,
         };
 
-        calculate_complexity(node, &mut complexity, 0);
+        calculate_complexity(node, &mut complexity, 0, DECISION_KINDS);
         complexity
     }
 }
@@ -263,30 +265,6 @@ fn extract_python_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Imp
 
     visit(&root, source, &mut imports);
     imports
-}
-
-/// Extract function signature from a function_definition node
-///
-/// This is the legacy version for backward compatibility.
-/// New code should use `extract_function_signature_with_path`.
-#[allow(dead_code)]
-fn extract_function_signature(
-    node: &tree_sitter::Node<'_>,
-    source: &[u8],
-    class_name: Option<&str>,
-) -> Option<SignatureInfo> {
-    // Extract function name
-    let name_node = node.child_by_field_name("name")?;
-    let name = name_node.utf8_text(source).ok()?.to_string();
-
-    // Build qualified name from class_name if present
-    let qualified_name = if let Some(class) = class_name {
-        format!("{}.{}", class, name)
-    } else {
-        name.clone()
-    };
-
-    extract_function_signature_with_path(node, source, &qualified_name)
 }
 
 /// Extract function signature from a function_definition node with a pre-computed qualified name
@@ -465,90 +443,17 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
     None
 }
 
-/// Find a node by its ID
-fn find_node_by_id<'a>(
-    node: &'a tree_sitter::Node<'a>,
-    id: usize,
-) -> Option<tree_sitter::Node<'a>> {
-    use std::collections::VecDeque;
-
-    if node.id() == id {
-        return Some(*node);
-    }
-
-    let mut queue: VecDeque<tree_sitter::Node<'a>> = VecDeque::new();
-    let mut cursor = node.walk();
-
-    for child in node.children(&mut cursor) {
-        queue.push_back(child);
-    }
-
-    while let Some(current) = queue.pop_front() {
-        if current.id() == id {
-            return Some(current);
-        }
-
-        let mut child_cursor = current.walk();
-        for child in current.children(&mut child_cursor) {
-            queue.push_back(child);
-        }
-    }
-
-    None
-}
-
 /// Calculate complexity metrics for a node
-fn calculate_complexity(
-    node: &tree_sitter::Node<'_>,
-    metrics: &mut ComplexityMetrics,
-    depth: usize,
-) {
-    // Update nesting depth
-    metrics.nesting_depth = metrics.nesting_depth.max(depth);
-
-    // Count lines using the node's byte range
-    metrics.line_count = std::cmp::max(metrics.line_count, 1);
-
-    // Count control flow structures (increase cyclomatic complexity)
-    match node.kind() {
-        "if_statement" | "while_statement" | "for_statement" | "match_statement"
-        | "try_statement" => {
-            metrics.cyclomatic += 1;
-        }
-        "elif_clause" => {
-            metrics.cyclomatic += 1;
-        }
-        _ => {}
-    }
-
-    // Count tokens (rough estimate)
-    metrics.token_count += node.child_count();
-
-    // Recursively process children
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        calculate_complexity(&child, metrics, depth + 1);
-    }
-}
-
-/// Control flow graph builder
-struct CfgBuilder<'a> {
-    source: &'a [u8],
-    blocks: Vec<Block>,
-    edges: Vec<Edge>,
-    next_block_id: usize,
-}
-
+const DECISION_KINDS: &[&str] = &[
+    "if_statement",
+    "while_statement",
+    "for_statement",
+    "match_statement",
+    "try_statement",
+    "elif_clause",
+];
+cfg_builder!();
 impl<'a> CfgBuilder<'a> {
-    fn new(source: &'a [u8]) -> Self {
-        Self {
-            source,
-            blocks: Vec::new(),
-            edges: Vec::new(),
-            next_block_id: 0,
-        }
-    }
-
     fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {
         // Create entry block
         let entry_id = self.create_block();
@@ -587,41 +492,6 @@ impl<'a> CfgBuilder<'a> {
                 }
             }
         }
-
-        Ok(())
-    }
-
-    fn handle_if_statement(
-        &mut self,
-        _node: &tree_sitter::Node<'_>,
-        current_block: usize,
-    ) -> Result<()> {
-        // Create true and false branches
-        let true_block = self.create_block();
-        let false_block = self.create_block();
-        let merge_block = self.create_block();
-
-        // Add edges
-        self.edges.push(Edge {
-            from: current_block,
-            to: true_block,
-            edge_type: EdgeType::TrueBranch,
-        });
-        self.edges.push(Edge {
-            from: current_block,
-            to: false_block,
-            edge_type: EdgeType::FalseBranch,
-        });
-        self.edges.push(Edge {
-            from: true_block,
-            to: merge_block,
-            edge_type: EdgeType::Unconditional,
-        });
-        self.edges.push(Edge {
-            from: false_block,
-            to: merge_block,
-            edge_type: EdgeType::Unconditional,
-        });
 
         Ok(())
     }
@@ -670,31 +540,6 @@ impl<'a> CfgBuilder<'a> {
         });
 
         Ok(())
-    }
-
-    fn create_block(&mut self) -> usize {
-        let id = self.next_block_id;
-        self.next_block_id += 1;
-        self.blocks.push(Block {
-            id,
-            statements: Vec::new(),
-        });
-        id
-    }
-
-    fn add_statement_to_block(&mut self, block_id: usize, statement: String) {
-        if let Some(block) = self.blocks.get_mut(block_id) {
-            block.statements.push(statement);
-        }
-    }
-
-    fn finish(self) -> Graph<Block, Edge> {
-        Graph {
-            blocks: self.blocks,
-            edges: self.edges,
-            entry_block: 0,
-            exit_blocks: vec![self.next_block_id.saturating_sub(1)],
-        }
     }
 }
 

@@ -73,46 +73,19 @@ impl FileSummaryHandler {
         let file = live
             .file(&requested_file)
             .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
-        let mut source_stale = false;
-        let db_path = live.active_storage().join("leindex.db");
-        if db_path.is_file() {
-            if let Ok(Some(catalog)) = CatalogReader::open(&db_path, live.root()).await {
-                if let Ok(mut symbols) = catalog.symbols_in_file(&file).await {
-                    for symbol in &mut symbols {
-                        symbol.file_path = live
-                            .file(&symbol.file_path.to_string_lossy())
-                            .map_err(|e| JsonRpcError::invalid_params(e.to_string()))?;
-                    }
-                    if !symbols.is_empty() {
-                        let catalog_total = catalog.count_symbols_in_file(&file).await.ok();
-                        let catalog_truncated = catalog_total
-                            .map(|total| total > symbols.len())
-                            .unwrap_or(symbols.len() >= 200);
-                        let bytes = read_live_bytes(file.clone()).await?;
-                        if catalog_is_fresh(&catalog, &file, &bytes).await {
-                            let (relations, pdg_status) = resident_file_relations(
-                                registry, &live, &symbols, false, budget, started,
-                            )
-                            .await;
-                            return file_summary_response(
-                                &file,
-                                &bytes,
-                                symbols,
-                                include_source,
-                                focus_symbol,
-                                token_budget,
-                                false,
-                                catalog_truncated,
-                                catalog_total,
-                                &relations,
-                                pdg_status,
-                                budget,
-                            );
-                        }
-                        source_stale = true;
-                    }
-                }
-            }
+        let (catalog_response, source_stale) = catalog_file_summary(
+            registry,
+            &live,
+            &file,
+            include_source,
+            focus_symbol,
+            token_budget,
+            budget,
+            started,
+        )
+        .await?;
+        if let Some(response) = catalog_response {
+            return Ok(response);
         }
         let parsed = parse_live_file(file.clone()).await?;
         let (relations, pdg_status) = resident_file_relations(
@@ -139,6 +112,72 @@ impl FileSummaryHandler {
             budget,
         )
     }
+}
+
+async fn catalog_file_summary(
+    registry: &Arc<ProjectRegistry>,
+    live: &LiveProject,
+    file: &Path,
+    include_source: bool,
+    focus_symbol: Option<&str>,
+    token_budget: usize,
+    budget: WorkBudget,
+    started: Instant,
+) -> Result<(Option<Value>, bool), JsonRpcError> {
+    let db_path = live.active_storage().join("leindex.db");
+    if !db_path.is_file() {
+        return Ok((None, false));
+    }
+    let Ok(Some(catalog)) = CatalogReader::open(&db_path, live.root()).await else {
+        return Ok((None, false));
+    };
+    let Ok(symbols) = catalog.symbols_in_file(file).await else {
+        return Ok((None, false));
+    };
+    // Resolve each symbol's live path; skip (drop) symbols whose lookup fails
+    // rather than aborting the whole request. All-stale -> empty -> the caller
+    // falls back to live parsing.
+    let mut resolved = Vec::with_capacity(symbols.len());
+    for mut symbol in symbols {
+        match live.file(&symbol.file_path.to_string_lossy()) {
+            Ok(path) => {
+                symbol.file_path = path;
+                resolved.push(symbol);
+            }
+            Err(_) => continue,
+        }
+    }
+    let symbols = resolved;
+    if symbols.is_empty() {
+        return Ok((None, false));
+    }
+
+    let catalog_total = catalog.count_symbols_in_file(file).await.ok();
+    let catalog_truncated = catalog_total
+        .map(|total| total > symbols.len())
+        .unwrap_or(symbols.len() >= 200);
+    let bytes = read_live_bytes(file.to_path_buf()).await?;
+    if !catalog_is_fresh(&catalog, file, &bytes).await {
+        return Ok((None, true));
+    }
+
+    let (relations, pdg_status) =
+        resident_file_relations(registry, live, &symbols, false, budget, started).await;
+    let response = file_summary_response(
+        file,
+        &bytes,
+        symbols,
+        include_source,
+        focus_symbol,
+        token_budget,
+        false,
+        catalog_truncated,
+        catalog_total,
+        &relations,
+        pdg_status,
+        budget,
+    )?;
+    Ok((Some(response), false))
 }
 
 fn file_summary_response(

@@ -1,5 +1,8 @@
 // Lua language parser implementation
 
+use crate::cfg_builder;
+use crate::parse::traits::calculate_complexity;
+use crate::parse::traits::clean_call_text;
 use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
@@ -51,7 +54,7 @@ impl CodeIntelligence for LuaParser {
             .ok_or_else(|| Error::ParseFailed("Failed to parse Lua source".to_string()))?;
 
         let root_node = tree.root_node();
-        let node = find_node_by_id(&root_node, node_id)
+        let node = crate::parse::traits::find_node_by_id(&root_node, node_id)
             .ok_or_else(|| Error::ParseFailed(format!("Node {} not found", node_id)))?;
 
         let mut cfg_builder = CfgBuilder::new(source);
@@ -66,7 +69,7 @@ impl CodeIntelligence for LuaParser {
             line_count: 0,
             token_count: 0,
         };
-        calculate_complexity(node, &mut complexity, 0);
+        calculate_complexity(node, &mut complexity, 0, DECISION_KINDS);
         complexity
     }
 }
@@ -174,10 +177,6 @@ fn extract_lua_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<Import
 fn extract_lua_calls(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<String> {
     let mut calls = Vec::new();
 
-    fn clean_call_text(raw: &str) -> String {
-        raw.split('(').next().unwrap_or(raw).trim().to_string()
-    }
-
     fn find_calls(node: &tree_sitter::Node<'_>, source: &[u8], calls: &mut Vec<String>) {
         match node.kind() {
             "function_call" | "method_call" => {
@@ -250,86 +249,16 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
     None
 }
 
-/// Find a node by its ID
-fn find_node_by_id<'a>(
-    node: &'a tree_sitter::Node<'a>,
-    id: usize,
-) -> Option<tree_sitter::Node<'a>> {
-    use std::collections::VecDeque;
-
-    if node.id() == id {
-        return Some(*node);
-    }
-
-    let mut queue: VecDeque<tree_sitter::Node<'a>> = VecDeque::new();
-    let mut cursor = node.walk();
-
-    for child in node.children(&mut cursor) {
-        queue.push_back(child);
-    }
-
-    while let Some(current) = queue.pop_front() {
-        if current.id() == id {
-            return Some(current);
-        }
-
-        let mut child_cursor = current.walk();
-        for child in current.children(&mut child_cursor) {
-            queue.push_back(child);
-        }
-    }
-
-    None
-}
-
 /// Calculate complexity metrics for a node
-fn calculate_complexity(
-    node: &tree_sitter::Node<'_>,
-    metrics: &mut ComplexityMetrics,
-    depth: usize,
-) {
-    // Update nesting depth
-    metrics.nesting_depth = metrics.nesting_depth.max(depth);
-
-    // Count lines using the node's byte range
-    metrics.line_count = std::cmp::max(metrics.line_count, 1);
-
-    // Count control flow structures (increase cyclomatic complexity)
-    match node.kind() {
-        "if_statement" | "while_statement" | "for_statement" | "repeat_statement" | "elseif" => {
-            metrics.cyclomatic += 1;
-        }
-        _ => {}
-    }
-
-    // Count tokens (rough estimate)
-    metrics.token_count += node.child_count();
-
-    // Recursively process children
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        calculate_complexity(&child, metrics, depth + 1);
-    }
-}
-
-/// Control flow graph builder
-struct CfgBuilder<'a> {
-    source: &'a [u8],
-    blocks: Vec<Block>,
-    edges: Vec<Edge>,
-    next_block_id: usize,
-}
-
+const DECISION_KINDS: &[&str] = &[
+    "if_statement",
+    "while_statement",
+    "for_statement",
+    "repeat_statement",
+    "elseif",
+];
+cfg_builder!();
 impl<'a> CfgBuilder<'a> {
-    fn new(source: &'a [u8]) -> Self {
-        Self {
-            source,
-            blocks: Vec::new(),
-            edges: Vec::new(),
-            next_block_id: 0,
-        }
-    }
-
     fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {
         let entry_id = self.create_block();
         self.build_cfg_recursive(node, entry_id)?;
@@ -367,39 +296,6 @@ impl<'a> CfgBuilder<'a> {
                 }
             }
         }
-
-        Ok(())
-    }
-
-    fn handle_if_statement(
-        &mut self,
-        _node: &tree_sitter::Node<'_>,
-        current_block: usize,
-    ) -> Result<()> {
-        let true_block = self.create_block();
-        let false_block = self.create_block();
-        let merge_block = self.create_block();
-
-        self.edges.push(Edge {
-            from: current_block,
-            to: true_block,
-            edge_type: EdgeType::TrueBranch,
-        });
-        self.edges.push(Edge {
-            from: current_block,
-            to: false_block,
-            edge_type: EdgeType::FalseBranch,
-        });
-        self.edges.push(Edge {
-            from: true_block,
-            to: merge_block,
-            edge_type: EdgeType::Unconditional,
-        });
-        self.edges.push(Edge {
-            from: false_block,
-            to: merge_block,
-            edge_type: EdgeType::Unconditional,
-        });
 
         Ok(())
     }
@@ -465,31 +361,6 @@ impl<'a> CfgBuilder<'a> {
         });
 
         Ok(())
-    }
-
-    fn create_block(&mut self) -> usize {
-        let id = self.next_block_id;
-        self.next_block_id += 1;
-        self.blocks.push(Block {
-            id,
-            statements: Vec::new(),
-        });
-        id
-    }
-
-    fn add_statement_to_block(&mut self, block_id: usize, statement: String) {
-        if let Some(block) = self.blocks.get_mut(block_id) {
-            block.statements.push(statement);
-        }
-    }
-
-    fn finish(self) -> Graph<Block, Edge> {
-        Graph {
-            blocks: self.blocks,
-            edges: self.edges,
-            entry_block: 0,
-            exit_blocks: vec![self.next_block_id.saturating_sub(1)],
-        }
     }
 }
 

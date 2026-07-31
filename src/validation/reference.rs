@@ -146,90 +146,130 @@ impl ReferenceChecker {
 
     /// Extract imports from edit change content
     fn extract_imports(&self, change: &ResolvedEditChange) -> Vec<String> {
-        let mut imports = Vec::new();
-        let lang = change.infer_language();
+        match change.infer_language() {
+            "python" => Self::extract_python_imports(&change.new_content),
+            "javascript" | "typescript" => Self::extract_javascript_imports(&change.new_content),
+            "rust" => Self::extract_rust_imports(&change.new_content),
+            "go" => Self::extract_go_imports(&change.new_content),
+            _ => Vec::new(),
+        }
+    }
 
-        match lang {
-            "python" => {
-                for line in change.new_content.lines() {
-                    let line = line.trim();
-                    if line.starts_with("import ") || line.starts_with("from ") {
-                        // Extract the import path
-                        if let Some(rest) = line.strip_prefix("import ") {
-                            let import_path = rest.split(" as ").next().unwrap_or(rest).trim();
-                            imports.push(import_path.to_string());
-                        } else if let Some(rest) = line.strip_prefix("from ") {
-                            let import_path = rest.split(" import ").next().unwrap_or(rest).trim();
-                            imports.push(import_path.to_string());
-                        }
+    fn extract_python_imports(content: &str) -> Vec<String> {
+        let mut imports = Vec::new();
+        for line in content.lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("import ") {
+                // `import a, b, c as d` -> one entry per module (alias removed)
+                for item in rest.split(',') {
+                    let item = item.split(" as ").next().unwrap_or(item).trim();
+                    if !item.is_empty() {
+                        imports.push(item.to_string());
                     }
                 }
-            }
-            "javascript" | "typescript" => {
-                for line in change.new_content.lines() {
-                    let line = line.trim();
-                    if line.contains("import ") && line.contains("from ") {
-                        // Extract from '...' or from "..."
-                        if let Some(start) = line.find("from ") {
-                            let rest = &line[start + 5..];
-                            let quote = rest.chars().next();
-                            if let Some('"') | Some('\'') = quote {
-                                if let Some(end) = rest[1..].find(quote.unwrap()) {
-                                    imports.push(rest[1..end + 1].to_string());
-                                }
-                            }
-                        }
-                    } else if line.contains("require(") {
-                        // Extract require('...') or require("...")
-                        if let Some(start) = line.find("require(") {
-                            let rest = &line[start + 8..]; // Skip "require("
-                            if let Some(end) = rest.find(')') {
-                                let inner = &rest[..end];
-                                let inner = inner.trim();
-                                if inner.starts_with('"') || inner.starts_with('\'') {
-                                    imports.push(inner[1..inner.len() - 1].to_string());
-                                }
-                            }
-                        }
-                    }
+            } else if let Some(rest) = line.strip_prefix("from ") {
+                // `from pkg import ...` -> the module is before " import ". Strip
+                // leading dots so relative imports (`.foo`, `..bar`) match the
+                // module name in the PDG instead of being rejected as `.foo`.
+                let module = rest.split(" import ").next().unwrap_or(rest).trim();
+                let module = module.trim_start_matches('.');
+                if !module.is_empty() {
+                    imports.push(module.to_string());
                 }
-            }
-            "rust" => {
-                for line in change.new_content.lines() {
-                    let line = line.trim();
-                    if line.starts_with("use ") {
-                        let import_path = line
-                            .trim_start_matches("use ")
-                            .trim_end_matches(';')
-                            .trim()
-                            .to_string();
-                        imports.push(import_path);
-                    } else if line.starts_with("mod ") {
-                        let mod_name = line
-                            .trim_start_matches("mod ")
-                            .trim_end_matches(';')
-                            .trim()
-                            .to_string();
-                        imports.push(mod_name);
-                    }
-                }
-            }
-            "go" => {
-                for line in change.new_content.lines() {
-                    let line = line.trim();
-                    if line.starts_with("\"") && line.contains("\"") {
-                        let import_path = line.trim_matches('"');
-                        imports.push(import_path.to_string());
-                    }
-                }
-            }
-            _ => {
-                // For other languages, use basic regex-like patterns
-                // This is a simplified approach
             }
         }
-
         imports
+    }
+
+    fn extract_javascript_imports(content: &str) -> Vec<String> {
+        let mut imports = Vec::new();
+        for line in content.lines().map(str::trim) {
+            if line.contains("import ") && line.contains("from ") {
+                if let Some(path) = Self::javascript_from_import(line) {
+                    imports.push(path);
+                }
+            } else if line.contains("require(") {
+                if let Some(path) = Self::javascript_require_import(line) {
+                    imports.push(path);
+                }
+            } else if let Some(rest) = line.strip_prefix("import ") {
+                // Side-effect / bare import: import './polyfill' (no 'from').
+                if !rest.contains(" from ") {
+                    if let Some(path) = Self::first_quoted(rest) {
+                        imports.push(path);
+                    }
+                }
+            }
+        }
+        imports
+    }
+
+    fn javascript_from_import(line: &str) -> Option<String> {
+        let start = line.find("from ")?;
+        let rest = &line[start + 5..];
+        let quote = rest.chars().next()?;
+        if !matches!(quote, '"' | '\'') {
+            return None;
+        }
+        let end = rest[1..].find(quote)?;
+        Some(rest[1..end + 1].to_string())
+    }
+
+    /// Extract the first single- or double-quoted string in `s` (matching quotes).
+    fn first_quoted(s: &str) -> Option<String> {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let q = bytes[i];
+            if q == b'"' || q == b'\'' {
+                if let Some(end) = s[i + 1..].find(char::from(q)) {
+                    return Some(s[i + 1..i + 1 + end].to_string());
+                }
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn javascript_require_import(line: &str) -> Option<String> {
+        let start = line.find("require(")?;
+        let rest = &line[start + 8..];
+        let end = rest.find(')')?;
+        let inner = rest[..end].trim();
+        // Require a matching open/close quote pair before slicing, so malformed
+        // or incomplete forms like `require(")` return None instead of panicking
+        // or slicing a non-string value.
+        let mut chars = inner.chars();
+        let first = chars.next()?;
+        if (first == '"' || first == '\'') && inner.ends_with(first) && inner.len() >= 2 {
+            return Some(inner[1..inner.len() - 1].to_string());
+        }
+        None
+    }
+
+    fn extract_rust_imports(content: &str) -> Vec<String> {
+        content
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                line.strip_prefix("use ")
+                    .or_else(|| line.strip_prefix("mod "))
+                    .map(|path| path.trim_end_matches(';').trim().to_string())
+            })
+            .collect()
+    }
+
+    fn extract_go_imports(content: &str) -> Vec<String> {
+        content
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| {
+                // Single-line `import "pkg"`, `import alias "pkg"`, blank `_ "pkg"`,
+                // and each `"pkg"` line inside an `import (...)` block all carry a
+                // double-quoted path — extract the first quoted segment.
+                let path_line = line.strip_prefix("import ").unwrap_or(line);
+                Self::first_quoted(path_line)
+            })
+            .collect()
     }
 
     /// Check if an import exists in the PDG

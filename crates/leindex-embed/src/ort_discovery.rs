@@ -354,11 +354,7 @@ fn read_ort_pip_cache() -> Option<PathBuf> {
     }
     let path = PathBuf::from(trimmed);
     // Only trust the cache if the file still exists.
-    if path.is_file() {
-        Some(path)
-    } else {
-        None
-    }
+    if path.is_file() { Some(path) } else { None }
 }
 
 /// User site-packages directories to scan for ORT.
@@ -777,57 +773,74 @@ mod tests {
     fn test_discover_candidates_includes_env_var() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(ORT_DYLIB_ENV, tmp.path().join("env.so"));
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(ORT_DYLIB_ENV, tmp.path().join("env.so")) };
 
         let candidates = discover_candidates();
-        assert!(candidates
-            .iter()
-            .any(|(s, p)| *s == DiscoverySource::EnvVar && p == &tmp.path().join("env.so")));
+        assert!(
+            candidates
+                .iter()
+                .any(|(s, p)| *s == DiscoverySource::EnvVar && p == &tmp.path().join("env.so"))
+        );
 
-        std::env::remove_var(ORT_DYLIB_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
     }
 
     #[test]
     fn test_discover_candidates_excludes_empty_env() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
-        std::env::set_var(ORT_DYLIB_ENV, "");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(ORT_DYLIB_ENV, "") };
         let candidates = discover_candidates();
-        assert!(!candidates
-            .iter()
-            .any(|(s, _)| *s == DiscoverySource::EnvVar));
-        std::env::remove_var(ORT_DYLIB_ENV);
+        assert!(
+            !candidates
+                .iter()
+                .any(|(s, _)| *s == DiscoverySource::EnvVar)
+        );
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
     }
 
     #[test]
     fn test_discover_candidates_includes_user_lib() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
-        std::env::remove_var(ORT_DYLIB_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
 
         let candidates = discover_candidates();
         let expected = tmp.path().join("lib").join(ort_lib_names()[0]);
-        assert!(candidates
-            .iter()
-            .any(|(s, p)| *s == DiscoverySource::UserLib && p == &expected));
+        assert!(
+            candidates
+                .iter()
+                .any(|(s, p)| *s == DiscoverySource::UserLib && p == &expected)
+        );
 
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[test]
     fn test_discover_candidates_includes_bundle_lib_next_to_bin() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
-        std::env::remove_var(ORT_DYLIB_ENV);
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
 
         let candidates = discover_candidates();
 
         if let Some(bin_dir) = binary_dir() {
             if let Some(bundle_root) = bin_dir.parent() {
                 let expected = bundle_root.join("lib").join(ort_lib_names()[0]);
-                assert!(candidates
-                    .iter()
-                    .any(|(s, p)| *s == DiscoverySource::Sibling && p == &expected));
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|(s, p)| *s == DiscoverySource::Sibling && p == &expected)
+                );
             }
         }
     }
@@ -835,8 +848,10 @@ mod tests {
     #[test]
     fn test_discover_candidates_includes_system_paths() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
-        std::env::remove_var(ORT_DYLIB_ENV);
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
 
         // System paths now live in `system_candidates()` (final fallback,
         // tried after pip), not in `discover_candidates()`.
@@ -844,9 +859,11 @@ mod tests {
         // System paths should be present at minimum on Unix.
         #[cfg(unix)]
         {
-            assert!(candidates
-                .iter()
-                .any(|(s, p)| *s == DiscoverySource::System && p.starts_with("/usr/local/lib")));
+            assert!(
+                candidates
+                    .iter()
+                    .any(|(s, p)| *s == DiscoverySource::System && p.starts_with("/usr/local/lib"))
+            );
         }
     }
 
@@ -854,7 +871,8 @@ mod tests {
     fn test_read_config_ort_path_returns_value() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
 
         // Create the library file so resolve_config_ort_path succeeds.
         let lib_dir = tmp.path().join("ort");
@@ -877,14 +895,16 @@ mod tests {
         let parsed = read_config_ort_path();
         assert_eq!(parsed, Some(lib_path));
 
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[test]
     fn test_read_config_ort_path_returns_none_when_missing() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
 
         // No config file
         assert_eq!(read_config_ort_path(), None);
@@ -899,14 +919,16 @@ mod tests {
         .unwrap();
         assert_eq!(read_config_ort_path(), None);
 
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[test]
     fn test_read_config_ort_path_handles_single_quotes() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
 
         // Create the library file so resolve_config_ort_path succeeds.
         let lib_dir = tmp.path().join("quote");
@@ -924,7 +946,8 @@ mod tests {
 
         assert_eq!(read_config_ort_path(), Some(lib_path));
 
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[cfg(target_os = "linux")]
@@ -1103,14 +1126,16 @@ mod tests {
         let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let fake_lib = make_fake_lib(tmp.path());
-        std::env::set_var(ORT_DYLIB_ENV, &fake_lib);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(ORT_DYLIB_ENV, &fake_lib) };
 
         // Snapshot LAST_OUTCOME: it must remain unchanged across the call.
         let before = last_outcome();
         let outcome = discover_path_only();
         let after = last_outcome();
 
-        std::env::remove_var(ORT_DYLIB_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
 
         let outcome = outcome.expect("discover_path_only should find the env candidate");
         assert_eq!(outcome.source, DiscoverySource::EnvVar);
@@ -1129,16 +1154,19 @@ mod tests {
         let _g = ENV_TEST_LOCK.lock().unwrap();
         // Ensure env var is unset and LEINDEX_HOME points to an empty temp
         // dir so user-lib and config-file lookups also miss.
-        std::env::remove_var(ORT_DYLIB_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(ORT_DYLIB_ENV) };
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
 
         // We cannot fully prevent pip/system fallbacks in this environment
         // (system ORT may exist on the dev machine), so we only assert that
         // the function is callable and returns a deterministic Option.
         let _ = discover_path_only();
 
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     // ── VAL-DAEMON-001: filesystem-first ORT discovery tests ─────────────

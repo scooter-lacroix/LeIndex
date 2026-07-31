@@ -41,7 +41,7 @@ use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 use super::distance::{
-    clear_adc_query_context, set_adc_query_context, AdcDistanceMetric, Int8AdcDistance,
+    AdcDistanceMetric, Int8AdcDistance, clear_adc_query_context, set_adc_query_context,
 };
 use super::quantization::Quantize;
 use super::vector::Int8QuantizedVector;

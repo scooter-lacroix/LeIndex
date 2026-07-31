@@ -1,5 +1,5 @@
-use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
-use leindex::phase::{run_phase_analysis, PhaseOptions, PhaseSelection};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use leindex::phase::{PhaseOptions, PhaseSelection, run_phase_analysis};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;

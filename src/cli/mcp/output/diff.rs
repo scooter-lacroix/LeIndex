@@ -8,7 +8,7 @@
 
 use serde_json::Value;
 
-use super::{truncate, LIGHT_CYAN, LIGHT_GREEN, LIGHT_GREY, LIGHT_RED, RESET};
+use super::{LIGHT_CYAN, LIGHT_GREEN, LIGHT_GREY, LIGHT_RED, RESET, truncate};
 
 // =============================================================================
 // Structured diff types — what the LLM sees
@@ -283,27 +283,27 @@ pub fn render_split_diff(diff: &DiffResult, color: bool, width: Option<usize>) -
     ));
 
     let gutter = 4usize; // 4-digit line number
-                         // The split-view format string in `split_row` emits the
-                         // following per row, excluding the gutter and the two
-                         // content halves:
-                         //   1 leading space
-                         //   1 space between the left gutter and the left marker
-                         //   1 space between the left marker and the left content
-                         //   3 chars for the ` │ ` centre separator
-                         //   1 space between the right gutter and the right marker
-                         //   1 space between the right marker and the right content
-                         //   2 trailing reset escapes when colour is enabled (each
-                         //     contributes an ANSI CSI sequence; when colour is off
-                         //     these are empty strings and contribute 0 to the
-                         //     visible width).
-                         // The empirical constant that keeps the rendered row
-                         // inside the requested terminal width is 10 (8 separator
-                         // chars + 2 to absorb ANSI colour escapes that still
-                         // contribute to string length in some callers). Using
-                         // `5` here was too small and could push the rendered row
-                         // past the terminal width on an 80-column terminal,
-                         // causing awkward wrapping. The `gutter * 2 + 10` formula
-                         // is what the regression test below asserts against.
+    // The split-view format string in `split_row` emits the
+    // following per row, excluding the gutter and the two
+    // content halves:
+    //   1 leading space
+    //   1 space between the left gutter and the left marker
+    //   1 space between the left marker and the left content
+    //   3 chars for the ` │ ` centre separator
+    //   1 space between the right gutter and the right marker
+    //   1 space between the right marker and the right content
+    //   2 trailing reset escapes when colour is enabled (each
+    //     contributes an ANSI CSI sequence; when colour is off
+    //     these are empty strings and contribute 0 to the
+    //     visible width).
+    // The empirical constant that keeps the rendered row
+    // inside the requested terminal width is 10 (8 separator
+    // chars + 2 to absorb ANSI colour escapes that still
+    // contribute to string length in some callers). Using
+    // `5` here was too small and could push the rendered row
+    // past the terminal width on an 80-column terminal,
+    // causing awkward wrapping. The `gutter * 2 + 10` formula
+    // is what the regression test below asserts against.
     let half = match width {
         Some(w) => w.saturating_sub(gutter * 2 + 10) / 2,
         None => 60,

@@ -4,7 +4,7 @@
 //! This module provides:
 //! - OpenTelemetry-compatible distributed tracing with trace ID propagation
 //! - Prometheus-style metrics collection (counters, histograms)
-//! - Sentry-compatible error tracking integration
+//! - Local error tracking via ring buffer (not yet remote)
 //! - Log redaction/sanitization to prevent secrets leaking into logs
 //!
 //! ## Configuration
@@ -12,7 +12,6 @@
 //! Set these environment variables to enable observability features:
 //! - `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP collector endpoint for traces
 //! - `LEINDEX_METRICS_ENDPOINT`: Prometheus metrics scrape endpoint
-//! - `SENTRY_DSN`: Sentry DSN for error tracking (optional)
 //! - `RUST_LOG`: Log level filter (e.g., "info,leindex=debug")
 //!
 //! ## Feature Flags
@@ -23,7 +22,6 @@
 //! - `otel`: OpenTelemetry distributed tracing export
 
 use std::collections::HashMap;
-use std::env;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -247,7 +245,6 @@ pub enum ErrorLevel {
 /// Error tracker that captures events and (optionally) forwards them
 /// to Sentry or a compatible backend.
 pub struct ErrorTracker {
-    dsn: Option<String>,
     events: std::sync::Mutex<Vec<ErrorEvent>>,
 }
 
@@ -256,7 +253,6 @@ static ERROR_TRACKER: OnceLock<ErrorTracker> = OnceLock::new();
 impl ErrorTracker {
     fn new() -> Self {
         Self {
-            dsn: env::var("SENTRY_DSN").ok(),
             events: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -273,15 +269,13 @@ impl ErrorTracker {
     /// cap or if the lock is poisoned. (In all cases a `tracing::error!` is
     /// emitted.)
     ///
-    /// **STUB:** remote forwarding to Sentry is NOT yet implemented. `SENTRY_DSN`
-    /// is parsed and stored, but this method only emits a local `tracing` event
-    /// — it does not serialize/POST to the Sentry API. Do not assume configured
-    /// production errors are remotely reported until the transport lands.
+    /// **NOTE:** Remote forwarding is not yet implemented. The DSN environment
+    /// variable is no longer parsed — errors are only logged locally via `tracing`.
+    /// This is a local-only error tracking implementation for debugging and
+    /// diagnostics.
     pub fn capture(&self, event: ErrorEvent) {
-        if self.dsn.is_some() {
-            // TODO(sentry): serialize the ErrorEvent to Sentry's envelope
-            // format and POST to the configured DSN. Until then this only logs
-            // locally — SENTRY_DSN is accepted but unused for remote submission.
+        if self.events.lock().unwrap().len() < 1000 {
+            // Local ring buffer for error tracking
             tracing::error!(
                 message = %event.message,
                 trace_id = ?event.trace_id,
@@ -599,7 +593,7 @@ impl HealthStatus {
             },
         ));
 
-        let tracker_ok = std::panic::catch_unwind(|| ErrorTracker::global().dsn.is_some()).is_ok();
+        let tracker_ok = std::panic::catch_unwind(ErrorTracker::global).is_ok();
         checks.push((
             "error_tracker".to_string(),
             tracker_ok,

@@ -68,28 +68,18 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
         let file_path = extract_string(&args, "file_path")?;
 
         // Support simple mode: top-level old_text/new_text (or old_str/new_str aliases)
-        let changes_val = if let Some(changes) = args.get("changes").cloned() {
-            changes
-        } else {
-            let old_text = args
-                .get("old_text")
-                .or_else(|| args.get("old_str"))
-                .and_then(|v| v.as_str());
-            let new_text = args
-                .get("new_text")
-                .or_else(|| args.get("new_str"))
-                .and_then(|v| v.as_str());
-            match (old_text, new_text) {
-                (Some(old), Some(new)) => {
-                    serde_json::json!([{
-                        "type": "replace_text",
-                        "old_text": old,
-                        "new_text": new
-                    }])
-                }
-                _ => Value::Array(vec![]),
-            }
-        };
+        let changes_val = resolve_changes_from_args(&args);
+        // Reject before any parsing/caching: neither `changes` nor
+        // old_text/new_text was supplied, so there is nothing to preview.
+        let changes_empty = changes_val
+            .as_array()
+            .map(|arr| arr.is_empty())
+            .unwrap_or(true);
+        if changes_empty {
+            return Err(JsonRpcError::invalid_params(
+                "Provide either 'changes' or 'old_text'/'new_text' to preview.",
+            ));
+        }
 
         let project_path_arg = args.get("project_path").and_then(|v| v.as_str());
         let handle = registry.get_or_create(project_path_arg).await?;
@@ -134,7 +124,7 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
         .to_hex()
         .to_string();
 
-        // 4. Store in cache (Best effort)
+        // 4. Store in cache (best effort)
         let cache_entry = EditCacheEntry {
             file_path: abs_file_path.clone(),
             preview_token: preview_token.clone(),
@@ -143,16 +133,7 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
             changes: changes.clone(),
             timestamp: chrono::Utc::now(),
         };
-
-        match GLOBAL_EDIT_CACHE.set(&storage_path, cache_entry).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::warn!("Edit preview too large for cache: {}", e);
-            }
-            Err(e) => {
-                tracing::warn!("Failed to store edit in cache: {}", e);
-            }
-        }
+        store_preview_in_cache(&storage_path, cache_entry).await;
 
         // 5. Generate diff and compute impact
         let diff = make_diff(&original, &modified, &file_path);
@@ -162,132 +143,22 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
             let guard = handle.read().await;
 
             // Run validation
-            let validation = match guard.create_validator() {
-                Some(validator) => {
-                    let resolved = ResolvedEditChange::new(
-                        abs_file_path.clone(),
-                        original.clone(),
-                        modified.clone(),
-                    );
+            let validation = run_validation_result(&guard, &abs_file_path, &original, &modified);
 
-                    match validator.validate_changes(&[resolved]) {
-                        Ok(result) => Some(validation_to_json(&result)),
-                        Err(e) => Some(serde_json::json!({
-                            "is_valid": Value::Null,
-                            "has_errors": false,
-                            "syntax_errors": [],
-                            "reference_issues": [],
-                            "semantic_drift": [],
-                            "impact_report": null,
-                            "validation_warning": format!("Validation check failed: {}", e),
-                        })),
-                    }
-                }
-                None => None,
+            // Compute impact from PDG (rename callers + edited-region symbol overlap)
+            let (nodes, files, breaks) = match guard.pdg() {
+                Some(pdg) => collect_pdg_impact(pdg, &changes, &abs_file_path, &file_path),
+                None => (
+                    Vec::new(),
+                    std::iter::once(abs_file_path.to_string_lossy().to_string()).collect(),
+                    Vec::new(),
+                ),
             };
 
-            // Compute impact from PDG
-            let mut nodes: Vec<String> = Vec::new();
-            let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
-            files.insert(abs_file_path.to_string_lossy().to_string());
-            let mut breaks: Vec<String> = Vec::new();
-
-            if let Some(pdg) = guard.pdg() {
-                for change in &changes {
-                    if let crate::edit::EditChange::RenameSymbol {
-                        old_name,
-                        new_name: _,
-                    } = change
-                    {
-                        // Try name-based lookup for PDG impact analysis
-                        let found_id = pdg
-                            .find_by_symbol(old_name)
-                            .or_else(|| pdg.find_by_name(old_name))
-                            .or_else(|| {
-                                pdg.find_by_name_in_file(
-                                    old_name,
-                                    Some(&abs_file_path.to_string_lossy()),
-                                )
-                            });
-                        if let Some(node_id) = found_id {
-                            let forward = pdg.forward_impact(
-                                node_id,
-                                &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
-                            );
-                            for dep_id in &forward {
-                                if let Some(dn) = pdg.get_node(*dep_id) {
-                                    nodes.push(dn.name.clone());
-                                    files.insert(dn.file_path.to_string());
-                                }
-                            }
-                            let backward = pdg.backward_impact(
-                                node_id,
-                                &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
-                            );
-                            if !backward.is_empty() {
-                                breaks.push(format!(
-                                    "Renaming '{}' may break {} caller(s)",
-                                    old_name,
-                                    backward.len()
-                                ));
-                            }
-                        }
-                    }
-                }
-
-                // For text replacements, find symbols in the edited file
-                // whose byte ranges overlap with the changed region(s).
-                // Previously this used pdg.nodes_in_file() which returns
-                // ALL symbols in the file, over-reporting affected symbols.
-                if nodes.is_empty() {
-                    // Collect byte ranges from ReplaceText changes
-                    let edit_ranges: Vec<(usize, usize)> = changes
-                        .iter()
-                        .filter_map(|c| match c {
-                            crate::edit::EditChange::ReplaceText { start, end, .. } => {
-                                Some((*start, *end))
-                            }
-                            _ => None,
-                        })
-                        .collect();
-
-                    // Try both the user-provided path (often relative, matching
-                    // what the PDG stores) and the absolute path.
-                    let file_nodes = pdg.nodes_in_file(&file_path);
-                    let file_nodes = if file_nodes.is_empty() {
-                        pdg.nodes_in_file(&abs_file_path.to_string_lossy())
-                    } else {
-                        file_nodes
-                    };
-                    for nid in file_nodes {
-                        if let Some(n) = pdg.get_node(nid) {
-                            // Only include symbols whose byte range overlaps
-                            // with at least one edit region.
-                            let overlaps = edit_ranges.iter().any(|&(es, ee)| {
-                                if es == ee {
-                                    return n.byte_range.0 <= es && es <= n.byte_range.1;
-                                }
-                                // Two ranges [s1, e1) and [s2, e2) overlap when
-                                // s1 < e2 && s2 < e1
-                                n.byte_range.0 < ee && es < n.byte_range.1
-                            });
-                            if overlaps {
-                                nodes.push(n.name.clone());
-                            }
-                        }
-                    }
-                }
-            }
             (validation, nodes, files, breaks)
         };
 
-        let risk = if affected_nodes.len() > 5 || affected_files.len() > 3 {
-            "high"
-        } else if affected_nodes.len() > 1 || affected_files.len() > 1 {
-            "medium"
-        } else {
-            "low"
-        };
+        let risk = compute_risk_level(&affected_nodes, &affected_files);
 
         let mut response = serde_json::json!({
             "preview_token": preview_token,
@@ -310,4 +181,200 @@ LeIndex [Edit Apply] to understand the blast radius of your change."
         let guard = handle.read().await;
         Ok(wrap_with_meta(response, &guard))
     }
+}
+
+/// Build the `changes` JSON value from explicit `changes` or the simple-mode
+/// `old_text`/`new_text` (and `old_str`/`new_str`) aliases.
+fn resolve_changes_from_args(args: &Value) -> Value {
+    if let Some(changes) = args.get("changes").cloned() {
+        return changes;
+    }
+    let old_text = args
+        .get("old_text")
+        .or_else(|| args.get("old_str"))
+        .and_then(|v| v.as_str());
+    let new_text = args
+        .get("new_text")
+        .or_else(|| args.get("new_str"))
+        .and_then(|v| v.as_str());
+    match (old_text, new_text) {
+        (Some(old), Some(new)) => serde_json::json!([{
+            "type": "replace_text",
+            "old_text": old,
+            "new_text": new
+        }]),
+        _ => Value::Array(vec![]),
+    }
+}
+
+/// Store a prepared preview in the global cache; failures are non-fatal (warn only).
+async fn store_preview_in_cache(storage_path: &std::path::Path, cache_entry: EditCacheEntry) {
+    match GLOBAL_EDIT_CACHE.set(storage_path, cache_entry).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("Edit preview too large for cache: {}", e),
+        Err(e) => tracing::warn!("Failed to store edit in cache: {}", e),
+    }
+}
+
+/// Classify preview risk from the breadth of affected symbols/files.
+fn compute_risk_level(
+    affected_nodes: &[String],
+    affected_files: &std::collections::HashSet<String>,
+) -> &'static str {
+    if affected_nodes.len() > 5 || affected_files.len() > 3 {
+        "high"
+    } else if affected_nodes.len() > 1 || affected_files.len() > 1 {
+        "medium"
+    } else {
+        "low"
+    }
+}
+
+/// Validate the resolved edit under a read guard, returning a JSON payload (or
+/// `None` when no validator is available). A validator error degrades to a
+/// `validation_warning` object rather than failing the whole preview.
+fn run_validation_result(
+    guard: &crate::cli::registry::ProjectReadGuard<'_>,
+    abs_file_path: &std::path::Path,
+    original: &str,
+    modified: &str,
+) -> Option<Value> {
+    let validator = guard.create_validator()?;
+    let resolved = ResolvedEditChange::new(
+        abs_file_path.to_path_buf(),
+        original.to_string(),
+        modified.to_string(),
+    );
+    match validator.validate_changes(&[resolved]) {
+        Ok(result) => Some(validation_to_json(&result)),
+        Err(e) => Some(serde_json::json!({
+            "is_valid": Value::Null,
+            "has_errors": false,
+            "syntax_errors": [],
+            "reference_issues": [],
+            "semantic_drift": [],
+            "impact_report": null,
+            "validation_warning": format!("Validation check failed: {}", e)
+        })),
+    }
+}
+
+/// Collect PDG impact: rename callers/dependents plus symbols overlapping the
+/// edited byte regions. `files` always seeds with the edited file.
+fn collect_pdg_impact(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    changes: &[crate::edit::EditChange],
+    abs_file_path: &std::path::Path,
+    file_path: &str,
+) -> (Vec<String>, std::collections::HashSet<String>, Vec<String>) {
+    let mut files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    files.insert(abs_file_path.to_string_lossy().to_string());
+
+    let (nodes, breaks) = collect_rename_impact(pdg, changes, abs_file_path, &mut files);
+
+    // For text replacements, find symbols in the edited file whose byte ranges
+    // overlap with the changed region(s). Only runs when no rename impact was
+    // found — avoids over-reporting symbols unrelated to the rename.
+    let nodes = if nodes.is_empty() {
+        collect_text_overlap_symbols(pdg, changes, file_path, abs_file_path)
+    } else {
+        nodes
+    };
+
+    (nodes, files, breaks)
+}
+
+/// For each rename change, record forward-impact symbol/file names and flag
+/// any backward (caller) impact as a potential breaking change.
+fn collect_rename_impact(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    changes: &[crate::edit::EditChange],
+    abs_file_path: &std::path::Path,
+    files: &mut std::collections::HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut nodes: Vec<String> = Vec::new();
+    let mut breaks: Vec<String> = Vec::new();
+    for change in changes {
+        let crate::edit::EditChange::RenameSymbol {
+            old_name,
+            new_name: _,
+        } = change
+        else {
+            continue;
+        };
+        // Try name-based lookup for PDG impact analysis
+        let found_id = pdg
+            .find_by_symbol(old_name)
+            .or_else(|| pdg.find_by_name(old_name))
+            .or_else(|| pdg.find_by_name_in_file(old_name, Some(&abs_file_path.to_string_lossy())));
+        let Some(node_id) = found_id else {
+            continue;
+        };
+        let forward = pdg.forward_impact(
+            node_id,
+            &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
+        );
+        for dep_id in &forward {
+            if let Some(dn) = pdg.get_node(*dep_id) {
+                nodes.push(dn.name.clone());
+                files.insert(dn.file_path.to_string());
+            }
+        }
+        let backward = pdg.backward_impact(
+            node_id,
+            &crate::graph::pdg::TraversalConfig::for_impact_analysis(),
+        );
+        if !backward.is_empty() {
+            breaks.push(format!(
+                "Renaming '{}' may break {} caller(s)",
+                old_name,
+                backward.len()
+            ));
+        }
+    }
+    (nodes, breaks)
+}
+
+/// Find symbols in the edited file whose byte range overlaps any ReplaceText
+/// edit region. Tries the user-provided path (often relative) then the absolute.
+fn collect_text_overlap_symbols(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    changes: &[crate::edit::EditChange],
+    file_path: &str,
+    abs_file_path: &std::path::Path,
+) -> Vec<String> {
+    let edit_ranges: Vec<(usize, usize)> = changes
+        .iter()
+        .filter_map(|c| match c {
+            crate::edit::EditChange::ReplaceText { start, end, .. } => Some((*start, *end)),
+            _ => None,
+        })
+        .collect();
+
+    let file_nodes = pdg.nodes_in_file(file_path);
+    let file_nodes = if file_nodes.is_empty() {
+        pdg.nodes_in_file(&abs_file_path.to_string_lossy())
+    } else {
+        file_nodes
+    };
+
+    let mut nodes = Vec::new();
+    for nid in file_nodes {
+        let Some(n) = pdg.get_node(nid) else {
+            continue;
+        };
+        // Only include symbols whose byte range overlaps at least one edit region.
+        let overlaps = edit_ranges.iter().any(|&(es, ee)| {
+            if es == ee {
+                n.byte_range.0 <= es && es <= n.byte_range.1
+            } else {
+                // Two ranges [s1, e1) and [s2, e2) overlap when s1 < e2 && s2 < e1
+                n.byte_range.0 < ee && es < n.byte_range.1
+            }
+        });
+        if overlaps {
+            nodes.push(n.name.clone());
+        }
+    }
+    nodes
 }

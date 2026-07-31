@@ -241,7 +241,8 @@ mod tests {
     #[test]
     fn test_resolve_report_path_none_when_unset() {
         // Clear env var to ensure clean state
-        std::env::remove_var(MEMORY_REPORT_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(MEMORY_REPORT_ENV) };
         assert!(resolve_report_path(None).is_none());
     }
 
@@ -255,34 +256,42 @@ mod tests {
     #[test]
     fn test_resolve_report_path_from_env() {
         // Clean up first to avoid interference from parallel tests
-        std::env::remove_var(MEMORY_REPORT_ENV);
-        std::env::set_var(MEMORY_REPORT_ENV, "/tmp/env-report.json");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(MEMORY_REPORT_ENV) };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(MEMORY_REPORT_ENV, "/tmp/env-report.json") };
         let result = resolve_report_path(None);
         assert_eq!(result, Some(PathBuf::from("/tmp/env-report.json")));
-        std::env::remove_var(MEMORY_REPORT_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(MEMORY_REPORT_ENV) };
     }
 
     #[test]
     fn test_flag_takes_precedence_over_env() {
-        std::env::set_var(MEMORY_REPORT_ENV, "/tmp/env-report.json");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(MEMORY_REPORT_ENV, "/tmp/env-report.json") };
         let flag_path = Path::new("/tmp/flag-report.json");
         let result = resolve_report_path(Some(flag_path));
         assert_eq!(result, Some(PathBuf::from("/tmp/flag-report.json")));
-        std::env::remove_var(MEMORY_REPORT_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(MEMORY_REPORT_ENV) };
     }
 
     #[test]
     fn test_empty_env_var_ignored() {
         // Ensure clean state first
-        std::env::remove_var(MEMORY_REPORT_ENV);
-        std::env::set_var(MEMORY_REPORT_ENV, "");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(MEMORY_REPORT_ENV) };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(MEMORY_REPORT_ENV, "") };
         let result = resolve_report_path(None);
         assert!(
             result.is_none(),
             "empty env var should be ignored, got {:?}",
             result
         );
-        std::env::remove_var(MEMORY_REPORT_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(MEMORY_REPORT_ENV) };
     }
 
     #[test]

@@ -61,6 +61,149 @@ impl LeIndex {
         self.search_internal(query, top_k, query_type, false)
     }
 
+    fn enrich_results_with_pdg_metadata(
+        &self,
+        results: &mut [SearchResult],
+        pdg: &ProgramDependenceGraph,
+        file_cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+    ) {
+        for result in results {
+            if let Some(node_idx) = pdg.find_by_id(&result.node_id) {
+                if let Some(node) = pdg.get_node(node_idx) {
+                    result.symbol_type = Some(match node.node_type {
+                        crate::graph::pdg::NodeType::Function => "function".to_string(),
+                        crate::graph::pdg::NodeType::Class => "class".to_string(),
+                        crate::graph::pdg::NodeType::Method => "method".to_string(),
+                        crate::graph::pdg::NodeType::Variable => "variable".to_string(),
+                        crate::graph::pdg::NodeType::Module => "module".to_string(),
+                        crate::graph::pdg::NodeType::External => "external".to_string(),
+                        crate::graph::pdg::NodeType::FileSummary => "file_summary".to_string(),
+                    });
+
+                    let file_path_str = node.file_path.to_string();
+                    if result.line_number.is_none() {
+                        let abs_path = self.resolve_indexed_file_path(&file_path_str);
+                        let content = file_cache
+                            .entry(file_path_str.clone())
+                            .or_insert_with(|| std::fs::read(abs_path).ok());
+                        if let Some(content) = content.as_ref() {
+                            if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
+                                let byte_offset = node.byte_range.0.min(content.len());
+                                let line_num = content[..byte_offset]
+                                    .iter()
+                                    .filter(|&&b| b == b'\n')
+                                    .count()
+                                    + 1;
+                                result.line_number = Some(line_num);
+                            } else if !node.name.is_empty() {
+                                if let Some(pos) = find_subsequence(content, node.name.as_bytes()) {
+                                    let line_num =
+                                        content[..pos].iter().filter(|&&b| b == b'\n').count() + 1;
+                                    result.line_number = Some(line_num);
+                                }
+                            }
+                        }
+                    }
+                }
+                result.caller_count = Some(pdg.predecessor_count(node_idx));
+                result.dependency_count = Some(pdg.neighbors(node_idx).len());
+            }
+        }
+    }
+
+    fn rerank_results(
+        &self,
+        results: &mut Vec<SearchResult>,
+        query: &str,
+        pdg: &ProgramDependenceGraph,
+        file_cache: &mut std::collections::HashMap<String, Option<Vec<u8>>>,
+        exact_route: bool,
+    ) {
+        let rerank_cfg = &crate::cli::neural_config::LeIndexConfig::load_cached().search;
+        if rerank_cfg.rerank_enabled && !exact_route && !results.is_empty() {
+            if let Some(embedder) = self.embedder.as_ref() {
+                let n = (rerank_cfg.rerank_top_n as usize).min(results.len());
+                let mut docs: Vec<(String, String, f32)> = Vec::with_capacity(n);
+                for result in results[..n].iter() {
+                    let content = pdg
+                        .find_by_id(&result.node_id)
+                        .and_then(|idx| pdg.get_node(idx))
+                        .and_then(|node| {
+                            let path = self.resolve_indexed_file_path(&node.file_path);
+                            let bytes = file_cache
+                                .entry(node.file_path.to_string())
+                                .or_insert_with(|| std::fs::read(&path).ok());
+                            bytes
+                                .as_ref()
+                                .filter(|bytes| {
+                                    node.byte_range.0 < node.byte_range.1
+                                        && node.byte_range.1 <= bytes.len()
+                                })
+                                .map(|bytes| {
+                                    String::from_utf8_lossy(
+                                        &bytes[node.byte_range.0..node.byte_range.1],
+                                    )
+                                    .to_string()
+                                })
+                        })
+                        .unwrap_or_else(|| format!("{} {}", result.symbol_name, result.file_path));
+                    docs.push((result.node_id.clone(), content, result.score.overall));
+                }
+
+                match embedder.rerank_blocking(query, docs) {
+                    Some(Ok(reranked)) => {
+                        let by_id: std::collections::HashMap<String, SearchResult> = results[..n]
+                            .iter()
+                            .map(|result| (result.node_id.clone(), result.clone()))
+                            .collect();
+                        let mut new_top: Vec<SearchResult> = Vec::with_capacity(n);
+                        for (id, _) in &reranked {
+                            if let Some(result) = by_id.get(id) {
+                                new_top.push(result.clone());
+                            }
+                        }
+                        for result in results[..n].iter() {
+                            if !new_top.iter().any(|item| item.node_id == result.node_id) {
+                                new_top.push(result.clone());
+                            }
+                        }
+                        new_top.extend(results[n..].iter().cloned());
+                        *results = new_top;
+                        for (index, result) in results.iter_mut().enumerate() {
+                            result.rank = index + 1;
+                        }
+                        debug!("reranker re-ordered top-{} for '{}'", n, query);
+                    }
+                    Some(Err(error)) => {
+                        tracing::warn!(error = %error, "reranker failed; keeping original order")
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    fn cache_search_results(&mut self, results: &[SearchResult], key: &str, query: &str) {
+        if let Ok(serialized) = bincode::serialize(results) {
+            let entry = CacheEntry::Binary {
+                metadata: std::collections::HashMap::from([
+                    ("type".to_string(), "search_results".to_string()),
+                    ("query".to_string(), query.to_string()),
+                ]),
+                serialized_data: serialized,
+            };
+            if self
+                .cache
+                .cache_spiller
+                .store_mut()
+                .insert(key.to_string(), entry)
+                .is_ok()
+            {
+                let _ = self.cache.cache_spiller.store_mut().persist_key(key);
+            }
+        }
+    }
+
     fn search_internal(
         &mut self,
         query: &str,
@@ -146,135 +289,10 @@ impl LeIndex {
             .search(search_query)
             .context("Search operation failed")?;
 
-        // Enrich results with PDG metadata: symbol_type, caller_count, dependency_count, line_number.
-        // These require the in-memory PDG which is available here but not in lerecherche.
         if let Some(pdg) = &self.pdg {
-            // Cache file contents to avoid re-reading the same file for multiple results
-            let mut file_cache: std::collections::HashMap<String, Option<Vec<u8>>> =
-                std::collections::HashMap::new();
-
-            for result in &mut results {
-                // Look up the PDG node by its string ID
-                if let Some(node_idx) = pdg.find_by_id(&result.node_id) {
-                    if let Some(node) = pdg.get_node(node_idx) {
-                        result.symbol_type = Some(match node.node_type {
-                            crate::graph::pdg::NodeType::Function => "function".to_string(),
-                            crate::graph::pdg::NodeType::Class => "class".to_string(),
-                            crate::graph::pdg::NodeType::Method => "method".to_string(),
-                            crate::graph::pdg::NodeType::Variable => "variable".to_string(),
-                            crate::graph::pdg::NodeType::Module => "module".to_string(),
-                            crate::graph::pdg::NodeType::External => "external".to_string(),
-                            crate::graph::pdg::NodeType::FileSummary => "file_summary".to_string(),
-                        });
-
-                        // Compute line number from byte_range, or fall back to
-                        // searching for the symbol name in the file content
-                        let file_path_str = node.file_path.to_string();
-                        let needs_line = result.line_number.is_none();
-                        if needs_line {
-                            let abs_path = self.resolve_indexed_file_path(&file_path_str);
-                            let content = file_cache
-                                .entry(file_path_str.clone())
-                                .or_insert_with(|| std::fs::read(abs_path).ok());
-                            if let Some(content) = content.as_ref() {
-                                if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
-                                    // Compute from byte_range
-                                    let byte_offset = node.byte_range.0.min(content.len());
-                                    let line_num = content[..byte_offset]
-                                        .iter()
-                                        .filter(|&&b| b == b'\n')
-                                        .count()
-                                        + 1;
-                                    result.line_number = Some(line_num);
-                                } else if !node.name.is_empty() {
-                                    // Fallback: find the symbol name in the file content
-                                    let name_bytes = node.name.as_bytes();
-                                    if let Some(pos) = find_subsequence(content, name_bytes) {
-                                        let line_num =
-                                            content[..pos].iter().filter(|&&b| b == b'\n').count()
-                                                + 1;
-                                        result.line_number = Some(line_num);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    result.caller_count = Some(pdg.predecessor_count(node_idx));
-                    result.dependency_count = Some(pdg.neighbors(node_idx).len());
-                }
-            }
-            // Cross-encoder rerank of the top-N results (if enabled). Re-reads
-            // each candidate's code via its PDG byte_range so the cross-encoder
-            // scores real content (not just the symbol name) — this is what
-            // closes the natural-language→code gap for conceptual queries.
-            // Re-orders the top-N by the cross-encoder; display scores are
-            // unchanged. (VAL-RERANK.)
-            let rerank_cfg = &crate::cli::neural_config::LeIndexConfig::load_cached().search;
-            if rerank_cfg.rerank_enabled && !exact_route && !results.is_empty() {
-                if let Some(embedder) = self.embedder.as_ref() {
-                    let n = (rerank_cfg.rerank_top_n as usize).min(results.len());
-                    let mut docs: Vec<(String, String, f32)> = Vec::with_capacity(n);
-                    for r in results[..n].iter() {
-                        let content = pdg
-                            .find_by_id(&r.node_id)
-                            .and_then(|idx| pdg.get_node(idx))
-                            .and_then(|node| {
-                                let path = self.resolve_indexed_file_path(&node.file_path);
-                                let bytes = file_cache
-                                    .entry(node.file_path.to_string())
-                                    .or_insert_with(|| std::fs::read(&path).ok())
-                                    .clone();
-                                bytes
-                                    .filter(|b| {
-                                        node.byte_range.0 < node.byte_range.1
-                                            && node.byte_range.1 <= b.len()
-                                    })
-                                    .map(|b| {
-                                        String::from_utf8_lossy(
-                                            &b[node.byte_range.0..node.byte_range.1],
-                                        )
-                                        .to_string()
-                                    })
-                            })
-                            .unwrap_or_else(|| format!("{} {}", r.symbol_name, r.file_path));
-                        docs.push((r.node_id.clone(), content, r.score.overall));
-                    }
-                    match embedder.rerank_blocking(query, docs) {
-                        Some(Ok(reranked)) => {
-                            // reranked is sorted desc by combined_score. Reorder
-                            // the top-N to that order; keep display scores.
-                            let by_id: std::collections::HashMap<String, SearchResult> = results
-                                [..n]
-                                .iter()
-                                .map(|r| (r.node_id.clone(), r.clone()))
-                                .collect();
-                            let mut new_top: Vec<SearchResult> = Vec::with_capacity(n);
-                            for (id, _) in &reranked {
-                                if let Some(r) = by_id.get(id) {
-                                    new_top.push(r.clone());
-                                }
-                            }
-                            // Defensive: any top-N id missing from reranked
-                            // stays in original relative order.
-                            for r in results[..n].iter() {
-                                if !new_top.iter().any(|x| x.node_id == r.node_id) {
-                                    new_top.push(r.clone());
-                                }
-                            }
-                            new_top.extend(results[n..].iter().cloned());
-                            results = new_top;
-                            for (i, r) in results.iter_mut().enumerate() {
-                                r.rank = i + 1;
-                            }
-                            debug!("reranker re-ordered top-{} for '{}'", n, query);
-                        }
-                        Some(Err(e)) => {
-                            tracing::warn!(error = %e, "reranker failed; keeping original order")
-                        }
-                        None => {}
-                    }
-                }
-            }
+            let mut file_cache = std::collections::HashMap::new();
+            self.enrich_results_with_pdg_metadata(&mut results, pdg, &mut file_cache);
+            self.rerank_results(&mut results, query, pdg, &mut file_cache, exact_route);
         }
 
         // Truncate the over-fetched candidate pool (search_top_k) back to the
@@ -284,28 +302,7 @@ impl LeIndex {
         debug!("Search for '{}' returned {} results", query, results.len());
 
         if cache_results {
-            if let Ok(serialized) = bincode::serialize(&results) {
-                let entry = CacheEntry::Binary {
-                    metadata: std::collections::HashMap::from([
-                        ("type".to_string(), "search_results".to_string()),
-                        ("query".to_string(), query.to_string()),
-                    ]),
-                    serialized_data: serialized,
-                };
-                if self
-                    .cache
-                    .cache_spiller
-                    .store_mut()
-                    .insert(search_cache_key.clone(), entry)
-                    .is_ok()
-                {
-                    let _ = self
-                        .cache
-                        .cache_spiller
-                        .store_mut()
-                        .persist_key(&search_cache_key);
-                }
-            }
+            self.cache_search_results(&results, &search_cache_key, query);
         }
 
         Ok(results)
@@ -669,214 +666,130 @@ impl LeIndex {
     /// 2. Extracts key technical terms and searches with those
     /// 3. Merges and deduplicates results, prioritizing source code files
     fn analyze_search(&mut self, query: &str) -> Result<Vec<SearchResult>> {
-        // Primary search with the full query
         let primary_neural_embedding = self.generate_query_neural_embedding(query);
         let try_additional_neural = primary_neural_embedding.is_some();
+        let primary_results = self
+            .search_engine
+            .search(self.analysis_search_query(query, primary_neural_embedding))
+            .context("Search for analysis failed")?;
 
-        let primary_query = SearchQuery {
+        let key_terms = extract_analysis_keywords(query);
+        let secondary_results = self.optional_analysis_search(
+            &key_terms,
+            key_terms != query.to_lowercase() && !key_terms.is_empty(),
+            try_additional_neural,
+        );
+        let stemmed_terms = extract_stemmed_keywords(query);
+        let stemmed_results = self.optional_analysis_search(
+            &stemmed_terms,
+            !stemmed_terms.is_empty() && stemmed_terms != key_terms,
+            try_additional_neural,
+        );
+
+        let mut final_results =
+            Self::merge_analysis_results(primary_results, secondary_results, stemmed_results);
+        if let Some(pdg) = &self.pdg {
+            let mut file_cache = std::collections::HashMap::new();
+            self.enrich_results_with_pdg_metadata(&mut final_results, pdg, &mut file_cache);
+        }
+        Ok(final_results)
+    }
+
+    fn analysis_search_query(
+        &self,
+        query: &str,
+        query_neural_embedding: Option<Vec<f32>>,
+    ) -> SearchQuery {
+        SearchQuery {
             query: query.to_string(),
             top_k: 15,
             token_budget: None,
             semantic: true,
             expand_context: false,
             query_embedding: Some(self.generate_query_embedding(query)),
-            query_neural_embedding: primary_neural_embedding,
+            query_neural_embedding,
             threshold: Some(0.05),
             query_type: Some(crate::search::ranking::QueryType::Semantic),
-        };
+        }
+    }
 
-        let primary_results = self
-            .search_engine
-            .search(primary_query)
-            .context("Search for analysis failed")?;
+    fn optional_analysis_search(
+        &mut self,
+        query: &str,
+        should_search: bool,
+        try_neural: bool,
+    ) -> Vec<SearchResult> {
+        if !should_search {
+            return Vec::new();
+        }
+        let neural_embedding = try_neural
+            .then(|| self.generate_query_neural_embedding(query))
+            .flatten();
+        self.search_engine
+            .search(self.analysis_search_query(query, neural_embedding))
+            .unwrap_or_default()
+    }
 
-        // Extract key terms from the query for a secondary search.
-        // This helps find relevant code that doesn't contain the exact
-        // query words but contains related technical terms.
-        let key_terms = extract_analysis_keywords(query);
-
-        // Only do secondary search if key terms differ significantly from original
-        let secondary_results = if key_terms != query.to_lowercase() && !key_terms.is_empty() {
-            let secondary_query = SearchQuery {
-                query: key_terms.clone(),
-                top_k: 15,
-                token_budget: None,
-                semantic: true,
-                expand_context: false,
-                query_embedding: Some(self.generate_query_embedding(&key_terms)),
-                query_neural_embedding: if try_additional_neural {
-                    self.generate_query_neural_embedding(&key_terms)
-                } else {
-                    None
-                },
-                threshold: Some(0.05),
-                query_type: Some(crate::search::ranking::QueryType::Semantic),
-            };
-
-            self.search_engine
-                .search(secondary_query)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Third search: use stemmed keywords to find related code.
-        // For example, "scoring" → "score" to find score_hybrid, calculate_text_score, etc.
-        let stemmed_terms = extract_stemmed_keywords(query);
-        let stemmed_results = if !stemmed_terms.is_empty() && stemmed_terms != key_terms {
-            let stemmed_query = SearchQuery {
-                query: stemmed_terms.clone(),
-                top_k: 15,
-                token_budget: None,
-                semantic: true,
-                expand_context: false,
-                query_embedding: Some(self.generate_query_embedding(&stemmed_terms)),
-                query_neural_embedding: if try_additional_neural {
-                    self.generate_query_neural_embedding(&stemmed_terms)
-                } else {
-                    None
-                },
-                threshold: Some(0.05),
-                query_type: Some(crate::search::ranking::QueryType::Semantic),
-            };
-
-            self.search_engine.search(stemmed_query).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-
-        // Merge results: deduplicate by node_id, keeping the highest score.
-        // Apply source code prioritization: boost source files, penalize
-        // non-source files (docs, scripts, configs).
+    fn merge_analysis_results(
+        primary_results: Vec<SearchResult>,
+        secondary_results: Vec<SearchResult>,
+        stemmed_results: Vec<SearchResult>,
+    ) -> Vec<SearchResult> {
         let mut merged: std::collections::HashMap<String, SearchResult> =
             std::collections::HashMap::new();
-
         for result in primary_results
             .into_iter()
             .chain(secondary_results)
             .chain(stemmed_results)
         {
-            let node_id = result.node_id.clone();
-            let new_score = result.score.overall;
-            match merged.entry(node_id) {
-                std::collections::hash_map::Entry::Occupied(mut e) => {
-                    // Keep the result with the higher overall score
-                    if new_score > e.get().score.overall {
-                        e.insert(result);
-                    }
+            match merged.entry(result.node_id.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut entry)
+                    if result.score.overall > entry.get().score.overall =>
+                {
+                    entry.insert(result);
                 }
-                std::collections::hash_map::Entry::Vacant(e) => {
-                    e.insert(result);
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(result);
                 }
+                _ => {}
             }
         }
 
         let mut results: Vec<SearchResult> = merged.into_values().collect();
-
-        // Apply source code prioritization
         for result in &mut results {
             if !is_source_code_file(&result.file_path) {
-                // Penalize non-source files (docs, scripts, configs)
                 result.score.overall *= 0.3;
             }
         }
+        Self::sort_results_by_score(&mut results);
 
-        // Apply diversity boost: ensure results from different files
-        // get representation. Group by file path and apply a small penalty
-        // to results from files that already have many entries, so that
-        // results from a variety of files appear in the top 10.
-        let mut file_counts: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        // Sort first by score to establish ranking order
-        results.sort_by(|a, b| {
-            b.score
-                .overall
-                .partial_cmp(&a.score.overall)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        let mut file_counts = std::collections::HashMap::new();
         for result in &mut results {
             let count = file_counts.get(&result.file_path).copied().unwrap_or(0);
-            // Apply diminishing returns: each additional result from the
-            // same file gets a 10% penalty
             if count > 0 {
-                result.score.overall *= (0.9_f32).powi(count as i32);
+                result.score.overall *= (0.9_f32).powi(count);
             }
             *file_counts.entry(result.file_path.clone()).or_default() += 1;
         }
 
-        // Sort by adjusted score
-        results.sort_by(|a, b| {
-            b.score
-                .overall
-                .partial_cmp(&a.score.overall)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Take top 10 and re-rank
+        Self::sort_results_by_score(&mut results);
         let mut final_results: Vec<SearchResult> = results.into_iter().take(10).collect();
-        for (i, result) in final_results.iter_mut().enumerate() {
-            result.rank = i + 1;
+        for (index, result) in final_results.iter_mut().enumerate() {
+            result.rank = index + 1;
         }
-
-        // Enrich with PDG metadata (same as regular search)
-        if let Some(pdg) = &self.pdg {
-            let mut file_cache: std::collections::HashMap<String, Option<Vec<u8>>> =
-                std::collections::HashMap::new();
-
-            for result in &mut final_results {
-                if let Some(node_idx) = pdg.find_by_id(&result.node_id) {
-                    if let Some(node) = pdg.get_node(node_idx) {
-                        result.symbol_type = Some(match node.node_type {
-                            crate::graph::pdg::NodeType::Function => "function".to_string(),
-                            crate::graph::pdg::NodeType::Class => "class".to_string(),
-                            crate::graph::pdg::NodeType::Method => "method".to_string(),
-                            crate::graph::pdg::NodeType::Variable => "variable".to_string(),
-                            crate::graph::pdg::NodeType::Module => "module".to_string(),
-                            crate::graph::pdg::NodeType::External => "external".to_string(),
-                            crate::graph::pdg::NodeType::FileSummary => "file_summary".to_string(),
-                        });
-
-                        // Compute line number from byte_range, or fall back to
-                        // searching for the symbol name in the file content
-                        let file_path_str = node.file_path.to_string();
-                        let needs_line = result.line_number.is_none();
-                        if needs_line {
-                            let abs_path = self.resolve_indexed_file_path(&file_path_str);
-                            let content = file_cache
-                                .entry(file_path_str.clone())
-                                .or_insert_with(|| std::fs::read(abs_path).ok());
-
-                            if let Some(content) = content.as_ref() {
-                                if node.byte_range.0 > 0 || node.byte_range.1 > 0 {
-                                    let byte_offset = node.byte_range.0.min(content.len());
-                                    let line_num = content[..byte_offset]
-                                        .iter()
-                                        .filter(|&&b| b == b'\n')
-                                        .count()
-                                        + 1;
-                                    result.line_number = Some(line_num);
-                                } else if !node.name.is_empty() {
-                                    let name_bytes = node.name.as_bytes();
-                                    if let Some(pos) = find_subsequence(content, name_bytes) {
-                                        let line_num =
-                                            content[..pos].iter().filter(|&&b| b == b'\n').count()
-                                                + 1;
-                                        result.line_number = Some(line_num);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    result.caller_count = Some(pdg.predecessor_count(node_idx));
-                    result.dependency_count = Some(pdg.neighbors(node_idx).len());
-                }
-            }
-        }
-
-        Ok(final_results)
+        final_results
     }
 
-    /// Expand context using PDG traversal
+    fn sort_results_by_score(results: &mut [SearchResult]) {
+        results.sort_by(|left, right| {
+            right
+                .score
+                .overall
+                .partial_cmp(&left.score.overall)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
     fn expand_context(
         &self,
         pdg: &ProgramDependenceGraph,
@@ -991,127 +904,133 @@ fn generate_deterministic_embedding(symbol_name: &str) -> Vec<f32> {
     embedding
 }
 
-/// On-demand fuzzy node discovery for event-loop-heavy files.
-///
-/// When exact lookup fails, this function scans the PDG for nodes whose
-/// name or ID contains the query as a case-insensitive substring. This
-/// ensures that winit event-loop entrypoints (e.g., `run_event_loop`,
-/// `EventLoop::run`, `main`) are discoverable even when the user's query
-/// doesn't exactly match the symbol name.
-///
-/// Returns the best-matching NodeId, preferring:
-/// 1. Nodes whose name contains the query as a substring
-/// 2. Nodes whose ID contains the query as a substring
-/// 3. Higher-complexity nodes (event loops tend to be complex)
+// On-demand fuzzy node discovery for event-loop-heavy files.
+//
+// When exact lookup fails, this function scans the PDG for nodes whose
+// name or ID contains the query as a case-insensitive substring. This
+// ensures that winit event-loop entrypoints (e.g., `run_event_loop`,
+// `EventLoop::run`, `main`) are discoverable even when the user's query
+// doesn't exactly match the symbol name.
+//
+// Returns the best-matching NodeId, preferring name, then ID, then
+// higher-complexity event-loop aliases.
+const EVENT_LOOP_ALIASES: &[&str] = &[
+    "run",
+    "main",
+    "event_loop",
+    "event loop",
+    "winit",
+    "app_runner",
+];
+const MAX_FUZZY_FALLBACK_SCAN: usize = 10_000;
+
 fn fuzzy_find_node(
     pdg: &crate::graph::pdg::ProgramDependenceGraph,
     query: &str,
 ) -> Option<crate::graph::pdg::NodeId> {
-    const NAME_MATCH_SCORE: usize = 100;
-    const ID_MATCH_SCORE: usize = 50;
-    const ALIAS_MATCH_SCORE: usize = 25;
-    const COMPLEXITY_SCORE_CAP: u32 = 50;
-    const MAX_FALLBACK_SCAN: usize = 10_000;
-
     let query_lower = query.to_lowercase();
-
-    // Empty query matches nothing — not a wildcard.
     if query_lower.is_empty() {
         return None;
     }
 
-    let event_loop_aliases: &[&str] = &[
-        "run",
-        "main",
-        "event_loop",
-        "event loop",
-        "winit",
-        "app_runner",
-    ];
-
-    let is_event_loop_query = event_loop_aliases
+    let is_event_loop_query = EVENT_LOOP_ALIASES
         .iter()
-        .any(|alias| query_lower.contains(alias));
+        .any(|alias| query_lower == *alias || query_lower.split_whitespace().any(|w| w == *alias));
+    let candidates = fuzzy_candidate_nodes(pdg, &query_lower, is_event_loop_query);
+    let mut best_match = None;
 
-    let mut best_match: Option<(crate::graph::pdg::NodeId, usize)> = None;
-
-    let mut score_node = |node_id: crate::graph::pdg::NodeId, node: &crate::graph::pdg::Node| {
-        let name_lower = node.name.to_lowercase();
-
-        let score = if name_lower.contains(&query_lower) {
-            NAME_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
-        } else {
-            let id_lower = node.id.to_lowercase();
-            if id_lower.contains(&query_lower) {
-                ID_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
-            } else if is_event_loop_query
-                && event_loop_aliases
-                    .iter()
-                    .any(|alias| name_lower.contains(alias))
-            {
-                ALIAS_MATCH_SCORE + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize
-            } else {
-                return;
-            }
+    for node_id in candidates {
+        let Some(node) = pdg.get_node(node_id) else {
+            continue;
         };
-
-        match &best_match {
-            None => best_match = Some((node_id, score)),
-            Some((_, best_score)) if score > *best_score => {
-                best_match = Some((node_id, score));
-            }
-            _ => {}
-        }
-    };
-
-    let candidate_indices = pdg.trigram_index().query(&query_lower);
-
-    if is_event_loop_query {
-        // Query trigram index for each alias, collect union of candidates
-        let mut alias_candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
-        for alias in event_loop_aliases {
-            if let Some(indices) = pdg.trigram_index().query(alias) {
-                alias_candidates.extend(indices.iter());
-            }
-        }
-        if alias_candidates.is_empty() {
-            // No trigram hits for any alias — fall back to full scan (bounded)
-            for (scanned, node_id) in pdg.node_indices().enumerate() {
-                if scanned >= MAX_FALLBACK_SCAN {
-                    break;
-                }
-                if let Some(node) = pdg.get_node(node_id) {
-                    score_node(node_id, node);
-                }
-            }
-        } else {
-            for &node_idx in &alias_candidates {
-                let node_id = crate::graph::pdg::NodeId::new(node_idx as usize);
-                if let Some(node) = pdg.get_node(node_id) {
-                    score_node(node_id, node);
-                }
-            }
-        }
-    } else if let Some(indices) = candidate_indices {
-        for node_idx in indices {
-            let node_id = crate::graph::pdg::NodeId::new(node_idx as usize);
-            if let Some(node) = pdg.get_node(node_id) {
-                score_node(node_id, node);
-            }
-        }
-    } else {
-        // No trigram index — fall back to full scan (bounded)
-        for (scanned, node_id) in pdg.node_indices().enumerate() {
-            if scanned >= MAX_FALLBACK_SCAN {
-                break;
-            }
-            if let Some(node) = pdg.get_node(node_id) {
-                score_node(node_id, node);
-            }
+        let Some(score) = fuzzy_node_score(node, &query_lower, is_event_loop_query) else {
+            continue;
+        };
+        if best_match
+            .as_ref()
+            .is_none_or(|(_, best_score)| score > *best_score)
+        {
+            best_match = Some((node_id, score));
         }
     }
 
-    best_match.map(|(nid, _)| nid)
+    best_match.map(|(node_id, _)| node_id)
+}
+
+fn fuzzy_candidate_nodes(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    query: &str,
+    is_event_loop_query: bool,
+) -> Vec<crate::graph::pdg::NodeId> {
+    if is_event_loop_query {
+        return event_loop_candidate_nodes(pdg);
+    }
+
+    pdg.trigram_index()
+        .query(query)
+        .map(|indices| {
+            indices
+                .iter()
+                .map(|index| crate::graph::pdg::NodeId::new(*index as usize))
+                .collect()
+        })
+        .unwrap_or_else(|| bounded_node_indices(pdg))
+}
+
+fn event_loop_candidate_nodes(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+) -> Vec<crate::graph::pdg::NodeId> {
+    let mut candidates: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for alias in EVENT_LOOP_ALIASES {
+        if let Some(indices) = pdg.trigram_index().query(alias) {
+            candidates.extend(indices.iter());
+        }
+    }
+
+    if candidates.is_empty() {
+        return bounded_node_indices(pdg);
+    }
+
+    let mut candidates: Vec<_> = candidates.into_iter().collect();
+    candidates.sort_unstable();
+    candidates
+        .into_iter()
+        .map(|index| crate::graph::pdg::NodeId::new(index as usize))
+        .collect()
+}
+
+fn bounded_node_indices(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+) -> Vec<crate::graph::pdg::NodeId> {
+    pdg.node_indices().take(MAX_FUZZY_FALLBACK_SCAN).collect()
+}
+
+fn fuzzy_node_score(
+    node: &crate::graph::pdg::Node,
+    query: &str,
+    is_event_loop_query: bool,
+) -> Option<usize> {
+    const NAME_MATCH_SCORE: usize = 100;
+    const ID_MATCH_SCORE: usize = 50;
+    const ALIAS_MATCH_SCORE: usize = 25;
+    const COMPLEXITY_SCORE_CAP: u32 = 50;
+
+    let name_lower = node.name.to_lowercase();
+    let base_score = if name_lower.contains(query) {
+        NAME_MATCH_SCORE
+    } else if node.id.to_lowercase().contains(query) {
+        ID_MATCH_SCORE
+    } else if is_event_loop_query
+        && EVENT_LOOP_ALIASES
+            .iter()
+            .any(|alias| name_lower.contains(alias))
+    {
+        ALIAS_MATCH_SCORE
+    } else {
+        return None;
+    };
+
+    Some(base_score + node.complexity.min(COMPLEXITY_SCORE_CAP) as usize)
 }
 
 /// Extract stemmed technical terms from a natural language query.
@@ -1332,7 +1251,7 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::{simple_stem, LeIndex};
+    use super::{LeIndex, simple_stem};
     use crate::cli::memory::CacheEntry;
     use crate::search::{ranking::Score, search::SearchResult};
 

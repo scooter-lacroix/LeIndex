@@ -36,7 +36,7 @@ fn unix_now_ms() -> u64 {
 #[cfg(feature = "onnx")]
 use ort::logging::LogLevel;
 #[cfg(feature = "onnx")]
-use ort::session::{builder::GraphOptimizationLevel, Session};
+use ort::session::{Session, builder::GraphOptimizationLevel, builder::SessionBuilder};
 
 /// Default idle timeout in seconds before the worker tears itself down.
 ///
@@ -386,6 +386,131 @@ struct SessionBuildOutcome {
     provider_status: ProviderRuntimeStatus,
 }
 
+/// Build the MIGraphX execution provider with the configured options.
+#[cfg(feature = "onnx")]
+fn build_migraphx_ep() -> ort::ep::ExecutionProviderDispatch {
+    let mut ep = ort::ep::MIGraphX::default();
+    // Compiled-program persistence is owned by ORT's native
+    // `ORT_MIGraphX_MODEL_CACHE_PATH` cache (set on the worker by the embedding
+    // client). Cold start JIT-compiles (~300 s) and writes the `.mxr`; warm start
+    // loads it (~4 s). We do NOT use the crate-level save/load (under the
+    // ort-crate/ORT struct skew those read an empty save path, collide with the
+    // native cache, and a synthetic warmup makes the kernel fail). Only prune
+    // stale `.mxr` files to bound the ~1.2 GB-per-shape growth.
+    if let Ok(cache_dir_str) = std::env::var(MIGRAPHX_MODEL_CACHE_PATH_ENV) {
+        // Keep enough .mxr for the embedder (b8 + query b1) AND the on-demand
+        // reranker (b8 x 512) to coexist. The prior keep=1 made them evict each
+        // other every process (mutual recompile). They share one cache dir.
+        prune_migraphx_cache(std::path::Path::new(&cache_dir_str), 6);
+    }
+    if env_flag(MIGRAPHX_FP16_ENV) {
+        tracing::info!("MIGraphX FP16 enabled via {}", MIGRAPHX_FP16_ENV);
+        ep = ep.with_fp16(true);
+    }
+    if env_flag(MIGRAPHX_EXHAUSTIVE_TUNE_ENV) {
+        tracing::info!(
+            "MIGraphX exhaustive tune enabled via {}",
+            MIGRAPHX_EXHAUSTIVE_TUNE_ENV
+        );
+        ep = ep.with_exhaustive_tune(true);
+    }
+    ep.build()
+}
+
+/// Try to attach `provider`; on failure, rebuild a fresh CPU-only session builder
+/// and report the fallback. `status_name` is the name recorded on the runtime
+/// status; `ep_label` is the (display) name used in the fallback log message.
+#[cfg(feature = "onnx")]
+fn try_provider_or_cpu(
+    builder: SessionBuilder,
+    provider: ort::ep::ExecutionProviderDispatch,
+    status_name: &str,
+    ep_label: &str,
+) -> Result<(SessionBuilder, ProviderRuntimeStatus), ort::Error> {
+    match builder.with_execution_providers([provider]) {
+        Ok(sb) => Ok((sb, ProviderRuntimeStatus::available(status_name))),
+        Err(e) => {
+            let reason = format!("{} EP not available: {}; falling back to CPU", ep_label, e);
+            tracing::warn!("{}", reason);
+            let cpu_builder = Session::builder()?
+                .with_memory_pattern(false)?
+                .with_log_level(LogLevel::Warning)?
+                .with_optimization_level(GraphOptimizationLevel::Level1)?
+                .with_execution_providers([ort::ep::CPU::default().build()])?;
+            Ok((cpu_builder, ProviderRuntimeStatus::fallback_to_cpu(reason)))
+        }
+    }
+}
+
+/// VAL-ORT-015/016 pre-flight: if a GPU provider was selected but MIGraphX is not
+/// compiled into the dynamically-loaded ORT binary, build a CPU-only session and
+/// return it so the caller can short-circuit. Returns `None` to proceed normally.
+#[cfg(feature = "onnx")]
+fn maybe_missing_ep_fallback(
+    model_path: &std::path::Path,
+    provider_name: &str,
+) -> Result<Option<SessionBuildOutcome>, ort::Error> {
+    if !matches!(provider_name, "migraphx" | "rocm") || crate::provider::is_migraphx_compiled_in() {
+        return Ok(None);
+    }
+    tracing::warn!(
+        "MIGraphX EP not available in the dynamically loaded ONNX \
+         Runtime binary (got provider_name={}, is_migraphx_compiled_in=false); \
+         falling back to CPU. Install onnxruntime-migraphx or point \
+         ORT_DYLIB_PATH at a migraphx-enabled libonnxruntime.",
+        provider_name
+    );
+    let session = Session::builder()?
+        .with_memory_pattern(false)?
+        .with_log_level(LogLevel::Warning)?
+        .with_optimization_level(GraphOptimizationLevel::Level1)?
+        .with_execution_providers([ort::ep::CPU::default().build()])?
+        .commit_from_file(model_path)?;
+    Ok(Some(SessionBuildOutcome {
+        session,
+        provider_status: ProviderRuntimeStatus::fallback_to_cpu(
+            "MIGraphX EP not available in the dynamically loaded ONNX Runtime binary",
+        ),
+    }))
+}
+
+/// Attach the selected execution provider to `builder`, falling back to CPU on
+/// registration failure. `provider_name` is recorded verbatim on the status.
+#[cfg(feature = "onnx")]
+fn attach_execution_provider(
+    builder: SessionBuilder,
+    provider_name: &str,
+) -> Result<(SessionBuilder, ProviderRuntimeStatus), ort::Error> {
+    match provider_name {
+        "cuda" => try_provider_or_cpu(
+            builder,
+            ort::ep::CUDA::default().build(),
+            provider_name,
+            "CUDA",
+        ),
+        // "auto" already resolved to MIGraphX by the selector; explicit "migraphx"
+        // uses it directly. The pre-flight check above guarantees MIGraphX is
+        // compiled in for "migraphx"; "auto" still lets try_provider_or_cpu fall
+        // back if registration fails.
+        "migraphx" | "auto" => {
+            try_provider_or_cpu(builder, build_migraphx_ep(), provider_name, "MIGraphX")
+        }
+        // ROCm EP is deprecated in favor of MIGraphX; "rocm" uses MIGraphX and
+        // falls back to CPU if registration fails.
+        "rocm" => try_provider_or_cpu(builder, build_migraphx_ep(), provider_name, "MIGraphX"),
+        "coreml" => try_provider_or_cpu(
+            builder,
+            ort::ep::CoreML::default().build(),
+            provider_name,
+            "CoreML",
+        ),
+        _ => Ok((
+            builder.with_execution_providers([ort::ep::CPU::default().build()])?,
+            ProviderRuntimeStatus::available("cpu"),
+        )),
+    }
+}
+
 impl WorkerRuntime {
     /// Create a new worker runtime with the given configuration.
     ///
@@ -612,169 +737,34 @@ impl WorkerRuntime {
         model_path: &std::path::Path,
         provider_name: &str,
     ) -> Result<SessionBuildOutcome, ort::Error> {
-        /// Try to attach the given execution provider; on failure, create a fresh
-        /// session builder and fall back to CPU.
-        macro_rules! try_provider_or_cpu {
-            ($builder:expr, $provider:expr, $name:literal) => {
-                match $builder.with_execution_providers([$provider]) {
-                    Ok(sb) => (sb, ProviderRuntimeStatus::available(provider_name)),
-                    Err(e) => {
-                        let reason =
-                            format!("{} EP not available: {}; falling back to CPU", $name, e);
-                        tracing::warn!("{}", reason);
-                        (
-                            Session::builder()?
-                                .with_memory_pattern(false)?
-                                .with_optimization_level(GraphOptimizationLevel::Level1)?
-                                .with_execution_providers([ort::ep::CPU::default().build()])?,
-                            ProviderRuntimeStatus::fallback_to_cpu(reason),
-                        )
-                    }
-                }
-            };
-        }
-
-        fn build_migraphx_ep() -> ort::ep::ExecutionProviderDispatch {
-            let mut ep = ort::ep::MIGraphX::default();
-
-            // Compiled-program persistence is owned by ORT's native
-            // `ORT_MIGraphX_MODEL_CACHE_PATH` cache, set on the worker process by
-            // the embedding client (`client.rs`). On a COLD start the first real
-            // inference JIT-compiles (~300 s) and the native cache writes the
-            // `.mxr`; on a WARM start the EP loads it at init (~4 s) and skips the
-            // compile. We do NOT use the crate-level `with_save_model`/
-            // `with_load_model`: under the ort-crate/ORT struct skew those read an
-            // empty save path, collide with the native cache, and a synthetic
-            // zero-input warmup makes the compiled kernel fail (so no `.mxr` is
-            // ever written). The first real embed request (e.g. `leindex setup`
-            // pipe mode) is the compile trigger. Only prune stale `.mxr` files to
-            // bound the ~1.2 GB-per-shape growth.
-            if let Ok(cache_dir_str) = std::env::var(MIGRAPHX_MODEL_CACHE_PATH_ENV) {
-                // Keep enough .mxr for the embedder (index b8 + query b1) AND the
-                // on-demand reranker (b8 x 512) to coexist. The prior keep=1 made
-                // them evict each other every process (mutual recompile, ~300s
-                // each, every search). They share this one cache dir because
-                // ORT_MIGraphX_MODEL_CACHE_PATH is a single process-global path.
-                prune_migraphx_cache(std::path::Path::new(&cache_dir_str), 6);
-            }
-
-            if env_flag(MIGRAPHX_FP16_ENV) {
-                tracing::info!("MIGraphX FP16 enabled via {}", MIGRAPHX_FP16_ENV);
-                ep = ep.with_fp16(true);
-            }
-            if env_flag(MIGRAPHX_EXHAUSTIVE_TUNE_ENV) {
-                tracing::info!(
-                    "MIGraphX exhaustive tune enabled via {}",
-                    MIGRAPHX_EXHAUSTIVE_TUNE_ENV
-                );
-                ep = ep.with_exhaustive_tune(true);
-            }
-
-            ep.build()
-        }
-
         // For GPU execution providers (MIGraphX/ROCm), use Level3 optimization
-        // so the ONNX graph undergoes maximum operator fusion and layout
-        // transformations before the EP sees it. MIGraphX works by identifying
-        // contiguous subgraphs it can compile to AMD GPU code; at Level1 the
-        // graph is too granular (individual Gemm/MatMul nodes, unfused
-        // attention) and MIGraphX falls back to CPU for most operators,
-        // leaving VRAM almost entirely unused (~42 MB / 24 GB observed
-        // on RX 7900 XTX). Level3 enables the transformer/attention fusion
-        // passes that produce subgraphs large enough for MIGraphX to take
-        // over, actually moving computation to the GPU.
+        // so the ONNX graph undergoes maximum operator fusion before the EP sees
+        // it; at Level1 the graph is too granular and MIGraphX falls back to CPU
+        // for most operators, leaving VRAM unused. Level3 enables the transformer
+        // fusion passes that move computation to the GPU.
         let optimization_level = match provider_name {
             "migraphx" | "rocm" | "auto" => GraphOptimizationLevel::Level3,
             _ => GraphOptimizationLevel::Level1,
         };
 
+        // Disable memory pattern reuse: tokenized sequence lengths vary between
+        // calls, and without this ORT may reuse a buffer shaped for the previous
+        // sequence and report a shape mismatch.
         let session_builder = Session::builder()?
-            // Disable memory pattern reuse because tokenized sequence lengths vary
-            // between inference calls. Without this, ORT may reuse an internal
-            // buffer shaped for the previous sequence and report a shape mismatch.
             .with_memory_pattern(false)?
             .with_log_level(LogLevel::Warning)?
             .with_optimization_level(optimization_level)?;
 
-        // VAL-ORT-015 / VAL-ORT-016: dynamic-load pre-flight check.
-        //
-        // When the `ort` crate's `load-dynamic` feature is used, the ORT binary
-        // is NOT known at compile time. The selector in `provider.rs` may report
-        // MIGraphX as available based on a useful-but-imprecise heuristic
-        // (presence of ROCm under /opt/rocm). The heuristic is right most of the
-        // time, but it can be wrong if the discovered libonnxruntime is a
-        // CPU-only build despite ROCm being installed.
-        //
-        // Before attempting registration, we consult
-        // [`crate::provider::is_migraphx_compiled_in`] which purely probes the
-        // loaded ORT binary via `GetAvailableProviders()`. If the EP truly is not
-        // compiled in, we log an explicit, actionable fallback message and skip
-        // the registration attempt entirely. The session will fall back to CPU
-        // inside ORT, but the operator can see exactly why MIGraphX was not used.
-        //
-        // This keeps the existing `try_provider_or_cpu!` path for genuine
-        // session-build errors that occur even when the EP IS compiled in (e.g.,
-        // missing GPU driver, no compatible device) while producing a clearer
-        // log message for the common dynamic-load incompatibility case.
-        match provider_name {
-            "migraphx" | "rocm" if !crate::provider::is_migraphx_compiled_in() => {
-                tracing::warn!(
-                    "MIGraphX EP not available in the dynamically loaded ONNX \
-                     Runtime binary (got provider_name={}, is_migraphx_compiled_in=false); \
-                     falling back to CPU. Install onnxruntime-migraphx or point \
-                     ORT_DYLIB_PATH at a migraphx-enabled libonnxruntime.",
-                    provider_name
-                );
-                let session = Session::builder()?
-                    .with_memory_pattern(false)?
-                    .with_optimization_level(GraphOptimizationLevel::Level1)?
-                    .with_execution_providers([ort::ep::CPU::default().build()])?
-                    .commit_from_file(model_path)?;
-                return Ok(SessionBuildOutcome {
-                    session,
-                    provider_status: ProviderRuntimeStatus::fallback_to_cpu(
-                        "MIGraphX EP not available in the dynamically loaded ONNX Runtime binary",
-                    ),
-                });
-            }
-            _ => {}
+        // VAL-ORT-015/016: short-circuit to a CPU session if a GPU provider was
+        // selected but MIGraphX is not compiled into the dynamically-loaded ORT
+        // binary. See `maybe_missing_ep_fallback`.
+        if let Some(outcome) = maybe_missing_ep_fallback(model_path, provider_name)? {
+            return Ok(outcome);
         }
 
-        // Configure execution providers based on selection
-        let (mut session_builder, provider_status) = match provider_name {
-            "cuda" => {
-                try_provider_or_cpu!(session_builder, ort::ep::CUDA::default().build(), "CUDA")
-            }
-            "migraphx" | "auto" => {
-                // For "auto", the provider selector already determined MIGraphX
-                // is the best available. For explicit "migraphx", use it directly.
-                // VAL-ORT-015: with the pre-flight check above, we know MIGraphX
-                // is compiled in when provider_name=="migraphx". For "auto", we
-                // still let the heuristic-driven path through (the auto-detector
-                // may believe MIGraphX is available even without the EP compiled
-                // in), and `try_provider_or_cpu!` will fall back if registration
-                // fails.
-                try_provider_or_cpu!(session_builder, build_migraphx_ep(), "MIGraphX")
-            }
-            "rocm" => {
-                // ROCm EP is deprecated in favor of MIGraphX; requests for "rocm"
-                // use MIGraphX and fall back directly to CPU if registration fails.
-                // (The pre-flight check above has already handled the case where
-                // MIGraphX is not compiled in and the user passed "rocm".)
-                try_provider_or_cpu!(session_builder, build_migraphx_ep(), "MIGraphX")
-            }
-            "coreml" => {
-                try_provider_or_cpu!(
-                    session_builder,
-                    ort::ep::CoreML::default().build(),
-                    "CoreML"
-                )
-            }
-            _ => (
-                session_builder.with_execution_providers([ort::ep::CPU::default().build()])?,
-                ProviderRuntimeStatus::available("cpu"),
-            ),
-        };
+        // Attach the selected execution provider, falling back to CPU on failure.
+        let (mut session_builder, provider_status) =
+            attach_execution_provider(session_builder, provider_name)?;
 
         let session = session_builder.commit_from_file(model_path)?;
         Ok(SessionBuildOutcome {
@@ -1247,68 +1237,37 @@ impl WorkerRuntime {
             }
         }
 
-        // Run inference with properly shaped tensors
-        // Shape: [batch_size, seq_len]
-        let input_ids_tensor = ort::value::Tensor::from_array(
-            ndarray::Array2::from_shape_vec((batch_size, max_len), input_ids).map_err(|e| {
-                WorkerError {
-                    kind: ErrorKind::Inference,
-                    message: format!("failed to create input_ids array: {}", e),
-                }
-            })?,
-        )
-        .map_err(|e| WorkerError {
-            kind: ErrorKind::Inference,
-            message: format!("failed to create input_ids tensor: {}", e),
-        })?;
-
-        let attention_mask_tensor = ort::value::Tensor::from_array(
-            ndarray::Array2::from_shape_vec((batch_size, max_len), attention_mask.clone())
+        // Build the [batch_size, seq_len] input tensors. The array+tensor
+        // creation is identical across all four inputs, so a local macro keeps
+        // each as a single (labelled) expression with one error path.
+        macro_rules! make_i64_tensor {
+            ($data:expr, $label:literal) => {
+                ort::value::Tensor::from_array(
+                    ndarray::Array2::from_shape_vec((batch_size, max_len), $data).map_err(|e| {
+                        WorkerError {
+                            kind: ErrorKind::Inference,
+                            message: format!("failed to create {} array: {}", $label, e),
+                        }
+                    })?,
+                )
                 .map_err(|e| WorkerError {
                     kind: ErrorKind::Inference,
-                    message: format!("failed to create attention_mask array: {}", e),
-                })?,
-        )
-        .map_err(|e| WorkerError {
-            kind: ErrorKind::Inference,
-            message: format!("failed to create attention_mask tensor: {}", e),
-        })?;
+                    message: format!("failed to create {} tensor: {}", $label, e),
+                })?
+            };
+        }
 
-        let position_ids_tensor = ort::value::Tensor::from_array(
-            ndarray::Array2::from_shape_vec(
-                (batch_size, max_len),
-                build_position_ids(batch_size, max_len),
-            )
-            .map_err(|e| WorkerError {
-                kind: ErrorKind::Inference,
-                message: format!("failed to create position_ids array: {}", e),
-            })?,
-        )
-        .map_err(|e| WorkerError {
-            kind: ErrorKind::Inference,
-            message: format!("failed to create position_ids tensor: {}", e),
-        })?;
-
-        // token_type_ids: BERT/GTE-style models (e.g. SFR-Embedding-Code-400M)
-        // have a `token_type_embeddings` layer that requires this input —
-        // without it inference fails at `/embeddings/token_type_embeddings/Gather`
-        // with "Missing Input: token_type_ids". For single-text retrieval every
-        // token is segment 0, so feed all-zeros. Models that lack this input
-        // never read it (see `uses_token_type_ids` below).
-        let token_type_ids_tensor = ort::value::Tensor::from_array(
-            ndarray::Array2::from_shape_vec(
-                (batch_size, max_len),
-                vec![0i64; batch_size * max_len],
-            )
-            .map_err(|e| WorkerError {
-                kind: ErrorKind::Inference,
-                message: format!("failed to create token_type_ids array: {}", e),
-            })?,
-        )
-        .map_err(|e| WorkerError {
-            kind: ErrorKind::Inference,
-            message: format!("failed to create token_type_ids tensor: {}", e),
-        })?;
+        let input_ids_tensor = make_i64_tensor!(input_ids, "input_ids");
+        let attention_mask_tensor = make_i64_tensor!(attention_mask.clone(), "attention_mask");
+        let position_ids_tensor =
+            make_i64_tensor!(build_position_ids(batch_size, max_len), "position_ids");
+        // token_type_ids: BERT/GTE-style models have a `token_type_embeddings`
+        // layer that requires this input — without it inference fails at
+        // `/embeddings/token_type_embeddings/Gather` with "Missing Input:
+        // token_type_ids". For single-text retrieval every token is segment 0,
+        // so feed all-zeros. Models that lack this input never read it.
+        let token_type_ids_tensor =
+            make_i64_tensor!(vec![0i64; batch_size * max_len], "token_type_ids");
 
         let mut session_guard = session.lock().map_err(|e| WorkerError {
             kind: ErrorKind::OnnxRuntime,
@@ -1352,26 +1311,34 @@ impl WorkerRuntime {
             message: format!("ONNX inference failed: {}", e),
         })?;
 
+        self.finalize_embed_output(&outputs, batch_size, expected_dim, &attention_mask)
+    }
+
+    /// Validate the embed output shape, normalize a pre-pooled `[b, hidden]`
+    /// tensor in place, or pool+normalize a `[b, seq, hidden]` tensor. Extracted
+    /// from `run_onnx_embed_sub_batch` to keep that function's branch count bounded.
+    #[cfg(feature = "onnx")]
+    fn finalize_embed_output(
+        &self,
+        outputs: &ort::session::SessionOutputs,
+        batch_size: usize,
+        expected_dim: usize,
+        attention_mask: &[i64],
+    ) -> Result<Vec<f32>, WorkerError> {
         if outputs.len() == 0 {
             return Err(WorkerError {
                 kind: ErrorKind::Inference,
                 message: "ONNX model returned no outputs".to_string(),
             });
         }
-
-        // Extract the actual output shape from the ONNX tensor.
         // Expected: [batch_size, seq_len, hidden_dim] or [batch_size, hidden_dim].
         let output_shape: Vec<usize> = outputs[0].shape().iter().map(|&d| d as usize).collect();
-
-        // MIGraphX may return float16 output even when the source graph is
-        // float32. Normalize both provider output types to the f32 storage
-        // contract used by search.
+        // MIGraphX may return float16 even when the source graph is float32;
+        // normalize both provider output types to the f32 storage contract.
         let embeddings_f32 = extract_output_tensor_f32(&outputs[0]).map_err(|e| WorkerError {
             kind: ErrorKind::Inference,
             message: format!("failed to extract output tensor: {}", e),
         })?;
-
-        // Derive seq_len and hidden_dim from the actual tensor shape.
         let (actual_seq_len, hidden_dim) = match output_shape.as_slice() {
             [bs, sl, hd] if *bs == batch_size => {
                 if *hd != expected_dim {
@@ -1395,7 +1362,7 @@ impl WorkerRuntime {
                         ),
                     });
                 }
-                // Already pooled: [batch_size, hidden_dim] — just L2-normalize per row
+                // Already pooled: L2-normalize per row.
                 let dim = *hd;
                 let mut embeddings_f32 = embeddings_f32;
                 for b in 0..batch_size {
@@ -1421,7 +1388,6 @@ impl WorkerRuntime {
                 });
             }
         };
-
         if embeddings_f32.len() != batch_size * actual_seq_len * hidden_dim {
             return Err(WorkerError {
                 kind: ErrorKind::Inference,
@@ -1433,17 +1399,14 @@ impl WorkerRuntime {
                 ),
             });
         }
-
         // Select the final unpadded token required by Qwen3, then L2 normalize.
-        // This is done per sub-batch.
         let pooled = self.pool_and_normalize(
             &embeddings_f32,
             batch_size,
             actual_seq_len,
-            &attention_mask,
+            attention_mask,
             hidden_dim,
         )?;
-
         Ok(pooled.vectors)
     }
 
@@ -1773,90 +1736,33 @@ impl WorkerRuntime {
             return Ok(vec![0.0f32; batch_size]);
         }
 
-        // Build input_ids and attention_mask vectors from encodings
-        let mut input_ids: Vec<i64> = Vec::with_capacity(batch_size * max_len);
-        let mut attention_mask: Vec<i64> = Vec::with_capacity(batch_size * max_len);
+        // Build LEFT-padded input_ids / attention_mask (decoder-style padding
+        // with overflow-safe suffix preservation).
+        let (input_ids, attention_mask) =
+            Self::build_rerank_input(encodings, max_len, suffix_token_len);
 
-        // LEFT padding: Qwen3-Reranker is decoder-style — it must attend up to
-        // the final real token (the assistant position). Right padding would
-        // place pads after the suffix and break the position the model predicts
-        // on. Real tokens go at the END, pads at the start.
-        for encoding in encodings {
-            let ids = encoding.get_ids();
-            let mask = encoding.get_attention_mask();
-            let total = ids.len();
-            let n = total.min(max_len);
-            // LEFT padding: Qwen3-Reranker is decoder-style — it must attend up
-            // to the final real token (the assistant position). Real tokens go
-            // at the END, pads at the start.
-            for _ in 0..(max_len - n) {
-                input_ids.push(0);
-                attention_mask.push(0);
-            }
-            if total > max_len && suffix_token_len > 0 && suffix_token_len < max_len {
-                // Input overflows the window. Keep the first (max_len - suffix)
-                // tokens (system+instruct+query+document start) AND the final
-                // `suffix_token_len` tokens (the required assistant suffix the
-                // model predicts on) — truncates the document middle. The prior
-                // code took the first `max_len` tokens, dropping the suffix and
-                // scoring long documents from an out-of-distribution prompt.
-                let front = max_len - suffix_token_len;
-                for i in 0..front {
-                    input_ids.push(ids[i] as i64);
-                    attention_mask.push(mask[i] as i64);
-                }
-                for i in (total - suffix_token_len)..total {
-                    input_ids.push(ids[i] as i64);
-                    attention_mask.push(mask[i] as i64);
-                }
-            } else {
-                for i in 0..n {
-                    input_ids.push(ids[i] as i64);
-                    attention_mask.push(mask[i] as i64);
-                }
-            }
-        }
-
-        // Create input tensors with proper ndarrays
-        let input_ids_tensor = ort::value::Tensor::from_array(
-            ndarray::Array2::from_shape_vec((batch_size, max_len), input_ids.clone()).map_err(
-                |e| WorkerError {
-                    kind: ErrorKind::Inference,
-                    message: format!("failed to create rerank input_ids array: {}", e),
-                },
-            )?,
-        )
-        .map_err(|e| WorkerError {
-            kind: ErrorKind::Inference,
-            message: format!("failed to create rerank input_ids tensor: {}", e),
-        })?;
-
-        let attention_mask_tensor = ort::value::Tensor::from_array(
-            ndarray::Array2::from_shape_vec((batch_size, max_len), attention_mask.clone())
+        // Create the [batch_size, seq_len] input tensors. Identical array+tensor
+        // creation across all three, so a local macro gives each one error path.
+        macro_rules! make_rerank_tensor {
+            ($data:expr, $label:literal) => {
+                ort::value::Tensor::from_array(
+                    ndarray::Array2::from_shape_vec((batch_size, max_len), $data).map_err(|e| {
+                        WorkerError {
+                            kind: ErrorKind::Inference,
+                            message: format!("failed to create rerank {} array: {}", $label, e),
+                        }
+                    })?,
+                )
                 .map_err(|e| WorkerError {
                     kind: ErrorKind::Inference,
-                    message: format!("failed to create rerank attention_mask array: {}", e),
-                })?,
-        )
-        .map_err(|e| WorkerError {
-            kind: ErrorKind::Inference,
-            message: format!("failed to create rerank attention_mask tensor: {}", e),
-        })?;
-
-        let position_ids_tensor = ort::value::Tensor::from_array(
-            ndarray::Array2::from_shape_vec(
-                (batch_size, max_len),
-                build_position_ids(batch_size, max_len),
-            )
-            .map_err(|e| WorkerError {
-                kind: ErrorKind::Inference,
-                message: format!("failed to create rerank position_ids array: {}", e),
-            })?,
-        )
-        .map_err(|e| WorkerError {
-            kind: ErrorKind::Inference,
-            message: format!("failed to create rerank position_ids tensor: {}", e),
-        })?;
+                    message: format!("failed to create rerank {} tensor: {}", $label, e),
+                })?
+            };
+        }
+        let input_ids_tensor = make_rerank_tensor!(input_ids.clone(), "input_ids");
+        let attention_mask_tensor = make_rerank_tensor!(attention_mask.clone(), "attention_mask");
+        let position_ids_tensor =
+            make_rerank_tensor!(build_position_ids(batch_size, max_len), "position_ids");
 
         let mut session_guard = session.lock().map_err(|e| WorkerError {
             kind: ErrorKind::OnnxRuntime,
@@ -1884,20 +1790,72 @@ impl WorkerRuntime {
             message: format!("ONNX rerank inference failed: {}", e),
         })?;
 
+        Self::finalize_rerank_output(&outputs, batch_size)
+    }
+
+    /// Build LEFT-padded `input_ids` / `attention_mask` for a rerank batch.
+    /// Qwen3-Reranker is decoder-style: real tokens go at the END (pads at the
+    /// start) so it attends up to the final assistant-suffix position. When an
+    /// input overflows the window, the first (max_len - suffix) tokens AND the
+    /// final `suffix_token_len` tokens are kept (document middle trimmed) so the
+    /// assistant suffix the model predicts on is preserved.
+    #[cfg(feature = "onnx")]
+    fn build_rerank_input(
+        encodings: &[tokenizers::Encoding],
+        max_len: usize,
+        suffix_token_len: usize,
+    ) -> (Vec<i64>, Vec<i64>) {
+        let batch_size = encodings.len();
+        let mut input_ids: Vec<i64> = Vec::with_capacity(batch_size * max_len);
+        let mut attention_mask: Vec<i64> = Vec::with_capacity(batch_size * max_len);
+        for encoding in encodings {
+            let ids = encoding.get_ids();
+            let mask = encoding.get_attention_mask();
+            let total = ids.len();
+            let n = total.min(max_len);
+            for _ in 0..(max_len - n) {
+                input_ids.push(0);
+                attention_mask.push(0);
+            }
+            if total > max_len && suffix_token_len > 0 && suffix_token_len < max_len {
+                let front = max_len - suffix_token_len;
+                for i in 0..front {
+                    input_ids.push(ids[i] as i64);
+                    attention_mask.push(mask[i] as i64);
+                }
+                for i in (total - suffix_token_len)..total {
+                    input_ids.push(ids[i] as i64);
+                    attention_mask.push(mask[i] as i64);
+                }
+            } else {
+                for i in 0..n {
+                    input_ids.push(ids[i] as i64);
+                    attention_mask.push(mask[i] as i64);
+                }
+            }
+        }
+        (input_ids, attention_mask)
+    }
+
+    /// Validate the rerank output shape and sigmoid-map the raw yes/no logits into
+    /// [0,1] relevance scores. Extracted from `run_onnx_rerank_sub_batch`.
+    #[cfg(feature = "onnx")]
+    fn finalize_rerank_output(
+        outputs: &ort::session::SessionOutputs,
+        batch_size: usize,
+    ) -> Result<Vec<f32>, WorkerError> {
         if outputs.len() == 0 {
             return Err(WorkerError {
                 kind: ErrorKind::Inference,
                 message: "ONNX rerank model returned no outputs".to_string(),
             });
         }
-
         let output = &outputs[0];
         let shape: Vec<usize> = output.shape().iter().map(|&d| d as usize).collect();
         let output_values = extract_output_tensor_f32(output).map_err(|e| WorkerError {
             kind: ErrorKind::Inference,
             message: format!("failed to extract rerank output tensor: {}", e),
         })?;
-
         let raw_logits: Vec<f32> = match shape.as_slice() {
             [n] if *n == batch_size => output_values,
             [n, 1] if *n == batch_size => output_values,
@@ -1912,14 +1870,12 @@ impl WorkerRuntime {
             }
         };
         // Qwen3-Reranker seq-cls emits a raw yes/no logit; sigmoid maps it to
-        // [0,1] relevance so the 0.7*rerank + 0.3*initial combine (in the
-        // caller) is on the same scale as the initial search score.
-        let rerank_scores: Vec<f32> = raw_logits
+        // [0,1] relevance so the 0.7*rerank + 0.3*initial combine is on the same
+        // scale as the initial search score.
+        Ok(raw_logits
             .into_iter()
             .map(|l| 1.0 / (1.0 + (-l).exp()))
-            .collect();
-
-        Ok(rerank_scores)
+            .collect())
     }
 
     /// Truncate a single text to the configured maximum size.
@@ -1980,514 +1936,5 @@ impl Drop for WorkerRuntime {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::protocol::EmbedRequest;
-    use std::io::Cursor;
-    use std::sync::Mutex as StdMutex;
-
-    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
-
-    /// Config whose model name resolves to no on-disk file, so
-    /// `WorkerRuntime::new` skips the ~300s MIGraphX JIT compile. The worker
-    /// tests below exercise pooling / idle-timer logic, never real inference, so
-    /// no model is needed. Without this, a real `qwen3-embed-0.6b.onnx` under
-    /// `~/.leindex/models` makes every `WorkerRuntime::new` compile the model and
-    /// OOM the test binary (regression introduced when the static model shipped).
-    fn no_compile_config() -> RuntimeConfig {
-        RuntimeConfig {
-            model_name: "__leindex_test_no_model__".to_string(),
-            ..RuntimeConfig::default()
-        }
-    }
-
-    #[test]
-    fn test_runtime_config_default() {
-        let config = RuntimeConfig::default();
-        assert_eq!(
-            config.idle_timeout,
-            Duration::from_secs(DEFAULT_IDLE_TIMEOUT_SECS)
-        );
-        assert_eq!(config.max_frame_size, 16 * 1024 * 1024);
-        assert_eq!(config.max_text_size, 1024 * 1024);
-        assert_eq!(config.embedding_dim, 1024);
-    }
-
-    #[test]
-    fn onnx_inference_batch_size_defaults_to_fixed_batch_safe_value() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
-
-        assert_eq!(
-            configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
-            DEFAULT_ONNX_INFERENCE_BATCH_SIZE
-        );
-        assert_eq!(
-            configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
-            1
-        );
-    }
-
-    #[test]
-    fn onnx_inference_batch_size_uses_positive_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var(ONNX_INFERENCE_BATCH_SIZE_ENV, "32");
-
-        assert_eq!(
-            configured_onnx_inference_batch_size("qwen3-embed-0.6b", "migraphx"),
-            32
-        );
-
-        std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
-    }
-
-    #[test]
-    fn onnx_inference_batch_size_rejects_zero_and_bad_values() {
-        let _guard = ENV_LOCK.lock().unwrap();
-
-        std::env::set_var(ONNX_INFERENCE_BATCH_SIZE_ENV, "0");
-        assert_eq!(
-            configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
-            DEFAULT_ONNX_INFERENCE_BATCH_SIZE
-        );
-
-        std::env::set_var(ONNX_INFERENCE_BATCH_SIZE_ENV, "nope");
-        assert_eq!(
-            configured_onnx_inference_batch_size("qwen3-embed-0.6b", "cpu"),
-            DEFAULT_ONNX_INFERENCE_BATCH_SIZE
-        );
-
-        std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
-    }
-
-    #[cfg(feature = "onnx")]
-    #[test]
-    fn qwen_pooling_uses_last_unpadded_token() {
-        let runtime = WorkerRuntime::new(no_compile_config());
-        let pooled = runtime
-            .pool_and_normalize(
-                &[
-                    1.0, 0.0, // first token
-                    0.0, 2.0, // final real token
-                    8.0, 8.0, // padding
-                ],
-                1,
-                3,
-                &[1, 1, 0],
-                2,
-            )
-            .unwrap();
-
-        assert_eq!(pooled.vectors, vec![0.0, 1.0]);
-    }
-
-    #[cfg(feature = "onnx")]
-    #[test]
-    fn qwen_pooling_rejects_short_embedding_output() {
-        let runtime = WorkerRuntime::new(no_compile_config());
-        let error = runtime
-            .pool_and_normalize(&[1.0], 1, 2, &[1, 1], 2)
-            .unwrap_err();
-
-        assert_eq!(error.kind, ErrorKind::Inference);
-        assert!(error.message.contains("embedding output is too short"));
-    }
-
-    #[test]
-    fn position_ids_repeat_sequence_for_each_batch_row() {
-        assert_eq!(build_position_ids(2, 4), vec![0, 1, 2, 3, 0, 1, 2, 3]);
-    }
-
-    #[test]
-    fn onnx_sequence_len_defaults_and_clamps_env_override() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(ONNX_SEQUENCE_LEN_ENV);
-        assert_eq!(configured_onnx_sequence_len(), DEFAULT_MAX_SEQ_LEN);
-
-        std::env::set_var(ONNX_SEQUENCE_LEN_ENV, "4");
-        assert_eq!(configured_onnx_sequence_len(), DEFAULT_MAX_SEQ_LEN);
-
-        std::env::set_var(ONNX_SEQUENCE_LEN_ENV, "256");
-        assert_eq!(configured_onnx_sequence_len(), 256);
-
-        std::env::set_var(ONNX_SEQUENCE_LEN_ENV, "4096");
-        assert_eq!(configured_onnx_sequence_len(), MAX_ONNX_SEQUENCE_LEN);
-        std::env::remove_var(ONNX_SEQUENCE_LEN_ENV);
-    }
-
-    #[test]
-    fn dynamic_qwen_uses_batched_inference_by_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
-
-        assert_eq!(
-            configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "cpu"),
-            DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE
-        );
-        const _: () = assert!(DEFAULT_DYNAMIC_ONNX_INFERENCE_BATCH_SIZE > 1);
-    }
-
-    #[test]
-    fn migraphx_uses_one_stable_batch_shape_by_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::remove_var(ONNX_INFERENCE_BATCH_SIZE_ENV);
-
-        assert_eq!(
-            configured_onnx_inference_batch_size("qwen3-embed-0.6b-dynamic", "migraphx"),
-            DEFAULT_MIGRAPHX_INFERENCE_BATCH_SIZE
-        );
-    }
-
-    #[test]
-    fn test_runtime_idle_not_expired_initially() {
-        let config = no_compile_config();
-        let rt = WorkerRuntime::new(config);
-        assert!(!rt.is_idle_expired());
-    }
-
-    #[test]
-    fn test_runtime_idle_expired_with_zero_timeout() {
-        let config = RuntimeConfig {
-            idle_timeout: Duration::from_secs(0),
-            ..no_compile_config()
-        };
-        let rt = WorkerRuntime::new(config);
-        // With zero timeout, it should be expired immediately
-        // (but we need at least a tiny delay for the check)
-        std::thread::sleep(Duration::from_millis(1));
-        assert!(rt.is_idle_expired());
-    }
-
-    #[test]
-    fn test_runtime_touch_resets_idle() {
-        let config = RuntimeConfig {
-            idle_timeout: Duration::from_millis(10),
-            ..no_compile_config()
-        };
-        let rt = WorkerRuntime::new(config);
-
-        std::thread::sleep(Duration::from_millis(20));
-        assert!(rt.is_idle_expired());
-
-        rt.touch();
-        assert!(!rt.is_idle_expired());
-    }
-
-    #[test]
-    fn cloned_runtime_shares_idle_activity() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<WorkerRuntime>();
-
-        let runtime = WorkerRuntime::new(no_compile_config());
-        let cloned = runtime.clone();
-        assert!(Arc::ptr_eq(&runtime.last_activity, &cloned.last_activity));
-        cloned.touch();
-        assert!(!runtime.is_idle_expired());
-    }
-
-    #[test]
-    fn test_shutdown_flag() {
-        let config = no_compile_config();
-        let rt = WorkerRuntime::new(config);
-        let flag = rt.shutdown_flag();
-
-        assert!(!flag.load(Ordering::Relaxed));
-        flag.store(true, Ordering::Relaxed);
-        assert!(flag.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn test_truncate_text_within_limit() {
-        let config = no_compile_config();
-        let rt = WorkerRuntime::new(config);
-        let text = "hello world".to_string();
-        let result = rt.truncate_text(text.clone());
-        assert_eq!(result, text);
-    }
-
-    #[test]
-    fn test_truncate_text_exceeds_limit() {
-        let config = RuntimeConfig {
-            max_text_size: 10,
-            ..no_compile_config()
-        };
-        let rt = WorkerRuntime::new(config);
-        let text = "hello world, this is a long string".to_string();
-        let result = rt.truncate_text(text);
-        assert!(result.len() <= 10);
-        assert_eq!(result, "hello worl");
-    }
-
-    #[test]
-    fn test_truncate_text_unicode_boundary() {
-        let config = RuntimeConfig {
-            max_text_size: 10,
-            ..no_compile_config()
-        };
-        let rt = WorkerRuntime::new(config);
-        // "héllo" has multi-byte chars
-        let text = "héllo wörld test".to_string();
-        let result = rt.truncate_text(text);
-        assert!(result.len() <= 10);
-        // Should not panic and should be valid UTF-8
-        assert!(result.is_char_boundary(result.len()));
-    }
-
-    #[test]
-    fn test_handle_embed_empty_batch() {
-        let config = no_compile_config();
-        let rt = WorkerRuntime::new(config);
-
-        let request = EmbedRequest {
-            texts: vec![],
-            expected_dim: 1024,
-        };
-        let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-        let result = rt.handle_embed(&frame);
-
-        // Empty batch returns Ok early (before any ONNX session check),
-        // so .unwrap() is safe regardless of feature flag.
-        let response = result.unwrap();
-        assert_eq!(response.count, 0);
-        assert_eq!(response.dimension, 1024);
-        assert!(response.vectors.is_empty());
-    }
-
-    #[test]
-    fn test_handle_embed_returns_flat_row_major() {
-        let config = no_compile_config();
-        let rt = WorkerRuntime::new(config);
-
-        let request = EmbedRequest {
-            texts: vec!["hello".to_string(), "world".to_string()],
-            expected_dim: 8,
-        };
-        let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-        let result = rt.handle_embed(&frame);
-
-        // When ORT or the model is unavailable (no model on disk, ORT not
-        // discovered, etc.), the worker returns ModelNotFound. On a developer
-        // machine that has both /usr/local/lib/libonnxruntime.so and a real
-        // model in `~/.leindex/models/`, ORT inference may actually run and
-        // fail with a different error (Inference); treat that as acceptable
-        // since the contract under test is "no crash, structured error".
-        #[cfg(feature = "onnx")]
-        {
-            let err = result.unwrap_err();
-            assert!(
-                err.kind == ErrorKind::ModelNotFound || err.kind == ErrorKind::Inference,
-                "expected ModelNotFound or Inference, got {:?}: {}",
-                err.kind,
-                err.message
-            );
-        }
-
-        // Without ONNX feature, returns zero vectors
-        #[cfg(not(feature = "onnx"))]
-        {
-            let response = result.unwrap();
-            assert_eq!(response.count, 2);
-            assert_eq!(response.dimension, 8);
-            assert_eq!(response.vectors.len(), 16);
-            assert_eq!(response.get_embedding(0).unwrap().len(), 8);
-            assert_eq!(response.get_embedding(1).unwrap().len(), 8);
-        }
-    }
-
-    #[test]
-    fn test_handle_embed_preserves_ordering() {
-        let config = no_compile_config();
-        let rt = WorkerRuntime::new(config);
-
-        let texts: Vec<String> = (0..5).map(|i| format!("text {}", i)).collect();
-        let request = EmbedRequest {
-            texts: texts.clone(),
-            expected_dim: 4,
-        };
-        let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-        let result = rt.handle_embed(&frame);
-
-        // Same rationale as test_handle_embed_returns_flat_row_major: developer
-        // machines with ORT + a real model present may reach inference and
-        // surface an Inference error instead of ModelNotFound. Both are
-        // acceptable; the contract under test is "no crash, structured error".
-        #[cfg(feature = "onnx")]
-        {
-            let err = result.unwrap_err();
-            assert!(
-                err.kind == ErrorKind::ModelNotFound || err.kind == ErrorKind::Inference,
-                "expected ModelNotFound or Inference, got {:?}: {}",
-                err.kind,
-                err.message
-            );
-        }
-
-        // Without ONNX feature, returns zero vectors with correct count
-        #[cfg(not(feature = "onnx"))]
-        {
-            let response = result.unwrap();
-            assert_eq!(response.count, 5);
-            for i in 0..5 {
-                assert!(response.get_embedding(i).is_some());
-            }
-        }
-    }
-
-    #[test]
-    fn test_dispatch_embed_request() {
-        let config = no_compile_config();
-        let rt = WorkerRuntime::new(config);
-
-        let request = EmbedRequest {
-            texts: vec!["test".to_string()],
-            expected_dim: 4,
-        };
-        let frame = protocol::embed_request_frame(BatchId::new(42), request).unwrap();
-        let response_frame = rt.dispatch(&frame);
-
-        assert_eq!(response_frame.header.batch_id, BatchId::new(42));
-
-        // Without a real ONNX session, dispatch returns an error frame
-        #[cfg(feature = "onnx")]
-        {
-            assert_eq!(response_frame.header.msg_type, MsgType::Error);
-        }
-
-        // Without ONNX feature, dispatch returns a success response
-        #[cfg(not(feature = "onnx"))]
-        {
-            assert_eq!(response_frame.header.msg_type, MsgType::EmbedResponse);
-        }
-    }
-
-    #[test]
-    fn test_dispatch_rerank_request() {
-        let config = no_compile_config();
-        let rt = WorkerRuntime::new(config);
-
-        let request = protocol::RerankRequest {
-            query: "test".to_string(),
-            documents: vec![protocol::RerankDocument {
-                id: "doc1".to_string(),
-                content: "content".to_string(),
-                initial_score: 0.9,
-            }],
-        };
-        let frame = protocol::rerank_request_frame(BatchId::new(7), request).unwrap();
-        let response_frame = rt.dispatch(&frame);
-
-        assert_eq!(response_frame.header.batch_id, BatchId::new(7));
-
-        // Without a real ONNX session, dispatch returns an error frame
-        #[cfg(feature = "onnx")]
-        {
-            assert_eq!(response_frame.header.msg_type, MsgType::Error);
-        }
-
-        // Without ONNX feature, dispatch returns a success response
-        #[cfg(not(feature = "onnx"))]
-        {
-            assert_eq!(response_frame.header.msg_type, MsgType::RerankResponse);
-        }
-    }
-
-    #[test]
-    fn test_dispatch_unknown_message_type() {
-        let config = no_compile_config();
-        let rt = WorkerRuntime::new(config);
-
-        let frame = Frame {
-            header: protocol::FrameHeader {
-                batch_id: BatchId::new(99),
-                msg_type: MsgType::Error, // Unexpected from main daemon
-            },
-            payload: vec![],
-        };
-        let response_frame = rt.dispatch(&frame);
-
-        assert_eq!(response_frame.header.batch_id, BatchId::new(99));
-        assert_eq!(response_frame.header.msg_type, MsgType::Error);
-    }
-
-    #[test]
-    fn test_run_loop_single_request() {
-        let config = RuntimeConfig {
-            idle_timeout: Duration::from_secs(300),
-            ..no_compile_config()
-        };
-        let rt = WorkerRuntime::new(config);
-
-        // Build a single embed request frame
-        let request = EmbedRequest {
-            texts: vec!["hello".to_string()],
-            expected_dim: 4,
-        };
-        let frame = protocol::embed_request_frame(BatchId::new(1), request).unwrap();
-        let wire = frame.encode_wire().unwrap();
-
-        // Create a reader that will return the frame then EOF
-        let reader = Cursor::new(wire);
-        let writer = Cursor::new(Vec::<u8>::new());
-
-        let result = rt.run_loop(reader, writer);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_run_loop_multiple_requests_same_runtime() {
-        // VAL-CPHASE-006: Worker remains reusable across successive batches
-        let config = RuntimeConfig {
-            idle_timeout: Duration::from_secs(300),
-            ..no_compile_config()
-        };
-        let rt = WorkerRuntime::new(config);
-
-        // Build two embed request frames
-        let request1 = EmbedRequest {
-            texts: vec!["first".to_string()],
-            expected_dim: 4,
-        };
-        let request2 = EmbedRequest {
-            texts: vec!["second".to_string()],
-            expected_dim: 4,
-        };
-
-        let frame1 = protocol::embed_request_frame(BatchId::new(1), request1).unwrap();
-        let frame2 = protocol::embed_request_frame(BatchId::new(2), request2).unwrap();
-
-        let wire1 = frame1.encode_wire().unwrap();
-        let wire2 = frame2.encode_wire().unwrap();
-
-        let mut combined = wire1.clone();
-        combined.extend_from_slice(&wire2);
-
-        let reader = Cursor::new(combined);
-        let writer = Cursor::new(Vec::<u8>::new());
-
-        let result = rt.run_loop(reader, writer);
-        assert!(result.is_ok());
-
-        // Verify both responses were written
-        result.unwrap();
-    }
-
-    #[test]
-    fn test_idle_timeout_causes_exit() {
-        // VAL-CPHASE-007: Worker tears down on idle
-        let config = RuntimeConfig {
-            idle_timeout: Duration::from_millis(1),
-            ..no_compile_config()
-        };
-        let rt = WorkerRuntime::new(config);
-
-        // Empty input — the loop should detect idle timeout
-        let reader = Cursor::new(Vec::<u8>::new());
-        let writer = Cursor::new(Vec::<u8>::new());
-
-        // This will fail because there's no data to read, but the idle check
-        // happens before the read. However, with empty input, read_exact will
-        // return UnexpectedEof immediately, which is a clean shutdown.
-        let result = rt.run_loop(reader, writer);
-        assert!(result.is_ok());
-    }
-}
+#[path = "runtime_test.rs"]
+mod tests;

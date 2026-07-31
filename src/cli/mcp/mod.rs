@@ -83,8 +83,8 @@ pub mod server;
 pub mod sse;
 
 pub use protocol::{
-    error_codes, JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,
-    JsonRpcResponse, NotificationType,
+    JsonRpcError, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
+    NotificationType, error_codes,
 };
 pub use server::{McpServer, McpServerConfig};
 

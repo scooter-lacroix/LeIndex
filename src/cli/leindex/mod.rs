@@ -19,14 +19,14 @@ pub use types::{
 };
 // Re-export crate-internal types for sibling modules (index_builder, index_cache, etc.)
 pub(crate) use types::{
-    ProjectFileScan, DEPENDENCY_MANIFEST_NAMES, SKIP_DIRS, SOURCE_FILE_EXTENSIONS,
+    DEPENDENCY_MANIFEST_NAMES, ProjectFileScan, SKIP_DIRS, SOURCE_FILE_EXTENSIONS,
 };
 
 use crate::cli::index_builder;
 use crate::cli::memory::WarmStrategy;
 use crate::graph::pdg::ProgramDependenceGraph;
 use crate::search::search::SearchEngine;
-use crate::storage::{schema::Storage, UniqueProjectId};
+use crate::storage::{UniqueProjectId, schema::Storage};
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -46,37 +46,37 @@ pub(crate) fn resolve_existing_storage_path(project_path: &Path) -> Option<PathB
 /// ```
 pub struct LeIndex {
     /// Project path
-    project_path: PathBuf,
+    pub(crate) project_path: PathBuf,
 
     /// Resolved storage root for index artifacts (may be outside project)
-    storage_path: PathBuf,
+    pub(crate) storage_path: PathBuf,
 
     /// Project identifier (legacy, for backward compatibility)
-    project_id: String,
+    pub(crate) project_id: String,
 
     /// Unique project identifier with BLAKE3-based path hashing
-    unique_id: UniqueProjectId,
+    pub(crate) unique_id: UniqueProjectId,
 
     /// Storage backend
-    storage: Storage,
+    pub(crate) storage: Storage,
 
     /// Search engine
-    search_engine: SearchEngine,
+    pub(crate) search_engine: SearchEngine,
 
     /// Program Dependence Graph
-    pdg: Option<ProgramDependenceGraph>,
+    pub(crate) pdg: Option<ProgramDependenceGraph>,
 
     /// Cache subsystem (spiller, project scan, file stats)
-    cache: crate::cli::index_cache::IndexCache,
+    pub(crate) cache: crate::cli::index_cache::IndexCache,
 
     /// Cached project configuration.
-    project_config: crate::cli::config::ProjectConfig,
+    pub(crate) project_config: crate::cli::config::ProjectConfig,
 
     /// Indexing statistics
-    stats: IndexStats,
+    pub(crate) stats: IndexStats,
 
     /// TF-IDF embedder (None until index_nodes() runs).
-    embedder: Option<index_builder::HybridEmbedder>,
+    pub(crate) embedder: Option<index_builder::HybridEmbedder>,
 
     /// Ephemeral state shared by the explicit indexing phases.
     pub(crate) pipeline: Option<indexing::IndexPipelineState>,
@@ -686,17 +686,6 @@ impl LeIndex {
         crate::cli::index_freshness::check_manifest_stale(&ctx, || self.scan_project_files())
     }
 
-    /// Given changed manifests, find source files importing from those packages.
-    #[allow(dead_code)]
-    fn files_importing_from_manifests(
-        &self,
-        changed_manifests: &[PathBuf],
-        all_source_paths: &[PathBuf],
-        pdg: &ProgramDependenceGraph,
-    ) -> Vec<PathBuf> {
-        index_builder::files_importing_from_manifests(changed_manifests, all_source_paths, pdg)
-    }
-
     /// Fast-path freshness check: O(1) for indexed files, O(D) for source
     /// directories (typically 10-20), and O(M) for manifest files.
     pub fn is_stale_fast(&self) -> bool {
@@ -782,7 +771,7 @@ impl LeIndex {
         if active == self.storage_path {
             return crate::storage::pdg_store::has_indexed_files(&self.storage, &self.project_id);
         }
-        crate::storage::schema::Storage::open(active.join("leindex.db"))
+        crate::storage::schema::Storage::open_readonly(active.join("leindex.db"))
             .ok()
             .is_some_and(|storage| {
                 crate::storage::pdg_store::has_indexed_files(&storage, &self.project_id)

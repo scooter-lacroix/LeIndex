@@ -183,8 +183,10 @@ mod tests {
     fn test_resolve_model_not_found() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Clear any env override
-        std::env::remove_var("LEINDEX_MODEL_PATH");
-        std::env::remove_var(crate::config::LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(crate::config::LEINDEX_HOME_ENV) };
 
         let result = ModelResolver::resolve("nonexistent-model-xyz");
         assert!(result.is_err());
@@ -196,8 +198,10 @@ mod tests {
     #[test]
     fn test_resolve_tokenizer_not_found() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LEINDEX_MODEL_PATH");
-        std::env::remove_var(crate::config::LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(crate::config::LEINDEX_HOME_ENV) };
 
         // Use a model name guaranteed not to correspond to a real model. The
         // user-cache fallback only triggers when `tokenizer.json` actually
@@ -228,13 +232,15 @@ mod tests {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Set env to a temp dir that doesn't have the model
         let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path()) };
 
         let result = ModelResolver::resolve("test-model");
         // Should still fail because the file doesn't exist in the temp dir
         assert!(result.is_err());
 
-        std::env::remove_var("LEINDEX_MODEL_PATH");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
     }
 
     #[test]
@@ -244,31 +250,36 @@ mod tests {
         let model_file = temp_dir.path().join("test-model.onnx");
         std::fs::write(&model_file, b"fake model").unwrap();
 
-        std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path()) };
 
         let result = ModelResolver::resolve("test-model");
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), model_file);
 
-        std::env::remove_var("LEINDEX_MODEL_PATH");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
     }
 
     #[test]
     fn test_resolve_with_leindex_home_models() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LEINDEX_MODEL_PATH");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
         let temp_dir = tempfile::tempdir().unwrap();
         let models_dir = temp_dir.path().join("models");
         std::fs::create_dir_all(&models_dir).unwrap();
         let model_file = models_dir.join("home-model.onnx");
         std::fs::write(&model_file, b"fake model").unwrap();
 
-        std::env::set_var(crate::config::LEINDEX_HOME_ENV, temp_dir.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(crate::config::LEINDEX_HOME_ENV, temp_dir.path()) };
 
         let result = ModelResolver::resolve("home-model");
         assert_eq!(result.unwrap(), model_file);
 
-        std::env::remove_var(crate::config::LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(crate::config::LEINDEX_HOME_ENV) };
     }
 
     #[test]
@@ -278,32 +289,38 @@ mod tests {
         let tokenizer_file = temp_dir.path().join("tokenizer.json");
         std::fs::write(&tokenizer_file, b"{}").unwrap();
 
-        std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path()) };
 
         let result = ModelResolver::resolve_tokenizer("test");
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), tokenizer_file);
 
-        std::env::remove_var("LEINDEX_MODEL_PATH");
-        std::env::remove_var(crate::config::LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(crate::config::LEINDEX_HOME_ENV) };
     }
 
     #[test]
     fn test_source_for_path_env_override() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let temp_dir = tempfile::tempdir().unwrap();
-        std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path()) };
 
         let path = temp_dir.path().join("model.onnx");
         assert_eq!(ModelResolver::source_for_path(&path), "env_override");
 
-        std::env::remove_var("LEINDEX_MODEL_PATH");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
     }
 
     #[test]
     fn test_source_for_path_user_cache() {
         let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("LEINDEX_MODEL_PATH");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
         let path = PathBuf::from("/some/random/path/model.onnx");
         assert_eq!(ModelResolver::source_for_path(&path), "user_cache");
     }

@@ -30,7 +30,7 @@
 //!     stats when possible.
 
 use crate::cli::errors::detect_corruption;
-use crate::cli::index_job::{new_job_id, IndexJobSnapshot, IndexJobState, JobPaths, JobStatus};
+use crate::cli::index_job::{IndexJobSnapshot, IndexJobState, JobPaths, JobStatus, new_job_id};
 use crate::cli::leindex::{IndexStats, LeIndex};
 use crate::cli::mcp::protocol::JsonRpcError;
 use crate::cli::watcher::IndexWatcher;
@@ -115,6 +115,13 @@ impl ProjectRwLock {
     pub async fn read(&self) -> ProjectReadGuard<'_> {
         ProjectReadGuard {
             inner: self.inner.lock().await,
+        }
+    }
+
+    /// Acquire a synchronous read guard from a `spawn_blocking` context.
+    pub fn blocking_read(&self) -> ProjectReadGuard<'_> {
+        ProjectReadGuard {
+            inner: self.inner.blocking_lock(),
         }
     }
 
@@ -522,215 +529,292 @@ impl ProjectRegistry {
             .unwrap_or_else(|| canonical.join(".leindex"));
         let next_state_path =
             JobPaths::new(&storage_root, previous_generation.saturating_add(1)).job_status();
-        let state = {
-            let mut jobs = self.index_jobs.lock().await;
-            if let Some(existing) = jobs.get(&canonical).cloned() {
-                let current = existing.snapshot().await;
-                // Reuse while Running (consolidate concurrent requests onto one
-                // in-flight index) OR when not forced (observe the existing —
-                // possibly terminal — job's status). A terminal job is reused on
-                // purpose so callers can poll its Completed/Failed snapshot
-                // (see `panic_during_index_sets_failed_status`). Source staleness
-                // after a Completed job is NOT handled here — it is handled by the
-                // `is_stale_fast` gate on the index path (registry.rs index entry
-                // + the r3/r4 tree-OID/drift improvements), which triggers a
-                // re-index when the tree has actually changed. Forcing a new job
-                // on every terminal state (an earlier attempt at this) broke
-                // status observation and livelocked the panic-recovery test.
-                if current.status == JobStatus::Running || !force_reindex {
-                    existing
-                } else {
-                    let state = Arc::new(IndexJobState::with_state_path(
-                        new_job_id(&canonical),
-                        next_state_path.clone(),
-                    ));
-                    jobs.insert(canonical.clone(), state.clone());
-                    state
-                }
-            } else {
-                let state = Arc::new(IndexJobState::with_state_path(
-                    new_job_id(&canonical),
-                    next_state_path.clone(),
-                ));
-                jobs.insert(canonical.clone(), state.clone());
-                state
-            }
-        };
-
-        if state.snapshot().await.status == JobStatus::Running {
-            let path = canonical.clone();
-            let path_string = path.to_string_lossy().into_owned();
-            let registry = Arc::clone(self);
-            let task_state = Arc::clone(&state);
-            let storage_for_poll = storage_root.clone();
-            if task_state.try_start() {
-                tokio::spawn(async move {
-                    // Spawn the actual indexing work as an inner task so that
-                    // JoinHandle captures panics. If the inner task panics,
-                    // `task_state.fail()` is called here instead of leaving the
-                    // job in "running" state forever (which would hang
-                    // `state.wait()` on the caller side).
-                    let task_state_for_panic = Arc::clone(&task_state);
-                    let path_for_panic = path.clone();
-
-                    let inner = tokio::spawn(async move {
-                        let mut resident_core_generation = previous_generation;
-                        task_state.set_phase("scan", 0, 0).await;
-
-                        // Test-only panic injection. Used by
-                        // `panic_during_index_sets_failed_status` to verify
-                        // that the outer task catches panics and marks the job
-                        // as failed. The env var is never set in production.
-                        if std::env::var("LEINDEX_INJECT_PANIC")
-                            .ok()
-                            .is_some_and(|value| value == "1")
-                        {
-                            panic!("injected test panic for index job lifecycle test");
-                        }
-
-                        let indexing = registry.index_project(Some(&path_string), force_reindex);
-                        tokio::pin!(indexing);
-                        let result = loop {
-                            tokio::select! {
-                                result = &mut indexing => break result,
-                                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                                    if let Some(health) = crate::cli::index_freshness::load_health(&storage_for_poll) {
-                                        if health.phase == crate::cli::leindex::IndexPhase::Complete
-                                            && health.generation > resident_core_generation
-                                        {
-                                            match registry
-                                                .refresh_loaded_from_active_generation(&path)
-                                                .await
-                                            {
-                                                Ok(()) => {
-                                                    resident_core_generation = health.generation;
-                                                    task_state
-                                                        .mark_core_published(health.generation)
-                                                        .await;
-                                                }
-                                                Err(error) => {
-                                                    warn!(
-                                                        project = %path.display(),
-                                                        "Core generation is published but resident hydration is pending: {error}"
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        let phase = format!("{:?}", health.phase).to_ascii_lowercase();
-                                        let total = health.indexed_file_count;
-                                        let completed = if health.phase == crate::cli::leindex::IndexPhase::Complete {
-                                            total
-                                        } else {
-                                            0
-                                        };
-                                        task_state.set_phase(phase, completed, total).await;
-                                    }
-                                }
-                            }
-                        };
-                        match result {
-                            Ok(_stats) => {
-                                let generation =
-                                    crate::cli::leindex::resolve_existing_storage_path(&path)
-                                        .and_then(|storage| {
-                                            crate::cli::index_freshness::load_health(&storage)
-                                        })
-                                        .map(|health| health.generation)
-                                        .unwrap_or(previous_generation.saturating_add(1));
-                                let neural_path =
-                                    crate::cli::leindex::resolve_existing_storage_path(&path)
-                                        .and_then(|storage| {
-                                            crate::cli::index_freshness::load_health(&storage).map(
-                                                |health| {
-                                                    storage
-                                                        .join("generations")
-                                                        .join(health.generation.to_string())
-                                                        .join("neural_embeddings.bin")
-                                                },
-                                            )
-                                        });
-                                if neural_path.as_ref().is_some_and(|path| {
-                                    path.is_file()
-                                        && std::fs::metadata(path)
-                                            .is_ok_and(|metadata| metadata.len() > 0)
-                                }) {
-                                    task_state.mark_neural_published().await;
-                                }
-                                task_state.complete(generation).await;
-                            }
-                            Err(error) => {
-                                // The core snapshot is published before neural
-                                // enrichment. Preserve those layer flags if the
-                                // optional follow-up fails afterward.
-                                if let Some(health) =
-                                    crate::cli::index_freshness::load_health(&storage_for_poll)
-                                {
-                                    if health.generation > previous_generation {
-                                        let core_loaded = if health.generation
-                                            > resident_core_generation
-                                        {
-                                            match registry
-                                                .refresh_loaded_from_active_generation(&path)
-                                                .await
-                                            {
-                                                Ok(()) => true,
-                                                Err(refresh_error) => {
-                                                    warn!(
-                                                        project = %path.display(),
-                                                        "Core generation remains durable but resident hydration failed: {refresh_error}"
-                                                    );
-                                                    false
-                                                }
-                                            }
-                                        } else {
-                                            true
-                                        };
-                                        if core_loaded {
-                                            task_state.mark_core_published(health.generation).await;
-                                        }
-                                    }
-                                }
-                                task_state.fail(error.to_string()).await;
-                            }
-                        }
-                    });
-
-                    // If the inner task panicked, recover the payload and mark
-                    // the job as failed so waiters do not hang forever.
-                    if let Err(join_error) = inner.await {
-                        if join_error.is_panic() {
-                            let payload = join_error.into_panic();
-                            let panic_msg = payload
-                                .downcast_ref::<&str>()
-                                .map(|s| s.to_string())
-                                .or_else(|| payload.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| "non-string panic payload".to_string());
-                            warn!(
-                                project = %path_for_panic.display(),
-                                "Indexing task panicked: {}; marking job as failed", panic_msg
-                            );
-                            task_state_for_panic
-                                .fail(format!("indexing panicked: {}", panic_msg))
-                                .await;
-                        } else {
-                            warn!(
-                                project = %path_for_panic.display(),
-                                "Indexing task was cancelled; marking job as failed"
-                            );
-                            task_state_for_panic
-                                .fail("indexing task was cancelled".to_string())
-                                .await;
-                        }
-                    }
-                });
-            }
-        }
+        let state = self
+            .select_index_job_state(&canonical, &next_state_path, force_reindex)
+            .await;
+        self.spawn_owned_index_job(
+            &state,
+            canonical,
+            storage_root,
+            previous_generation,
+            force_reindex,
+        )
+        .await;
 
         if wait {
             Ok(state.wait().await)
         } else {
             Ok(state.snapshot().await)
         }
+    }
+
+    /// Read the current owned indexing-job snapshot without starting or
+    /// coalescing a job. Used by polling clients and lifecycle tests.
+    pub async fn get_index_job_snapshot(
+        &self,
+        project_path: Option<&str>,
+    ) -> Result<Option<IndexJobSnapshot>, JsonRpcError> {
+        let canonical = self.resolve_path(project_path).await?;
+        let state = self.index_jobs.lock().await.get(&canonical).cloned();
+        Ok(match state {
+            Some(state) => Some(state.snapshot().await),
+            None => None,
+        })
+    }
+
+    /// Select the existing owned job or replace a completed one for an explicit reindex.
+    async fn select_index_job_state(
+        &self,
+        canonical: &Path,
+        next_state_path: &Path,
+        force_reindex: bool,
+    ) -> Arc<IndexJobState> {
+        let mut jobs = self.index_jobs.lock().await;
+        if let Some(existing) = jobs.get(canonical).cloned() {
+            let current = existing.snapshot().await;
+            if current.status == JobStatus::Running || !force_reindex {
+                return existing;
+            }
+        }
+
+        let state = Arc::new(IndexJobState::with_state_path(
+            new_job_id(canonical),
+            next_state_path.to_path_buf(),
+        ));
+        jobs.insert(canonical.to_path_buf(), state.clone());
+        state
+    }
+
+    /// Start the detached outer task only once for a running owned job.
+    async fn spawn_owned_index_job(
+        self: &Arc<Self>,
+        state: &Arc<IndexJobState>,
+        path: PathBuf,
+        storage_root: PathBuf,
+        previous_generation: u64,
+        force_reindex: bool,
+    ) {
+        if state.snapshot().await.status != JobStatus::Running || !state.try_start() {
+            return;
+        }
+
+        let registry = Arc::clone(self);
+        let task_state = Arc::clone(state);
+        tokio::spawn(async move {
+            // The inner task captures panics so the outer task can publish a
+            // terminal snapshot and wake every waiter.
+            let state_for_exit = Arc::clone(&task_state);
+            let path_for_exit = path.clone();
+            let inner = tokio::spawn(async move {
+                registry
+                    .run_owned_index_work(
+                        task_state,
+                        path,
+                        storage_root,
+                        previous_generation,
+                        force_reindex,
+                    )
+                    .await;
+            });
+
+            if let Err(join_error) = inner.await {
+                if join_error.is_panic() {
+                    let payload = join_error.into_panic();
+                    let panic_msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|message| message.to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string());
+                    warn!(
+                        project = %path_for_exit.display(),
+                        "Indexing task panicked: {}; marking job as failed", panic_msg
+                    );
+                    state_for_exit
+                        .fail(format!("indexing panicked: {panic_msg}"))
+                        .await;
+                } else {
+                    warn!(
+                        project = %path_for_exit.display(),
+                        "Indexing task was cancelled; marking job as failed"
+                    );
+                    state_for_exit.fail("indexing task was cancelled").await;
+                }
+            }
+        });
+    }
+
+    async fn run_owned_index_work(
+        self: &Arc<Self>,
+        state: Arc<IndexJobState>,
+        path: PathBuf,
+        storage_root: PathBuf,
+        previous_generation: u64,
+        force_reindex: bool,
+    ) {
+        let mut resident_core_generation = previous_generation;
+        state.set_phase("scan", 0, 0).await;
+
+        // Test-only panic injection. Used by
+        // `panic_during_index_sets_failed_status` to verify that the outer
+        // task catches panics and marks the job as failed.
+        if std::env::var("LEINDEX_INJECT_PANIC")
+            .ok()
+            .is_some_and(|value| value == "1")
+        {
+            panic!("injected test panic for index job lifecycle test");
+        }
+
+        match self
+            .await_index_with_job_progress(
+                &state,
+                &path,
+                &storage_root,
+                &mut resident_core_generation,
+                force_reindex,
+            )
+            .await
+        {
+            Ok(_) => {
+                self.finish_owned_index(&state, &path, previous_generation)
+                    .await
+            }
+            Err(error) => {
+                self.preserve_core_after_job_error(
+                    &state,
+                    &path,
+                    &storage_root,
+                    previous_generation,
+                    resident_core_generation,
+                    &error,
+                )
+                .await;
+            }
+        }
+    }
+
+    async fn await_index_with_job_progress(
+        &self,
+        state: &IndexJobState,
+        path: &Path,
+        storage_root: &Path,
+        resident_core_generation: &mut u64,
+        force_reindex: bool,
+    ) -> Result<IndexStats, JsonRpcError> {
+        let path_string = path.to_string_lossy().into_owned();
+        let indexing = self.index_project(Some(&path_string), force_reindex);
+        tokio::pin!(indexing);
+        loop {
+            tokio::select! {
+                result = &mut indexing => break result,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                    self.update_job_progress(state, path, storage_root, resident_core_generation).await;
+                }
+            }
+        }
+    }
+
+    async fn update_job_progress(
+        &self,
+        state: &IndexJobState,
+        path: &Path,
+        storage_root: &Path,
+        resident_core_generation: &mut u64,
+    ) {
+        let Some(health) = crate::cli::index_freshness::load_health(storage_root) else {
+            return;
+        };
+        if health.phase == crate::cli::leindex::IndexPhase::Complete
+            && health.generation > *resident_core_generation
+        {
+            match self.refresh_loaded_from_active_generation(path).await {
+                Ok(()) => {
+                    *resident_core_generation = health.generation;
+                    state.mark_core_published(health.generation).await;
+                }
+                Err(error) => {
+                    warn!(
+                        project = %path.display(),
+                        "Core generation is published but resident hydration is pending: {error}"
+                    );
+                }
+            }
+        }
+        let phase = format!("{:?}", health.phase).to_ascii_lowercase();
+        let total = health.indexed_file_count;
+        let completed = if health.phase == crate::cli::leindex::IndexPhase::Complete {
+            total
+        } else {
+            0
+        };
+        state.set_phase(phase, completed, total).await;
+    }
+
+    async fn finish_owned_index(
+        &self,
+        state: &IndexJobState,
+        path: &Path,
+        previous_generation: u64,
+    ) {
+        let generation = crate::cli::leindex::resolve_existing_storage_path(path)
+            .and_then(|storage| crate::cli::index_freshness::load_health(&storage))
+            .map(|health| health.generation)
+            .unwrap_or(previous_generation.saturating_add(1));
+        let neural_path =
+            crate::cli::leindex::resolve_existing_storage_path(path).and_then(|storage| {
+                crate::cli::index_freshness::load_health(&storage).map(|health| {
+                    storage
+                        .join("generations")
+                        .join(health.generation.to_string())
+                        .join("neural_embeddings.bin")
+                })
+            });
+        if neural_path.as_ref().is_some_and(|path| {
+            path.is_file() && std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0)
+        }) {
+            state.mark_neural_published().await;
+        }
+        state.complete(generation).await;
+        // Mark the job as complete in the checkpoint state to prevent reuse
+        // of stale artifacts on subsequent force_reindex runs.
+        let storage_root = crate::cli::leindex::resolve_existing_storage_path(path)
+            .unwrap_or_else(|| path.join(".leindex"));
+        let job_paths = crate::cli::index_job::JobPaths::new(&storage_root, generation);
+        let _ = crate::cli::index_job::mark_checkpoint_complete(&job_paths.state(), generation);
+    }
+
+    async fn preserve_core_after_job_error(
+        &self,
+        state: &IndexJobState,
+        path: &Path,
+        storage_root: &Path,
+        previous_generation: u64,
+        resident_core_generation: u64,
+        error: &JsonRpcError,
+    ) {
+        // The core snapshot is published before neural enrichment. Preserve
+        // those layer flags if the optional follow-up fails afterward.
+        if let Some(health) = crate::cli::index_freshness::load_health(storage_root) {
+            if health.generation > previous_generation {
+                let core_loaded = if health.generation > resident_core_generation {
+                    match self.refresh_loaded_from_active_generation(path).await {
+                        Ok(()) => true,
+                        Err(refresh_error) => {
+                            warn!(
+                                project = %path.display(),
+                                "Core generation remains durable but resident hydration failed: {refresh_error}"
+                            );
+                            false
+                        }
+                    }
+                } else {
+                    true
+                };
+                if core_loaded {
+                    state.mark_core_published(health.generation).await;
+                }
+            }
+        }
+        state.fail(error.to_string()).await;
     }
 
     /// Number of projects currently in memory.
@@ -1011,21 +1095,11 @@ impl ProjectRegistry {
             tokio::select! {
                 result = &mut indexing => break result,
                 _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                    let storage_path = crate::cli::leindex::resolve_existing_storage_path(&project_path)
-                        .unwrap_or_else(|| project_path.join(".leindex"));
-                    if let Some(health) = crate::cli::index_freshness::load_health(&storage_path) {
-                        if health.phase == crate::cli::leindex::IndexPhase::Complete
-                            && health.generation > resident_core_generation
-                        {
-                            match self.refresh_loaded_from_active_generation(&project_path).await {
-                                Ok(()) => resident_core_generation = health.generation,
-                                Err(error) => debug!(
-                                    project = %project_path.display(),
-                                    "Published core generation is waiting for resident hydration: {error}"
-                                ),
-                            }
-                        }
-                    }
+                    self.refresh_resident_core_if_published(
+                        &project_path,
+                        &mut resident_core_generation,
+                    )
+                    .await;
                 }
             }
         };
@@ -1109,9 +1183,23 @@ impl ProjectRegistry {
     /// default so that subsequent tool calls that omit `project_path` resolve
     /// to it. The actual `LeIndex` creation happens lazily on first tool call
     /// via `get_or_load()`.
+    /// Set the default project path (canonicalized).
     pub async fn set_default_path(&self, path: PathBuf) {
+        let canonical = path.canonicalize().unwrap_or_else(|err| {
+            // Canonicalization can fail for a transiently-missing mount or a
+            // permission error. Fall back to the raw path rather than panicking:
+            // the caller supplied a real path, and `default_project_path()`
+            // re-canonicalizes on lookup, so a non-canonical stored form degrades
+            // to an extra reload rather than breaking the registry.
+            warn!(
+                "Failed to canonicalize default project path {}: {}",
+                path.display(),
+                err
+            );
+            path.clone()
+        });
         let mut default = self.default_project.write().await;
-        *default = Some(path);
+        *default = Some(canonical);
     }
 
     /// Return the configured default path without creating or hydrating a project.
@@ -1122,6 +1210,26 @@ impl ProjectRegistry {
     /// Return an already-loaded project without creating or hydrating it.
     pub async fn try_get_loaded(&self, path: &Path) -> Option<ProjectHandle> {
         self.projects.read().await.get(path).cloned()
+    }
+
+    async fn refresh_resident_core_if_published(&self, path: &Path, resident_generation: &mut u64) {
+        let storage_path = crate::cli::leindex::resolve_existing_storage_path(path)
+            .unwrap_or_else(|| path.join(".leindex"));
+        let Some(health) = crate::cli::index_freshness::load_health(&storage_path) else {
+            return;
+        };
+        if health.phase != crate::cli::leindex::IndexPhase::Complete
+            || health.generation <= *resident_generation
+        {
+            return;
+        }
+        match self.refresh_loaded_from_active_generation(path).await {
+            Ok(()) => *resident_generation = health.generation,
+            Err(error) => debug!(
+                project = %path.display(),
+                "Published core generation is waiting for resident hydration: {error}"
+            ),
+        }
     }
 
     /// Refresh the resident handle from the immutable generation selected by

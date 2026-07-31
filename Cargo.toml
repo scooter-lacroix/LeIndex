@@ -1,8 +1,8 @@
 [package]
 name = "leindex"
 version = "1.9.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.85"
 authors = ["LeIndex Contributors"]
 description = "LeIndex MCP and semantic code search engine for AI tools and large codebases"
 documentation = "https://docs.rs/leindex"
@@ -503,6 +503,14 @@ workspace = true
 # ort rc.12 deadlocks while reporting dynamic-loader errors because its error
 # constructor recursively initializes ORT under the dylib OnceLock. Pin the
 # focused upstream fix until a crates.io release containing it is available.
+#
+# CAVEAT (crates.io consumers): a workspace `[patch.crates-io]` does NOT
+# propagate to downstream crates that depend on the separately published
+# `leindex-embed`. Repository builds use this fixed revision, but standalone
+# crates.io consumers of leindex-embed resolve the unpatched ort rc.12 until
+# upstream publishes a release containing 17ed727. Track upstream ort releases
+# and bump leindex-embed's `ort` version requirement (removing this patch) as
+# soon as a fixed release is ≥3 days old (per the dep-release-age policy).
 [patch.crates-io]
 ort = { git = "https://github.com/pykeio/ort", rev = "17ed727770746447620d0d76e9893ed1a3d7c221" }
 ort-sys = { git = "https://github.com/pykeio/ort", rev = "17ed727770746447620d0d76e9893ed1a3d7c221" }

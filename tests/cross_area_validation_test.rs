@@ -190,7 +190,10 @@ mod ort_discovery_priority {
         assert!(
             env < cfg && cfg < ul && ul < sib,
             "discovery chain MUST be ordered: ORT_DYLIB_PATH -> config -> user_lib -> sibling (got env={}, cfg={}, user_lib={}, sib={})",
-            env, cfg, ul, sib
+            env,
+            cfg,
+            ul,
+            sib
         );
     }
 
@@ -386,7 +389,7 @@ mod setup_idempotency_and_preservation {
     /// branch in ensure_models_present which logs "already present".
     #[test]
     fn setup_skips_model_download_when_checksum_matches() {
-        let setup = read_file("src/cli/leindex/setup.rs");
+        let setup = read_file("src/cli/leindex/setup_models.rs");
         assert!(
             setup.contains("already present, checksum verified"),
             "setup must skip re-download when the on-disk model checksum matches"
@@ -597,7 +600,7 @@ mod diagnostics_ort_info {
 
     #[test]
     fn setup_ort_path_uses_worker_discovery_chain() {
-        let setup = read_file("src/cli/leindex/setup.rs");
+        let setup = read_file("src/cli/leindex/setup_ort.rs");
         let helper = setup
             .split("pub(crate) fn discover_ort_path()")
             .nth(1)
@@ -793,9 +796,9 @@ mod cross_surface_fallback_consistency {
     /// produces search results without requiring any worker.
     #[test]
     fn tfidf_only_embedder_variant_exists_for_zero_setup_path() {
-        let src = read_file("src/cli/index_builder.rs");
+        let src = read_file("src/cli/index_builder/hybrid.rs");
         assert!(
-            src.contains("HybridEmbedder::TfIdfOnly("),
+            src.contains("TfIdfOnly(TfIdfEmbedder)"),
             "VAL-CROSS-008 / VAL-CROSS-017: TfIdfOnly embedder variant must exist so TF-IDF works without ORT"
         );
     }

@@ -15,8 +15,8 @@ use anyhow::{Context, Result};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Canonical phase names in execution order (VAL-MEASURE-002, VAL-CPHASE-036).
@@ -56,6 +56,47 @@ pub struct WorkloadConfig {
     /// Path to the leindex-embed worker binary (for worker-active phases).
     /// If None, worker-active phases are skipped.
     pub worker_binary: Option<PathBuf>,
+}
+
+/// Copy fixture source files into a disposable directory, excluding its index.
+pub fn copy_fixture_source(source: &Path) -> Result<tempfile::TempDir> {
+    let destination = tempfile::tempdir().context("failed to create isolated fixture directory")?;
+    copy_fixture_contents(source, destination.path())?;
+    Ok(destination)
+}
+
+fn copy_fixture_contents(source: &Path, destination: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(source)
+        .with_context(|| format!("failed to read fixture directory {}", source.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to read entry in {}", source.display()))?;
+        if entry.file_name() == ".leindex" {
+            continue;
+        }
+
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", source_path.display()))?
+            .is_dir()
+        {
+            std::fs::create_dir_all(&destination_path)
+                .with_context(|| format!("failed to create {}", destination_path.display()))?;
+            copy_fixture_contents(&source_path, &destination_path)?;
+        } else {
+            std::fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Run the full canonical workload and return per-phase reports.
@@ -358,7 +399,10 @@ fn run_embed_active_phase(config: &WorkloadConfig) -> Result<(Child, PhaseReport
     if config.verbose {
         eprintln!(
             "memcheck: phase 'embed_active' complete — main_rss_max: {} KiB, worker_rss_max: {} KiB, combined_rss_max: {} KiB, samples: {}",
-            report.rss_max_kib, report.worker_rss_max_kib, report.combined_rss_max_kib, report.sample_count
+            report.rss_max_kib,
+            report.worker_rss_max_kib,
+            report.combined_rss_max_kib,
+            report.sample_count
         );
     }
 
@@ -815,6 +859,27 @@ mod tests {
     #[test]
     fn test_canonical_phases_count() {
         assert_eq!(CANONICAL_PHASES.len(), 9);
+    }
+
+    #[test]
+    fn test_copy_fixture_source_excludes_root_leindex() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source.path().join("src")).unwrap();
+        std::fs::create_dir_all(source.path().join(".leindex")).unwrap();
+        std::fs::write(source.path().join("src/lib.rs"), "pub fn fixture() {}\n").unwrap();
+        std::fs::write(source.path().join(".leindex/index.db"), "source index").unwrap();
+
+        let isolated = copy_fixture_source(source.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(isolated.path().join("src/lib.rs")).unwrap(),
+            "pub fn fixture() {}\n"
+        );
+        assert!(!isolated.path().join(".leindex").exists());
+        assert_eq!(
+            std::fs::read_to_string(source.path().join(".leindex/index.db")).unwrap(),
+            "source index"
+        );
     }
 
     #[test]

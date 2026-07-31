@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use sysinfo::{get_current_pid, ProcessesToUpdate, System};
+use sysinfo::{ProcessesToUpdate, System, get_current_pid};
 use tracing::{debug, info, warn};
 
 // ============================================================================
@@ -515,27 +515,30 @@ impl CacheStore {
         if !self.cache_dir.exists() {
             return 0;
         }
-        if let Ok(entries) = std::fs::read_dir(&self.cache_dir) {
-            for entry in entries.flatten() {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(".bin") && name.starts_with(sanitized_prefix) {
-                        let path = entry.path();
-                        match std::fs::remove_file(&path) {
-                            Ok(()) => count += 1,
-                            Err(err) => warn!(
-                                "failed to remove spilled cache entry {}: {}",
-                                path.display(),
-                                err
-                            ),
+        match std::fs::read_dir(&self.cache_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if name.ends_with(".bin") && name.starts_with(sanitized_prefix) {
+                            let path = entry.path();
+                            match std::fs::remove_file(&path) {
+                                Ok(()) => count += 1,
+                                Err(err) => warn!(
+                                    "failed to remove spilled cache entry {}: {}",
+                                    path.display(),
+                                    err
+                                ),
+                            }
                         }
                     }
                 }
             }
-        } else {
-            warn!(
-                "failed to read spilled cache directory {} for prefix cleanup",
-                self.cache_dir.display()
-            );
+            _ => {
+                warn!(
+                    "failed to read spilled cache directory {} for prefix cleanup",
+                    self.cache_dir.display()
+                );
+            }
         }
         count
     }

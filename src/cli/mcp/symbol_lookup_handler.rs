@@ -124,33 +124,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
             resolve_scope(&args, guard.project_path())?
         };
 
-        // Determine symbol list: single "symbol" or batch "symbols"
-        let symbols: Vec<String> = if let Some(arr) = args.get("symbols").and_then(|v| v.as_array())
-        {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .filter(|s| !s.trim().is_empty())
-                .take(20)
-                .collect()
-        } else if let Ok(sym) = extract_string(&args, "symbol") {
-            if sym.trim().is_empty() {
-                return Err(JsonRpcError::invalid_params(
-                    "'symbol' must be a non-empty string".to_string(),
-                ));
-            }
-            vec![sym]
-        } else {
-            return Err(JsonRpcError::invalid_params(
-                "Provide either 'symbol' (string) or 'symbols' (array of strings)".to_string(),
-            ));
-        };
-
-        // Validate symbols is non-empty (after filtering blanks)
-        if symbols.is_empty() {
-            return Err(JsonRpcError::invalid_params(
-                "'symbols' array must contain at least one non-blank string".to_string(),
-            ));
-        }
+        let symbols = parse_symbols(&args)?;
 
         let mut guard = handle.write().await;
 
@@ -242,77 +216,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
         started: Instant,
         budget: WorkBudget,
     ) -> Result<Value, JsonRpcError> {
-        let in_scope = |node: &crate::graph::pdg::Node| match scope {
-            Some(s) => node.file_path.starts_with(s),
-            None => true,
-        };
-
-        // 1. Exact symbol lookup (by node.id in symbol_index)
-        let node_id = if let Some(nid) = pdg.find_by_symbol(symbol) {
-            pdg.get_node(nid).filter(|n| in_scope(n)).map(|_| nid)
-        } else {
-            None
-        }
-        // 2. Exact name lookup (by node.name in name_index) — prefer non-module nodes
-        .or_else(|| {
-            let candidates = pdg.find_all_by_name(symbol);
-            // Prefer class/function/method over module nodes
-            candidates
-                .iter()
-                .copied()
-                .find(|&nid| {
-                    pdg.get_node(nid)
-                        .map(|n| n.node_type != crate::graph::pdg::NodeType::Module && in_scope(n))
-                        .unwrap_or(false)
-                })
-                .or_else(|| {
-                    candidates
-                        .iter()
-                        .copied()
-                        .find(|&nid| pdg.get_node(nid).is_some_and(&in_scope))
-                })
-        })
-        .or_else(|| {
-            // 3. Fuzzy match: substring, case-insensitive — prefer non-module nodes
-            let sym_lower = symbol.to_lowercase();
-            let mut best: Option<crate::graph::pdg::NodeId> = None;
-            let mut best_is_module = true;
-            for nid in pdg.node_indices() {
-                let Some(n) = pdg.get_node(nid) else { continue };
-                if !in_scope(n) {
-                    continue;
-                }
-                let matches = n.name.to_lowercase().contains(&sym_lower)
-                    || n.id.to_lowercase().contains(&sym_lower);
-                if !matches {
-                    continue;
-                }
-                let is_module = n.node_type == crate::graph::pdg::NodeType::Module;
-                // Always prefer non-module; only accept module if it's the first match
-                if best.is_none() || (best_is_module && !is_module) {
-                    best = Some(nid);
-                    best_is_module = is_module;
-                    if !is_module {
-                        break;
-                    } // non-module is best, stop early
-                }
-            }
-            best
-        })
-        .ok_or_else(|| {
-            let total_symbols = pdg.node_count();
-            let total_files = pdg.file_count();
-            let suggestion = format!(
-                "Symbol '{}' not found among {} indexed symbols across {} files. Try: \
-                check spelling, use LeIndex [Grep Symbols] for partial matches, \
-                or LeIndex [Text Search] for raw content search.",
-                symbol, total_symbols, total_files
-            );
-            JsonRpcError::invalid_params_with_suggestion(
-                format!("Symbol '{}' not found in project index", symbol),
-                &suggestion,
-            )
-        })?;
+        let node_id = resolve_symbol_node(pdg, symbol, scope)?;
 
         let node = pdg
             .get_node(node_id)
@@ -321,25 +225,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
 
         // Callees (direct)
         let (callees, callees_truncated) = if include_callees && !partial {
-            let capped_callees: Vec<Value> = pdg
-                .neighbors(node_id)
-                .iter()
-                .filter_map(|&cid| {
-                    pdg.get_node(cid).map(|cn| {
-                        serde_json::json!({
-                            "name": cn.name,
-                            "file": cn.file_path,
-                            "type": node_type_str(&cn.node_type)
-                        })
-                    })
-                })
-                .take(51)
-                .collect();
-            let truncated = capped_callees.len() > 50;
-            (
-                capped_callees.into_iter().take(50).collect::<Vec<_>>(),
-                truncated,
-            )
+            summarize_nodes(pdg, pdg.neighbors(node_id))
         } else {
             (Vec::new(), false)
         };
@@ -347,24 +233,7 @@ For the exact source implementation use LeIndex [Read Symbol]."
 
         // Callers (direct)
         let (callers, callers_truncated) = if include_callers && !partial {
-            let capped_callers: Vec<Value> = get_direct_callers(pdg, node_id)
-                .iter()
-                .filter_map(|&cid| {
-                    pdg.get_node(cid).map(|cn| {
-                        serde_json::json!({
-                            "name": cn.name,
-                            "file": cn.file_path,
-                            "type": node_type_str(&cn.node_type)
-                        })
-                    })
-                })
-                .take(51)
-                .collect();
-            let truncated = capped_callers.len() > 50;
-            (
-                capped_callers.into_iter().take(50).collect::<Vec<_>>(),
-                truncated,
-            )
+            summarize_nodes(pdg, get_direct_callers(pdg, node_id))
         } else {
             (Vec::new(), false)
         };
@@ -417,6 +286,146 @@ For the exact source implementation use LeIndex [Read Symbol]."
 
         Ok(result)
     }
+}
+
+fn resolve_symbol_node(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    symbol: &str,
+    scope: &Option<String>,
+) -> Result<crate::graph::pdg::NodeId, JsonRpcError> {
+    let in_scope = |node: &crate::graph::pdg::Node| match scope {
+        Some(s) => node.file_path.starts_with(s),
+        None => true,
+    };
+
+    // 1. Exact symbol lookup (by node.id in symbol_index)
+    let node_id = if let Some(nid) = pdg.find_by_symbol(symbol) {
+        pdg.get_node(nid).filter(|n| in_scope(n)).map(|_| nid)
+    } else {
+        None
+    }
+    // 2. Exact name lookup (by node.name in name_index) — prefer non-module nodes
+    .or_else(|| {
+        let candidates = pdg.find_all_by_name(symbol);
+        // Prefer class/function/method over module nodes
+        candidates
+            .iter()
+            .copied()
+            .find(|&nid| {
+                pdg.get_node(nid)
+                    .map(|n| n.node_type != crate::graph::pdg::NodeType::Module && in_scope(n))
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|&nid| pdg.get_node(nid).is_some_and(&in_scope))
+            })
+    })
+    .or_else(|| find_fuzzy_node(pdg, symbol, &in_scope))
+    .ok_or_else(|| {
+        let total_symbols = pdg.node_count();
+        let total_files = pdg.file_count();
+        let suggestion = format!(
+            "Symbol '{}' not found among {} indexed symbols across {} files. Try: \
+            check spelling, use LeIndex [Grep Symbols] for partial matches, \
+            or LeIndex [Text Search] for raw content search.",
+            symbol, total_symbols, total_files
+        );
+        JsonRpcError::invalid_params_with_suggestion(
+            format!("Symbol '{}' not found in project index", symbol),
+            &suggestion,
+        )
+    })?;
+
+    Ok(node_id)
+}
+
+fn find_fuzzy_node(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    symbol: &str,
+    in_scope: &impl Fn(&crate::graph::pdg::Node) -> bool,
+) -> Option<crate::graph::pdg::NodeId> {
+    // 3. Fuzzy match: substring, case-insensitive — prefer non-module nodes
+    let sym_lower = symbol.to_lowercase();
+    let mut best: Option<crate::graph::pdg::NodeId> = None;
+    let mut best_is_module = true;
+    for nid in pdg.node_indices() {
+        let Some(n) = pdg.get_node(nid) else {
+            continue;
+        };
+        if !in_scope(n) {
+            continue;
+        }
+        let matches =
+            n.name.to_lowercase().contains(&sym_lower) || n.id.to_lowercase().contains(&sym_lower);
+        if !matches {
+            continue;
+        }
+        let is_module = n.node_type == crate::graph::pdg::NodeType::Module;
+        // Always prefer non-module; only accept module if it's the first match
+        if best.is_none() || (best_is_module && !is_module) {
+            best = Some(nid);
+            best_is_module = is_module;
+            if !is_module {
+                break;
+            } // non-module is best, stop early
+        }
+    }
+    best
+}
+
+fn summarize_nodes(
+    pdg: &crate::graph::pdg::ProgramDependenceGraph,
+    node_ids: Vec<crate::graph::pdg::NodeId>,
+) -> (Vec<Value>, bool) {
+    let capped_nodes: Vec<Value> = node_ids
+        .into_iter()
+        .filter_map(|node_id| {
+            pdg.get_node(node_id).map(|node| {
+                serde_json::json!({
+                    "name": node.name,
+                    "file": node.file_path,
+                    "type": node_type_str(&node.node_type)
+                })
+            })
+        })
+        .take(51)
+        .collect();
+    let truncated = capped_nodes.len() > 50;
+    (capped_nodes.into_iter().take(50).collect(), truncated)
+}
+
+fn parse_symbols(args: &Value) -> Result<Vec<String>, JsonRpcError> {
+    // Determine symbol list: single "symbol" or batch "symbols"
+    let symbols = if let Some(arr) = args.get("symbols").and_then(|v| v.as_array()) {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .filter(|s| !s.trim().is_empty())
+            .take(20)
+            .collect()
+    } else if let Ok(sym) = extract_string(args, "symbol") {
+        if sym.trim().is_empty() {
+            return Err(JsonRpcError::invalid_params(
+                "'symbol' must be a non-empty string".to_string(),
+            ));
+        }
+        vec![sym]
+    } else {
+        return Err(JsonRpcError::invalid_params(
+            "Provide either 'symbol' (string) or 'symbols' (array of strings)".to_string(),
+        ));
+    };
+
+    // Validate symbols is non-empty (after filtering blanks)
+    if symbols.is_empty() {
+        return Err(JsonRpcError::invalid_params(
+            "'symbols' array must contain at least one non-blank string".to_string(),
+        ));
+    }
+
+    Ok(symbols)
 }
 
 fn retrieval_meta(budget: WorkBudget, started: Instant) -> Value {

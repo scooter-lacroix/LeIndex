@@ -382,34 +382,123 @@ impl std::fmt::Debug for MmapEmbeddingIndex {
     }
 }
 
+fn map_embedding_file(path: &Path) -> Result<memmap2::Mmap, MmapError> {
+    let file = std::fs::File::open(path).map_err(MmapError::Io)?;
+    let metadata = file.metadata().map_err(MmapError::Io)?;
+    if metadata.len() < MmapHeader::SIZE as u64 {
+        return Err(MmapError::Corrupt("file too small for header".into()));
+    }
+
+    // Safety: the file is opened read-only and the mapping is used exclusively
+    // for reads. The file must not be modified while this mapping is alive.
+    unsafe { memmap2::Mmap::map(&file).map_err(|error| MmapError::Mmap(error.to_string())) }
+}
+
+fn validate_v1_header(mmap: &[u8]) -> Result<MmapHeader, MmapError> {
+    let header = MmapHeader::read_from(mmap)
+        .ok_or_else(|| MmapError::Corrupt("failed to read header".into()))?;
+    if header.magic != MMAP_MAGIC {
+        return Err(MmapError::Corrupt("invalid magic bytes".into()));
+    }
+    if header.version != MMAP_VERSION {
+        return Err(MmapError::Corrupt(format!(
+            "unsupported version {}",
+            header.version
+        )));
+    }
+    Ok(header)
+}
+
+fn checked_id_table_bounds(node_count: u32, file_len: usize) -> Result<(usize, usize), MmapError> {
+    let n = node_count as usize;
+    let offsets_start = MmapHeader::SIZE;
+    let offsets_table_size = n
+        .checked_mul(8)
+        .ok_or_else(|| MmapError::Corrupt("offset table size overflow".into()))?;
+    let offsets_end = offsets_start
+        .checked_add(offsets_table_size)
+        .ok_or_else(|| MmapError::Corrupt("offset table end overflow".into()))?;
+    let lengths_table_size = n
+        .checked_mul(4)
+        .ok_or_else(|| MmapError::Corrupt("length table size overflow".into()))?;
+    let lengths_end = offsets_end
+        .checked_add(lengths_table_size)
+        .ok_or_else(|| MmapError::Corrupt("length table end overflow".into()))?;
+
+    if offsets_end > file_len {
+        return Err(MmapError::Corrupt(format!(
+            "offset table exceeds file size: table size {}, file size {}",
+            offsets_table_size, file_len
+        )));
+    }
+    if lengths_end > file_len {
+        return Err(MmapError::Corrupt(format!(
+            "length table exceeds file size: table size {}, file size {}",
+            lengths_table_size, file_len
+        )));
+    }
+    Ok((offsets_end, lengths_end))
+}
+
+fn scan_ids_section_end(
+    mmap: &[u8],
+    node_count: u32,
+    lengths_start: usize,
+    ids_section_offset: usize,
+) -> Result<usize, MmapError> {
+    let mut max_end = ids_section_offset;
+    for index in 0..node_count as usize {
+        let offset_start = MmapHeader::SIZE + index * 8;
+        let length_start = lengths_start + index * 4;
+        let offset = u64::from_le_bytes(
+            mmap[offset_start..offset_start + 8]
+                .try_into()
+                .expect("validated offset table entry"),
+        ) as usize;
+        let length = u32::from_le_bytes(
+            mmap[length_start..length_start + 4]
+                .try_into()
+                .expect("validated length table entry"),
+        ) as usize;
+        let section_end = ids_section_offset
+            .checked_add(offset)
+            .and_then(|value| value.checked_add(length))
+            .ok_or_else(|| MmapError::Corrupt("ID section end overflow".into()))?;
+        max_end = max_end.max(section_end);
+    }
+    Ok(max_end)
+}
+
+fn checked_embedding_matrix_size(node_count: u32, dimension: u32) -> Result<usize, MmapError> {
+    (dimension as usize)
+        .checked_mul(4)
+        .and_then(|row_size| (node_count as usize).checked_mul(row_size))
+        .ok_or_else(|| MmapError::Corrupt("embedding matrix size overflow".into()))
+}
+
+fn build_id_rows(
+    mmap: &[u8],
+    node_count: u32,
+    ids_section_offset: usize,
+) -> Result<HashMap<String, u32>, MmapError> {
+    let mut id_rows = HashMap::with_capacity(node_count as usize);
+    for index in 0..node_count as usize {
+        match read_node_id_from_mmap(mmap, node_count, ids_section_offset, index) {
+            Ok(id) => {
+                id_rows.insert(id, index as u32);
+            }
+            Err(error) if error.to_string().contains("not UTF-8") => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(id_rows)
+}
+
 impl MmapEmbeddingIndex {
     /// Open an existing mmap embedding file for read-only access.
     pub fn open(path: &Path) -> Result<Self, MmapError> {
-        let file = std::fs::File::open(path).map_err(MmapError::Io)?;
-        let metadata = file.metadata().map_err(MmapError::Io)?;
-
-        if metadata.len() < MmapHeader::SIZE as u64 {
-            return Err(MmapError::Corrupt("file too small for header".into()));
-        }
-
-        // Safety: we open the file read-only and the mmap is used exclusively
-        // for reads. The file must not be modified by another process while
-        // this mapping is alive.
-        let mmap =
-            unsafe { memmap2::Mmap::map(&file).map_err(|e| MmapError::Mmap(e.to_string()))? };
-
-        let header = MmapHeader::read_from(&mmap)
-            .ok_or_else(|| MmapError::Corrupt("failed to read header".into()))?;
-
-        if header.magic != MMAP_MAGIC {
-            return Err(MmapError::Corrupt("invalid magic bytes".into()));
-        }
-        if header.version != MMAP_VERSION {
-            return Err(MmapError::Corrupt(format!(
-                "unsupported version {}",
-                header.version
-            )));
-        }
+        let mmap = map_embedding_file(path)?;
+        let header = validate_v1_header(&mmap)?;
 
         let node_count = header.node_count;
         let dimension = header.dimension;
@@ -425,104 +514,9 @@ impl MmapEmbeddingIndex {
             });
         }
 
-        let n = node_count as usize;
-
-        // Offset table: node_count × 8 bytes (u64 offsets into ID string section)
-        let offsets_start = MmapHeader::SIZE;
-        let offsets_end = offsets_start + n * 8;
-
-        // Length table: node_count × 4 bytes (u32 length per ID)
-        let lengths_start = offsets_end;
-        let lengths_end = lengths_start + n * 4;
-
-        // ID strings start after offset+length tables.
-        // Read the maximum offset+length to determine the end of the ID section.
-        let ids_section_offset = lengths_end;
-
-        // Verify offset and length tables fit in file before accessing
-        // Use checked arithmetic to prevent overflow on malicious node_count
-        let offsets_table_size = n
-            .checked_mul(8)
-            .ok_or_else(|| MmapError::Corrupt("offset table size overflow".to_string()))?;
-        let lengths_table_size = n
-            .checked_mul(4)
-            .ok_or_else(|| MmapError::Corrupt("length table size overflow".to_string()))?;
-        let offsets_end_checked = offsets_start
-            .checked_add(offsets_table_size)
-            .ok_or_else(|| MmapError::Corrupt("offset table end overflow".to_string()))?;
-        let lengths_end_checked = lengths_start
-            .checked_add(lengths_table_size)
-            .ok_or_else(|| MmapError::Corrupt("length table end overflow".to_string()))?;
-
-        if offsets_end_checked > mmap.len() {
-            return Err(MmapError::Corrupt(format!(
-                "offset table exceeds file size: table size {}, file size {}",
-                offsets_table_size,
-                mmap.len()
-            )));
-        }
-        if lengths_end_checked > mmap.len() {
-            return Err(MmapError::Corrupt(format!(
-                "length table exceeds file size: table size {}, file size {}",
-                lengths_table_size,
-                mmap.len()
-            )));
-        }
-
-        let ids_section_end = {
-            let mut max_end: usize = ids_section_offset;
-            for i in 0..n {
-                // Use checked arithmetic for slice indices to prevent overflow
-                let offset_idx_start =
-                    offsets_start
-                        .checked_add(i.checked_mul(8).ok_or_else(|| {
-                            MmapError::Corrupt("offset index overflow".to_string())
-                        })?)
-                        .ok_or_else(|| MmapError::Corrupt("offset start overflow".to_string()))?;
-                let offset_idx_end = offset_idx_start
-                    .checked_add(8)
-                    .ok_or_else(|| MmapError::Corrupt("offset end overflow".to_string()))?;
-                let len_idx_start =
-                    lengths_start
-                        .checked_add(i.checked_mul(4).ok_or_else(|| {
-                            MmapError::Corrupt("length index overflow".to_string())
-                        })?)
-                        .ok_or_else(|| MmapError::Corrupt("length start overflow".to_string()))?;
-                let len_idx_end = len_idx_start
-                    .checked_add(4)
-                    .ok_or_else(|| MmapError::Corrupt("length end overflow".to_string()))?;
-
-                if offset_idx_end > mmap.len() {
-                    return Err(MmapError::Corrupt(format!(
-                        "offset slice exceeds file size: [{}, {}], file size {}",
-                        offset_idx_start,
-                        offset_idx_end,
-                        mmap.len()
-                    )));
-                }
-                if len_idx_end > mmap.len() {
-                    return Err(MmapError::Corrupt(format!(
-                        "length slice exceeds file size: [{}, {}], file size {}",
-                        len_idx_start,
-                        len_idx_end,
-                        mmap.len()
-                    )));
-                }
-
-                let off =
-                    u64::from_le_bytes(mmap[offset_idx_start..offset_idx_end].try_into().unwrap())
-                        as usize;
-                let len = u32::from_le_bytes(mmap[len_idx_start..len_idx_end].try_into().unwrap())
-                    as usize;
-                // Use checked addition for ID section end calculation to prevent overflow
-                let section_end = ids_section_offset
-                    .checked_add(off)
-                    .and_then(|v| v.checked_add(len))
-                    .ok_or_else(|| MmapError::Corrupt("ID section end overflow".to_string()))?;
-                max_end = max_end.max(section_end);
-            }
-            max_end
-        };
+        let (lengths_start, ids_section_offset) = checked_id_table_bounds(node_count, mmap.len())?;
+        let ids_section_end =
+            scan_ids_section_end(&mmap, node_count, lengths_start, ids_section_offset)?;
 
         // Pad to 4-byte alignment for the embedding matrix
         let embedding_matrix_offset = ids_section_end
@@ -531,10 +525,7 @@ impl MmapEmbeddingIndex {
             & !3;
 
         // Validate total file size
-        let embedding_matrix_size = (dimension as usize)
-            .checked_mul(4)
-            .and_then(|v| n.checked_mul(v))
-            .ok_or_else(|| MmapError::Corrupt("embedding matrix size overflow".to_string()))?;
+        let embedding_matrix_size = checked_embedding_matrix_size(node_count, dimension)?;
         let expected_size = embedding_matrix_offset
             .checked_add(embedding_matrix_size)
             .ok_or_else(|| MmapError::Corrupt("expected file size overflow".to_string()))?;
@@ -546,20 +537,8 @@ impl MmapEmbeddingIndex {
             )));
         }
 
-        let mut id_rows = HashMap::with_capacity(n);
-        for index in 0..n {
-            match read_node_id_from_mmap(&mmap, node_count, ids_section_offset, index) {
-                Ok(id) => {
-                    id_rows.insert(id, index as u32);
-                }
-                Err(error) if error.to_string().contains("not UTF-8") => {
-                    // Keep opening the map so the compatibility `entries()`
-                    // path can report the precise malformed row. Valid rows
-                    // remain available through O(1) ID lookup.
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        // Malformed UTF-8 remains deferred to `entries()`; valid IDs stay searchable.
+        let id_rows = build_id_rows(&mmap, node_count, ids_section_offset)?;
 
         Ok(Self {
             mmap,
@@ -1219,25 +1198,38 @@ mod tests {
     }
 
     #[test]
-    fn test_mmap_overflow_in_size_computation_returns_corrupt() {
+    fn test_mmap_rejects_unsupported_version() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("overflow.bin");
-
-        // Header with extreme values to trigger checked arithmetic overflow
-        // magic=LIEE, version=1, node_count=usize::MAX (as u32), dimension=usize::MAX (as u32)
-        let mut header = Vec::new();
-        header.extend_from_slice(b"LIEE");
-        header.extend_from_slice(&1u32.to_le_bytes());
-        header.extend_from_slice(&u32::MAX.to_le_bytes()); // node_count
-        header.extend_from_slice(&u32::MAX.to_le_bytes()); // dimension
+        let path = dir.path().join("unsupported.bin");
+        let mut header = *b"LIEE\0\0\0\0\0\0\0\0\0\0\0\0";
+        header[4..8].copy_from_slice(&(MMAP_VERSION + 1).to_le_bytes());
         std::fs::write(&path, header).unwrap();
 
-        let result = MmapEmbeddingIndex::open(&path);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let error = MmapEmbeddingIndex::open(&path).unwrap_err().to_string();
+        assert!(error.contains("unsupported version 2"), "{error}");
+    }
+
+    #[test]
+    fn test_mmap_rejects_missing_offset_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing-offsets.bin");
+        let mut header = *b"LIEE\0\0\0\0\0\0\0\0\0\0\0\0";
+        header[4..8].copy_from_slice(&MMAP_VERSION.to_le_bytes());
+        header[8..12].copy_from_slice(&1u32.to_le_bytes());
+        std::fs::write(&path, header).unwrap();
+
+        let error = MmapEmbeddingIndex::open(&path).unwrap_err().to_string();
         assert!(
-            err.contains("overflow") || err.contains("Corrupt"),
-            "expected overflow or corrupt error, got: {err}"
+            error.contains("offset table exceeds file size: table size 8, file size 16"),
+            "{error}"
         );
+    }
+
+    #[test]
+    fn test_embedding_matrix_size_overflow_is_checked() {
+        let error = checked_embedding_matrix_size(u32::MAX, u32::MAX)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("embedding matrix size overflow"), "{error}");
     }
 }

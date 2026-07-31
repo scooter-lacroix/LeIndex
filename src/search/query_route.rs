@@ -51,7 +51,7 @@ pub fn classify(query: &str, requested: RequestedMode) -> QueryRoute {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, QueryRoute, RequestedMode};
+    use super::{QueryRoute, RequestedMode, classify};
 
     #[test]
     fn routes_identifier_and_natural_language_queries() {

@@ -462,7 +462,8 @@ fn test_model_path_env_override_precedence() {
     std::fs::write(&model_file, b"fake model").unwrap();
 
     // Set env override
-    std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path());
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path()) };
 
     let result = ModelResolver::resolve("test-model");
     assert!(result.is_ok());
@@ -472,7 +473,8 @@ fn test_model_path_env_override_precedence() {
     // Verify source is reported as env_override
     assert_eq!(ModelResolver::source_for_path(&path), "env_override");
 
-    std::env::remove_var("LEINDEX_MODEL_PATH");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
 }
 
 #[test]
@@ -483,20 +485,23 @@ fn test_model_path_env_override_takes_priority() {
     let model_file = temp_dir.path().join("priority-test.onnx");
     std::fs::write(&model_file, b"fake model").unwrap();
 
-    std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path());
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LEINDEX_MODEL_PATH", temp_dir.path()) };
 
     let result = ModelResolver::resolve("priority-test");
     assert!(result.is_ok());
     // Should resolve to the env override path, not bundled or user cache
     assert!(result.unwrap().starts_with(temp_dir.path()));
 
-    std::env::remove_var("LEINDEX_MODEL_PATH");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
 }
 
 #[test]
 fn test_model_path_not_found_reports_error() {
     let _guard = ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("LEINDEX_MODEL_PATH");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_MODEL_PATH") };
     let result = ModelResolver::resolve("nonexistent-xyz-model");
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -850,12 +855,18 @@ fn test_full_lifecycle_cold_start_reuse_teardown_restart() {
 #[test]
 fn test_runtime_config_from_env() {
     // Test that config can be built from env vars
-    std::env::set_var("LEINDEX_WORKER_IDLE_TIMEOUT", "60");
-    std::env::set_var("LEINDEX_WORKER_MAX_FRAME_SIZE", "8388608");
-    std::env::set_var("LEINDEX_WORKER_MAX_TEXT_SIZE", "524288");
-    std::env::set_var("LEINDEX_WORKER_MODEL", "test-model");
-    std::env::set_var("LEINDEX_WORKER_EMBEDDING_DIM", "768");
-    std::env::set_var("LEINDEX_WORKER_EXECUTION_PROVIDER", "cuda");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LEINDEX_WORKER_IDLE_TIMEOUT", "60") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LEINDEX_WORKER_MAX_FRAME_SIZE", "8388608") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LEINDEX_WORKER_MAX_TEXT_SIZE", "524288") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LEINDEX_WORKER_MODEL", "test-model") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LEINDEX_WORKER_EMBEDDING_DIM", "768") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LEINDEX_WORKER_EXECUTION_PROVIDER", "cuda") };
 
     let config = RuntimeConfig::from_env();
     assert_eq!(config.idle_timeout, Duration::from_secs(60));
@@ -866,12 +877,18 @@ fn test_runtime_config_from_env() {
     assert_eq!(config.execution_provider, "cuda");
 
     // Clean up
-    std::env::remove_var("LEINDEX_WORKER_IDLE_TIMEOUT");
-    std::env::remove_var("LEINDEX_WORKER_MAX_FRAME_SIZE");
-    std::env::remove_var("LEINDEX_WORKER_MAX_TEXT_SIZE");
-    std::env::remove_var("LEINDEX_WORKER_MODEL");
-    std::env::remove_var("LEINDEX_WORKER_EMBEDDING_DIM");
-    std::env::remove_var("LEINDEX_WORKER_EXECUTION_PROVIDER");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_WORKER_IDLE_TIMEOUT") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_WORKER_MAX_FRAME_SIZE") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_WORKER_MAX_TEXT_SIZE") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_WORKER_MODEL") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_WORKER_EMBEDDING_DIM") };
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_WORKER_EXECUTION_PROVIDER") };
 }
 
 // ── Process-leak regression tests (fix-worker-process-leak) ─────────────

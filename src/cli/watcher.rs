@@ -125,53 +125,7 @@ impl IndexWatcher {
                             // the write lock. Completion is reported through
                             // the channel instead, so slow work remains visible
                             // without duplicate jobs or state races.
-                            let blocking = tokio::task::spawn_blocking(move || -> ReindexOutcome {
-                                let mut idx = match try_acquire_lock(&handle_clone) {
-                                    LockAcquire::Acquired(g) => g,
-                                    LockAcquire::Skipped => return ReindexOutcome::Skipped,
-                                };
-                                // Cross-process guard: skip (not block) if
-                                // another process is already writing this
-                                // project (e.g. a concurrent `leindex index`).
-                                // A blocking flock here would stall the watcher
-                                // — spawn_blocking can't be cancelled, so a held
-                                // lock would leave reindex_active true forever.
-                                // Held via RAII for the whole reindex below.
-                                let _flock = match idx.try_acquire_write_lock() {
-                                    Ok(Some(guard)) => guard,
-                                    Ok(None) => return ReindexOutcome::Skipped,
-                                    Err(e) => {
-                                        return ReindexOutcome::Failed(format!(
-                                            "write-lock probe: {e}"
-                                        ))
-                                    }
-                                };
-                                let reindex_result = std::panic::catch_unwind(
-                                    std::panic::AssertUnwindSafe(|| {
-                                        idx.incremental_reindex_from_watcher()
-                                    }),
-                                );
-                                match reindex_result {
-                                    Ok(Ok(_)) => ReindexOutcome::Completed,
-                                    Ok(Err(e)) => {
-                                        warn!("Auto-reindex failed: {}", e);
-                                        ReindexOutcome::Failed(e.to_string())
-                                    }
-                                    Err(panic_payload) => {
-                                        let msg = panic_payload
-                                            .downcast_ref::<&str>()
-                                            .map(|s| s.to_string())
-                                            .or_else(|| {
-                                                panic_payload
-                                                    .downcast_ref::<String>()
-                                                    .cloned()
-                                            })
-                                            .unwrap_or_else(|| "non-string panic payload".to_string());
-                                        warn!("Auto-reindex panicked: {}; lock will release on drop", msg);
-                                        ReindexOutcome::Failed(format!("panic: {}", msg))
-                                    }
-                                }
-                            });
+                            let blocking = tokio::task::spawn_blocking(move || run_reindex(handle_clone));
                             reindex_active = true;
                             let done_tx = done_tx.clone();
                             tokio::spawn(async move {
@@ -191,6 +145,42 @@ impl IndexWatcher {
         });
 
         Ok(Self { _watcher: watcher })
+    }
+}
+
+fn run_reindex(handle: ProjectHandle) -> ReindexOutcome {
+    let mut idx = match try_acquire_lock(&handle) {
+        LockAcquire::Acquired(g) => g,
+        LockAcquire::Skipped => return ReindexOutcome::Skipped,
+    };
+    // Cross-process guard: skip (not block) if another process is already
+    // writing this project (e.g. a concurrent `leindex index`). A blocking
+    // flock here would stall the watcher — spawn_blocking can't be cancelled,
+    // so a held lock would leave reindex_active true forever. Held via RAII
+    // for the whole reindex below.
+    let _flock = match idx.try_acquire_write_lock() {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return ReindexOutcome::Skipped,
+        Err(e) => return ReindexOutcome::Failed(format!("write-lock probe: {e}")),
+    };
+    let reindex_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        idx.incremental_reindex_from_watcher()
+    }));
+    match reindex_result {
+        Ok(Ok(_)) => ReindexOutcome::Completed,
+        Ok(Err(e)) => {
+            warn!("Auto-reindex failed: {}", e);
+            ReindexOutcome::Failed(e.to_string())
+        }
+        Err(panic_payload) => {
+            let msg = panic_payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic_payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".to_string());
+            warn!("Auto-reindex panicked: {}; lock will release on drop", msg);
+            ReindexOutcome::Failed(format!("panic: {}", msg))
+        }
     }
 }
 
@@ -241,8 +231,8 @@ mod tests {
     /// + a real project handle, so we exercise the *enum contract*:
     ///
     /// the `Failed` variant exists, carries a reason, and matches a
-    /// `dirty = true` arm in the consumer. The full e2e path is
-    /// covered by integration tests in `tests/watcher_retry.rs`.
+    /// `dirty = true` arm in the consumer. The adjacent unit test
+    /// covers this enum contract.
     #[test]
     fn test_watcher_failed_outcome_carries_reason() {
         let outcome: ReindexOutcome = ReindexOutcome::Failed(

@@ -417,7 +417,10 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigError::NoHomeDir => {
-                write!(f, "Cannot resolve LeIndex home directory. Set LEINDEX_HOME or ensure HOME is set.")
+                write!(
+                    f,
+                    "Cannot resolve LeIndex home directory. Set LEINDEX_HOME or ensure HOME is set."
+                )
             }
             ConfigError::Io(path, msg) => {
                 write!(f, "I/O error on {}: {}", path.display(), msg)
@@ -543,7 +546,8 @@ mod tests {
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::write(&config_path, "[neural\nbroken toml").unwrap();
 
-        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
 
         let (config, action) = LeIndexConfig::load_or_recover().unwrap();
 
@@ -554,17 +558,20 @@ mod tests {
         let backup = config_path.with_extension("toml.bak");
         assert!(backup.exists());
 
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[test]
     fn test_config_load_returns_default_when_missing() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, "/nonexistent/path/for/testing");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, "/nonexistent/path/for/testing") };
         let (config, action) = LeIndexConfig::load_or_recover().unwrap();
         assert!(matches!(action, RecoveryAction::CreatedDefault));
         assert!(!config.neural.enabled);
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[test]
@@ -584,39 +591,46 @@ mod tests {
     #[test]
     fn test_resolve_leindex_home_env_override() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, "/custom/leindex");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, "/custom/leindex") };
         assert_eq!(
             resolve_leindex_home(),
             Some(PathBuf::from("/custom/leindex"))
         );
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[test]
     fn test_resolve_leindex_home_relative_ignored() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, "relative/path");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, "relative/path") };
         // Should fall back to home dir, not use the relative path
         assert!(resolve_leindex_home().is_some());
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[test]
     fn test_config_file_path() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, "/tmp/testhome");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, "/tmp/testhome") };
         assert_eq!(
             config_file_path(),
             Some(PathBuf::from("/tmp/testhome/config/leindex.toml"))
         );
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[test]
     fn test_save_and_load_round_trip() {
         let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
 
         let config = LeIndexConfig {
             neural: NeuralConfig {
@@ -635,7 +649,8 @@ mod tests {
 
         assert_eq!(config, loaded);
 
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[test]
@@ -643,7 +658,8 @@ mod tests {
         // VAL-SETUP-024: re-running save produces identical config
         let _g = ENV_TEST_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        std::env::set_var(LEINDEX_HOME_ENV, tmp.path());
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(LEINDEX_HOME_ENV, tmp.path()) };
 
         let config = LeIndexConfig {
             neural: NeuralConfig {
@@ -667,7 +683,8 @@ mod tests {
 
         assert_eq!(first, second);
 
-        std::env::remove_var(LEINDEX_HOME_ENV);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var(LEINDEX_HOME_ENV) };
     }
 
     #[test]

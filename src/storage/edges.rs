@@ -1,7 +1,7 @@
 // Edge persistence operations
 
 use crate::storage::schema::Storage;
-use rusqlite::{params, Result as SqliteResult};
+use rusqlite::{Result as SqliteResult, params};
 use serde::{Deserialize, Serialize};
 
 /// Edge record for database storage

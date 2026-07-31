@@ -203,6 +203,7 @@ fn run_socket_worker(config: RuntimeConfig, socket_path: PathBuf) -> anyhow::Res
 
     let status_path = socket_path.with_extension("status");
     let pid_path = socket_path.with_extension("pid");
+    let start_time_path = socket_path.with_extension("start");
     let initial_health = HealthResponse {
         state: WorkerState::Initializing,
         phase: "initializing".to_string(),
@@ -212,6 +213,8 @@ fn run_socket_worker(config: RuntimeConfig, socket_path: PathBuf) -> anyhow::Res
         error: None,
     };
     write_worker_pid(&pid_path, process::id())?;
+    #[cfg(target_os = "linux")]
+    write_worker_start_time(&start_time_path, process::id())?;
     write_worker_status(&status_path, "initializing")?;
     if socket_path.exists() {
         std::fs::remove_file(&socket_path)?;
@@ -226,6 +229,7 @@ fn run_socket_worker(config: RuntimeConfig, socket_path: PathBuf) -> anyhow::Res
             let _ = write_worker_status(&status_path, "failed");
             let _ = std::fs::remove_file(&status_path);
             let _ = std::fs::remove_file(&pid_path);
+            let _ = std::fs::remove_file(&start_time_path);
             return Err(error.into());
         }
     };
@@ -233,65 +237,42 @@ fn run_socket_worker(config: RuntimeConfig, socket_path: PathBuf) -> anyhow::Res
     // Socket is visible now. Model/ORT initialization runs in exactly one
     // thread so health requests and fast fallback remain responsive.
     let lifecycle = Arc::new(SocketLifecycle::new(initial_health));
-    let init_lifecycle = Arc::clone(&lifecycle);
-    let init_status_path = status_path.clone();
-    std::thread::spawn(move || {
-        let result =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| WorkerRuntime::new(config)));
-        match result {
-            Ok(runtime) if runtime.is_neural_ready() => {
-                runtime.log_startup_report();
-                let health = runtime.health_response(WorkerState::Ready, None);
-                init_lifecycle.set_ready(runtime, health);
-                let _ = write_worker_status(&init_status_path, "ready");
-            }
-            Ok(runtime) => {
-                runtime.log_startup_report();
-                let error = "neural runtime unavailable after initialization".to_string();
-                let health = runtime.health_response(WorkerState::Failed, Some(error));
-                init_lifecycle.set_failed(health);
-                let _ = write_worker_status(&init_status_path, "failed");
-            }
-            Err(_) => {
-                let health = init_lifecycle
-                    .failed_health("worker runtime initialization panicked".to_string());
-                init_lifecycle.set_failed(health);
-                let _ = write_worker_status(&init_status_path, "failed");
-            }
-        }
-    });
+    spawn_runtime_init(config, Arc::clone(&lifecycle), status_path.clone());
     tracing::info!(
         "leindex-embed socket worker listening at {}",
         socket_path.display()
     );
 
+    run_socket_accept_loop(listener, lifecycle, socket_path, status_path, pid_path)
+}
+
+#[cfg(unix)]
+fn run_socket_accept_loop(
+    listener: std::os::unix::net::UnixListener,
+    lifecycle: Arc<SocketLifecycle>,
+    socket_path: PathBuf,
+    status_path: PathBuf,
+    pid_path: PathBuf,
+) -> anyhow::Result<()> {
     loop {
         if lifecycle.is_failed() {
             tracing::error!("socket worker initialization failed; shutting down");
-            lifecycle.shutdown();
-            let _ = std::fs::remove_file(&socket_path);
-            let _ = std::fs::remove_file(&status_path);
-            let _ = std::fs::remove_file(&pid_path);
+            shutdown_worker(&lifecycle, &socket_path, &status_path, &pid_path);
             return Ok(());
         }
         if let Some(runtime) = lifecycle.runtime() {
             if runtime.is_idle_expired() {
                 tracing::info!("socket worker idle timeout expired");
-                lifecycle.shutdown();
-                let _ = std::fs::remove_file(&socket_path);
-                let _ = std::fs::remove_file(&status_path);
-                let _ = std::fs::remove_file(&pid_path);
+                shutdown_worker(&lifecycle, &socket_path, &status_path, &pid_path);
                 return Ok(());
             }
         }
 
         match listener.accept() {
             Ok((stream, _addr)) => {
-                // `UnixListener` is nonblocking so the accept loop can
-                // observe idle shutdown, but accepted sockets must be
-                // blocking. Otherwise the first health/frame read can race
-                // the peer write and return EAGAIN, which looks like a dead
-                // worker to the client.
+                // `UnixListener` is nonblocking so the accept loop can observe
+                // idle shutdown, but accepted sockets must be blocking so the
+                // first health/frame read does not race the peer write.
                 if let Err(error) = stream.set_nonblocking(false) {
                     tracing::warn!(error = %error, "failed to make worker client socket blocking");
                     continue;
@@ -306,14 +287,71 @@ fn run_socket_worker(config: RuntimeConfig, socket_path: PathBuf) -> anyhow::Res
                     let _ = std::fs::remove_file(&pid_path);
                     return Err(e.into());
                 };
-                if e.kind() != io::ErrorKind::WouldBlock {
-                    tracing::warn!(error = %e, "transient socket accept error; retrying");
-                }
-                if !delay.is_zero() {
-                    std::thread::sleep(delay);
-                }
+                wait_accept_retry(&e, delay);
             }
         }
+    }
+}
+
+/// Spawn the single-threaded runtime/ORT initialization. Runs in a dedicated
+/// thread so the socket stays responsive to health checks and fast fallback
+/// while the model loads; updates `lifecycle` and `status_path` on completion.
+#[cfg(unix)]
+fn spawn_runtime_init(
+    config: RuntimeConfig,
+    lifecycle: Arc<SocketLifecycle>,
+    status_path: PathBuf,
+) {
+    std::thread::spawn(move || {
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| WorkerRuntime::new(config)));
+        match result {
+            Ok(runtime) if runtime.is_neural_ready() => {
+                runtime.log_startup_report();
+                let health = runtime.health_response(WorkerState::Ready, None);
+                lifecycle.set_ready(runtime, health);
+                let _ = write_worker_status(&status_path, "ready");
+            }
+            Ok(runtime) => {
+                runtime.log_startup_report();
+                let error = "neural runtime unavailable after initialization".to_string();
+                let health = runtime.health_response(WorkerState::Failed, Some(error));
+                lifecycle.set_failed(health);
+                let _ = write_worker_status(&status_path, "failed");
+            }
+            Err(_) => {
+                let health =
+                    lifecycle.failed_health("worker runtime initialization panicked".to_string());
+                lifecycle.set_failed(health);
+                let _ = write_worker_status(&status_path, "failed");
+            }
+        }
+    });
+}
+
+/// Tear down a running worker: stop the lifecycle and remove every control file.
+#[cfg(unix)]
+fn shutdown_worker(
+    lifecycle: &SocketLifecycle,
+    socket_path: &std::path::Path,
+    status_path: &std::path::Path,
+    pid_path: &std::path::Path,
+) {
+    lifecycle.shutdown();
+    let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_file(status_path);
+    let _ = std::fs::remove_file(pid_path);
+    let _ = std::fs::remove_file(socket_path.with_extension("start"));
+}
+
+/// Log a transient accept error (unless it is a quiet busy-loop) and back off.
+#[cfg(unix)]
+fn wait_accept_retry(error: &io::Error, delay: Duration) {
+    if error.kind() != io::ErrorKind::WouldBlock {
+        tracing::warn!(error = %error, "transient socket accept error; retrying");
+    }
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
     }
 }
 
@@ -321,7 +359,7 @@ fn run_socket_worker(config: RuntimeConfig, socket_path: PathBuf) -> anyhow::Res
 enum SocketLifecycleState {
     Initializing(HealthResponse),
     Ready {
-        runtime: WorkerRuntime,
+        runtime: Box<WorkerRuntime>,
         health: HealthResponse,
     },
     Failed(HealthResponse),
@@ -346,7 +384,7 @@ impl SocketLifecycle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         match &*state {
-            SocketLifecycleState::Ready { runtime, .. } => Some(runtime.clone()),
+            SocketLifecycleState::Ready { runtime, .. } => Some((**runtime).clone()),
             SocketLifecycleState::Initializing(_) | SocketLifecycleState::Failed(_) => None,
         }
     }
@@ -384,7 +422,10 @@ impl SocketLifecycle {
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *state = SocketLifecycleState::Ready { runtime, health };
+        *state = SocketLifecycleState::Ready {
+            runtime: Box::new(runtime),
+            health,
+        };
     }
 
     fn set_failed(&self, health: HealthResponse) {
@@ -437,6 +478,18 @@ fn write_worker_status(path: &std::path::Path, status: &str) -> io::Result<()> {
 fn write_worker_pid(path: &std::path::Path, pid: u32) -> io::Result<()> {
     let next = path.with_extension("pid.next");
     std::fs::write(&next, format!("{}\n", pid))?;
+    std::fs::rename(next, path)
+}
+
+#[cfg(target_os = "linux")]
+fn write_worker_start_time(path: &std::path::Path, pid: u32) -> io::Result<()> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    let start_time = stat
+        .rsplit_once(") ")
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .ok_or_else(|| io::Error::other("missing process start time"))?;
+    let next = path.with_extension("start.next");
+    std::fs::write(&next, format!("{start_time}\n"))?;
     std::fs::rename(next, path)
 }
 

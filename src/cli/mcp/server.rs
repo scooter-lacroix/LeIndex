@@ -3,35 +3,48 @@
 // This module implements the MCP (Model Context Protocol) JSON-RPC server
 // using axum for HTTP handling.
 
-use super::handlers::{all_tool_handlers, ToolHandler};
+use super::handlers::{ToolHandler, all_tool_handlers};
 use super::protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 use super::request_meta::{collect_request_timings, elapsed_ms};
 use crate::cli::registry::ProjectRegistry;
 use anyhow::Context;
 use axum::{
+    Router,
     extract::Json,
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::{get, post},
-    Router,
 };
 use dashmap::DashMap;
 use futures_util::stream::{Stream, StreamExt};
-use serde::Serialize;
 use serde_json::Value;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
+
+#[cfg(unix)]
+const SOCKET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(unix)]
+const INITIAL_SOCKET_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+#[cfg(unix)]
+fn socket_read_timeout(first_frame: bool) -> std::time::Duration {
+    if first_frame {
+        INITIAL_SOCKET_READ_TIMEOUT
+    } else {
+        SOCKET_READ_TIMEOUT
+    }
+}
 
 /// Global server state — multi-project registry.
 ///
@@ -410,8 +423,9 @@ impl McpServer {
         // Detach with error logging: if the cleanup task panics or errors,
         // log it rather than dying silently.
         tokio::spawn(async move {
-            if let Err(e) = _cleanup_handle.await {
-                error!("cleanup task died: {e}");
+            match _cleanup_handle.await {
+                Ok(_) => {}
+                Err(e) => error!("cleanup task died: {e}"),
             }
         });
 
@@ -823,12 +837,13 @@ async fn json_rpc_handler(headers: HeaderMap, Json(body): Json<Value>) -> Respon
         // All other methods require a valid handshaked session.
         let session_ok = match &incoming_session_id {
             Some(sid) => {
-                if let Some(mut entry) = server_instance.session_handshakes.get_mut(sid.as_str()) {
-                    // Update last access time
-                    entry.1 = Instant::now();
-                    entry.0
-                } else {
-                    false
+                match server_instance.session_handshakes.get_mut(sid.as_str()) {
+                    Some(mut entry) => {
+                        // Update last access time
+                        entry.1 = Instant::now();
+                        entry.0
+                    }
+                    _ => false,
                 }
             }
             None => false,
@@ -1021,55 +1036,6 @@ pub fn list_tools_json(handlers: &[ToolHandler]) -> Value {
     serde_json::json!({ "tools": tools })
 }
 
-/// List prompts as JSON
-pub fn list_prompts_json() -> Value {
-    let prompts = get_prompts();
-    serde_json::json!({ "prompts": prompts })
-}
-
-/// Handle prompts/get request
-pub fn handle_prompt_get(req: &JsonRpcRequest) -> Result<Value, JsonRpcError> {
-    let params = req
-        .params
-        .as_ref()
-        .ok_or_else(|| JsonRpcError::invalid_params("Missing params for prompts/get"))?;
-
-    let name = params
-        .get("name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| JsonRpcError::invalid_params("Missing or invalid 'name' field"))?;
-
-    let arguments = params.get("arguments").cloned();
-    let messages = get_prompt(name, arguments)?;
-
-    Ok(serde_json::json!({
-        "description": format!("Prompt: {}", name),
-        "messages": messages
-    }))
-}
-
-/// List resources as JSON
-pub fn list_resources_json() -> Value {
-    let resources = get_resources();
-    serde_json::json!({ "resources": resources })
-}
-
-/// Handle resources/read request
-pub fn handle_resource_read(req: &JsonRpcRequest) -> Result<Value, JsonRpcError> {
-    let params = req
-        .params
-        .as_ref()
-        .ok_or_else(|| JsonRpcError::invalid_params("Missing params for resources/read"))?;
-
-    let uri = params
-        .get("uri")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| JsonRpcError::invalid_params("Missing or invalid 'uri' field"))?;
-
-    let content = get_resource(uri)?;
-    Ok(serde_json::json!({ "contents": [content] }))
-}
-
 /// List tools handler
 ///
 /// Public discovery endpoint — no handshake required.
@@ -1183,7 +1149,6 @@ impl McpServer {
     /// The socket file is removed when the returned future completes or is
     /// dropped (via `SocketCleanupGuard`).
     pub async fn run_socket(&self, socket_path: &std::path::Path) -> anyhow::Result<()> {
-        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
 
         // Remove stale socket file if present
@@ -1220,142 +1185,12 @@ impl McpServer {
                 (false, Instant::now()),
             );
 
-            let session_id_clone = session_id.clone();
-            let session_handshakes = self.session_handshakes.clone();
-            let handshake_complete = self.handshake_complete.clone();
-
-            tokio::spawn(async move {
-                debug!(
-                    "Accepted Unix socket connection (session: {})",
-                    session_id_clone
-                );
-
-                let (reader, mut writer) = stream.into_split();
-                let mut reader = BufReader::new(reader);
-                let mut use_content_length = false;
-
-                // Security limits to prevent memory exhaustion attacks
-                const MAX_LINE_LENGTH: usize = 10_240; // 10KB max line length
-                const MAX_PAYLOAD_SIZE: usize = 10_485_760; // 10MB max payload size
-
-                loop {
-                    let mut line = String::new();
-                    match reader.read_line(&mut line).await {
-                        Ok(0) => break, // EOF
-                        Ok(_) => {
-                            if line.len() > MAX_LINE_LENGTH {
-                                debug!(
-                                    "Line too long (session {}): {} bytes",
-                                    session_id_clone,
-                                    line.len()
-                                );
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            debug!("Socket read error (session {}): {}", session_id_clone, e);
-                            break;
-                        }
-                    };
-
-                    let line_trim = line.trim_end();
-                    if line_trim.is_empty() {
-                        continue;
-                    }
-
-                    let json_payload = if line_trim
-                        .to_ascii_lowercase()
-                        .starts_with("content-length:")
-                    {
-                        let len_str = line_trim.split(':').nth(1).unwrap_or("").trim();
-                        let length: usize = match len_str.parse() {
-                            Ok(v) => v,
-                            Err(e) => {
-                                debug!("Invalid Content-Length header: {}", e);
-                                continue;
-                            }
-                        };
-
-                        // Reject excessively large payloads to prevent OOM
-                        if length > MAX_PAYLOAD_SIZE {
-                            debug!(
-                                "Payload too large (session {}): {} bytes",
-                                session_id_clone, length
-                            );
-                            break;
-                        }
-
-                        // Consume remaining header lines until blank line
-                        loop {
-                            let mut header = String::new();
-                            match reader.read_line(&mut header).await {
-                                Ok(0) => break,
-                                Ok(_) => {
-                                    if header.len() > MAX_LINE_LENGTH {
-                                        debug!(
-                                            "Header line too long (session {}): {} bytes",
-                                            session_id_clone,
-                                            header.len()
-                                        );
-                                        break;
-                                    }
-                                    if header.trim().is_empty() {
-                                        break;
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-
-                        let mut buf = vec![0u8; length];
-                        if let Err(e) = reader.read_exact(&mut buf).await {
-                            debug!("Failed to read JSON payload: {}", e);
-                            break;
-                        }
-
-                        use_content_length = true;
-                        String::from_utf8_lossy(&buf).to_string()
-                    } else {
-                        line_trim.to_string()
-                    };
-
-                    // Parse and handle the JSON-RPC message
-                    let response_json = match handle_socket_message(
-                        &json_payload,
-                        &session_id_clone,
-                        &session_handshakes,
-                        &handshake_complete,
-                    )
-                    .await
-                    {
-                        Some(json) => json,
-                        None => continue, // Notification, no response
-                    };
-
-                    // Send response
-                    if use_content_length {
-                        let msg = format!(
-                            "Content-Length: {}\r\n\r\n{}",
-                            response_json.len(),
-                            response_json
-                        );
-                        if writer.write_all(msg.as_bytes()).await.is_err() {
-                            break;
-                        }
-                    } else {
-                        let msg = format!("{}\n", response_json);
-                        if writer.write_all(msg.as_bytes()).await.is_err() {
-                            break;
-                        }
-                    }
-                    let _ = writer.flush().await;
-                }
-
-                // Clean up session on disconnect
-                session_handshakes.remove(session_id_clone.as_str());
-
-                debug!("Socket connection closed (session: {})", session_id_clone);
-            });
+            tokio::spawn(handle_socket_connection(
+                stream,
+                session_id,
+                self.session_handshakes.clone(),
+                self.handshake_complete.clone(),
+            ));
         }
 
         #[allow(unreachable_code)]
@@ -1364,6 +1199,246 @@ impl McpServer {
             Ok(())
         }
     }
+}
+
+#[cfg(unix)]
+/// Read one line (including its trailing `\n`) but abort with an error once it
+/// exceeds `max` bytes — so a peer sending an unbounded line with no newline
+/// cannot exhaust memory before a length check. `Ok(None)` = clean EOF.
+#[cfg(unix)]
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Option<String>> {
+    use tokio::io::AsyncBufReadExt;
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let buf = reader.fill_buf().await?;
+        if buf.is_empty() {
+            return Ok(if out.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&out).into_owned())
+            });
+        }
+        let nl = buf.iter().position(|&b| b == b'\n');
+        let take = nl.map(|i| i + 1).unwrap_or(buf.len());
+        if out.len().saturating_add(take) > max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "line exceeds max length",
+            ));
+        }
+        out.extend_from_slice(&buf[..take]);
+        reader.consume(take);
+        if nl.is_some() {
+            return Ok(Some(String::from_utf8_lossy(&out).into_owned()));
+        }
+    }
+}
+#[cfg(unix)]
+#[derive(Debug)]
+enum SocketFrame {
+    Message {
+        payload: String,
+        content_length: bool,
+    },
+    Error {
+        response: String,
+        content_length: bool,
+    },
+}
+
+#[cfg(unix)]
+async fn read_socket_frame<R>(
+    reader: &mut R,
+    session_id: &str,
+    first_frame: bool,
+) -> Option<SocketFrame>
+where
+    R: tokio::io::AsyncBufRead + tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    const MAX_LINE_LENGTH: usize = 10_240;
+    const MAX_PAYLOAD_SIZE: usize = 10_485_760;
+    let line_timeout = socket_read_timeout(first_frame);
+
+    let line = match tokio::time::timeout(line_timeout, read_bounded_line(reader, MAX_PAYLOAD_SIZE))
+        .await
+    {
+        Ok(Ok(Some(line))) => line,
+        Ok(Ok(None)) => return None,
+        Ok(Err(error)) => {
+            debug!(
+                "Socket read error / line too long (session {}): {}",
+                session_id, error
+            );
+            let error_response = JsonRpcResponse::error(
+                serde_json::Value::Null,
+                JsonRpcError::new(-32600, "request payload exceeds maximum size"),
+            );
+            return serde_json::to_string(&error_response).ok().map(|response| {
+                SocketFrame::Error {
+                    response,
+                    content_length: false,
+                }
+            });
+        }
+        Err(_) => {
+            debug!("Socket read timed out (session {})", session_id);
+            return None;
+        }
+    };
+
+    let line_trim = line.trim_end();
+    if line_trim.is_empty() {
+        return Some(SocketFrame::Message {
+            payload: String::new(),
+            content_length: false,
+        });
+    }
+    if !line_trim
+        .to_ascii_lowercase()
+        .starts_with("content-length:")
+    {
+        return Some(SocketFrame::Message {
+            payload: line_trim.to_string(),
+            content_length: false,
+        });
+    }
+
+    let len_str = line_trim.split(':').nth(1).unwrap_or("").trim();
+    let length = match len_str.parse::<usize>() {
+        Ok(length) => length,
+        Err(error) => {
+            debug!("Invalid Content-Length header: {}", error);
+            let response = JsonRpcResponse::error(
+                serde_json::Value::Null,
+                JsonRpcError::new(-32600, "invalid Content-Length header"),
+            );
+            return serde_json::to_string(&response)
+                .ok()
+                .map(|response| SocketFrame::Error {
+                    response,
+                    content_length: false,
+                });
+        }
+    };
+    if length > MAX_PAYLOAD_SIZE {
+        debug!(
+            "Payload too large (session {}): {} bytes",
+            session_id, length
+        );
+        let response = JsonRpcResponse::error(
+            serde_json::Value::Null,
+            JsonRpcError::new(-32600, "request payload exceeds maximum size"),
+        );
+        return serde_json::to_string(&response)
+            .ok()
+            .map(|response| SocketFrame::Error {
+                response,
+                content_length: true,
+            });
+    }
+
+    loop {
+        let header = match tokio::time::timeout(
+            SOCKET_READ_TIMEOUT,
+            read_bounded_line(reader, MAX_LINE_LENGTH),
+        )
+        .await
+        {
+            Ok(Ok(Some(header))) => header,
+            Ok(Ok(None)) | Ok(Err(_)) | Err(_) => return None,
+        };
+        if header.trim().is_empty() {
+            break;
+        }
+    }
+
+    let mut buffer = vec![0u8; length];
+    match tokio::time::timeout(SOCKET_READ_TIMEOUT, reader.read_exact(&mut buffer)).await {
+        Ok(Ok(_)) => Some(SocketFrame::Message {
+            payload: String::from_utf8_lossy(&buffer).into_owned(),
+            content_length: true,
+        }),
+        Ok(Err(error)) => {
+            debug!("Failed to read JSON payload: {}", error);
+            None
+        }
+        Err(_) => {
+            debug!("Socket payload read timed out (session {})", session_id);
+            None
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn write_socket_frame<W>(writer: &mut W, response: &str, content_length: bool) -> bool
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let message = if content_length {
+        format!("Content-Length: {}\r\n\r\n{}", response.len(), response)
+    } else {
+        format!("{}\n", response)
+    };
+    writer.write_all(message.as_bytes()).await.is_ok() && writer.flush().await.is_ok()
+}
+
+#[cfg(unix)]
+async fn handle_socket_connection(
+    stream: tokio::net::UnixStream,
+    session_id: String,
+    session_handshakes: Arc<DashMap<Arc<str>, (bool, Instant)>>,
+    handshake_complete: Arc<AtomicBool>,
+) {
+    use tokio::io::BufReader;
+
+    debug!("Accepted Unix socket connection (session: {})", session_id);
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader);
+
+    let mut first_frame = true;
+    loop {
+        let Some(frame) = read_socket_frame(&mut reader, &session_id, first_frame).await else {
+            break;
+        };
+        first_frame = false;
+        let (json_payload, content_length) = match frame {
+            SocketFrame::Message {
+                payload,
+                content_length,
+            } => (payload, content_length),
+            SocketFrame::Error {
+                response,
+                content_length,
+            } => {
+                let _ = write_socket_frame(&mut writer, &response, content_length).await;
+                break;
+            }
+        };
+        if json_payload.is_empty() {
+            continue;
+        }
+        let Some(response) = handle_socket_message(
+            &json_payload,
+            &session_id,
+            &session_handshakes,
+            &handshake_complete,
+        )
+        .await
+        else {
+            continue;
+        };
+        if !write_socket_frame(&mut writer, &response, content_length).await {
+            break;
+        }
+    }
+
+    session_handshakes.remove(session_id.as_str());
+    debug!("Socket connection closed (session: {})", session_id);
 }
 
 /// Handle a single JSON-RPC message received over a Unix socket connection.
@@ -1376,7 +1451,7 @@ async fn handle_socket_message(
     handshake_complete: &Arc<AtomicBool>,
 ) -> Option<String> {
     use super::protocol::{JsonRpcMessage, JsonRpcResponse};
-    use crate::cli::mcp::server::{list_tools_json, HANDLERS, SERVER_STATE};
+    use crate::cli::mcp::server::{HANDLERS, SERVER_STATE, list_tools_json};
 
     let transport_started = Instant::now();
     let message = match JsonRpcMessage::from_json(json_payload) {
@@ -1426,12 +1501,13 @@ async fn handle_socket_message(
 
             // Check handshake state for this session (allow initialize and ping before handshake)
             if method_name != "initialize" && method_name != "ping" {
-                let handshaked = if let Some(mut entry) = session_handshakes.get_mut(session_id) {
-                    // Update last access time to prevent eviction
-                    entry.1 = Instant::now();
-                    entry.0
-                } else {
-                    false
+                let handshaked = match session_handshakes.get_mut(session_id) {
+                    Some(mut entry) => {
+                        // Update last access time to prevent eviction
+                        entry.1 = Instant::now();
+                        entry.0
+                    }
+                    _ => false,
                 };
                 if !handshaked {
                     let resp = JsonRpcResponse::error(
@@ -1512,802 +1588,13 @@ async fn handle_socket_message(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Serialize any test that mutates process-global environment
-    /// variables. `std::env::set_var` is not thread-safe and `cargo
-    /// test` runs tests in parallel by default — the
-    /// `test_max_http_sessions_env_override` test below reads/writes
-    /// `LEINDEX_MAX_SESSIONS` while other tests concurrently call
-    /// `max_http_sessions()` (which reads the same variable), which
-    /// is an active data race under POSIX. Holding this mutex for the
-    /// entire test body guarantees only one test at a time touches
-    /// the env.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    #[test]
-    fn test_server_config_default() {
-        let config = McpServerConfig::default();
-        assert_eq!(
-            config.bind_address,
-            SocketAddr::from(([127, 0, 0, 1], DEFAULT_MCP_PORT))
-        );
-        // Loopback-only binding on a high, rarely-used port. We avoid the
-        // well-known dev-server range (<10000) which collides with Node,
-        // Rails, Django, etc. 47500 sits well above that and below the
-        // IANA dynamic range (49152+) so it's reliably available.
-        assert!(config.bind_address.ip().is_loopback());
-        assert!(config.bind_address.port() >= 10000);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_socket_cleanup_guard_removes_file() {
-        let dir = std::env::temp_dir().join("leindex_test_socket_guard");
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket_path = dir.join("test.sock");
-        std::fs::write(&socket_path, b"").unwrap();
-        assert!(socket_path.exists());
-
-        {
-            let _guard = SocketCleanupGuard {
-                path: socket_path.clone(),
-            };
-        }
-        assert!(!socket_path.exists());
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    // ---- A+ MCP session cleanup tests (VAL-APLUS-025, VAL-APLUS-026) ----
-
-    /// VAL-APLUS-025: MCP session handshake handling preserves behavior under
-    /// concurrent sessions. Multiple sessions can be initialized and tracked
-    /// independently without corrupting each other.
-    #[test]
-    fn test_concurrent_session_handshake_isolation() {
-        let registry = Arc::new(ProjectRegistry::new(5));
-        let server = McpServer {
-            config: McpServerConfig::default(),
-            _registry: registry,
-            handshake_complete: Arc::new(AtomicBool::new(false)),
-            session_handshakes: Arc::new(DashMap::new()),
-            in_flight: Arc::new(DashMap::new()),
-            freshness_advisories: Arc::new(DashMap::new()),
-        };
-
-        // Simulate multiple concurrent session handshakes
-        let (result1, sid1) = handle_initialize_for_test(&server);
-        let (result2, sid2) = handle_initialize_for_test(&server);
-        let (result3, sid3) = handle_initialize_for_test(&server);
-
-        // All should succeed with unique session IDs
-        assert!(result1.get("protocolVersion").is_some());
-        assert!(result2.get("protocolVersion").is_some());
-        assert!(result3.get("protocolVersion").is_some());
-
-        // Session IDs must be unique
-        assert_ne!(sid1, sid2);
-        assert_ne!(sid2, sid3);
-        assert_ne!(sid1, sid3);
-
-        // All sessions should be tracked
-        assert_eq!(server.active_session_count(), 3);
-
-        // All sessions should be marked as handshaked
-        {
-            assert!(server.session_handshakes.get(sid1.as_str()).unwrap().0);
-            assert!(server.session_handshakes.get(sid2.as_str()).unwrap().0);
-            assert!(server.session_handshakes.get(sid3.as_str()).unwrap().0);
-        }
-    }
-
-    /// VAL-APLUS-026: MCP session tracking remains isolated per session.
-    /// Operations on one session do not corrupt or block unrelated session state.
-    #[test]
-    fn test_session_isolation_per_session() {
-        let registry = Arc::new(ProjectRegistry::new(5));
-        let server = McpServer {
-            config: McpServerConfig::default(),
-            _registry: registry,
-            handshake_complete: Arc::new(AtomicBool::new(false)),
-            session_handshakes: Arc::new(DashMap::new()),
-            in_flight: Arc::new(DashMap::new()),
-            freshness_advisories: Arc::new(DashMap::new()),
-        };
-
-        let (_, sid1) = handle_initialize_for_test(&server);
-        let (_, sid2) = handle_initialize_for_test(&server);
-
-        // Remove session 1
-        server.session_handshakes.remove(sid1.as_str());
-
-        // Session 2 should still be valid
-        assert!(server.session_handshakes.get(sid2.as_str()).is_some());
-        assert!(server.session_handshakes.get(sid2.as_str()).unwrap().0);
-
-        assert_eq!(server.active_session_count(), 1);
-    }
-
-    #[test]
-    fn test_freshness_advisory_is_once_per_session_and_generation() {
-        let registry = Arc::new(ProjectRegistry::new(5));
-        let server = McpServer {
-            config: McpServerConfig::default(),
-            _registry: registry,
-            handshake_complete: Arc::new(AtomicBool::new(false)),
-            session_handshakes: Arc::new(DashMap::new()),
-            in_flight: Arc::new(DashMap::new()),
-            freshness_advisories: Arc::new(DashMap::new()),
-        };
-        let (_, session_id) = handle_initialize_for_test(&server);
-
-        let response = || {
-            serde_json::json!({
-                "project_path": "/tmp/project",
-                "_meta": {"freshness": {
-                    "generation": 7,
-                    "warning": "refresh recommended"
-                }}
-            })
-        };
-        let mut first = response();
-        server.apply_freshness_advisory(&session_id, None, &mut first);
-        assert_eq!(
-            first["_meta"]["freshness"]["advisory"],
-            "refresh recommended"
-        );
-        assert!(first["_meta"]["freshness"].get("warning").is_none());
-
-        let mut second = response();
-        server.apply_freshness_advisory(&session_id, None, &mut second);
-        assert!(second["_meta"]["freshness"]["advisory"].is_null());
-
-        let mut new_generation = response();
-        new_generation["_meta"]["freshness"]["generation"] = serde_json::json!(8);
-        server.apply_freshness_advisory(&session_id, None, &mut new_generation);
-        assert_eq!(
-            new_generation["_meta"]["freshness"]["advisory"],
-            "refresh recommended"
-        );
-    }
-
-    /// VAL-APLUS-025 variant: stale session cleanup removes only expired sessions.
-    #[test]
-    fn test_stale_session_cleanup() {
-        let registry = Arc::new(ProjectRegistry::new(5));
-        let server = McpServer {
-            config: McpServerConfig::default(),
-            _registry: registry,
-            handshake_complete: Arc::new(AtomicBool::new(false)),
-            session_handshakes: Arc::new(DashMap::new()),
-            in_flight: Arc::new(DashMap::new()),
-            freshness_advisories: Arc::new(DashMap::new()),
-        };
-
-        // Create a session
-        let (_, sid) = handle_initialize_for_test(&server);
-        assert_eq!(server.active_session_count(), 1);
-
-        // Manually age the session's last_access time to simulate staleness
-        if let Some(mut entry) = server.session_handshakes.get_mut(sid.as_str()) {
-            entry.1 = Instant::now() - std::time::Duration::from_secs(600);
-        }
-
-        // Cleanup with a 60-second idle timeout should remove the stale session
-        let removed = server.cleanup_stale_sessions(std::time::Duration::from_secs(60));
-        assert_eq!(removed, 1);
-        assert_eq!(server.active_session_count(), 0);
-    }
-
-    /// Helper: simulate an initialize call and return (result, session_id).
-    fn handle_initialize_for_test(server: &McpServer) -> (Value, String) {
-        let (result, sid) = handle_initialize(server);
-        (result, sid.unwrap())
-    }
-
-    /// Regression test for HIGH #2: when `handle_initialize` is forced to
-    /// evict to make room for a new session, it must NOT evict a session
-    /// that is currently processing a request. Without the in_flight
-    /// filter, a long-running tool call could be evicted mid-request,
-    /// producing spurious "Server not initialized" errors for the
-    /// active client.
-    ///
-    /// Test strategy: lower the session cap to 2, register 2 sessions
-    /// (one of which is in_flight), and call `handle_initialize` a
-    /// third time. The in_flight session must survive; the idle
-    /// session must be evicted.
-    ///
-    /// `handle_initialize` reads `LEINDEX_MAX_SESSIONS` via
-    /// `max_http_sessions()`. `cargo test` runs tests in parallel by
-    /// default and `test_max_http_sessions_env_override` mutates that
-    /// env var on a sibling thread, so we hold `ENV_LOCK` for the
-    /// entire test body to serialise env access.
-    #[test]
-    fn test_handle_initialize_does_not_evict_in_flight_session() {
-        let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Override the cap for this test. We can't override
-        // `DEFAULT_MAX_HTTP_SESSIONS` (it's a const) but we can verify
-        // the eviction logic by pre-loading 2 sessions and forcing a
-        // third call to be on the boundary.
-        //
-        // To exercise the eviction code path directly we use a slightly
-        // higher load than the cap: register MAX sessions, then call
-        // initialize once more and check the in_flight session is kept.
-        let registry = Arc::new(ProjectRegistry::new(5));
-        let server = McpServer {
-            config: McpServerConfig::default(),
-            _registry: registry,
-            handshake_complete: Arc::new(AtomicBool::new(false)),
-            session_handshakes: Arc::new(DashMap::new()),
-            in_flight: Arc::new(DashMap::new()),
-            freshness_advisories: Arc::new(DashMap::new()),
-        };
-
-        // Fill the session map to the cap. We use `insert` directly
-        // because `handle_initialize` generates its own session IDs and
-        // we want to control which ones are "old" and "in flight".
-        let now = Instant::now();
-        for i in 0..DEFAULT_MAX_HTTP_SESSIONS {
-            let sid = format!("sess-{i:04}");
-            server
-                .session_handshakes
-                .insert(Arc::<str>::from(sid.as_str()), (true, now));
-        }
-        assert_eq!(server.active_session_count(), DEFAULT_MAX_HTTP_SESSIONS);
-
-        // Mark the very first session (oldest by insertion order) as
-        // in-flight. `last_access_time` is the same as the others, so
-        // without the in_flight filter it would be evicted.
-        let in_flight_sid = "sess-0000".to_string();
-        server.begin_request(&in_flight_sid);
-        assert!(server.session_in_flight(&in_flight_sid));
-
-        // The next initialize call should trigger eviction logic.
-        let (_, new_sid) = handle_initialize_for_test(&server);
-
-        // The in-flight session must still be present.
-        assert!(
-            server
-                .session_handshakes
-                .contains_key(in_flight_sid.as_str()),
-            "in_flight session {} was evicted during initialize",
-            in_flight_sid,
-        );
-        // The new session must be present.
-        assert!(
-            server.session_handshakes.contains_key(new_sid.as_str()),
-            "newly initialized session {} was not registered",
-            new_sid,
-        );
-        // The total count is at most MAX + 1 (the new session, since
-        // the in_flight one was preserved and exactly one other was
-        // evicted).
-        assert!(
-            server.active_session_count() <= DEFAULT_MAX_HTTP_SESSIONS + 1,
-            "session count {} exceeds cap + 1",
-            server.active_session_count(),
-        );
-
-        // Cleanup: end the request so the in_flight map is empty for
-        // other tests in the same process.
-        server.end_request(&in_flight_sid);
-    }
-
-    /// `LEINDEX_MAX_SESSIONS` env var overrides the default session cap.
-    #[test]
-    fn test_max_http_sessions_env_override() {
-        // Hold the env-mutation lock for the entire body. Other tests in
-        // this module (e.g. the eviction test) call `handle_initialize`,
-        // which reads `LEINDEX_MAX_SESSIONS` via `max_http_sessions()`;
-        // racing `std::env::set_var` against a concurrent
-        // `std::env::var` is undefined behaviour. Serialising on
-        // `ENV_LOCK` keeps every env read/write in this test entirely
-        // single-threaded.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Default (env unset) returns the default.
-        unsafe {
-            std::env::set_var(MAX_SESSIONS_ENV, "42");
-        }
-        assert_eq!(max_http_sessions(), 42);
-        unsafe {
-            std::env::remove_var(MAX_SESSIONS_ENV);
-        }
-        assert_eq!(max_http_sessions(), DEFAULT_MAX_HTTP_SESSIONS);
-        // Bogus value falls back to default.
-        unsafe {
-            std::env::set_var(MAX_SESSIONS_ENV, "not-a-number");
-        }
-        assert_eq!(max_http_sessions(), DEFAULT_MAX_HTTP_SESSIONS);
-        unsafe {
-            std::env::remove_var(MAX_SESSIONS_ENV);
-        }
-    }
-
-    /// Regression for MED #3342354737: `session_handshakes` is keyed
-    /// on `Arc<str>`, and `begin_request` clones the cached
-    /// `Arc<str>` from the handshake table (refcount bump, no
-    /// allocation) instead of constructing a fresh
-    /// `Arc::<str>::from(&str)` for every request. Verify the
-    /// in_flight map's key is `Arc`-equal (same allocation) to the
-    /// session_handshakes key.
-    #[test]
-    fn test_begin_request_clones_cached_arc_str_key() {
-        let registry = Arc::new(ProjectRegistry::new(5));
-        let server = McpServer {
-            config: McpServerConfig::default(),
-            _registry: registry,
-            handshake_complete: Arc::new(AtomicBool::new(false)),
-            session_handshakes: Arc::new(DashMap::new()),
-            in_flight: Arc::new(DashMap::new()),
-            freshness_advisories: Arc::new(DashMap::new()),
-        };
-
-        // Register a session directly so the key is an `Arc<str>` we
-        // can compare against.
-        let sid = Arc::<str>::from("sess-arc-key");
-        let cached: Arc<str> = sid.clone();
-        server
-            .session_handshakes
-            .insert(sid, (true, Instant::now()));
-
-        // `begin_request` should clone the cached `Arc<str>` rather
-        // than allocating a new one.
-        server.begin_request("sess-arc-key");
-
-        // The in_flight map should contain a key whose pointer
-        // matches the cached one.
-        let stored = server
-            .in_flight
-            .iter()
-            .next()
-            .expect("expected one in_flight entry");
-        assert_eq!(
-            stored.key().as_ptr(),
-            cached.as_ptr(),
-            "in_flight key should be the same Arc<str> allocation as session_handshakes"
-        );
-        assert_eq!(stored.key().as_ref(), "sess-arc-key");
-    }
-
-    /// `begin_request` falls back to `Arc::<str>::from(&str)` when
-    /// the session is not yet registered. The fallback allocation
-    /// is acceptable; the test exists to lock the contract so a
-    /// future refactor doesn't silently panic or skip the insert.
-    #[test]
-    fn test_begin_request_allocates_when_session_unknown() {
-        let registry = Arc::new(ProjectRegistry::new(5));
-        let server = McpServer {
-            config: McpServerConfig::default(),
-            _registry: registry,
-            handshake_complete: Arc::new(AtomicBool::new(false)),
-            session_handshakes: Arc::new(DashMap::new()),
-            in_flight: Arc::new(DashMap::new()),
-            freshness_advisories: Arc::new(DashMap::new()),
-        };
-
-        // Session not registered yet — should still insert into
-        // in_flight (allocates a fresh `Arc<str>`).
-        server.begin_request("unregistered-session");
-
-        assert!(
-            server.session_in_flight("unregistered-session"),
-            "begin_request must insert even when session is unregistered"
-        );
-
-        // Lookup works via `&str` (DashMap resolves Arc<str>: Borrow<str>).
-        let stored = server
-            .in_flight
-            .get("unregistered-session")
-            .expect("lookup by &str must work");
-        assert_eq!(stored.key().as_ref(), "unregistered-session");
-    }
-
-    /// Regression for MED round 18: the fixed-port loop in
-    /// `bind_with_fallback` previously used
-    /// `preferred.port().saturating_add(offset)`, which
-    /// silently caps the candidate port at `u16::MAX`. With
-    /// `BIND_FALLBACK_PORT_RANGE = 10` and a preferred port of
-    /// 65530, the loop would burn six of its eleven slots
-    /// re-binding the saturated port 65535 instead of moving
-    /// on. The fix uses `checked_add` and breaks out of the
-    /// fixed range on overflow, falling through to the
-    /// ephemeral-bind fallback.
-    ///
-    /// This test exercises the overflow path: bind to the
-    /// highest valid port (65535), then ask
-    /// `bind_with_fallback` to start near the top of the
-    /// range. We assert it returns *some* `TcpListener`
-    /// (either via the ephemeral fallback or via the
-    /// saturated port) without entering an infinite loop.
-    /// The previous implementation would also return a
-    /// listener eventually, but it would burn cycles on
-    /// duplicate bind attempts. The regression target is the
-    /// contract: the loop must terminate promptly and the
-    /// function must not loop forever on saturated ports.
-    #[tokio::test]
-    async fn test_bind_with_fallback_breaks_on_port_overflow() {
-        // Bind to the highest valid port to consume it.
-        let high = SocketAddr::from(([127, 0, 0, 1], u16::MAX));
-        let _occupying = tokio::net::TcpListener::bind(high).await.unwrap();
-
-        // Start the search 5 ports below u16::MAX. With a
-        // 10-port fallback range, offset 0..=10 covers
-        // 65530..65535 + the saturating case. The fixed
-        // range will collide with the occupying listener on
-        // 65535; post-fix the loop breaks on overflow
-        // (offset 5 → 65535, then offset 6..10 would
-        // overflow), and falls through to ephemeral.
-        let preferred = SocketAddr::from(([127, 0, 0, 1], u16::MAX - 5));
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            bind_with_fallback(preferred),
-        )
-        .await;
-        let listener = result
-            .expect("bind_with_fallback must terminate within 5s")
-            .expect("ephemeral fallback must succeed on a free IP");
-        // The returned listener must be on the preferred IP.
-        assert_eq!(
-            listener.local_addr().unwrap().ip(),
-            preferred.ip(),
-            "ephemeral fallback must use the preferred IP"
-        );
-    }
-
-    /// The happy path: when the preferred port is free,
-    /// `bind_with_fallback` must return a listener bound to
-    /// that exact port — no fallback walk, no ephemeral
-    /// detour. This guards against an over-eager overflow
-    /// break that would cause the function to give up the
-    /// preferred port for an ephemeral one.
-    #[tokio::test]
-    async fn test_bind_with_fallback_uses_preferred_when_free() {
-        let preferred = SocketAddr::from(([127, 0, 0, 1], 0));
-        let listener = bind_with_fallback(preferred).await.unwrap();
-        let bound = listener.local_addr().unwrap();
-        // Port 0 → ephemeral, so just assert the IP matches.
-        assert_eq!(bound.ip(), preferred.ip());
-    }
-
-    /// Regression for MED round 20: when `preferred.port() == 0`,
-    /// `bind_with_fallback` must bypass the fixed-range
-    /// fallback loop entirely and let the OS pick an
-    /// ephemeral port directly. The pre-fix code walked
-    /// `1..=BIND_FALLBACK_PORT_RANGE` even when the
-    /// preferred port was 0, probing privileged ports (< 1024
-    /// on Unix) that could fail with EACCES on systems where
-    /// the process has no CAP_NET_BIND_SERVICE.
-    ///
-    /// The new contract is observable in two ways:
-    ///   1. The returned listener's port is non-zero (the
-    ///      OS-assigned ephemeral port).
-    ///   2. No privileged ports (1..=1023) were probed —
-    ///      which we verify indirectly by asserting the
-    ///      function returns successfully on a default-
-    ///      capability process without touching any port
-    ///      that would need root.
-    #[tokio::test]
-    async fn test_bind_with_fallback_port_zero_skips_fallback_loop() {
-        let preferred = SocketAddr::from(([127, 0, 0, 1], 0));
-        let listener = bind_with_fallback(preferred).await.unwrap();
-        let bound = listener.local_addr().unwrap();
-        // The OS-assigned ephemeral port is non-zero.
-        assert_ne!(
-            bound.port(),
-            0,
-            "OS-assigned ephemeral port must be non-zero; got port 0 (bind did not actually request ephemeral)"
-        );
-        // The IP is preserved through the fast path.
-        assert_eq!(bound.ip(), preferred.ip());
-    }
-}
-
-// ============================================================================
-// MCP Prompts Implementation
-// ============================================================================
-
-/// A prompt definition for the MCP prompts capability
-#[derive(Debug, Clone, Serialize)]
-pub struct Prompt {
-    /// Unique identifier for the prompt
-    pub name: String,
-    /// Human-readable description
-    pub description: String,
-    /// Optional arguments the prompt accepts
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub arguments: Option<Vec<PromptArgument>>,
-}
-
-/// A prompt argument definition
-#[derive(Debug, Clone, Serialize)]
-pub struct PromptArgument {
-    /// Argument name
-    pub name: String,
-    /// Argument description
-    pub description: String,
-    /// Whether the argument is required
-    pub required: bool,
-}
-
-/// A prompt message (content)
-#[derive(Debug, Clone, Serialize)]
-pub struct PromptMessage {
-    /// Role of the message sender
-    pub role: String,
-    /// Content of the message
-    pub content: PromptContent,
-}
-
-/// Content of a prompt message
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type")]
-pub enum PromptContent {
-    /// Text content
-    #[serde(rename = "text")]
-    Text {
-        /// The text content of the message
-        text: String,
-    },
-}
-
-/// Get the list of available prompts
-pub fn get_prompts() -> Vec<Prompt> {
-    vec![
-        Prompt {
-            name: "quickstart".to_string(),
-            description: "Quick introduction to using LeIndex effectively".to_string(),
-            arguments: None,
-        },
-        Prompt {
-            name: "investigation_workflow".to_string(),
-            description: "Step-by-step guide for investigating code with LeIndex".to_string(),
-            arguments: Some(vec![PromptArgument {
-                name: "query".to_string(),
-                description: "What you're trying to find or understand".to_string(),
-                required: true,
-            }]),
-        },
-    ]
-}
-
-/// Get a specific prompt by name
-pub fn get_prompt(
-    name: &str,
-    arguments: Option<Value>,
-) -> Result<Vec<PromptMessage>, JsonRpcError> {
-    match name {
-        "quickstart" => Ok(vec![
-            PromptMessage {
-                role: "user".to_string(),
-                content: PromptContent::Text {
-                    text: "Welcome to LeIndex! Here's how to get started:\n\n1. **Indexing**: First, index your project with `leindex.index`\n2. **Searching**: Use `leindex.search` for semantic code search\n3. **Analysis**: Use `leindex.deep-analyze` for comprehensive code analysis\n4. **Context**: Use `leindex.context` to expand around specific symbols\n\nPro tip: LeIndex auto-indexes on first use, so you can start searching immediately!".to_string(),
-                },
-            },
-        ]),
-        "investigation_workflow" => {
-            let query = arguments
-                .as_ref()
-                .and_then(|a| a.get("query"))
-                .and_then(|q| q.as_str())
-                .unwrap_or("your code investigation");
-
-            Ok(vec![
-                PromptMessage {
-                    role: "user".to_string(),
-                    content: PromptContent::Text {
-                        text: format!(
-                            "Let me help you investigate: {}\n\nHere's the recommended workflow:\n\n1. **Start broad**: Use `leindex.search` with a natural language query like '{}'\n2. **Find entry points**: Look for the most relevant symbols in the results\n3. **Deep dive**: Use `leindex.deep-analyze` on the most relevant symbol\n4. **Expand context**: Use `leindex.context` to see how the symbol is used\n5. **Navigate**: Follow symbol references with `leindex.read-symbol`\n\nWould you like me to help you with any specific step?",
-                            query, query
-                        ),
-                    },
-                },
-            ])
-        }
-        _ => Err(JsonRpcError::method_not_found(format!("Prompt '{}' not found", name))),
-    }
-}
-
-// ============================================================================
-// MCP Resources Implementation
-// ============================================================================
-
-/// A resource definition for the MCP resources capability
-#[derive(Debug, Clone, Serialize)]
-pub struct Resource {
-    /// Unique URI for the resource
-    pub uri: String,
-    /// Human-readable name
-    pub name: String,
-    /// MIME type of the resource
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,
-    /// Resource description
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-}
-
-/// Resource content
-#[derive(Debug, Clone, Serialize)]
-pub struct ResourceContent {
-    /// Resource URI
-    pub uri: String,
-    /// MIME type
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mime_type: Option<String>,
-    /// Text content (if text resource)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub text: Option<String>,
-    /// Binary content (if binary resource)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blob: Option<String>,
-}
-
-/// Get the list of available resources
-pub fn get_resources() -> Vec<Resource> {
-    vec![
-        Resource {
-            uri: "leindex://docs/quickstart".to_string(),
-            name: "LeIndex Quickstart Guide".to_string(),
-            mime_type: Some("text/markdown".to_string()),
-            description: Some("Quick start guide for using LeIndex".to_string()),
-        },
-        Resource {
-            uri: "leindex://docs/server-config".to_string(),
-            name: "Server Configuration".to_string(),
-            mime_type: Some("text/markdown".to_string()),
-            description: Some("Configuration options for LeIndex server".to_string()),
-        },
-    ]
-}
-
-/// Get a specific resource by URI
-pub fn get_resource(uri: &str) -> Result<ResourceContent, JsonRpcError> {
-    match uri {
-        "leindex://docs/quickstart" => Ok(ResourceContent {
-            uri: uri.to_string(),
-            mime_type: Some("text/markdown".to_string()),
-            text: Some(QUICKSTART_GUIDE.to_string()),
-            blob: None,
-        }),
-        "leindex://docs/server-config" => Ok(ResourceContent {
-            uri: uri.to_string(),
-            mime_type: Some("text/markdown".to_string()),
-            text: Some(SERVER_CONFIG_GUIDE.to_string()),
-            blob: None,
-        }),
-        _ => Err(JsonRpcError::method_not_found(format!(
-            "Resource '{}' not found",
-            uri
-        ))),
-    }
-}
-
-/// Quickstart guide content
-const QUICKSTART_GUIDE: &str = r#"# LeIndex Quickstart Guide
-
-## Installation
-
-```bash
-cargo install leindex
-```
-
-## Basic Usage
-
-### 1. Index a Project
-
-```bash
-leindex index /path/to/project
-```
-
-Or use the MCP tool:
-```json
-{
-  "name": "leindex.index",
-  "arguments": {
-    "project_path": "/path/to/project"
-  }
-}
-```
-
-### 2. Search Code
-
-```bash
-leindex search "how is authentication handled"
-```
-
-Or use the MCP tool:
-```json
-{
-  "name": "leindex.search",
-  "arguments": {
-    "query": "how is authentication handled",
-    "limit": 10
-  }
-}
-```
-
-### 3. Deep Analysis
-
-```bash
-leindex analyze --symbol "User::authenticate"
-```
-
-Or use the MCP tool:
-```json
-{
-  "name": "leindex.deep-analyze",
-  "arguments": {
-    "query": "User::authenticate"
-  }
-}
-```
-
-## Available Tools
-
-- `leindex.search` - Semantic code search
-- `leindex.deep-analyze` - Comprehensive code analysis
-- `leindex.context` - Expand symbol context
-- `leindex.grep-symbols` - Search symbols by name
-- `leindex.read-file` - Read file with PDG annotations
-- `leindex.file-summary` - Get file structural summary
-
-## Environment Variables
-
-- `LEINDEX_HOME` - Storage directory (default: ~/.leindex)
-- `LEINDEX_PORT` - Server port (default: 47268)
-"#;
-
-/// Server configuration guide content
-const SERVER_CONFIG_GUIDE: &str = r#"# LeIndex Server Configuration
-
-## Configuration Options
-
-The LeIndex server can be configured via:
-
-1. Command-line arguments
-2. Environment variables
-3. Configuration file (config.yaml)
-
-## Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `LEINDEX_HOME` | Storage/index directory | `~/.leindex` |
-| `LEINDEX_PORT` | HTTP server port | `47268` |
-| `LEINDEX_HOST` | HTTP server host | `127.0.0.1` |
-
-## MCP Server Mode
-
-Start the MCP server:
-
-```bash
-leindex mcp --stdio
-```
-
-For HTTP transport:
-
-```bash
-leindex serve
-```
-
-## Feature Flags
-
-When building from source:
-
-- `full` - All features (default)
-- `minimal` - Parse and search only
-- `cli` - CLI + MCP server
-- `server` - HTTP server only
-
-## Multi-Project Support
-
-The server supports multiple concurrent projects:
-
-```bash
-leindex serve --max-projects 10
-```
-
-Default maximum: 5 projects.
-"#;
+#[path = "server_test.rs"]
+mod tests;
+
+#[path = "prompts_resources.rs"]
+mod prompts_resources;
+pub use prompts_resources::{
+    Prompt, PromptArgument, PromptContent, PromptMessage, Resource, ResourceContent, get_prompt,
+    get_prompts, get_resource, get_resources, handle_prompt_get, handle_resource_read,
+    list_prompts_json, list_resources_json,
+};

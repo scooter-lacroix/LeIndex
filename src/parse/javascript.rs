@@ -1,5 +1,8 @@
 // JavaScript and TypeScript language parser implementation
 
+use crate::cfg_builder;
+use crate::cfg_loop_handler;
+use crate::parse::traits::calculate_complexity;
 use crate::parse::traits::{Block, Edge, EdgeType, Parameter, Visibility};
 use crate::parse::traits::{
     CodeIntelligence, ComplexityMetrics, Error, Graph, ImportInfo, Result, SignatureInfo,
@@ -28,114 +31,125 @@ impl JavaScriptParser {
         root: tree_sitter::Node<'_>,
     ) -> Vec<SignatureInfo> {
         let mut signatures = Vec::new();
-
-        fn visit_node(
-            node: &tree_sitter::Node<'_>,
-            source: &[u8],
-            signatures: &mut Vec<SignatureInfo>,
-            parent_path: &[String],
-        ) {
-            match node.kind() {
-                "function_declaration" | "method_definition" | "generator_function_declaration" => {
-                    if let Some(sig) = extract_function_signature(node, source, parent_path) {
-                        signatures.push(sig);
-                    }
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        visit_node(&child, source, signatures, parent_path);
-                    }
-                }
-                "class_declaration" | "class_expression" => {
-                    let class_name = node
-                        .child_by_field_name("name")
-                        .and_then(|n| n.utf8_text(source).ok())
-                        .map(|s| s.to_string());
-
-                    if let Some(name) = class_name {
-                        let mut class_path = parent_path.to_vec();
-                        class_path.push(name.clone());
-
-                        // Extract class as a signature info
-                        signatures.push(SignatureInfo {
-                            name: name.clone(),
-                            qualified_name: if parent_path.is_empty() {
-                                name.clone()
-                            } else {
-                                format!("{}.{}", parent_path.join("."), name)
-                            },
-                            parameters: vec![],
-                            return_type: None,
-                            visibility: Visibility::Public,
-                            is_async: false,
-                            is_method: false,
-                            docstring: extract_docstring(node, source),
-                            calls: vec![],
-                            imports: vec![],
-                            byte_range: (node.start_byte(), node.end_byte()),
-                            flow_facts: vec![],
-
-                            cyclomatic_complexity: 0,
-                        });
-
-                        let mut cursor = node.walk();
-                        for child in node.children(&mut cursor) {
-                            visit_node(&child, source, signatures, &class_path);
-                        }
-                    } else {
-                        let mut cursor = node.walk();
-                        for child in node.children(&mut cursor) {
-                            visit_node(&child, source, signatures, parent_path);
-                        }
-                    }
-                }
-                "lexical_declaration" | "variable_declaration" => {
-                    // Check for arrow functions or function expressions
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        if child.kind() == "variable_declarator" {
-                            if let Some(name) = child
-                                .child_by_field_name("name")
-                                .and_then(|n| n.utf8_text(source).ok())
-                            {
-                                if let Some(value) = child.child_by_field_name("value") {
-                                    if value.kind() == "arrow_function"
-                                        || value.kind() == "function_expression"
-                                    {
-                                        if let Some(sig) =
-                                            extract_function_signature(&value, source, parent_path)
-                                        {
-                                            // Override name with variable name
-                                            let mut sig = sig;
-                                            sig.name = name.to_string();
-                                            sig.qualified_name = if parent_path.is_empty() {
-                                                name.to_string()
-                                            } else {
-                                                format!("{}.{}", parent_path.join("."), name)
-                                            };
-                                            signatures.push(sig);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Continue recursion
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        visit_node(&child, source, signatures, parent_path);
-                    }
-                }
-                _ => {
-                    let mut cursor = node.walk();
-                    for child in node.children(&mut cursor) {
-                        visit_node(&child, source, signatures, parent_path);
-                    }
-                }
-            }
-        }
-
-        visit_node(&root, source, &mut signatures, &[]);
+        Self::visit_javascript_node(&root, source, &mut signatures, &[]);
         signatures
+    }
+
+    fn visit_javascript_node(
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        signatures: &mut Vec<SignatureInfo>,
+        parent_path: &[String],
+    ) {
+        match node.kind() {
+            "function_declaration" | "method_definition" | "generator_function_declaration" => {
+                if let Some(signature) = extract_function_signature(node, source, parent_path) {
+                    signatures.push(signature);
+                }
+                Self::visit_javascript_children(node, source, signatures, parent_path);
+            }
+            "class_declaration" | "class_expression" => {
+                Self::visit_javascript_class(node, source, signatures, parent_path);
+            }
+            "lexical_declaration" | "variable_declaration" => {
+                Self::extract_variable_functions(node, source, signatures, parent_path);
+                Self::visit_javascript_children(node, source, signatures, parent_path);
+            }
+            _ => Self::visit_javascript_children(node, source, signatures, parent_path),
+        }
+    }
+
+    fn visit_javascript_children(
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        signatures: &mut Vec<SignatureInfo>,
+        parent_path: &[String],
+    ) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::visit_javascript_node(&child, source, signatures, parent_path);
+        }
+    }
+
+    fn visit_javascript_class(
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        signatures: &mut Vec<SignatureInfo>,
+        parent_path: &[String],
+    ) {
+        let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source).ok())
+        else {
+            Self::visit_javascript_children(node, source, signatures, parent_path);
+            return;
+        };
+        let mut class_path = parent_path.to_vec();
+        class_path.push(name.to_string());
+        signatures.push(SignatureInfo {
+            name: name.to_string(),
+            qualified_name: Self::javascript_qualified_name(parent_path, name),
+            parameters: vec![],
+            return_type: None,
+            visibility: Visibility::Public,
+            is_async: false,
+            is_method: false,
+            docstring: extract_docstring(node, source),
+            calls: vec![],
+            imports: vec![],
+            byte_range: (node.start_byte(), node.end_byte()),
+            flow_facts: vec![],
+            cyclomatic_complexity: 0,
+        });
+        Self::visit_javascript_children(node, source, signatures, &class_path);
+    }
+
+    fn extract_variable_functions(
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        signatures: &mut Vec<SignatureInfo>,
+        parent_path: &[String],
+    ) {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::extract_variable_function(&child, source, signatures, parent_path);
+        }
+    }
+
+    fn extract_variable_function(
+        node: &tree_sitter::Node<'_>,
+        source: &[u8],
+        signatures: &mut Vec<SignatureInfo>,
+        parent_path: &[String],
+    ) {
+        if node.kind() != "variable_declarator" {
+            return;
+        }
+        let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(source).ok())
+        else {
+            return;
+        };
+        let Some(value) = node.child_by_field_name("value") else {
+            return;
+        };
+        if !matches!(value.kind(), "arrow_function" | "function_expression") {
+            return;
+        }
+        if let Some(mut signature) = extract_function_signature(&value, source, parent_path) {
+            signature.name = name.to_string();
+            signature.qualified_name = Self::javascript_qualified_name(parent_path, name);
+            signatures.push(signature);
+        }
+    }
+
+    fn javascript_qualified_name(parent_path: &[String], name: &str) -> String {
+        if parent_path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}.{}", parent_path.join("."), name)
+        }
     }
 }
 
@@ -182,7 +196,7 @@ impl CodeIntelligence for JavaScriptParser {
 
         let root_node = tree.root_node();
 
-        let node = find_node_by_id(&root_node, node_id)
+        let node = crate::parse::traits::find_node_by_id(&root_node, node_id)
             .ok_or_else(|| Error::ParseFailed(format!("Node {} not found", node_id)))?;
 
         let mut cfg_builder = CfgBuilder::new(source);
@@ -199,7 +213,7 @@ impl CodeIntelligence for JavaScriptParser {
             token_count: 0,
         };
 
-        calculate_complexity(node, &mut complexity, 0);
+        calculate_complexity(node, &mut complexity, 0, DECISION_KINDS);
         complexity
     }
 }
@@ -377,7 +391,7 @@ impl CodeIntelligence for TypeScriptParser {
 
         let root_node = tree.root_node();
 
-        let node = find_node_by_id(&root_node, node_id)
+        let node = crate::parse::traits::find_node_by_id(&root_node, node_id)
             .ok_or_else(|| Error::ParseFailed(format!("Node {} not found", node_id)))?;
 
         let mut cfg_builder = CfgBuilder::new(source);
@@ -394,7 +408,7 @@ impl CodeIntelligence for TypeScriptParser {
             token_count: 0,
         };
 
-        calculate_complexity(node, &mut complexity, 0);
+        calculate_complexity(node, &mut complexity, 0, DECISION_KINDS);
         complexity
     }
 }
@@ -438,24 +452,7 @@ fn extract_js_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportI
             }
 
             if clause.starts_with('{') {
-                let inner = clause.trim_matches('{').trim_matches('}');
-                for part in inner.split(',') {
-                    let part = part.trim();
-                    if part.is_empty() {
-                        continue;
-                    }
-                    if let Some((name, alias)) = part.split_once(" as ") {
-                        let path = format!("{}.{}", module, name.trim());
-                        add_import(imports, &path, Some(alias.trim().to_string()));
-                    } else {
-                        let path = format!("{}.{}", module, part);
-                        add_import(
-                            imports,
-                            &path,
-                            part.split('.').next_back().map(|s| s.to_string()),
-                        );
-                    }
-                }
+                parse_named_imports(imports, module, clause);
                 return;
             }
 
@@ -471,27 +468,39 @@ fn extract_js_imports(root: tree_sitter::Node<'_>, source: &[u8]) -> Vec<ImportI
             }
             if let Some(named) = parts.next() {
                 if named.starts_with('{') {
-                    let inner = named.trim_matches('{').trim_matches('}');
-                    for part in inner.split(',') {
-                        let part = part.trim();
-                        if part.is_empty() {
-                            continue;
-                        }
-                        if let Some((name, alias)) = part.split_once(" as ") {
-                            let path = format!("{}.{}", module, name.trim());
-                            add_import(imports, &path, Some(alias.trim().to_string()));
-                        } else {
-                            let path = format!("{}.{}", module, part);
-                            add_import(
-                                imports,
-                                &path,
-                                part.split('.').next_back().map(|s| s.to_string()),
-                            );
-                        }
-                    }
+                    parse_named_imports(imports, module, named);
                 }
             }
         }
+    }
+
+    fn parse_named_imports(imports: &mut Vec<ImportInfo>, module: &str, clause: &str) {
+        let inner = clause.trim_matches('{').trim_matches('}');
+        for part in inner
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+        {
+            add_named_import(imports, module, part);
+        }
+    }
+
+    fn add_named_import(imports: &mut Vec<ImportInfo>, module: &str, part: &str) {
+        if module.is_empty() {
+            return;
+        }
+        if let Some((name, alias)) = part.split_once(" as ") {
+            let path = format!("{}.{}", module, name.trim());
+            add_import(imports, &path, Some(alias.trim().to_string()));
+            return;
+        }
+
+        let path = format!("{}.{}", module, part);
+        add_import(
+            imports,
+            &path,
+            part.split('.').next_back().map(str::to_string),
+        );
     }
 
     fn visit(node: &tree_sitter::Node<'_>, source: &[u8], imports: &mut Vec<ImportInfo>) {
@@ -739,12 +748,11 @@ fn extract_ts_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<Par
                     // If no name field found, look for identifier child
                     let param_name = if param_name.is_none() {
                         let mut ccursor = child.walk();
-                        let result = child
+                        child
                             .children(&mut ccursor)
                             .find(|c| c.kind() == "identifier")
                             .and_then(|c| c.utf8_text(source).ok())
-                            .map(|s| s.to_string());
-                        result
+                            .map(|s| s.to_string())
                     } else {
                         param_name
                     };
@@ -771,12 +779,11 @@ fn extract_ts_parameters(node: &tree_sitter::Node<'_>, source: &[u8]) -> Vec<Par
                     // If no name field found, look for identifier child
                     let param_name = if param_name.is_none() {
                         let mut ccursor = child.walk();
-                        let result = child
+                        child
                             .children(&mut ccursor)
                             .find(|c| c.kind() == "identifier")
                             .and_then(|c| c.utf8_text(source).ok())
-                            .map(|s| s.to_string());
-                        result
+                            .map(|s| s.to_string())
                     } else {
                         param_name
                     };
@@ -845,84 +852,19 @@ fn extract_docstring(node: &tree_sitter::Node<'_>, source: &[u8]) -> Option<Stri
     None
 }
 
-/// Find a node by its ID
-fn find_node_by_id<'a>(
-    node: &'a tree_sitter::Node<'a>,
-    id: usize,
-) -> Option<tree_sitter::Node<'a>> {
-    use std::collections::VecDeque;
-
-    if node.id() == id {
-        return Some(*node);
-    }
-
-    let mut queue: VecDeque<tree_sitter::Node<'a>> = VecDeque::new();
-    let mut cursor = node.walk();
-
-    for child in node.children(&mut cursor) {
-        queue.push_back(child);
-    }
-
-    while let Some(current) = queue.pop_front() {
-        if current.id() == id {
-            return Some(current);
-        }
-
-        let mut child_cursor = current.walk();
-        for child in current.children(&mut child_cursor) {
-            queue.push_back(child);
-        }
-    }
-
-    None
-}
-
 /// Calculate complexity metrics
-fn calculate_complexity(
-    node: &tree_sitter::Node<'_>,
-    metrics: &mut ComplexityMetrics,
-    depth: usize,
-) {
-    metrics.nesting_depth = metrics.nesting_depth.max(depth);
-    metrics.line_count = std::cmp::max(metrics.line_count, 1);
-
-    match node.kind() {
-        "if_statement" | "while_statement" | "for_statement" | "for_in_statement"
-        | "for_of_statement" | "try_statement" | "switch_statement" | "catch_clause" => {
-            metrics.cyclomatic += 1;
-        }
-        "else" | "case" => {
-            metrics.cyclomatic += 1;
-        }
-        _ => {}
-    }
-
-    metrics.token_count += node.child_count();
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        calculate_complexity(&child, metrics, depth + 1);
-    }
-}
-
-/// Control flow graph builder
-struct CfgBuilder<'a> {
-    source: &'a [u8],
-    blocks: Vec<Block>,
-    edges: Vec<Edge>,
-    next_block_id: usize,
-}
-
+const DECISION_KINDS: &[&str] = &[
+    "if_statement",
+    "while_statement",
+    "for_statement",
+    "for_in_statement",
+    "for_of_statement",
+    "catch_clause",
+    "switch_case",
+];
+cfg_builder!();
+cfg_loop_handler!();
 impl<'a> CfgBuilder<'a> {
-    fn new(source: &'a [u8]) -> Self {
-        Self {
-            source,
-            blocks: Vec::new(),
-            edges: Vec::new(),
-            next_block_id: 0,
-        }
-    }
-
     fn build_from_node(&mut self, node: &tree_sitter::Node<'_>) -> Result<()> {
         let entry_id = self.create_block();
         self.build_cfg_recursive(node, entry_id)?;
@@ -959,60 +901,6 @@ impl<'a> CfgBuilder<'a> {
         Ok(())
     }
 
-    fn handle_if_statement(
-        &mut self,
-        _node: &tree_sitter::Node<'_>,
-        current_block: usize,
-    ) -> Result<()> {
-        let true_block = self.create_block();
-        let false_block = self.create_block();
-        let merge_block = self.create_block();
-
-        self.edges.push(Edge {
-            from: current_block,
-            to: true_block,
-            edge_type: EdgeType::TrueBranch,
-        });
-        self.edges.push(Edge {
-            from: current_block,
-            to: false_block,
-            edge_type: EdgeType::FalseBranch,
-        });
-        self.edges.push(Edge {
-            from: true_block,
-            to: merge_block,
-            edge_type: EdgeType::Unconditional,
-        });
-        self.edges.push(Edge {
-            from: false_block,
-            to: merge_block,
-            edge_type: EdgeType::Unconditional,
-        });
-
-        Ok(())
-    }
-
-    fn handle_loop_statement(
-        &mut self,
-        _node: &tree_sitter::Node<'_>,
-        current_block: usize,
-    ) -> Result<()> {
-        let body_block = self.create_block();
-
-        self.edges.push(Edge {
-            from: current_block,
-            to: body_block,
-            edge_type: EdgeType::Unconditional,
-        });
-        self.edges.push(Edge {
-            from: body_block,
-            to: current_block,
-            edge_type: EdgeType::Loop,
-        });
-
-        Ok(())
-    }
-
     fn handle_try_statement(
         &mut self,
         _node: &tree_sitter::Node<'_>,
@@ -1039,31 +927,6 @@ impl<'a> CfgBuilder<'a> {
         });
 
         Ok(())
-    }
-
-    fn create_block(&mut self) -> usize {
-        let id = self.next_block_id;
-        self.next_block_id += 1;
-        self.blocks.push(Block {
-            id,
-            statements: Vec::new(),
-        });
-        id
-    }
-
-    fn add_statement_to_block(&mut self, block_id: usize, statement: String) {
-        if let Some(block) = self.blocks.get_mut(block_id) {
-            block.statements.push(statement);
-        }
-    }
-
-    fn finish(self) -> Graph<Block, Edge> {
-        Graph {
-            blocks: self.blocks,
-            edges: self.edges,
-            entry_block: 0,
-            exit_blocks: vec![self.next_block_id.saturating_sub(1)],
-        }
     }
 }
 
@@ -1232,5 +1095,42 @@ type JsonObject = Record<string, unknown>;";
 
         assert!(metrics.cyclomatic > 1);
         assert!(metrics.nesting_depth > 0);
+    }
+
+    #[test]
+    fn test_javascript_empty_named_import_is_ignored() {
+        let source = b"import { helper } from \"\";\nfunction run() { return 1; }";
+
+        let signatures = JavaScriptParser::new().get_signatures(source).unwrap();
+
+        assert_eq!(signatures.len(), 1);
+        assert!(signatures[0].imports.is_empty());
+    }
+
+    #[test]
+    fn test_javascript_complexity_counts_catch_and_switch_cases() {
+        let source = b"function decide(value) {
+    try {
+        if (value > 0) {
+            return value;
+        }
+    } catch (error) {
+        switch (value) {
+            case 0:
+                return 0;
+            default:
+                return -1;
+        }
+    }
+}";
+
+        let mut parser = Parser::new();
+        parser
+            .set_language(&crate::parse::traits::languages::javascript::language())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let metrics = JavaScriptParser::new().extract_complexity(&tree.root_node());
+
+        assert_eq!(metrics.cyclomatic, 4);
     }
 }

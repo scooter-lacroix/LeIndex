@@ -1,7 +1,7 @@
 // DuckDB analytics integration
 
 use crate::storage::schema::Storage;
-use rusqlite::{params, Result as SqliteResult};
+use rusqlite::{Result as SqliteResult, params};
 use serde::{Deserialize, Serialize};
 
 /// Analytics for graph metrics

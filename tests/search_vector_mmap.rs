@@ -3,7 +3,7 @@
 //
 // Validates: VAL-BPHASE-001, VAL-BPHASE-002, VAL-BPHASE-003, VAL-BPHASE-004
 
-use leindex::search::vector::{cosine_similarity, write_mmap_embeddings, MmapEmbeddingIndex};
+use leindex::search::vector::{MmapEmbeddingIndex, cosine_similarity, write_mmap_embeddings};
 
 /// Helper: create a temp mmap file with known embeddings and return the index.
 fn create_test_index() -> (tempfile::TempDir, MmapEmbeddingIndex) {

@@ -239,10 +239,14 @@ mod tests {
 
     #[test]
     fn test_config_from_env() {
-        std::env::set_var("LESERVE_HOST", "0.0.0.0");
-        std::env::set_var("LESERVE_PORT", "8080");
-        std::env::set_var("LESERVE_DB_PATH", "/tmp/test.db");
-        std::env::set_var("LESERVE_LOG_LEVEL", "debug");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("LESERVE_HOST", "0.0.0.0") };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("LESERVE_PORT", "8080") };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("LESERVE_DB_PATH", "/tmp/test.db") };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var("LESERVE_LOG_LEVEL", "debug") };
 
         let config = ServerConfig::from_env();
 
@@ -252,10 +256,14 @@ mod tests {
         assert_eq!(config.log_level, "debug");
 
         // Clean up
-        std::env::remove_var("LESERVE_HOST");
-        std::env::remove_var("LESERVE_PORT");
-        std::env::remove_var("LESERVE_DB_PATH");
-        std::env::remove_var("LESERVE_LOG_LEVEL");
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LESERVE_HOST") };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LESERVE_PORT") };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LESERVE_DB_PATH") };
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::remove_var("LESERVE_LOG_LEVEL") };
     }
 
     #[test]

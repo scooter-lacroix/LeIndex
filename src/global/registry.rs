@@ -3,9 +3,9 @@
 //! Provides persistent storage for discovered projects with automatic reconnection.
 
 use crate::global::DEFAULT_DB_PATH;
-use crate::storage::schema::{GLOBAL_REGISTRY_CACHE_SIZE_KIB, GLOBAL_REGISTRY_MMAP_SIZE};
 use crate::storage::UniqueProjectId;
-use rusqlite::{params, Connection};
+use crate::storage::schema::{GLOBAL_REGISTRY_CACHE_SIZE_KIB, GLOBAL_REGISTRY_MMAP_SIZE};
+use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -244,6 +244,31 @@ impl GlobalRegistry {
         Ok(unique_id.to_string())
     }
 
+    fn row_to_project_info(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectInfo> {
+        let id_str: String = row.get(0)?;
+        let unique_id =
+            UniqueProjectId::parse_id(&id_str).ok_or_else(|| rusqlite::Error::InvalidQuery)?;
+
+        Ok(ProjectInfo {
+            unique_id,
+            base_name: row.get(1)?,
+            path: PathBuf::from(row.get::<_, String>(2)?),
+            language: row.get(3)?,
+            file_count: row.get::<_, i64>(4)?.try_into().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?,
+            content_fingerprint: row.get(5)?,
+            is_clone: row.get(6)?,
+            cloned_from: row.get(7)?,
+            registered_at: row.get(8)?,
+            last_modified: row.get::<_, Option<i64>>(9)?,
+        })
+    }
+
     /// List all projects in the registry
     ///
     /// # Returns
@@ -260,24 +285,7 @@ impl GlobalRegistry {
         )?;
 
         let projects = stmt
-            .query_map([], |row| {
-                let id_str: String = row.get(0)?;
-                let unique_id = UniqueProjectId::parse_id(&id_str)
-                    .ok_or_else(|| rusqlite::Error::InvalidQuery)?;
-
-                Ok(ProjectInfo {
-                    unique_id,
-                    base_name: row.get(1)?,
-                    path: PathBuf::from(row.get::<_, String>(2)?),
-                    language: row.get(3)?,
-                    file_count: row.get::<_, i64>(4)? as usize,
-                    content_fingerprint: row.get(5)?,
-                    is_clone: row.get(6)?,
-                    cloned_from: row.get(7)?,
-                    registered_at: row.get(8)?,
-                    last_modified: row.get::<_, Option<i64>>(9)?,
-                })
-            })?
+            .query_map([], Self::row_to_project_info)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
         Ok(projects)
@@ -302,24 +310,7 @@ impl GlobalRegistry {
             "#,
         )?;
 
-        let result = stmt.query_row(params![id], |row| {
-            let id_str: String = row.get(0)?;
-            let unique_id =
-                UniqueProjectId::parse_id(&id_str).ok_or_else(|| rusqlite::Error::InvalidQuery)?;
-
-            Ok(ProjectInfo {
-                unique_id,
-                base_name: row.get(1)?,
-                path: PathBuf::from(row.get::<_, String>(2)?),
-                language: row.get(3)?,
-                file_count: row.get::<_, i64>(4)? as usize,
-                content_fingerprint: row.get(5)?,
-                is_clone: row.get(6)?,
-                cloned_from: row.get(7)?,
-                registered_at: row.get(8)?,
-                last_modified: row.get::<_, Option<i64>>(9)?,
-            })
-        });
+        let result = stmt.query_row(params![id], Self::row_to_project_info);
 
         match result {
             Ok(p) => Ok(Some(p)),
@@ -366,24 +357,7 @@ impl GlobalRegistry {
             "#,
         )?;
 
-        let result = stmt.query_row(params![fingerprint], |row| {
-            let id_str: String = row.get(0)?;
-            let unique_id =
-                UniqueProjectId::parse_id(&id_str).ok_or_else(|| rusqlite::Error::InvalidQuery)?;
-
-            Ok(ProjectInfo {
-                unique_id,
-                base_name: row.get(1)?,
-                path: PathBuf::from(row.get::<_, String>(2)?),
-                language: row.get(3)?,
-                file_count: row.get::<_, i64>(4)? as usize,
-                content_fingerprint: row.get(5)?,
-                is_clone: row.get(6)?,
-                cloned_from: row.get(7)?,
-                registered_at: row.get(8)?,
-                last_modified: row.get::<_, Option<i64>>(9)?,
-            })
-        });
+        let result = stmt.query_row(params![fingerprint], Self::row_to_project_info);
 
         match result {
             Ok(p) => Ok(Some(p)),
@@ -521,9 +495,11 @@ mod tests {
         let projects = registry.list_projects().unwrap();
 
         assert_eq!(projects.len(), 3);
-        assert!(projects
-            .iter()
-            .all(|p| p.language == Some("rust".to_string())));
+        assert!(
+            projects
+                .iter()
+                .all(|p| p.language == Some("rust".to_string()))
+        );
     }
 
     #[test]
@@ -598,6 +574,31 @@ mod tests {
 
         let err = registry.load_existing_ids("broken").unwrap_err();
         assert!(matches!(err, GlobalRegistryError::Database(_)));
+    }
+
+    #[test]
+    fn test_list_projects_rejects_negative_file_count() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let mut registry = GlobalRegistry::init(&db_path).unwrap();
+        let project_path = temp_dir.path().join("negative-count");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        let id = registry
+            .register_project(&project_path, None, 1, "negative-count-fp")
+            .unwrap();
+
+        registry
+            .conn
+            .execute(
+                "UPDATE global_projects SET file_count = -1 WHERE unique_project_id = ?1",
+                params![id],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            registry.list_projects(),
+            Err(GlobalRegistryError::Database(_))
+        ));
     }
 
     #[test]

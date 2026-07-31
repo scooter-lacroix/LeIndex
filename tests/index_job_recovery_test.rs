@@ -16,11 +16,11 @@ fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
-        .expect("test env lock")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[test]
-fn resume_each_phase() {
+fn test_resume_each_phase() {
     let temp = tempfile::tempdir().expect("checkpoint tempdir");
     let store = CheckpointStore::new(temp.path(), 7);
     let scan = ScanCheckpoint {
@@ -54,14 +54,18 @@ fn resume_each_phase() {
                 .collect(),
         })
         .expect("persist parse phase");
-    assert!(store
-        .read_parsed_verified("file", &parsed_hash)
-        .expect("verify parse artifact")
-        .is_some());
-    assert!(store
-        .read_parsed_verified("file", "wrong-hash")
-        .expect("reject wrong parse artifact hash")
-        .is_none());
+    assert!(
+        store
+            .read_parsed_verified("file", &parsed_hash)
+            .expect("verify parse artifact")
+            .is_some()
+    );
+    assert!(
+        store
+            .read_parsed_verified("file", "wrong-hash")
+            .expect("reject wrong parse artifact hash")
+            .is_none()
+    );
     let pdg = leindex::graph::pdg::ProgramDependenceGraph::default();
     let pdg_checkpoint = store
         .write_pdg("scan".to_string(), &pdg)
@@ -75,6 +79,11 @@ fn resume_each_phase() {
             pdg_hash: pdg_checkpoint.artifact_hash.clone(),
             snapshot_path,
             tfidf_path,
+            admitted_node_ids: vec![
+                "node-z".to_string(),
+                "node-a".to_string(),
+                "node-a".to_string(),
+            ],
         })
         .expect("persist lexical");
     let neural_hash = store
@@ -113,18 +122,18 @@ fn resume_each_phase() {
             .scan_hash,
         scan.input_hash
     );
-    assert!(store
-        .read_pdg_artifact(state.artifact_hashes.get("pdg").unwrap())
-        .expect("load pdg")
-        .is_some());
-    assert_eq!(
+    assert!(
         store
-            .read_lexical()
-            .expect("load lexical")
-            .unwrap()
-            .pdg_hash,
-        pdg_checkpoint.artifact_hash
+            .read_pdg_artifact(state.artifact_hashes.get("pdg").unwrap())
+            .expect("load pdg")
+            .is_some()
     );
+    let lexical = store
+        .read_lexical()
+        .expect("load lexical")
+        .expect("lexical checkpoint");
+    assert_eq!(lexical.pdg_hash, pdg_checkpoint.artifact_hash);
+    assert_eq!(lexical.admitted_node_ids, ["node-a", "node-z"]);
     assert_eq!(store.read_neural().expect("load neural").unwrap().rows, 0);
     assert_eq!(
         store.read_state().expect("load state").unwrap().job_id,
@@ -133,7 +142,7 @@ fn resume_each_phase() {
 }
 
 #[test]
-fn bucketed_parse_artifacts_keep_path_identity() {
+fn test_bucketed_parse_artifacts_keep_path_identity() {
     let temp = tempfile::tempdir().expect("checkpoint tempdir");
     let store = CheckpointStore::new(temp.path(), 8);
     let parsed = ParsedFileCheckpoint {
@@ -147,18 +156,22 @@ fn bucketed_parse_artifacts_keep_path_identity() {
     let hash = store
         .write_parsed_batch("ab", &bucket)
         .expect("persist parse bucket");
-    assert!(store
-        .read_parsed_for_path_verified("abcdef", &hash, PathBuf::from("src/lib.rs").as_path())
-        .expect("read parse bucket")
-        .is_some());
-    assert!(store
-        .read_parsed_for_path_verified("abcdef", &hash, PathBuf::from("src/main.rs").as_path())
-        .expect("reject wrong path")
-        .is_none());
+    assert!(
+        store
+            .read_parsed_for_path_verified("abcdef", &hash, PathBuf::from("src/lib.rs").as_path())
+            .expect("read parse bucket")
+            .is_some()
+    );
+    assert!(
+        store
+            .read_parsed_for_path_verified("abcdef", &hash, PathBuf::from("src/main.rs").as_path())
+            .expect("reject wrong path")
+            .is_none()
+    );
 }
 
 #[test]
-fn lexical_failure_keeps_core_current_and_restart_reuses_checkpoint() {
+fn test_lexical_failure_keeps_core_current_and_restart_reuses_checkpoint() {
     let _env_lock = env_test_lock();
     let temp = tempfile::tempdir().expect("project tempdir");
     std::fs::create_dir_all(temp.path().join("src")).expect("source directory");
@@ -169,9 +182,11 @@ fn lexical_failure_keeps_core_current_and_restart_reuses_checkpoint() {
     .expect("source file");
 
     let mut first = leindex::cli::leindex::LeIndex::new(temp.path()).expect("create index");
-    std::env::set_var("LEINDEX_INJECT_FAILURE_PHASE", "lexical");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::set_var("LEINDEX_INJECT_FAILURE_PHASE", "lexical") };
     let first_result = first.index_project(true);
-    std::env::remove_var("LEINDEX_INJECT_FAILURE_PHASE");
+    // FIXME: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("LEINDEX_INJECT_FAILURE_PHASE") };
     assert!(first_result.is_err(), "failure injection must stop the job");
 
     let storage = temp.path().join(".leindex");
@@ -192,15 +207,17 @@ fn lexical_failure_keeps_core_current_and_restart_reuses_checkpoint() {
         generation >= 2,
         "resume must publish a generation after the failed lexical attempt"
     );
-    assert!(storage
-        .join("generations")
-        .join(generation.to_string())
-        .join("leindex.db")
-        .is_file());
+    assert!(
+        storage
+            .join("generations")
+            .join(generation.to_string())
+            .join("leindex.db")
+            .is_file()
+    );
 }
 
 #[tokio::test]
-async fn registry_hydrates_current_generation_not_mutable_root() {
+async fn test_registry_hydrates_current_generation_not_mutable_root() {
     let temp = tempfile::tempdir().expect("project tempdir");
     std::fs::create_dir_all(temp.path().join("src")).expect("source directory");
     std::fs::write(
@@ -310,7 +327,8 @@ struct EnvVarGuard {
 impl EnvVarGuard {
     fn set(key: &str, value: &str) -> Self {
         let original = std::env::var(key).ok();
-        std::env::set_var(key, value);
+        // FIXME: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(key, value) };
         Self {
             key: key.to_string(),
             original,
@@ -321,8 +339,10 @@ impl EnvVarGuard {
 impl Drop for EnvVarGuard {
     fn drop(&mut self) {
         match &self.original {
-            Some(value) => std::env::set_var(&self.key, value),
-            None => std::env::remove_var(&self.key),
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            Some(value) => unsafe { std::env::set_var(&self.key, value) },
+            // FIXME: Audit that the environment access only happens in single-threaded code.
+            None => unsafe { std::env::remove_var(&self.key) },
         }
     }
 }
@@ -347,7 +367,7 @@ fn make_tiny_rust_project() -> tempfile::TempDir {
 /// The owned, detached task continues to run and reaches `complete` status
 /// independently of the caller that started it.
 #[tokio::test]
-async fn disconnect_survival_job_continues_to_completion() {
+async fn test_disconnect_survival_job_continues_to_completion() {
     let _env_lock = AsyncEnvTestLock::acquire().await;
     let temp = make_tiny_rust_project();
     let registry = Arc::new(ProjectRegistry::new(2));
@@ -376,9 +396,10 @@ async fn disconnect_survival_job_continues_to_completion() {
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let snapshot = registry
-            .start_index_job(Some(&project), false, false)
+            .get_index_job_snapshot(Some(&project))
             .await
-            .expect("poll job");
+            .expect("read job status")
+            .expect("owned job status");
         if snapshot.status != JobStatus::Running {
             final_snapshot = snapshot;
             break;
@@ -408,7 +429,7 @@ async fn disconnect_survival_job_continues_to_completion() {
 /// same project path while a job is running, the second call must return the
 /// same `job_id` rather than starting a second job.
 #[tokio::test]
-async fn concurrent_requests_coalesce_into_single_job() {
+async fn test_concurrent_requests_coalesce_into_single_job() {
     let _env_lock = AsyncEnvTestLock::acquire().await;
     let temp = make_tiny_rust_project();
     let registry = Arc::new(ProjectRegistry::new(2));
@@ -419,6 +440,12 @@ async fn concurrent_requests_coalesce_into_single_job() {
         .start_index_job(Some(&project), false, false)
         .await
         .expect("first start_index_job");
+
+    assert_eq!(
+        snap1.status,
+        JobStatus::Running,
+        "the first start_index_job call must publish Running before coalescing"
+    );
 
     // Second concurrent call (force_reindex=false) must coalesce onto the
     // running job rather than creating a second job.
@@ -432,10 +459,24 @@ async fn concurrent_requests_coalesce_into_single_job() {
         "concurrent start_index_job calls for the same project must coalesce into the same job_id"
     );
 
-    // The job_id equality holds whether the job is still running or has
-    // already completed: the second call always coalesces onto the existing
-    // entry for the same project path. We do not need to wait for completion
-    // — the spawned task is cancelled cleanly when the runtime shuts down.
+    // The job_id equality holds while the same owned job is running. Wait for
+    // terminal completion before dropping the temporary project so detached
+    // work cannot race teardown.
+    let mut attempts = 0usize;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let snapshot = registry
+            .get_index_job_snapshot(Some(&project))
+            .await
+            .expect("read coalesced job status")
+            .expect("coalesced job status");
+        if snapshot.status != JobStatus::Running {
+            assert_eq!(snapshot.status, JobStatus::Complete);
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 1200, "coalesced job did not finish");
+    }
 }
 
 /// VAL-JOBLIFECYCLE-003: When 20 concurrent `get_or_create` calls are issued
@@ -443,7 +484,7 @@ async fn concurrent_requests_coalesce_into_single_job() {
 /// conflict. The `.leindex` storage directory must exist after all calls
 /// complete, and the project must be loaded exactly once.
 #[tokio::test]
-async fn concurrent_first_load_creates_project_once() {
+async fn test_concurrent_first_load_creates_project_once() {
     let _env_lock = AsyncEnvTestLock::acquire().await;
     let temp = make_tiny_rust_project();
 
@@ -505,7 +546,7 @@ async fn concurrent_first_load_creates_project_once() {
 /// (here, the outer JoinHandle on the inner spawned task) must capture the
 /// panic and update the job state with a message containing "panic".
 #[tokio::test]
-async fn panic_during_index_sets_failed_status() {
+async fn test_panic_during_index_sets_failed_status() {
     let _env_lock = AsyncEnvTestLock::acquire().await;
     let _panic_marker = EnvVarGuard::set("LEINDEX_INJECT_PANIC", "1");
 
@@ -531,9 +572,10 @@ async fn panic_during_index_sets_failed_status() {
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         let snapshot = registry
-            .start_index_job(Some(&project), false, false)
+            .get_index_job_snapshot(Some(&project))
             .await
-            .expect("poll job");
+            .expect("read job status")
+            .expect("owned job status");
         if snapshot.status != JobStatus::Running {
             final_snapshot = snapshot;
             break;

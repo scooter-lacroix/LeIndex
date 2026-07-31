@@ -8,7 +8,7 @@
 //            VAL-BPHASE-039, VAL-BPHASE-040
 
 use leindex::search::search::{NodeInfo, SearchEngine, SearchQuery, TextIndexDelta};
-use leindex::search::vector::{write_mmap_embeddings, MmapEmbeddingIndex};
+use leindex::search::vector::{MmapEmbeddingIndex, write_mmap_embeddings};
 
 /// Helper: create a NodeInfo with the given id, content, and embedding.
 fn make_node(id: &str, content: &str, embedding: Vec<f32>) -> NodeInfo {

@@ -41,13 +41,13 @@ pub use global_symbols::{
 };
 pub use nodes::{NodeRecord, NodeStore};
 pub use pdg_store::{
-    delete_pdg, load_pdg, pdg_exists, save_pdg, PdgStoreError, Result as PdgStoreResult,
+    PdgStoreError, Result as PdgStoreResult, delete_pdg, load_pdg, pdg_exists, save_pdg,
 };
 pub use project_id::UniqueProjectId;
 pub use project_metadata::{ProjectMetadata, ProjectMetadataError};
 pub use salsa::{IncrementalCache, NodeHash};
 pub use schema::{
-    Storage, StorageConfig, StoragePool, StoragePoolError, StorageRole, DEFAULT_READER_POOL_SIZE,
+    DEFAULT_READER_POOL_SIZE, Storage, StorageConfig, StoragePool, StoragePoolError, StorageRole,
 };
 
 #[cfg(feature = "turso")]

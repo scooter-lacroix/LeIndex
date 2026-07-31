@@ -204,7 +204,7 @@ impl RemoteEmbeddingProvider for OpenAIEmbeddingProvider {
             _ => {
                 return Err(RemoteEmbeddingError::ApiError(
                     "Invalid provider".to_string(),
-                ))
+                ));
             }
         };
 
@@ -313,7 +313,7 @@ impl RemoteEmbeddingProvider for CohereEmbeddingProvider {
             _ => {
                 return Err(RemoteEmbeddingError::ApiError(
                     "Invalid provider".to_string(),
-                ))
+                ));
             }
         };
 

@@ -150,7 +150,7 @@ mod cli_workflow_tests {
 mod cache_management_tests {
     use super::*;
     use leindex::cli::memory::{
-        create_pdg_entry, create_search_entry, CacheEntry, CacheSpiller, MemoryConfig, WarmStrategy,
+        CacheEntry, CacheSpiller, MemoryConfig, WarmStrategy, create_pdg_entry, create_search_entry,
     };
     use std::collections::HashMap;
 
@@ -410,8 +410,8 @@ mod e2e_workflow_tests {
 
     #[test]
     fn test_cache_integration_with_leindex() {
-        use leindex::cli::memory::MemoryConfig;
         use leindex::cli::LeIndex;
+        use leindex::cli::memory::MemoryConfig;
 
         let temp_dir = TempDir::new().unwrap();
         let project_path = temp_dir.path().to_path_buf();
@@ -444,8 +444,8 @@ mod e2e_workflow_tests {
 
 mod cache_spill_reload_tests {
     use super::*;
-    use leindex::cli::memory::WarmStrategy;
     use leindex::cli::LeIndex;
+    use leindex::cli::memory::WarmStrategy;
 
     /// Helper function to create a test project with some code
     fn create_test_project(temp_dir: &TempDir) -> PathBuf {
@@ -516,7 +516,7 @@ fn greet() {
         let (pdg_bytes, vector_bytes) = result.unwrap();
         // Vector cache should have been spilled
         assert_eq!(vector_bytes, vector_bytes); // usize is non-negative
-                                                // PDG bytes should be 0 since PDG wasn't loaded
+        // PDG bytes should be 0 since PDG wasn't loaded
         assert_eq!(pdg_bytes, 0);
     }
 
