@@ -59,7 +59,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install lizard
-        run: pip install lizard
+        run: pip install lizard jinja2  # jinja2 required for lizard's HTML report (-o)
       - name: Run complexity analysis
         run: |
           # Generate the browsable HTML report (lizard -o always exits 0).
