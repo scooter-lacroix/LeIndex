@@ -303,7 +303,12 @@ fn scan_file(
     let file_path = file_path.to_string_lossy();
 
     for (line_index, line) in lines.iter().enumerate() {
-        if results.len() >= params.offset.saturating_add(params.max_results) {
+        if results.len()
+            >= params
+                .offset
+                .saturating_add(params.max_results)
+                .saturating_add(1)
+        {
             break;
         }
         if params.budget.elapsed(started) {
@@ -332,7 +337,12 @@ fn scan_source_paths(
 ) -> (Vec<Value>, bool) {
     let mut results = Vec::new();
     for file_path in source_paths {
-        if results.len() >= params.offset.saturating_add(params.max_results) {
+        if results.len()
+            >= params
+                .offset
+                .saturating_add(params.max_results)
+                .saturating_add(1)
+        {
             break;
         }
         if params.budget.elapsed(started) {
@@ -469,7 +479,7 @@ to understand match context. Supports regex, globs, scope, and context_lines."
             "offset": params.offset,
             "count": count,
             "total_matched": total,
-            "has_more": params.offset + count < total,
+            "has_more": total > params.offset.saturating_add(params.max_results),
             "results": paginated,
             "retrieval": {
                 "tfidf_status": "not_used_exact",
