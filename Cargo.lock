@@ -1975,7 +1975,7 @@ dependencies = [
  "tree-sitter-typescript",
  "unicode-normalization",
  "walkdir",
- "which 5.0.0",
+ "which 8.0.5",
  "wide",
 ]
 
@@ -4767,15 +4767,11 @@ dependencies = [
 
 [[package]]
 name = "which"
-version = "5.0.0"
+version = "8.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bf3ea8596f3a0dd5980b46430f2058dfe2c36a27ccfbb1845d6fbfcd9ba6e14"
+checksum = "8f3ef584124b911bcc3875c2f1472e80f24361ceb789bd1c62b3e9a3df9ff43c"
 dependencies = [
- "either",
- "home",
- "once_cell",
- "rustix 0.38.44",
- "windows-sys 0.48.0",
+ "libc",
 ]
 
 [[package]]
